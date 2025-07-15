@@ -12,9 +12,9 @@ mod posix_tests;
 use crate::filesystem::{CacheConfig, S3Config, SlateDbFs};
 use crate::inode::Inode;
 use async_trait::async_trait;
-use nfsserve::nfs::*;
+use nfsserve::nfs::{ftype3, *};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use nfsserve::vfs::{NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::{AuthContext, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::{debug, info};
 
 #[cfg(not(target_env = "msvc"))]
@@ -34,7 +34,12 @@ impl NFSFileSystem for SlateDbFs {
         VFSCapabilities::ReadWrite
     }
 
-    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+    async fn lookup(
+        &self,
+        _auth: &AuthContext,
+        dirid: fileid3,
+        filename: &filename3,
+    ) -> Result<fileid3, nfsstat3> {
         let filename_str = String::from_utf8_lossy(filename);
         debug!("lookup called: dirid={}, filename={}", dirid, filename_str);
 
@@ -68,7 +73,7 @@ impl NFSFileSystem for SlateDbFs {
         }
     }
 
-    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+    async fn getattr(&self, _auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
         let inode = self.load_inode(id).await?;
         Ok(inode.to_fattr3(id))
@@ -76,15 +81,22 @@ impl NFSFileSystem for SlateDbFs {
 
     async fn read(
         &self,
+        auth: &AuthContext,
         id: fileid3,
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
-        self.process_read_file(id, offset, count).await
+        self.process_read_file(auth, id, offset, count).await
     }
 
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+    async fn write(
+        &self,
+        auth: &AuthContext,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<fattr3, nfsstat3> {
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
             data.len(),
@@ -92,11 +104,12 @@ impl NFSFileSystem for SlateDbFs {
             offset
         );
 
-        self.process_write(id, offset, data).await
+        self.process_write(auth, id, offset, data).await
     }
 
     async fn create(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         filename: &filename3,
         attr: sattr3,
@@ -104,11 +117,12 @@ impl NFSFileSystem for SlateDbFs {
         let filename_str = String::from_utf8_lossy(filename);
         debug!("create called: dirid={}, filename={}", dirid, filename_str);
 
-        self.process_create(dirid, filename, attr).await
+        self.process_create(auth, dirid, filename, attr).await
     }
 
     async fn create_exclusive(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
@@ -117,28 +131,35 @@ impl NFSFileSystem for SlateDbFs {
             dirid, filename
         );
 
-        self.process_create_exclusive(dirid, filename).await
+        self.process_create_exclusive(auth, dirid, filename).await
     }
 
     async fn mkdir(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let dirname_str = String::from_utf8_lossy(dirname);
         debug!("mkdir called: dirid={}, dirname={}", dirid, dirname_str);
 
-        self.process_mkdir(dirid, dirname).await
+        self.process_mkdir(auth, dirid, dirname).await
     }
 
-    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+    async fn remove(
+        &self,
+        auth: &AuthContext,
+        dirid: fileid3,
+        filename: &filename3,
+    ) -> Result<(), nfsstat3> {
         debug!("remove called: dirid={}, filename={:?}", dirid, filename);
 
-        self.process_remove(dirid, filename).await
+        self.process_remove(auth, dirid, filename).await
     }
 
     async fn rename(
         &self,
+        auth: &AuthContext,
         from_dirid: fileid3,
         from_filename: &filename3,
         to_dirid: fileid3,
@@ -149,12 +170,13 @@ impl NFSFileSystem for SlateDbFs {
             from_dirid, to_dirid
         );
 
-        self.process_rename(from_dirid, from_filename, to_dirid, to_filename)
+        self.process_rename(auth, from_dirid, from_filename, to_dirid, to_filename)
             .await
     }
 
     async fn readdir(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
@@ -163,17 +185,24 @@ impl NFSFileSystem for SlateDbFs {
             "readdir called: dirid={}, start_after={}, max_entries={}",
             dirid, start_after, max_entries
         );
-        self.process_readdir(dirid, start_after, max_entries).await
+        self.process_readdir(auth, dirid, start_after, max_entries)
+            .await
     }
 
-    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+    async fn setattr(
+        &self,
+        auth: &AuthContext,
+        id: fileid3,
+        setattr: sattr3,
+    ) -> Result<fattr3, nfsstat3> {
         debug!("setattr called: id={}, setattr={:?}", id, setattr);
 
-        self.process_setattr(id, setattr).await
+        self.process_setattr(auth, id, setattr).await
     }
 
     async fn symlink(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         linkname: &filename3,
         symlink: &nfspath3,
@@ -184,11 +213,11 @@ impl NFSFileSystem for SlateDbFs {
             dirid, linkname, symlink
         );
 
-        self.process_symlink(dirid, &linkname.0, &symlink.0, *attr)
+        self.process_symlink(auth, dirid, &linkname.0, &symlink.0, *attr)
             .await
     }
 
-    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+    async fn readlink(&self, _auth: &AuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         debug!("readlink called: id={}", id);
 
         let inode = self.load_inode(id).await?;
@@ -196,6 +225,49 @@ impl NFSFileSystem for SlateDbFs {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
             _ => Err(nfsstat3::NFS3ERR_INVAL),
         }
+    }
+
+    async fn mknod(
+        &self,
+        auth: &AuthContext,
+        dirid: fileid3,
+        filename: &filename3,
+        ftype: ftype3,
+        attr: &sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        debug!(
+            "mknod called: dirid={}, filename={:?}, ftype={:?}",
+            dirid, filename, ftype
+        );
+
+        // Extract device numbers if this is a device file
+        let rdev = match ftype {
+            ftype3::NF3CHR | ftype3::NF3BLK => {
+                // In NFS3, device numbers are passed in the sattr3 structure
+                // For now, we'll use default values - a proper implementation
+                // would extract these from the protocol
+                Some((0, 0))
+            }
+            _ => None,
+        };
+
+        self.process_mknod(auth, dirid, &filename.0, ftype, attr, rdev)
+            .await
+    }
+
+    async fn link(
+        &self,
+        auth: &AuthContext,
+        fileid: fileid3,
+        linkdirid: fileid3,
+        linkname: &filename3,
+    ) -> Result<(), nfsstat3> {
+        debug!(
+            "link called: fileid={}, linkdirid={}, linkname={:?}",
+            fileid, linkdirid, linkname
+        );
+        self.process_link(auth, fileid, linkdirid, &linkname.0)
+            .await
     }
 }
 
@@ -264,7 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::filesystem::SlateDbFs;
-    use crate::test_helpers::test_helpers::filename;
+    use crate::test_helpers::test_helpers::{filename, test_auth};
     use nfsserve::nfs::{set_atime, set_mtime};
 
     #[tokio::test]
@@ -280,14 +352,19 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .create(0, &filename(b"test.txt"), sattr3::default())
+            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
             .await
             .unwrap();
 
-        let found_id = fs.lookup(0, &filename(b"test.txt")).await.unwrap();
+        let found_id = fs
+            .lookup(&test_auth(), 0, &filename(b"test.txt"))
+            .await
+            .unwrap();
         assert_eq!(found_id, file_id);
 
-        let result = fs.lookup(0, &filename(b"nonexistent.txt")).await;
+        let result = fs
+            .lookup(&test_auth(), 0, &filename(b"nonexistent.txt"))
+            .await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
     }
 
@@ -295,7 +372,7 @@ mod tests {
     async fn test_getattr() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let fattr = fs.getattr(0).await.unwrap();
+        let fattr = fs.getattr(&test_auth(), 0).await.unwrap();
         assert!(matches!(fattr.ftype, ftype3::NF3DIR));
         assert_eq!(fattr.fileid, 0);
     }
@@ -305,15 +382,18 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .create(0, &filename(b"test.txt"), sattr3::default())
+            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
             .await
             .unwrap();
 
         let data = b"Hello, NFS!";
-        let fattr = fs.write(file_id, 0, data).await.unwrap();
+        let fattr = fs.write(&test_auth(), file_id, 0, data).await.unwrap();
         assert_eq!(fattr.size, data.len() as u64);
 
-        let (read_data, eof) = fs.read(file_id, 0, data.len() as u32).await.unwrap();
+        let (read_data, eof) = fs
+            .read(&test_auth(), file_id, 0, data.len() as u32)
+            .await
+            .unwrap();
         assert_eq!(read_data, data);
         assert!(eof);
     }
@@ -323,12 +403,14 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let file_id = fs
-            .create_exclusive(0, &filename(b"exclusive.txt"))
+            .create_exclusive(&test_auth(), 0, &filename(b"exclusive.txt"))
             .await
             .unwrap();
         assert!(file_id > 0);
 
-        let result = fs.create_exclusive(0, &filename(b"exclusive.txt")).await;
+        let result = fs
+            .create_exclusive(&test_auth(), 0, &filename(b"exclusive.txt"))
+            .await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_EXIST)));
     }
 
@@ -336,15 +418,23 @@ mod tests {
     async fn test_mkdir_and_readdir() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, fattr) = fs.mkdir(0, &filename(b"mydir")).await.unwrap();
+        let (dir_id, fattr) = fs
+            .mkdir(&test_auth(), 0, &filename(b"mydir"))
+            .await
+            .unwrap();
         assert!(matches!(fattr.ftype, ftype3::NF3DIR));
 
         let (_file_id, _) = fs
-            .create(dir_id, &filename(b"file_in_dir.txt"), sattr3::default())
+            .create(
+                &test_auth(),
+                dir_id,
+                &filename(b"file_in_dir.txt"),
+                sattr3::default(),
+            )
             .await
             .unwrap();
 
-        let result = fs.readdir(dir_id, 0, 10).await.unwrap();
+        let result = fs.readdir(&test_auth(), dir_id, 0, 10).await.unwrap();
         assert!(result.end);
 
         let names: Vec<&[u8]> = result.entries.iter().map(|e| e.name.0.as_ref()).collect();
@@ -358,20 +448,36 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .create(0, &filename(b"original.txt"), sattr3::default())
+            .create(
+                &test_auth(),
+                0,
+                &filename(b"original.txt"),
+                sattr3::default(),
+            )
             .await
             .unwrap();
 
-        fs.write(file_id, 0, b"test data").await.unwrap();
-
-        fs.rename(0, &filename(b"original.txt"), 0, &filename(b"renamed.txt"))
+        fs.write(&test_auth(), file_id, 0, b"test data")
             .await
             .unwrap();
 
-        let result = fs.lookup(0, &filename(b"original.txt")).await;
+        fs.rename(
+            &test_auth(),
+            0,
+            &filename(b"original.txt"),
+            0,
+            &filename(b"renamed.txt"),
+        )
+        .await
+        .unwrap();
+
+        let result = fs.lookup(&test_auth(), 0, &filename(b"original.txt")).await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
 
-        let found_id = fs.lookup(0, &filename(b"renamed.txt")).await.unwrap();
+        let found_id = fs
+            .lookup(&test_auth(), 0, &filename(b"renamed.txt"))
+            .await
+            .unwrap();
         assert_eq!(found_id, file_id);
     }
 
@@ -380,16 +486,25 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .create(0, &filename(b"to_remove.txt"), sattr3::default())
+            .create(
+                &test_auth(),
+                0,
+                &filename(b"to_remove.txt"),
+                sattr3::default(),
+            )
             .await
             .unwrap();
 
-        fs.remove(0, &filename(b"to_remove.txt")).await.unwrap();
+        fs.remove(&test_auth(), 0, &filename(b"to_remove.txt"))
+            .await
+            .unwrap();
 
-        let result = fs.lookup(0, &filename(b"to_remove.txt")).await;
+        let result = fs
+            .lookup(&test_auth(), 0, &filename(b"to_remove.txt"))
+            .await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
 
-        let result = fs.getattr(file_id).await;
+        let result = fs.getattr(&test_auth(), file_id).await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
     }
 
@@ -398,7 +513,7 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, initial_fattr) = fs
-            .create(0, &filename(b"test.txt"), sattr3::default())
+            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
             .await
             .unwrap();
 
@@ -412,7 +527,10 @@ mod tests {
             mtime: set_mtime::DONT_CHANGE,
         };
 
-        let fattr = fs.setattr(file_id, setattr_mode).await.unwrap();
+        let fattr = fs
+            .setattr(&test_auth(), file_id, setattr_mode)
+            .await
+            .unwrap();
         assert_eq!(fattr.mode, 0o755);
 
         // Test that uid/gid remain unchanged when not specified
@@ -429,7 +547,10 @@ mod tests {
             mtime: set_mtime::DONT_CHANGE,
         };
 
-        let fattr = fs.setattr(file_id, setattr_size).await.unwrap();
+        let fattr = fs
+            .setattr(&test_auth(), file_id, setattr_size)
+            .await
+            .unwrap();
         assert_eq!(fattr.size, 1024);
     }
 
@@ -443,12 +564,12 @@ mod tests {
         let attr = sattr3::default();
 
         let (link_id, fattr) = fs
-            .symlink(0, &filename(b"mylink"), &target, &attr)
+            .symlink(&test_auth(), 0, &filename(b"mylink"), &target, &attr)
             .await
             .unwrap();
         assert!(matches!(fattr.ftype, ftype3::NF3LNK));
 
-        let read_target = fs.readlink(link_id).await.unwrap();
+        let read_target = fs.readlink(&test_auth(), link_id).await.unwrap();
         assert_eq!(read_target.0, target.0);
     }
 
@@ -456,27 +577,55 @@ mod tests {
     async fn test_complex_filesystem_operations() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (docs_dir, _) = fs.mkdir(0, &filename(b"documents")).await.unwrap();
-        let (images_dir, _) = fs.mkdir(0, &filename(b"images")).await.unwrap();
+        let (docs_dir, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"documents"))
+            .await
+            .unwrap();
+        let (images_dir, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"images"))
+            .await
+            .unwrap();
 
         let (file1_id, _) = fs
-            .create(docs_dir, &filename(b"readme.txt"), sattr3::default())
+            .create(
+                &test_auth(),
+                docs_dir,
+                &filename(b"readme.txt"),
+                sattr3::default(),
+            )
             .await
             .unwrap();
         let (file2_id, _) = fs
-            .create(docs_dir, &filename(b"notes.txt"), sattr3::default())
+            .create(
+                &test_auth(),
+                docs_dir,
+                &filename(b"notes.txt"),
+                sattr3::default(),
+            )
             .await
             .unwrap();
         let (file3_id, _) = fs
-            .create(images_dir, &filename(b"photo.jpg"), sattr3::default())
+            .create(
+                &test_auth(),
+                images_dir,
+                &filename(b"photo.jpg"),
+                sattr3::default(),
+            )
             .await
             .unwrap();
 
-        fs.write(file1_id, 0, b"This is the readme").await.unwrap();
-        fs.write(file2_id, 0, b"These are my notes").await.unwrap();
-        fs.write(file3_id, 0, b"JPEG data...").await.unwrap();
+        fs.write(&test_auth(), file1_id, 0, b"This is the readme")
+            .await
+            .unwrap();
+        fs.write(&test_auth(), file2_id, 0, b"These are my notes")
+            .await
+            .unwrap();
+        fs.write(&test_auth(), file3_id, 0, b"JPEG data...")
+            .await
+            .unwrap();
 
         fs.rename(
+            &test_auth(),
             docs_dir,
             &filename(b"readme.txt"),
             images_dir,
@@ -485,13 +634,13 @@ mod tests {
         .await
         .unwrap();
 
-        let docs_entries = fs.readdir(docs_dir, 0, 10).await.unwrap();
+        let docs_entries = fs.readdir(&test_auth(), docs_dir, 0, 10).await.unwrap();
         assert_eq!(docs_entries.entries.len(), 3);
 
-        let images_entries = fs.readdir(images_dir, 0, 10).await.unwrap();
+        let images_entries = fs.readdir(&test_auth(), images_dir, 0, 10).await.unwrap();
         assert_eq!(images_entries.entries.len(), 4);
 
-        let (data, _) = fs.read(file1_id, 0, 100).await.unwrap();
+        let (data, _) = fs.read(&test_auth(), file1_id, 0, 100).await.unwrap();
         assert_eq!(data, b"This is the readme");
     }
 }
