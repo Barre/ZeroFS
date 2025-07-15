@@ -194,8 +194,8 @@ impl SlateDbFs {
         Bytes::from(format!("direntry:{}/{}", dir_inode_id, name))
     }
 
-    pub fn dir_scan_key(dir_inode_id: InodeId, entry_inode_id: InodeId) -> Bytes {
-        Bytes::from(format!("dirscan:{}/{:020}", dir_inode_id, entry_inode_id))
+    pub fn dir_scan_key(dir_inode_id: InodeId, entry_inode_id: InodeId, name: &str) -> Bytes {
+        Bytes::from(format!("dirscan:{}/{:020}/{}", dir_inode_id, entry_inode_id, name))
     }
 
     pub fn dir_scan_prefix(dir_inode_id: InodeId) -> String {

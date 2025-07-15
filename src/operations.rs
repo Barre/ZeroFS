@@ -253,8 +253,8 @@ impl SlateDbFs {
 
                 batch.put(entry_key, file_id.to_le_bytes());
 
-                let scan_key = Self::dir_scan_key(dirid, file_id);
-                batch.put(scan_key, name.as_bytes());
+                let scan_key = Self::dir_scan_key(dirid, file_id, &name);
+                batch.put(scan_key, file_id.to_le_bytes());
 
                 dir.entry_count += 1;
                 let (now_sec, now_nsec) = get_current_time();
@@ -383,8 +383,8 @@ impl SlateDbFs {
 
                 batch.put(entry_key, new_dir_id.to_le_bytes());
 
-                let scan_key = Self::dir_scan_key(dirid, new_dir_id);
-                batch.put(scan_key, name.as_bytes());
+                let scan_key = Self::dir_scan_key(dirid, new_dir_id, &name);
+                batch.put(scan_key, new_dir_id.to_le_bytes());
 
                 dir.entry_count += 1;
                 let (now_sec, now_nsec) = get_current_time();
@@ -518,7 +518,7 @@ impl SlateDbFs {
 
                 batch.delete(entry_key);
 
-                let scan_key = Self::dir_scan_key(dirid, file_id);
+                let scan_key = Self::dir_scan_key(dirid, file_id, &name);
                 batch.delete(scan_key);
 
                 dir.entry_count = dir.entry_count.saturating_sub(1);
@@ -684,7 +684,7 @@ impl SlateDbFs {
                 batch.delete(inode_key);
 
                 // Delete the existing scan entry
-                let existing_scan_key = Self::dir_scan_key(from_dirid, existing_id);
+                let existing_scan_key = Self::dir_scan_key(from_dirid, existing_id, &to_name);
                 batch.delete(existing_scan_key);
             }
 
@@ -692,15 +692,15 @@ impl SlateDbFs {
             batch.delete(from_entry_key);
 
             // Delete old scan entry
-            let from_scan_key = Self::dir_scan_key(from_dirid, inode_id);
+            let from_scan_key = Self::dir_scan_key(from_dirid, inode_id, &from_name);
             batch.delete(from_scan_key);
 
             // Add new entry
             batch.put(to_entry_key, inode_id.to_le_bytes());
 
             // Add new scan entry
-            let to_scan_key = Self::dir_scan_key(from_dirid, inode_id);
-            batch.put(to_scan_key, to_name.as_bytes());
+            let to_scan_key = Self::dir_scan_key(from_dirid, inode_id, &to_name);
+            batch.put(to_scan_key, inode_id.to_le_bytes());
 
             // Update directory metadata
             let mut dir_inode = self.load_inode(from_dirid).await?;
@@ -835,7 +835,7 @@ impl SlateDbFs {
                 batch.delete(inode_key);
 
                 // Delete the existing scan entry
-                let existing_scan_key = Self::dir_scan_key(to_dirid, existing_id);
+                let existing_scan_key = Self::dir_scan_key(to_dirid, existing_id, &to_name);
                 batch.delete(existing_scan_key);
 
                 // Update target directory entry count (will be decremented for removal, then incremented for addition)
@@ -845,15 +845,15 @@ impl SlateDbFs {
             batch.delete(from_entry_key);
 
             // Delete old scan entry
-            let from_scan_key = Self::dir_scan_key(from_dirid, inode_id);
+            let from_scan_key = Self::dir_scan_key(from_dirid, inode_id, &from_name);
             batch.delete(from_scan_key);
 
             // Add to target directory
             batch.put(to_entry_key, inode_id.to_le_bytes());
 
             // Add new scan entry
-            let to_scan_key = Self::dir_scan_key(to_dirid, inode_id);
-            batch.put(to_scan_key, to_name.as_bytes());
+            let to_scan_key = Self::dir_scan_key(to_dirid, inode_id, &to_name);
+            batch.put(to_scan_key, inode_id.to_le_bytes());
 
             // Update the moved inode's parent field
             let mut moved_inode = self.load_inode(inode_id).await?;
@@ -1386,8 +1386,8 @@ impl SlateDbFs {
         batch.put(entry_key, new_id.to_le_bytes());
 
         // Add directory scan entry (for efficient readdir)
-        let scan_key = Self::dir_scan_key(dirid, new_id);
-        batch.put(scan_key, linkname_str.as_bytes());
+        let scan_key = Self::dir_scan_key(dirid, new_id, &linkname_str);
+        batch.put(scan_key, new_id.to_le_bytes());
 
         // Update directory metadata
         dir.entry_count += 1;
@@ -1629,8 +1629,8 @@ impl SlateDbFs {
 
                 batch.put(entry_key, special_id.to_le_bytes());
 
-                let scan_key = Self::dir_scan_key(dirid, special_id);
-                batch.put(scan_key, name.as_bytes());
+                let scan_key = Self::dir_scan_key(dirid, special_id, &name);
+                batch.put(scan_key, special_id.to_le_bytes());
 
                 dir.entry_count += 1;
                 let (now_sec, now_nsec) = get_current_time();
@@ -1717,8 +1717,8 @@ impl SlateDbFs {
                 batch.put(entry_key, fileid.to_le_bytes());
 
                 // Add to directory scan index
-                let scan_key = Self::dir_scan_key(linkdirid, fileid);
-                batch.put(scan_key, name.as_bytes());
+                let scan_key = Self::dir_scan_key(linkdirid, fileid, &name);
+                batch.put(scan_key, fileid.to_le_bytes());
 
                 // Increment link count
                 file.nlink += 1;
@@ -1726,7 +1726,7 @@ impl SlateDbFs {
                 file.ctime = now_sec;
                 file.ctime_nsec = now_nsec;
 
-                // Save updated file inode
+                // Save updated file inode (we need to serialize the whole enum after modification)
                 let file_inode_key = Self::inode_key(fileid);
                 let file_inode_data =
                     bincode::serialize(&file_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
@@ -1834,15 +1834,21 @@ impl SlateDbFs {
                     }
 
                     let key = kv.key;
-                    let value = kv.value;
+                    let _value = kv.value;
                     let key_str = String::from_utf8_lossy(&key);
 
-                    // Extract the inode ID from the key
-                    if let Some(inode_str) = key_str.strip_prefix(&scan_prefix) {
-                        if let Ok(inode_id) = inode_str.parse::<u64>() {
-                            let name = String::from_utf8_lossy(&value);
-                            debug!("readdir: found entry {} (inode {})", name, inode_id);
-                            dir_entries.push((inode_id, value.to_vec()));
+                    // Extract the inode ID and filename from the key
+                    // Key format: dirscan:{dir_id}/{inode_id:020}/{filename}
+                    if let Some(suffix) = key_str.strip_prefix(&scan_prefix) {
+                        // Split by '/' to get inode_id and filename
+                        if let Some(slash_pos) = suffix.find('/') {
+                            let inode_str = &suffix[..slash_pos];
+                            let filename = &suffix[slash_pos + 1..];
+                            
+                            if let Ok(inode_id) = inode_str.parse::<u64>() {
+                                debug!("readdir: found entry {} (inode {})", filename, inode_id);
+                                dir_entries.push((inode_id, filename.as_bytes().to_vec()));
+                            }
                         }
                     }
                 }

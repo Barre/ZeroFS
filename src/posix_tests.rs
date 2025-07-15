@@ -825,6 +825,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hardlink_both_names_visible() {
+        let fs = create_test_fs().await;
+        
+        // Create file 'a'
+        let (file_a_id, _) = fs
+            .create(&test_auth(), 0, &filename(b"a"), sattr3::default())
+            .await
+            .unwrap();
+            
+        
+        // Create hard link 'b' pointing to same inode as 'a'
+        fs.link(&test_auth(), file_a_id, 0, &filename(b"b"))
+            .await
+            .unwrap();
+            
+        // Both 'a' and 'b' should be visible in directory listing
+        let entries = fs.readdir(&test_auth(), 0, 0, 100).await.unwrap();
+        
+        let names: Vec<String> = entries
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.name.0).to_string())
+            .collect();
+            
+        // Check that both 'a' and 'b' exist
+        assert!(names.contains(&"a".to_string()), "File 'a' should exist after creating hard link");
+        assert!(names.contains(&"b".to_string()), "Hard link 'b' should exist");
+        
+        // Verify they point to the same inode
+        let a_id = fs.lookup(&test_auth(), 0, &filename(b"a")).await.unwrap();
+        let b_id = fs.lookup(&test_auth(), 0, &filename(b"b")).await.unwrap();
+        assert_eq!(a_id, b_id, "Both names should point to the same inode");
+        
+        // Check link count
+        let fattr = fs.getattr(&test_auth(), a_id).await.unwrap();
+        assert_eq!(fattr.nlink, 2, "Link count should be 2");
+    }
+
+    #[tokio::test]
     async fn test_chmod_special_bits() {
         let fs = create_test_fs().await;
 
