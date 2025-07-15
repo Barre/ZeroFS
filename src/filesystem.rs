@@ -10,7 +10,7 @@ use slatedb::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,7 +52,7 @@ pub const LOCK_SHARD_COUNT: usize = 1024;
 #[derive(Clone)]
 pub struct SlateDbFs {
     pub db: Arc<Db>,
-    pub inode_locks: Arc<Vec<Arc<Mutex<()>>>>,
+    pub inode_locks: Arc<Vec<Arc<RwLock<()>>>>,
     pub next_inode_id: Arc<AtomicU64>,
 }
 
@@ -161,7 +161,7 @@ impl SlateDbFs {
         let mut locks = Vec::with_capacity(LOCK_SHARD_COUNT);
 
         for _ in 0..LOCK_SHARD_COUNT {
-            locks.push(Arc::new(Mutex::new(())));
+            locks.push(Arc::new(RwLock::new(())));
         }
 
         let fs = Self {
@@ -177,7 +177,7 @@ impl SlateDbFs {
         Bytes::from(format!("inode:{}", inode_id))
     }
 
-    pub fn get_inode_lock(&self, inode_id: InodeId) -> Arc<Mutex<()>> {
+    pub fn get_inode_lock(&self, inode_id: InodeId) -> Arc<RwLock<()>> {
         let shard = (inode_id as usize) % LOCK_SHARD_COUNT;
         self.inode_locks[shard].clone()
     }
@@ -304,7 +304,7 @@ impl SlateDbFs {
 
         let mut locks = Vec::with_capacity(LOCK_SHARD_COUNT);
         for _ in 0..LOCK_SHARD_COUNT {
-            locks.push(Arc::new(Mutex::new(())));
+            locks.push(Arc::new(RwLock::new(())));
         }
 
         let fs = Self {
