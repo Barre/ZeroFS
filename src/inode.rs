@@ -16,6 +16,7 @@ pub struct FileInode {
     pub uid: u32,
     pub gid: u32,
     pub parent: InodeId,
+    pub nlink: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,7 @@ pub struct DirectoryInode {
     pub gid: u32,
     pub entry_count: u64,
     pub parent: InodeId,
+    pub nlink: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +48,23 @@ pub struct SymlinkInode {
     pub uid: u32,
     pub gid: u32,
     pub parent: InodeId,
+    pub nlink: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialInode {
+    pub mtime: u64,
+    pub mtime_nsec: u32,
+    pub ctime: u64,
+    pub ctime_nsec: u32,
+    pub atime: u64,
+    pub atime_nsec: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub parent: InodeId,
+    pub nlink: u32,
+    pub rdev: Option<(u32, u32)>, // For character and block devices (major, minor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +72,10 @@ pub enum Inode {
     File(FileInode),
     Directory(DirectoryInode),
     Symlink(SymlinkInode),
+    Fifo(SpecialInode),
+    Socket(SpecialInode),
+    CharDevice(SpecialInode),
+    BlockDevice(SpecialInode),
 }
 
 impl Inode {
@@ -61,7 +84,7 @@ impl Inode {
             Inode::File(file) => fattr3 {
                 ftype: ftype3::NF3REG,
                 mode: file.mode,
-                nlink: 1,
+                nlink: file.nlink,
                 uid: file.uid,
                 gid: file.gid,
                 size: file.size,
@@ -88,7 +111,7 @@ impl Inode {
             Inode::Directory(dir) => fattr3 {
                 ftype: ftype3::NF3DIR,
                 mode: dir.mode,
-                nlink: 2,
+                nlink: dir.nlink,
                 uid: dir.uid,
                 gid: dir.gid,
                 size: 4096,
@@ -115,7 +138,7 @@ impl Inode {
             Inode::Symlink(symlink) => fattr3 {
                 ftype: ftype3::NF3LNK,
                 mode: symlink.mode,
-                nlink: 1,
+                nlink: symlink.nlink,
                 uid: symlink.uid,
                 gid: symlink.gid,
                 size: symlink.target.len() as u64,
@@ -137,6 +160,114 @@ impl Inode {
                 ctime: nfstime3 {
                     seconds: (symlink.ctime & 0xFFFFFFFF) as u32,
                     nseconds: symlink.ctime_nsec,
+                },
+            },
+            Inode::Fifo(special) => fattr3 {
+                ftype: ftype3::NF3FIFO,
+                mode: special.mode,
+                nlink: special.nlink,
+                uid: special.uid,
+                gid: special.gid,
+                size: 0,
+                used: 0,
+                rdev: specdata3 {
+                    specdata1: 0,
+                    specdata2: 0,
+                },
+                fsid: 0,
+                fileid: inode_id,
+                atime: nfstime3 {
+                    seconds: (special.atime & 0xFFFFFFFF) as u32,
+                    nseconds: special.atime_nsec,
+                },
+                mtime: nfstime3 {
+                    seconds: (special.mtime & 0xFFFFFFFF) as u32,
+                    nseconds: special.mtime_nsec,
+                },
+                ctime: nfstime3 {
+                    seconds: (special.ctime & 0xFFFFFFFF) as u32,
+                    nseconds: special.ctime_nsec,
+                },
+            },
+            Inode::Socket(special) => fattr3 {
+                ftype: ftype3::NF3SOCK,
+                mode: special.mode,
+                nlink: special.nlink,
+                uid: special.uid,
+                gid: special.gid,
+                size: 0,
+                used: 0,
+                rdev: specdata3 {
+                    specdata1: 0,
+                    specdata2: 0,
+                },
+                fsid: 0,
+                fileid: inode_id,
+                atime: nfstime3 {
+                    seconds: (special.atime & 0xFFFFFFFF) as u32,
+                    nseconds: special.atime_nsec,
+                },
+                mtime: nfstime3 {
+                    seconds: (special.mtime & 0xFFFFFFFF) as u32,
+                    nseconds: special.mtime_nsec,
+                },
+                ctime: nfstime3 {
+                    seconds: (special.ctime & 0xFFFFFFFF) as u32,
+                    nseconds: special.ctime_nsec,
+                },
+            },
+            Inode::CharDevice(special) => fattr3 {
+                ftype: ftype3::NF3CHR,
+                mode: special.mode,
+                nlink: special.nlink,
+                uid: special.uid,
+                gid: special.gid,
+                size: 0,
+                used: 0,
+                rdev: specdata3 {
+                    specdata1: special.rdev.map(|(major, _)| major).unwrap_or(0),
+                    specdata2: special.rdev.map(|(_, minor)| minor).unwrap_or(0),
+                },
+                fsid: 0,
+                fileid: inode_id,
+                atime: nfstime3 {
+                    seconds: (special.atime & 0xFFFFFFFF) as u32,
+                    nseconds: special.atime_nsec,
+                },
+                mtime: nfstime3 {
+                    seconds: (special.mtime & 0xFFFFFFFF) as u32,
+                    nseconds: special.mtime_nsec,
+                },
+                ctime: nfstime3 {
+                    seconds: (special.ctime & 0xFFFFFFFF) as u32,
+                    nseconds: special.ctime_nsec,
+                },
+            },
+            Inode::BlockDevice(special) => fattr3 {
+                ftype: ftype3::NF3BLK,
+                mode: special.mode,
+                nlink: special.nlink,
+                uid: special.uid,
+                gid: special.gid,
+                size: 0,
+                used: 0,
+                rdev: specdata3 {
+                    specdata1: special.rdev.map(|(major, _)| major).unwrap_or(0),
+                    specdata2: special.rdev.map(|(_, minor)| minor).unwrap_or(0),
+                },
+                fsid: 0,
+                fileid: inode_id,
+                atime: nfstime3 {
+                    seconds: (special.atime & 0xFFFFFFFF) as u32,
+                    nseconds: special.atime_nsec,
+                },
+                mtime: nfstime3 {
+                    seconds: (special.mtime & 0xFFFFFFFF) as u32,
+                    nseconds: special.mtime_nsec,
+                },
+                ctime: nfstime3 {
+                    seconds: (special.ctime & 0xFFFFFFFF) as u32,
+                    nseconds: special.ctime_nsec,
                 },
             },
         }
@@ -161,6 +292,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: 0,
+            nlink: 1,
         };
 
         let inode = Inode::File(file_inode);
@@ -190,6 +322,7 @@ mod tests {
             gid: 1000,
             entry_count: 2,
             parent: 0,
+            nlink: 2,
         };
 
         let inode = Inode::Directory(dir_inode);
@@ -218,6 +351,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: 0,
+            nlink: 1,
         };
 
         let inode = Inode::Symlink(symlink_inode.clone());
@@ -246,6 +380,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: 0,
+            nlink: 1,
         };
 
         let inode = Inode::File(file_inode.clone());
