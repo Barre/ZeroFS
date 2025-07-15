@@ -53,7 +53,7 @@ mod tests {
         let fs = create_test_fs().await;
 
         let (dir_id, fattr) = fs
-            .mkdir(&test_auth(), 0, &filename(b"testdir"))
+            .mkdir(&test_auth(), 0, &filename(b"testdir"), &sattr3::default())
             .await
             .unwrap();
         assert_eq!(
@@ -90,7 +90,12 @@ mod tests {
         );
 
         let (_subdir_id, subdir_fattr) = fs
-            .mkdir(&test_auth(), dir_id, &filename(b"subdir"))
+            .mkdir(
+                &test_auth(),
+                dir_id,
+                &filename(b"subdir"),
+                &sattr3::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -104,9 +109,18 @@ mod tests {
     async fn test_rename_to_descendant() {
         let fs = create_test_fs().await;
 
-        let (a_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"a")).await.unwrap();
-        let (b_id, _) = fs.mkdir(&test_auth(), a_id, &filename(b"b")).await.unwrap();
-        let (c_id, _) = fs.mkdir(&test_auth(), b_id, &filename(b"c")).await.unwrap();
+        let (a_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"a"), &sattr3::default())
+            .await
+            .unwrap();
+        let (b_id, _) = fs
+            .mkdir(&test_auth(), a_id, &filename(b"b"), &sattr3::default())
+            .await
+            .unwrap();
+        let (c_id, _) = fs
+            .mkdir(&test_auth(), b_id, &filename(b"c"), &sattr3::default())
+            .await
+            .unwrap();
 
         let result = fs
             .rename(&test_auth(), 0, &filename(b"a"), b_id, &filename(b"a"))
@@ -172,7 +186,7 @@ mod tests {
         let fs = create_test_fs().await;
 
         let (parent_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"parent"))
+            .mkdir(&test_auth(), 0, &filename(b"parent"), &sattr3::default())
             .await
             .unwrap();
 
@@ -187,7 +201,12 @@ mod tests {
         fs.setattr(&test_auth(), parent_id, setattr).await.unwrap();
 
         let (_subdir_id, _) = fs
-            .mkdir(&test_auth(), parent_id, &filename(b"subdir"))
+            .mkdir(
+                &test_auth(),
+                parent_id,
+                &filename(b"subdir"),
+                &sattr3::default(),
+            )
             .await
             .unwrap();
 
@@ -205,7 +224,10 @@ mod tests {
     async fn test_remove_non_empty_directory() {
         let fs = create_test_fs().await;
 
-        let (dir_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"dir")).await.unwrap();
+        let (dir_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"dir"), &sattr3::default())
+            .await
+            .unwrap();
         fs.create(&test_auth(), dir_id, &filename(b"file"), sattr3::default())
             .await
             .unwrap();
@@ -294,7 +316,10 @@ mod tests {
     async fn test_sticky_bit_deletion() {
         let fs = create_test_fs().await;
 
-        let (tmp_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"tmp")).await.unwrap();
+        let (tmp_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"tmp"), &sattr3::default())
+            .await
+            .unwrap();
 
         let setattr = sattr3 {
             mode: set_mode3::mode(0o1777),
@@ -391,7 +416,7 @@ mod tests {
         let fs = create_test_fs().await;
 
         let (dir_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"testdir"))
+            .mkdir(&test_auth(), 0, &filename(b"testdir"), &sattr3::default())
             .await
             .unwrap();
 
@@ -440,8 +465,14 @@ mod tests {
     async fn test_rename_across_directories() {
         let fs = create_test_fs().await;
 
-        let (dir1_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"dir1")).await.unwrap();
-        let (dir2_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"dir2")).await.unwrap();
+        let (dir1_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"dir1"), &sattr3::default())
+            .await
+            .unwrap();
+        let (dir2_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"dir2"), &sattr3::default())
+            .await
+            .unwrap();
 
         let (file_id, _) = fs
             .create(
@@ -696,7 +727,7 @@ mod tests {
         let fs = create_test_fs().await;
 
         let (dir_id, initial_attr) = fs
-            .mkdir(&test_auth(), 0, &filename(b"testdir"))
+            .mkdir(&test_auth(), 0, &filename(b"testdir"), &sattr3::default())
             .await
             .unwrap();
 
@@ -757,8 +788,14 @@ mod tests {
     async fn test_directory_hierarchy() {
         let fs = create_test_fs().await;
 
-        let (a_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"a")).await.unwrap();
-        let (b_id, _) = fs.mkdir(&test_auth(), a_id, &filename(b"b")).await.unwrap();
+        let (a_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"a"), &sattr3::default())
+            .await
+            .unwrap();
+        let (b_id, _) = fs
+            .mkdir(&test_auth(), a_id, &filename(b"b"), &sattr3::default())
+            .await
+            .unwrap();
 
         let result = fs.readdir(&test_auth(), 0, 0, 10).await.unwrap();
         let names: Vec<String> = result
@@ -813,7 +850,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let (_dir_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"testdir"))
+            .mkdir(&test_auth(), 0, &filename(b"testdir"), &sattr3::default())
             .await
             .unwrap();
 
@@ -915,13 +952,26 @@ mod tests {
     async fn test_rename_directory_with_contents() {
         let fs = create_test_fs().await;
 
-        let (dir1_id, _) = fs.mkdir(&test_auth(), 0, &filename(b"dir1")).await.unwrap();
+        let (dir1_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"dir1"), &sattr3::default())
+            .await
+            .unwrap();
         let (dir2_id, _) = fs
-            .mkdir(&test_auth(), dir1_id, &filename(b"dir2"))
+            .mkdir(
+                &test_auth(),
+                dir1_id,
+                &filename(b"dir2"),
+                &sattr3::default(),
+            )
             .await
             .unwrap();
         let (dir3_id, _) = fs
-            .mkdir(&test_auth(), dir2_id, &filename(b"dir3"))
+            .mkdir(
+                &test_auth(),
+                dir2_id,
+                &filename(b"dir3"),
+                &sattr3::default(),
+            )
             .await
             .unwrap();
 
