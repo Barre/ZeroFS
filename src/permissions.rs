@@ -37,15 +37,6 @@ impl Credentials {
         creds
     }
 
-    pub fn root() -> Self {
-        Self {
-            uid: 0,
-            gid: 0,
-            groups: [0; 16],
-            groups_count: 0,
-        }
-    }
-
     pub fn is_member_of_group(&self, gid: u32) -> bool {
         if self.gid == gid {
             return true;

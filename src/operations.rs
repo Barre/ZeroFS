@@ -134,6 +134,11 @@ impl SlateDbFs {
                 file.mtime = now_sec;
                 file.mtime_nsec = now_nsec;
 
+                // Clear SUID/SGID bits on write by non-owner
+                if creds.uid != file.uid && creds.uid != 0 {
+                    file.mode &= !0o6000; // Clear both SUID (4000) and SGID (2000)
+                }
+
                 let inode_key = Self::inode_key(id);
                 let inode_data = bincode::serialize(&inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
                 batch.put(inode_key, &inode_data);
@@ -506,13 +511,27 @@ impl SlateDbFs {
                         let inode_key = Self::inode_key(file_id);
                         batch.delete(inode_key);
                     }
-                    Inode::Fifo(_)
-                    | Inode::Socket(_)
-                    | Inode::CharDevice(_)
-                    | Inode::BlockDevice(_) => {
-                        // Special files don't have data chunks, just delete the inode
-                        let inode_key = Self::inode_key(file_id);
-                        batch.delete(inode_key);
+                    Inode::Fifo(special)
+                    | Inode::Socket(special)
+                    | Inode::CharDevice(special)
+                    | Inode::BlockDevice(special) => {
+                        // Check if this is the last hard link
+                        if special.nlink > 1 {
+                            // Just decrement the link count, don't delete the inode
+                            special.nlink -= 1;
+                            let (now_sec, now_nsec) = get_current_time();
+                            special.ctime = now_sec;
+                            special.ctime_nsec = now_nsec;
+
+                            let inode_key = Self::inode_key(file_id);
+                            let inode_data = bincode::serialize(&file_inode)
+                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            batch.put(inode_key, &inode_data);
+                        } else {
+                            // Last link, delete the inode
+                            let inode_key = Self::inode_key(file_id);
+                            batch.delete(inode_key);
+                        }
                     }
                 }
 
@@ -699,7 +718,7 @@ impl SlateDbFs {
             batch.put(to_entry_key, inode_id.to_le_bytes());
 
             // Add new scan entry
-            let to_scan_key = Self::dir_scan_key(from_dirid, inode_id, &to_name);
+            let to_scan_key = Self::dir_scan_key(to_dirid, inode_id, &to_name);
             batch.put(to_scan_key, inode_id.to_le_bytes());
 
             // Update directory metadata
@@ -938,20 +957,35 @@ impl SlateDbFs {
         }
 
         // For chown/chgrp, must be root (or owner with restrictions)
-        if (matches!(setattr.uid, set_uid3::uid(_)) || matches!(setattr.gid, set_gid3::gid(_)))
-            && creds.uid != 0
-        {
-            // Non-root users can only change group to a group they're member of
+        // Note: If both uid and gid are not being changed (Void), allow the operation
+        let changing_uid = matches!(setattr.uid, set_uid3::uid(_));
+        let changing_gid = matches!(setattr.gid, set_gid3::gid(_));
+
+        if (changing_uid || changing_gid) && creds.uid != 0 {
+            // Non-root users cannot change uid
+            if changing_uid {
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+
+            // Non-root users can only change group if they own the file and are member of both old and new groups
             if let set_gid3::gid(new_gid) = setattr.gid {
                 check_ownership(&inode, &creds)?;
-                // Check if user is member of new group
-                if !creds.is_member_of_group(new_gid) {
+
+                // Get current gid of the inode
+                let current_gid = match &inode {
+                    Inode::File(f) => f.gid,
+                    Inode::Directory(d) => d.gid,
+                    Inode::Symlink(s) => s.gid,
+                    Inode::Fifo(s)
+                    | Inode::Socket(s)
+                    | Inode::CharDevice(s)
+                    | Inode::BlockDevice(s) => s.gid,
+                };
+
+                // Check if user is member of both current and new group
+                if !creds.is_member_of_group(current_gid) || !creds.is_member_of_group(new_gid) {
                     return Err(nfsstat3::NFS3ERR_PERM);
                 }
-            }
-            // Non-root users cannot change uid
-            if matches!(setattr.uid, set_uid3::uid(_)) {
-                return Err(nfsstat3::NFS3ERR_PERM);
             }
         }
 
@@ -1058,6 +1092,13 @@ impl SlateDbFs {
                 if let set_mode3::mode(mode) = setattr.mode {
                     debug!("Setting file mode from {} to {:#o}", file.mode, mode);
                     file.mode = validate_mode(mode);
+                    // POSIX: If non-root user sets mode with setgid bit and doesn't belong to file's group, clear setgid
+                    if creds.uid != 0
+                        && (file.mode & 0o2000) != 0
+                        && !creds.is_member_of_group(file.gid)
+                    {
+                        file.mode &= !0o2000;
+                    }
                 }
                 if let set_uid3::uid(uid) = setattr.uid {
                     file.uid = uid;
@@ -1068,7 +1109,8 @@ impl SlateDbFs {
                 if let set_gid3::gid(gid) = setattr.gid {
                     file.gid = gid;
                     if creds.uid != 0 {
-                        file.mode &= !0o2000;
+                        // Clear both SUID and SGID bits when non-root changes ownership
+                        file.mode &= !0o6000;
                     }
                 }
                 match setattr.atime {
@@ -1122,6 +1164,13 @@ impl SlateDbFs {
                 if let set_mode3::mode(mode) = setattr.mode {
                     debug!("Setting directory mode from {} to {:#o}", dir.mode, mode);
                     dir.mode = validate_mode(mode);
+                    // POSIX: If non-root user sets mode with setgid bit and doesn't belong to directory's group, clear setgid
+                    if creds.uid != 0
+                        && (dir.mode & 0o2000) != 0
+                        && !creds.is_member_of_group(dir.gid)
+                    {
+                        dir.mode &= !0o2000;
+                    }
                 }
                 if let set_uid3::uid(uid) = setattr.uid {
                     dir.uid = uid;
@@ -1132,7 +1181,8 @@ impl SlateDbFs {
                 if let set_gid3::gid(gid) = setattr.gid {
                     dir.gid = gid;
                     if creds.uid != 0 {
-                        dir.mode &= !0o2000;
+                        // Clear both SUID and SGID bits when non-root changes ownership
+                        dir.mode &= !0o6000;
                     }
                 }
                 match setattr.atime {
@@ -1588,7 +1638,7 @@ impl SlateDbFs {
 
                 let mut final_mode = base_mode & !umask;
                 if let set_mode3::mode(m) = attr.mode {
-                    final_mode = validate_mode(m);
+                    final_mode = validate_mode(m) & !umask;
                 }
 
                 let special_inode = SpecialInode {
@@ -1693,72 +1743,85 @@ impl SlateDbFs {
             _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
         };
 
-        // Check that the target file exists and is a regular file
+        // Check that the target file exists
         let mut file_inode = self.load_inode(fileid).await?;
+
+        // Don't allow hard links to directories
+        if matches!(file_inode, Inode::Directory(_)) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
+
+        // Don't allow hard links to symlinks (they're typically not allowed)
+        if matches!(file_inode, Inode::Symlink(_)) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
+
+        let name = linkname_str.to_string();
+        let entry_key = Self::dir_entry_key(linkdirid, &name);
+
+        // Check if the name already exists
+        if self
+            .db
+            .get(&entry_key)
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .is_some()
+        {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
+
+        let mut batch = WriteBatch::new();
+        batch.put(entry_key, fileid.to_le_bytes());
+
+        let scan_key = Self::dir_scan_key(linkdirid, fileid, &name);
+        batch.put(scan_key, fileid.to_le_bytes());
+
+        let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
             Inode::File(file) => {
-                // Hard links are only allowed for regular files
-                let name = linkname_str.to_string();
-                let entry_key = Self::dir_entry_key(linkdirid, &name);
-
-                // Check if the name already exists
-                if self
-                    .db
-                    .get(&entry_key)
-                    .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
-                    .is_some()
-                {
-                    return Err(nfsstat3::NFS3ERR_EXIST);
-                }
-
-                // Create the directory entry
-                let mut batch = WriteBatch::new();
-                batch.put(entry_key, fileid.to_le_bytes());
-
-                // Add to directory scan index
-                let scan_key = Self::dir_scan_key(linkdirid, fileid, &name);
-                batch.put(scan_key, fileid.to_le_bytes());
-
-                // Increment link count
                 file.nlink += 1;
-                let (now_sec, now_nsec) = get_current_time();
                 file.ctime = now_sec;
                 file.ctime_nsec = now_nsec;
-
-                // Save updated file inode (we need to serialize the whole enum after modification)
-                let file_inode_key = Self::inode_key(fileid);
-                let file_inode_data =
-                    bincode::serialize(&file_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch.put(file_inode_key, &file_inode_data);
-
-                // Update directory
-                link_dir.entry_count += 1;
-                link_dir.mtime = now_sec;
-                link_dir.mtime_nsec = now_nsec;
-
-                let dir_inode_key = Self::inode_key(linkdirid);
-                let dir_inode_data = bincode::serialize(&Inode::Directory(link_dir))
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch.put(dir_inode_key, &dir_inode_data);
-
-                self.db
-                    .write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-
-                Ok(())
             }
-            _ => {
-                // Hard links are only supported for regular files
-                Err(nfsstat3::NFS3ERR_INVAL)
+            Inode::Fifo(special)
+            | Inode::Socket(special)
+            | Inode::CharDevice(special)
+            | Inode::BlockDevice(special) => {
+                special.nlink += 1;
+                special.ctime = now_sec;
+                special.ctime_nsec = now_nsec;
             }
+            _ => unreachable!(), // We already filtered out directories and symlinks
         }
+
+        // Save updated inode
+        let file_inode_key = Self::inode_key(fileid);
+        let file_inode_data = bincode::serialize(&file_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put(file_inode_key, &file_inode_data);
+
+        // Update directory
+        link_dir.entry_count += 1;
+        link_dir.mtime = now_sec;
+        link_dir.mtime_nsec = now_nsec;
+        link_dir.ctime = now_sec;
+        link_dir.ctime_nsec = now_nsec;
+
+        let dir_inode_key = Self::inode_key(linkdirid);
+        let dir_inode_data =
+            bincode::serialize(&Inode::Directory(link_dir)).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put(dir_inode_key, &dir_inode_data);
+
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        Ok(())
     }
 
     pub async fn process_readdir(
@@ -1844,7 +1907,7 @@ impl SlateDbFs {
                         if let Some(slash_pos) = suffix.find('/') {
                             let inode_str = &suffix[..slash_pos];
                             let filename = &suffix[slash_pos + 1..];
-                            
+
                             if let Ok(inode_id) = inode_str.parse::<u64>() {
                                 debug!("readdir: found entry {} (inode {})", filename, inode_id);
                                 dir_entries.push((inode_id, filename.as_bytes().to_vec()));

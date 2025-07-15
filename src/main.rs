@@ -36,7 +36,7 @@ impl NFSFileSystem for SlateDbFs {
 
     async fn lookup(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
@@ -46,7 +46,10 @@ impl NFSFileSystem for SlateDbFs {
         let dir_inode = self.load_inode(dirid).await?;
 
         match dir_inode {
-            Inode::Directory(_) => {
+            Inode::Directory(ref _dir) => {
+                use crate::permissions::{AccessMode, Credentials, check_access};
+                let creds = Credentials::from_auth_context(auth);
+                check_access(&dir_inode, &creds, AccessMode::Execute)?;
                 let name = filename_str.to_string();
                 let entry_key = SlateDbFs::dir_entry_key(dirid, &name);
 
