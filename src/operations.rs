@@ -1,15 +1,15 @@
 use futures::stream::{self, StreamExt};
 use nfsserve::nfs::{
-    fattr3, fileid3, nfsstat3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3,
-    set_uid3,
+    fattr3, fileid3, ftype3, nfsstat3, sattr3, set_atime, set_gid3, set_mode3, set_mtime,
+    set_size3, set_uid3,
 };
-use nfsserve::vfs::{DirEntry, ReadDirResult};
+use nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
 use slatedb::{WriteBatch, config::WriteOptions};
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
 
 use crate::filesystem::{CHUNK_SIZE, LOCK_SHARD_COUNT, SlateDbFs, get_current_time, get_umask};
-use crate::inode::{DirectoryInode, FileInode, Inode, InodeId, SymlinkInode};
+use crate::inode::{DirectoryInode, FileInode, Inode, InodeId, SpecialInode, SymlinkInode};
 use crate::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, check_sticky_bit_delete,
     validate_mode,
@@ -33,6 +33,10 @@ impl SlateDbFs {
                 Inode::File(f) => f.parent,
                 Inode::Directory(d) => d.parent,
                 Inode::Symlink(s) => s.parent,
+                Inode::Fifo(s) => s.parent,
+                Inode::Socket(s) => s.parent,
+                Inode::CharDevice(s) => s.parent,
+                Inode::BlockDevice(s) => s.parent,
             };
 
             if parent_id == ancestor_id {
@@ -47,6 +51,7 @@ impl SlateDbFs {
 
     pub async fn process_write(
         &self,
+        auth: &AuthContext,
         id: InodeId,
         offset: u64,
         data: &[u8],
@@ -63,7 +68,7 @@ impl SlateDbFs {
         let _guard = lock.lock().await;
         let mut inode = self.load_inode(id).await?;
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
         check_access(&inode, &creds, AccessMode::Write)?;
 
         match &mut inode {
@@ -158,6 +163,7 @@ impl SlateDbFs {
 
     pub async fn process_create(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         filename: &[u8],
         attr: sattr3,
@@ -169,11 +175,11 @@ impl SlateDbFs {
         let _guard = lock.lock().await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
-        let (default_uid, default_gid, _parent_mode) = match &dir_inode {
+        let (_default_uid, _default_gid, _parent_mode) = match &dir_inode {
             Inode::Directory(d) => (d.uid, d.gid, d.mode),
             _ => {
                 #[cfg(unix)]
@@ -228,13 +234,14 @@ impl SlateDbFs {
                     mode: final_mode,
                     uid: match attr.uid {
                         set_uid3::uid(u) => u,
-                        _ => default_uid,
+                        _ => auth.uid,
                     },
                     gid: match attr.gid {
                         set_gid3::gid(g) => g,
-                        _ => default_gid,
+                        _ => auth.gid,
                     },
                     parent: dirid,
+                    nlink: 1,
                 };
 
                 let mut batch = WriteBatch::new();
@@ -286,17 +293,19 @@ impl SlateDbFs {
 
     pub async fn process_create_exclusive(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         filename: &[u8],
     ) -> Result<fileid3, nfsstat3> {
         let (id, _) = self
-            .process_create(dirid, filename, sattr3::default())
+            .process_create(auth, dirid, filename, sattr3::default())
             .await?;
         Ok(id)
     }
 
     pub async fn process_mkdir(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         dirname: &[u8],
     ) -> Result<(fileid3, fattr3), nfsstat3> {
@@ -307,11 +316,11 @@ impl SlateDbFs {
         let _guard = lock.lock().await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
-        let (default_uid, default_gid) = match &dir_inode {
+        let (_default_uid, _default_gid) = match &dir_inode {
             Inode::Directory(d) => (d.uid, d.gid),
             _ => {
                 #[cfg(unix)]
@@ -358,10 +367,11 @@ impl SlateDbFs {
                     atime: now_sec,
                     atime_nsec: now_nsec,
                     mode: new_mode,
-                    uid: default_uid,
-                    gid: default_gid,
+                    uid: auth.uid,
+                    gid: auth.gid,
                     entry_count: 0,
                     parent: dirid,
+                    nlink: 2, // . and parent's reference
                 };
 
                 let mut batch = WriteBatch::new();
@@ -412,12 +422,17 @@ impl SlateDbFs {
         }
     }
 
-    pub async fn process_remove(&self, dirid: fileid3, filename: &[u8]) -> Result<(), nfsstat3> {
+    pub async fn process_remove(
+        &self,
+        auth: &AuthContext,
+        dirid: fileid3,
+        filename: &[u8],
+    ) -> Result<(), nfsstat3> {
         let lock = self.get_inode_lock(dirid);
         let _guard = lock.lock().await;
         let dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
 
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
@@ -441,7 +456,7 @@ impl SlateDbFs {
         bytes.copy_from_slice(&entry_data[..8]);
         let file_id = u64::from_le_bytes(bytes);
 
-        let file_inode = self.load_inode(file_id).await?;
+        let mut file_inode = self.load_inode(file_id).await?;
 
         check_sticky_bit_delete(&dir_inode, &file_inode, &creds)?;
 
@@ -451,24 +466,55 @@ impl SlateDbFs {
             Inode::Directory(dir) => {
                 let mut batch = WriteBatch::new();
 
-                match file_inode {
+                match &mut file_inode {
                     Inode::File(file) => {
-                        let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
-                        for chunk_idx in 0..total_chunks {
-                            let chunk_key = Self::chunk_key_by_index(file_id, chunk_idx);
-                            batch.delete(chunk_key);
+                        // Check if this is the last hard link
+                        if file.nlink > 1 {
+                            // Just decrement the link count, don't delete the file
+                            file.nlink -= 1;
+                            let (now_sec, now_nsec) = get_current_time();
+                            file.ctime = now_sec;
+                            file.ctime_nsec = now_nsec;
+
+                            // Save the updated inode
+                            let inode_key = Self::inode_key(file_id);
+                            let inode_data = bincode::serialize(&file_inode)
+                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            batch.put(inode_key, &inode_data);
+                        } else {
+                            // Last link, delete all data chunks
+                            let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
+                            for chunk_idx in 0..total_chunks {
+                                let chunk_key = Self::chunk_key_by_index(file_id, chunk_idx);
+                                batch.delete(chunk_key);
+                            }
+                            // Delete the inode
+                            let inode_key = Self::inode_key(file_id);
+                            batch.delete(inode_key);
                         }
                     }
                     Inode::Directory(subdir) => {
                         if subdir.entry_count > 0 {
                             return Err(nfsstat3::NFS3ERR_NOTEMPTY);
                         }
+                        // Delete the directory inode
+                        let inode_key = Self::inode_key(file_id);
+                        batch.delete(inode_key);
                     }
-                    Inode::Symlink(_) => {}
+                    Inode::Symlink(_) => {
+                        // Delete the symlink inode
+                        let inode_key = Self::inode_key(file_id);
+                        batch.delete(inode_key);
+                    }
+                    Inode::Fifo(_)
+                    | Inode::Socket(_)
+                    | Inode::CharDevice(_)
+                    | Inode::BlockDevice(_) => {
+                        // Special files don't have data chunks, just delete the inode
+                        let inode_key = Self::inode_key(file_id);
+                        batch.delete(inode_key);
+                    }
                 }
-
-                let inode_key = Self::inode_key(file_id);
-                batch.delete(inode_key);
 
                 batch.delete(entry_key);
 
@@ -504,6 +550,7 @@ impl SlateDbFs {
 
     pub async fn process_rename(
         &self,
+        auth: &AuthContext,
         from_dirid: fileid3,
         from_filename: &[u8],
         to_dirid: fileid3,
@@ -560,7 +607,7 @@ impl SlateDbFs {
             return Err(nfsstat3::NFS3ERR_INVAL);
         }
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
 
         if from_dirid == to_dirid {
             let lock = self.get_inode_lock(from_dirid);
@@ -624,6 +671,12 @@ impl SlateDbFs {
                         // Directory case already handled above (must be empty)
                     }
                     Inode::Symlink(_) => {}
+                    Inode::Fifo(_)
+                    | Inode::Socket(_)
+                    | Inode::CharDevice(_)
+                    | Inode::BlockDevice(_) => {
+                        // Special files don't have data chunks
+                    }
                 }
 
                 // Delete the existing inode
@@ -769,6 +822,12 @@ impl SlateDbFs {
                         // Directory case already handled above (must be empty)
                     }
                     Inode::Symlink(_) => {}
+                    Inode::Fifo(_)
+                    | Inode::Socket(_)
+                    | Inode::CharDevice(_)
+                    | Inode::BlockDevice(_) => {
+                        // Special files don't have data chunks
+                    }
                 }
 
                 // Delete the existing inode
@@ -802,6 +861,10 @@ impl SlateDbFs {
                 Inode::File(f) => f.parent = to_dirid,
                 Inode::Directory(d) => d.parent = to_dirid,
                 Inode::Symlink(s) => s.parent = to_dirid,
+                Inode::Fifo(s) => s.parent = to_dirid,
+                Inode::Socket(s) => s.parent = to_dirid,
+                Inode::CharDevice(s) => s.parent = to_dirid,
+                Inode::BlockDevice(s) => s.parent = to_dirid,
             }
             batch.put(
                 Self::inode_key(inode_id),
@@ -855,13 +918,18 @@ impl SlateDbFs {
         }
     }
 
-    pub async fn process_setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+    pub async fn process_setattr(
+        &self,
+        auth: &AuthContext,
+        id: fileid3,
+        setattr: sattr3,
+    ) -> Result<fattr3, nfsstat3> {
         debug!("process_setattr: id={}, setattr={:?}", id, setattr);
         let lock = self.get_inode_lock(id);
         let _guard = lock.lock().await;
         let mut inode = self.load_inode(id).await?;
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
 
         // Check permissions for various operations
         // For chmod (mode change), must be owner
@@ -1163,6 +1231,62 @@ impl SlateDbFs {
                     symlink.ctime_nsec = now_nsec;
                 }
             }
+            Inode::Fifo(special)
+            | Inode::Socket(special)
+            | Inode::CharDevice(special)
+            | Inode::BlockDevice(special) => {
+                if let set_mode3::mode(mode) = setattr.mode {
+                    special.mode = validate_mode(mode);
+                }
+                if let set_uid3::uid(uid) = setattr.uid {
+                    special.uid = uid;
+                }
+                if let set_gid3::gid(gid) = setattr.gid {
+                    special.gid = gid;
+                }
+                match setattr.atime {
+                    set_atime::SET_TO_CLIENT_TIME(t) => {
+                        special.atime = t.seconds as u64;
+                        special.atime_nsec = t.nseconds;
+                    }
+                    set_atime::SET_TO_SERVER_TIME => {
+                        let (sec, nsec) = get_current_time();
+                        special.atime = sec;
+                        special.atime_nsec = nsec;
+                    }
+                    _ => {}
+                }
+                match setattr.mtime {
+                    set_mtime::SET_TO_CLIENT_TIME(t) => {
+                        special.mtime = t.seconds as u64;
+                        special.mtime_nsec = t.nseconds;
+                    }
+                    set_mtime::SET_TO_SERVER_TIME => {
+                        let (sec, nsec) = get_current_time();
+                        special.mtime = sec;
+                        special.mtime_nsec = nsec;
+                    }
+                    _ => {}
+                }
+
+                let attribute_changed = matches!(setattr.mode, set_mode3::mode(_))
+                    || matches!(setattr.uid, set_uid3::uid(_))
+                    || matches!(setattr.gid, set_gid3::gid(_))
+                    || matches!(
+                        setattr.atime,
+                        set_atime::SET_TO_CLIENT_TIME(_) | set_atime::SET_TO_SERVER_TIME
+                    )
+                    || matches!(
+                        setattr.mtime,
+                        set_mtime::SET_TO_CLIENT_TIME(_) | set_mtime::SET_TO_SERVER_TIME
+                    );
+
+                if attribute_changed {
+                    let (now_sec, now_nsec) = get_current_time();
+                    special.ctime = now_sec;
+                    special.ctime_nsec = now_nsec;
+                }
+            }
         }
 
         self.save_inode(id, &inode).await?;
@@ -1171,6 +1295,7 @@ impl SlateDbFs {
 
     pub async fn process_symlink(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         linkname: &[u8],
         target: &[u8],
@@ -1187,12 +1312,12 @@ impl SlateDbFs {
         let _guard = lock.lock().await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
         // Get parent directory's uid/gid as defaults before the mutable borrow
-        let (default_uid, default_gid) = match &dir_inode {
+        let (_default_uid, _default_gid) = match &dir_inode {
             Inode::Directory(d) => (d.uid, d.gid),
             _ => (65534, 65534),
         };
@@ -1226,13 +1351,13 @@ impl SlateDbFs {
         let uid = if let set_uid3::uid(u) = attr.uid {
             u
         } else {
-            default_uid
+            auth.uid
         };
 
         let gid = if let set_gid3::gid(g) = attr.gid {
             g
         } else {
-            default_gid
+            auth.gid
         };
 
         let (now_sec, now_nsec) = get_current_time();
@@ -1248,6 +1373,7 @@ impl SlateDbFs {
             uid,
             gid,
             parent: dirid,
+            nlink: 1,
         });
 
         let mut batch = WriteBatch::new();
@@ -1295,6 +1421,7 @@ impl SlateDbFs {
 
     pub async fn process_read_file(
         &self,
+        auth: &AuthContext,
         id: fileid3,
         offset: u64,
         count: u32,
@@ -1306,7 +1433,7 @@ impl SlateDbFs {
         let inode = self.load_inode(id).await?;
 
         // Check read permission
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
         check_access(&inode, &creds, AccessMode::Read)?;
 
         match &inode {
@@ -1401,8 +1528,242 @@ impl SlateDbFs {
         }
     }
 
+    pub async fn process_mknod(
+        &self,
+        auth: &AuthContext,
+        dirid: fileid3,
+        filename: &[u8],
+        ftype: ftype3,
+        attr: &sattr3,
+        rdev: Option<(u32, u32)>, // For device files
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let filename_str = String::from_utf8_lossy(filename);
+        debug!(
+            "process_mknod: dirid={}, filename={}, ftype={:?}",
+            dirid, filename_str, ftype
+        );
+
+        let lock = self.get_inode_lock(dirid);
+        let _guard = lock.lock().await;
+        let mut dir_inode = self.load_inode(dirid).await?;
+
+        let creds = Credentials::from_auth_context(auth);
+        check_access(&dir_inode, &creds, AccessMode::Write)?;
+        check_access(&dir_inode, &creds, AccessMode::Execute)?;
+
+        let (_default_uid, _default_gid, _parent_mode) = match &dir_inode {
+            Inode::Directory(d) => (d.uid, d.gid, d.mode),
+            _ => {
+                debug!("Parent is not a directory");
+                return Err(nfsstat3::NFS3ERR_NOTDIR);
+            }
+        };
+
+        match &mut dir_inode {
+            Inode::Directory(dir) => {
+                let name = filename_str.to_string();
+                let entry_key = Self::dir_entry_key(dirid, &name);
+
+                if self
+                    .db
+                    .get(&entry_key)
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .is_some()
+                {
+                    debug!("File already exists");
+                    return Err(nfsstat3::NFS3ERR_EXIST);
+                }
+
+                let special_id = self.allocate_inode().await?;
+                let (now_sec, now_nsec) = get_current_time();
+
+                let umask = get_umask();
+                let base_mode = match ftype {
+                    ftype3::NF3FIFO => 0o666,
+                    ftype3::NF3CHR | ftype3::NF3BLK => 0o666,
+                    ftype3::NF3SOCK => 0o666,
+                    _ => return Err(nfsstat3::NFS3ERR_INVAL),
+                };
+
+                let mut final_mode = base_mode & !umask;
+                if let set_mode3::mode(m) = attr.mode {
+                    final_mode = validate_mode(m);
+                }
+
+                let special_inode = SpecialInode {
+                    mtime: now_sec,
+                    mtime_nsec: now_nsec,
+                    ctime: now_sec,
+                    ctime_nsec: now_nsec,
+                    atime: now_sec,
+                    atime_nsec: now_nsec,
+                    mode: final_mode,
+                    uid: match attr.uid {
+                        set_uid3::uid(u) => u,
+                        _ => auth.uid,
+                    },
+                    gid: match attr.gid {
+                        set_gid3::gid(g) => g,
+                        _ => auth.gid,
+                    },
+                    parent: dirid,
+                    nlink: 1,
+                    rdev,
+                };
+
+                let inode = match ftype {
+                    ftype3::NF3FIFO => Inode::Fifo(special_inode),
+                    ftype3::NF3CHR => Inode::CharDevice(special_inode),
+                    ftype3::NF3BLK => Inode::BlockDevice(special_inode),
+                    ftype3::NF3SOCK => Inode::Socket(special_inode),
+                    _ => return Err(nfsstat3::NFS3ERR_INVAL),
+                };
+
+                let mut batch = WriteBatch::new();
+
+                let special_inode_key = Self::inode_key(special_id);
+                let special_inode_data =
+                    bincode::serialize(&inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put(special_inode_key, &special_inode_data);
+
+                batch.put(entry_key, special_id.to_le_bytes());
+
+                let scan_key = Self::dir_scan_key(dirid, special_id);
+                batch.put(scan_key, name.as_bytes());
+
+                dir.entry_count += 1;
+                let (now_sec, now_nsec) = get_current_time();
+                dir.mtime = now_sec;
+                dir.mtime_nsec = now_nsec;
+
+                let dir_inode_key = Self::inode_key(dirid);
+                let dir_inode_data =
+                    bincode::serialize(&dir_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put(dir_inode_key, &dir_inode_data);
+
+                self.db
+                    .write_with_options(
+                        batch,
+                        &WriteOptions {
+                            await_durable: false,
+                        },
+                    )
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+                Ok((special_id, inode.to_fattr3(special_id)))
+            }
+            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
+        }
+    }
+
+    pub async fn process_link(
+        &self,
+        auth: &AuthContext,
+        fileid: fileid3,
+        linkdirid: fileid3,
+        linkname: &[u8],
+    ) -> Result<(), nfsstat3> {
+        let linkname_str = String::from_utf8_lossy(linkname);
+        debug!(
+            "process_link: fileid={}, linkdirid={}, linkname={}",
+            fileid, linkdirid, linkname_str
+        );
+
+        // Get locks in a consistent order to avoid deadlocks
+        let (lock1, lock2) = if fileid < linkdirid {
+            (self.get_inode_lock(fileid), self.get_inode_lock(linkdirid))
+        } else {
+            (self.get_inode_lock(linkdirid), self.get_inode_lock(fileid))
+        };
+
+        let _guard1 = lock1.lock().await;
+        let _guard2 = lock2.lock().await;
+
+        // Check that the link directory exists and is a directory
+        let link_dir_inode = self.load_inode(linkdirid).await?;
+        let creds = Credentials::from_auth_context(auth);
+
+        check_access(&link_dir_inode, &creds, AccessMode::Write)?;
+        check_access(&link_dir_inode, &creds, AccessMode::Execute)?;
+
+        let mut link_dir = match link_dir_inode {
+            Inode::Directory(d) => d,
+            _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+        };
+
+        // Check that the target file exists and is a regular file
+        let mut file_inode = self.load_inode(fileid).await?;
+        match &mut file_inode {
+            Inode::File(file) => {
+                // Hard links are only allowed for regular files
+                let name = linkname_str.to_string();
+                let entry_key = Self::dir_entry_key(linkdirid, &name);
+
+                // Check if the name already exists
+                if self
+                    .db
+                    .get(&entry_key)
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .is_some()
+                {
+                    return Err(nfsstat3::NFS3ERR_EXIST);
+                }
+
+                // Create the directory entry
+                let mut batch = WriteBatch::new();
+                batch.put(entry_key, fileid.to_le_bytes());
+
+                // Add to directory scan index
+                let scan_key = Self::dir_scan_key(linkdirid, fileid);
+                batch.put(scan_key, name.as_bytes());
+
+                // Increment link count
+                file.nlink += 1;
+                let (now_sec, now_nsec) = get_current_time();
+                file.ctime = now_sec;
+                file.ctime_nsec = now_nsec;
+
+                // Save updated file inode
+                let file_inode_key = Self::inode_key(fileid);
+                let file_inode_data =
+                    bincode::serialize(&file_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put(file_inode_key, &file_inode_data);
+
+                // Update directory
+                link_dir.entry_count += 1;
+                link_dir.mtime = now_sec;
+                link_dir.mtime_nsec = now_nsec;
+
+                let dir_inode_key = Self::inode_key(linkdirid);
+                let dir_inode_data = bincode::serialize(&Inode::Directory(link_dir))
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put(dir_inode_key, &dir_inode_data);
+
+                self.db
+                    .write_with_options(
+                        batch,
+                        &WriteOptions {
+                            await_durable: false,
+                        },
+                    )
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+                Ok(())
+            }
+            _ => {
+                // Hard links are only supported for regular files
+                Err(nfsstat3::NFS3ERR_INVAL)
+            }
+        }
+    }
+
     pub async fn process_readdir(
         &self,
+        auth: &AuthContext,
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
@@ -1414,7 +1775,7 @@ impl SlateDbFs {
         let dir_inode = self.load_inode(dirid).await?;
 
         // Check read permission on directory
-        let creds = Credentials::current();
+        let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Read)?;
 
         match &dir_inode {
@@ -1532,6 +1893,7 @@ impl SlateDbFs {
 mod tests {
     use super::*;
     use crate::filesystem::SlateDbFs;
+    use crate::test_helpers::test_helpers::test_auth;
     use nfsserve::nfs::{ftype3, set_atime, set_mtime};
 
     #[tokio::test]
@@ -1547,7 +1909,10 @@ mod tests {
             mtime: set_mtime::DONT_CHANGE,
         };
 
-        let (file_id, fattr) = fs.process_create(0, b"test.txt", attr).await.unwrap();
+        let (file_id, fattr) = fs
+            .process_create(&test_auth(), 0, b"test.txt", attr)
+            .await
+            .unwrap();
 
         assert!(file_id > 0);
         assert_eq!(fattr.mode, 0o644);
@@ -1570,9 +1935,12 @@ mod tests {
 
         let attr = sattr3::default();
 
-        let _ = fs.process_create(0, b"test.txt", attr).await.unwrap();
+        let _ = fs
+            .process_create(&test_auth(), 0, b"test.txt", attr)
+            .await
+            .unwrap();
 
-        let result = fs.process_create(0, b"test.txt", attr).await;
+        let result = fs.process_create(&test_auth(), 0, b"test.txt", attr).await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_EXIST)));
     }
 
@@ -1580,7 +1948,7 @@ mod tests {
     async fn test_process_mkdir() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, fattr) = fs.process_mkdir(0, b"testdir").await.unwrap();
+        let (dir_id, fattr) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
 
         assert!(dir_id > 0);
         assert_eq!(fattr.mode, 0o755);
@@ -1600,17 +1968,20 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(0, b"test.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
             .await
             .unwrap();
 
         let data = b"Hello, World!";
-        let fattr = fs.process_write(file_id, 0, data).await.unwrap();
+        let fattr = fs
+            .process_write(&test_auth(), file_id, 0, data)
+            .await
+            .unwrap();
 
         assert_eq!(fattr.size, data.len() as u64);
 
         let (read_data, eof) = fs
-            .process_read_file(file_id, 0, data.len() as u32)
+            .process_read_file(&test_auth(), file_id, 0, data.len() as u32)
             .await
             .unwrap();
 
@@ -1623,17 +1994,24 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(0, b"test.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
             .await
             .unwrap();
 
         let data1 = vec![b'A'; 100];
-        fs.process_write(file_id, 0, &data1).await.unwrap();
+        fs.process_write(&test_auth(), file_id, 0, &data1)
+            .await
+            .unwrap();
 
         let data2 = vec![b'B'; 50];
-        fs.process_write(file_id, 50, &data2).await.unwrap();
+        fs.process_write(&test_auth(), file_id, 50, &data2)
+            .await
+            .unwrap();
 
-        let (read_data, _) = fs.process_read_file(file_id, 0, 100).await.unwrap();
+        let (read_data, _) = fs
+            .process_read_file(&test_auth(), file_id, 0, 100)
+            .await
+            .unwrap();
 
         assert_eq!(read_data.len(), 100);
         assert_eq!(&read_data[0..50], &vec![b'A'; 50]);
@@ -1645,18 +2023,21 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(0, b"bigfile.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"bigfile.txt", sattr3::default())
             .await
             .unwrap();
 
         let chunk_size = CHUNK_SIZE;
         let data = vec![b'X'; chunk_size * 2 + 1024];
 
-        let fattr = fs.process_write(file_id, 0, &data).await.unwrap();
+        let fattr = fs
+            .process_write(&test_auth(), file_id, 0, &data)
+            .await
+            .unwrap();
         assert_eq!(fattr.size, data.len() as u64);
 
         let (read_data, eof) = fs
-            .process_read_file(file_id, 0, data.len() as u32)
+            .process_read_file(&test_auth(), file_id, 0, data.len() as u32)
             .await
             .unwrap();
 
@@ -1669,13 +2050,17 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(0, b"test.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
             .await
             .unwrap();
 
-        fs.process_write(file_id, 0, b"some data").await.unwrap();
+        fs.process_write(&test_auth(), file_id, 0, b"some data")
+            .await
+            .unwrap();
 
-        fs.process_remove(0, b"test.txt").await.unwrap();
+        fs.process_remove(&test_auth(), 0, b"test.txt")
+            .await
+            .unwrap();
 
         // Check that the file was removed from the directory
         let entry_key = SlateDbFs::dir_entry_key(0, "test.txt");
@@ -1690,9 +2075,11 @@ mod tests {
     async fn test_process_remove_empty_directory() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, _) = fs.process_mkdir(0, b"testdir").await.unwrap();
+        let (dir_id, _) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
 
-        fs.process_remove(0, b"testdir").await.unwrap();
+        fs.process_remove(&test_auth(), 0, b"testdir")
+            .await
+            .unwrap();
 
         let result = fs.load_inode(dir_id).await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
@@ -1702,13 +2089,13 @@ mod tests {
     async fn test_process_remove_non_empty_directory() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, _) = fs.process_mkdir(0, b"testdir").await.unwrap();
+        let (dir_id, _) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
 
-        fs.process_create(dir_id, b"file.txt", sattr3::default())
+        fs.process_create(&test_auth(), dir_id, b"file.txt", sattr3::default())
             .await
             .unwrap();
 
-        let result = fs.process_remove(0, b"testdir").await;
+        let result = fs.process_remove(&test_auth(), 0, b"testdir").await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOTEMPTY)));
     }
 
@@ -1717,11 +2104,11 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(0, b"old.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"old.txt", sattr3::default())
             .await
             .unwrap();
 
-        fs.process_rename(0, b"old.txt", 0, b"new.txt")
+        fs.process_rename(&test_auth(), 0, b"old.txt", 0, b"new.txt")
             .await
             .unwrap();
 
@@ -1743,18 +2130,22 @@ mod tests {
 
         // Create two files
         let (file1_id, _) = fs
-            .process_create(0, b"file1.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
             .await
             .unwrap();
-        fs.process_write(file1_id, 0, b"content1").await.unwrap();
+        fs.process_write(&test_auth(), file1_id, 0, b"content1")
+            .await
+            .unwrap();
 
         let (file2_id, _) = fs
-            .process_create(0, b"file2.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
             .await
             .unwrap();
-        fs.process_write(file2_id, 0, b"content2").await.unwrap();
+        fs.process_write(&test_auth(), file2_id, 0, b"content2")
+            .await
+            .unwrap();
 
-        fs.process_rename(0, b"file1.txt", 0, b"file2.txt")
+        fs.process_rename(&test_auth(), 0, b"file1.txt", 0, b"file2.txt")
             .await
             .unwrap();
 
@@ -1771,7 +2162,10 @@ mod tests {
         assert_eq!(stored_id, file1_id);
 
         // Verify content
-        let (read_data, _) = fs.process_read_file(file1_id, 0, 100).await.unwrap();
+        let (read_data, _) = fs
+            .process_read_file(&test_auth(), file1_id, 0, 100)
+            .await
+            .unwrap();
         assert_eq!(read_data, b"content1");
 
         // Check that the original file2 inode is gone
@@ -1783,15 +2177,15 @@ mod tests {
     async fn test_process_rename_across_directories() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir1_id, _) = fs.process_mkdir(0, b"dir1").await.unwrap();
-        let (dir2_id, _) = fs.process_mkdir(0, b"dir2").await.unwrap();
+        let (dir1_id, _) = fs.process_mkdir(&test_auth(), 0, b"dir1").await.unwrap();
+        let (dir2_id, _) = fs.process_mkdir(&test_auth(), 0, b"dir2").await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(dir1_id, b"file.txt", sattr3::default())
+            .process_create(&test_auth(), dir1_id, b"file.txt", sattr3::default())
             .await
             .unwrap();
 
-        fs.process_rename(dir1_id, b"file.txt", dir2_id, b"moved.txt")
+        fs.process_rename(&test_auth(), dir1_id, b"file.txt", dir2_id, b"moved.txt")
             .await
             .unwrap();
 
@@ -1830,11 +2224,11 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         // Create a directory with two files
-        let (dir_id, _) = fs.process_mkdir(0, b"testdir").await.unwrap();
-        fs.process_create(dir_id, b"file1.txt", sattr3::default())
+        let (dir_id, _) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
+        fs.process_create(&test_auth(), dir_id, b"file1.txt", sattr3::default())
             .await
             .unwrap();
-        fs.process_create(dir_id, b"file2.txt", sattr3::default())
+        fs.process_create(&test_auth(), dir_id, b"file2.txt", sattr3::default())
             .await
             .unwrap();
 
@@ -1845,7 +2239,7 @@ mod tests {
             _ => panic!("Should be a directory"),
         }
 
-        fs.process_rename(dir_id, b"file1.txt", dir_id, b"file2.txt")
+        fs.process_rename(&test_auth(), dir_id, b"file1.txt", dir_id, b"file2.txt")
             .await
             .unwrap();
 
@@ -1856,7 +2250,9 @@ mod tests {
             _ => panic!("Should be a directory"),
         }
 
-        fs.process_remove(dir_id, b"file2.txt").await.unwrap();
+        fs.process_remove(&test_auth(), dir_id, b"file2.txt")
+            .await
+            .unwrap();
 
         // Directory should now be empty and removable
         let dir_inode = fs.load_inode(dir_id).await.unwrap();
@@ -1866,7 +2262,9 @@ mod tests {
         }
 
         // Should be able to remove the empty directory
-        fs.process_remove(0, b"testdir").await.unwrap();
+        fs.process_remove(&test_auth(), 0, b"testdir")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1874,11 +2272,11 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(0, b"test.txt", sattr3::default())
+            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
             .await
             .unwrap();
 
-        fs.process_write(file_id, 0, &vec![b'A'; 1000])
+        fs.process_write(&test_auth(), file_id, 0, &vec![b'A'; 1000])
             .await
             .unwrap();
 
@@ -1891,10 +2289,16 @@ mod tests {
             mtime: set_mtime::DONT_CHANGE,
         };
 
-        let fattr = fs.process_setattr(file_id, setattr).await.unwrap();
+        let fattr = fs
+            .process_setattr(&test_auth(), file_id, setattr)
+            .await
+            .unwrap();
         assert_eq!(fattr.size, 500);
 
-        let (read_data, _) = fs.process_read_file(file_id, 0, 1000).await.unwrap();
+        let (read_data, _) = fs
+            .process_read_file(&test_auth(), file_id, 0, 1000)
+            .await
+            .unwrap();
         assert_eq!(read_data.len(), 500);
     }
 
@@ -1905,7 +2309,10 @@ mod tests {
         let target = b"/path/to/target";
         let attr = sattr3::default();
 
-        let (link_id, fattr) = fs.process_symlink(0, b"link", target, attr).await.unwrap();
+        let (link_id, fattr) = fs
+            .process_symlink(&test_auth(), 0, b"link", target, attr)
+            .await
+            .unwrap();
 
         assert!(link_id > 0);
         assert!(matches!(fattr.ftype, ftype3::NF3LNK));
@@ -1924,15 +2331,15 @@ mod tests {
     async fn test_process_readdir() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        fs.process_create(0, b"file1.txt", sattr3::default())
+        fs.process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
             .await
             .unwrap();
-        fs.process_create(0, b"file2.txt", sattr3::default())
+        fs.process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
             .await
             .unwrap();
-        fs.process_mkdir(0, b"dir1").await.unwrap();
+        fs.process_mkdir(&test_auth(), 0, b"dir1").await.unwrap();
 
-        let result = fs.process_readdir(0, 0, 10).await.unwrap();
+        let result = fs.process_readdir(&test_auth(), 0, 0, 10).await.unwrap();
 
         assert!(result.end);
         assert_eq!(result.entries.len(), 5);
@@ -1954,17 +2361,25 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         for i in 0..10 {
-            fs.process_create(0, format!("file{}.txt", i).as_bytes(), sattr3::default())
-                .await
-                .unwrap();
+            fs.process_create(
+                &test_auth(),
+                0,
+                format!("file{}.txt", i).as_bytes(),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
         }
 
-        let result1 = fs.process_readdir(0, 0, 5).await.unwrap();
+        let result1 = fs.process_readdir(&test_auth(), 0, 0, 5).await.unwrap();
         assert!(!result1.end);
         assert_eq!(result1.entries.len(), 5);
 
         let last_id = result1.entries.last().unwrap().fileid;
-        let result2 = fs.process_readdir(0, last_id, 10).await.unwrap();
+        let result2 = fs
+            .process_readdir(&test_auth(), 0, last_id, 10)
+            .await
+            .unwrap();
         assert!(result2.end);
     }
 
@@ -1973,33 +2388,41 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         // Create directory structure: /a/b/c
-        let (a_id, _) = fs.process_mkdir(0, b"a").await.unwrap();
-        let (b_id, _) = fs.process_mkdir(a_id, b"b").await.unwrap();
-        let (c_id, _) = fs.process_mkdir(b_id, b"c").await.unwrap();
+        let (a_id, _) = fs.process_mkdir(&test_auth(), 0, b"a").await.unwrap();
+        let (b_id, _) = fs.process_mkdir(&test_auth(), a_id, b"b").await.unwrap();
+        let (c_id, _) = fs.process_mkdir(&test_auth(), b_id, b"c").await.unwrap();
 
         // Test 1: Try to rename /a into /a/b (direct descendant)
-        let result = fs.process_rename(0, b"a", b_id, b"a_moved").await;
+        let result = fs
+            .process_rename(&test_auth(), 0, b"a", b_id, b"a_moved")
+            .await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_INVAL)));
 
         // Test 2: Try to rename /a into /a/b/c (deeper descendant)
-        let result = fs.process_rename(0, b"a", c_id, b"a_moved").await;
+        let result = fs
+            .process_rename(&test_auth(), 0, b"a", c_id, b"a_moved")
+            .await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_INVAL)));
 
         // Test 3: Try to rename /a/b into /a/b/c (moving into immediate child)
-        let result = fs.process_rename(a_id, b"b", c_id, b"b_moved").await;
+        let result = fs
+            .process_rename(&test_auth(), a_id, b"b", c_id, b"b_moved")
+            .await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_INVAL)));
 
         // Test 4: Valid rename - moving /a/b/c to root
-        let result = fs.process_rename(b_id, b"c", 0, b"c_moved").await;
+        let result = fs
+            .process_rename(&test_auth(), b_id, b"c", 0, b"c_moved")
+            .await;
         assert!(result.is_ok());
 
         // Test 5: Valid rename - moving a file (not a directory) should work
         let (_file_id, _) = fs
-            .process_create(a_id, b"file.txt", sattr3::default())
+            .process_create(&test_auth(), a_id, b"file.txt", sattr3::default())
             .await
             .unwrap();
         let result = fs
-            .process_rename(a_id, b"file.txt", b_id, b"file_moved.txt")
+            .process_rename(&test_auth(), a_id, b"file.txt", b_id, b"file_moved.txt")
             .await;
         assert!(result.is_ok());
     }
@@ -2009,10 +2432,10 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         // Create directory structure: /a/b/c/d
-        let (a_id, _) = fs.process_mkdir(0, b"a").await.unwrap();
-        let (b_id, _) = fs.process_mkdir(a_id, b"b").await.unwrap();
-        let (c_id, _) = fs.process_mkdir(b_id, b"c").await.unwrap();
-        let (d_id, _) = fs.process_mkdir(c_id, b"d").await.unwrap();
+        let (a_id, _) = fs.process_mkdir(&test_auth(), 0, b"a").await.unwrap();
+        let (b_id, _) = fs.process_mkdir(&test_auth(), a_id, b"b").await.unwrap();
+        let (c_id, _) = fs.process_mkdir(&test_auth(), b_id, b"c").await.unwrap();
+        let (d_id, _) = fs.process_mkdir(&test_auth(), c_id, b"d").await.unwrap();
 
         // Test ancestry relationships
         assert!(fs.is_ancestor_of(a_id, b_id).await.unwrap());
