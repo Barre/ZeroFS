@@ -1,6 +1,6 @@
 use futures::stream::{self, StreamExt};
 use nfsserve::nfs::{
-    fattr3, fileid3, ftype3, nfsstat3, sattr3, set_atime, set_gid3, set_mode3, set_mtime,
+    fattr3, fileid3, ftype3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime,
     set_size3, set_uid3,
 };
 use nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
@@ -313,6 +313,7 @@ impl SlateDbFs {
         auth: &AuthContext,
         dirid: fileid3,
         dirname: &[u8],
+        attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let dirname_str = String::from_utf8_lossy(dirname);
         debug!("process_mkdir: dirid={}, dirname={}", dirid, dirname_str);
@@ -357,23 +358,59 @@ impl SlateDbFs {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let umask = get_umask();
-                let mut new_mode = 0o777 & !umask;
+                let mut new_mode = match attr.mode {
+                    set_mode3::mode(m) => m & !umask,
+                    set_mode3::Void => 0o777 & !umask,
+                };
 
                 let parent_mode = dir.mode;
                 if parent_mode & 0o2000 != 0 {
                     new_mode |= 0o2000;
                 }
 
+                // Apply uid/gid from attributes, with defaults
+                let new_uid = match attr.uid {
+                    set_uid3::uid(u) => u,
+                    set_uid3::Void => auth.uid,
+                };
+
+                let new_gid = match attr.gid {
+                    set_gid3::gid(g) => g,
+                    set_gid3::Void => {
+                        // If parent has setgid bit, inherit parent's gid
+                        if parent_mode & 0o2000 != 0 {
+                            dir.gid
+                        } else {
+                            auth.gid
+                        }
+                    }
+                };
+
+                // Apply time attributes
+                let (atime_sec, atime_nsec) = match attr.atime {
+                    set_atime::SET_TO_CLIENT_TIME(nfstime3 { seconds, nseconds }) => {
+                        (seconds as u64, nseconds)
+                    }
+                    set_atime::SET_TO_SERVER_TIME | set_atime::DONT_CHANGE => (now_sec, now_nsec),
+                };
+
+                let (mtime_sec, mtime_nsec) = match attr.mtime {
+                    set_mtime::SET_TO_CLIENT_TIME(nfstime3 { seconds, nseconds }) => {
+                        (seconds as u64, nseconds)
+                    }
+                    set_mtime::SET_TO_SERVER_TIME | set_mtime::DONT_CHANGE => (now_sec, now_nsec),
+                };
+
                 let new_dir_inode = DirectoryInode {
-                    mtime: now_sec,
-                    mtime_nsec: now_nsec,
+                    mtime: mtime_sec,
+                    mtime_nsec,
                     ctime: now_sec,
                     ctime_nsec: now_nsec,
-                    atime: now_sec,
-                    atime_nsec: now_nsec,
+                    atime: atime_sec,
+                    atime_nsec,
                     mode: new_mode,
-                    uid: auth.uid,
-                    gid: auth.gid,
+                    uid: new_uid,
+                    gid: new_gid,
                     entry_count: 0,
                     parent: dirid,
                     nlink: 2, // . and parent's reference
@@ -2017,7 +2054,10 @@ mod tests {
     async fn test_process_mkdir() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, fattr) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
+        let (dir_id, fattr) = fs
+            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .await
+            .unwrap();
 
         assert!(dir_id > 0);
         assert_eq!(fattr.mode, 0o755);
@@ -2030,6 +2070,30 @@ mod tests {
             }
             _ => panic!("Should be a directory"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_mkdir_with_custom_attrs() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        
+        // Test with custom mode
+        let custom_attrs = sattr3 {
+            mode: set_mode3::mode(0o700),
+            uid: set_uid3::uid(1001),
+            gid: set_gid3::gid(1001),
+            size: set_size3::Void,
+            atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 { seconds: 1234567890, nseconds: 0 }),
+            mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 { seconds: 1234567890, nseconds: 0 }),
+        };
+        
+        let (_dir_id, fattr) = fs.process_mkdir(&test_auth(), 0, b"customdir", &custom_attrs).await.unwrap();
+        
+        // Check that attributes were applied correctly
+        assert_eq!(fattr.mode & 0o777, 0o700, "Custom mode should be applied");
+        assert_eq!(fattr.uid, 1001, "Custom uid should be applied");
+        assert_eq!(fattr.gid, 1001, "Custom gid should be applied");
+        assert_eq!(fattr.atime.seconds, 1234567890, "Custom atime should be applied");
+        assert_eq!(fattr.mtime.seconds, 1234567890, "Custom mtime should be applied");
     }
 
     #[tokio::test]
@@ -2144,7 +2208,10 @@ mod tests {
     async fn test_process_remove_empty_directory() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, _) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
+        let (dir_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .await
+            .unwrap();
 
         fs.process_remove(&test_auth(), 0, b"testdir")
             .await
@@ -2158,7 +2225,10 @@ mod tests {
     async fn test_process_remove_non_empty_directory() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir_id, _) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
+        let (dir_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .await
+            .unwrap();
 
         fs.process_create(&test_auth(), dir_id, b"file.txt", sattr3::default())
             .await
@@ -2246,8 +2316,14 @@ mod tests {
     async fn test_process_rename_across_directories() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
-        let (dir1_id, _) = fs.process_mkdir(&test_auth(), 0, b"dir1").await.unwrap();
-        let (dir2_id, _) = fs.process_mkdir(&test_auth(), 0, b"dir2").await.unwrap();
+        let (dir1_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"dir1", &sattr3::default())
+            .await
+            .unwrap();
+        let (dir2_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"dir2", &sattr3::default())
+            .await
+            .unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), dir1_id, b"file.txt", sattr3::default())
@@ -2293,7 +2369,10 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         // Create a directory with two files
-        let (dir_id, _) = fs.process_mkdir(&test_auth(), 0, b"testdir").await.unwrap();
+        let (dir_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .await
+            .unwrap();
         fs.process_create(&test_auth(), dir_id, b"file1.txt", sattr3::default())
             .await
             .unwrap();
@@ -2406,7 +2485,9 @@ mod tests {
         fs.process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
             .await
             .unwrap();
-        fs.process_mkdir(&test_auth(), 0, b"dir1").await.unwrap();
+        fs.process_mkdir(&test_auth(), 0, b"dir1", &sattr3::default())
+            .await
+            .unwrap();
 
         let result = fs.process_readdir(&test_auth(), 0, 0, 10).await.unwrap();
 
@@ -2457,9 +2538,18 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         // Create directory structure: /a/b/c
-        let (a_id, _) = fs.process_mkdir(&test_auth(), 0, b"a").await.unwrap();
-        let (b_id, _) = fs.process_mkdir(&test_auth(), a_id, b"b").await.unwrap();
-        let (c_id, _) = fs.process_mkdir(&test_auth(), b_id, b"c").await.unwrap();
+        let (a_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"a", &sattr3::default())
+            .await
+            .unwrap();
+        let (b_id, _) = fs
+            .process_mkdir(&test_auth(), a_id, b"b", &sattr3::default())
+            .await
+            .unwrap();
+        let (c_id, _) = fs
+            .process_mkdir(&test_auth(), b_id, b"c", &sattr3::default())
+            .await
+            .unwrap();
 
         // Test 1: Try to rename /a into /a/b (direct descendant)
         let result = fs
@@ -2501,10 +2591,22 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         // Create directory structure: /a/b/c/d
-        let (a_id, _) = fs.process_mkdir(&test_auth(), 0, b"a").await.unwrap();
-        let (b_id, _) = fs.process_mkdir(&test_auth(), a_id, b"b").await.unwrap();
-        let (c_id, _) = fs.process_mkdir(&test_auth(), b_id, b"c").await.unwrap();
-        let (d_id, _) = fs.process_mkdir(&test_auth(), c_id, b"d").await.unwrap();
+        let (a_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"a", &sattr3::default())
+            .await
+            .unwrap();
+        let (b_id, _) = fs
+            .process_mkdir(&test_auth(), a_id, b"b", &sattr3::default())
+            .await
+            .unwrap();
+        let (c_id, _) = fs
+            .process_mkdir(&test_auth(), b_id, b"c", &sattr3::default())
+            .await
+            .unwrap();
+        let (d_id, _) = fs
+            .process_mkdir(&test_auth(), c_id, b"d", &sattr3::default())
+            .await
+            .unwrap();
 
         // Test ancestry relationships
         assert!(fs.is_ancestor_of(a_id, b_id).await.unwrap());

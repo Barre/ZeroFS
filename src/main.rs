@@ -142,11 +142,12 @@ impl NFSFileSystem for SlateDbFs {
         auth: &AuthContext,
         dirid: fileid3,
         dirname: &filename3,
+        attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let dirname_str = String::from_utf8_lossy(dirname);
         debug!("mkdir called: dirid={}, dirname={}", dirid, dirname_str);
 
-        self.process_mkdir(auth, dirid, dirname).await
+        self.process_mkdir(auth, dirid, dirname, attr).await
     }
 
     async fn remove(
@@ -422,7 +423,7 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (dir_id, fattr) = fs
-            .mkdir(&test_auth(), 0, &filename(b"mydir"))
+            .mkdir(&test_auth(), 0, &filename(b"mydir"), &sattr3::default())
             .await
             .unwrap();
         assert!(matches!(fattr.ftype, ftype3::NF3DIR));
@@ -581,11 +582,11 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let (docs_dir, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"documents"))
+            .mkdir(&test_auth(), 0, &filename(b"documents"), &sattr3::default())
             .await
             .unwrap();
         let (images_dir, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"images"))
+            .mkdir(&test_auth(), 0, &filename(b"images"), &sattr3::default())
             .await
             .unwrap();
 
