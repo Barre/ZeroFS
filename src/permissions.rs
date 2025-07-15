@@ -1,5 +1,6 @@
 use crate::inode::Inode;
 use nfsserve::nfs::nfsstat3;
+use nfsserve::vfs::AuthContext;
 
 const S_IRUSR: u32 = 0o400;
 const S_IWUSR: u32 = 0o200;
@@ -21,27 +22,28 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    pub fn current() -> Self {
-        #[cfg(unix)]
-        unsafe {
-            let mut creds = Self {
-                uid: libc::geteuid(),
-                gid: libc::getegid(),
-                groups: [0; 16],
-                groups_count: 0,
-            };
+    pub fn from_auth_context(auth: &AuthContext) -> Self {
+        let mut creds = Self {
+            uid: auth.uid,
+            gid: auth.gid,
+            groups: [0; 16],
+            groups_count: auth.gids.len().min(16),
+        };
 
-            let mut groups: [libc::gid_t; 16] = [0; 16];
-            let ngroups = libc::getgroups(16, groups.as_mut_ptr());
-            if ngroups > 0 {
-                creds.groups_count = ngroups as usize;
-                creds.groups[..creds.groups_count].copy_from_slice(&groups[..creds.groups_count]);
-            }
-
-            creds
+        for (i, gid) in auth.gids.iter().take(16).enumerate() {
+            creds.groups[i] = *gid;
         }
-        #[cfg(not(unix))]
-        Self::root()
+
+        creds
+    }
+
+    pub fn root() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            groups: [0; 16],
+            groups_count: 0,
+        }
     }
 
     pub fn is_member_of_group(&self, gid: u32) -> bool {
@@ -69,6 +71,10 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
         Inode::File(f) => (f.uid, f.gid, f.mode),
         Inode::Directory(d) => (d.uid, d.gid, d.mode),
         Inode::Symlink(s) => (s.uid, s.gid, s.mode),
+        Inode::Fifo(s) => (s.uid, s.gid, s.mode),
+        Inode::Socket(s) => (s.uid, s.gid, s.mode),
+        Inode::CharDevice(s) => (s.uid, s.gid, s.mode),
+        Inode::BlockDevice(s) => (s.uid, s.gid, s.mode),
     };
 
     if creds.uid == 0 {
@@ -106,6 +112,10 @@ pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), nfsstat
         Inode::File(f) => f.uid,
         Inode::Directory(d) => d.uid,
         Inode::Symlink(s) => s.uid,
+        Inode::Fifo(s) => s.uid,
+        Inode::Socket(s) => s.uid,
+        Inode::CharDevice(s) => s.uid,
+        Inode::BlockDevice(s) => s.uid,
     };
 
     if creds.uid == 0 || creds.uid == uid {
@@ -126,6 +136,10 @@ pub fn check_sticky_bit_delete(
                 Inode::File(f) => f.uid,
                 Inode::Directory(d) => d.uid,
                 Inode::Symlink(s) => s.uid,
+                Inode::Fifo(s) => s.uid,
+                Inode::Socket(s) => s.uid,
+                Inode::CharDevice(s) => s.uid,
+                Inode::BlockDevice(s) => s.uid,
             };
 
             if creds.uid != 0 && creds.uid != parent_dir.uid && creds.uid != target_uid {
@@ -149,6 +163,10 @@ pub fn can_set_times(
         Inode::File(f) => f.uid,
         Inode::Directory(d) => d.uid,
         Inode::Symlink(s) => s.uid,
+        Inode::Fifo(s) => s.uid,
+        Inode::Socket(s) => s.uid,
+        Inode::CharDevice(s) => s.uid,
+        Inode::BlockDevice(s) => s.uid,
     };
 
     if creds.uid == 0 || creds.uid == uid {
