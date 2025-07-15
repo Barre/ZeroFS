@@ -92,7 +92,7 @@ impl SlateDbFs {
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
 
         let cache_size_bytes = (cache_config.max_cache_size_gb * 1_000_000_000.0) as usize;
-        
+
         let settings = slatedb::config::Settings {
             object_store_cache_options: ObjectStoreCacheOptions {
                 root_folder: Some(cache_config.root_folder.into()),
@@ -139,11 +139,12 @@ impl SlateDbFs {
                 ctime_nsec: now_nsec,
                 atime: now_sec,
                 atime_nsec: now_nsec,
-                mode: 0o755,
+                mode: 0o1777,
                 uid,
                 gid,
                 entry_count: 0,
                 parent: 0,
+                nlink: 2, // . and ..
             };
             let serialized = bincode::serialize(&Inode::Directory(root_dir))?;
             db.put_with_options(
@@ -279,11 +280,12 @@ impl SlateDbFs {
                 ctime_nsec: now_nsec,
                 atime: now_sec,
                 atime_nsec: now_nsec,
-                mode: 0o755,
+                mode: 0o1777,
                 uid,
                 gid,
                 entry_count: 0,
                 parent: 0,
+                nlink: 2, // . and ..
             };
             let serialized = bincode::serialize(&Inode::Directory(root_dir))?;
             db.put_with_options(
@@ -324,7 +326,7 @@ mod tests {
         let root_inode = fs.load_inode(0).await.unwrap();
         match root_inode {
             Inode::Directory(dir) => {
-                assert_eq!(dir.mode, 0o755);
+                assert_eq!(dir.mode, 0o1777);
                 let (expected_uid, expected_gid) = get_current_uid_gid();
                 assert_eq!(dir.uid, expected_uid);
                 assert_eq!(dir.gid, expected_gid);
@@ -366,6 +368,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: 0,
+            nlink: 1,
         };
 
         let inode = Inode::File(file_inode.clone());
