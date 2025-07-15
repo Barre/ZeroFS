@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nfsserve = "0.10"
+nfsserve = { git = "https://github.com/Barre/nfsserve.git" }
 tokio = { version = "1.46", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
