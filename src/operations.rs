@@ -49,6 +49,44 @@ impl SlateDbFs {
         Ok(false)
     }
 
+    /// Check execute permission on all parent directories leading to a file
+    async fn check_parent_execute_permissions(
+        &self,
+        id: InodeId,
+        creds: &Credentials,
+    ) -> Result<(), nfsstat3> {
+        // Root directory doesn't need parent permission check
+        if id == 0 {
+            return Ok(());
+        }
+
+        let inode = self.load_inode(id).await?;
+        let parent_id = match &inode {
+            Inode::File(f) => f.parent,
+            Inode::Directory(d) => d.parent,
+            Inode::Symlink(s) => s.parent,
+            Inode::Fifo(s) => s.parent,
+            Inode::Socket(s) => s.parent,
+            Inode::CharDevice(s) => s.parent,
+            Inode::BlockDevice(s) => s.parent,
+        };
+
+        // Walk up the directory tree checking execute permissions
+        let mut current_id = parent_id;
+        while current_id != 0 {
+            let parent_inode = self.load_inode(current_id).await?;
+
+            check_access(&parent_inode, creds, AccessMode::Execute)?;
+
+            current_id = match &parent_inode {
+                Inode::Directory(d) => d.parent,
+                _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+            };
+        }
+
+        Ok(())
+    }
+
     pub async fn process_write(
         &self,
         auth: &AuthContext,
@@ -69,6 +107,10 @@ impl SlateDbFs {
         let mut inode = self.load_inode(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
+
+        // Check execute permission on all parent directories
+        self.check_parent_execute_permissions(id, &creds).await?;
+
         check_access(&inode, &creds, AccessMode::Write)?;
 
         match &mut inode {
@@ -987,6 +1029,9 @@ impl SlateDbFs {
 
         let creds = Credentials::from_auth_context(auth);
 
+        // Check execute permission on all parent directories
+        self.check_parent_execute_permissions(id, &creds).await?;
+
         // Check permissions for various operations
         // For chmod (mode change), must be owner
         if matches!(setattr.mode, set_mode3::mode(_)) {
@@ -1521,6 +1566,9 @@ impl SlateDbFs {
 
         // Check read permission
         let creds = Credentials::from_auth_context(auth);
+
+        self.check_parent_execute_permissions(id, &creds).await?;
+
         check_access(&inode, &creds, AccessMode::Read)?;
 
         match &inode {
@@ -2075,25 +2123,40 @@ mod tests {
     #[tokio::test]
     async fn test_process_mkdir_with_custom_attrs() {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
-        
+
         // Test with custom mode
         let custom_attrs = sattr3 {
             mode: set_mode3::mode(0o700),
             uid: set_uid3::uid(1001),
             gid: set_gid3::gid(1001),
             size: set_size3::Void,
-            atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 { seconds: 1234567890, nseconds: 0 }),
-            mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 { seconds: 1234567890, nseconds: 0 }),
+            atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
+                seconds: 1234567890,
+                nseconds: 0,
+            }),
+            mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+                seconds: 1234567890,
+                nseconds: 0,
+            }),
         };
-        
-        let (_dir_id, fattr) = fs.process_mkdir(&test_auth(), 0, b"customdir", &custom_attrs).await.unwrap();
-        
+
+        let (_dir_id, fattr) = fs
+            .process_mkdir(&test_auth(), 0, b"customdir", &custom_attrs)
+            .await
+            .unwrap();
+
         // Check that attributes were applied correctly
         assert_eq!(fattr.mode & 0o777, 0o700, "Custom mode should be applied");
         assert_eq!(fattr.uid, 1001, "Custom uid should be applied");
         assert_eq!(fattr.gid, 1001, "Custom gid should be applied");
-        assert_eq!(fattr.atime.seconds, 1234567890, "Custom atime should be applied");
-        assert_eq!(fattr.mtime.seconds, 1234567890, "Custom mtime should be applied");
+        assert_eq!(
+            fattr.atime.seconds, 1234567890,
+            "Custom atime should be applied"
+        );
+        assert_eq!(
+            fattr.mtime.seconds, 1234567890,
+            "Custom mtime should be applied"
+        );
     }
 
     #[tokio::test]
@@ -2634,5 +2697,84 @@ mod tests {
         // Test self-relationships (should return true)
         assert!(fs.is_ancestor_of(a_id, a_id).await.unwrap());
         assert!(fs.is_ancestor_of(b_id, b_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_parent_directory_execute_permissions() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        let (dir_id, _) = fs
+            .process_mkdir(&test_auth(), 0, b"test_dir", &sattr3::default())
+            .await
+            .unwrap();
+
+        let (file_id, _) = fs
+            .process_create(&test_auth(), dir_id, b"test.txt", sattr3::default())
+            .await
+            .unwrap();
+
+        fs.process_write(&test_auth(), file_id, 0, b"initial data")
+            .await
+            .unwrap();
+
+        let no_exec_attrs = sattr3 {
+            mode: set_mode3::mode(0o644),
+            uid: set_uid3::Void,
+            gid: set_gid3::Void,
+            size: set_size3::Void,
+            atime: set_atime::DONT_CHANGE,
+            mtime: set_mtime::DONT_CHANGE,
+        };
+
+        fs.process_setattr(&test_auth(), dir_id, no_exec_attrs)
+            .await
+            .unwrap();
+
+        let chmod_attrs = sattr3 {
+            mode: set_mode3::mode(0o600),
+            uid: set_uid3::Void,
+            gid: set_gid3::Void,
+            size: set_size3::Void,
+            atime: set_atime::DONT_CHANGE,
+            mtime: set_mtime::DONT_CHANGE,
+        };
+
+        let result = fs.process_setattr(&test_auth(), file_id, chmod_attrs).await;
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_ACCES)));
+
+        let result = fs.process_read_file(&test_auth(), file_id, 0, 100).await;
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_ACCES)));
+
+        let result = fs
+            .process_write(&test_auth(), file_id, 0, b"new data")
+            .await;
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_ACCES)));
+
+        let exec_attrs = sattr3 {
+            mode: set_mode3::mode(0o755),
+            uid: set_uid3::Void,
+            gid: set_gid3::Void,
+            size: set_size3::Void,
+            atime: set_atime::DONT_CHANGE,
+            mtime: set_mtime::DONT_CHANGE,
+        };
+
+        fs.process_setattr(&test_auth(), dir_id, exec_attrs)
+            .await
+            .unwrap();
+
+        fs.process_setattr(&test_auth(), file_id, chmod_attrs)
+            .await
+            .unwrap();
+
+        let (data, _) = fs
+            .process_read_file(&test_auth(), file_id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(data, b"initial data");
+
+        fs.process_write(&test_auth(), file_id, 0, b"updated data")
+            .await
+            .unwrap();
     }
 }
