@@ -2,7 +2,6 @@ use crate::cache::{CacheKey, CacheValue, UnifiedCache};
 use crate::encryption::{EncryptedDb, EncryptionManager};
 use crate::lock_manager::LockManager;
 use bytes::Bytes;
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use slatedb::config::ObjectStoreCacheOptions;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::object_store::{ObjectStore, path::Path};
@@ -56,16 +55,6 @@ pub struct DangerousUnencryptedSlateDbFs {
 }
 
 #[derive(Clone)]
-pub struct S3Config {
-    pub endpoint: String,
-    pub bucket_name: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub region: String,
-    pub allow_http: bool,
-}
-
-#[derive(Clone)]
 pub struct CacheConfig {
     pub root_folder: String,
     pub max_cache_size_gb: f64,
@@ -73,27 +62,12 @@ pub struct CacheConfig {
 }
 
 impl SlateDbFs {
-    pub async fn new_with_s3(
-        s3_config: S3Config,
+    pub async fn new_with_object_store(
+        object_store: Arc<dyn ObjectStore>,
         cache_config: CacheConfig,
         db_path: String,
         encryption_key: [u8; 32],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(&s3_config.bucket_name)
-            .with_region(&s3_config.region)
-            .with_access_key_id(&s3_config.access_key_id)
-            .with_secret_access_key(&s3_config.secret_access_key)
-            .with_allow_http(s3_config.allow_http)
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
-
-        if !s3_config.endpoint.is_empty() {
-            builder = builder.with_endpoint(&s3_config.endpoint);
-        }
-
-        let object_store = builder.build()?;
-        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
-
         let slatedb_disk_cache_size_gb = cache_config.max_cache_size_gb;
         let zerofs_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -404,26 +378,11 @@ impl SlateDbFs {
 
 impl SlateDbFs {
     /// DANGEROUS: Creates an unencrypted database connection. Only use for key management!
-    pub async fn dangerous_new_with_s3_unencrypted_for_key_management_only(
-        s3_config: S3Config,
+    pub async fn dangerous_new_with_object_store_unencrypted_for_key_management_only(
+        object_store: Arc<dyn ObjectStore>,
         cache_config: CacheConfig,
         db_path: String,
     ) -> Result<DangerousUnencryptedSlateDbFs, Box<dyn std::error::Error>> {
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(&s3_config.bucket_name)
-            .with_region(&s3_config.region)
-            .with_access_key_id(&s3_config.access_key_id)
-            .with_secret_access_key(&s3_config.secret_access_key)
-            .with_allow_http(s3_config.allow_http)
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
-
-        if !s3_config.endpoint.is_empty() {
-            builder = builder.with_endpoint(&s3_config.endpoint);
-        }
-
-        let object_store = builder.build()?;
-        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
-
         let total_cache_size_gb = cache_config.max_cache_size_gb;
 
         // Since ZeroFS now uses only in-memory cache, allocate all disk cache to SlateDB
