@@ -305,6 +305,28 @@ impl NFSFileSystem for SlateDbFs {
             }
         }
     }
+
+    async fn fsstat(&self, auth: &AuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
+        debug!("fsstat called: fileid={}", fileid);
+
+        let obj_attr = match self.getattr(auth, fileid).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        let res = fsstat3 {
+            obj_attributes: obj_attr,
+            tbytes: 1 << 60,    // 1 EiB
+            fbytes: 1 << 60,    // 1 EiB free
+            abytes: 1 << 60,    // 1 EiB available
+            tfiles: 1 << 40,    // ~1.1 trillion files
+            ffiles: 1 << 40,    // ~1.1 trillion free
+            afiles: 1 << 40,    // ~1.1 trillion available
+            invarsec: u32::MAX, // No change in attributes
+        };
+
+        Ok(res)
+    }
 }
 
 pub async fn start_nfs_server(
