@@ -382,7 +382,9 @@ The "shared" in "shared ZFS pool" means shared access capability, not concurrent
 
 > Thus, if there is a network partition, one has to choose between consistency or availability.
 
-It seems that we are able to maintain all three CAP properties in case of network paritions.
+The "network partition" in CAP assumes nodes can't coordinate. But if nodes don't NEED to coordinate because the storage layer handles it, then you've sidestepped the constraint.
+
+It seems that we are able to maintain all three CAP properties in case of network partitions.
 
 If anyone has a rebutal for this please open an issue! :)
 
