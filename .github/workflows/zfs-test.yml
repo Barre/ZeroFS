@@ -156,9 +156,31 @@ jobs:
           # Show space usage
           sudo zfs list -o name,used,avail,refer,mountpoint
 
+          echo "Running ZFS TRIM..."
+          sudo zpool trim testpool
+          
+          # Wait for trim to complete
+          echo "Waiting for TRIM to complete..."
+          while sudo zpool status testpool | grep -q 'trimming'; do
+            sleep 2
+            echo "TRIM in progress..."
+            sudo zpool status testpool
+          done
+          echo "TRIM completed"
+
           echo "Starting ZFS scrub..."
           sudo zpool scrub testpool
-          sleep 5
+          
+          # Wait for scrub to complete
+          echo "Waiting for scrub to complete..."
+          while sudo zpool status testpool | grep -q 'scrub in progress'; do
+            sleep 2
+            echo "Scrub in progress..."
+            sudo zpool status testpool
+          done
+          echo "Scrub completed"
+          
+          # Show final pool status
           sudo zpool status testpool
 
       - name: Show ZeroFS S3 usage

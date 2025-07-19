@@ -689,21 +689,37 @@ where
 }
 
 async fn handle_trim_command<W>(
-    _filesystem: &SlateDbFs,
-    _inode: u64,
+    filesystem: &SlateDbFs,
+    inode: u64,
     writer: &mut W,
     cookie: u64,
-    _offset: u64,
-    _length: u32,
+    offset: u64,
+    length: u32,
 ) -> u32
 where
     W: AsyncWriteExt + Unpin,
 {
-    // Just reply success - ZeroFS handles sparse storage automatically
-    if send_simple_reply(writer, cookie, 0, &[]).await.is_err() {
-        return NBD_EIO;
+    use zerofs_nfsserve::vfs::AuthContext;
+
+    let auth = AuthContext {
+        uid: 0,
+        gid: 0,
+        gids: vec![],
+    };
+
+    match filesystem.trim(&auth, inode, offset, length as u64).await {
+        Ok(_) => {
+            if send_simple_reply(writer, cookie, 0, &[]).await.is_err() {
+                return NBD_EIO;
+            }
+            0
+        }
+        Err(e) => {
+            error!("NBD trim failed: {:?}", e);
+            let _ = send_simple_reply(writer, cookie, NBD_EIO, &[]).await;
+            NBD_EIO
+        }
     }
-    0
 }
 
 async fn handle_write_zeroes_command<W>(
