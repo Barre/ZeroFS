@@ -161,9 +161,10 @@ jobs:
           
           # Wait for trim to complete
           echo "Waiting for TRIM to complete..."
-          while [ "$(sudo zpool status testpool | grep -c 'trimming')" -gt 0 ]; do
+          while sudo zpool status testpool | grep -q 'trimming'; do
             sleep 2
-            sudo zpool status testpool | grep -A 2 trim
+            echo "TRIM in progress..."
+            sudo zpool status testpool
           done
           echo "TRIM completed"
 
@@ -172,9 +173,10 @@ jobs:
           
           # Wait for scrub to complete
           echo "Waiting for scrub to complete..."
-          while [ "$(sudo zpool status testpool | grep -c 'scrub in progress')" -gt 0 ]; do
+          while sudo zpool status testpool | grep -q 'scrub in progress'; do
             sleep 2
-            sudo zpool status testpool | grep -A 3 scrub
+            echo "Scrub in progress..."
+            sudo zpool status testpool
           done
           echo "Scrub completed"
           
