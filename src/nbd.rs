@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
@@ -201,37 +201,47 @@ impl NBDServer {
 }
 
 async fn handle_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     filesystem: Arc<SlateDbFs>,
     devices: HashMap<String, NBDDevice>,
 ) -> io::Result<()> {
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+
     // Handshake phase
-    perform_handshake(&mut stream, &devices).await?;
+    perform_handshake(&mut reader, &mut writer, &devices).await?;
 
     // Get selected device from handshake
-    let device = wait_for_export_selection(&mut stream, &devices).await?;
+    let device = wait_for_export_selection(&mut reader, &mut writer, &devices).await?;
 
     info!("Client selected device: {}", device.name);
 
     // Transmission phase
-    handle_transmission(&mut stream, filesystem, device).await?;
+    handle_transmission(reader, writer, filesystem, device).await?;
 
     Ok(())
 }
 
-async fn perform_handshake(
-    stream: &mut TcpStream,
+async fn perform_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
     _devices: &HashMap<String, NBDDevice>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     // Send initial handshake
-    stream.write_u64(NBD_MAGIC).await?;
-    stream.write_u64(NBD_IHAVEOPT).await?;
-    stream
+    writer.write_u64(NBD_MAGIC).await?;
+    writer.write_u64(NBD_IHAVEOPT).await?;
+    writer
         .write_u16(NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES)
         .await?;
+    writer.flush().await?;
 
     // Read client flags
-    let client_flags = stream.read_u32().await?;
+    let client_flags = reader.read_u32().await?;
     debug!("Client flags: 0x{:x}", client_flags);
 
     if (client_flags & NBD_FLAG_C_FIXED_NEWSTYLE) == 0 {
@@ -244,13 +254,18 @@ async fn perform_handshake(
     Ok(())
 }
 
-async fn wait_for_export_selection(
-    stream: &mut TcpStream,
+async fn wait_for_export_selection<R, W>(
+    reader: &mut R,
+    writer: &mut W,
     devices: &HashMap<String, NBDDevice>,
-) -> io::Result<NBDDevice> {
+) -> io::Result<NBDDevice>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     loop {
         // Read option header
-        let magic = stream.read_u64().await?;
+        let magic = reader.read_u64().await?;
         if magic != NBD_IHAVEOPT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -258,24 +273,24 @@ async fn wait_for_export_selection(
             ));
         }
 
-        let option = stream.read_u32().await?;
-        let length = stream.read_u32().await?;
+        let option = reader.read_u32().await?;
+        let length = reader.read_u32().await?;
 
         match option {
             NBD_OPT_LIST => {
-                handle_list_option(stream, devices, length).await?;
+                handle_list_option(reader, writer, devices, length).await?;
             }
             NBD_OPT_EXPORT_NAME => {
-                return handle_export_name_option(stream, devices, length).await;
+                return handle_export_name_option(reader, writer, devices, length).await;
             }
             NBD_OPT_GO => {
-                return handle_go_option(stream, devices, length).await;
+                return handle_go_option(reader, writer, devices, length).await;
             }
             NBD_OPT_STRUCTURED_REPLY => {
-                handle_structured_reply_option(stream, length).await?;
+                handle_structured_reply_option(reader, writer, length).await?;
             }
             NBD_OPT_ABORT => {
-                send_option_reply(stream, option, NBD_REP_ACK, &[]).await?;
+                send_option_reply(writer, option, NBD_REP_ACK, &[]).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "Client aborted",
@@ -284,22 +299,27 @@ async fn wait_for_export_selection(
             _ => {
                 // Skip unknown option data
                 let mut buf = vec![0u8; length as usize];
-                stream.read_exact(&mut buf).await?;
-                send_option_reply(stream, option, NBD_REP_ERR_UNSUP, &[]).await?;
+                reader.read_exact(&mut buf).await?;
+                send_option_reply(writer, option, NBD_REP_ERR_UNSUP, &[]).await?;
             }
         }
     }
 }
 
-async fn handle_list_option(
-    stream: &mut TcpStream,
+async fn handle_list_option<R, W>(
+    reader: &mut R,
+    writer: &mut W,
     devices: &HashMap<String, NBDDevice>,
     length: u32,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     // Skip any data
     if length > 0 {
         let mut buf = vec![0u8; length as usize];
-        stream.read_exact(&mut buf).await?;
+        reader.read_exact(&mut buf).await?;
     }
 
     // Send device list
@@ -309,21 +329,27 @@ async fn handle_list_option(
         reply_data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
         reply_data.extend_from_slice(name_bytes);
 
-        send_option_reply(stream, NBD_OPT_LIST, NBD_REP_SERVER, &reply_data).await?;
+        send_option_reply(writer, NBD_OPT_LIST, NBD_REP_SERVER, &reply_data).await?;
     }
 
     // Send final ACK
-    send_option_reply(stream, NBD_OPT_LIST, NBD_REP_ACK, &[]).await?;
+    send_option_reply(writer, NBD_OPT_LIST, NBD_REP_ACK, &[]).await?;
+    writer.flush().await?;
     Ok(())
 }
 
-async fn handle_export_name_option(
-    stream: &mut TcpStream,
+async fn handle_export_name_option<R, W>(
+    reader: &mut R,
+    writer: &mut W,
     devices: &HashMap<String, NBDDevice>,
     length: u32,
-) -> io::Result<NBDDevice> {
+) -> io::Result<NBDDevice>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut name_buf = vec![0u8; length as usize];
-    stream.read_exact(&mut name_buf).await?;
+    reader.read_exact(&mut name_buf).await?;
     let name = String::from_utf8_lossy(&name_buf);
 
     let device = devices.get(name.as_ref()).ok_or_else(|| {
@@ -331,8 +357,8 @@ async fn handle_export_name_option(
     })?;
 
     // Send export info
-    stream.write_u64(device.size).await?;
-    stream
+    writer.write_u64(device.size).await?;
+    writer
         .write_u16(
             NBD_FLAG_HAS_FLAGS
                 | NBD_FLAG_SEND_FLUSH
@@ -341,21 +367,27 @@ async fn handle_export_name_option(
                 | NBD_FLAG_SEND_WRITE_ZEROES,
         )
         .await?;
+    writer.flush().await?;
     // No trailing zeroes due to NBD_FLAG_NO_ZEROES
 
     Ok(device.clone())
 }
 
-async fn handle_go_option(
-    stream: &mut TcpStream,
+async fn handle_go_option<R, W>(
+    reader: &mut R,
+    writer: &mut W,
     devices: &HashMap<String, NBDDevice>,
     length: u32,
-) -> io::Result<NBDDevice> {
+) -> io::Result<NBDDevice>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut data = vec![0u8; length as usize];
-    stream.read_exact(&mut data).await?;
+    reader.read_exact(&mut data).await?;
 
     if data.len() < 4 {
-        send_option_reply(stream, NBD_OPT_GO, NBD_REP_ERR_INVALID, &[]).await?;
+        send_option_reply(writer, NBD_OPT_GO, NBD_REP_ERR_INVALID, &[]).await?;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid GO option",
@@ -364,7 +396,7 @@ async fn handle_go_option(
 
     let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if data.len() < 4 + name_len + 2 {
-        send_option_reply(stream, NBD_OPT_GO, NBD_REP_ERR_INVALID, &[]).await?;
+        send_option_reply(writer, NBD_OPT_GO, NBD_REP_ERR_INVALID, &[]).await?;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid GO option",
@@ -389,45 +421,63 @@ async fn handle_go_option(
             .to_be_bytes(),
     );
 
-    send_option_reply(stream, NBD_OPT_GO, NBD_REP_INFO, &info_data).await?;
-    send_option_reply(stream, NBD_OPT_GO, NBD_REP_ACK, &[]).await?;
+    send_option_reply(writer, NBD_OPT_GO, NBD_REP_INFO, &info_data).await?;
+    send_option_reply(writer, NBD_OPT_GO, NBD_REP_ACK, &[]).await?;
+    writer.flush().await?;
 
     Ok(device.clone())
 }
 
-async fn handle_structured_reply_option(stream: &mut TcpStream, length: u32) -> io::Result<()> {
+async fn handle_structured_reply_option<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    length: u32,
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     // Skip any data
     if length > 0 {
         let mut buf = vec![0u8; length as usize];
-        stream.read_exact(&mut buf).await?;
+        reader.read_exact(&mut buf).await?;
     }
 
     // We don't support structured replies for now
-    send_option_reply(stream, NBD_OPT_STRUCTURED_REPLY, NBD_REP_ERR_UNSUP, &[]).await?;
+    send_option_reply(writer, NBD_OPT_STRUCTURED_REPLY, NBD_REP_ERR_UNSUP, &[]).await?;
+    writer.flush().await?;
     Ok(())
 }
 
-async fn send_option_reply(
-    stream: &mut TcpStream,
+async fn send_option_reply<W>(
+    writer: &mut W,
     option: u32,
     reply_type: u32,
     data: &[u8],
-) -> io::Result<()> {
-    stream.write_u64(NBD_REPLY_MAGIC).await?;
-    stream.write_u32(option).await?;
-    stream.write_u32(reply_type).await?;
-    stream.write_u32(data.len() as u32).await?;
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    writer.write_u64(NBD_REPLY_MAGIC).await?;
+    writer.write_u32(option).await?;
+    writer.write_u32(reply_type).await?;
+    writer.write_u32(data.len() as u32).await?;
     if !data.is_empty() {
-        stream.write_all(data).await?;
+        writer.write_all(data).await?;
     }
     Ok(())
 }
 
-async fn handle_transmission(
-    stream: &mut TcpStream,
+async fn handle_transmission<R, W>(
+    mut reader: R,
+    mut writer: W,
     filesystem: Arc<SlateDbFs>,
     device: NBDDevice,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     use zerofs_nfsserve::nfs::nfsstring;
     use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
@@ -452,7 +502,7 @@ async fn handle_transmission(
 
     loop {
         // Read request header
-        let magic = stream.read_u32().await?;
+        let magic = reader.read_u32().await?;
         if magic != NBD_REQUEST_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -460,11 +510,11 @@ async fn handle_transmission(
             ));
         }
 
-        let flags = stream.read_u16().await?;
-        let cmd_type = stream.read_u16().await?;
-        let cookie = stream.read_u64().await?;
-        let offset = stream.read_u64().await?;
-        let length = stream.read_u32().await?;
+        let flags = reader.read_u16().await?;
+        let cmd_type = reader.read_u16().await?;
+        let cookie = reader.read_u64().await?;
+        let offset = reader.read_u64().await?;
+        let length = reader.read_u32().await?;
 
         debug!(
             "NBD command: type={}, offset={}, length={}",
@@ -473,13 +523,22 @@ async fn handle_transmission(
 
         let error = match cmd_type {
             NBD_CMD_READ => {
-                handle_read_command(&filesystem, device_inode, stream, cookie, offset, length).await
+                handle_read_command(
+                    &filesystem,
+                    device_inode,
+                    &mut writer,
+                    cookie,
+                    offset,
+                    length,
+                )
+                .await
             }
             NBD_CMD_WRITE => {
                 handle_write_command(
                     &filesystem,
                     device_inode,
-                    stream,
+                    &mut reader,
+                    &mut writer,
                     cookie,
                     offset,
                     length,
@@ -491,15 +550,25 @@ async fn handle_transmission(
                 info!("Client disconnecting");
                 return Ok(());
             }
-            NBD_CMD_FLUSH => handle_flush_command(&filesystem, device_inode, stream, cookie).await,
+            NBD_CMD_FLUSH => {
+                handle_flush_command(&filesystem, device_inode, &mut writer, cookie).await
+            }
             NBD_CMD_TRIM => {
-                handle_trim_command(&filesystem, device_inode, stream, cookie, offset, length).await
+                handle_trim_command(
+                    &filesystem,
+                    device_inode,
+                    &mut writer,
+                    cookie,
+                    offset,
+                    length,
+                )
+                .await
             }
             NBD_CMD_WRITE_ZEROES => {
                 handle_write_zeroes_command(
                     &filesystem,
                     device_inode,
-                    stream,
+                    &mut writer,
                     cookie,
                     offset,
                     length,
@@ -507,7 +576,7 @@ async fn handle_transmission(
                 .await
             }
             _ => {
-                let _ = send_simple_reply(stream, cookie, NBD_EINVAL, &[]).await;
+                let _ = send_simple_reply(&mut writer, cookie, NBD_EINVAL, &[]).await;
                 0
             }
         };
@@ -518,14 +587,17 @@ async fn handle_transmission(
     }
 }
 
-async fn handle_read_command(
+async fn handle_read_command<W>(
     filesystem: &SlateDbFs,
     inode: u64,
-    stream: &mut TcpStream,
+    writer: &mut W,
     cookie: u64,
     offset: u64,
     length: u32,
-) -> u32 {
+) -> u32
+where
+    W: AsyncWriteExt + Unpin,
+{
     use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
     let auth = AuthContext {
@@ -536,27 +608,33 @@ async fn handle_read_command(
 
     match filesystem.read(&auth, inode, offset, length).await {
         Ok((data, _)) => {
-            if send_simple_reply(stream, cookie, 0, &data).await.is_err() {
+            if send_simple_reply(writer, cookie, 0, &data).await.is_err() {
                 return NBD_EIO;
             }
             0
         }
         Err(_) => {
-            let _ = send_simple_reply(stream, cookie, NBD_EIO, &[]).await;
+            let _ = send_simple_reply(writer, cookie, NBD_EIO, &[]).await;
             NBD_EIO
         }
     }
 }
 
-async fn handle_write_command(
+#[allow(clippy::too_many_arguments)]
+async fn handle_write_command<R, W>(
     filesystem: &SlateDbFs,
     inode: u64,
-    stream: &mut TcpStream,
+    reader: &mut R,
+    writer: &mut W,
     cookie: u64,
     offset: u64,
     length: u32,
     _flags: u16,
-) -> u32 {
+) -> u32
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
     let auth = AuthContext {
@@ -566,70 +644,79 @@ async fn handle_write_command(
     };
 
     let mut data = vec![0u8; length as usize];
-    if stream.read_exact(&mut data).await.is_err() {
-        let _ = send_simple_reply(stream, cookie, NBD_EIO, &[]).await;
+    if reader.read_exact(&mut data).await.is_err() {
+        let _ = send_simple_reply(writer, cookie, NBD_EIO, &[]).await;
         return NBD_EIO;
     }
 
     match filesystem.write(&auth, inode, offset, &data).await {
         Ok(_) => {
             // Note: FUA (Force Unit Access) is handled by the filesystem layer
-            if send_simple_reply(stream, cookie, 0, &[]).await.is_err() {
+            if send_simple_reply(writer, cookie, 0, &[]).await.is_err() {
                 return NBD_EIO;
             }
             0
         }
         Err(_) => {
-            let _ = send_simple_reply(stream, cookie, NBD_EIO, &[]).await;
+            let _ = send_simple_reply(writer, cookie, NBD_EIO, &[]).await;
             NBD_EIO
         }
     }
 }
 
-async fn handle_flush_command(
+async fn handle_flush_command<W>(
     filesystem: &SlateDbFs,
     _inode: u64,
-    stream: &mut TcpStream,
+    writer: &mut W,
     cookie: u64,
-) -> u32 {
+) -> u32
+where
+    W: AsyncWriteExt + Unpin,
+{
     match filesystem.db.flush().await {
         Ok(_) => {
-            if send_simple_reply(stream, cookie, 0, &[]).await.is_err() {
+            if send_simple_reply(writer, cookie, 0, &[]).await.is_err() {
                 return NBD_EIO;
             }
             0
         }
         Err(e) => {
             error!("NBD flush failed: {}", e);
-            let _ = send_simple_reply(stream, cookie, NBD_EIO, &[]).await;
+            let _ = send_simple_reply(writer, cookie, NBD_EIO, &[]).await;
             NBD_EIO
         }
     }
 }
 
-async fn handle_trim_command(
+async fn handle_trim_command<W>(
     _filesystem: &SlateDbFs,
     _inode: u64,
-    stream: &mut TcpStream,
+    writer: &mut W,
     cookie: u64,
     _offset: u64,
     _length: u32,
-) -> u32 {
+) -> u32
+where
+    W: AsyncWriteExt + Unpin,
+{
     // Just reply success - ZeroFS handles sparse storage automatically
-    if send_simple_reply(stream, cookie, 0, &[]).await.is_err() {
+    if send_simple_reply(writer, cookie, 0, &[]).await.is_err() {
         return NBD_EIO;
     }
     0
 }
 
-async fn handle_write_zeroes_command(
+async fn handle_write_zeroes_command<W>(
     filesystem: &SlateDbFs,
     inode: u64,
-    stream: &mut TcpStream,
+    writer: &mut W,
     cookie: u64,
     offset: u64,
     length: u32,
-) -> u32 {
+) -> u32
+where
+    W: AsyncWriteExt + Unpin,
+{
     use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
     let auth = AuthContext {
@@ -641,29 +728,33 @@ async fn handle_write_zeroes_command(
 
     match filesystem.write(&auth, inode, offset, &zero_data).await {
         Ok(_) => {
-            if send_simple_reply(stream, cookie, 0, &[]).await.is_err() {
+            if send_simple_reply(writer, cookie, 0, &[]).await.is_err() {
                 return NBD_EIO;
             }
             0
         }
         Err(_) => {
-            let _ = send_simple_reply(stream, cookie, NBD_EIO, &[]).await;
+            let _ = send_simple_reply(writer, cookie, NBD_EIO, &[]).await;
             NBD_EIO
         }
     }
 }
 
-async fn send_simple_reply(
-    stream: &mut TcpStream,
+async fn send_simple_reply<W>(
+    writer: &mut W,
     cookie: u64,
     error: u32,
     data: &[u8],
-) -> io::Result<()> {
-    stream.write_u32(NBD_SIMPLE_REPLY_MAGIC).await?;
-    stream.write_u32(error).await?;
-    stream.write_u64(cookie).await?;
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    writer.write_u32(NBD_SIMPLE_REPLY_MAGIC).await?;
+    writer.write_u32(error).await?;
+    writer.write_u64(cookie).await?;
     if !data.is_empty() {
-        stream.write_all(data).await?;
+        writer.write_all(data).await?;
     }
+    writer.flush().await?;
     Ok(())
 }
