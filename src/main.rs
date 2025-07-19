@@ -332,7 +332,8 @@ impl NFSFileSystem for SlateDbFs {
     }
 }
 
-const HOSTPORT: u32 = 2049;
+const DEFAULT_NFS_IP: &'static str = "127.0.0.1";
+const DEFAULT_NFS_PORT: u32 = 2049;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -468,11 +469,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fs_arc = Arc::new(fs);
 
     // Start NFS server
+    let zerofs_nfs_host_ip = std::env::var("ZEROFS_NFS_HOST_IP")
+        .unwrap_or_else(|_| DEFAULT_NFS_IP.to_string());
+
+    let zerofs_nfs_host_port = std::env::var("ZEROFS_NFS_HOST_PORT")
+        .map_or_else(|_| Ok(DEFAULT_NFS_PORT), |port| port.parse::<u32>())
+        .expect("ZEROFS_NFS_HOST_PORT must be a valid port number");
+
     let nfs_fs = Arc::clone(&fs_arc);
     let nfs_handle = tokio::spawn(async move {
         let listener =
-            NFSTcpListener::bind(&format!("127.0.0.1:{HOSTPORT}"), (*nfs_fs).clone()).await?;
-        info!("NFS server listening on 127.0.0.1:{}", HOSTPORT);
+            NFSTcpListener::bind(&format!("{zerofs_nfs_host_ip}:{zerofs_nfs_host_port}"), (*nfs_fs).clone()).await?;
+        info!("NFS server listening on {zerofs_nfs_host_ip}:{zerofs_nfs_host_port}");
         listener.handle_forever().await
     });
 
