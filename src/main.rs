@@ -15,7 +15,7 @@ mod test_helpers;
 mod posix_tests;
 
 use crate::cache::{CacheKey, CacheValue};
-use crate::filesystem::{CacheConfig, S3Config, SlateDbFs};
+use crate::filesystem::{CacheConfig, SlateDbFs};
 use crate::inode::Inode;
 use crate::nbd::NBDServer;
 use async_trait::async_trait;
@@ -350,18 +350,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let s3_config = S3Config {
-        endpoint: std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "".to_string()),
-        bucket_name: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "slatedb".to_string()),
-        access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "".to_string()),
-        secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
-            .unwrap_or_else(|_| "".to_string()),
-        region: std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        allow_http: std::env::var("AWS_ALLOW_HTTP").unwrap_or_else(|_| "false".to_string())
-            == "true",
-    };
-
     let db_path = args.get(1).cloned().unwrap_or_else(|| "test".to_string());
+    let url = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "s3://slatedb".to_string());
 
     let cache_config = CacheConfig {
         root_folder: std::env::var("SLATEDB_CACHE_DIR")
@@ -379,14 +372,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("SLATEDB_CACHE_SIZE_GB must be a positive number".into());
     }
 
-    info!("Starting SlateDB NFS server with S3 backend");
+    let (object_store, _) = object_store::parse_url_opts(
+        &url.parse()?,
+        std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v)),
+    )?;
+    let object_store = Arc::new(object_store);
 
-    if !s3_config.endpoint.is_empty() {
-        info!("S3 Endpoint: {}", s3_config.endpoint);
-    }
-    info!("S3 Bucket: {}", s3_config.bucket_name);
-    info!("S3 Region: {}", s3_config.region);
-    info!("S3 Path: {}", db_path);
+    info!("Starting SlateDB NFS server with {} backend", object_store);
+    info!("DB Path: {}", db_path);
     info!("Cache Directory: {}", cache_config.root_folder);
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
@@ -408,8 +401,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Loading or initializing encryption key");
 
-    let temp_fs = SlateDbFs::dangerous_new_with_s3_unencrypted_for_key_management_only(
-        s3_config.clone(),
+    let temp_fs = SlateDbFs::dangerous_new_with_object_store_unencrypted_for_key_management_only(
+        object_store.clone(),
         cache_config.clone(),
         db_path.clone(),
     )
@@ -458,7 +451,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Encryption key loaded successfully");
 
-    let fs = SlateDbFs::new_with_s3(s3_config, cache_config, db_path, encryption_key).await?;
+    let fs = SlateDbFs::new_with_object_store(object_store, cache_config, db_path, encryption_key)
+        .await?;
 
     // Parse NBD device configuration from environment
     let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());
