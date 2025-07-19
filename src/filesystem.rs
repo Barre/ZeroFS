@@ -19,12 +19,6 @@ const SLATEDB_BLOCK_SIZE: usize = 64 * 1024;
 use crate::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-fn get_current_uid_gid() -> (u32, u32) {
-    unsafe { (libc::getuid(), libc::getgid()) }
-}
-
-#[cfg(not(unix))]
 fn get_current_uid_gid() -> (u32, u32) {
     (0, 0)
 }
