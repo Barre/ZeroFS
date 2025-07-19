@@ -426,4 +426,140 @@ impl SlateDbFs {
             _ => Err(nfsstat3::NFS3ERR_ISDIR),
         }
     }
+
+    pub async fn trim(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), nfsstat3> {
+        debug!(
+            "Processing trim on inode {} at offset {} length {}",
+            id, offset, length
+        );
+
+        let _guard = self.lock_manager.acquire_write(id).await;
+        let inode = self.load_inode(id).await?;
+
+        let creds = Credentials::from_auth_context(auth);
+
+        // Owner can always trim their files
+        match &inode {
+            Inode::File(file) if creds.uid != file.uid => {
+                check_access(&inode, &creds, AccessMode::Write)?;
+            }
+            Inode::File(_) => {}
+            _ => return Err(nfsstat3::NFS3ERR_ISDIR),
+        }
+
+        let file = match &inode {
+            Inode::File(f) => f,
+            _ => return Err(nfsstat3::NFS3ERR_ISDIR),
+        };
+
+        let end_offset = offset + length;
+        let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
+        let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
+
+        let mut batch = self.db.new_write_batch();
+
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
+            let chunk_end = chunk_start + CHUNK_SIZE as u64;
+
+            if chunk_start >= file.size {
+                continue;
+            }
+
+            let chunk_key = Self::chunk_key_by_index(id, chunk_idx);
+
+            // Check if entire chunk is being trimmed
+            if offset <= chunk_start && end_offset >= chunk_end {
+                // Delete the entire chunk
+                batch.delete_bytes(&chunk_key);
+
+                let cache_key = CacheKey::Block {
+                    inode_id: id,
+                    block_index: chunk_idx as u64,
+                };
+                self.metadata_cache.remove(cache_key);
+            } else {
+                // Partial trim - need to zero out the trimmed portion
+                let trim_start = if offset > chunk_start {
+                    (offset - chunk_start) as usize
+                } else {
+                    0
+                };
+
+                let trim_end = if end_offset < chunk_end {
+                    (end_offset - chunk_start) as usize
+                } else {
+                    CHUNK_SIZE
+                };
+
+                // Load existing chunk data
+                let mut chunk_data = vec![0u8; CHUNK_SIZE];
+                let mut has_data = false;
+
+                if let Some(existing_data) = self
+                    .db
+                    .get_bytes(&chunk_key)
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                {
+                    let copy_len = existing_data.len().min(CHUNK_SIZE);
+                    chunk_data[..copy_len].copy_from_slice(&existing_data[..copy_len]);
+                    has_data = true;
+                }
+
+                if has_data {
+                    chunk_data[trim_start..trim_end].fill(0);
+
+                    if chunk_data.iter().all(|&b| b == 0) {
+                        batch.delete_bytes(&chunk_key);
+
+                        let cache_key = CacheKey::Block {
+                            inode_id: id,
+                            block_index: chunk_idx as u64,
+                        };
+                        self.metadata_cache.remove(cache_key);
+                    } else {
+                        let chunk_size_in_file =
+                            std::cmp::min(CHUNK_SIZE, (file.size - chunk_start) as usize);
+                        batch
+                            .put_bytes(&chunk_key, &chunk_data[..chunk_size_in_file])
+                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+                        let cache_key = CacheKey::Block {
+                            inode_id: id,
+                            block_index: chunk_idx as u64,
+                        };
+                        self.metadata_cache.remove(cache_key);
+                    }
+                }
+            }
+        }
+
+        if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES {
+            let cache_key = CacheKey::SmallFile(id);
+            self.small_file_cache.remove(cache_key);
+        }
+
+        self.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to commit trim batch: {}", e);
+                nfsstat3::NFS3ERR_IO
+            })?;
+
+        debug!("Trim completed successfully for inode {}", id);
+        Ok(())
+    }
 }
