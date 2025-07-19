@@ -1,4 +1,4 @@
-# ZeroFS - The S3FS That Doesn't Suck
+# ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
 
 ZeroFS makes S3 storage feel like a real filesystem. Built on [SlateDB](https://github.com/slatedb/slatedb), it provides both **file-level access via NFS** and **block-level access via NBD**. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
