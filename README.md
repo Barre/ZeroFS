@@ -316,6 +316,76 @@ These are standard pgbench runs with 50 concurrent clients. The underlying data 
         (us-east) (eu-west) (ap-south) (us-west) (eu-north) (ap-east)
 ```
 
+### CAP Theorem
+
+[From Wikipedia](https://en.wikipedia.org/wiki/CAP_theorem)
+
+
+> In database theory, the **CAP theorem**, also named **Brewer's theorem** after computer scientist Eric Brewer, states that any distributed data store can provide at most two of the following three guarantees:[1][2][3]
+>
+> ### Consistency
+>
+> Every read receives the most recent write or an error. Consistency as defined in the CAP theorem is quite different from the consistency guaranteed in ACID database transactions.[4]
+>
+> ### Availability
+>
+> Every request received by a non-failing node in the system must result in a response. This is the definition of availability in CAP theorem as defined by Gilbert and Lynch.[1] Availability as defined in CAP theorem is different from high availability in software architecture.[5]
+>
+> ### Partition Tolerance
+>
+> The system continues to operate despite an arbitrary number of messages being dropped (or delayed) by the network between nodes.
+>
+> When a network partition failure happens, it must be decided whether to do one of the following:
+>
+> - Cancel the operation and thus decrease the availability but ensure consistency
+> - Proceed with the operation and thus provide availability but risk inconsistency. This does not necessarily mean that system is highly available to its users.[5]
+>
+> Thus, if there is a network partition, one has to choose between consistency or availability.
+
+
+In an architecture that looks like
+
+```
+  Client A ←→ Client B ←→ Client C
+     ↓           ↓           ↓
+     ├───────────┼───────────┤
+     ↓           ↓           ↓
+  PG Node 1   PG Node 2   PG Node 3
+     ↓           ↓           ↓
+     └───────────┼───────────┘
+                 ↓
+          Shared ZFS Pool
+                 ↓
+          Global ZeroFS
+```
+
+The architecture ensures only ONE node has read-write access at any time:
+
+1. Normal operation: Primary has ZFS mounted RW, standby unmounted.
+2. Partition detected: Client fences primary (ensures it can't write, through ZeroFS) by mounting the block devices, ZeroFS and then the pool.
+3. Client mounts ZFS RW on standby and starts PostgreSQL there
+4. If primary returns, it can't mount (ZeroFS will fence it, only a single writer is allowed )
+
+The client orchestrates exclusive access. There's never a moment where two nodes could write, because:
+
+- ZeroFS acquires exclusive access to the database
+- Fencing ensures the old primary can't suddenly start writing
+- The shared storage itself provides the coordination
+
+So we get:
+
+- Consistency: Only one writer exists at any moment
+- Availability: Client can always promote an accessible node
+- Partition tolerance: System continues despite network partition
+
+The "shared" in "shared ZFS pool" means shared access capability, not concurrent access.
+
+> Thus, if there is a network partition, one has to choose between consistency or availability.
+
+It seems that we are able to maintain all three CAP properties in case of network paritions.
+
+If anyone has a rebutal for this please open an issue! :)
+
 ## Why NFS?
 
 We chose NFS because it's supported everywhere - macOS, Linux, Windows, BSD - without requiring any additional software. The client-side kernel implementation is highly optimized, while our server can remain in userspace with full control over the storage backend.
