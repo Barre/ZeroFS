@@ -34,7 +34,15 @@ impl SlateDbFs {
 
         self.check_parent_execute_permissions(id, &creds).await?;
 
-        check_access(&inode, &creds, AccessMode::Write)?;
+        // NFS RFC 1813 section 4.4 suggests that servers should allow the owner of a file
+        // to access it regardless of permission settings, to better emulate POSIX semantics
+        // where a file descriptor retains its access rights even if the file mode changes.
+        match &inode {
+            Inode::File(file) if creds.uid != file.uid => {
+                check_access(&inode, &creds, AccessMode::Write)?;
+            }
+            _ => {} // Owner can always write to their own files
+        }
 
         match &mut inode {
             Inode::File(file) => {
