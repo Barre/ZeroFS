@@ -15,7 +15,7 @@ mod test_helpers;
 #[cfg(test)]
 mod posix_tests;
 
-use crate::filesystem::{CacheConfig, S3Config, SlateDbFs};
+use crate::filesystem::{CacheConfig, SlateDbFs};
 use crate::nbd::NBDServer;
 use std::sync::Arc;
 use tracing::info;
@@ -79,10 +79,7 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!();
         eprintln!("{YELLOW}Optional AWS S3 Configuration:{RESET}");
         eprintln!(
-            "  {BLUE}AWS_ENDPOINT_URL{RESET}               - S3 endpoint URL (default: AWS S3)"
-        );
-        eprintln!(
-            "  {BLUE}AWS_S3_BUCKET{RESET}                  - S3 bucket name (default: slatedb)"
+            "  {BLUE}AWS_ENDPOINT{RESET}                   - S3 endpoint URL (default: AWS S3)"
         );
         eprintln!("  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key");
         eprintln!("  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key");
@@ -126,19 +123,18 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  export SLATEDB_CACHE_DIR=/tmp/zerofs-cache");
         eprintln!("  export SLATEDB_CACHE_SIZE_GB=10");
         eprintln!("  export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'");
-        eprintln!("  zerofs [path]");
+        eprintln!("  zerofs [url]");
         eprintln!();
         eprintln!("{CYAN}With S3 backend:{RESET}");
         eprintln!("  export AWS_ACCESS_KEY_ID='your-access-key'");
         eprintln!("  export AWS_SECRET_ACCESS_KEY='your-secret-key'");
-        eprintln!("  export AWS_S3_BUCKET='my-bucket'");
         eprintln!("  # ... other required vars ...");
-        eprintln!("  zerofs s3://my-bucket/path");
+        eprintln!("  zerofs s3://my-bucket/prefix");
         eprintln!();
         eprintln!("{CYAN}Change encryption password:{RESET}");
         eprintln!("  export ZEROFS_NEW_PASSWORD='new-password'");
         eprintln!("  # ... other required vars ...");
-        eprintln!("  zerofs [path]");
+        eprintln!("  zerofs [url]");
 
         std::process::exit(1);
     }
@@ -173,18 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let s3_config = S3Config {
-        endpoint: std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "".to_string()),
-        bucket_name: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "slatedb".to_string()),
-        access_key_id: std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_else(|_| "".to_string()),
-        secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")
-            .unwrap_or_else(|_| "".to_string()),
-        region: std::env::var("AWS_DEFAULT_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        allow_http: std::env::var("AWS_ALLOW_HTTP").unwrap_or_else(|_| "false".to_string())
-            == "true",
-    };
-
-    let db_path = args.get(1).cloned().unwrap_or_else(|| "test".to_string());
+    let url = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "s3://slatedb".to_string());
 
     let cache_config = CacheConfig {
         root_folder: std::env::var("SLATEDB_CACHE_DIR")
@@ -202,14 +190,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("SLATEDB_CACHE_SIZE_GB must be a positive number".into());
     }
 
-    info!("Starting SlateDB NFS server with S3 backend");
+    let (object_store, path_from_url) = object_store::parse_url_opts(
+        &url.parse()?,
+        std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v)),
+    )?;
+    let object_store = Arc::new(object_store);
 
-    if !s3_config.endpoint.is_empty() {
-        info!("S3 Endpoint: {}", s3_config.endpoint);
-    }
-    info!("S3 Bucket: {}", s3_config.bucket_name);
-    info!("S3 Region: {}", s3_config.region);
-    info!("S3 Path: {}", db_path);
+    let actual_db_path = path_from_url.to_string();
+
+    info!("Starting SlateDB NFS server with {} backend", object_store);
+    info!("DB Path: {}", actual_db_path);
     info!("Cache Directory: {}", cache_config.root_folder);
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
@@ -218,10 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Loading or initializing encryption key");
 
-    let temp_fs = SlateDbFs::dangerous_new_with_s3_unencrypted_for_key_management_only(
-        s3_config.clone(),
+    let temp_fs = SlateDbFs::dangerous_new_with_object_store_unencrypted_for_key_management_only(
+        object_store.clone(),
         cache_config.clone(),
-        db_path.clone(),
+        actual_db_path.clone(),
     )
     .await?;
 
@@ -242,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("  unset ZEROFS_NEW_PASSWORD");
                 info!(
                     "  ZEROFS_ENCRYPTION_PASSWORD='{}' zerofs {}",
-                    new_password, db_path
+                    new_password, url
                 );
                 std::process::exit(0);
             }
@@ -268,7 +258,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Encryption key loaded successfully");
 
-    let fs = SlateDbFs::new_with_s3(s3_config, cache_config, db_path, encryption_key).await?;
+    let fs = SlateDbFs::new_with_object_store(
+        object_store,
+        cache_config,
+        actual_db_path,
+        encryption_key,
+    )
+    .await?;
 
     // Parse NBD device configuration from environment
     let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());

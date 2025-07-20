@@ -7,7 +7,7 @@ Join our community on Discord: https://discord.gg/eGKNQTbG
 
 **Key Features:**
 - **NFS Server** - Mount as a network filesystem on any OS
-- **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem  
+- **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
 - **Always Encrypted** - ChaCha20-Poly1305 encryption with compression
 - **High Performance** - Multi-layered caching with microsecond latencies
 - **S3 Compatible** - Works with any S3-compatible storage
@@ -16,7 +16,7 @@ Join our community on Discord: https://discord.gg/eGKNQTbG
 
 ZeroFS passes all tests in the [pjdfstest_nfs](https://github.com/Barre/pjdfstest_nfs) test suite - 8,662 tests covering POSIX filesystem operations including file operations, permissions, ownership, and more.
 
-We use ZFS as an end-to-end test in our CI. [We create ZFS pools on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/zfs-test.yml), extract the Linux kernel source tree, and run scrub operations to verify data integrity. All operations complete without errors. 
+We use ZFS as an end-to-end test in our CI. [We create ZFS pools on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/zfs-test.yml), extract the Linux kernel source tree, and run scrub operations to verify data integrity. All operations complete without errors.
 
 ## Demo
 
@@ -51,6 +51,15 @@ ZeroFS supports dual-mode access to the same S3-backed storage:
 
 Both modes share the same encrypted, compressed, cached storage backend.
 
+You can also use ZeroFS with any supported object store backend by [object_store](https://crates.io/crates/object_store) crate.
+
+You need to pass a URL as the argument to configure your backend, for example:
+```bash
+zerofs s3://bucket/path
+```
+
+Would use Amazon S3 backend for `slatedb` bucket. See [`object_store`'s documentation](https://docs.rs/object_store/0.12.3/object_store/enum.ObjectStoreScheme.html#supported-formats) for all supported formats.
+
 ### Required Environment Variables
 
 - `SLATEDB_CACHE_DIR`: Directory path for SlateDB disk cache (required)
@@ -59,8 +68,9 @@ Both modes share the same encrypted, compressed, cached storage backend.
 
 ### Optional Environment Variables
 
-- `AWS_ENDPOINT_URL`: S3-compatible endpoint URL
-- `AWS_S3_BUCKET`: S3 bucket name (default: `"slatedb"`)
+You can configure your object store with optional set of environment variables depending on your backing implementation. For example, if you're using an Amazon S3 backend:
+
+- `AWS_ENDPOINT`: S3-compatible endpoint URL
 - `AWS_ACCESS_KEY_ID`: AWS access key ID
 - `AWS_SECRET_ACCESS_KEY`: AWS secret access key
 - `AWS_DEFAULT_REGION`: AWS region (default: `"us-east-1"`)
@@ -72,13 +82,15 @@ Both modes share the same encrypted, compressed, cached storage backend.
 - `ZEROFS_NBD_DEVICE_SIZES_GB`: Comma-separated list of device sizes in GB (optional, must match `ZEROFS_NBD_PORTS` count)
 - `ZEROFS_MEMORY_CACHE_SIZE_GB`: Size of ZeroFS in-memory cache in GB (optional, default: 0.25GB)
 
+See [Available `ObjectStore` Implementations](https://docs.rs/object_store/0.12.3/object_store/index.html#available-objectstore-implementations) for other environment variables.
+
 ### Encryption
 
 Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with zstd compression. A password is required to start the filesystem:
 
 ```bash
 # Start ZeroFS with encryption password
-ZEROFS_ENCRYPTION_PASSWORD='your-secure-password' zerofs /path/to/db
+ZEROFS_ENCRYPTION_PASSWORD='your-secure-password' zerofs s3://bucket/path
 ```
 
 #### Password Management
@@ -91,7 +103,7 @@ To change your password:
 # Change the encryption password
 ZEROFS_ENCRYPTION_PASSWORD='current-password' \
 ZEROFS_NEW_PASSWORD='new-password' \
-zerofs /path/to/db
+zerofs s3://bucket/path
 ```
 
 The program will change the password and exit. Then you can use the new password for future runs.
@@ -131,11 +143,11 @@ In addition to NFS, ZeroFS can provide raw block devices through NBD with full T
 ZEROFS_ENCRYPTION_PASSWORD='your-password' \
 ZEROFS_NBD_PORTS='10809,10810,10811' \
 ZEROFS_NBD_DEVICE_SIZES_GB='1,2,5' \
-zerofs /path/to/db
+zerofs s3://bucket/path
 
 # Connect to NBD devices
 nbd-client 127.0.0.1 10809 /dev/nbd0  # 1GB device
-nbd-client 127.0.0.1 10810 /dev/nbd1  # 2GB device  
+nbd-client 127.0.0.1 10810 /dev/nbd1  # 2GB device
 nbd-client 127.0.0.1 10811 /dev/nbd2  # 5GB device
 
 # Use the block devices
@@ -168,7 +180,7 @@ When blocks are trimmed, ZeroFS removes the corresponding chunks from ZeroFS' LS
 
 NBD devices appear as files in the `.nbd` directory when mounted via NFS:
 - `.nbd/device_10809` - 1GB device accessible on port 10809
-- `.nbd/device_10810` - 2GB device accessible on port 10810  
+- `.nbd/device_10810` - 2GB device accessible on port 10810
 - `.nbd/device_10811` - 5GB device accessible on port 10811
 
 You can read/write these files directly through NFS, or access them as block devices through NBD.
@@ -185,26 +197,26 @@ rm /mnt/zerofs/.nbd/device_10809
 Since ZeroFS makes S3 regions look like local block devices, you can create globally distributed ZFS pools by running multiple ZeroFS instances across different regions:
 
 ```bash
-# Terminal 1 - US East  
+# Terminal 1 - US East
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=us-east-1 \
 ZEROFS_NBD_PORTS='10809' \
 ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs us-east-db
+zerofs s3://my-bucket/us-east-db
 
 # Terminal 2 - EU West
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=eu-west-1 \
 ZEROFS_NBD_PORTS='10810' \
 ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs eu-west-db
+zerofs s3://my-bucket/eu-west-db
 
-# Terminal 3 - Asia Pacific  
+# Terminal 3 - Asia Pacific
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=ap-southeast-1 \
 ZEROFS_NBD_PORTS='10811' \
 ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs asia-db
+zerofs s3://my-bucket/asia-db
 ```
 
 Then connect to all three NBD devices and create a geo-distributed ZFS pool:
@@ -212,7 +224,7 @@ Then connect to all three NBD devices and create a geo-distributed ZFS pool:
 ```bash
 # Connect to NBD devices from each region
 nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809  # US East
-nbd-client 127.0.0.2 10810 /dev/nbd1 -N device_10810  # EU West  
+nbd-client 127.0.0.2 10810 /dev/nbd1 -N device_10810  # EU West
 nbd-client 127.0.0.3 10811 /dev/nbd2 -N device_10811  # Asia Pacific
 
 # Create a mirrored pool across continents using raw block devices
@@ -222,7 +234,7 @@ zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2
 **Result**: Your ZFS pool now spans three continents with automatic:
 
 - **Disaster recovery** - If any region goes down, your data remains available
-- **Geographic redundancy** - Data is simultaneously stored in multiple regions  
+- **Geographic redundancy** - Data is simultaneously stored in multiple regions
 - **Infinite scalability** - Add more regions by spinning up additional ZeroFS instances
 
 This turns expensive geo-distributed storage infrastructure into a few simple commands.
