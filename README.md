@@ -534,4 +534,3 @@ Key-Value Store:
 ## Future Enhancements
 
 - [ ] Snapshot capabilities using SlateDB's checkpoints
-

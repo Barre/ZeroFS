@@ -29,9 +29,127 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 const HOSTPORT: u32 = 2049;
 
+// ANSI color codes
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const BLUE: &str = "\x1b[34m";
+const CYAN: &str = "\x1b[36m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
+
+fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
+    let mut missing_vars = Vec::new();
+
+    if std::env::var("SLATEDB_CACHE_DIR").is_err() {
+        missing_vars.push("SLATEDB_CACHE_DIR");
+    }
+
+    if std::env::var("SLATEDB_CACHE_SIZE_GB").is_err() {
+        missing_vars.push("SLATEDB_CACHE_SIZE_GB");
+    }
+
+    if std::env::var("ZEROFS_ENCRYPTION_PASSWORD").is_err() {
+        missing_vars.push("ZEROFS_ENCRYPTION_PASSWORD");
+    }
+
+    if !missing_vars.is_empty() {
+        eprintln!(
+            "{}{}Error:{} Missing required environment variables: {}{}{}",
+            BOLD,
+            RED,
+            RESET,
+            RED,
+            missing_vars.join(", "),
+            RESET
+        );
+        eprintln!();
+        eprintln!("{BOLD}{CYAN}ZeroFS Configuration Guide{RESET}");
+        eprintln!("{CYAN}==========================={RESET}");
+        eprintln!();
+        eprintln!("{YELLOW}Required Environment Variables:{RESET}");
+        eprintln!(
+            "  {BOLD}SLATEDB_CACHE_DIR{RESET}              - Local directory for caching data"
+        );
+        eprintln!(
+            "  {BOLD}SLATEDB_CACHE_SIZE_GB{RESET}          - Maximum cache size in GB (e.g., 10)"
+        );
+        eprintln!("  {BOLD}ZEROFS_ENCRYPTION_PASSWORD{RESET}     - Password for data encryption");
+        eprintln!();
+        eprintln!("{YELLOW}Optional AWS S3 Configuration:{RESET}");
+        eprintln!(
+            "  {BLUE}AWS_ENDPOINT_URL{RESET}               - S3 endpoint URL (default: AWS S3)"
+        );
+        eprintln!(
+            "  {BLUE}AWS_S3_BUCKET{RESET}                  - S3 bucket name (default: slatedb)"
+        );
+        eprintln!("  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key");
+        eprintln!("  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key");
+        eprintln!(
+            "  {BLUE}AWS_DEFAULT_REGION{RESET}             - AWS region (default: us-east-1)"
+        );
+        eprintln!(
+            "  {BLUE}AWS_ALLOW_HTTP{RESET}                 - Allow HTTP endpoints (default: false)"
+        );
+        eprintln!();
+        eprintln!("{YELLOW}Optional ZeroFS Configuration:{RESET}");
+        eprintln!("  {BLUE}ZEROFS_MEMORY_CACHE_SIZE_GB{RESET}    - Memory cache size in GB");
+        eprintln!(
+            "  {BLUE}ZEROFS_NBD_PORTS{RESET}               - Comma-separated NBD server ports"
+        );
+        eprintln!(
+            "  {BLUE}ZEROFS_NBD_DEVICE_SIZES_GB{RESET}     - Comma-separated NBD device sizes in GB"
+        );
+        eprintln!(
+            "  {BLUE}ZEROFS_NEW_PASSWORD{RESET}            - New password when changing encryption"
+        );
+        eprintln!();
+        eprintln!("{YELLOW}Logging Configuration:{RESET}");
+        eprintln!(
+            "  {BLUE}RUST_LOG{RESET}                       - Log level (default: error,zerofs=info)"
+        );
+        eprintln!();
+        eprintln!("{GREEN}Usage Examples:{RESET}");
+        eprintln!("{GREEN}---------------{RESET}");
+        eprintln!();
+        eprintln!("{CYAN}Basic usage:{RESET}");
+        eprintln!("  export SLATEDB_CACHE_DIR=/tmp/zerofs-cache");
+        eprintln!("  export SLATEDB_CACHE_SIZE_GB=10");
+        eprintln!("  export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'");
+        eprintln!("  zerofs [path]");
+        eprintln!();
+        eprintln!("{CYAN}With S3 backend:{RESET}");
+        eprintln!("  export AWS_ACCESS_KEY_ID='your-access-key'");
+        eprintln!("  export AWS_SECRET_ACCESS_KEY='your-secret-key'");
+        eprintln!("  export AWS_S3_BUCKET='my-bucket'");
+        eprintln!("  # ... other required vars ...");
+        eprintln!("  zerofs s3://my-bucket/path");
+        eprintln!();
+        eprintln!("{CYAN}Change encryption password:{RESET}");
+        eprintln!("  export ZEROFS_NEW_PASSWORD='new-password'");
+        eprintln!("  # ... other required vars ...");
+        eprintln!("  zerofs [path]");
+
+        std::process::exit(1);
+    }
+
+    if let Ok(size_str) = std::env::var("SLATEDB_CACHE_SIZE_GB") {
+        if size_str.parse::<f64>().is_err() {
+            eprintln!("{BOLD}{RED}Error:{RESET} SLATEDB_CACHE_SIZE_GB must be a valid number");
+            eprintln!("Current value: {RED}'{size_str}'{RESET}");
+            eprintln!("Example: {GREEN}SLATEDB_CACHE_SIZE_GB=10{RESET}");
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tracing_subscriber::EnvFilter;
+
+    validate_environment()?;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // Default: info for zerofs, error for slatedb to reduce noise
@@ -85,21 +203,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Cache Directory: {}", cache_config.root_folder);
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
-    let password = match std::env::var("ZEROFS_ENCRYPTION_PASSWORD") {
-        Ok(pwd) => pwd,
-        Err(_) => {
-            eprintln!("Error: ZEROFS_ENCRYPTION_PASSWORD environment variable is required");
-            eprintln!();
-            eprintln!("Usage:");
-            eprintln!("  ZEROFS_ENCRYPTION_PASSWORD='your-password' zerofs <path>");
-            eprintln!();
-            eprintln!("To change password:");
-            eprintln!(
-                "  ZEROFS_ENCRYPTION_PASSWORD='current-password' ZEROFS_NEW_PASSWORD='new-password' zerofs <path>"
-            );
-            std::process::exit(1);
-        }
-    };
+    let password = std::env::var("ZEROFS_ENCRYPTION_PASSWORD")
+        .expect("ZEROFS_ENCRYPTION_PASSWORD should be validated");
 
     info!("Loading or initializing encryption key");
 
