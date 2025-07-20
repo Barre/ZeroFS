@@ -329,12 +329,13 @@ impl NFSFileSystem for SlateDbFs {
     }
 }
 
-pub async fn start_nfs_server(
+pub async fn start_nfs_server_with_config(
     filesystem: SlateDbFs,
-    hostport: u32,
+    host: &str,
+    port: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = NFSTcpListener::bind(&format!("127.0.0.1:{hostport}"), filesystem).await?;
-    info!("NFS server listening on 127.0.0.1:{}", hostport);
+    let listener = NFSTcpListener::bind(&format!("{host}:{port}"), filesystem).await?;
+    info!("NFS server listening on {}:{}", host, port);
     listener
         .handle_forever()
         .await

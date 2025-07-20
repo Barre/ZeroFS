@@ -60,13 +60,16 @@ Both modes share the same encrypted, compressed, cached storage backend.
 ### Optional Environment Variables
 
 - `AWS_ENDPOINT_URL`: S3-compatible endpoint URL
-- `AWS_S3_BUCKET`: S3 bucket name (default: "slatedb")
+- `AWS_S3_BUCKET`: S3 bucket name (default: `"slatedb"`)
 - `AWS_ACCESS_KEY_ID`: AWS access key ID
 - `AWS_SECRET_ACCESS_KEY`: AWS secret access key
-- `AWS_DEFAULT_REGION`: AWS region (default: "us-east-1")
-- `AWS_ALLOW_HTTP`: Allow HTTP connections (default: "false")
+- `AWS_DEFAULT_REGION`: AWS region (default: `"us-east-1"`)
+- `AWS_ALLOW_HTTP`: Allow HTTP connections (default: `"false"`)
+- `ZEROFS_NFS_HOST`: Address (IP or hostname) to bind the NFS TCP socket (default: `"127.0.0.1"`)
+- `ZEROFS_NFS_HOST_PORT`: Port to bind the NFS TCP socket (default: `2049`)
+- `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP sockets (default: `"127.0.0.1"`)
 - `ZEROFS_NBD_PORTS`: Comma-separated list of ports for NBD servers (optional)
-- `ZEROFS_NBD_DEVICE_SIZES_GB`: Comma-separated list of device sizes in GB (optional, must match NBD_PORTS count)
+- `ZEROFS_NBD_DEVICE_SIZES_GB`: Comma-separated list of device sizes in GB (optional, must match `ZEROFS_NBD_PORTS` count)
 - `ZEROFS_MEMORY_CACHE_SIZE_GB`: Size of ZeroFS in-memory cache in GB (optional, default: 0.25GB)
 
 ### Encryption

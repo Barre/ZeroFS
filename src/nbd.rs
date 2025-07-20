@@ -66,14 +66,16 @@ pub struct NBDDevice {
 pub struct NBDServer {
     filesystem: Arc<SlateDbFs>,
     devices: HashMap<String, NBDDevice>,
+    host: String,
     port: u16,
 }
 
 impl NBDServer {
-    pub fn new(filesystem: Arc<SlateDbFs>, port: u16) -> Self {
+    pub fn new(filesystem: Arc<SlateDbFs>, host: String, port: u16) -> Self {
         Self {
             filesystem,
             devices: HashMap::new(),
+            host,
             port,
         }
     }
@@ -92,8 +94,8 @@ impl NBDServer {
             self.initialize_device(device).await?;
         }
 
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
-        info!("NBD server listening on port {}", self.port);
+        let listener = TcpListener::bind(format!("{}:{}", self.host, self.port)).await?;
+        info!("NBD server listening on {}:{}", self.host, self.port);
 
         loop {
             let (stream, addr) = listener.accept().await?;

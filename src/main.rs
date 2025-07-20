@@ -27,7 +27,8 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-const HOSTPORT: u32 = 2049;
+const DEFAULT_NFS_HOST: &str = "127.0.0.1";
+const DEFAULT_NFS_PORT: u32 = 2049;
 
 // ANSI color codes
 const RED: &str = "\x1b[31m";
@@ -101,7 +102,16 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
             "  {BLUE}ZEROFS_NBD_DEVICE_SIZES_GB{RESET}     - Comma-separated NBD device sizes in GB"
         );
         eprintln!(
+            "  {BLUE}ZEROFS_NBD_HOST{RESET}                - NBD server bind address (default: 127.0.0.1)"
+        );
+        eprintln!(
             "  {BLUE}ZEROFS_NEW_PASSWORD{RESET}            - New password when changing encryption"
+        );
+        eprintln!(
+            "  {BLUE}ZEROFS_NFS_HOST{RESET}                - NFS server bind address (default: 127.0.0.1)"
+        );
+        eprintln!(
+            "  {BLUE}ZEROFS_NFS_HOST_PORT{RESET}           - NFS server port (default: 2049)"
         );
         eprintln!();
         eprintln!("{YELLOW}Logging Configuration:{RESET}");
@@ -264,13 +274,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());
     let nbd_device_sizes =
         std::env::var("ZEROFS_NBD_DEVICE_SIZES_GB").unwrap_or_else(|_| "".to_string());
+    let nbd_host = std::env::var("ZEROFS_NBD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
     let fs_arc = Arc::new(fs);
 
     // Start NFS server
+    let zerofs_nfs_host =
+        std::env::var("ZEROFS_NFS_HOST").unwrap_or_else(|_| DEFAULT_NFS_HOST.to_string());
+
+    let zerofs_nfs_host_port = std::env::var("ZEROFS_NFS_HOST_PORT")
+        .map_or_else(|_| Ok(DEFAULT_NFS_PORT), |port| port.parse::<u32>())
+        .expect("ZEROFS_NFS_HOST_PORT must be a valid port number");
+
     let nfs_fs = Arc::clone(&fs_arc);
     let nfs_handle = tokio::spawn(async move {
-        match crate::nfs::start_nfs_server((*nfs_fs).clone(), HOSTPORT).await {
+        match crate::nfs::start_nfs_server_with_config(
+            (*nfs_fs).clone(),
+            &zerofs_nfs_host,
+            zerofs_nfs_host_port,
+        )
+        .await
+        {
             Ok(()) => Ok(()),
             Err(e) => Err(std::io::Error::other(e.to_string())),
         }
@@ -326,11 +350,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for (&port, &size) in ports.iter().zip(sizes.iter()) {
-            let mut nbd_server = NBDServer::new(Arc::clone(&fs_arc), port);
+            let mut nbd_server = NBDServer::new(Arc::clone(&fs_arc), nbd_host.clone(), port);
             nbd_server.add_device(format!("device_{port}"), size);
 
             info!(
-                "Starting NBD server on port {} with device size {} GB",
+                "Starting NBD server on {}:{} with device size {} GB",
+                nbd_host,
                 port,
                 size as f64 / (1024.0 * 1024.0 * 1024.0)
             );
