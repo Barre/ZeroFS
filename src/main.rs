@@ -74,9 +74,7 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  {BOLD}SLATEDB_CACHE_SIZE_GB{RESET}          - Maximum cache size in GB (e.g., 10)"
         );
-        eprintln!(
-            "  {BOLD}ZEROFS_ENCRYPTION_PASSWORD{RESET}     - Password for data encryption"
-        );
+        eprintln!("  {BOLD}ZEROFS_ENCRYPTION_PASSWORD{RESET}     - Password for data encryption");
         eprintln!();
         eprintln!("{YELLOW}Optional AWS S3 Configuration:{RESET}");
         eprintln!(
@@ -85,12 +83,8 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  {BLUE}AWS_S3_BUCKET{RESET}                  - S3 bucket name (default: slatedb)"
         );
-        eprintln!(
-            "  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key"
-        );
-        eprintln!(
-            "  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key"
-        );
+        eprintln!("  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key");
+        eprintln!("  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key");
         eprintln!(
             "  {BLUE}AWS_DEFAULT_REGION{RESET}             - AWS region (default: us-east-1)"
         );
@@ -99,9 +93,7 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!();
         eprintln!("{YELLOW}Optional ZeroFS Configuration:{RESET}");
-        eprintln!(
-            "  {BLUE}ZEROFS_MEMORY_CACHE_SIZE_GB{RESET}    - Memory cache size in GB"
-        );
+        eprintln!("  {BLUE}ZEROFS_MEMORY_CACHE_SIZE_GB{RESET}    - Memory cache size in GB");
         eprintln!(
             "  {BLUE}ZEROFS_NBD_PORTS{RESET}               - Comma-separated NBD server ports"
         );
@@ -143,9 +135,7 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Ok(size_str) = std::env::var("SLATEDB_CACHE_SIZE_GB") {
         if size_str.parse::<f64>().is_err() {
-            eprintln!(
-                "{BOLD}{RED}Error:{RESET} SLATEDB_CACHE_SIZE_GB must be a valid number"
-            );
+            eprintln!("{BOLD}{RED}Error:{RESET} SLATEDB_CACHE_SIZE_GB must be a valid number");
             eprintln!("Current value: {RED}'{size_str}'{RESET}");
             eprintln!("Example: {GREEN}SLATEDB_CACHE_SIZE_GB=10{RESET}");
             std::process::exit(1);
