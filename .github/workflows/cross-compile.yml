@@ -1,0 +1,108 @@
+name: Cross Compile
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cross-compile:
+    name: Cross compile for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+          - target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+          - target: i686-unknown-linux-gnu
+            arch: i386
+          - target: powerpc64le-unknown-linux-gnu
+            arch: ppc64le
+          - target: s390x-unknown-linux-gnu
+            arch: s390x
+          - target: riscv64gc-unknown-linux-gnu
+            arch: riscv64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        run: |
+          cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare binary
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.arch }}
+          chmod +x artifacts/zerofs-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-${{ matrix.arch }}
+          path: artifacts/zerofs-${{ matrix.arch }}
+          retention-days: 7
+
+  create-release-artifacts:
+    name: Create combined release artifacts
+    needs: cross-compile
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: |
+          ls -la artifacts/
+          ls -la artifacts/*/
+
+      - name: Create tarball
+        run: |
+          mkdir -p release
+          for arch_dir in artifacts/*/; do
+            if [ -d "$arch_dir" ]; then
+              cp "$arch_dir"* release/
+            fi
+          done
+          cd release
+          tar czf ../zerofs-linux-multiarch.tar.gz zerofs-*
+          cd ..
+          sha256sum zerofs-linux-multiarch.tar.gz > zerofs-linux-multiarch.tar.gz.sha256
+
+      - name: Upload combined artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-linux-multiarch
+          path: |
+            zerofs-linux-multiarch.tar.gz
+            zerofs-linux-multiarch.tar.gz.sha256
+          retention-days: 30
+
+      - name: Display SHA256 checksums
+        run: |
+          echo "SHA256 checksums for individual binaries:"
+          cd release
+          sha256sum zerofs-*

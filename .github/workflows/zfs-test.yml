@@ -156,10 +156,219 @@ jobs:
           # Show space usage
           sudo zfs list -o name,used,avail,refer,mountpoint
 
+      - name: Create tarball and checksum for durability test
+        run: |
+          echo "Creating tarball of ZFS data..."
+          cd /mnt/zfsdata
+          sudo tar -czf /tmp/zfsdata-backup.tar.gz .
+          
+          echo "Calculating checksum..."
+          sudo sha256sum /tmp/zfsdata-backup.tar.gz > /tmp/zfsdata-backup.sha256
+          cat /tmp/zfsdata-backup.sha256
+          
+          # Also create checksum of individual files for comparison
+          sudo find . -type f -exec sha256sum {} \; | sort > /tmp/file-checksums.txt
+          echo "Number of files checksummed: $(wc -l < /tmp/file-checksums.txt)"
+
+      - name: Sync and prepare for durability test
+        run: |
+          echo "Syncing filesystem..."
+          sync
+          sudo zpool sync testpool
+          
+          echo "Running ZFS TRIM..."
+          sudo zpool trim testpool
+          
+          # Wait for trim to complete
+          echo "Waiting for TRIM to complete..."
+          while sudo zpool status testpool | grep -q 'trimming'; do
+            sleep 2
+            echo "TRIM in progress..."
+            sudo zpool status testpool
+          done
+          echo "TRIM completed"
+
           echo "Starting ZFS scrub..."
           sudo zpool scrub testpool
-          sleep 5
+          
+          # Wait for scrub to complete
+          echo "Waiting for scrub to complete..."
+          while sudo zpool status testpool | grep -q 'scrub in progress'; do
+            sleep 2
+            echo "Scrub in progress..."
+            sudo zpool status testpool
+          done
+          echo "Scrub completed"
+          
+          # Show final pool status before restart
           sudo zpool status testpool
+
+      - name: Unmount and export ZFS pool
+        run: |
+          echo "Unmounting ZFS filesystem..."
+          sudo zfs unmount testpool/data
+          
+          echo "Exporting ZFS pool..."
+          sudo zpool export testpool
+          
+          # Verify pool is exported
+          if sudo zpool list testpool 2>/dev/null; then
+            echo "ERROR: Pool still imported!"
+            exit 1
+          fi
+          echo "Pool successfully exported"
+
+      - name: Disconnect NBD and stop ZeroFS
+        run: |
+          echo "Disconnecting NBD device..."
+          sudo nbd-client -d /dev/nbd0
+          
+          # Wait for NBD to fully disconnect - check if device is actually in use
+          echo "Waiting for NBD device to disconnect..."
+          for i in {1..10}; do
+            # Check if the NBD device is in use by looking at /sys/block/nbd0/size
+            # When disconnected, this should be 0
+            if [ ! -e /sys/block/nbd0/size ] || [ "$(cat /sys/block/nbd0/size 2>/dev/null)" = "0" ]; then
+              echo "NBD device disconnected successfully"
+              break
+            fi
+            echo "Waiting for NBD disconnect... attempt $i/10"
+            sleep 1
+          done
+          
+          # Also check using nbd-client -c to see if device is connected
+          if sudo nbd-client -c /dev/nbd0 2>/dev/null; then
+            echo "WARNING: NBD device reports as still connected, but continuing..."
+          else
+            echo "NBD device confirmed disconnected"
+          fi
+          
+          echo "Stopping ZeroFS..."
+          # Find and kill the actual zerofs process (not cargo)
+          # First try to find the process
+          ZEROFS_PID=$(pgrep -f "zerofs.*zfs-test" || true)
+          if [ -n "$ZEROFS_PID" ]; then
+            echo "Found ZeroFS process: $ZEROFS_PID"
+            kill -TERM $ZEROFS_PID || true
+          else
+            echo "No ZeroFS process found (may have already stopped)"
+          fi
+          
+          # Wait for ZeroFS to stop
+          for i in {1..10}; do
+            if ! pgrep -f "zerofs.*zfs-test" > /dev/null; then
+              echo "ZeroFS stopped"
+              break
+            fi
+            echo "Waiting for ZeroFS to stop... attempt $i/10"
+            sleep 1
+          done
+          
+          # Final check if ZeroFS stopped
+          if pgrep -f "zerofs.*zfs-test" > /dev/null; then
+            echo "WARNING: ZeroFS may still be running, forcing kill..."
+            pkill -KILL -f "zerofs.*zfs-test" || true
+            sleep 1
+          fi
+          
+          # Ensure port is free
+          echo "Waiting for port 10809 to be free..."
+          for i in {1..10}; do
+            if ! nc -z 127.0.0.1 10809 2>/dev/null; then
+              echo "Port 10809 is free"
+              break
+            fi
+            echo "Waiting for port to be released... attempt $i/10"
+            sleep 1
+          done
+          
+          # Final check
+          if nc -z 127.0.0.1 10809 2>/dev/null; then
+            echo "ERROR: Port 10809 still in use after 10 seconds!"
+            exit 1
+          fi
+
+      - name: Restart ZeroFS
+        run: |
+          echo "Starting ZeroFS again..."
+          AWS_ENDPOINT_URL=http://localhost:9000 \
+          AWS_S3_BUCKET=zerofs-zfs-test \
+          AWS_ACCESS_KEY_ID=minioadmin \
+          AWS_SECRET_ACCESS_KEY=minioadmin \
+          AWS_ALLOW_HTTP=true \
+          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
+          SLATEDB_CACHE_SIZE_GB=2 \
+          ZEROFS_ENCRYPTION_PASSWORD=secret \
+          ZEROFS_NBD_PORTS=10809 \
+          ZEROFS_NBD_DEVICE_SIZES_GB=3 \
+          cargo run --release zfs-test &
+          
+          # Wait for ZeroFS NBD server to start
+          echo "Waiting for ZeroFS NBD server to restart..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "ZeroFS NBD server is ready"
+              break
+            fi
+            sleep 1
+          done
+          
+          # Verify ZeroFS NBD server is running
+          if ! nc -z 127.0.0.1 10809; then
+            echo "ZeroFS NBD server failed to restart"
+            exit 1
+          fi
+
+      - name: Reconnect NBD and import pool
+        run: |
+          echo "Reconnecting NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809
+          
+          # Verify NBD device is available
+          sudo blockdev --getsize64 /dev/nbd0
+          sudo fdisk -l /dev/nbd0
+          
+          echo "Importing ZFS pool..."
+          sudo zpool import testpool
+          
+          # Check pool status
+          sudo zpool status testpool
+          sudo zfs list
+
+      - name: Verify data integrity
+        run: |
+          echo "Creating new tarball of restored data..."
+          cd /mnt/zfsdata
+          sudo tar -czf /tmp/zfsdata-restored.tar.gz .
+          
+          echo "Calculating checksum of restored data..."
+          sudo sha256sum /tmp/zfsdata-restored.tar.gz > /tmp/zfsdata-restored.sha256
+          cat /tmp/zfsdata-restored.sha256
+          
+          # Compare checksums
+          echo "Comparing tarball checksums..."
+          ORIGINAL_SUM=$(cut -d' ' -f1 < /tmp/zfsdata-backup.sha256)
+          RESTORED_SUM=$(cut -d' ' -f1 < /tmp/zfsdata-restored.sha256)
+          
+          if [ "$ORIGINAL_SUM" = "$RESTORED_SUM" ]; then
+            echo "SUCCESS: Checksums match! Data integrity verified."
+          else
+            echo "ERROR: Checksums do not match!"
+            echo "Original: $ORIGINAL_SUM"
+            echo "Restored: $RESTORED_SUM"
+            exit 1
+          fi
+          
+          # Also verify individual file checksums
+          echo "Verifying individual file checksums..."
+          sudo find . -type f -exec sha256sum {} \; | sort > /tmp/file-checksums-restored.txt
+          
+          if diff /tmp/file-checksums.txt /tmp/file-checksums-restored.txt; then
+            echo "SUCCESS: All individual file checksums match!"
+          else
+            echo "ERROR: Individual file checksums differ!"
+            exit 1
+          fi
 
       - name: Show ZeroFS S3 usage
         run: |
