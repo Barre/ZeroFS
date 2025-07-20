@@ -113,18 +113,18 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  export SLATEDB_CACHE_DIR=/tmp/zerofs-cache");
         eprintln!("  export SLATEDB_CACHE_SIZE_GB=10");
         eprintln!("  export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'");
-        eprintln!("  zerofs [path]");
+        eprintln!("  zerofs [url]");
         eprintln!();
         eprintln!("{CYAN}With S3 backend:{RESET}");
         eprintln!("  export AWS_ACCESS_KEY_ID='your-access-key'");
         eprintln!("  export AWS_SECRET_ACCESS_KEY='your-secret-key'");
         eprintln!("  # ... other required vars ...");
-        eprintln!("  zerofs /path/to/db s3://my-bucket/prefix");
+        eprintln!("  zerofs s3://my-bucket/prefix");
         eprintln!();
         eprintln!("{CYAN}Change encryption password:{RESET}");
         eprintln!("  export ZEROFS_NEW_PASSWORD='new-password'");
         eprintln!("  # ... other required vars ...");
-        eprintln!("  zerofs [path]");
+        eprintln!("  zerofs [url]");
 
         std::process::exit(1);
     }
@@ -159,9 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let db_path = args.get(1).cloned().unwrap_or_else(|| "test".to_string());
     let url = args
-        .get(2)
+        .get(1)
         .cloned()
         .unwrap_or_else(|| "s3://slatedb".to_string());
 
@@ -181,14 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("SLATEDB_CACHE_SIZE_GB must be a positive number".into());
     }
 
-    let (object_store, _) = object_store::parse_url_opts(
+    let (object_store, path_from_url) = object_store::parse_url_opts(
         &url.parse()?,
         std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v)),
     )?;
     let object_store = Arc::new(object_store);
 
+    let actual_db_path = path_from_url.to_string();
+
     info!("Starting SlateDB NFS server with {} backend", object_store);
-    info!("DB Path: {}", db_path);
+    info!("DB Path: {}", actual_db_path);
     info!("Cache Directory: {}", cache_config.root_folder);
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
@@ -200,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temp_fs = SlateDbFs::dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store.clone(),
         cache_config.clone(),
-        db_path.clone(),
+        actual_db_path.clone(),
     )
     .await?;
 
@@ -221,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("  unset ZEROFS_NEW_PASSWORD");
                 info!(
                     "  ZEROFS_ENCRYPTION_PASSWORD='{}' zerofs {}",
-                    new_password, db_path
+                    new_password, url
                 );
                 std::process::exit(0);
             }
@@ -247,8 +248,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Encryption key loaded successfully");
 
-    let fs = SlateDbFs::new_with_object_store(object_store, cache_config, db_path, encryption_key)
-        .await?;
+    let fs = SlateDbFs::new_with_object_store(
+        object_store,
+        cache_config,
+        actual_db_path,
+        encryption_key,
+    )
+    .await?;
 
     // Parse NBD device configuration from environment
     let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());

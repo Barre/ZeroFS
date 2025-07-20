@@ -53,9 +53,9 @@ Both modes share the same encrypted, compressed, cached storage backend.
 
 You can also use ZeroFS with any supported object store backend by [object_store](https://crates.io/crates/object_store) crate.
 
-You need to pass an URL as the second argument to configure your backend, for example:
+You need to pass a URL as the argument to configure your backend, for example:
 ```bash
-zerofs /path/to/db s3://slatedb
+zerofs s3://bucket/path
 ```
 
 Would use Amazon S3 backend for `slatedb` bucket. See [`object_store`'s documentation](https://docs.rs/object_store/0.12.3/object_store/enum.ObjectStoreScheme.html#supported-formats) for all supported formats.
@@ -87,7 +87,7 @@ Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha2
 
 ```bash
 # Start ZeroFS with encryption password
-ZEROFS_ENCRYPTION_PASSWORD='your-secure-password' zerofs /path/to/db
+ZEROFS_ENCRYPTION_PASSWORD='your-secure-password' zerofs s3://bucket/path
 ```
 
 #### Password Management
@@ -100,7 +100,7 @@ To change your password:
 # Change the encryption password
 ZEROFS_ENCRYPTION_PASSWORD='current-password' \
 ZEROFS_NEW_PASSWORD='new-password' \
-zerofs /path/to/db
+zerofs s3://bucket/path
 ```
 
 The program will change the password and exit. Then you can use the new password for future runs.
@@ -140,7 +140,7 @@ In addition to NFS, ZeroFS can provide raw block devices through NBD with full T
 ZEROFS_ENCRYPTION_PASSWORD='your-password' \
 ZEROFS_NBD_PORTS='10809,10810,10811' \
 ZEROFS_NBD_DEVICE_SIZES_GB='1,2,5' \
-zerofs /path/to/db
+zerofs s3://bucket/path
 
 # Connect to NBD devices
 nbd-client 127.0.0.1 10809 /dev/nbd0  # 1GB device
@@ -199,21 +199,21 @@ ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=us-east-1 \
 ZEROFS_NBD_PORTS='10809' \
 ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs us-east-db
+zerofs s3://my-bucket/us-east-db
 
 # Terminal 2 - EU West
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=eu-west-1 \
 ZEROFS_NBD_PORTS='10810' \
 ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs eu-west-db
+zerofs s3://my-bucket/eu-west-db
 
 # Terminal 3 - Asia Pacific
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=ap-southeast-1 \
 ZEROFS_NBD_PORTS='10811' \
 ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs asia-db
+zerofs s3://my-bucket/asia-db
 ```
 
 Then connect to all three NBD devices and create a geo-distributed ZFS pool:
