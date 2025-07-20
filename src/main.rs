@@ -64,90 +64,76 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
             RESET
         );
         eprintln!();
-        eprintln!("{}{}ZeroFS Configuration Guide{}", BOLD, CYAN, RESET);
-        eprintln!("{}==========================={}", CYAN, RESET);
+        eprintln!("{BOLD}{CYAN}ZeroFS Configuration Guide{RESET}");
+        eprintln!("{CYAN}==========================={RESET}");
         eprintln!();
-        eprintln!("{}Required Environment Variables:{}", YELLOW, RESET);
+        eprintln!("{YELLOW}Required Environment Variables:{RESET}");
         eprintln!(
-            "  {}SLATEDB_CACHE_DIR{}              - Local directory for caching data",
-            BOLD, RESET
+            "  {BOLD}SLATEDB_CACHE_DIR{RESET}              - Local directory for caching data"
         );
         eprintln!(
-            "  {}SLATEDB_CACHE_SIZE_GB{}          - Maximum cache size in GB (e.g., 10)",
-            BOLD, RESET
+            "  {BOLD}SLATEDB_CACHE_SIZE_GB{RESET}          - Maximum cache size in GB (e.g., 10)"
         );
         eprintln!(
-            "  {}ZEROFS_ENCRYPTION_PASSWORD{}     - Password for data encryption",
-            BOLD, RESET
+            "  {BOLD}ZEROFS_ENCRYPTION_PASSWORD{RESET}     - Password for data encryption"
         );
         eprintln!();
-        eprintln!("{}Optional AWS S3 Configuration:{}", YELLOW, RESET);
+        eprintln!("{YELLOW}Optional AWS S3 Configuration:{RESET}");
         eprintln!(
-            "  {}AWS_ENDPOINT_URL{}               - S3 endpoint URL (default: AWS S3)",
-            BLUE, RESET
+            "  {BLUE}AWS_ENDPOINT_URL{RESET}               - S3 endpoint URL (default: AWS S3)"
         );
         eprintln!(
-            "  {}AWS_S3_BUCKET{}                  - S3 bucket name (default: slatedb)",
-            BLUE, RESET
+            "  {BLUE}AWS_S3_BUCKET{RESET}                  - S3 bucket name (default: slatedb)"
         );
         eprintln!(
-            "  {}AWS_ACCESS_KEY_ID{}              - AWS access key",
-            BLUE, RESET
+            "  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key"
         );
         eprintln!(
-            "  {}AWS_SECRET_ACCESS_KEY{}          - AWS secret key",
-            BLUE, RESET
+            "  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key"
         );
         eprintln!(
-            "  {}AWS_DEFAULT_REGION{}             - AWS region (default: us-east-1)",
-            BLUE, RESET
+            "  {BLUE}AWS_DEFAULT_REGION{RESET}             - AWS region (default: us-east-1)"
         );
         eprintln!(
-            "  {}AWS_ALLOW_HTTP{}                 - Allow HTTP endpoints (default: false)",
-            BLUE, RESET
+            "  {BLUE}AWS_ALLOW_HTTP{RESET}                 - Allow HTTP endpoints (default: false)"
         );
         eprintln!();
-        eprintln!("{}Optional ZeroFS Configuration:{}", YELLOW, RESET);
+        eprintln!("{YELLOW}Optional ZeroFS Configuration:{RESET}");
         eprintln!(
-            "  {}ZEROFS_MEMORY_CACHE_SIZE_GB{}    - Memory cache size in GB",
-            BLUE, RESET
+            "  {BLUE}ZEROFS_MEMORY_CACHE_SIZE_GB{RESET}    - Memory cache size in GB"
         );
         eprintln!(
-            "  {}ZEROFS_NBD_PORTS{}               - Comma-separated NBD server ports",
-            BLUE, RESET
+            "  {BLUE}ZEROFS_NBD_PORTS{RESET}               - Comma-separated NBD server ports"
         );
         eprintln!(
-            "  {}ZEROFS_NBD_DEVICE_SIZES_GB{}     - Comma-separated NBD device sizes in GB",
-            BLUE, RESET
+            "  {BLUE}ZEROFS_NBD_DEVICE_SIZES_GB{RESET}     - Comma-separated NBD device sizes in GB"
         );
         eprintln!(
-            "  {}ZEROFS_NEW_PASSWORD{}            - New password when changing encryption",
-            BLUE, RESET
+            "  {BLUE}ZEROFS_NEW_PASSWORD{RESET}            - New password when changing encryption"
         );
         eprintln!();
-        eprintln!("{}Logging Configuration:{}", YELLOW, RESET);
+        eprintln!("{YELLOW}Logging Configuration:{RESET}");
         eprintln!(
-            "  {}RUST_LOG{}                       - Log level (default: error,zerofs=info)",
-            BLUE, RESET
+            "  {BLUE}RUST_LOG{RESET}                       - Log level (default: error,zerofs=info)"
         );
         eprintln!();
-        eprintln!("{}Usage Examples:{}", GREEN, RESET);
-        eprintln!("{}---------------{}", GREEN, RESET);
+        eprintln!("{GREEN}Usage Examples:{RESET}");
+        eprintln!("{GREEN}---------------{RESET}");
         eprintln!();
-        eprintln!("{}Basic usage:{}", CYAN, RESET);
+        eprintln!("{CYAN}Basic usage:{RESET}");
         eprintln!("  export SLATEDB_CACHE_DIR=/tmp/zerofs-cache");
         eprintln!("  export SLATEDB_CACHE_SIZE_GB=10");
         eprintln!("  export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'");
         eprintln!("  zerofs [path]");
         eprintln!();
-        eprintln!("{}With S3 backend:{}", CYAN, RESET);
+        eprintln!("{CYAN}With S3 backend:{RESET}");
         eprintln!("  export AWS_ACCESS_KEY_ID='your-access-key'");
         eprintln!("  export AWS_SECRET_ACCESS_KEY='your-secret-key'");
         eprintln!("  export AWS_S3_BUCKET='my-bucket'");
         eprintln!("  # ... other required vars ...");
         eprintln!("  zerofs s3://my-bucket/path");
         eprintln!();
-        eprintln!("{}Change encryption password:{}", CYAN, RESET);
+        eprintln!("{CYAN}Change encryption password:{RESET}");
         eprintln!("  export ZEROFS_NEW_PASSWORD='new-password'");
         eprintln!("  # ... other required vars ...");
         eprintln!("  zerofs [path]");
@@ -158,11 +144,10 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(size_str) = std::env::var("SLATEDB_CACHE_SIZE_GB") {
         if size_str.parse::<f64>().is_err() {
             eprintln!(
-                "{}{}Error:{} SLATEDB_CACHE_SIZE_GB must be a valid number",
-                BOLD, RED, RESET
+                "{BOLD}{RED}Error:{RESET} SLATEDB_CACHE_SIZE_GB must be a valid number"
             );
-            eprintln!("Current value: {}'{}'{}", RED, size_str, RESET);
-            eprintln!("Example: {}SLATEDB_CACHE_SIZE_GB=10{}", GREEN, RESET);
+            eprintln!("Current value: {RED}'{size_str}'{RESET}");
+            eprintln!("Example: {GREEN}SLATEDB_CACHE_SIZE_GB=10{RESET}");
             std::process::exit(1);
         }
     }
