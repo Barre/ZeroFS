@@ -1,4 +1,4 @@
-# ZeroFS - The S3FS That Doesn't Suck
+# ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
 
 ZeroFS makes S3 storage feel like a real filesystem. Built on [SlateDB](https://github.com/slatedb/slatedb), it provides both **file-level access via NFS** and **block-level access via NBD**. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
@@ -121,7 +121,7 @@ mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:
 
 ## NBD Configuration and Usage
 
-In addition to NFS, ZeroFS can provide raw block devices through NBD:
+In addition to NFS, ZeroFS can provide raw block devices through NBD with full TRIM/discard support:
 
 ```bash
 # Start ZeroFS with both NFS and NBD support
@@ -142,6 +142,24 @@ mount /dev/nbd0 /mnt/block
 # Or create a ZFS pool
 zpool create mypool /dev/nbd0 /dev/nbd1 /dev/nbd2
 ```
+
+### TRIM/Discard Support
+
+ZeroFS NBD devices support TRIM operations, which actually delete the corresponding chunks from the LSM-tree database backed by S3:
+
+```bash
+# Manual TRIM
+fstrim /mnt/block
+
+# Enable automatic discard (for filesystems)
+mount -o discard /dev/nbd0 /mnt/block
+
+# ZFS automatic TRIM
+zpool set autotrim=on mypool
+zpool trim mypool
+```
+
+When blocks are trimmed, ZeroFS removes the corresponding chunks from ZeroFS' LSM-tree, which eventually results in freed space in S3 storage through compaction. This reduces storage costs for any filesystem or application that issues TRIM commands.
 
 ### NBD Device Files
 
@@ -382,7 +400,28 @@ The "shared" in "shared ZFS pool" means shared access capability, not concurrent
 
 > Thus, if there is a network partition, one has to choose between consistency or availability.
 
-It seems that we are able to maintain all three CAP properties in case of network paritions.
+Even in a scenario where clients couldn't communicate due to a "client-wide" network partition - because they implement the same logic - would just route to the "new" primary.
+
+```
+[Clients 1,2] ← partition → [Clients 3,4]
+```
+
+The "network partition" in CAP assumes nodes can't coordinate. But if nodes don't NEED to coordinate because the storage layer handles it, then you've sidestepped the constraint.
+
+The theorem doesn't say:
+
+- HOW nodes must coordinate
+- That storage must be distributed
+- That you can't use locking primitives
+- That all coordination must be peer-to-peer
+
+So during a partition between database nodes:
+
+- Consistency: Only one writer via exclusive locking
+- Availability: Whichever node can reach ZeroFS can serve requests
+- Partition tolerance: System continues despite node-to-node partition
+
+It seems that CAP applies to a specific model of distributed systems, and if you change the model (shared storage arbitration instead of network consensus), different rules apply.
 
 If anyone has a rebutal for this please open an issue! :)
 
@@ -495,4 +534,3 @@ Key-Value Store:
 ## Future Enhancements
 
 - [ ] Snapshot capabilities using SlateDB's checkpoints
-

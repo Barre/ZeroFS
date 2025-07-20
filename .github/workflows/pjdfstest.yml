@@ -9,12 +9,16 @@ on:
 jobs:
   pjdfstest:
     name: Run pjdfstest NFS Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start MinIO
+      - name: Start MinIO (Linux)
+        if: runner.os == 'Linux'
         run: |
           docker run -d \
             --name minio \
@@ -32,10 +36,37 @@ jobs:
             sleep 1
           done
 
-      - name: Install dependencies
+      - name: Start MinIO (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Download MinIO binary
+          wget https://dl.min.io/server/minio/release/darwin-amd64/minio
+          chmod +x minio
+
+          # Start MinIO in background
+          export MINIO_ROOT_USER=minioadmin
+          export MINIO_ROOT_PASSWORD=minioadmin
+          ./minio server /tmp/minio-data &
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y nfs-common build-essential autoconf automake libtool git perl
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake libtool perl
 
       - name: Clone pjdfstest_nfs
         run: |
@@ -51,7 +82,11 @@ jobs:
       - name: Setup MinIO bucket
         run: |
           # Install mc (MinIO client)
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          else
+            wget https://dl.min.io/client/mc/release/darwin-amd64/mc
+          fi
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true
@@ -91,19 +126,40 @@ jobs:
             exit 1
           fi
 
-      - name: Mount NFS
+      - name: Mount NFS (Linux)
+        if: runner.os == 'Linux'
         run: |
           # Create mount point
           sudo mkdir -p /mnt/zerofs
 
           # Mount ZeroFS via NFS
-          sudo mount -t nfs -o vers=3,nolock,tcp,port=2049,mountport=2049,soft 127.0.0.1:/ /mnt/zerofs
+          sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
 
           # Verify mount
           mount | grep zerofs
 
-      - name: Run pjdfstest
+      - name: Mount NFS (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Create mount point in /tmp which is writable
+          sudo mkdir -p /tmp/zerofs
+
+          # Mount ZeroFS via NFS (macOS uses nolocks instead of nolock)
+          sudo mount -t nfs -o vers=3,nolocks,tcp,port=2049,mountport=2049,async,hard 127.0.0.1:/ /tmp/zerofs
+
+          # Verify mount
+          mount | grep zerofs
+
+      - name: Run pjdfstest (Linux)
+        if: runner.os == 'Linux'
         working-directory: /mnt/zerofs
+        run: |
+          # Run the test suite
+          sudo prove -rv /tmp/pjdfstest_nfs/tests/
+
+      - name: Run pjdfstest (macOS)
+        if: runner.os == 'macOS'
+        working-directory: /tmp/zerofs
         run: |
           # Run the test suite
           sudo prove -rv /tmp/pjdfstest_nfs/tests/
@@ -112,7 +168,11 @@ jobs:
         if: always()
         run: |
           # Unmount
-          sudo umount /mnt/zerofs || true
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo umount /mnt/zerofs || true
+          else
+            sudo umount /tmp/zerofs || true
+          fi
 
           # Kill ZeroFS
           pkill -f "cargo run --release test" || true
