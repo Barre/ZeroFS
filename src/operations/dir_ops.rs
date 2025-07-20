@@ -36,18 +36,6 @@ impl SlateDbFs {
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
-        let (_default_uid, _default_gid) = match &dir_inode {
-            Inode::Directory(d) => (d.uid, d.gid),
-            _ => {
-                #[cfg(unix)]
-                unsafe {
-                    (libc::getuid(), libc::getgid())
-                }
-                #[cfg(not(unix))]
-                (0, 0)
-            }
-        };
-
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 let name = dirname_str.to_string();
