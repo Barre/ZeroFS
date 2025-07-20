@@ -100,15 +100,14 @@ jobs:
           mkdir -p /tmp/zerofs-cache
 
           # Start ZeroFS in the background
-          AWS_ENDPOINT_URL=http://localhost:9000 \
-          AWS_S3_BUCKET=zerofs-test \
+          AWS_ENDPOINT=http://localhost:9000 \
           AWS_ACCESS_KEY_ID=minioadmin \
           AWS_SECRET_ACCESS_KEY=minioadmin \
           AWS_ALLOW_HTTP=true \
           SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
           SLATEDB_CACHE_SIZE_GB=1 \
           ZEROFS_ENCRYPTION_PASSWORD=secret \
-          cargo run --release test &
+          cargo run --release s3://zerofs-test/test &
 
           # Wait for ZeroFS to start
           echo "Waiting for ZeroFS to start..."
@@ -175,4 +174,4 @@ jobs:
           fi
 
           # Kill ZeroFS
-          pkill -f "cargo run --release test" || true
+          pkill -f "cargo run --release s3://zerofs-test/test" || true

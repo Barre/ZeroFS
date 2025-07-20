@@ -54,8 +54,7 @@ jobs:
           mkdir -p /tmp/zerofs-cache
 
           # Start ZeroFS with NBD support in the background
-          AWS_ENDPOINT_URL=http://localhost:9000 \
-          AWS_S3_BUCKET=zerofs-zfs-test \
+          AWS_ENDPOINT=http://localhost:9000 \
           AWS_ACCESS_KEY_ID=minioadmin \
           AWS_SECRET_ACCESS_KEY=minioadmin \
           AWS_ALLOW_HTTP=true \
@@ -64,7 +63,7 @@ jobs:
           ZEROFS_ENCRYPTION_PASSWORD=secret \
           ZEROFS_NBD_PORTS=10809 \
           ZEROFS_NBD_DEVICE_SIZES_GB=3 \
-          cargo run --release zfs-test &
+          cargo run --release s3://zerofs-zfs-test/zfs-test &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to start..."
@@ -246,7 +245,7 @@ jobs:
           echo "Stopping ZeroFS..."
           # Find and kill the actual zerofs process (not cargo)
           # First try to find the process
-          ZEROFS_PID=$(pgrep -f "zerofs.*zfs-test" || true)
+          ZEROFS_PID=$(pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" || true)
           if [ -n "$ZEROFS_PID" ]; then
             echo "Found ZeroFS process: $ZEROFS_PID"
             kill -TERM $ZEROFS_PID || true
@@ -256,7 +255,7 @@ jobs:
           
           # Wait for ZeroFS to stop
           for i in {1..10}; do
-            if ! pgrep -f "zerofs.*zfs-test" > /dev/null; then
+            if ! pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" > /dev/null; then
               echo "ZeroFS stopped"
               break
             fi
@@ -265,9 +264,9 @@ jobs:
           done
           
           # Final check if ZeroFS stopped
-          if pgrep -f "zerofs.*zfs-test" > /dev/null; then
+          if pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" > /dev/null; then
             echo "WARNING: ZeroFS may still be running, forcing kill..."
-            pkill -KILL -f "zerofs.*zfs-test" || true
+            pkill -KILL -f "zerofs.*s3://zerofs-zfs-test/zfs-test" || true
             sleep 1
           fi
           
@@ -291,8 +290,7 @@ jobs:
       - name: Restart ZeroFS
         run: |
           echo "Starting ZeroFS again..."
-          AWS_ENDPOINT_URL=http://localhost:9000 \
-          AWS_S3_BUCKET=zerofs-zfs-test \
+          AWS_ENDPOINT=http://localhost:9000 \
           AWS_ACCESS_KEY_ID=minioadmin \
           AWS_SECRET_ACCESS_KEY=minioadmin \
           AWS_ALLOW_HTTP=true \
@@ -301,7 +299,7 @@ jobs:
           ZEROFS_ENCRYPTION_PASSWORD=secret \
           ZEROFS_NBD_PORTS=10809 \
           ZEROFS_NBD_DEVICE_SIZES_GB=3 \
-          cargo run --release zfs-test &
+          cargo run --release s3://zerofs-zfs-test/zfs-test &
           
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to restart..."
@@ -385,7 +383,7 @@ jobs:
           sudo nbd-client -d /dev/nbd0 || true
 
           # Kill ZeroFS
-          pkill -f "cargo run --release zfs-test" || true
+          pkill -f "cargo run --release s3://zerofs-zfs-test/zfs-test" || true
 
           # Stop MinIO
           docker stop minio || true
