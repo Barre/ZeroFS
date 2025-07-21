@@ -21,9 +21,7 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "2fe991affaed8e2cb9caf3eed73589367484f09a" }
-object_store = { version = "0.12.3", features = ["aws"] }
-object_store_opendal = "0.54"
-opendal = { version = "0.54.0", features = ["services-gdrive", "services-onedrive", "services-dropbox", "services-gcs"] }
+object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
 bytes = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
