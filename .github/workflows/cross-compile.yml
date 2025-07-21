@@ -13,24 +13,46 @@ env:
 jobs:
   cross-compile:
     name: Cross compile for ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
+            os: ubuntu-latest
+            platform: linux
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+            os: ubuntu-latest
+            platform: linux
           - target: armv7-unknown-linux-gnueabihf
             arch: armv7
+            os: ubuntu-latest
+            platform: linux
           - target: i686-unknown-linux-gnu
-            arch: i386
+            arch: i686
+            os: ubuntu-latest
+            platform: linux
           - target: powerpc64le-unknown-linux-gnu
             arch: ppc64le
+            os: ubuntu-latest
+            platform: linux
           - target: s390x-unknown-linux-gnu
             arch: s390x
+            os: ubuntu-latest
+            platform: linux
           - target: riscv64gc-unknown-linux-gnu
             arch: riscv64
+            os: ubuntu-latest
+            platform: linux
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            os: macos-latest
+            platform: darwin
+          - target: aarch64-apple-darwin
+            arch: aarch64
+            os: macos-latest
+            platform: darwin
 
     steps:
       - name: Checkout
@@ -41,25 +63,32 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross
+      - name: Install cross (Linux only)
+        if: matrix.platform == 'linux'
         run: |
           cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build with cross
+      - name: Build with cross (Linux)
+        if: matrix.platform == 'linux'
         run: |
           cross build --profile ci --target ${{ matrix.target }}
+
+      - name: Build with cargo (macOS)
+        if: matrix.platform == 'darwin'
+        run: |
+          cargo build --profile ci --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.arch }}
-          chmod +x artifacts/zerofs-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-${{ matrix.arch }}
-          path: artifacts/zerofs-${{ matrix.arch }}
+          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
           retention-days: 7
 
   create-release-artifacts:
@@ -88,17 +117,17 @@ jobs:
             fi
           done
           cd release
-          tar czf ../zerofs-linux-multiarch.tar.gz zerofs-*
+          tar czf ../zerofs-multiplatform.tar.gz zerofs-*
           cd ..
-          sha256sum zerofs-linux-multiarch.tar.gz > zerofs-linux-multiarch.tar.gz.sha256
+          sha256sum zerofs-multiplatform.tar.gz > zerofs-multiplatform.tar.gz.sha256
 
       - name: Upload combined artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-linux-multiarch
+          name: zerofs-multiplatform
           path: |
-            zerofs-linux-multiarch.tar.gz
-            zerofs-linux-multiarch.tar.gz.sha256
+            zerofs-multiplatform.tar.gz
+            zerofs-multiplatform.tar.gz.sha256
           retention-days: 30
 
       - name: Display SHA256 checksums
