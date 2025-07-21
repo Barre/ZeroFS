@@ -47,12 +47,12 @@ jobs:
 
       - name: Build with cross
         run: |
-          cross build --release --target ${{ matrix.target }}
+          cross build --profile ci --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.arch }}
           chmod +x artifacts/zerofs-${{ matrix.arch }}
 
       - name: Upload artifacts

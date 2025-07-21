@@ -9,6 +9,11 @@ opt-level = 3
 codegen-units = 1
 strip = true
 
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [dependencies]
 zerofs_nfsserve = "0.11.0"
 tokio = { version = "1.46", features = ["full"] }
@@ -17,6 +22,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "2fe991affaed8e2cb9caf3eed73589367484f09a" }
 object_store = { version = "0.12.3", features = ["aws"] }
+object_store_opendal = "0.54"
+opendal = { version = "0.54.0", features = ["services-gdrive", "services-onedrive", "services-dropbox", "services-gcs"] }
 bytes = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
@@ -31,6 +38,7 @@ zstd = "0.13"
 anyhow = "1.0"
 hex = "0.4"
 argon2 = "0.5"
+url = "2.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }

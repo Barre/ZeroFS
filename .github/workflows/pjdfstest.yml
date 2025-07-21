@@ -92,7 +92,7 @@ jobs:
           ./mc mb myminio/zerofs-test || true
 
       - name: Build ZeroFS
-        run: cargo build --release
+        run: cargo build --profile ci
 
       - name: Start ZeroFS
         run: |
@@ -107,7 +107,7 @@ jobs:
           SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
           SLATEDB_CACHE_SIZE_GB=1 \
           ZEROFS_ENCRYPTION_PASSWORD=secret \
-          cargo run --release s3://zerofs-test/test &
+          cargo run --profile ci s3://zerofs-test/test &
 
           # Wait for ZeroFS to start
           echo "Waiting for ZeroFS to start..."
@@ -174,4 +174,4 @@ jobs:
           fi
 
           # Kill ZeroFS
-          pkill -f "cargo run --release s3://zerofs-test/test" || true
+          pkill -f "cargo run --profile ci s3://zerofs-test/test" || true

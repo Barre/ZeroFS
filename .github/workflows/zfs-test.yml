@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nbd-client zfsutils-linux wget
+          sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz
 
       - name: Setup MinIO bucket
         run: |
@@ -46,7 +46,7 @@ jobs:
           ./mc mb myminio/zerofs-zfs-test || true
 
       - name: Build ZeroFS
-        run: cargo build --release
+        run: cargo build --profile ci
 
       - name: Start ZeroFS
         run: |
@@ -63,7 +63,7 @@ jobs:
           ZEROFS_ENCRYPTION_PASSWORD=secret \
           ZEROFS_NBD_PORTS=10809 \
           ZEROFS_NBD_DEVICE_SIZES_GB=3 \
-          cargo run --release s3://zerofs-zfs-test/zfs-test &
+          cargo run --profile ci s3://zerofs-zfs-test/zfs-test &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to start..."
@@ -125,9 +125,8 @@ jobs:
           # Show download size
           ls -lh linux-6.15.6.tar.xz
 
-          # Extract kernel (this tests many small file operations)
           echo "Extracting kernel source..."
-          time sudo tar -xf linux-6.15.6.tar.xz
+          time sudo tar -I pixz -xf linux-6.15.6.tar.xz
 
           # Count files to verify extraction
           echo "Counting extracted files..."
@@ -159,7 +158,7 @@ jobs:
         run: |
           echo "Creating tarball of ZFS data..."
           cd /mnt/zfsdata
-          sudo tar -czf /tmp/zfsdata-backup.tar.gz .
+          sudo tar -I pigz -cf /tmp/zfsdata-backup.tar.gz .
           
           echo "Calculating checksum..."
           sudo sha256sum /tmp/zfsdata-backup.tar.gz > /tmp/zfsdata-backup.sha256
@@ -299,7 +298,7 @@ jobs:
           ZEROFS_ENCRYPTION_PASSWORD=secret \
           ZEROFS_NBD_PORTS=10809 \
           ZEROFS_NBD_DEVICE_SIZES_GB=3 \
-          cargo run --release s3://zerofs-zfs-test/zfs-test &
+          cargo run --profile ci s3://zerofs-zfs-test/zfs-test &
           
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to restart..."
@@ -337,7 +336,7 @@ jobs:
         run: |
           echo "Creating new tarball of restored data..."
           cd /mnt/zfsdata
-          sudo tar -czf /tmp/zfsdata-restored.tar.gz .
+          sudo tar -I pigz -cf /tmp/zfsdata-restored.tar.gz .
           
           echo "Calculating checksum of restored data..."
           sudo sha256sum /tmp/zfsdata-restored.tar.gz > /tmp/zfsdata-restored.sha256
@@ -383,7 +382,7 @@ jobs:
           sudo nbd-client -d /dev/nbd0 || true
 
           # Kill ZeroFS
-          pkill -f "cargo run --release s3://zerofs-zfs-test/zfs-test" || true
+          pkill -f "cargo run --profile ci s3://zerofs-zfs-test/zfs-test" || true
 
           # Stop MinIO
           docker stop minio || true
