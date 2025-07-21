@@ -1,0 +1,63 @@
+name: Database Integration Tests
+
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  database-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Setup persistent database storage
+      - name: Setup ZeroFS for PostgreSQL
+        uses: Barre/ZeroFS@v1
+        with:
+          object-store-url: 's3://my-bucket/test-databases/pr-${{ github.event.pull_request.number }}'
+          mount-path: '/mnt/pgdata'
+          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          cache-size-gb: '2'
+      
+      - name: Configure PostgreSQL to use ZeroFS
+        run: |
+          # Stop default PostgreSQL
+          sudo systemctl stop postgresql
+          
+          # Create PostgreSQL data directory on ZeroFS
+          sudo mkdir -p /mnt/pgdata/postgresql
+          sudo chown postgres:postgres /mnt/pgdata/postgresql
+          
+          # Initialize database on ZeroFS
+          sudo -u postgres initdb -D /mnt/pgdata/postgresql
+          
+          # Start PostgreSQL with ZeroFS data directory
+          sudo -u postgres pg_ctl -D /mnt/pgdata/postgresql -l logfile start
+      
+      - name: Run Database Tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/test_db
+        run: |
+          # Create test database
+          createdb -U postgres test_db
+          
+          # Run migrations
+          ./scripts/migrate.sh
+          
+          # Run integration tests
+          cargo test --test database_integration
+      
+      # The database persists for debugging failed tests!
