@@ -550,6 +550,21 @@ Key-Value Store:
 - Efficient small updates reduce write amplification
 - Predictable costs through batching
 
+## GitHub Action
+
+ZeroFS is available as a GitHub Action for easy integration into your CI/CD workflows:
+
+```yaml
+- uses: Barre/zerofs@v1
+  with:
+    object-store-url: 's3://bucket/path'
+    encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+```
+
+This enables persistent storage across workflow runs, shared artifacts between jobs, and more.
+
 ## Future Enhancements
 
 - [ ] Snapshot capabilities using SlateDB's checkpoints
