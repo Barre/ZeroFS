@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz
+          sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
 
       - name: Setup MinIO bucket
         run: |
@@ -165,7 +165,7 @@ jobs:
           cat /tmp/zfsdata-backup.sha256
           
           # Also create checksum of individual files for comparison
-          sudo find . -type f -exec sha256sum {} \; | sort > /tmp/file-checksums.txt
+          sudo find . -type f -print0 | parallel -0 -j+0 sha256sum | sort > /tmp/file-checksums.txt
           echo "Number of files checksummed: $(wc -l < /tmp/file-checksums.txt)"
 
       - name: Sync and prepare for durability test
@@ -358,7 +358,7 @@ jobs:
           
           # Also verify individual file checksums
           echo "Verifying individual file checksums..."
-          sudo find . -type f -exec sha256sum {} \; | sort > /tmp/file-checksums-restored.txt
+          sudo find . -type f -print0 | parallel -0 -j+0 sha256sum | sort > /tmp/file-checksums-restored.txt
           
           if diff /tmp/file-checksums.txt /tmp/file-checksums-restored.txt; then
             echo "SUCCESS: All individual file checksums match!"
