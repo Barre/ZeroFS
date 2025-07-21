@@ -1,0 +1,41 @@
+name: Build with Persistent Cache
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Setup persistent cache volume
+      - name: Setup ZeroFS Cache
+        uses: Barre/ZeroFS@v1
+        with:
+          object-store-url: 's3://my-bucket/ci-cache'
+          mount-path: '/mnt/cache'
+          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      # Example: Node.js with persistent npm cache
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Configure npm cache
+        run: |
+          npm config set cache /mnt/cache/npm --global
+          
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build
+        run: npm run build
+      
+      # The cache persists across runs!

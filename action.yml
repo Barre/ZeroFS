@@ -1,0 +1,103 @@
+name: 'ZeroFS Volume'
+description: 'Setup a persistent volume using ZeroFS backed by S3-compatible storage'
+author: 'Pierre Barre'
+branding:
+  icon: 'hard-drive'
+  color: 'blue'
+
+inputs:
+  object-store-url:
+    description: 'Object store URL (e.g. s3://bucket/path)'
+    required: true
+  
+  mount-path:
+    description: 'Path where the volume should be mounted (defaults to /mnt/zerofs on Linux, /tmp/zerofs on macOS)'
+    required: false
+  
+  cache-dir:
+    description: 'Directory for SlateDB disk cache'
+    required: false
+    default: '/tmp/zerofs-cache'
+  
+  cache-size-gb:
+    description: 'SlateDB disk cache size in GB'
+    required: false
+    default: '1'
+  
+  memory-cache-size-gb:
+    description: 'ZeroFS in-memory cache size in GB'
+    required: false
+    default: '0.25'
+  
+  encryption-password:
+    description: 'Password for filesystem encryption'
+    required: true
+  
+  aws-access-key-id:
+    description: 'AWS access key ID (for S3)'
+    required: false
+  
+  aws-secret-access-key:
+    description: 'AWS secret access key (for S3)'
+    required: false
+  
+  aws-region:
+    description: 'AWS region'
+    required: false
+    default: 'us-east-1'
+  
+  aws-endpoint:
+    description: 'S3-compatible endpoint URL'
+    required: false
+  
+  aws-allow-http:
+    description: 'Allow HTTP connections (for local testing with MinIO, etc.)'
+    required: false
+    default: 'false'
+  
+  nfs-host:
+    description: 'NFS server host address'
+    required: false
+    default: '127.0.0.1'
+  
+  nfs-port:
+    description: 'NFS server port'
+    required: false
+    default: '2049'
+  
+  zerofs-version:
+    description: 'ZeroFS version to use (latest, v0.1.0, etc.)'
+    required: false
+    default: 'latest'
+
+outputs:
+  mount-path:
+    description: 'Path where the volume is mounted'
+    value: ${{ steps.setup-zerofs.outputs.mount-path }}
+  nfs-endpoint:
+    description: 'NFS endpoint (host:port)'
+    value: ${{ steps.setup-zerofs.outputs.nfs-endpoint }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup ZeroFS
+      id: setup-zerofs
+      shell: bash
+      run: |
+        ${{ github.action_path }}/scripts/setup-zerofs.sh
+      env:
+        ZEROFS_VERSION: ${{ inputs.zerofs-version }}
+        OBJECT_STORE_URL: ${{ inputs.object-store-url }}
+        MOUNT_PATH: ${{ inputs.mount-path }}
+        SLATEDB_CACHE_DIR: ${{ inputs.cache-dir }}
+        SLATEDB_CACHE_SIZE_GB: ${{ inputs.cache-size-gb }}
+        ZEROFS_MEMORY_CACHE_SIZE_GB: ${{ inputs.memory-cache-size-gb }}
+        ZEROFS_ENCRYPTION_PASSWORD: ${{ inputs.encryption-password }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+        AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+        AWS_ENDPOINT: ${{ inputs.aws-endpoint }}
+        AWS_ALLOW_HTTP: ${{ inputs.aws-allow-http }}
+        ZEROFS_NFS_HOST: ${{ inputs.nfs-host }}
+        ZEROFS_NFS_HOST_PORT: ${{ inputs.nfs-port }}

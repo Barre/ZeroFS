@@ -1,0 +1,62 @@
+name: Test ZeroFS Action with MinIO
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-with-minio:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+      
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/test-bucket || true
+      
+      - name: Setup ZeroFS Volume
+        uses: ./
+        with:
+          object-store-url: 's3://test-bucket/github-actions-test'
+          encryption-password: 'test-password-123'
+          aws-access-key-id: 'minioadmin'
+          aws-secret-access-key: 'minioadmin'
+          aws-endpoint: 'http://localhost:9000'
+          aws-allow-http: 'true'
+          aws-region: 'us-east-1'
+          cache-size-gb: '1'
+          mount-path: '/mnt/zerofs-test'
+      
+      - name: Test Volume Operations
+        run: |
+          echo "Testing ZeroFS volume..."
+          sudo mkdir -p /mnt/zerofs-test/test-dir
+          echo "Hello from GitHub Actions!" | sudo tee /mnt/zerofs-test/test-dir/test.txt
+          sudo cat /mnt/zerofs-test/test-dir/test.txt
+          sudo ls -la /mnt/zerofs-test/test-dir/
+          echo "Tests passed!"

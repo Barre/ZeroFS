@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "::group::Setting up ZeroFS"
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$ARCH" in
+    x86_64|amd64)
+        ARCH="x86_64"
+        ;;
+    aarch64|arm64)
+        ARCH="aarch64"
+        ;;
+    *)
+        echo "::error::Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
+case "$OS" in
+    linux)
+        TARGET="${ARCH}-unknown-linux-gnu"
+        ;;
+    darwin)
+        TARGET="${ARCH}-apple-darwin"
+        ;;
+    *)
+        echo "::error::Unsupported OS: $OS"
+        exit 1
+        ;;
+esac
+
+if [ "$ZEROFS_VERSION" = "latest" ]; then
+    DOWNLOAD_URL="https://github.com/Barre/ZeroFS/releases/latest/download/zerofs-${TARGET}"
+else
+    DOWNLOAD_URL="https://github.com/Barre/ZeroFS/releases/download/${ZEROFS_VERSION}/zerofs-${TARGET}"
+fi
+
+echo "Downloading ZeroFS from: $DOWNLOAD_URL"
+sudo curl -L -o /usr/local/bin/zerofs "$DOWNLOAD_URL"
+sudo chmod +x /usr/local/bin/zerofs
+
+echo "ZeroFS installed at: /usr/local/bin/zerofs"
+/usr/local/bin/zerofs --version || echo "Version info not available"
+
+mkdir -p "$SLATEDB_CACHE_DIR"
+
+if [ -z "${MOUNT_PATH:-}" ]; then
+    case "$OS" in
+        linux)
+            MOUNT_PATH="/mnt/zerofs"
+            ;;
+        darwin)
+            MOUNT_PATH="/tmp/zerofs"
+            ;;
+        *)
+            MOUNT_PATH="/tmp/zerofs"
+            ;;
+    esac
+fi
+
+if [ "$OS" = "darwin" ] && [[ "$MOUNT_PATH" == /mnt/* ]]; then
+    echo "::warning::macOS doesn't have /mnt by default, using /tmp instead"
+    MOUNT_PATH="/tmp/$(basename "$MOUNT_PATH")"
+fi
+
+sudo mkdir -p "$MOUNT_PATH"
+
+nohup /usr/local/bin/zerofs "$OBJECT_STORE_URL" > zerofs.log 2>&1 &
+ZEROFS_PID=$!
+echo $ZEROFS_PID > zerofs.pid
+
+echo "Waiting for ZeroFS to start..."
+for i in {1..30}; do
+    if nc -z "$ZEROFS_NFS_HOST" "$ZEROFS_NFS_HOST_PORT" 2>/dev/null; then
+        echo "ZeroFS is ready!"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        echo "::error::ZeroFS failed to start within 30 seconds"
+        cat zerofs.log
+        exit 1
+    fi
+    sleep 1
+done
+
+echo "Mounting ZeroFS..."
+case "$OS" in
+    linux)
+        sudo mount -t nfs -o vers=3,async,nolock,tcp,port="$ZEROFS_NFS_HOST_PORT",mountport="$ZEROFS_NFS_HOST_PORT",hard "$ZEROFS_NFS_HOST":/ "$MOUNT_PATH"
+        ;;
+    darwin)
+        sudo mount -t nfs -o async,nolocks,vers=3,tcp,port="$ZEROFS_NFS_HOST_PORT",mountport="$ZEROFS_NFS_HOST_PORT",hard "$ZEROFS_NFS_HOST":/ "$MOUNT_PATH"
+        ;;
+    *)
+        echo "::error::Mounting is not supported on OS: $OS"
+        exit 1
+        ;;
+esac
+
+if mount | grep -q "$MOUNT_PATH"; then
+    echo "ZeroFS successfully mounted at: $MOUNT_PATH"
+    df -h "$MOUNT_PATH"
+else
+    echo "::error::Failed to mount ZeroFS"
+    cat zerofs.log
+    exit 1
+fi
+
+echo "mount-path=$MOUNT_PATH" >> $GITHUB_OUTPUT
+echo "nfs-endpoint=$ZEROFS_NFS_HOST:$ZEROFS_NFS_HOST_PORT" >> $GITHUB_OUTPUT
+
+cat > cleanup-zerofs.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "::group::Cleaning up ZeroFS"
+
+if mount | grep -q "$MOUNT_PATH"; then
+    echo "Unmounting $MOUNT_PATH..."
+    sudo umount "$MOUNT_PATH" || sudo umount -f "$MOUNT_PATH" || true
+fi
+
+if [ -f zerofs.pid ]; then
+    PID=$(cat zerofs.pid)
+    if kill -0 $PID 2>/dev/null; then
+        echo "Stopping ZeroFS (PID: $PID)..."
+        kill $PID || true
+        sleep 2
+        kill -9 $PID 2>/dev/null || true
+    fi
+    rm -f zerofs.pid
+fi
+
+if [ -f zerofs.log ] && grep -i error zerofs.log > /dev/null 2>&1; then
+    echo "::warning::ZeroFS had errors during execution:"
+    grep -i error zerofs.log | head -20
+fi
+
+echo "::endgroup::"
+EOF
+chmod +x cleanup-zerofs.sh
+
+echo "$PWD/cleanup-zerofs.sh" >> $GITHUB_PATH
+
+echo "::endgroup::"
+echo "::notice::ZeroFS is ready! Volume mounted at: $MOUNT_PATH"

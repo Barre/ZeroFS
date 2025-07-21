@@ -1,0 +1,57 @@
+name: Shared Artifacts Across Jobs
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Shared Volume
+        uses: Barre/ZeroFS@v1
+        with:
+          object-store-url: 's3://my-bucket/shared-artifacts'
+          mount-path: '/mnt/shared'
+          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: Build and Store Artifacts
+        run: |
+          # Build your project
+          cargo build --release
+          
+          # Store artifacts in shared volume
+          sudo cp -r target/release/* /mnt/shared/
+          
+          # Create manifest
+          echo "Build completed at $(date)" | sudo tee /mnt/shared/build-manifest.txt
+  
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-suite: [unit, integration, e2e]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Shared Volume
+        uses: Barre/ZeroFS@v1
+        with:
+          object-store-url: 's3://my-bucket/shared-artifacts'
+          mount-path: '/mnt/shared'
+          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      
+      - name: Run Tests with Shared Artifacts
+        run: |
+          # Use artifacts from build job
+          sudo cp -r /mnt/shared/* target/release/
+          
+          # Run specific test suite
+          cargo test --release --test ${{ matrix.test-suite }}
