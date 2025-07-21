@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+</p>
+
 # ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
 
