@@ -41,10 +41,22 @@ echo "Downloading ZeroFS archive from: $DOWNLOAD_URL"
 echo "Will extract binary: $BINARY_NAME"
 
 # Download and extract the specific binary
-if ! curl -fsSL "$DOWNLOAD_URL" | tar xz "$BINARY_NAME" -O | sudo tee /usr/local/bin/zerofs > /dev/null; then
-    echo "::error::Failed to download or extract ZeroFS"
+TEMP_DIR=$(mktemp -d)
+echo "Using temp directory: $TEMP_DIR"
+
+if ! curl -fsSL "$DOWNLOAD_URL" | tar xz -C "$TEMP_DIR"; then
+    echo "::error::Failed to download or extract ZeroFS archive"
     exit 1
 fi
+
+if [ ! -f "$TEMP_DIR/$BINARY_NAME" ]; then
+    echo "::error::Binary $BINARY_NAME not found in archive"
+    ls -la "$TEMP_DIR"
+    exit 1
+fi
+
+sudo mv "$TEMP_DIR/$BINARY_NAME" /usr/local/bin/zerofs
+rm -rf "$TEMP_DIR"
 
 sudo chmod +x /usr/local/bin/zerofs
 

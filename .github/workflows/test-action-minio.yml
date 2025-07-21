@@ -8,12 +8,16 @@ on:
 
 jobs:
   test-with-minio:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     
     steps:
       - uses: actions/checkout@v4
       
-      - name: Start MinIO
+      - name: Start MinIO (Linux)
+        if: runner.os == 'Linux'
         run: |
           docker run -d \
             --name minio \
@@ -31,15 +35,41 @@ jobs:
             sleep 1
           done
       
+      - name: Start MinIO (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Download MinIO binary
+          wget https://dl.min.io/server/minio/release/darwin-amd64/minio
+          chmod +x minio
+          
+          # Start MinIO in background
+          export MINIO_ROOT_USER=minioadmin
+          export MINIO_ROOT_PASSWORD=minioadmin
+          ./minio server /tmp/minio-data &
+          
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+      
       - name: Setup MinIO bucket
         run: |
           # Install mc (MinIO client)
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          else
+            wget https://dl.min.io/client/mc/release/darwin-amd64/mc
+          fi
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/test-bucket || true
       
       - name: Setup ZeroFS Volume
+        id: setup-zerofs
         uses: ./
         with:
           object-store-url: 's3://test-bucket/github-actions-test'
@@ -54,9 +84,16 @@ jobs:
       
       - name: Test Volume Operations
         run: |
-          echo "Testing ZeroFS volume..."
-          sudo mkdir -p /mnt/zerofs-test/test-dir
-          echo "Hello from GitHub Actions!" | sudo tee /mnt/zerofs-test/test-dir/test.txt
-          sudo cat /mnt/zerofs-test/test-dir/test.txt
-          sudo ls -la /mnt/zerofs-test/test-dir/
+          echo "Testing ZeroFS volume on ${{ matrix.os }}..."
+          
+          # Use the mount path from the action output
+          MOUNT_PATH="${{ steps.setup-zerofs.outputs.mount-path }}"
+          if [ -z "$MOUNT_PATH" ]; then
+            MOUNT_PATH="/mnt/zerofs-test"
+          fi
+          
+          sudo mkdir -p "$MOUNT_PATH/test-dir"
+          echo "Hello from GitHub Actions on ${{ matrix.os }}!" | sudo tee "$MOUNT_PATH/test-dir/test.txt"
+          sudo cat "$MOUNT_PATH/test-dir/test.txt"
+          sudo ls -la "$MOUNT_PATH/test-dir/"
           echo "Tests passed!"
