@@ -93,7 +93,7 @@ impl SlateDbFs {
                         } else {
                             // Last link, check if we should delete immediately or defer
                             let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
-                            
+
                             if total_chunks <= 10 {
                                 // Small file, delete chunks immediately
                                 for chunk_idx in 0..total_chunks {
@@ -107,9 +107,11 @@ impl SlateDbFs {
                                 batch
                                     .put_bytes(&tombstone_key, &file.size.to_le_bytes())
                                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                                self.stats.tombstones_created.fetch_add(1, Ordering::Relaxed);
+                                self.stats
+                                    .tombstones_created
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
-                            
+
                             // Delete the inode
                             let inode_key = Self::inode_key(file_id);
                             batch.delete_bytes(&inode_key);
@@ -125,7 +127,9 @@ impl SlateDbFs {
                         batch.delete_bytes(&inode_key);
                         // Decrement parent's nlink since we're removing a subdirectory
                         dir.nlink = dir.nlink.saturating_sub(1);
-                        self.stats.directories_deleted.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .directories_deleted
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     Inode::Symlink(_) => {
                         // Delete the symlink inode
@@ -197,7 +201,7 @@ impl SlateDbFs {
                         dir_id: dirid,
                         name: name.clone(),
                     });
-                
+
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 Ok(())
