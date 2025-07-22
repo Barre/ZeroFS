@@ -132,6 +132,9 @@ impl SlateDbFs {
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
                 dir.entry_count += 1;
+                if dir.nlink == u32::MAX {
+                    return Err(nfsstat3::NFS3ERR_NOSPC);
+                }
                 dir.nlink += 1; // New subdirectory's ".." points to this directory
                 let (now_sec, now_nsec) = get_current_time();
                 dir.mtime = now_sec;

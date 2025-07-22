@@ -220,6 +220,9 @@ impl SlateDbFs {
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
             Inode::File(file) => {
+                if file.nlink == u32::MAX {
+                    return Err(nfsstat3::NFS3ERR_MLINK);
+                }
                 file.nlink += 1;
                 file.ctime = now_sec;
                 file.ctime_nsec = now_nsec;
@@ -228,6 +231,9 @@ impl SlateDbFs {
             | Inode::Socket(special)
             | Inode::CharDevice(special)
             | Inode::BlockDevice(special) => {
+                if special.nlink == u32::MAX {
+                    return Err(nfsstat3::NFS3ERR_MLINK);
+                }
                 special.nlink += 1;
                 special.ctime = now_sec;
                 special.ctime_nsec = now_nsec;
