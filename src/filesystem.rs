@@ -1,6 +1,7 @@
 use crate::cache::{CacheKey, CacheValue, UnifiedCache};
 use crate::encryption::{EncryptedDb, EncryptionManager};
 use crate::lock_manager::LockManager;
+use crate::stats::FileSystemStats;
 use bytes::Bytes;
 use slatedb::config::ObjectStoreCacheOptions;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
@@ -40,6 +41,7 @@ pub struct SlateDbFs {
     pub metadata_cache: Arc<UnifiedCache>,
     pub small_file_cache: Arc<UnifiedCache>,
     pub dir_entry_cache: Arc<UnifiedCache>,
+    pub stats: Arc<FileSystemStats>,
 }
 
 // Struct for temporary unencrypted access (only for key management)
@@ -185,6 +187,7 @@ impl SlateDbFs {
             metadata_cache,
             small_file_cache,
             dir_entry_cache,
+            stats: Arc::new(FileSystemStats::new()),
         };
 
         Ok(fs)
@@ -216,6 +219,10 @@ impl SlateDbFs {
         format!("dirscan:{dir_inode_id}/")
     }
 
+    pub fn tombstone_key(timestamp: u64, inode_id: InodeId) -> Bytes {
+        Bytes::from(format!("tombstone:{timestamp}:{inode_id}"))
+    }
+
     pub async fn allocate_inode(&self) -> Result<InodeId, nfsstat3> {
         let id = self.next_inode_id.fetch_add(1, Ordering::SeqCst);
         Ok(id)
@@ -224,8 +231,10 @@ impl SlateDbFs {
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, nfsstat3> {
         let cache_key = CacheKey::Metadata(inode_id);
         if let Some(CacheValue::Metadata(cached_inode)) = self.metadata_cache.get(cache_key).await {
+            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((*cached_inode).clone());
         }
+        self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let key = Self::inode_key(inode_id);
         let data = self
@@ -265,6 +274,145 @@ impl SlateDbFs {
         if let Inode::File(file) = inode {
             if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES {
                 self.small_file_cache.remove(CacheKey::SmallFile(inode_id));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn run_garbage_collection(&self) -> Result<(), nfsstat3> {
+        const CHUNK_BATCH_SIZE: usize = 10_000;
+
+        self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
+
+        loop {
+            let prefix = Bytes::from("tombstone:");
+            let range = prefix.clone()..Bytes::from("tombstone:~");
+
+            let mut tombstones_to_update = Vec::new();
+            let mut chunks_deleted_this_round = 0;
+            let mut tombstones_completed_this_round = 0;
+            let mut found_incomplete_tombstones = false;
+
+            let iter = self
+                .db
+                .scan(range)
+                .await
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            futures::pin_mut!(iter);
+
+            while let Some(Ok((key, value))) = futures::StreamExt::next(&mut iter).await {
+                // Parse inode_id from key: "tombstone:<timestamp>:<inode_id>"
+                let key_str = String::from_utf8_lossy(&key);
+                let parts: Vec<&str> = key_str.split(':').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+
+                let inode_id = match parts[2].parse::<u64>() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+
+                if value.len() != 8 {
+                    panic!(
+                        "Corrupted tombstone found for inode {}: expected 8 bytes, got {}",
+                        inode_id,
+                        value.len()
+                    );
+                }
+
+                let size_bytes: [u8; 8] = value.as_ref().try_into().unwrap();
+                let size = u64::from_le_bytes(size_bytes);
+
+                if size == 0 {
+                    // No chunks left, just delete the tombstone
+                    tombstones_to_update.push((key, inode_id, 0, 0, true));
+                    continue;
+                }
+
+                let total_chunks = size.div_ceil(CHUNK_SIZE as u64) as usize;
+                let chunks_to_delete = total_chunks.min(CHUNK_BATCH_SIZE);
+                let start_chunk = total_chunks.saturating_sub(chunks_to_delete);
+
+                let is_final_batch = chunks_to_delete == total_chunks;
+                if !is_final_batch {
+                    found_incomplete_tombstones = true;
+                }
+                tombstones_to_update.push((key, inode_id, size, start_chunk, is_final_batch));
+
+                let mut batch = self.db.new_write_batch();
+                for chunk_idx in start_chunk..total_chunks {
+                    let chunk_key = Self::chunk_key_by_index(inode_id, chunk_idx);
+                    batch.delete_bytes(&chunk_key);
+                }
+
+                if chunks_to_delete > 0 {
+                    self.db
+                        .write_with_options(
+                            batch,
+                            &WriteOptions {
+                                await_durable: false,
+                            },
+                        )
+                        .await
+                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+                    chunks_deleted_this_round += chunks_to_delete;
+                    // Count this as processing a tombstone (even if not fully completed)
+                    if is_final_batch {
+                        tombstones_completed_this_round += 1;
+                    }
+                }
+            }
+
+            if !tombstones_to_update.is_empty() {
+                let mut batch = self.db.new_write_batch();
+
+                for (key, _inode_id, old_size, start_chunk, delete_tombstone) in
+                    tombstones_to_update
+                {
+                    if delete_tombstone {
+                        batch.delete_bytes(&key);
+                    } else {
+                        let remaining_chunks = start_chunk;
+                        let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
+                        let actual_remaining = remaining_size.min(old_size);
+                        batch
+                            .put_bytes(&key, &actual_remaining.to_le_bytes())
+                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    }
+                }
+
+                self.db
+                    .write_with_options(
+                        batch,
+                        &WriteOptions {
+                            await_durable: false,
+                        },
+                    )
+                    .await
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+                self.stats
+                    .tombstones_processed
+                    .fetch_add(tombstones_completed_this_round, Ordering::Relaxed);
+            }
+
+            if chunks_deleted_this_round > 0 || tombstones_completed_this_round > 0 {
+                self.stats
+                    .gc_chunks_deleted
+                    .fetch_add(chunks_deleted_this_round as u64, Ordering::Relaxed);
+
+                tracing::info!(
+                    "GC: processed {} tombstones, deleted {} chunks",
+                    tombstones_completed_this_round,
+                    chunks_deleted_this_round,
+                );
+            }
+
+            if !found_incomplete_tombstones {
+                break;
             }
         }
 
@@ -364,6 +512,7 @@ impl SlateDbFs {
             metadata_cache,
             small_file_cache,
             dir_entry_cache,
+            stats: Arc::new(FileSystemStats::new()),
         };
 
         Ok(fs)
