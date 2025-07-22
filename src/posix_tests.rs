@@ -9,11 +9,6 @@ mod tests {
         SlateDbFs::new_in_memory().await.unwrap()
     }
 
-    #[allow(dead_code)]
-    async fn stat(fs: &SlateDbFs, id: fileid3) -> Result<fattr3, nfsstat3> {
-        fs.getattr(&test_auth(), id).await
-    }
-
     #[tokio::test]
     async fn test_chmod_basic() {
         let fs = create_test_fs().await;

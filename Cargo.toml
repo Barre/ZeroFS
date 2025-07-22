@@ -37,6 +37,8 @@ anyhow = "1.0"
 hex = "0.4"
 argon2 = "0.5"
 url = "2.5"
+deku = "0.19"
+thiserror = "2.0"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }
