@@ -6,6 +6,7 @@ use zerofs_nfsserve::vfs::AuthContext;
 use super::common::validate_filename;
 use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
 use crate::inode::Inode;
+use crate::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 
 impl SlateDbFs {
@@ -94,7 +95,7 @@ impl SlateDbFs {
                             // Last link, check if we should delete immediately or defer
                             let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
 
-                            if total_chunks <= 10 {
+                            if total_chunks <= SMALL_FILE_TOMBSTONE_THRESHOLD {
                                 // Small file, delete chunks immediately
                                 for chunk_idx in 0..total_chunks {
                                     let chunk_key = Self::chunk_key_by_index(file_id, chunk_idx);
