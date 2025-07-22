@@ -130,12 +130,12 @@ This should be fine for most use-cases but if you need to hide directory structu
 
 ### macOS
 ```bash
-mount -t nfs -o async,nolocks,vers=3,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ mnt
+mount -t nfs -o sync,nolocks,vers=3,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ mnt
 ```
 
 ### Linux
 ```bash
-mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt
+mount -t nfs -o sync,nolock,vers=3,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt
 ```
 
 ## NBD Configuration and Usage
