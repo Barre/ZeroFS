@@ -8,6 +8,7 @@ mod nbd;
 mod nfs;
 mod operations;
 mod permissions;
+mod stats;
 
 #[cfg(test)]
 mod test_helpers;
@@ -378,9 +379,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Wait for either NFS or any NBD server to complete (or error)
+    let gc_fs = Arc::clone(&fs_arc);
+    let gc_handle = tokio::spawn(async move {
+        info!("Starting garbage collection task (runs continuously)");
+        loop {
+            if let Err(e) = gc_fs.run_garbage_collection().await {
+                tracing::error!("Garbage collection failed: {:?}", e);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+
+    let stats_fs = Arc::clone(&fs_arc);
+    let stats_handle = tokio::spawn(async move {
+        info!("Starting stats reporting task (reports every 5 seconds)");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            info!("\n{}", stats_fs.stats.report());
+        }
+    });
+
     if nbd_handles.is_empty() {
-        nfs_handle.await??;
+        tokio::select! {
+            result = nfs_handle => {
+                result??;
+            }
+            _ = gc_handle => {
+                // GC task should never complete
+            }
+            _ = stats_handle => {
+                // Stats task should never complete
+            }
+        }
     } else {
         tokio::select! {
             result = nfs_handle => {
@@ -398,6 +429,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err(e.into());
                     }
                 }
+            }
+            _ = gc_handle => {
+            }
+            _ = stats_handle => {
             }
         }
     }

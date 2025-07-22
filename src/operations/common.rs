@@ -3,6 +3,8 @@ use crate::inode::{Inode, InodeId};
 use crate::permissions::{AccessMode, Credentials, check_access};
 use zerofs_nfsserve::nfs::nfsstat3;
 
+pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
+
 // POSIX limits
 pub const NAME_MAX: usize = 255; // Maximum filename length
 
