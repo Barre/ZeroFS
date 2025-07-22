@@ -323,6 +323,9 @@ impl SlateDbFs {
                 // If we moved a directory in, increment nlink (gained the .. entry)
                 // But if we replaced an existing directory, the net change is 0
                 if is_moved_dir && (target_inode_id.is_none() || !target_was_directory) {
+                    if d.nlink == u32::MAX {
+                        return Err(nfsstat3::NFS3ERR_NOSPC);
+                    }
                     d.nlink += 1;
                 }
                 d.mtime = now_sec;
