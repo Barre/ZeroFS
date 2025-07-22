@@ -42,5 +42,6 @@ thiserror = "2.0"
 comfy-table = "7.1"
 num-format = "0.4"
 
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }
