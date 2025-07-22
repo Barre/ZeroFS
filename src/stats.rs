@@ -208,24 +208,21 @@ impl FileSystemStats {
         table.add_row(vec![
             Cell::new("  Read"),
             Cell::new(format!(
-                "{:.1} ops/s ({:.2} MB/s)",
-                read_ops_per_sec, mb_read_per_sec
+                "{read_ops_per_sec:.1} ops/s ({mb_read_per_sec:.2} MB/s)"
             ))
             .fg(Color::Green),
         ]);
         table.add_row(vec![
             Cell::new("  Write"),
             Cell::new(format!(
-                "{:.1} ops/s ({:.2} MB/s)",
-                write_ops_per_sec, mb_written_per_sec
+                "{write_ops_per_sec:.1} ops/s ({mb_written_per_sec:.2} MB/s)"
             ))
             .fg(Color::Blue),
         ]);
         table.add_row(vec![
             Cell::new("  All Operations"),
             Cell::new(format!(
-                "{:.1} ops/s (includes create/delete/list/etc.)",
-                ops_per_sec
+                "{ops_per_sec:.1} ops/s (includes create/delete/list/etc.)",
             ))
             .fg(Color::Magenta)
             .add_attribute(Attribute::Bold),
