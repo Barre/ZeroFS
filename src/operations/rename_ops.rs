@@ -1,4 +1,5 @@
 use slatedb::config::WriteOptions;
+use std::sync::atomic::Ordering;
 use tracing::debug;
 use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::AuthContext;
@@ -218,12 +219,26 @@ impl SlateDbFs {
                             .put_bytes(&inode_key, &inode_data)
                             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
                     } else {
-                        // Last link, delete the file and its data
+                        // Last link, check if we should delete immediately or defer
                         let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
-                        for chunk_idx in 0..total_chunks {
-                            let chunk_key = Self::chunk_key_by_index(target_id, chunk_idx);
-                            batch.delete_bytes(&chunk_key);
+                        
+                        if total_chunks <= 10 {
+                            // Small file, delete chunks immediately
+                            for chunk_idx in 0..total_chunks {
+                                let chunk_key = Self::chunk_key_by_index(target_id, chunk_idx);
+                                batch.delete_bytes(&chunk_key);
+                            }
+                        } else {
+                            // Large file, create tombstone for deferred chunk deletion
+                            let (timestamp, _) = get_current_time();
+                            let tombstone_key = Self::tombstone_key(timestamp, target_id);
+                            batch
+                                .put_bytes(&tombstone_key, &file.size.to_le_bytes())
+                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            self.stats.tombstones_created.fetch_add(1, Ordering::Relaxed);
                         }
+                        
+                        // Delete the inode
                         let inode_key = Self::inode_key(target_id);
                         batch.delete_bytes(&inode_key);
                     }
