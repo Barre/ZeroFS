@@ -3,6 +3,8 @@ use num_format::{Locale, ToFormattedString};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+const MB_IN_BYTES: f64 = 1_048_576.0;
+
 struct PreviousSnapshot {
     total_operations: u64,
     bytes_read: u64,
@@ -124,13 +126,13 @@ impl FileSystemStats {
         };
 
         let mb_read_per_sec = if interval_secs > 0.0 {
-            (bytes_read - snapshot.bytes_read) as f64 / interval_secs / 1_048_576.0
+            (bytes_read - snapshot.bytes_read) as f64 / interval_secs / MB_IN_BYTES
         } else {
             0.0
         };
 
         let mb_written_per_sec = if interval_secs > 0.0 {
-            (bytes_written - snapshot.bytes_written) as f64 / interval_secs / 1_048_576.0
+            (bytes_written - snapshot.bytes_written) as f64 / interval_secs / MB_IN_BYTES
         } else {
             0.0
         };
