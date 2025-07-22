@@ -168,6 +168,9 @@ impl SlateDbFs {
 
                 self.metadata_cache.remove(CacheKey::Metadata(dirid));
 
+                self.stats.directories_created.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
                 Ok((
                     new_dir_id,
                     Inode::Directory(new_dir_inode).to_fattr3(new_dir_id),
@@ -305,6 +308,10 @@ impl SlateDbFs {
                     result.entries.len(),
                     result.end
                 );
+                
+                self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+                
                 Ok(result)
             }
             _ => Err(nfsstat3::NFS3ERR_NOTDIR),

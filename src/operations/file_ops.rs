@@ -140,6 +140,11 @@ impl SlateDbFs {
                     "Write processed successfully for inode {}, new size: {}, took: {:?}",
                     id, new_size, elapsed
                 );
+                
+                self.stats.bytes_written.fetch_add(data.len() as u64, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+                
                 Ok(inode.to_fattr3(id))
             }
             _ => Err(nfsstat3::NFS3ERR_ISDIR),
@@ -268,6 +273,9 @@ impl SlateDbFs {
 
                 self.metadata_cache.remove(CacheKey::Metadata(dirid));
 
+                self.stats.files_created.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
                 Ok((file_id, Inode::File(file_inode).to_fattr3(file_id)))
             }
             _ => Err(nfsstat3::NFS3ERR_NOTDIR),
@@ -324,6 +332,9 @@ impl SlateDbFs {
                     {
                         debug!("Serving file {} from small file cache", id);
                         let eof = file.size <= count as u64;
+                        self.stats.bytes_read.fetch_add(cached_data.len() as u64, Ordering::Relaxed);
+                        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
                         return Ok(((*cached_data).clone(), eof));
                     }
                 }
@@ -420,6 +431,10 @@ impl SlateDbFs {
                         crate::cache::CacheValue::SmallFile(std::sync::Arc::new(result.clone()));
                     self.small_file_cache.insert(cache_key, cache_value, false);
                 }
+
+                self.stats.bytes_read.fetch_add(result.len() as u64, Ordering::Relaxed);
+                self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 Ok((result, eof))
             }
