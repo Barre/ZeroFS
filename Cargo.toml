@@ -15,7 +15,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-zerofs_nfsserve = "0.11.0"
+zerofs_nfsserve = "0.11"
 tokio = { version = "1.46", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"

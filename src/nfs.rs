@@ -289,15 +289,17 @@ impl NFSFileSystem for SlateDbFs {
         offset: u64,
         count: u32,
     ) -> Result<writeverf3, nfsstat3> {
-        debug!(
+        tracing::debug!(
             "commit called: fileid={}, offset={}, count={}",
-            fileid, offset, count
+            fileid,
+            offset,
+            count
         );
 
         match self.db.flush().await {
             Ok(_) => {
                 debug!("commit successful for file {}", fileid);
-                Ok(self.get_write_verf())
+                Ok(self.serverid())
             }
             Err(e) => {
                 tracing::error!("commit failed for file {}: {}", fileid, e);
