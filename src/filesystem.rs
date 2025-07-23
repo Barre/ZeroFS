@@ -98,6 +98,7 @@ impl SlateDbFs {
                 ..Default::default()
             },
             compactor_options: Some(slatedb::config::CompactorOptions {
+                max_sst_size: 256 * 1024 * 1024,
                 max_concurrent_compactions: 16,
                 ..Default::default()
             }),
