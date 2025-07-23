@@ -12,6 +12,7 @@ use slatedb::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::nfsstat3;
 
 const SLATEDB_BLOCK_SIZE: usize = 64 * 1024;
@@ -109,9 +110,24 @@ impl SlateDbFs {
         }));
 
         let db_path = Path::from(db_path);
+
+        let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
+            let runtime = Runtime::new().unwrap();
+            let handle = runtime.handle().clone();
+
+            let runtime_keeper = std::thread::spawn(move || {
+                runtime.block_on(async { std::future::pending::<()>().await });
+            });
+
+            (handle, runtime_keeper)
+        })
+        .await?;
+
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
+                .with_gc_runtime(runtime_handle.clone())
+                .with_compaction_runtime(runtime_handle.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block64Kib)
                 .with_block_cache(cache)
                 .build()
