@@ -199,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let actual_db_path = path_from_url.to_string();
 
-    info!("Starting SlateDB NFS server with {} backend", object_store);
+    info!("Starting ZeroFS NFS server with {} backend", object_store);
     info!("DB Path: {}", actual_db_path);
     info!("Cache Directory: {}", cache_config.root_folder);
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
