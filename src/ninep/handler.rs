@@ -276,7 +276,7 @@ impl NinePHandler {
                 iounit: src_fid.iounit,
                 opened: false,
                 mode: None,
-                creds: src_fid.creds.clone(), // Inherit credentials from source fid
+                creds: src_fid.creds, // Inherit credentials from source fid
             };
             self.session.fids.insert(tw.newfid, new_fid);
         }
@@ -301,7 +301,7 @@ impl NinePHandler {
         }
 
         let inode_id = fid_entry.inode_id;
-        let creds = fid_entry.creds.clone();
+        let creds = fid_entry.creds;
         let iounit = fid_entry.iounit;
 
         debug!(
@@ -420,7 +420,7 @@ impl NinePHandler {
             Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
         };
 
-        let mut temp_creds = parent_fid.creds.clone();
+        let mut temp_creds = parent_fid.creds;
         temp_creds.gid = tc.gid;
         let auth = self.make_auth_context(&temp_creds);
 
@@ -564,7 +564,7 @@ impl NinePHandler {
                 Some(f) => f,
                 None => return P9Message::error(tag, libc::EBADF as u32),
             };
-            (fid_entry.inode_id, fid_entry.creds.clone())
+            (fid_entry.inode_id, fid_entry.creds)
         };
 
         let auth = self.make_auth_context(&creds);
@@ -630,7 +630,7 @@ impl NinePHandler {
 
         let parent_id = parent_fid.inode_id;
 
-        let creds = parent_fid.creds.clone();
+        let creds = parent_fid.creds;
 
         let name = match tm.name.as_str() {
             Ok(s) => s,
@@ -642,7 +642,7 @@ impl NinePHandler {
             parent_id, name, tm.dfid, tm.mode, tm.gid, creds.uid, creds.gid
         );
 
-        let mut temp_creds = creds.clone();
+        let mut temp_creds = creds;
         temp_creds.gid = tm.gid;
         let auth = self.make_auth_context(&temp_creds);
 
@@ -683,7 +683,7 @@ impl NinePHandler {
         };
 
         let parent_id = parent_fid.inode_id;
-        let creds = parent_fid.creds.clone();
+        let creds = parent_fid.creds;
 
         let name = match ts.name.as_str() {
             Ok(s) => s,
@@ -695,7 +695,7 @@ impl NinePHandler {
             Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
         };
 
-        let mut temp_creds = creds.clone();
+        let mut temp_creds = creds;
         temp_creds.gid = ts.gid;
         let auth = self.make_auth_context(&temp_creds);
 
@@ -736,7 +736,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        let mut temp_creds = parent_fid.creds.clone();
+        let mut temp_creds = parent_fid.creds;
         temp_creds.gid = tm.gid;
         let auth = self.make_auth_context(&temp_creds);
 
@@ -833,7 +833,7 @@ impl NinePHandler {
         let dir_id = dir_fid.inode_id;
         let file_id = file_fid.inode_id;
 
-        let creds = dir_fid.creds.clone();
+        let creds = dir_fid.creds;
 
         let name = match tl.name.as_str() {
             Ok(s) => s,
@@ -873,10 +873,10 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EINVAL as u32);
         }
 
-        let source_name = source_fid.path.last().unwrap().clone();
+        let source_name = source_fid.path.last().unwrap();
         let source_parent_path = source_fid.path[..source_fid.path.len() - 1].to_vec();
         let dest_parent_id = dest_fid.inode_id;
-        let creds = source_fid.creds.clone();
+        let creds = source_fid.creds;
 
         let mut source_parent_id = 0;
         let auth = self.make_auth_context(&creds);
@@ -927,7 +927,7 @@ impl NinePHandler {
 
         let old_parent_id = old_dir_fid.inode_id;
         let new_parent_id = new_dir_fid.inode_id;
-        let creds = old_dir_fid.creds.clone();
+        let creds = old_dir_fid.creds;
 
         let old_name = match tr.oldname.as_str() {
             Ok(s) => s,
@@ -964,7 +964,7 @@ impl NinePHandler {
         };
 
         let parent_id = dir_fid.inode_id;
-        let creds = dir_fid.creds.clone();
+        let creds = dir_fid.creds;
 
         let name = match tu.name.as_str() {
             Ok(s) => s,
