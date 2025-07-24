@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::nfsstat3;
 
-const SLATEDB_BLOCK_SIZE: usize = 64 * 1024;
+const SLATEDB_BLOCK_SIZE: usize = 4 * 1024;
 
 use crate::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,8 +31,7 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 64 * 1024;
-pub const LOCK_SHARD_COUNT: usize = 1_000_000;
+pub const CHUNK_SIZE: usize = 16 * 1024;
 
 #[derive(Clone)]
 pub struct SlateDbFs {
@@ -129,7 +128,6 @@ impl SlateDbFs {
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_compaction_runtime(runtime_handle.clone())
-                .with_sst_block_size(slatedb::SstBlockSize::Block64Kib)
                 .with_block_cache(cache)
                 .build()
                 .await?,
@@ -177,7 +175,7 @@ impl SlateDbFs {
             .await?;
         }
 
-        let lock_manager = Arc::new(LockManager::new(LOCK_SHARD_COUNT));
+        let lock_manager = Arc::new(LockManager::new());
 
         // ZeroFS now uses only in-memory cache, no need for disk cache directory
         let unified_cache = Arc::new(
@@ -527,7 +525,7 @@ impl SlateDbFs {
             .await?;
         }
 
-        let lock_manager = Arc::new(LockManager::new(LOCK_SHARD_COUNT));
+        let lock_manager = Arc::new(LockManager::new());
 
         // ZeroFS uses only in-memory cache for tests (100MB)
         let unified_cache = Arc::new(UnifiedCache::new("", 0.0, Some(0.1)).await?);

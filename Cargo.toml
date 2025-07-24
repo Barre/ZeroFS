@@ -43,6 +43,7 @@ comfy-table = "7.1"
 num-format = "0.4"
 libc = "0.2"
 rayon = "1.10"
+dashmap = "6.1"
 
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
