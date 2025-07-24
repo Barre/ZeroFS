@@ -1760,6 +1760,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "madsim"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3967,6 +3976,7 @@ dependencies = [
  "hex",
  "hkdf",
  "libc",
+ "lz4_flex",
  "num-format",
  "object_store",
  "rand 0.8.5",
@@ -3981,7 +3991,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zerofs_nfsserve",
- "zstd",
 ]
 
 [[package]]

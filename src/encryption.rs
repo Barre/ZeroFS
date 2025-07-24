@@ -17,7 +17,6 @@ use std::sync::Arc;
 use tokio::task;
 
 const NONCE_SIZE: usize = 12;
-const COMPRESSION_LEVEL: i32 = 3;
 
 pub struct EncryptionManager {
     cipher: ChaCha20Poly1305,
@@ -42,9 +41,8 @@ impl EncryptionManager {
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // Compress chunks only
-        let data = if key.starts_with("chunk:") && plaintext.len() > 100 {
-            zstd::encode_all(plaintext, COMPRESSION_LEVEL)?
+        let data = if key.starts_with("chunk:") {
+            lz4_flex::compress_prepend_size(plaintext)
         } else {
             plaintext.to_vec()
         };
@@ -77,14 +75,9 @@ impl EncryptionManager {
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         // Decompress chunks
-        if key.starts_with("chunk:") && !decrypted.is_empty() {
-            // Check if data was compressed (zstd magic number)
-            if decrypted.len() >= 4 && decrypted[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-                zstd::decode_all(&decrypted[..])
-                    .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
-            } else {
-                Ok(decrypted)
-            }
+        if key.starts_with("chunk:") {
+            lz4_flex::decompress_size_prepended(&decrypted)
+                .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
         } else {
             Ok(decrypted)
         }
