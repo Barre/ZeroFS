@@ -3936,6 +3936,7 @@ dependencies = [
  "futures",
  "hex",
  "hkdf",
+ "libc",
  "num-format",
  "object_store",
  "rand 0.8.5",
