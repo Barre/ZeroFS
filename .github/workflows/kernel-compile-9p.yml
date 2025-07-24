@@ -1,0 +1,169 @@
+name: kernel-compile-9p
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  kernel-compile-9p:
+    name: Compile Linux Kernel on 9P
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+
+          # Load 9p kernel modules
+          sudo modprobe 9p
+          sudo modprobe 9pnet
+          sudo modprobe 9pnet_virtio
+
+          # List loaded 9p modules
+          lsmod | grep 9p || echo "No 9p modules loaded yet"
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
+      - name: Build ZeroFS
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS with 9P support
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Start ZeroFS in the background with 9P enabled
+          AWS_ENDPOINT=http://localhost:9000 \
+          AWS_ACCESS_KEY_ID=minioadmin \
+          AWS_SECRET_ACCESS_KEY=minioadmin \
+          AWS_ALLOW_HTTP=true \
+          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
+          SLATEDB_CACHE_SIZE_GB=5 \
+          ZEROFS_MEMORY_CACHE_SIZE_GB=10 \
+          ZEROFS_ENCRYPTION_PASSWORD=secret \
+          cargo run --profile ci s3://zerofs-test/test &
+
+          # Save PID for stats collection
+          echo $! > /tmp/zerofs.pid
+
+          # Wait for ZeroFS 9P server to start
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 5564 2>/dev/null; then
+            echo "ZeroFS 9P server failed to start"
+            exit 1
+          fi
+
+      - name: Mount 9P filesystem
+        run: |
+          # Create mount point
+          sudo mkdir -p /mnt/zerofs
+
+          # Mount ZeroFS via 9P
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+
+          # Verify mount
+          mount | grep zerofs
+
+          # Test write access
+          touch /mnt/zerofs/test_file && rm /mnt/zerofs/test_file
+
+      - name: Check disk space
+        run: df -h
+
+      - name: Download Linux kernel
+        run: |
+          cd /mnt/zerofs
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+          tar -xf linux-6.11.tar.xz
+          rm linux-6.11.tar.xz
+
+      - name: Compile kernel
+        run: |
+          cd /mnt/zerofs/linux-6.11
+
+          # Configure with tinyconfig for minimal build
+          make tinyconfig
+
+          # Show config size
+          echo "Config size: $(wc -l < .config) lines"
+
+          # Time the compilation
+          echo "Starting kernel compilation with $(nproc) cores..."
+          time make -j$(nproc) 2>&1 | tee /tmp/kernel-build.log
+
+          # Check if vmlinux was created
+          if [ -f vmlinux ]; then
+            echo "Kernel compilation successful!"
+            ls -lh vmlinux
+          else
+            echo "Kernel compilation failed!"
+            exit 1
+          fi
+
+      - name: Collect ZeroFS statistics
+        if: always()
+        run: |
+          # Send SIGUSR1 to get stats (if your implementation supports it)
+          if [ -f /tmp/zerofs.pid ]; then
+            kill -USR1 $(cat /tmp/zerofs.pid) || true
+            sleep 2
+          fi
+
+          # Extract relevant stats from logs
+          echo "=== ZeroFS Performance Statistics ==="
+
+          # Look for the most recent stats in the logs
+          journalctl -u cargo --no-pager -n 1000 2>/dev/null | grep -A20 "ZeroFS Statistics" | tail -25 || true
+
+          # Also check cargo output
+          ps aux | grep "[c]argo run" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount
+          sudo umount /mnt/zerofs || true
+
+          # Kill ZeroFS
+          if [ -f /tmp/zerofs.pid ]; then
+            kill $(cat /tmp/zerofs.pid) || true
+          fi
+          pkill -f "cargo run --profile ci s3://zerofs-test/test" || true
