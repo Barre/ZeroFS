@@ -135,7 +135,7 @@ This should be fine for most use-cases but if you need to hide directory structu
 9P provides better performance and more accurate POSIX semantics, especially for fsync/commit operations:
 
 ```bash
-mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=65536,access=user 127.0.0.1 /mnt/9p
+mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,access=user 127.0.0.1 /mnt/9p
 ```
 
 ### NFS
