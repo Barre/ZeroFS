@@ -23,7 +23,10 @@ pub struct FileSystemStats {
     pub files_renamed: AtomicU64,
     pub directories_created: AtomicU64,
     pub directories_deleted: AtomicU64,
-    pub symlinks_created: AtomicU64,
+    pub directories_renamed: AtomicU64,
+    pub links_created: AtomicU64,
+    pub links_deleted: AtomicU64,
+    pub links_renamed: AtomicU64,
 
     // Read/Write operations
     pub read_operations: AtomicU64,
@@ -56,7 +59,10 @@ impl FileSystemStats {
             files_renamed: AtomicU64::new(0),
             directories_created: AtomicU64::new(0),
             directories_deleted: AtomicU64::new(0),
-            symlinks_created: AtomicU64::new(0),
+            directories_renamed: AtomicU64::new(0),
+            links_created: AtomicU64::new(0),
+            links_deleted: AtomicU64::new(0),
+            links_renamed: AtomicU64::new(0),
             read_operations: AtomicU64::new(0),
             write_operations: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
@@ -88,7 +94,10 @@ impl FileSystemStats {
         let files_renamed = self.files_renamed.load(Ordering::Relaxed);
         let dirs_created = self.directories_created.load(Ordering::Relaxed);
         let dirs_deleted = self.directories_deleted.load(Ordering::Relaxed);
-        let symlinks_created = self.symlinks_created.load(Ordering::Relaxed);
+        let dirs_renamed = self.directories_renamed.load(Ordering::Relaxed);
+        let links_created = self.links_created.load(Ordering::Relaxed);
+        let links_deleted = self.links_deleted.load(Ordering::Relaxed);
+        let links_renamed = self.links_renamed.load(Ordering::Relaxed);
 
         let read_ops = self.read_operations.load(Ordering::Relaxed);
         let write_ops = self.write_operations.load(Ordering::Relaxed);
@@ -188,16 +197,19 @@ impl FileSystemStats {
         table.add_row(vec![
             Cell::new("  Directories"),
             Cell::new(format!(
-                "Created: {} | Deleted: {}",
+                "Created: {} | Deleted: {} | Renamed: {}",
                 dirs_created.to_formatted_string(&Locale::en),
-                dirs_deleted.to_formatted_string(&Locale::en)
+                dirs_deleted.to_formatted_string(&Locale::en),
+                dirs_renamed.to_formatted_string(&Locale::en)
             )),
         ]);
         table.add_row(vec![
-            Cell::new("  Symlinks"),
+            Cell::new("  Links"),
             Cell::new(format!(
-                "Created: {}",
-                symlinks_created.to_formatted_string(&Locale::en)
+                "Created: {} | Deleted: {} | Renamed: {}",
+                links_created.to_formatted_string(&Locale::en),
+                links_deleted.to_formatted_string(&Locale::en),
+                links_renamed.to_formatted_string(&Locale::en)
             )),
         ]);
 

@@ -136,6 +136,7 @@ impl SlateDbFs {
                         // Delete the symlink inode
                         let inode_key = Self::inode_key(file_id);
                         batch.delete_bytes(&inode_key);
+                        self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                     }
                     Inode::Fifo(special)
                     | Inode::Socket(special)

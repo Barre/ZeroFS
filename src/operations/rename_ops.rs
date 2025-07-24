@@ -409,6 +409,22 @@ impl SlateDbFs {
             name: to_name.clone(),
         });
 
+        match source_inode {
+            Inode::File(_) => {
+                self.stats.files_renamed.fetch_add(1, Ordering::Relaxed);
+            }
+            Inode::Directory(_) => {
+                self.stats
+                    .directories_renamed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Inode::Symlink(_) => {
+                self.stats.links_renamed.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
         Ok(())
     }
 }

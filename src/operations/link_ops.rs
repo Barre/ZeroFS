@@ -144,6 +144,9 @@ impl SlateDbFs {
 
         self.metadata_cache.remove(CacheKey::Metadata(dirid));
 
+        self.stats.links_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
         Ok((new_id, symlink_inode.to_fattr3(new_id)))
     }
 
@@ -272,6 +275,9 @@ impl SlateDbFs {
 
         self.metadata_cache.remove(CacheKey::Metadata(fileid)); // File's metadata changed (nlink, ctime)
         self.metadata_cache.remove(CacheKey::Metadata(linkdirid)); // Directory's metadata changed
+
+        self.stats.links_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
