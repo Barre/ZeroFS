@@ -6,6 +6,7 @@ mod key_management;
 mod lock_manager;
 mod nbd;
 mod nfs;
+mod ninep;
 mod operations;
 mod permissions;
 mod stats;
@@ -30,6 +31,8 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 const DEFAULT_NFS_HOST: &str = "127.0.0.1";
 const DEFAULT_NFS_PORT: u32 = 2049;
+const DEFAULT_9P_HOST: &str = "127.0.0.1";
+const DEFAULT_9P_PORT: u16 = 5564;
 
 // ANSI color codes
 const RED: &str = "\x1b[31m";
@@ -111,6 +114,10 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  {BLUE}ZEROFS_NFS_HOST_PORT{RESET}           - NFS server port (default: 2049)"
         );
+        eprintln!(
+            "  {BLUE}ZEROFS_9P_HOST{RESET}                 - 9P server bind address (default: 127.0.0.1)"
+        );
+        eprintln!("  {BLUE}ZEROFS_9P_PORT{RESET}                 - 9P server port (default: 5564)");
         eprintln!();
         eprintln!("{YELLOW}Logging Configuration:{RESET}");
         eprintln!(
@@ -400,9 +407,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Start 9P server
+    let ninep_host =
+        std::env::var("ZEROFS_9P_HOST").unwrap_or_else(|_| DEFAULT_9P_HOST.to_string());
+    let ninep_port = std::env::var("ZEROFS_9P_PORT")
+        .map_or_else(|_| Ok(DEFAULT_9P_PORT), |port| port.parse::<u16>())
+        .expect("ZEROFS_9P_PORT must be a valid port number");
+
+    let ninep_fs = Arc::clone(&fs_arc);
+    let ninep_addr = format!("{ninep_host}:{ninep_port}")
+        .parse()
+        .expect("Invalid 9P server address");
+    let ninep_server = crate::ninep::NinePServer::new(ninep_fs, ninep_addr);
+    let ninep_handle = tokio::spawn(async move { ninep_server.start().await });
+
     if nbd_handles.is_empty() {
         tokio::select! {
             result = nfs_handle => {
+                result??;
+            }
+            result = ninep_handle => {
                 result??;
             }
             _ = gc_handle => {
@@ -415,6 +439,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tokio::select! {
             result = nfs_handle => {
+                result??;
+            }
+            result = ninep_handle => {
                 result??;
             }
             result = futures::future::select_all(nbd_handles) => {

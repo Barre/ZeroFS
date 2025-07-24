@@ -1,0 +1,144 @@
+name: pjdfstest-9p
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  pjdfstest-9p:
+    name: Run pjdfstest 9P Test Suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool git perl
+          
+          # Check if 9p kernel module is available
+          sudo modprobe 9p
+          sudo modprobe 9pnet
+          sudo modprobe 9pnet_virtio
+          
+          # List loaded 9p modules
+          lsmod | grep 9p || echo "No 9p modules loaded yet"
+
+      - name: Clone pjdfstest_nfs
+        run: |
+          git clone https://github.com/Barre/pjdfstest_nfs.git /tmp/pjdfstest_nfs
+
+      - name: Build pjdfstest
+        working-directory: /tmp/pjdfstest_nfs
+        run: |
+          autoreconf -fvi
+          ./configure
+          make
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
+      - name: Build ZeroFS
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS with 9P support
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Start ZeroFS in the background with 9P enabled
+          AWS_ENDPOINT=http://localhost:9000 \
+          AWS_ACCESS_KEY_ID=minioadmin \
+          AWS_SECRET_ACCESS_KEY=minioadmin \
+          AWS_ALLOW_HTTP=true \
+          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
+          SLATEDB_CACHE_SIZE_GB=1 \
+          ZEROFS_ENCRYPTION_PASSWORD=secret \
+          cargo run --profile ci s3://zerofs-test/test &
+
+          # Wait for ZeroFS to start (9P runs on port 5564)
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 5564 2>/dev/null; then
+            echo "ZeroFS 9P server failed to start"
+            exit 1
+          fi
+
+      - name: Mount 9P filesystem
+        run: |
+          # Create mount point
+          sudo mkdir -p /mnt/zerofs-9p
+
+          # Mount ZeroFS via 9P using v9fs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=65536,access=user 127.0.0.1 /mnt/zerofs-9p
+
+          # Verify mount
+          mount | grep zerofs-9p
+
+      - name: Run pjdfstest
+        working-directory: /mnt/zerofs-9p
+        run: |
+          # Create test directory
+          mkdir -p pjdfstest_test
+          cd pjdfstest_test
+
+          # Get list of all test files
+          find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
+          
+          # Filter out excluded tests
+          grep -v -f ${{ github.workspace }}/.github/.pjdfstest-9p-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
+          
+          # Run the filtered test suite
+          sudo prove -rv $(cat /tmp/tests_to_run.txt)
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "pjdfstest suite completed for 9P filesystem"
+          echo "Excluded tests listed in .pjdfstest-9p-exclude due to 9P protocol limitations"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount
+          sudo umount /mnt/zerofs-9p || true
+
+          # Kill ZeroFS
+          pkill -f "cargo run --profile ci s3://zerofs-test/test" || true

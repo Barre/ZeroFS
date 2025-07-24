@@ -5,12 +5,13 @@
 # ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
 
-ZeroFS makes S3 storage feel like a real filesystem. Built on [SlateDB](https://github.com/slatedb/slatedb), it provides both **file-level access via NFS** and **block-level access via NBD**. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
+ZeroFS makes S3 storage feel like a real filesystem. Built on [SlateDB](https://github.com/slatedb/slatedb), it provides **file-level access via NFS and 9P** and **block-level access via NBD**. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
 
 Join our community on Discord: https://discord.gg/eGKNQTbG
 
 **Key Features:**
 - **NFS Server** - Mount as a network filesystem on any OS
+- **9P Server** - High-performance alternative with better POSIX semantics
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
 - **Always Encrypted** - ChaCha20-Poly1305 encryption with compression
 - **High Performance** - Multi-layered caching with microsecond latencies
@@ -48,12 +49,13 @@ ZeroFS can self-host! Here's a demo showing Rust's toolchain building ZeroFS whi
 
 ## Configuration
 
-ZeroFS supports dual-mode access to the same S3-backed storage:
+ZeroFS supports multiple access modes to the same S3-backed storage:
 
 - **NFS Mode** - Traditional file-level access for general filesystem use
+- **9P Mode** - High-performance file-level access with better POSIX FSYNC semantics
 - **NBD Mode** - Block-level access for ZFS pools, databases, and raw storage applications
 
-Both modes share the same encrypted, compressed, cached storage backend.
+All modes share the same encrypted, compressed, cached storage backend.
 
 You can also use ZeroFS with any supported object store backend by [object_store](https://crates.io/crates/object_store) crate.
 
@@ -128,12 +130,22 @@ This should be fine for most use-cases but if you need to hide directory structu
 
 ## Mounting the Filesystem
 
-### macOS
+### 9P (Recommended for better performance and FSYNC POSIX semantics)
+
+9P provides better performance and more accurate POSIX semantics, especially for fsync/commit operations:
+
+```bash
+mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=65536,access=user 127.0.0.1 /mnt/9p
+```
+
+### NFS
+
+#### macOS
 ```bash
 mount -t nfs -o async,nolocks,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ mnt
 ```
 
-### Linux
+#### Linux
 ```bash
 mount -t nfs -o async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt
 ```
