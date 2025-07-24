@@ -298,7 +298,7 @@ impl SlateDbFs {
     }
 
     pub async fn run_garbage_collection(&self) -> Result<(), nfsstat3> {
-        const CHUNK_BATCH_SIZE: usize = 10_000;
+        const MAX_CHUNKS_PER_ROUND: usize = 10_000;
 
         self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
 
@@ -318,7 +318,14 @@ impl SlateDbFs {
                 .map_err(|_| nfsstat3::NFS3ERR_IO)?;
             futures::pin_mut!(iter);
 
+            let mut chunks_remaining_in_round = MAX_CHUNKS_PER_ROUND;
+
             while let Some(Ok((key, value))) = futures::StreamExt::next(&mut iter).await {
+                if chunks_remaining_in_round == 0 {
+                    found_incomplete_tombstones = true;
+                    break;
+                }
+
                 // Parse inode_id from key: "tombstone:<timestamp>:<inode_id>"
                 let key_str = String::from_utf8_lossy(&key);
                 let parts: Vec<&str> = key_str.split(':').collect();
@@ -349,7 +356,7 @@ impl SlateDbFs {
                 }
 
                 let total_chunks = size.div_ceil(CHUNK_SIZE as u64) as usize;
-                let chunks_to_delete = total_chunks.min(CHUNK_BATCH_SIZE);
+                let chunks_to_delete = total_chunks.min(chunks_remaining_in_round);
                 let start_chunk = total_chunks.saturating_sub(chunks_to_delete);
 
                 let is_final_batch = chunks_to_delete == total_chunks;
@@ -376,9 +383,14 @@ impl SlateDbFs {
                         .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
                     chunks_deleted_this_round += chunks_to_delete;
-                    // Count this as processing a tombstone (even if not fully completed)
+                    chunks_remaining_in_round -= chunks_to_delete;
+
                     if is_final_batch {
                         tombstones_completed_this_round += 1;
+                    }
+
+                    if chunks_deleted_this_round % 1000 == 0 {
+                        tokio::task::yield_now().await;
                     }
                 }
             }
@@ -421,7 +433,7 @@ impl SlateDbFs {
                     .gc_chunks_deleted
                     .fetch_add(chunks_deleted_this_round as u64, Ordering::Relaxed);
 
-                tracing::info!(
+                tracing::debug!(
                     "GC: processed {} tombstones, deleted {} chunks",
                     tombstones_completed_this_round,
                     chunks_deleted_this_round,
@@ -431,6 +443,8 @@ impl SlateDbFs {
             if !found_incomplete_tombstones {
                 break;
             }
+
+            tokio::task::yield_now().await;
         }
 
         Ok(())
