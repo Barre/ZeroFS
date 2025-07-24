@@ -8,6 +8,7 @@ use tracing::{debug, error, info};
 use super::handler::NinePHandler;
 use super::protocol::P9Message;
 use crate::filesystem::SlateDbFs;
+use crate::ninep::handler::DEFAULT_MSIZE;
 
 pub struct NinePServer {
     filesystem: Arc<SlateDbFs>,
@@ -45,7 +46,6 @@ async fn handle_client(
     filesystem: Arc<SlateDbFs>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut handler = NinePHandler::new(filesystem);
-    const DEFAULT_MSIZE: u32 = 65536;
 
     loop {
         let mut size_buf = [0u8; 4];

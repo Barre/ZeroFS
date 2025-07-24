@@ -10,8 +10,8 @@ use crate::permissions::Credentials;
 use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::NFSFileSystem;
 
-pub const DEFAULT_MSIZE: u32 = 65536;
-pub const DEFAULT_IOUNIT: u32 = 8192;
+pub const DEFAULT_MSIZE: u32 = 1_048_576; // 1MB
+pub const DEFAULT_IOUNIT: u32 = 262_144; // 256KB
 pub const AT_REMOVEDIR: u32 = 0x200;
 
 // Linux dirent type constants
