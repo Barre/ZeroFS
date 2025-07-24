@@ -8,11 +8,13 @@ use chacha20poly1305::{
 use futures::stream::Stream;
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
+use rayon::prelude::*;
 use sha2::Sha256;
 use slatedb::{WriteBatch, config::WriteOptions};
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::task;
 
 const NONCE_SIZE: usize = 12;
 const COMPRESSION_LEVEL: i32 = 3;
@@ -95,6 +97,7 @@ pub struct EncryptedWriteBatch {
     encryptor: Arc<EncryptionManager>,
     // Queue of cache operations to apply after successful write
     cache_ops: Vec<(Bytes, Option<Vec<u8>>)>, // (key, Some(value) for put, None for delete)
+    pending_operations: Vec<(Bytes, Vec<u8>)>,
 }
 
 impl EncryptedWriteBatch {
@@ -103,6 +106,7 @@ impl EncryptedWriteBatch {
             inner: WriteBatch::new(),
             encryptor,
             cache_ops: Vec::new(),
+            pending_operations: Vec::new(),
         }
     }
 
@@ -115,8 +119,7 @@ impl EncryptedWriteBatch {
             self.cache_ops.push((key.clone(), Some(value.to_vec())));
         }
 
-        let encrypted = self.encryptor.encrypt(key_str, value)?;
-        self.inner.put(key, &encrypted);
+        self.pending_operations.push((key.clone(), value.to_vec()));
         Ok(())
     }
 
@@ -132,8 +135,33 @@ impl EncryptedWriteBatch {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn into_inner(self) -> (WriteBatch, Vec<(Bytes, Option<Vec<u8>>)>) {
-        (self.inner, self.cache_ops)
+    pub async fn into_inner(self) -> Result<(WriteBatch, Vec<(Bytes, Option<Vec<u8>>)>)> {
+        let mut inner = self.inner;
+
+        if !self.pending_operations.is_empty() {
+            let operations = self.pending_operations;
+            let encryptor = self.encryptor.clone();
+
+            let encrypted_operations = task::spawn_blocking(move || {
+                operations
+                    .into_par_iter()
+                    .map(|(key, value)| {
+                        let key_str = std::str::from_utf8(&key)
+                            .map_err(|e| anyhow::anyhow!("Invalid UTF8 in key: {}", e))?;
+                        let encrypted = encryptor.encrypt(key_str, &value)?;
+                        Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
+
+            for (key, encrypted) in encrypted_operations {
+                inner.put(&key, &encrypted);
+            }
+        }
+
+        Ok((inner, self.cache_ops))
     }
 }
 
@@ -192,7 +220,14 @@ impl EncryptedDb {
 
         match self.inner.get(key).await? {
             Some(encrypted) => {
-                let decrypted = self.encryptor.decrypt(key_str, &encrypted)?;
+                let encryptor = self.encryptor.clone();
+                let key_string = key_str.to_string();
+                let encrypted_data = encrypted.to_vec();
+
+                let decrypted =
+                    task::spawn_blocking(move || encryptor.decrypt(&key_string, &encrypted_data))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
 
                 if let (Some(cache), Some((inode_id, block_index))) =
                     (&self.cache, Self::parse_chunk_key(key_str))
@@ -263,7 +298,7 @@ impl EncryptedDb {
         batch: EncryptedWriteBatch,
         options: &WriteOptions,
     ) -> Result<()> {
-        let (inner_batch, cache_ops) = batch.into_inner();
+        let (inner_batch, cache_ops) = batch.into_inner().await?;
 
         // Write to database first
         self.inner.write_with_options(inner_batch, options).await?;
