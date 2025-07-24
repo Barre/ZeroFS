@@ -127,24 +127,6 @@ jobs:
             exit 1
           fi
 
-      - name: Collect ZeroFS statistics
-        if: always()
-        run: |
-          # Send SIGUSR1 to get stats (if your implementation supports it)
-          if [ -f /tmp/zerofs.pid ]; then
-            kill -USR1 $(cat /tmp/zerofs.pid) || true
-            sleep 2
-          fi
-
-          # Extract relevant stats from logs
-          echo "=== ZeroFS Performance Statistics ==="
-
-          # Look for the most recent stats in the logs
-          journalctl -u cargo --no-pager -n 1000 2>/dev/null | grep -A20 "ZeroFS Statistics" | tail -25 || true
-
-          # Also check cargo output
-          ps aux | grep "[c]argo run" || true
-
       - name: Cleanup
         if: always()
         run: |
