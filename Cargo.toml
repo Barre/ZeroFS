@@ -32,7 +32,7 @@ foyer-common = "0.18"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
-zstd = "0.13"
+lz4_flex = "0.11"
 anyhow = "1.0"
 hex = "0.4"
 argon2 = "0.5"
@@ -42,6 +42,7 @@ thiserror = "2.0"
 comfy-table = "7.1"
 num-format = "0.4"
 libc = "0.2"
+rayon = "1.10"
 
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
