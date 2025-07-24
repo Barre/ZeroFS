@@ -32,7 +32,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 const DEFAULT_NFS_HOST: &str = "127.0.0.1";
 const DEFAULT_NFS_PORT: u32 = 2049;
 const DEFAULT_9P_HOST: &str = "127.0.0.1";
-const DEFAULT_9P_PORT: u16 = 564;
+const DEFAULT_9P_PORT: u16 = 5564;
 
 // ANSI color codes
 const RED: &str = "\x1b[31m";
@@ -117,7 +117,7 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "  {BLUE}ZEROFS_9P_HOST{RESET}                 - 9P server bind address (default: 127.0.0.1)"
         );
-        eprintln!("  {BLUE}ZEROFS_9P_PORT{RESET}                 - 9P server port (default: 564)");
+        eprintln!("  {BLUE}ZEROFS_9P_PORT{RESET}                 - 9P server port (default: 5564)");
         eprintln!();
         eprintln!("{YELLOW}Logging Configuration:{RESET}");
         eprintln!(
