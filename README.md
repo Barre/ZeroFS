@@ -92,7 +92,7 @@ See [Available `ObjectStore` Implementations](https://docs.rs/object_store/0.12.
 
 ### Encryption
 
-Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with zstd compression. A password is required to start the filesystem:
+Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with lz4 compression. A password is required to start the filesystem:
 
 ```bash
 # Start ZeroFS with encryption password
