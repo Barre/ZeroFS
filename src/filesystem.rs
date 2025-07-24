@@ -245,6 +245,10 @@ impl SlateDbFs {
         Ok(id)
     }
 
+    pub async fn flush(&self) -> Result<(), nfsstat3> {
+        self.db.flush().await.map_err(|_| nfsstat3::NFS3ERR_IO)
+    }
+
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, nfsstat3> {
         let cache_key = CacheKey::Metadata(inode_id);
         if let Some(CacheValue::Metadata(cached_inode)) = self.metadata_cache.get(cache_key).await {
