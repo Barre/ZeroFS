@@ -99,7 +99,7 @@ impl SlateDbFs {
             },
             compactor_options: Some(slatedb::config::CompactorOptions {
                 max_sst_size: 256 * 1024 * 1024,
-                max_concurrent_compactions: 16,
+                max_concurrent_compactions: 32,
                 ..Default::default()
             }),
             compression_codec: None, // Disable compression - we handle it in encryption layer
