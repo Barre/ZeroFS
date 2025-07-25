@@ -23,6 +23,8 @@ ZeroFS passes all tests in the [pjdfstest_nfs](https://github.com/Barre/pjdfstes
 
 We use ZFS as an end-to-end test in our CI. [We create ZFS pools on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/zfs-test.yml), extract the Linux kernel source tree, and run scrub operations to verify data integrity. All operations complete without errors.
 
+We also [compile the Linux kernel on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/kernel-compile-9p.yml) as part of our CI, using parallel compilation (`make -j$(nproc)`) to stress-test concurrent operations.
+
 ## Demo
 
 ### ZFS on S3 via NBD
