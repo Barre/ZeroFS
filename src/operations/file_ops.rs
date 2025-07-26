@@ -48,6 +48,7 @@ impl SlateDbFs {
 
         match &mut inode {
             Inode::File(file) => {
+                let old_size = file.size;
                 let end_offset = offset + data.len() as u64;
                 let new_size = std::cmp::max(file.size, end_offset);
 
@@ -154,6 +155,17 @@ impl SlateDbFs {
                     .put_bytes(&inode_key, &inode_data)
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+                let stats_update = if let Some(update) = self
+                    .global_stats
+                    .prepare_size_change(id, old_size, new_size)
+                    .await
+                {
+                    self.global_stats.add_to_batch(&update, &mut batch)?;
+                    Some(update)
+                } else {
+                    None
+                };
+
                 let db_write_start = std::time::Instant::now();
                 self.db
                     .write_with_options(
@@ -165,6 +177,10 @@ impl SlateDbFs {
                     .await
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
+
+                if let Some(update) = stats_update {
+                    self.global_stats.commit_update(&update);
+                }
 
                 self.metadata_cache.remove(CacheKey::Metadata(id));
                 self.small_file_cache.remove(CacheKey::SmallFile(id));
@@ -294,6 +310,10 @@ impl SlateDbFs {
                     .put_bytes(&dir_key, &dir_data)
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+                // Update statistics
+                let stats_update = self.global_stats.prepare_inode_create(file_id).await;
+                self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+
                 self.db
                     .write_with_options(
                         batch,
@@ -306,6 +326,9 @@ impl SlateDbFs {
                         error!("Failed to write batch: {:?}", e);
                         nfsstat3::NFS3ERR_IO
                     })?;
+
+                // Update in-memory statistics after successful commit
+                self.global_stats.commit_update(&stats_update);
 
                 self.metadata_cache.remove(CacheKey::Metadata(dirid));
 

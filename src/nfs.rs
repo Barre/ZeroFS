@@ -316,15 +316,20 @@ impl NFSFileSystem for SlateDbFs {
             Err(_) => post_op_attr::Void,
         };
 
+        let (used_bytes, used_inodes) = self.global_stats.get_totals();
+
+        const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
+        const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
+
         let res = fsstat3 {
             obj_attributes: obj_attr,
-            tbytes: 1 << 60,    // 1 EiB
-            fbytes: 1 << 60,    // 1 EiB free
-            abytes: 1 << 60,    // 1 EiB available
-            tfiles: 1 << 40,    // ~1.1 trillion files
-            ffiles: 1 << 40,    // ~1.1 trillion free
-            afiles: 1 << 40,    // ~1.1 trillion available
-            invarsec: u32::MAX, // No change in attributes
+            tbytes: TOTAL_BYTES,
+            fbytes: TOTAL_BYTES.saturating_sub(used_bytes),
+            abytes: TOTAL_BYTES.saturating_sub(used_bytes),
+            tfiles: TOTAL_INODES,
+            ffiles: TOTAL_INODES.saturating_sub(used_inodes),
+            afiles: TOTAL_INODES.saturating_sub(used_inodes),
+            invarsec: 1,
         };
 
         Ok(res)

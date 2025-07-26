@@ -95,6 +95,10 @@ pub enum MessageType {
     Tunlinkat,
     #[deku(id = "77")]
     Runlinkat,
+    #[deku(id = "8")]
+    Tstatfs,
+    #[deku(id = "9")]
+    Rstatfs,
 }
 
 // QID type constants
@@ -414,6 +418,12 @@ pub struct Treadlink {
     pub fid: u32,
 }
 
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tstatfs {
+    #[deku(endian = "little")]
+    pub fid: u32,
+}
+
 // Core 9P structures
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Tflush {
@@ -553,6 +563,28 @@ pub struct Runlinkat;
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rfsync;
 
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rstatfs {
+    #[deku(endian = "little")]
+    pub r#type: u32, // filesystem type
+    #[deku(endian = "little")]
+    pub bsize: u32, // optimal transfer block size
+    #[deku(endian = "little")]
+    pub blocks: u64, // total data blocks in filesystem
+    #[deku(endian = "little")]
+    pub bfree: u64, // free blocks in filesystem
+    #[deku(endian = "little")]
+    pub bavail: u64, // free blocks available to non-superuser
+    #[deku(endian = "little")]
+    pub files: u64, // total file nodes in filesystem
+    #[deku(endian = "little")]
+    pub ffree: u64, // free file nodes in filesystem
+    #[deku(endian = "little")]
+    pub fsid: u64, // filesystem id
+    #[deku(endian = "little")]
+    pub namelen: u32, // maximum length of filenames
+}
+
 // Main message enum
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(ctx = "_type: u8", id = "_type")]
@@ -647,6 +679,10 @@ pub enum Message {
     Txattrwalk(Txattrwalk),
     #[deku(id = "31")]
     Rxattrwalk(Rxattrwalk),
+    #[deku(id = "8")]
+    Tstatfs(Tstatfs),
+    #[deku(id = "9")]
+    Rstatfs(Rstatfs),
 }
 
 // Complete 9P message with header
@@ -729,6 +765,8 @@ impl P9Message {
             Message::Rflush(_) => 109,
             Message::Txattrwalk(_) => 30,
             Message::Rxattrwalk(_) => 31,
+            Message::Tstatfs(_) => 8,
+            Message::Rstatfs(_) => 9,
         };
 
         Self {
