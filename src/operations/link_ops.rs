@@ -119,7 +119,6 @@ impl SlateDbFs {
         dir.ctime = now_sec;
         dir.ctime_nsec = now_nsec;
 
-        // Persist the counter
         let counter_key = Self::counter_key();
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
         batch
@@ -132,6 +131,9 @@ impl SlateDbFs {
             .put_bytes(&dir_key, &dir_data)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+        let stats_update = self.global_stats.prepare_inode_create(new_id).await;
+        self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+
         self.db
             .write_with_options(
                 batch,
@@ -141,6 +143,8 @@ impl SlateDbFs {
             )
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        self.global_stats.commit_update(&stats_update);
 
         self.metadata_cache.remove(CacheKey::Metadata(dirid));
 
@@ -165,7 +169,6 @@ impl SlateDbFs {
             fileid, linkdirid, linkname_str
         );
 
-        // Use lock manager to acquire locks in proper order
         let _guards = self
             .lock_manager
             .acquire_multiple_write(vec![fileid, linkdirid])
