@@ -109,6 +109,7 @@ impl NinePHandler {
             Message::Tfsync(tf) => self.handle_fsync(tag, tf).await,
             Message::Tflush(tf) => self.handle_tflush(tag, tf).await,
             Message::Txattrwalk(tx) => self.handle_txattrwalk(tag, tx).await,
+            Message::Tstatfs(ts) => self.handle_statfs(tag, ts).await,
             _ => P9Message::error(tag, libc::ENOSYS as u32),
         }
     }
@@ -1022,6 +1023,38 @@ impl NinePHandler {
         }
     }
 
+    async fn handle_statfs(&self, tag: u16, ts: Tstatfs) -> P9Message {
+        if !self.session.fids.contains_key(&ts.fid) {
+            return P9Message::error(tag, libc::EBADF as u32);
+        }
+
+        let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
+
+        // Constants matching NFS implementation
+        const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
+        const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
+        const BLOCK_SIZE: u32 = 4096; // 4KB blocks
+
+        // Calculate block counts (round up for used blocks)
+        let total_blocks = TOTAL_BYTES / BLOCK_SIZE as u64;
+        let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
+        let free_blocks = total_blocks.saturating_sub(used_blocks);
+
+        let statfs = Rstatfs {
+            r#type: 0x5a45524f,
+            bsize: BLOCK_SIZE,
+            blocks: total_blocks,
+            bfree: free_blocks,
+            bavail: free_blocks,
+            files: TOTAL_INODES,
+            ffree: TOTAL_INODES - used_inodes,
+            fsid: 0,
+            namelen: 255,
+        };
+
+        P9Message::new(tag, Message::Rstatfs(statfs))
+    }
+
     async fn handle_txattrwalk(&self, tag: u16, _tx: Txattrwalk) -> P9Message {
         // We don't support extended attributes
         P9Message::error(tag, libc::ENOTSUP as u32)
@@ -1229,5 +1262,147 @@ pub fn errno_from_nfsstat(e: nfsstat3) -> u32 {
         nfsstat3::NFS3ERR_SERVERFAULT => libc::EIO as u32,
         nfsstat3::NFS3ERR_BADTYPE => libc::EINVAL as u32,
         nfsstat3::NFS3ERR_JUKEBOX => libc::EAGAIN as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::SlateDbFs;
+
+    #[tokio::test]
+    async fn test_statfs() {
+        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let mut handler = NinePHandler::new(fs.clone());
+
+        let version_msg = Message::Tversion(Tversion {
+            msize: DEFAULT_MSIZE,
+            version: P9String::new(VERSION_9P2000L),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new("test"),
+            aname: P9String::new(""),
+            n_uname: 1000,
+        });
+        let attach_resp = handler.handle_message(1, attach_msg).await;
+
+        match &attach_resp.body {
+            Message::Rattach(_) => {}
+            _ => panic!("Expected Rattach, got {:?}", attach_resp.body),
+        }
+
+        let statfs_msg = Message::Tstatfs(Tstatfs { fid: 1 });
+        let statfs_resp = handler.handle_message(2, statfs_msg).await;
+
+        match &statfs_resp.body {
+            Message::Rstatfs(rstatfs) => {
+                assert_eq!(rstatfs.r#type, 0x5a45524f); // "ZERO" filesystem type
+                assert_eq!(rstatfs.bsize, 4096);
+                assert!(rstatfs.blocks > 0);
+                assert!(rstatfs.bfree > 0);
+                assert_eq!(rstatfs.bavail, rstatfs.bfree);
+                assert!(rstatfs.files > 0);
+                assert!(rstatfs.ffree > 0);
+                assert_eq!(rstatfs.namelen, 255);
+
+                // Verify totals match our constants
+                const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
+                const TOTAL_INODES: u64 = 1 << 48;
+                assert_eq!(rstatfs.blocks * 4096, TOTAL_BYTES);
+                assert_eq!(rstatfs.files, TOTAL_INODES);
+            }
+            _ => panic!("Expected Rstatfs, got {:?}", statfs_resp.body),
+        }
+
+        // Test statfs with invalid fid
+        let invalid_statfs_msg = Message::Tstatfs(Tstatfs { fid: 999 });
+        let invalid_resp = handler.handle_message(3, invalid_statfs_msg).await;
+
+        match &invalid_resp.body {
+            Message::Rlerror(rerror) => {
+                assert_eq!(rerror.ecode, libc::EBADF as u32);
+            }
+            _ => panic!("Expected Rlerror, got {:?}", invalid_resp.body),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_statfs_with_files() {
+        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let mut handler = NinePHandler::new(fs.clone());
+
+        // Set up a session
+        let version_msg = Message::Tversion(Tversion {
+            msize: DEFAULT_MSIZE,
+            version: P9String::new(VERSION_9P2000L),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        // Attach to the filesystem
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new("test"),
+            aname: P9String::new(""),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        // Get initial statfs
+        let statfs_msg = Message::Tstatfs(Tstatfs { fid: 1 });
+        let initial_resp = handler.handle_message(2, statfs_msg.clone()).await;
+
+        let (initial_free_blocks, initial_free_inodes) = match &initial_resp.body {
+            Message::Rstatfs(rstatfs) => (rstatfs.bfree, rstatfs.ffree),
+            _ => panic!("Expected Rstatfs"),
+        };
+
+        // Walk to create a new fid for the file we'll create
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 2,
+            nwname: 0,
+            wnames: vec![],
+        });
+        handler.handle_message(3, walk_msg).await;
+
+        // Create a file using the new fid
+        let create_msg = Message::Tlcreate(Tlcreate {
+            fid: 2,
+            name: P9String::new("test.txt"),
+            flags: 0x8002, // O_RDWR | O_CREAT
+            mode: 0o644,
+            gid: 1000,
+        });
+        handler.handle_message(4, create_msg).await;
+
+        // Write 10KB of data
+        let data = vec![0u8; 10240];
+        let write_msg = Message::Twrite(Twrite {
+            fid: 2,
+            offset: 0,
+            count: data.len() as u32,
+            data,
+        });
+        handler.handle_message(5, write_msg).await;
+
+        // Get statfs after write (using original fid which still points to root)
+        let after_resp = handler.handle_message(6, statfs_msg).await;
+
+        match &after_resp.body {
+            Message::Rstatfs(rstatfs) => {
+                // Should have 1 less inode (file created)
+                assert_eq!(rstatfs.ffree, initial_free_inodes - 1);
+
+                // Should have fewer free blocks (10KB written = 3 blocks of 4KB)
+                let expected_blocks_used = (10240 + 4095) / 4096; // Round up
+                assert_eq!(rstatfs.bfree, initial_free_blocks - expected_blocks_used);
+            }
+            _ => panic!("Expected Rstatfs"),
+        }
     }
 }
