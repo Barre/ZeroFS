@@ -156,6 +156,9 @@ impl SlateDbFs {
                     .put_bytes(&parent_dir_key, &parent_dir_data)
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+                let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
+                self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+
                 self.db
                     .write_with_options(
                         batch,
@@ -165,6 +168,8 @@ impl SlateDbFs {
                     )
                     .await
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+                self.global_stats.commit_update(&stats_update);
 
                 self.metadata_cache.remove(CacheKey::Metadata(dirid));
 
