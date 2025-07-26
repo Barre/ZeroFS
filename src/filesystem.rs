@@ -1,5 +1,6 @@
 use crate::cache::{CacheKey, CacheValue, UnifiedCache};
 use crate::encryption::{EncryptedDb, EncryptionManager};
+use crate::filesystem_stats::{FileSystemGlobalStats, StatsShardData};
 use crate::lock_manager::LockManager;
 use crate::stats::FileSystemStats;
 use bytes::Bytes;
@@ -32,6 +33,7 @@ pub fn get_current_time() -> (u64, u32) {
 }
 
 pub const CHUNK_SIZE: usize = 16 * 1024;
+pub const STATS_SHARDS: usize = 100;
 
 #[derive(Clone)]
 pub struct SlateDbFs {
@@ -42,6 +44,7 @@ pub struct SlateDbFs {
     pub small_file_cache: Arc<UnifiedCache>,
     pub dir_entry_cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
+    pub global_stats: Arc<FileSystemGlobalStats>,
 }
 
 // Struct for temporary unencrypted access (only for key management)
@@ -196,6 +199,17 @@ impl SlateDbFs {
         let small_file_cache = unified_cache.clone();
         let dir_entry_cache = unified_cache.clone();
 
+        let global_stats = Arc::new(FileSystemGlobalStats::new());
+
+        for i in 0..STATS_SHARDS {
+            let shard_key = Self::stats_shard_key(i);
+            if let Some(data) = db.get_bytes(&shard_key).await? {
+                if let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data) {
+                    global_stats.load_shard(i, &shard_data);
+                }
+            }
+        }
+
         let fs = Self {
             db: db.clone(),
             lock_manager,
@@ -204,6 +218,7 @@ impl SlateDbFs {
             small_file_cache,
             dir_entry_cache,
             stats: Arc::new(FileSystemStats::new()),
+            global_stats,
         };
 
         Ok(fs)
@@ -237,6 +252,10 @@ impl SlateDbFs {
 
     pub fn tombstone_key(timestamp: u64, inode_id: InodeId) -> Bytes {
         Bytes::from(format!("tombstone:{timestamp}:{inode_id}"))
+    }
+
+    pub fn stats_shard_key(shard_id: usize) -> Bytes {
+        Bytes::from(format!("stats:shard:{shard_id}"))
     }
 
     pub async fn allocate_inode(&self) -> Result<InodeId, nfsstat3> {
@@ -539,6 +558,17 @@ impl SlateDbFs {
         let small_file_cache = unified_cache.clone();
         let dir_entry_cache = unified_cache.clone();
 
+        let global_stats = Arc::new(FileSystemGlobalStats::new());
+
+        for i in 0..STATS_SHARDS {
+            let shard_key = Self::stats_shard_key(i);
+            if let Some(data) = db.get_bytes(&shard_key).await? {
+                if let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data) {
+                    global_stats.load_shard(i, &shard_data);
+                }
+            }
+        }
+
         let fs = Self {
             db: db.clone(),
             lock_manager,
@@ -547,6 +577,7 @@ impl SlateDbFs {
             small_file_cache,
             dir_entry_cache,
             stats: Arc::new(FileSystemStats::new()),
+            global_stats,
         };
 
         Ok(fs)

@@ -1,6 +1,7 @@
 mod cache;
 mod encryption;
 mod filesystem;
+mod filesystem_stats;
 mod inode;
 mod key_management;
 mod lock_manager;
