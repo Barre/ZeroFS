@@ -566,23 +566,23 @@ pub struct Rfsync;
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rstatfs {
     #[deku(endian = "little")]
-    pub r#type: u32,     // filesystem type
+    pub r#type: u32, // filesystem type
     #[deku(endian = "little")]
-    pub bsize: u32,      // optimal transfer block size
+    pub bsize: u32, // optimal transfer block size
     #[deku(endian = "little")]
-    pub blocks: u64,     // total data blocks in filesystem
+    pub blocks: u64, // total data blocks in filesystem
     #[deku(endian = "little")]
-    pub bfree: u64,      // free blocks in filesystem
+    pub bfree: u64, // free blocks in filesystem
     #[deku(endian = "little")]
-    pub bavail: u64,     // free blocks available to non-superuser
+    pub bavail: u64, // free blocks available to non-superuser
     #[deku(endian = "little")]
-    pub files: u64,      // total file nodes in filesystem
+    pub files: u64, // total file nodes in filesystem
     #[deku(endian = "little")]
-    pub ffree: u64,      // free file nodes in filesystem
+    pub ffree: u64, // free file nodes in filesystem
     #[deku(endian = "little")]
-    pub fsid: u64,       // filesystem id
+    pub fsid: u64, // filesystem id
     #[deku(endian = "little")]
-    pub namelen: u32,    // maximum length of filenames
+    pub namelen: u32, // maximum length of filenames
 }
 
 // Main message enum
