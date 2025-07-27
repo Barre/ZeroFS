@@ -549,4 +549,316 @@ mod tests {
         assert_eq!(fsstat.ffiles, TOTAL_INODES - 5); // 5 files
         assert_eq!(fsstat.afiles, TOTAL_INODES - 5);
     }
+
+    #[tokio::test]
+    async fn test_stats_rename_without_replacement() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(
+                &test_auth(),
+                0,
+                &filename(b"original.txt"),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+
+        let data = vec![0u8; 1000];
+        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 1000);
+        assert_eq!(inodes_before, 1);
+
+        // Rename without replacing anything
+        fs.rename(
+            &test_auth(),
+            0,
+            &filename(b"original.txt"),
+            0,
+            &filename(b"renamed.txt"),
+        )
+        .await
+        .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 1000); // No change
+        assert_eq!(inodes_after, 1); // No change
+    }
+
+    #[tokio::test]
+    async fn test_stats_rename_replacing_file() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create source file with 1000 bytes
+        let (file1_id, _) = fs
+            .create(&test_auth(), 0, &filename(b"source.txt"), sattr3::default())
+            .await
+            .unwrap();
+        let data1 = vec![0u8; 1000];
+        fs.write(&test_auth(), file1_id, 0, &data1).await.unwrap();
+
+        // Create target file with 2000 bytes
+        let (file2_id, _) = fs
+            .create(&test_auth(), 0, &filename(b"target.txt"), sattr3::default())
+            .await
+            .unwrap();
+        let data2 = vec![0u8; 2000];
+        fs.write(&test_auth(), file2_id, 0, &data2).await.unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 3000); // 1000 + 2000
+        assert_eq!(inodes_before, 2);
+
+        // Rename source over target (replacing it)
+        fs.rename(
+            &test_auth(),
+            0,
+            &filename(b"source.txt"),
+            0,
+            &filename(b"target.txt"),
+        )
+        .await
+        .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 1000); // Only source file remains
+        assert_eq!(inodes_after, 1); // Only one inode remains
+    }
+
+    #[tokio::test]
+    async fn test_stats_rename_replacing_file_with_hard_links() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create source file
+        let (source_id, _) = fs
+            .create(&test_auth(), 0, &filename(b"source.txt"), sattr3::default())
+            .await
+            .unwrap();
+        let data1 = vec![0u8; 500];
+        fs.write(&test_auth(), source_id, 0, &data1).await.unwrap();
+
+        // Create target file with 1500 bytes
+        let (target_id, _) = fs
+            .create(&test_auth(), 0, &filename(b"target.txt"), sattr3::default())
+            .await
+            .unwrap();
+        let data2 = vec![0u8; 1500];
+        fs.write(&test_auth(), target_id, 0, &data2).await.unwrap();
+
+        // Create a hard link to target
+        fs.link(&test_auth(), target_id, 0, &filename(b"hardlink.txt"))
+            .await
+            .unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 2000); // 500 + 1500
+        assert_eq!(inodes_before, 2); // source + target (hardlink doesn't add inode)
+
+        // Rename source over target (which has a hard link)
+        fs.rename(
+            &test_auth(),
+            0,
+            &filename(b"source.txt"),
+            0,
+            &filename(b"target.txt"),
+        )
+        .await
+        .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 2000); // Both files still exist (source + hardlinked target)
+        assert_eq!(inodes_after, 2); // Both inodes remain
+
+        // Verify hardlink still works
+        let attrs = fs.getattr(&test_auth(), target_id).await.unwrap();
+        assert_eq!(attrs.size, 1500); // Original target size via hardlink
+    }
+
+    #[tokio::test]
+    async fn test_stats_rename_replacing_directory() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create source directory
+        let (_source_dir_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"sourcedir"), &sattr3::default())
+            .await
+            .unwrap();
+
+        // Create target directory (must be empty to be replaceable)
+        let (_target_dir_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"targetdir"), &sattr3::default())
+            .await
+            .unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 0); // Directories don't consume bytes
+        assert_eq!(inodes_before, 2); // Two directories
+
+        // Rename source directory over target directory
+        fs.rename(
+            &test_auth(),
+            0,
+            &filename(b"sourcedir"),
+            0,
+            &filename(b"targetdir"),
+        )
+        .await
+        .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 0);
+        assert_eq!(inodes_after, 1); // Only source directory remains
+    }
+
+    #[tokio::test]
+    async fn test_stats_rename_replacing_symlink() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create a file to rename
+        let (file_id, _) = fs
+            .create(&test_auth(), 0, &filename(b"file.txt"), sattr3::default())
+            .await
+            .unwrap();
+        let data = vec![0u8; 750];
+        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+
+        // Create a symlink
+        let (_link_id, _) = fs
+            .symlink(
+                &test_auth(),
+                0,
+                &filename(b"link"),
+                &filename(b"/some/target"),
+                &sattr3::default(),
+            )
+            .await
+            .unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 750);
+        assert_eq!(inodes_before, 2); // file + symlink
+
+        // Rename file over symlink
+        fs.rename(
+            &test_auth(),
+            0,
+            &filename(b"file.txt"),
+            0,
+            &filename(b"link"),
+        )
+        .await
+        .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 750);
+        assert_eq!(inodes_after, 1); // Only file remains
+    }
+
+    #[tokio::test]
+    async fn test_stats_rename_cross_directory() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create two directories
+        let (dir1_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"dir1"), &sattr3::default())
+            .await
+            .unwrap();
+        let (dir2_id, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"dir2"), &sattr3::default())
+            .await
+            .unwrap();
+
+        // Create file in dir1
+        let (file_id, _) = fs
+            .create(
+                &test_auth(),
+                dir1_id,
+                &filename(b"file.txt"),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        let data = vec![0u8; 1234];
+        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+
+        // Create another file in dir2 that will be replaced
+        let (target_id, _) = fs
+            .create(
+                &test_auth(),
+                dir2_id,
+                &filename(b"target.txt"),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        let target_data = vec![0u8; 5678];
+        fs.write(&test_auth(), target_id, 0, &target_data)
+            .await
+            .unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 6912); // 1234 + 5678
+        assert_eq!(inodes_before, 4); // 2 dirs + 2 files
+
+        // Rename file from dir1 to dir2, replacing target
+        fs.rename(
+            &test_auth(),
+            dir1_id,
+            &filename(b"file.txt"),
+            dir2_id,
+            &filename(b"target.txt"),
+        )
+        .await
+        .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 1234); // Only source file remains
+        assert_eq!(inodes_after, 3); // 2 dirs + 1 file
+    }
+
+    #[tokio::test]
+    async fn test_stats_rename_special_files() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create a FIFO
+        let (_fifo_id, _) = fs
+            .mknod(
+                &test_auth(),
+                0,
+                &filename(b"fifo1"),
+                zerofs_nfsserve::nfs::ftype3::NF3FIFO,
+                &sattr3::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Create another FIFO to be replaced
+        let (_fifo2_id, _) = fs
+            .mknod(
+                &test_auth(),
+                0,
+                &filename(b"fifo2"),
+                zerofs_nfsserve::nfs::ftype3::NF3FIFO,
+                &sattr3::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (bytes_before, inodes_before) = fs.global_stats.get_totals();
+        assert_eq!(bytes_before, 0); // Special files don't have size
+        assert_eq!(inodes_before, 2); // Two FIFOs
+
+        // Rename fifo1 over fifo2
+        fs.rename(&test_auth(), 0, &filename(b"fifo1"), 0, &filename(b"fifo2"))
+            .await
+            .unwrap();
+
+        let (bytes_after, inodes_after) = fs.global_stats.get_totals();
+        assert_eq!(bytes_after, 0);
+        assert_eq!(inodes_after, 1); // Only one FIFO remains
+    }
 }

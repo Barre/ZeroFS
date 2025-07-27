@@ -176,11 +176,21 @@ impl SlateDbFs {
 
         // Handle target if it exists
         let mut target_was_directory = false;
+        let mut target_stats_update = None;
         if let Some(target_id) = target_inode_id {
             let existing_inode = self.load_inode(target_id).await?;
 
-            // Track if we're replacing a directory
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
+
+            let (original_nlink, original_file_size, should_always_remove_stats) =
+                match &existing_inode {
+                    Inode::File(f) => (f.nlink, Some(f.size), false),
+                    Inode::Directory(_) | Inode::Symlink(_) => (1, None, true),
+                    Inode::Fifo(s)
+                    | Inode::Socket(s)
+                    | Inode::CharDevice(s)
+                    | Inode::BlockDevice(s) => (s.nlink, None, false),
+                };
 
             macro_rules! handle_special_file {
                 ($special:expr, $inode_variant:ident) => {
@@ -266,6 +276,17 @@ impl SlateDbFs {
                 Inode::BlockDevice(mut special) => {
                     handle_special_file!(special, BlockDevice);
                 }
+            }
+
+            // Prepare statistics update based on what we're deleting
+            // For directories and symlinks: always remove from stats (should_always_remove_stats = true)
+            // For files and special files: only remove if this is the last link (nlink <= 1)
+            if should_always_remove_stats || original_nlink <= 1 {
+                target_stats_update = Some(
+                    self.global_stats
+                        .prepare_inode_remove(target_id, original_file_size)
+                        .await,
+                );
             }
 
             // Delete the existing scan entry
@@ -380,6 +401,10 @@ impl SlateDbFs {
                 .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }
 
+        if let Some(ref update) = target_stats_update {
+            self.global_stats.add_to_batch(update, &mut batch)?;
+        }
+
         self.db
             .write_with_options(
                 batch,
@@ -389,6 +414,10 @@ impl SlateDbFs {
             )
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        if let Some(update) = target_stats_update {
+            self.global_stats.commit_update(&update);
+        }
 
         self.metadata_cache
             .remove(CacheKey::Metadata(source_inode_id));
