@@ -149,10 +149,9 @@ impl SlateDbFs {
                                     .map_err(|_| nfsstat3::NFS3ERR_IO)?
                                 {
                                     let mut new_chunk_data = vec![0u8; last_chunk_size];
-                                    new_chunk_data.copy_from_slice(
-                                        &old_chunk_data
-                                            [..last_chunk_size.min(old_chunk_data.len())],
-                                    );
+                                    let copy_len = last_chunk_size.min(old_chunk_data.len());
+                                    new_chunk_data[..copy_len]
+                                        .copy_from_slice(&old_chunk_data[..copy_len]);
                                     batch
                                         .put_bytes(&key, &new_chunk_data)
                                         .map_err(|_| nfsstat3::NFS3ERR_IO)?;

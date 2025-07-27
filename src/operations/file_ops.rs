@@ -127,10 +127,8 @@ impl SlateDbFs {
                     chunk_data[write_start..write_end]
                         .copy_from_slice(&data[data_offset..data_offset + data_len]);
 
-                    let chunk_data_to_store =
-                        &chunk_data[..std::cmp::min(CHUNK_SIZE, (new_size - chunk_start) as usize)];
                     batch
-                        .put_bytes(&chunk_key, chunk_data_to_store)
+                        .put_bytes(&chunk_key, &chunk_data)
                         .map_err(|_| nfsstat3::NFS3ERR_IO)?;
                 }
 
