@@ -191,45 +191,23 @@ impl SlateDbFs {
                     .put_bytes(&dir_key, &dir_data)
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
-                let stats_update = match &file_inode {
-                    Inode::File(file) => {
-                        // Only update stats if this was the last link (before decrement)
-                        if original_nlink <= 1 {
-                            Some(
-                                self.global_stats
-                                    .prepare_inode_remove(file_id, Some(file.size))
-                                    .await,
-                            )
-                        } else {
-                            None
-                        }
-                    }
-                    Inode::Directory(_)
-                    | Inode::Symlink(_)
-                    | Inode::Fifo(_)
-                    | Inode::Socket(_)
-                    | Inode::CharDevice(_)
-                    | Inode::BlockDevice(_) => {
-                        // For special files, check original nlink too
-                        if original_nlink <= 1 {
-                            match &file_inode {
-                                Inode::Directory(_) | Inode::Symlink(_) => {
-                                    // These always get removed
-                                    Some(
-                                        self.global_stats.prepare_inode_remove(file_id, None).await,
-                                    )
-                                }
-                                _ => {
-                                    // Special files only if last link
-                                    Some(
-                                        self.global_stats.prepare_inode_remove(file_id, None).await,
-                                    )
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    }
+                // Prepare statistics update based on what we're deleting
+                // For directories and symlinks: always remove from stats
+                // For files and special files: only remove if this is the last link
+                let (file_size, should_always_remove_stats) = match &file_inode {
+                    Inode::File(f) => (Some(f.size), false),
+                    Inode::Directory(_) | Inode::Symlink(_) => (None, true),
+                    _ => (None, false), // Special files (Fifo, Socket, CharDevice, BlockDevice)
+                };
+
+                let stats_update = if should_always_remove_stats || original_nlink <= 1 {
+                    Some(
+                        self.global_stats
+                            .prepare_inode_remove(file_id, file_size)
+                            .await,
+                    )
+                } else {
+                    None
                 };
 
                 if let Some(ref update) = stats_update {
