@@ -119,7 +119,7 @@ The program will change the password and exit. Then you can use the new password
 #### What's Encrypted vs What's Not
 
 **Encrypted:**
-- All file contents (in 64K chunks)
+- All file contents (in 16K chunks)
 - File metadata values (permissions, timestamps, etc.)
 
 **Not Encrypted:**
@@ -369,97 +369,6 @@ These are standard pgbench runs with 50 concurrent clients. The underlying data 
         (us-east) (eu-west) (ap-south) (us-west) (eu-north) (ap-east)
 ```
 
-### CAP Theorem
-
-[From Wikipedia](https://en.wikipedia.org/wiki/CAP_theorem)
-
-
-> In database theory, the **CAP theorem**, also named **Brewer's theorem** after computer scientist Eric Brewer, states that any distributed data store can provide at most two of the following three guarantees:[1][2][3]
->
-> ### Consistency
->
-> Every read receives the most recent write or an error. Consistency as defined in the CAP theorem is quite different from the consistency guaranteed in ACID database transactions.[4]
->
-> ### Availability
->
-> Every request received by a non-failing node in the system must result in a response. This is the definition of availability in CAP theorem as defined by Gilbert and Lynch.[1] Availability as defined in CAP theorem is different from high availability in software architecture.[5]
->
-> ### Partition Tolerance
->
-> The system continues to operate despite an arbitrary number of messages being dropped (or delayed) by the network between nodes.
->
-> When a network partition failure happens, it must be decided whether to do one of the following:
->
-> - Cancel the operation and thus decrease the availability but ensure consistency
-> - Proceed with the operation and thus provide availability but risk inconsistency. This does not necessarily mean that system is highly available to its users.[5]
->
-> Thus, if there is a network partition, one has to choose between consistency or availability.
-
-
-In an architecture that looks like
-
-```
-  Client A ←→ Client B ←→ Client C
-     ↓           ↓           ↓
-     ├───────────┼───────────┤
-     ↓           ↓           ↓
-  PG Node 1   PG Node 2   PG Node 3
-     ↓           ↓           ↓
-     └───────────┼───────────┘
-                 ↓
-          Shared ZFS Pool
-                 ↓
-          Global ZeroFS
-```
-
-The architecture ensures only ONE node has read-write access at any time:
-
-1. Normal operation: Primary has ZFS mounted RW, standby unmounted.
-2. Partition detected: Client fences primary (ensures it can't write, through ZeroFS) by mounting the block devices, ZeroFS and then the pool.
-3. Client mounts ZFS RW on standby and starts PostgreSQL there
-4. If primary returns, it can't mount (ZeroFS will fence it, only a single writer is allowed )
-
-The client orchestrates exclusive access. There's never a moment where two nodes could write, because:
-
-- ZeroFS acquires exclusive access to the database
-- Fencing ensures the old primary can't suddenly start writing
-- The shared storage itself provides the coordination
-
-So we get:
-
-- Consistency: Only one writer exists at any moment
-- Availability: Client can always promote an accessible node
-- Partition tolerance: System continues despite network partition
-
-The "shared" in "shared ZFS pool" means shared access capability, not concurrent access.
-
-> Thus, if there is a network partition, one has to choose between consistency or availability.
-
-Even in a scenario where clients couldn't communicate due to a "client-wide" network partition - because they implement the same logic - would just route to the "new" primary.
-
-```
-[Clients 1,2] ← partition → [Clients 3,4]
-```
-
-The "network partition" in CAP assumes nodes can't coordinate. But if nodes don't NEED to coordinate because the storage layer handles it, then you've sidestepped the constraint.
-
-The theorem doesn't say:
-
-- HOW nodes must coordinate
-- That storage must be distributed
-- That you can't use locking primitives
-- That all coordination must be peer-to-peer
-
-So during a partition between database nodes:
-
-- Consistency: Only one writer via exclusive locking
-- Availability: Whichever node can reach ZeroFS can serve requests
-- Partition tolerance: System continues despite node-to-node partition
-
-It seems that CAP applies to a specific model of distributed systems, and if you change the model (shared storage arbitration instead of network consensus), different rules apply.
-
-If anyone has a rebutal for this please open an issue! :)
-
 ## Why NFS and 9P?
 
 We support both NFS and 9P because they offer complementary advantages for network filesystems:
@@ -524,7 +433,7 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
 
 **ZeroFS:**
 - Uses SlateDB, a log-structured merge-tree (LSM) database
-- Files are chunked into 64K blocks for efficient S3 operations
+- Files are chunked into 16K blocks for efficient S3 operations
 - Inodes and file data stored as key-value pairs
 - Metadata is first-class data in the database
 
@@ -558,8 +467,8 @@ s3://bucket/
 Key-Value Store:
 ├── inode:0 → {type: directory, entries: {...}}
 ├── inode:1 → {type: file, size: 1024, ...}
-├── chunk:1/0 → [first 64K of file data]
-├── chunk:1/1 → [second 64K of file data]
+├── chunk:1/0 → [first 16K of file data]
+├── chunk:1/1 → [second 16K of file data]
 └── next_inode_id → 2
 ```
 
@@ -589,6 +498,25 @@ ZeroFS is available as a GitHub Action for easy integration into your CI/CD work
 ```
 
 This enables persistent storage across workflow runs, shared artifacts between jobs, and more.
+
+## Filesystem Limits
+
+ZeroFS has the following theoretical limits:
+
+- **Maximum file size**: 16 EB (exabytes) per file
+- **Maximum number of files**: 281 trillion (2^48)
+- **Maximum hardlinks per file**: 65,535 (across all directories)
+- **Maximum filesystem size**: 4,096 geopbytes (2^112 bytes)
+  - = 4 million yottabytes  
+  - = 4 billion zettabytes
+  - = 4 trillion exabytes
+
+These limits come from the filesystem design:
+- File IDs use 48 bits for the inode number and 16 bits for hardlink position
+- File sizes are stored as 64-bit integers
+- The chunking system uses 16KB blocks with 64-bit indexing
+
+In practice, you'll encounter other constraints well before these theoretical limits, such as S3 provider limits, performance considerations with billions of objects, or simply running out of money.
 
 ## Future Enhancements
 
