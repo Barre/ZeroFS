@@ -12,7 +12,7 @@ use zerofs_nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
 
 use super::common::validate_filename;
 use crate::cache::CacheKey;
-use crate::filesystem::{SlateDbFs, get_current_time};
+use crate::filesystem::{EncodedFileId, SlateDbFs, get_current_time};
 use crate::inode::{DirectoryInode, Inode};
 use crate::permissions::{AccessMode, Credentials, check_access};
 
@@ -209,8 +209,17 @@ impl SlateDbFs {
         match &dir_inode {
             Inode::Directory(dir) => {
                 let mut entries = Vec::new();
+                let mut inode_positions = std::collections::HashMap::new();
 
-                if start_after == 0 {
+                let (start_inode, start_position) = if start_after == 0 {
+                    (0, 0)
+                } else {
+                    EncodedFileId::from(start_after).decode()
+                };
+
+                let skip_special = start_after != 0;
+
+                if !skip_special {
                     debug!("readdir: adding . entry for current directory");
                     entries.push(DirEntry {
                         fileid: dirid,
@@ -221,13 +230,11 @@ impl SlateDbFs {
                     debug!("readdir: adding .. entry for parent directory");
                     let parent_id = if dirid == 0 { 0 } else { dir.parent };
                     let parent_attr = if parent_id == dirid {
-                        // Root directory, use self
                         dir_inode.to_fattr3(dirid)
                     } else {
-                        // Load parent directory attributes
                         match self.load_inode(parent_id).await {
                             Ok(parent_inode) => parent_inode.to_fattr3(parent_id),
-                            Err(_) => dir_inode.to_fattr3(dirid), // Fallback to self on error
+                            Err(_) => dir_inode.to_fattr3(dirid),
                         }
                     };
                     entries.push(DirEntry {
@@ -242,8 +249,8 @@ impl SlateDbFs {
                 let start_key = if start_after == 0 {
                     scan_prefix.clone()
                 } else {
-                    // Start right after the given inode (formatted with leading zeros)
-                    format!("dirscan:{dirid}/{:020}", start_after + 1)
+                    // Resume from the exact inode we left off at
+                    format!("dirscan:{dirid}/{start_inode:020}")
                 };
                 let end_key = format!("dirscan:{dirid}0");
 
@@ -255,9 +262,14 @@ impl SlateDbFs {
                 pin_mut!(iter);
 
                 let mut dir_entries = Vec::new();
+                let mut resuming = start_after != 0;
+                let mut has_more = false;
+
                 while let Some(result) = iter.next().await {
+                    // Check if we already have enough entries
                     if dir_entries.len() >= max_entries - entries.len() {
-                        debug!("readdir: reached max_entries limit");
+                        debug!("readdir: reached max_entries limit, found one more entry");
+                        has_more = true;
                         break;
                     }
 
@@ -265,14 +277,28 @@ impl SlateDbFs {
                     let key_str = String::from_utf8_lossy(&key);
 
                     // Extract the inode ID and filename from the key
-                    // Key format: dirscan:{dir_id}/{inode_id:020}/{filename}
                     if let Some(suffix) = key_str.strip_prefix(&scan_prefix) {
-                        // Split by '/' to get inode_id and filename
                         if let Some(slash_pos) = suffix.find('/') {
                             let inode_str = &suffix[..slash_pos];
                             let filename = &suffix[slash_pos + 1..];
 
                             if let Ok(inode_id) = inode_str.parse::<u64>() {
+                                // If we're resuming, check if we need to skip entries
+                                if resuming {
+                                    if inode_id == start_inode {
+                                        // Same inode - check position
+                                        let pos = inode_positions.entry(inode_id).or_insert(0);
+                                        if *pos <= start_position {
+                                            *pos += 1;
+                                            continue;
+                                        }
+                                    } else if inode_id < start_inode {
+                                        // Earlier inode - skip
+                                        continue;
+                                    }
+                                    resuming = false;
+                                }
+
                                 debug!("readdir: found entry {} (inode {})", filename, inode_id);
                                 dir_entries.push((inode_id, filename.as_bytes().to_vec()));
                             }
@@ -296,18 +322,22 @@ impl SlateDbFs {
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Add the loaded entries to results
+                // Add the loaded entries to results with encoded fileids
                 for (inode_id, name, inode) in loaded_entries {
+                    let position = inode_positions.entry(inode_id).or_insert(0);
+                    let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
+                    *position += 1;
+
                     entries.push(DirEntry {
-                        fileid: inode_id,
+                        fileid: encoded_id,
                         name: name.into(),
                         attr: inode.to_fattr3(inode_id),
                     });
-                    debug!("readdir: added entry to results");
+                    debug!("readdir: added entry with encoded id {}", encoded_id);
                 }
 
-                // Check if we've reached the end by seeing if we got fewer entries than requested
-                let end = entries.len() < max_entries;
+                // We're at the end if there are no more entries
+                let end = !has_more;
 
                 let result = ReadDirResult { end, entries };
                 debug!(

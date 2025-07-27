@@ -6,7 +6,7 @@ use zerofs_nfsserve::vfs::AuthContext;
 
 use super::common::validate_filename;
 use crate::cache::CacheKey;
-use crate::filesystem::{SlateDbFs, get_current_time};
+use crate::filesystem::{MAX_HARDLINKS_PER_INODE, SlateDbFs, get_current_time};
 use crate::inode::{Inode, SymlinkInode};
 use crate::permissions::{AccessMode, Credentials, check_access};
 
@@ -226,7 +226,7 @@ impl SlateDbFs {
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
             Inode::File(file) => {
-                if file.nlink == u32::MAX {
+                if file.nlink >= MAX_HARDLINKS_PER_INODE {
                     return Err(nfsstat3::NFS3ERR_MLINK);
                 }
                 file.nlink += 1;
@@ -237,7 +237,7 @@ impl SlateDbFs {
             | Inode::Socket(special)
             | Inode::CharDevice(special)
             | Inode::BlockDevice(special) => {
-                if special.nlink == u32::MAX {
+                if special.nlink >= MAX_HARDLINKS_PER_INODE {
                     return Err(nfsstat3::NFS3ERR_MLINK);
                 }
                 special.nlink += 1;

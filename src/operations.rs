@@ -8,8 +8,8 @@ pub mod rename_ops;
 
 #[cfg(test)]
 mod tests {
-    use crate::filesystem::CHUNK_SIZE;
     use crate::filesystem::SlateDbFs;
+    use crate::filesystem::{CHUNK_SIZE, EncodedFileId};
     use crate::inode::Inode;
     use crate::test_helpers::test_helpers_mod::test_auth;
     use zerofs_nfsserve::nfs::{
@@ -664,6 +664,111 @@ mod tests {
         // Test self-relationships (should return true)
         assert!(fs.is_ancestor_of(a_id, a_id).await.unwrap());
         assert!(fs.is_ancestor_of(b_id, b_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_readdir_encoding_with_hardlinks() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create files with hardlinks
+        let (file1_id, _) = fs
+            .process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
+            .await
+            .unwrap();
+
+        // Create hardlinks
+        fs.process_link(&test_auth(), file1_id, 0, b"hardlink1.txt")
+            .await
+            .unwrap();
+        fs.process_link(&test_auth(), file1_id, 0, b"hardlink2.txt")
+            .await
+            .unwrap();
+
+        // Create another file
+        let (_file2_id, _) = fs
+            .process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
+            .await
+            .unwrap();
+
+        // First readdir - get all entries
+        let result1 = fs.process_readdir(&test_auth(), 0, 0, 10).await.unwrap();
+        assert_eq!(result1.entries.len(), 6); // . .. file1.txt hardlink1.txt hardlink2.txt file2.txt
+
+        // Check that hardlinks have different encoded fileids
+        let file1_encoded = result1.entries[2].fileid;
+        let hardlink1_encoded = result1.entries[3].fileid;
+        let hardlink2_encoded = result1.entries[4].fileid;
+
+        // Decode to verify they point to the same inode
+        let (file1_inode, file1_pos) = EncodedFileId::from(file1_encoded).decode();
+        let (hardlink1_inode, hardlink1_pos) = EncodedFileId::from(hardlink1_encoded).decode();
+        let (hardlink2_inode, hardlink2_pos) = EncodedFileId::from(hardlink2_encoded).decode();
+
+        assert_eq!(file1_inode, hardlink1_inode);
+        assert_eq!(file1_inode, hardlink2_inode);
+        assert_eq!(file1_pos, 0);
+        assert_eq!(hardlink1_pos, 1);
+        assert_eq!(hardlink2_pos, 2);
+
+        // Test pagination - start after the first hardlink
+        let result2 = fs
+            .process_readdir(&test_auth(), 0, hardlink1_encoded, 10)
+            .await
+            .unwrap();
+        assert_eq!(result2.entries.len(), 2); // hardlink2.txt file2.txt
+        assert_eq!(result2.entries[0].name.0, b"hardlink2.txt");
+        assert_eq!(result2.entries[1].name.0, b"file2.txt");
+    }
+
+    #[tokio::test]
+    async fn test_max_hardlinks_limit() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create a file
+        let (file_id, _) = fs
+            .process_create(&test_auth(), 0, b"original.txt", sattr3::default())
+            .await
+            .unwrap();
+
+        // Manually set nlink to just below the limit to avoid creating 65k files
+        let mut inode = fs.load_inode(file_id).await.unwrap();
+        match &mut inode {
+            Inode::File(file) => {
+                file.nlink = crate::filesystem::MAX_HARDLINKS_PER_INODE - 1;
+            }
+            _ => panic!("Expected file inode"),
+        }
+        fs.save_inode(file_id, &inode).await.unwrap();
+
+        // Create one more hardlink - should succeed
+        let result = fs
+            .process_link(&test_auth(), file_id, 0, b"last_link.txt")
+            .await;
+        assert!(result.is_ok());
+
+        // Verify the file now has exactly MAX_HARDLINKS_PER_INODE links
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            Inode::File(file) => {
+                assert_eq!(file.nlink, crate::filesystem::MAX_HARDLINKS_PER_INODE);
+            }
+            _ => panic!("Expected file inode"),
+        }
+
+        // Try to create one more hardlink - should fail
+        let result = fs
+            .process_link(&test_auth(), file_id, 0, b"one_too_many.txt")
+            .await;
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_MLINK)));
+
+        // Verify the file still has MAX_HARDLINKS_PER_INODE links
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            Inode::File(file) => {
+                assert_eq!(file.nlink, crate::filesystem::MAX_HARDLINKS_PER_INODE);
+            }
+            _ => panic!("Expected file inode"),
+        }
     }
 
     #[tokio::test]
