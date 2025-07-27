@@ -36,7 +36,7 @@ pub const CHUNK_SIZE: usize = 16 * 1024;
 pub const STATS_SHARDS: usize = 100;
 
 // Maximum hardlinks per inode - limited by our encoding scheme (16 bits for position)
-pub const MAX_HARDLINKS_PER_INODE: u32 = 65535;
+pub const MAX_HARDLINKS_PER_INODE: u32 = u16::MAX as u32;
 // Maximum inode ID - limited by our encoding scheme (48 bits for inode ID)
 pub const MAX_INODE_ID: u64 = (1u64 << 48) - 1;
 
