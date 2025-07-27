@@ -14,7 +14,7 @@ use slatedb::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
-use zerofs_nfsserve::nfs::nfsstat3;
+use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
 
 const SLATEDB_BLOCK_SIZE: usize = 4 * 1024;
 
@@ -34,6 +34,63 @@ pub fn get_current_time() -> (u64, u32) {
 
 pub const CHUNK_SIZE: usize = 16 * 1024;
 pub const STATS_SHARDS: usize = 100;
+
+// Maximum hardlinks per inode - limited by our encoding scheme (16 bits for position)
+pub const MAX_HARDLINKS_PER_INODE: u32 = 65535;
+// Maximum inode ID - limited by our encoding scheme (48 bits for inode ID)
+pub const MAX_INODE_ID: u64 = (1u64 << 48) - 1;
+
+/// Encoded file ID for NFS operations
+/// High 48 bits: real inode ID
+/// Low 16 bits: position within entries that share the same inode ID (for hardlinks)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EncodedFileId(u64);
+
+impl EncodedFileId {
+    /// Create a new encoded file ID from inode and position
+    pub fn new(inode_id: u64, position: u16) -> Self {
+        Self((inode_id << 16) | (position as u64))
+    }
+
+    /// Create an encoded file ID for a regular file (position 0)
+    pub fn from_inode(inode_id: u64) -> Self {
+        Self::new(inode_id, 0)
+    }
+
+    /// Decode into (inode_id, position)
+    pub fn decode(self) -> (u64, u16) {
+        let inode = self.0 >> 16;
+        let position = (self.0 & 0xFFFF) as u16;
+        (inode, position)
+    }
+
+    /// Get the raw u64 value
+    pub fn as_raw(self) -> u64 {
+        self.0
+    }
+
+    /// Get just the inode ID part
+    pub fn inode_id(self) -> u64 {
+        self.0 >> 16
+    }
+
+    /// Get just the position part
+    pub fn position(self) -> u16 {
+        (self.0 & 0xFFFF) as u16
+    }
+}
+
+impl From<fileid3> for EncodedFileId {
+    fn from(id: fileid3) -> Self {
+        Self(id)
+    }
+}
+
+impl From<EncodedFileId> for fileid3 {
+    fn from(id: EncodedFileId) -> Self {
+        id.0
+    }
+}
 
 #[derive(Clone)]
 pub struct SlateDbFs {
@@ -260,6 +317,14 @@ impl SlateDbFs {
 
     pub async fn allocate_inode(&self) -> Result<InodeId, nfsstat3> {
         let id = self.next_inode_id.fetch_add(1, Ordering::SeqCst);
+
+        // Check if we exceeded the maximum
+        if id > MAX_INODE_ID {
+            // We've gone over the limit, try to set it back to indicate we're full
+            self.next_inode_id.store(MAX_INODE_ID + 2, Ordering::SeqCst);
+            return Err(nfsstat3::NFS3ERR_NOSPC);
+        }
+
         Ok(id)
     }
 
@@ -743,5 +808,69 @@ mod tests {
 
         let result = fs.load_inode(999).await;
         assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
+    }
+
+    #[tokio::test]
+    async fn test_max_inode_id_limit() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Set the counter to MAX_INODE_ID (next allocation will get this value)
+        fs.next_inode_id.store(MAX_INODE_ID, Ordering::SeqCst);
+
+        // Should be able to allocate one more inode
+        let id = fs.allocate_inode().await.unwrap();
+        assert_eq!(id, MAX_INODE_ID);
+
+        // Next allocation should fail
+        let result = fs.allocate_inode().await;
+        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOSPC)));
+
+        // Verify the counter is set to indicate we're full
+        assert!(fs.next_inode_id.load(Ordering::SeqCst) > MAX_INODE_ID);
+    }
+
+    #[test]
+    fn test_dir_entry_encoding() {
+        // Test case 1: Root directory (0)
+        let encoded = EncodedFileId::from(0u64);
+        let (inode, pos) = encoded.decode();
+        assert_eq!(inode, 0);
+        assert_eq!(pos, 0);
+
+        // Test case 2: Regular inode with position 0
+        let encoded = EncodedFileId::new(42, 0);
+        assert_eq!(encoded.inode_id(), 42);
+        assert_eq!(encoded.position(), 0);
+        let (inode, pos) = encoded.decode();
+        assert_eq!(inode, 42);
+        assert_eq!(pos, 0);
+
+        // Test case 3: Hardlink with position
+        let encoded = EncodedFileId::new(100, 5);
+        assert_eq!(encoded.inode_id(), 100);
+        assert_eq!(encoded.position(), 5);
+        let (inode, pos) = encoded.decode();
+        assert_eq!(inode, 100);
+        assert_eq!(pos, 5);
+
+        // Test case 4: Maximum position
+        let encoded = EncodedFileId::new(1000, 65535);
+        let (inode, pos) = encoded.decode();
+        assert_eq!(inode, 1000);
+        assert_eq!(pos, 65535);
+
+        // Test case 5: Large inode ID (near max)
+        let large_id = MAX_INODE_ID;
+        let encoded = EncodedFileId::new(large_id, 0);
+        let (inode, pos) = encoded.decode();
+        assert_eq!(inode, large_id);
+        assert_eq!(pos, 0);
+
+        // Test case 6: Converting from raw u64
+        let raw_value = (42u64 << 16) | 5; // Should be 2752517
+        let from_raw = EncodedFileId::from(raw_value);
+        assert_eq!(from_raw.inode_id(), 42);
+        assert_eq!(from_raw.position(), 5);
+        assert_eq!(from_raw.as_raw(), raw_value);
     }
 }

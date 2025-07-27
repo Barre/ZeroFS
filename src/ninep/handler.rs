@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::protocol::*;
-use crate::filesystem::SlateDbFs;
+use crate::filesystem::{EncodedFileId, SlateDbFs};
 use crate::inode::{Inode, InodeId};
 use crate::permissions::Credentials;
 use zerofs_nfsserve::nfs::nfsstat3;
@@ -51,6 +51,9 @@ pub struct Fid {
     pub opened: bool,
     pub mode: Option<u32>,
     pub creds: Credentials, // Store credentials per fid/session
+    // For directory reads: track position for sequential reads
+    pub dir_last_offset: u64, // Last offset we returned entries for
+    pub dir_last_cookie: u64, // Last cookie from process_readdir for continuation
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +214,8 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds,
+                dir_last_offset: 0,
+                dir_last_cookie: 0,
             },
         );
 
@@ -243,12 +248,14 @@ impl NinePHandler {
             match inode {
                 Inode::Directory(ref _dir) => {
                     let auth = self.make_auth_context(&src_fid.creds);
+                    let encoded_current_id = EncodedFileId::from_inode(current_id).into();
                     match self
                         .filesystem
-                        .lookup(&auth, current_id, &name.as_bytes().into())
+                        .lookup(&auth, encoded_current_id, &name.as_bytes().into())
                         .await
                     {
-                        Ok(child_id) => {
+                        Ok(encoded_id) => {
+                            let child_id = EncodedFileId::from(encoded_id).inode_id();
                             let child_inode = match self.filesystem.load_inode(child_id).await {
                                 Ok(i) => i,
                                 Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
@@ -278,6 +285,8 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds: src_fid.creds, // Inherit credentials from source fid
+                dir_last_offset: 0,
+                dir_last_cookie: 0,
             };
             self.session.fids.insert(tw.newfid, new_fid);
         }
@@ -315,15 +324,16 @@ impl NinePHandler {
             Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
         };
 
-        // Skip permission checking in lopen - let the actual read/write operations handle it
-        // This matches how NFS works and ensures consistent behavior
-
         let qid = inode_to_qid(&inode, inode_id);
 
         if let Some(fid_entry) = self.session.fids.get_mut(&tl.fid) {
             fid_entry.qid = qid.clone();
             fid_entry.opened = true;
             fid_entry.mode = Some(tl.flags);
+            if matches!(inode, Inode::Directory(_)) {
+                fid_entry.dir_last_offset = 0;
+                fid_entry.dir_last_cookie = 0;
+            }
         }
 
         P9Message::new(tag, Message::Rlopen(Rlopen { qid, iounit }))
@@ -334,9 +344,9 @@ impl NinePHandler {
         P9Message::new(tag, Message::Rclunk(Rclunk))
     }
 
-    async fn handle_readdir(&self, tag: u16, tr: Treaddir) -> P9Message {
+    async fn handle_readdir(&mut self, tag: u16, tr: Treaddir) -> P9Message {
         let fid_entry = match self.session.fids.get(&tr.fid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -346,64 +356,147 @@ impl NinePHandler {
 
         let auth = self.make_auth_context(&fid_entry.creds);
 
-        match self
-            .filesystem
-            .process_readdir(&auth, fid_entry.inode_id, 0, usize::MAX)
-            .await
-        {
-            Ok(entries) => {
-                let mut data = Vec::new();
-                let mut current_offset = 0u64;
+        let is_sequential = tr.offset == fid_entry.dir_last_offset;
 
-                for (i, entry) in entries.entries.into_iter().enumerate() {
-                    if (i as u64) < tr.offset {
-                        current_offset += 1;
-                        continue;
-                    }
+        let mut entries_to_return = Vec::new();
+        let mut current_offset = 0u64;
+        let mut cookie = 0u64;
 
-                    let child_inode = match self.filesystem.load_inode(entry.fileid).await {
-                        Ok(i) => i,
-                        Err(_) => continue,
-                    };
+        if is_sequential && tr.offset > 0 {
+            current_offset = fid_entry.dir_last_offset;
+            cookie = fid_entry.dir_last_cookie;
+        } else if tr.offset > 0 {
+            // Non-sequential: we need to skip entries from the beginning
+            debug!(
+                "handle_readdir: non-sequential access, seeking to offset {}",
+                tr.offset
+            );
+        }
 
-                    let dirent = DirEntry {
-                        qid: inode_to_qid(&child_inode, entry.fileid),
-                        offset: current_offset + 1,
-                        type_: match child_inode {
-                            Inode::Directory(_) => DT_DIR,
-                            Inode::File(_) => DT_REG,
-                            Inode::Symlink(_) => DT_LNK,
-                            Inode::CharDevice(_) => DT_CHR,
-                            Inode::BlockDevice(_) => DT_BLK,
-                            Inode::Fifo(_) => DT_FIFO,
-                            Inode::Socket(_) => DT_SOCK,
-                        },
-                        name: P9String::new(&String::from_utf8_lossy(&entry.name)),
-                    };
+        while current_offset < tr.offset || entries_to_return.is_empty() {
+            const BATCH_SIZE: usize = 1000;
 
-                    let encoded = dirent
-                        .to_bytes()
-                        .map_err(|_| libc::EIO as u32)
-                        .unwrap_or_default();
-
-                    if data.len() + encoded.len() > tr.count as usize {
+            match self
+                .filesystem
+                .process_readdir(&auth, fid_entry.inode_id, cookie, BATCH_SIZE)
+                .await
+            {
+                Ok(result) => {
+                    if result.entries.is_empty() {
                         break;
                     }
 
-                    data.extend_from_slice(&encoded);
-                    current_offset += 1;
-                }
+                    for entry in result.entries {
+                        let name = String::from_utf8_lossy(&entry.name).to_string();
 
-                P9Message::new(
-                    tag,
-                    Message::Rreaddir(Rreaddir {
-                        count: data.len() as u32,
-                        data,
-                    }),
-                )
+                        if current_offset < tr.offset {
+                            current_offset += 1;
+                        } else {
+                            // We've reached the target offset, start collecting
+                            entries_to_return.push((current_offset, name, entry.fileid));
+                            current_offset += 1;
+                        }
+
+                        cookie = entry.fileid;
+                    }
+
+                    if result.end || !entries_to_return.is_empty() {
+                        break; // Either end of dir or we have entries to return
+                    }
+                }
+                Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
             }
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
         }
+
+        // Update FID state for next sequential read
+        if let Some(fid) = self.session.fids.get_mut(&tr.fid) {
+            fid.dir_last_offset = current_offset;
+            fid.dir_last_cookie = cookie;
+        }
+
+        let mut data = Vec::new();
+
+        for (offset, name, _) in &entries_to_return {
+            let (child_id, child_inode) = if name == "." {
+                let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                (fid_entry.inode_id, inode)
+            } else if name == ".." {
+                let current_inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                let parent_id = match &current_inode {
+                    Inode::Directory(dir) => {
+                        if fid_entry.inode_id == 0 {
+                            0
+                        } else {
+                            dir.parent
+                        }
+                    }
+                    _ => unreachable!("readdir called on non-directory"),
+                };
+                let parent_inode = match self.filesystem.load_inode(parent_id).await {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                (parent_id, parent_inode)
+            } else {
+                // NFS lookup expects encoded IDs
+                let encoded_parent_id = EncodedFileId::from_inode(fid_entry.inode_id).into();
+                match self
+                    .filesystem
+                    .lookup(&auth, encoded_parent_id, &name.as_bytes().into())
+                    .await
+                {
+                    Ok(encoded_id) => {
+                        let real_id = EncodedFileId::from(encoded_id).inode_id();
+                        let inode = match self.filesystem.load_inode(real_id).await {
+                            Ok(i) => i,
+                            Err(_) => continue,
+                        };
+                        (real_id, inode)
+                    }
+                    Err(_) => continue,
+                }
+            };
+
+            let dirent = DirEntry {
+                qid: inode_to_qid(&child_inode, child_id),
+                offset: offset + 1,
+                type_: match child_inode {
+                    Inode::Directory(_) => DT_DIR,
+                    Inode::File(_) => DT_REG,
+                    Inode::Symlink(_) => DT_LNK,
+                    Inode::CharDevice(_) => DT_CHR,
+                    Inode::BlockDevice(_) => DT_BLK,
+                    Inode::Fifo(_) => DT_FIFO,
+                    Inode::Socket(_) => DT_SOCK,
+                },
+                name: P9String::new(name),
+            };
+
+            let encoded = dirent
+                .to_bytes()
+                .map_err(|_| libc::EIO as u32)
+                .unwrap_or_default();
+
+            if data.len() + encoded.len() > tr.count as usize {
+                break;
+            }
+
+            data.extend_from_slice(&encoded);
+        }
+
+        P9Message::new(
+            tag,
+            Message::Rreaddir(Rreaddir {
+                count: data.len() as u32,
+                data,
+            }),
+        )
     }
 
     async fn handle_lcreate(&mut self, tag: u16, tc: Tlcreate) -> P9Message {
@@ -882,12 +975,16 @@ impl NinePHandler {
         let mut source_parent_id = 0;
         let auth = self.make_auth_context(&creds);
         for name in &source_parent_path {
+            let encoded_parent_id = EncodedFileId::from_inode(source_parent_id).into();
             match self
                 .filesystem
-                .lookup(&auth, source_parent_id, &name.as_bytes().into())
+                .lookup(&auth, encoded_parent_id, &name.as_bytes().into())
                 .await
             {
-                Ok(id) => source_parent_id = id,
+                Ok(encoded_id) => {
+                    let real_id = EncodedFileId::from(encoded_id).inode_id();
+                    source_parent_id = real_id;
+                }
                 Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
             }
         }
@@ -973,12 +1070,13 @@ impl NinePHandler {
         };
 
         let auth = self.make_auth_context(&creds);
+        let encoded_parent_id = EncodedFileId::from_inode(parent_id).into();
         let child_id = match self
             .filesystem
-            .lookup(&auth, parent_id, &name.as_bytes().into())
+            .lookup(&auth, encoded_parent_id, &name.as_bytes().into())
             .await
         {
-            Ok(id) => id,
+            Ok(encoded_id) => EncodedFileId::from(encoded_id).inode_id(),
             Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
         };
 
@@ -1269,6 +1367,9 @@ pub fn errno_from_nfsstat(e: nfsstat3) -> u32 {
 mod tests {
     use super::*;
     use crate::filesystem::SlateDbFs;
+    use libc::O_RDONLY;
+    use std::sync::Arc;
+    use zerofs_nfsserve::vfs::AuthContext;
 
     #[tokio::test]
     async fn test_statfs() {
@@ -1404,5 +1505,202 @@ mod tests {
             }
             _ => panic!("Expected Rstatfs"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_readdir_random_pagination() {
+        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+
+        let auth = AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+        };
+        for i in 0..10 {
+            fs.create(
+                &auth,
+                0,
+                &format!("file{:02}.txt", i).as_bytes().into(),
+                zerofs_nfsserve::nfs::sattr3::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut handler = NinePHandler::new(fs);
+
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new("9P2000.L"),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new("test"),
+            aname: P9String::new("/"),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 1,
+            flags: O_RDONLY as u32,
+        });
+        handler.handle_message(200, open_msg).await;
+
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 1,
+            offset: 0,
+            count: 8192,
+        });
+        let resp = handler.handle_message(201, readdir_msg).await;
+
+        let entries_count = match &resp.body {
+            Message::Rreaddir(rreaddir) => {
+                assert!(rreaddir.data.len() > 0);
+                let mut count = 0;
+                let mut offset = 0;
+                while offset < rreaddir.data.len() {
+                    // Each entry: qid(13) + offset(8) + type(1) + name_len(2) + name
+                    if offset + 24 > rreaddir.data.len() {
+                        break;
+                    }
+                    let name_len = u16::from_le_bytes([
+                        rreaddir.data[offset + 22],
+                        rreaddir.data[offset + 23],
+                    ]) as usize;
+                    offset += 24 + name_len;
+                    count += 1;
+                }
+                count
+            }
+            _ => panic!("Expected Rreaddir"),
+        };
+
+        // Should have at least . and .. plus the created files
+        assert_eq!(
+            entries_count, 12,
+            "Expected 12 entries (. .. and 10 files), got {}",
+            entries_count
+        );
+
+        // Test reading from random offset (skip first 5 entries)
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 1,
+            offset: 5,
+            count: 8192,
+        });
+        let resp = handler.handle_message(202, readdir_msg).await;
+
+        match &resp.body {
+            Message::Rreaddir(rreaddir) => {
+                // Should have fewer entries when starting from offset 5
+                let mut count = 0;
+                let mut offset = 0;
+                while offset < rreaddir.data.len() {
+                    if offset + 24 > rreaddir.data.len() {
+                        break;
+                    }
+                    let name_len = u16::from_le_bytes([
+                        rreaddir.data[offset + 22],
+                        rreaddir.data[offset + 23],
+                    ]) as usize;
+                    offset += 24 + name_len;
+                    count += 1;
+                }
+                assert_eq!(count, entries_count - 5);
+            }
+            _ => panic!("Expected Rreaddir"),
+        };
+    }
+
+    #[tokio::test]
+    async fn test_readdir_backwards_seek() {
+        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+
+        // Create a few files
+        let auth = AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+        };
+        for i in 0..5 {
+            fs.create(
+                &auth,
+                0,
+                &format!("file{}.txt", i).as_bytes().into(),
+                zerofs_nfsserve::nfs::sattr3::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut handler = NinePHandler::new(fs);
+
+        // Initialize
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new("9P2000.L"),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new("test"),
+            aname: P9String::new("/"),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        // Open directory
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 1,
+            flags: O_RDONLY as u32,
+        });
+        handler.handle_message(20, open_msg).await;
+
+        // Read from offset 3
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 1,
+            offset: 3,
+            count: 8192,
+        });
+        handler.handle_message(21, readdir_msg).await;
+
+        // Now read from offset 1 (backwards seek)
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 1,
+            offset: 1,
+            count: 8192,
+        });
+        let resp = handler.handle_message(22, readdir_msg).await;
+
+        match &resp.body {
+            Message::Rreaddir(rreaddir) => {
+                // Should successfully read from offset 1
+                assert!(rreaddir.data.len() > 0);
+
+                // Count entries
+                let mut count = 0;
+                let mut offset = 0;
+                while offset < rreaddir.data.len() {
+                    if offset + 24 > rreaddir.data.len() {
+                        break;
+                    }
+                    let name_len = u16::from_le_bytes([
+                        rreaddir.data[offset + 22],
+                        rreaddir.data[offset + 23],
+                    ]) as usize;
+                    offset += 24 + name_len;
+                    count += 1;
+                }
+                // Should have 6 entries from offset 1 (skipping only ".")
+                assert_eq!(count, 6, "Expected 6 entries from offset 1");
+            }
+            _ => panic!("Expected Rreaddir"),
+        };
     }
 }

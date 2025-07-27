@@ -1,5 +1,5 @@
 use crate::cache::{CacheKey, CacheValue};
-use crate::filesystem::SlateDbFs;
+use crate::filesystem::{EncodedFileId, SlateDbFs};
 use crate::inode::Inode;
 use async_trait::async_trait;
 use tracing::{debug, info};
@@ -23,13 +23,18 @@ impl NFSFileSystem for SlateDbFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        let encoded_dirid = EncodedFileId::from(dirid);
+        let real_dirid = encoded_dirid.inode_id();
         let filename_str = String::from_utf8_lossy(filename);
-        debug!("lookup called: dirid={}, filename={}", dirid, filename_str);
+        debug!(
+            "lookup called: dirid={}, filename={}",
+            real_dirid, filename_str
+        );
 
         // Acquire read lock on the directory for the entire lookup operation
-        let _guard = self.lock_manager.acquire_read(dirid).await;
+        let _guard = self.lock_manager.acquire_read(real_dirid).await;
 
-        let dir_inode = self.load_inode(dirid).await?;
+        let dir_inode = self.load_inode(real_dirid).await?;
 
         match dir_inode {
             Inode::Directory(ref _dir) => {
@@ -39,17 +44,17 @@ impl NFSFileSystem for SlateDbFs {
                 let name = filename_str.to_string();
 
                 let cache_key = CacheKey::DirEntry {
-                    dir_id: dirid,
+                    dir_id: real_dirid,
                     name: name.clone(),
                 };
                 if let Some(CacheValue::DirEntry(inode_id)) =
                     self.dir_entry_cache.get(cache_key).await
                 {
                     debug!("lookup cache hit: {} -> inode {}", name, inode_id);
-                    return Ok(inode_id);
+                    return Ok(EncodedFileId::from_inode(inode_id).into());
                 }
 
-                let entry_key = SlateDbFs::dir_entry_key(dirid, &name);
+                let entry_key = SlateDbFs::dir_entry_key(real_dirid, &name);
 
                 match self
                     .db
@@ -64,13 +69,13 @@ impl NFSFileSystem for SlateDbFs {
                         debug!("lookup found: {} -> inode {}", name, inode_id);
 
                         let cache_key = crate::cache::CacheKey::DirEntry {
-                            dir_id: dirid,
+                            dir_id: real_dirid,
                             name: name.clone(),
                         };
                         let cache_value = crate::cache::CacheValue::DirEntry(inode_id);
                         self.dir_entry_cache.insert(cache_key, cache_value, false);
 
-                        Ok(inode_id)
+                        Ok(EncodedFileId::from_inode(inode_id).into())
                     }
                     None => {
                         debug!("lookup not found: {} in directory", name);
@@ -84,10 +89,12 @@ impl NFSFileSystem for SlateDbFs {
 
     async fn getattr(&self, _auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
+        let encoded_id = EncodedFileId::from(id);
+        let real_id = encoded_id.inode_id();
         // Acquire read lock for consistent view of metadata
-        let _guard = self.lock_manager.acquire_read(id).await;
-        let inode = self.load_inode(id).await?;
-        Ok(inode.to_fattr3(id))
+        let _guard = self.lock_manager.acquire_read(real_id).await;
+        let inode = self.load_inode(real_id).await?;
+        Ok(inode.to_fattr3(real_id))
     }
 
     async fn read(
@@ -98,7 +105,8 @@ impl NFSFileSystem for SlateDbFs {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
-        self.process_read_file(auth, id, offset, count).await
+        let real_id = EncodedFileId::from(id).inode_id();
+        self.process_read_file(auth, real_id, offset, count).await
     }
 
     async fn write(
@@ -108,14 +116,15 @@ impl NFSFileSystem for SlateDbFs {
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsstat3> {
+        let real_id = EncodedFileId::from(id).inode_id();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
             data.len(),
-            id,
+            real_id,
             offset
         );
 
-        self.process_write(auth, id, offset, data).await
+        self.process_write(auth, real_id, offset, data).await
     }
 
     async fn create(
@@ -125,10 +134,17 @@ impl NFSFileSystem for SlateDbFs {
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
         let filename_str = String::from_utf8_lossy(filename);
-        debug!("create called: dirid={}, filename={}", dirid, filename_str);
+        debug!(
+            "create called: dirid={}, filename={}",
+            real_dirid, filename_str
+        );
 
-        self.process_create(auth, dirid, filename, attr).await
+        let (id, fattr) = self
+            .process_create(auth, real_dirid, filename, attr)
+            .await?;
+        Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
     async fn create_exclusive(
@@ -137,12 +153,16 @@ impl NFSFileSystem for SlateDbFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
         debug!(
             "create_exclusive called: dirid={}, filename={:?}",
-            dirid, filename
+            real_dirid, filename
         );
 
-        self.process_create_exclusive(auth, dirid, filename).await
+        let id = self
+            .process_create_exclusive(auth, real_dirid, filename)
+            .await?;
+        Ok(EncodedFileId::from_inode(id).into())
     }
 
     async fn mkdir(
@@ -152,10 +172,15 @@ impl NFSFileSystem for SlateDbFs {
         dirname: &filename3,
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
         let dirname_str = String::from_utf8_lossy(dirname);
-        debug!("mkdir called: dirid={}, dirname={}", dirid, dirname_str);
+        debug!(
+            "mkdir called: dirid={}, dirname={}",
+            real_dirid, dirname_str
+        );
 
-        self.process_mkdir(auth, dirid, dirname, attr).await
+        let (id, fattr) = self.process_mkdir(auth, real_dirid, dirname, attr).await?;
+        Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
     async fn remove(
@@ -164,9 +189,13 @@ impl NFSFileSystem for SlateDbFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        debug!("remove called: dirid={}, filename={:?}", dirid, filename);
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
+        debug!(
+            "remove called: dirid={}, filename={:?}",
+            real_dirid, filename
+        );
 
-        self.process_remove(auth, dirid, filename).await
+        self.process_remove(auth, real_dirid, filename).await
     }
 
     async fn rename(
@@ -177,13 +206,21 @@ impl NFSFileSystem for SlateDbFs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        let real_from_dirid = EncodedFileId::from(from_dirid).inode_id();
+        let real_to_dirid = EncodedFileId::from(to_dirid).inode_id();
         debug!(
             "rename called: from_dirid={}, to_dirid={}",
-            from_dirid, to_dirid
+            real_from_dirid, real_to_dirid
         );
 
-        self.process_rename(auth, from_dirid, from_filename, to_dirid, to_filename)
-            .await
+        self.process_rename(
+            auth,
+            real_from_dirid,
+            from_filename,
+            real_to_dirid,
+            to_filename,
+        )
+        .await
     }
 
     async fn readdir(
@@ -193,11 +230,12 @@ impl NFSFileSystem for SlateDbFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
         debug!(
             "readdir called: dirid={}, start_after={}, max_entries={}",
-            dirid, start_after, max_entries
+            real_dirid, start_after, max_entries
         );
-        self.process_readdir(auth, dirid, start_after, max_entries)
+        self.process_readdir(auth, real_dirid, start_after, max_entries)
             .await
     }
 
@@ -207,9 +245,10 @@ impl NFSFileSystem for SlateDbFs {
         id: fileid3,
         setattr: sattr3,
     ) -> Result<fattr3, nfsstat3> {
-        debug!("setattr called: id={}, setattr={:?}", id, setattr);
+        let real_id = EncodedFileId::from(id).inode_id();
+        debug!("setattr called: id={}, setattr={:?}", real_id, setattr);
 
-        self.process_setattr(auth, id, setattr).await
+        self.process_setattr(auth, real_id, setattr).await
     }
 
     async fn symlink(
@@ -220,20 +259,24 @@ impl NFSFileSystem for SlateDbFs {
         symlink: &nfspath3,
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
         debug!(
             "symlink called: dirid={}, linkname={:?}, target={:?}",
-            dirid, linkname, symlink
+            real_dirid, linkname, symlink
         );
 
-        self.process_symlink(auth, dirid, &linkname.0, &symlink.0, *attr)
-            .await
+        let (id, fattr) = self
+            .process_symlink(auth, real_dirid, &linkname.0, &symlink.0, *attr)
+            .await?;
+        Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
     async fn readlink(&self, _auth: &AuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         debug!("readlink called: id={}", id);
+        let real_id = EncodedFileId::from(id).inode_id();
 
-        let _guard = self.lock_manager.acquire_read(id).await;
-        let inode = self.load_inode(id).await?;
+        let _guard = self.lock_manager.acquire_read(real_id).await;
+        let inode = self.load_inode(real_id).await?;
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
             _ => Err(nfsstat3::NFS3ERR_INVAL),
@@ -249,9 +292,10 @@ impl NFSFileSystem for SlateDbFs {
         attr: &sattr3,
         spec: Option<&specdata3>,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let real_dirid = EncodedFileId::from(dirid).inode_id();
         debug!(
             "mknod called: dirid={}, filename={:?}, ftype={:?}",
-            dirid, filename, ftype
+            real_dirid, filename, ftype
         );
 
         // Extract device numbers if this is a device file
@@ -263,8 +307,10 @@ impl NFSFileSystem for SlateDbFs {
             _ => None,
         };
 
-        self.process_mknod(auth, dirid, &filename.0, ftype, attr, rdev)
-            .await
+        let (id, fattr) = self
+            .process_mknod(auth, real_dirid, &filename.0, ftype, attr, rdev)
+            .await?;
+        Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
     async fn link(
@@ -274,11 +320,13 @@ impl NFSFileSystem for SlateDbFs {
         linkdirid: fileid3,
         linkname: &filename3,
     ) -> Result<(), nfsstat3> {
+        let real_fileid = EncodedFileId::from(fileid).inode_id();
+        let real_linkdirid = EncodedFileId::from(linkdirid).inode_id();
         debug!(
             "link called: fileid={}, linkdirid={}, linkname={:?}",
-            fileid, linkdirid, linkname
+            real_fileid, real_linkdirid, linkname
         );
-        self.process_link(auth, fileid, linkdirid, &linkname.0)
+        self.process_link(auth, real_fileid, real_linkdirid, &linkname.0)
             .await
     }
 
@@ -289,27 +337,29 @@ impl NFSFileSystem for SlateDbFs {
         offset: u64,
         count: u32,
     ) -> Result<writeverf3, nfsstat3> {
+        let real_fileid = EncodedFileId::from(fileid).inode_id();
         tracing::debug!(
             "commit called: fileid={}, offset={}, count={}",
-            fileid,
+            real_fileid,
             offset,
             count
         );
 
         match self.db.flush().await {
             Ok(_) => {
-                debug!("commit successful for file {}", fileid);
+                debug!("commit successful for file {}", real_fileid);
                 Ok(self.serverid())
             }
             Err(e) => {
-                tracing::error!("commit failed for file {}: {}", fileid, e);
+                tracing::error!("commit failed for file {}: {}", real_fileid, e);
                 Err(nfsstat3::NFS3ERR_IO)
             }
         }
     }
 
     async fn fsstat(&self, auth: &AuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
-        debug!("fsstat called: fileid={}", fileid);
+        let real_fileid = EncodedFileId::from(fileid).inode_id();
+        debug!("fsstat called: fileid={}", real_fileid);
 
         let obj_attr = match self.getattr(auth, fileid).await {
             Ok(v) => post_op_attr::attributes(v),
@@ -661,5 +711,301 @@ mod tests {
 
         let (data, _) = fs.read(&test_auth(), file1_id, 0, 100).await.unwrap();
         assert_eq!(data, b"This is the readme");
+    }
+
+    #[tokio::test]
+    async fn test_large_directory_pagination() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create a large number of files
+        let num_files = 100;
+        for i in 0..num_files {
+            fs.create(
+                &test_auth(),
+                0,
+                &filename(format!("file_{:04}.txt", i).as_bytes()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Test pagination with different page sizes
+        let page_sizes = vec![10, 25, 50];
+
+        for page_size in page_sizes {
+            let mut all_entries = Vec::new();
+            let mut last_fileid = 0;
+            let mut iterations = 0;
+
+            loop {
+                let result = fs
+                    .readdir(&test_auth(), 0, last_fileid, page_size)
+                    .await
+                    .unwrap();
+
+                // Skip . and .. if we're at the beginning
+                let start_idx = if last_fileid == 0 { 2 } else { 0 };
+
+                for entry in &result.entries[start_idx..] {
+                    all_entries.push(String::from_utf8_lossy(&entry.name).to_string());
+                    last_fileid = entry.fileid;
+                }
+
+                iterations += 1;
+
+                if result.end {
+                    break;
+                }
+
+                // Safety check to prevent infinite loops
+                assert!(
+                    iterations < 50,
+                    "Too many iterations for page size {}",
+                    page_size
+                );
+            }
+
+            // Should have all files
+            assert_eq!(
+                all_entries.len(),
+                num_files,
+                "Wrong number of entries for page size {}",
+                page_size
+            );
+
+            // Verify all files are present and in order
+            all_entries.sort();
+            for i in 0..num_files {
+                assert_eq!(all_entries[i], format!("file_{:04}.txt", i));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pagination_with_many_hardlinks() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create original files
+        let num_files = 5;
+        let hardlinks_per_file = 20;
+
+        let mut file_ids = Vec::new();
+        for i in 0..num_files {
+            let (file_id, _) = fs
+                .create(
+                    &test_auth(),
+                    0,
+                    &filename(format!("original_{}.txt", i).as_bytes()),
+                    sattr3::default(),
+                )
+                .await
+                .unwrap();
+            file_ids.push(file_id);
+        }
+
+        // Create many hardlinks for each file
+        for (i, &file_id) in file_ids.iter().enumerate() {
+            for j in 0..hardlinks_per_file {
+                fs.link(
+                    &test_auth(),
+                    file_id,
+                    0,
+                    &filename(format!("link_{}_{:02}.txt", i, j).as_bytes()),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // Test pagination - should handle all entries correctly
+        let mut all_entries = Vec::new();
+        let mut last_fileid = 0;
+        let page_size = 20;
+
+        loop {
+            let result = fs
+                .readdir(&test_auth(), 0, last_fileid, page_size)
+                .await
+                .unwrap();
+
+            let start_idx = if last_fileid == 0 { 2 } else { 0 };
+
+            for entry in &result.entries[start_idx..] {
+                let name = String::from_utf8_lossy(&entry.name).to_string();
+                all_entries.push(name);
+
+                // Verify encoded fileid can be decoded properly
+                let encoded_id = EncodedFileId::from(entry.fileid);
+                let (real_inode, position) = encoded_id.decode();
+                assert!(real_inode > 0);
+                assert!(position < 65535); // Should be within u16 range
+
+                last_fileid = entry.fileid;
+            }
+
+            if result.end {
+                break;
+            }
+        }
+
+        // Should have all files: originals + all hardlinks
+        let expected_count = num_files + (num_files * hardlinks_per_file);
+        assert_eq!(all_entries.len(), expected_count);
+
+        // Verify no duplicates
+        all_entries.sort();
+        for i in 1..all_entries.len() {
+            assert_ne!(all_entries[i - 1], all_entries[i], "Found duplicate entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pagination_edge_cases() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Test 1: Empty directory (only . and ..)
+        let (empty_dir, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"empty"), &sattr3::default())
+            .await
+            .unwrap();
+
+        let result = fs.readdir(&test_auth(), empty_dir, 0, 10).await.unwrap();
+        assert_eq!(result.entries.len(), 2); // Only . and ..
+        assert!(result.end);
+        assert_eq!(result.entries[0].name.0, b".");
+        assert_eq!(result.entries[1].name.0, b"..");
+
+        // Test 2: Single entry directory
+        let (single_dir, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"single"), &sattr3::default())
+            .await
+            .unwrap();
+        fs.create(
+            &test_auth(),
+            single_dir,
+            &filename(b"file.txt"),
+            sattr3::default(),
+        )
+        .await
+        .unwrap();
+
+        let result = fs.readdir(&test_auth(), single_dir, 0, 10).await.unwrap();
+        assert_eq!(result.entries.len(), 3); // ., .., file.txt
+        assert!(result.end);
+
+        // Test 3: Pagination with exactly page_size entries
+        let (exact_dir, _) = fs
+            .mkdir(&test_auth(), 0, &filename(b"exact"), &sattr3::default())
+            .await
+            .unwrap();
+
+        // Create 8 files (so with . and .. we have 10 total)
+        for i in 0..8 {
+            fs.create(
+                &test_auth(),
+                exact_dir,
+                &filename(format!("f{}", i).as_bytes()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Read with page size 10 - should get all in one go
+        let result = fs.readdir(&test_auth(), exact_dir, 0, 10).await.unwrap();
+        assert_eq!(result.entries.len(), 10);
+        assert!(result.end);
+
+        // Read with page size 5 - should need exactly 2 reads
+        let result1 = fs.readdir(&test_auth(), exact_dir, 0, 5).await.unwrap();
+        assert_eq!(result1.entries.len(), 5);
+        assert!(!result1.end);
+
+        let last_id = result1.entries.last().unwrap().fileid;
+        let result2 = fs
+            .readdir(&test_auth(), exact_dir, last_id, 5)
+            .await
+            .unwrap();
+        assert_eq!(result2.entries.len(), 5);
+        assert!(result2.end);
+
+        // Test 4: Resume from non-existent cookie (should fail)
+        let fake_cookie = EncodedFileId::new(999999, 0).as_raw();
+        let _result = fs.readdir(&test_auth(), 0, fake_cookie, 10).await;
+        // This should work but return no entries (or few entries if the inode exists)
+        // The implementation continues scanning from the encoded position
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_readdir_operations() {
+        let fs = SlateDbFs::new_in_memory().await.unwrap();
+
+        // Create some files
+        for i in 0..20 {
+            fs.create(
+                &test_auth(),
+                0,
+                &filename(format!("file_{:02}.txt", i).as_bytes()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Simulate multiple concurrent readdir operations
+        let fs1 = fs.clone();
+        let fs2 = fs.clone();
+
+        let handle1 = tokio::spawn(async move {
+            let mut entries = Vec::new();
+            let mut last_id = 0;
+
+            loop {
+                let result = fs1.readdir(&test_auth(), 0, last_id, 5).await.unwrap();
+                for entry in &result.entries {
+                    if entry.name.0 != b"." && entry.name.0 != b".." {
+                        entries.push(String::from_utf8_lossy(&entry.name).to_string());
+                    }
+                    last_id = entry.fileid;
+                }
+                if result.end {
+                    break;
+                }
+            }
+            entries
+        });
+
+        let handle2 = tokio::spawn(async move {
+            let mut entries = Vec::new();
+            let mut last_id = 0;
+
+            loop {
+                let result = fs2.readdir(&test_auth(), 0, last_id, 7).await.unwrap();
+                for entry in &result.entries {
+                    if entry.name.0 != b"." && entry.name.0 != b".." {
+                        entries.push(String::from_utf8_lossy(&entry.name).to_string());
+                    }
+                    last_id = entry.fileid;
+                }
+                if result.end {
+                    break;
+                }
+            }
+            entries
+        });
+
+        let (entries1, entries2) = tokio::join!(handle1, handle2);
+        let mut entries1 = entries1.unwrap();
+        let mut entries2 = entries2.unwrap();
+
+        // Both should have all 20 files
+        assert_eq!(entries1.len(), 20);
+        assert_eq!(entries2.len(), 20);
+
+        // Sort and verify they're identical
+        entries1.sort();
+        entries2.sort();
+        assert_eq!(entries1, entries2);
     }
 }
