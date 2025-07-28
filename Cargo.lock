@@ -2895,8 +2895,9 @@ checksum = "04dc19736151f35336d325007ac991178d504a119863a2fcb3758cdb5e52c50d"
 [[package]]
 name = "slatedb"
 version = "0.7.0"
-source = "git+https://github.com/slatedb/slatedb.git?rev=2fe991affaed8e2cb9caf3eed73589367484f09a#2fe991affaed8e2cb9caf3eed73589367484f09a"
+source = "git+https://github.com/slatedb/slatedb.git?rev=394454b63a0d7d291611f304821206bdc66f8812#394454b63a0d7d291611f304821206bdc66f8812"
 dependencies = [
+ "anyhow",
  "async-trait",
  "atomic",
  "bitflags 2.9.1",
