@@ -723,7 +723,7 @@ mod tests {
             fs.create(
                 &test_auth(),
                 0,
-                &filename(format!("file_{:04}.txt", i).as_bytes()),
+                &filename(format!("file_{i:04}.txt").as_bytes()),
                 sattr3::default(),
             )
             .await
@@ -761,8 +761,7 @@ mod tests {
                 // Safety check to prevent infinite loops
                 assert!(
                     iterations < 50,
-                    "Too many iterations for page size {}",
-                    page_size
+                    "Too many iterations for page size {page_size}"
                 );
             }
 
@@ -770,14 +769,13 @@ mod tests {
             assert_eq!(
                 all_entries.len(),
                 num_files,
-                "Wrong number of entries for page size {}",
-                page_size
+                "Wrong number of entries for page size {page_size}"
             );
 
             // Verify all files are present and in order
             all_entries.sort();
             for i in 0..num_files {
-                assert_eq!(all_entries[i], format!("file_{:04}.txt", i));
+                assert_eq!(all_entries[i], format!("file_{i:04}.txt"));
             }
         }
     }
@@ -796,7 +794,7 @@ mod tests {
                 .create(
                     &test_auth(),
                     0,
-                    &filename(format!("original_{}.txt", i).as_bytes()),
+                    &filename(format!("original_{i}.txt").as_bytes()),
                     sattr3::default(),
                 )
                 .await
@@ -811,7 +809,7 @@ mod tests {
                     &test_auth(),
                     file_id,
                     0,
-                    &filename(format!("link_{}_{:02}.txt", i, j).as_bytes()),
+                    &filename(format!("link_{i}_{j:02}.txt").as_bytes()),
                 )
                 .await
                 .unwrap();
@@ -905,7 +903,7 @@ mod tests {
             fs.create(
                 &test_auth(),
                 exact_dir,
-                &filename(format!("f{}", i).as_bytes()),
+                &filename(format!("f{i}").as_bytes()),
                 sattr3::default(),
             )
             .await
@@ -946,7 +944,7 @@ mod tests {
             fs.create(
                 &test_auth(),
                 0,
-                &filename(format!("file_{:02}.txt", i).as_bytes()),
+                &filename(format!("file_{i:02}.txt").as_bytes()),
                 sattr3::default(),
             )
             .await

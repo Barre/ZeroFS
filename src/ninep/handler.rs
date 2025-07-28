@@ -359,21 +359,44 @@ impl NinePHandler {
         let is_sequential = tr.offset == fid_entry.dir_last_offset;
 
         let mut entries_to_return = Vec::new();
-        let mut current_offset = 0u64;
-        let mut cookie = 0u64;
+        let mut current_offset;
 
-        if is_sequential && tr.offset > 0 {
-            current_offset = fid_entry.dir_last_offset;
-            cookie = fid_entry.dir_last_cookie;
-        } else if tr.offset > 0 {
-            // Non-sequential: we need to skip entries from the beginning
-            debug!(
-                "handle_readdir: non-sequential access, seeking to offset {}",
-                tr.offset
-            );
+        let parent_id = match self.filesystem.load_inode(fid_entry.inode_id).await {
+            Ok(Inode::Directory(dir)) => {
+                if fid_entry.inode_id == 0 {
+                    0
+                } else {
+                    dir.parent
+                }
+            }
+            _ => 0,
+        };
+
+        // Handle special entries . and .. based on offset
+        if tr.offset == 0 {
+            // Add both . and ..
+            entries_to_return.push((0, ".".to_string(), fid_entry.inode_id));
+            entries_to_return.push((1, "..".to_string(), parent_id));
+            current_offset = 2;
+        } else if tr.offset == 1 {
+            // Add only ..
+            entries_to_return.push((1, "..".to_string(), parent_id));
+            current_offset = 2;
+        } else {
+            // Start from offset 2 (after special entries)
+            current_offset = 2;
         }
 
-        while current_offset < tr.offset || entries_to_return.is_empty() {
+        // Now read regular entries if needed
+        let mut cookie = if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
+            fid_entry.dir_last_cookie
+        } else {
+            // Always start from 0 to get all entries, we'll filter special ones
+            0
+        };
+
+        // Read regular entries - continue until we hit the end
+        loop {
             const BATCH_SIZE: usize = 1000;
 
             match self
@@ -382,12 +405,18 @@ impl NinePHandler {
                 .await
             {
                 Ok(result) => {
-                    if result.entries.is_empty() {
+                    if result.entries.is_empty() && result.end {
                         break;
                     }
 
                     for entry in result.entries {
                         let name = String::from_utf8_lossy(&entry.name).to_string();
+
+                        // Skip special entries - we handle them manually
+                        if name == "." || name == ".." {
+                            cookie = entry.fileid;
+                            continue;
+                        }
 
                         if current_offset < tr.offset {
                             current_offset += 1;
@@ -400,8 +429,9 @@ impl NinePHandler {
                         cookie = entry.fileid;
                     }
 
-                    if result.end || !entries_to_return.is_empty() {
-                        break; // Either end of dir or we have entries to return
+                    // Only break if we have collected entries past the requested offset
+                    if result.end || (!entries_to_return.is_empty() && current_offset > tr.offset) {
+                        break; // Either end of dir or we have enough entries
                     }
                 }
                 Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
@@ -1500,7 +1530,7 @@ mod tests {
                 assert_eq!(rstatfs.ffree, initial_free_inodes - 1);
 
                 // Should have fewer free blocks (10KB written = 3 blocks of 4KB)
-                let expected_blocks_used = (10240 + 4095) / 4096; // Round up
+                let expected_blocks_used = 10240_u64.div_ceil(4096); // Round up
                 assert_eq!(rstatfs.bfree, initial_free_blocks - expected_blocks_used);
             }
             _ => panic!("Expected Rstatfs"),
@@ -1520,7 +1550,7 @@ mod tests {
             fs.create(
                 &auth,
                 0,
-                &format!("file{:02}.txt", i).as_bytes().into(),
+                &format!("file{i:02}.txt").as_bytes().into(),
                 zerofs_nfsserve::nfs::sattr3::default(),
             )
             .await
@@ -1559,7 +1589,7 @@ mod tests {
 
         let entries_count = match &resp.body {
             Message::Rreaddir(rreaddir) => {
-                assert!(rreaddir.data.len() > 0);
+                assert!(!rreaddir.data.is_empty());
                 let mut count = 0;
                 let mut offset = 0;
                 while offset < rreaddir.data.len() {
@@ -1582,8 +1612,7 @@ mod tests {
         // Should have at least . and .. plus the created files
         assert_eq!(
             entries_count, 12,
-            "Expected 12 entries (. .. and 10 files), got {}",
-            entries_count
+            "Expected 12 entries (. .. and 10 files), got {entries_count}"
         );
 
         // Test reading from random offset (skip first 5 entries)
@@ -1630,7 +1659,7 @@ mod tests {
             fs.create(
                 &auth,
                 0,
-                &format!("file{}.txt", i).as_bytes().into(),
+                &format!("file{i}.txt").as_bytes().into(),
                 zerofs_nfsserve::nfs::sattr3::default(),
             )
             .await
@@ -1681,7 +1710,7 @@ mod tests {
         match &resp.body {
             Message::Rreaddir(rreaddir) => {
                 // Should successfully read from offset 1
-                assert!(rreaddir.data.len() > 0);
+                assert!(!rreaddir.data.is_empty());
 
                 // Count entries
                 let mut count = 0;
@@ -1699,6 +1728,121 @@ mod tests {
                 }
                 // Should have 6 entries from offset 1 (skipping only ".")
                 assert_eq!(count, 6, "Expected 6 entries from offset 1");
+            }
+            _ => panic!("Expected Rreaddir"),
+        };
+    }
+
+    #[tokio::test]
+    async fn test_readdir_empty_directory() {
+        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+
+        let auth = AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+        };
+        let (_empty_dir_id, _) = fs
+            .mkdir(
+                &auth,
+                0,
+                &b"emptydir".to_vec().into(),
+                &zerofs_nfsserve::nfs::sattr3::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut handler = NinePHandler::new(fs);
+
+        let version_msg = Message::Tversion(Tversion {
+            msize: 8192,
+            version: P9String::new("9P2000.L"),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new("test"),
+            aname: P9String::new("/"),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        let walk_msg = Message::Twalk(Twalk {
+            fid: 1,
+            newfid: 2,
+            nwname: 1,
+            wnames: vec![P9String::new("emptydir")],
+        });
+        handler.handle_message(2, walk_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 2,
+            flags: O_RDONLY as u32,
+        });
+        handler.handle_message(3, open_msg).await;
+
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 2,
+            offset: 0,
+            count: 8192,
+        });
+        let resp = handler.handle_message(4, readdir_msg).await;
+
+        match &resp.body {
+            Message::Rreaddir(rreaddir) => {
+                // Should have . and .. entries
+                let mut count = 0;
+                let mut offset = 0;
+                while offset < rreaddir.data.len() {
+                    if offset + 24 > rreaddir.data.len() {
+                        break;
+                    }
+                    let name_len = u16::from_le_bytes([
+                        rreaddir.data[offset + 22],
+                        rreaddir.data[offset + 23],
+                    ]) as usize;
+                    offset += 24 + name_len;
+                    count += 1;
+                }
+                assert_eq!(count, 2, "Expected 2 entries (. and ..)");
+            }
+            _ => panic!("Expected Rreaddir"),
+        };
+
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 2,
+            offset: 2,
+            count: 8192,
+        });
+        let resp = handler.handle_message(5, readdir_msg).await;
+
+        match &resp.body {
+            Message::Rreaddir(rreaddir) => {
+                assert_eq!(
+                    rreaddir.data.len(),
+                    0,
+                    "Expected empty response for offset past end"
+                );
+            }
+            _ => panic!("Expected Rreaddir"),
+        };
+
+        let readdir_msg = Message::Treaddir(Treaddir {
+            fid: 2,
+            offset: 2,
+            count: 8192,
+        });
+        let resp = handler.handle_message(6, readdir_msg).await;
+
+        match &resp.body {
+            Message::Rreaddir(rreaddir) => {
+                assert_eq!(
+                    rreaddir.data.len(),
+                    0,
+                    "Expected empty response for sequential read past end"
+                );
             }
             _ => panic!("Expected Rreaddir"),
         };

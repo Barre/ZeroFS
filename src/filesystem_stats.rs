@@ -461,7 +461,7 @@ mod tests {
         for i in 0..10 {
             let fs_clone = fs.clone();
             let handle = tokio::spawn(async move {
-                let fname = format!("file{}.txt", i);
+                let fname = format!("file{i}.txt");
                 let (file_id, _) = fs_clone
                     .create(
                         &test_auth(),
@@ -521,7 +521,7 @@ mod tests {
 
         // Create some files
         for i in 0..5 {
-            let fname = format!("file{}.txt", i);
+            let fname = format!("file{i}.txt");
             let (file_id, _) = fs
                 .create(
                     &test_auth(),
