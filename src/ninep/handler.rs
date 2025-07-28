@@ -388,7 +388,10 @@ impl NinePHandler {
         }
 
         // Now read regular entries if needed
-        let mut cookie = if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
+        let mut cookie = if tr.offset == 0 {
+            // Always reset cookie when rewinding to beginning
+            0
+        } else if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
             fid_entry.dir_last_cookie
         } else {
             // Always start from 0 to get all entries, we'll filter special ones
