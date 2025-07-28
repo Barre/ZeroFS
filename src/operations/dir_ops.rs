@@ -136,7 +136,6 @@ impl SlateDbFs {
                     return Err(nfsstat3::NFS3ERR_NOSPC);
                 }
                 dir.nlink += 1; // New subdirectory's ".." points to this directory
-                let (now_sec, now_nsec) = get_current_time();
                 dir.mtime = now_sec;
                 dir.mtime_nsec = now_nsec;
                 dir.ctime = now_sec;

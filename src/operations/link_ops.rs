@@ -113,7 +113,6 @@ impl SlateDbFs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
         dir.entry_count += 1;
-        let (now_sec, now_nsec) = get_current_time();
         dir.mtime = now_sec;
         dir.mtime_nsec = now_nsec;
         dir.ctime = now_sec;

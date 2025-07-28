@@ -83,6 +83,7 @@ impl SlateDbFs {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 let mut batch = self.db.new_write_batch();
+                let (now_sec, now_nsec) = get_current_time();
 
                 match &mut file_inode {
                     Inode::File(file) => {
@@ -90,7 +91,6 @@ impl SlateDbFs {
                         if file.nlink > 1 {
                             // Just decrement the link count, don't delete the file
                             file.nlink -= 1;
-                            let (now_sec, now_nsec) = get_current_time();
                             file.ctime = now_sec;
                             file.ctime_nsec = now_nsec;
 
@@ -155,7 +155,6 @@ impl SlateDbFs {
                         if special.nlink > 1 {
                             // Just decrement the link count, don't delete the inode
                             special.nlink -= 1;
-                            let (now_sec, now_nsec) = get_current_time();
                             special.ctime = now_sec;
                             special.ctime_nsec = now_nsec;
 
@@ -179,7 +178,6 @@ impl SlateDbFs {
                 batch.delete_bytes(&scan_key);
 
                 dir.entry_count = dir.entry_count.saturating_sub(1);
-                let (now_sec, now_nsec) = get_current_time();
                 dir.mtime = now_sec;
                 dir.mtime_nsec = now_nsec;
                 dir.ctime = now_sec;
