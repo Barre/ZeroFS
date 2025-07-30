@@ -198,8 +198,6 @@ impl SlateDbFs {
             dirid, start_after, max_entries
         );
 
-        let _guard = self.lock_manager.acquire_read(dirid).await;
-
         let dir_inode = self.load_inode(dirid).await?;
 
         let creds = Credentials::from_auth_context(auth);

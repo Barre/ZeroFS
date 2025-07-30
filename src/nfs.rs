@@ -31,9 +31,6 @@ impl NFSFileSystem for SlateDbFs {
             real_dirid, filename_str
         );
 
-        // Acquire read lock on the directory for the entire lookup operation
-        let _guard = self.lock_manager.acquire_read(real_dirid).await;
-
         let dir_inode = self.load_inode(real_dirid).await?;
 
         match dir_inode {
@@ -91,8 +88,6 @@ impl NFSFileSystem for SlateDbFs {
         debug!("getattr called: id={}", id);
         let encoded_id = EncodedFileId::from(id);
         let real_id = encoded_id.inode_id();
-        // Acquire read lock for consistent view of metadata
-        let _guard = self.lock_manager.acquire_read(real_id).await;
         let inode = self.load_inode(real_id).await?;
         Ok(inode.to_fattr3(real_id))
     }
@@ -275,7 +270,6 @@ impl NFSFileSystem for SlateDbFs {
         debug!("readlink called: id={}", id);
         let real_id = EncodedFileId::from(id).inode_id();
 
-        let _guard = self.lock_manager.acquire_read(real_id).await;
         let inode = self.load_inode(real_id).await?;
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),

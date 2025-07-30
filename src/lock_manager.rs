@@ -1,24 +1,17 @@
 use crate::inode::InodeId;
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[derive(Clone)]
 pub struct LockManager {
-    locks: Arc<DashMap<InodeId, Arc<RwLock<()>>>>,
+    locks: Arc<DashMap<InodeId, Arc<Mutex<()>>>>,
 }
 
-pub enum LockGuard {
-    Read {
-        _guard: OwnedRwLockReadGuard<()>,
-        inode_id: InodeId,
-        locks: Arc<DashMap<InodeId, Arc<RwLock<()>>>>,
-    },
-    Write {
-        _guard: OwnedRwLockWriteGuard<()>,
-        inode_id: InodeId,
-        locks: Arc<DashMap<InodeId, Arc<RwLock<()>>>>,
-    },
+pub struct LockGuard {
+    _guard: OwnedMutexGuard<()>,
+    inode_id: InodeId,
+    locks: Arc<DashMap<InodeId, Arc<Mutex<()>>>>,
 }
 
 struct ShardLockGuard {
@@ -37,29 +30,18 @@ impl LockManager {
     }
 
     /// Get or create the lock for a given inode ID
-    fn get_or_create_lock(&self, inode_id: InodeId) -> Arc<RwLock<()>> {
+    fn get_or_create_lock(&self, inode_id: InodeId) -> Arc<Mutex<()>> {
         self.locks
             .entry(inode_id)
-            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
-    }
-
-    /// Acquire a single lock for reading
-    pub async fn acquire_read(&self, inode_id: InodeId) -> LockGuard {
-        let lock = self.get_or_create_lock(inode_id);
-        let guard = lock.read_owned().await;
-        LockGuard::Read {
-            _guard: guard,
-            inode_id,
-            locks: self.locks.clone(),
-        }
     }
 
     /// Acquire a single lock for writing
     pub async fn acquire_write(&self, inode_id: InodeId) -> LockGuard {
         let lock = self.get_or_create_lock(inode_id);
-        let guard = lock.write_owned().await;
-        LockGuard::Write {
+        let guard = lock.lock_owned().await;
+        LockGuard {
             _guard: guard,
             inode_id,
             locks: self.locks.clone(),
@@ -76,8 +58,8 @@ impl LockManager {
 
         for inode_id in inode_ids {
             let lock = self.get_or_create_lock(inode_id);
-            let guard = lock.write_owned().await;
-            let lock_guard = LockGuard::Write {
+            let guard = lock.lock_owned().await;
+            let lock_guard = LockGuard {
                 _guard: guard,
                 inode_id,
                 locks: self.locks.clone(),
@@ -93,18 +75,9 @@ impl LockManager {
 /// Implement drop to clean up unused locks
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let (inode_id, locks) = match self {
-            LockGuard::Read {
-                inode_id, locks, ..
-            } => (*inode_id, locks),
-            LockGuard::Write {
-                inode_id, locks, ..
-            } => (*inode_id, locks),
-        };
-
         // Try to remove the lock if it's no longer in use
-        locks.remove_if(&inode_id, |_, lock| {
-            // The guard holds one reference via OwnedRwLock*Guard
+        self.locks.remove_if(&self.inode_id, |_, lock| {
+            // The guard holds one reference via OwnedMutexGuard
             // DashMap holds another
             // If strong_count is 2 or less, we can safely remove
             Arc::strong_count(lock) <= 2
@@ -120,12 +93,10 @@ mod tests {
     async fn test_single_lock_acquisition() {
         let manager = LockManager::new();
 
-        let guard1 = manager.acquire_write(1).await;
-        assert!(matches!(guard1, LockGuard::Write { .. }));
-        drop(guard1);
+        let _guard1 = manager.acquire_write(1).await;
+        drop(_guard1);
 
-        let guard2 = manager.acquire_read(1).await;
-        assert!(matches!(guard2, LockGuard::Read { .. }));
+        let _guard2 = manager.acquire_write(1).await;
     }
 
     #[tokio::test]
@@ -198,7 +169,7 @@ mod tests {
         // Acquire multiple locks
         {
             let _guard1 = manager.acquire_write(1).await;
-            let _guard2 = manager.acquire_read(2).await;
+            let _guard2 = manager.acquire_write(2).await;
             assert_eq!(manager.locks.len(), 2);
         }
 
@@ -221,8 +192,8 @@ mod tests {
             handles.push(handle);
         }
 
-        // Collect all the Arc<RwLock<()>> results
-        let locks: Vec<Arc<RwLock<()>>> = futures::future::join_all(handles)
+        // Collect all the Arc<Mutex<()>> results
+        let locks: Vec<Arc<Mutex<()>>> = futures::future::join_all(handles)
             .await
             .into_iter()
             .map(|r| r.unwrap())
