@@ -45,6 +45,13 @@ libc = "0.2"
 rayon = "1.10"
 dashmap = "6.1"
 
+[patch.crates-io]
+object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "077d0ff07ee5fb4c2dedcdeb8069ad6a28778761", features = [
+    "aws",
+    "azure",
+    "gcp",
+] }
+
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }
