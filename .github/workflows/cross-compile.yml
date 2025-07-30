@@ -71,17 +71,17 @@ jobs:
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
         run: |
-          cross build --profile ci --target ${{ matrix.target }}
+          cross build --release --target ${{ matrix.target }}
 
       - name: Build with cargo (macOS)
         if: matrix.platform == 'darwin'
         run: |
-          cargo build --profile ci --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Upload artifacts
