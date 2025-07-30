@@ -422,6 +422,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ninep_server = crate::ninep::NinePServer::new(ninep_fs, ninep_addr);
     let ninep_handle = tokio::spawn(async move { ninep_server.start().await });
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     if nbd_handles.is_empty() {
         tokio::select! {
             result = nfs_handle => {
@@ -435,6 +437,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = stats_handle => {
                 // Stats task should never complete
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down gracefully...");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down gracefully...");
             }
         }
     } else {
@@ -461,6 +469,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = gc_handle => {
             }
             _ = stats_handle => {
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down gracefully...");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down gracefully...");
             }
         }
     }

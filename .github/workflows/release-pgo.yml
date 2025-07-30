@@ -1,0 +1,262 @@
+name: Release with PGO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  collect-pgo-profile:
+    name: Collect PGO Profile Data
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with PGO support
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+
+          sudo modprobe 9p
+          sudo modprobe 9pnet
+          sudo modprobe 9pnet_virtio
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Setup MinIO bucket
+        run: |
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/pgo-profile || true
+
+      - name: Build with PGO instrumentation
+        run: |
+          rm -rf /tmp/pgo-data
+
+          RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
+            cargo build --release --target=x86_64-unknown-linux-gnu
+
+      - name: Run profiling workloads
+        run: |
+          mkdir -p /tmp/zerofs-cache
+          export AWS_ENDPOINT=http://localhost:9000
+          export AWS_ACCESS_KEY_ID=minioadmin
+          export AWS_SECRET_ACCESS_KEY=minioadmin
+          export AWS_ALLOW_HTTP=true
+          export SLATEDB_CACHE_DIR=/tmp/zerofs-cache
+          export SLATEDB_CACHE_SIZE_GB=5
+          export ZEROFS_MEMORY_CACHE_SIZE_GB=10
+          export ZEROFS_ENCRYPTION_PASSWORD=secret
+          ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-profile/test &
+          ZEROFS_PID=$!
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+          cd /mnt/zerofs
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+          tar -xf linux-6.11.tar.xz
+          cd linux-6.11
+          make tinyconfig
+          make -j$(nproc)
+          cd /mnt/zerofs
+          dd if=/dev/urandom of=1gb.bin bs=1M count=1024
+          dd if=/dev/urandom of=500mb.bin bs=1M count=500
+          dd if=1gb.bin of=/dev/null bs=1M
+          cp 1gb.bin 1gb-copy.bin
+
+          cd /
+          sudo umount /mnt/zerofs || true
+
+          kill -TERM $ZEROFS_PID || true
+
+          wait $ZEROFS_PID || true
+
+      - name: Generate PGO data
+        run: |
+          LLVM_PROFDATA=$(find ~/.rustup -name llvm-profdata | head -1)
+          echo "Using llvm-profdata: $LLVM_PROFDATA"
+
+          echo "Profile files generated:"
+          ls -la /tmp/pgo-data/
+
+          $LLVM_PROFDATA merge -o merged.profdata /tmp/pgo-data
+
+          mkdir -p pgo-data
+          cp merged.profdata pgo-data/
+          cp Cargo.toml pgo-data/
+          cp Cargo.lock pgo-data/
+
+      - name: Upload PGO profile data
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profile-data
+          path: pgo-data/
+
+  build-release:
+    name: Build optimized for ${{ matrix.target }}
+    needs: collect-pgo-profile
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: i686-unknown-linux-gnu
+            arch: i686
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: powerpc64le-unknown-linux-gnu
+            arch: ppc64le
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: s390x-unknown-linux-gnu
+            arch: s390x
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: riscv64gc-unknown-linux-gnu
+            arch: riscv64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            os: macos-latest
+            platform: darwin
+            use_cross: false
+          - target: aarch64-apple-darwin
+            arch: aarch64
+            os: macos-latest
+            platform: darwin
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download PGO profile data
+        uses: actions/download-artifact@v4
+        with:
+          name: pgo-profile-data
+          path: pgo-data/
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux only)
+        if: matrix.use_cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Setup PGO profile
+        run: |
+          mkdir -p target/x86_64-unknown-linux-gnu/release
+          cp pgo-data/merged.profdata target/x86_64-unknown-linux-gnu/release/
+          cp pgo-data/Cargo.lock .
+
+      - name: Build with PGO (cross)
+        if: matrix.use_cross
+        run: |
+          export RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata"
+          cross build --release --target ${{ matrix.target }}
+
+      - name: Build with PGO (cargo)
+        if: matrix.use_cross == false
+        run: |
+          export RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata"
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare binary
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          path: artifacts/
+          retention-days: 30
+
+  create-release-bundle:
+    name: Create release bundle
+    needs: build-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create tarball
+        run: |
+          mkdir -p release
+          for arch_dir in artifacts/*/; do
+            if [ -d "$arch_dir" ]; then
+              cp "$arch_dir"* release/
+            fi
+          done
+          cd release
+          tar czf ../zerofs-pgo-multiplatform.tar.gz zerofs-*-pgo*
+          cd ..
+          sha256sum zerofs-pgo-multiplatform.tar.gz > zerofs-pgo-multiplatform.tar.gz.sha256
+
+      - name: Upload combined release
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-pgo-release
+          path: |
+            zerofs-pgo-multiplatform.tar.gz
+            zerofs-pgo-multiplatform.tar.gz.sha256
+          retention-days: 90
