@@ -2007,7 +2007,7 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.12.3"
-source = "git+https://github.com/Barre/arrow-rs-object-store.git?rev=077d0ff07ee5fb4c2dedcdeb8069ad6a28778761#077d0ff07ee5fb4c2dedcdeb8069ad6a28778761"
+source = "git+https://github.com/Barre/arrow-rs-object-store.git?rev=ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4#ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4"
 dependencies = [
  "async-trait",
  "base64",

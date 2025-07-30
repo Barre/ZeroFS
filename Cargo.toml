@@ -46,7 +46,7 @@ rayon = "1.10"
 dashmap = "6.1"
 
 [patch.crates-io]
-object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "077d0ff07ee5fb4c2dedcdeb8069ad6a28778761", features = [
+object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4", features = [
     "aws",
     "azure",
     "gcp",
