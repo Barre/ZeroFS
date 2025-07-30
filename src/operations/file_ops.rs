@@ -362,8 +362,6 @@ impl SlateDbFs {
             id, offset, count
         );
 
-        let _guard = self.lock_manager.acquire_read(id).await;
-
         let inode = self.load_inode(id).await?;
 
         let creds = Credentials::from_auth_context(auth);

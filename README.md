@@ -119,7 +119,7 @@ The program will change the password and exit. Then you can use the new password
 #### What's Encrypted vs What's Not
 
 **Encrypted:**
-- All file contents (in 16K chunks)
+- All file contents (in 256K chunks)
 - File metadata values (permissions, timestamps, etc.)
 
 **Not Encrypted:**
@@ -433,7 +433,7 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
 
 **ZeroFS:**
 - Uses SlateDB, a log-structured merge-tree (LSM) database
-- Files are chunked into 16K blocks for efficient S3 operations
+- Files are chunked into 256K blocks for efficient S3 operations
 - Inodes and file data stored as key-value pairs
 - Metadata is first-class data in the database
 
@@ -467,8 +467,8 @@ s3://bucket/
 Key-Value Store:
 ├── inode:0 → {type: directory, entries: {...}}
 ├── inode:1 → {type: file, size: 1024, ...}
-├── chunk:1/0 → [first 16K of file data]
-├── chunk:1/1 → [second 16K of file data]
+├── chunk:1/0 → [first 256K of file data]
+├── chunk:1/1 → [second 256K of file data]
 └── next_inode_id → 2
 ```
 
@@ -514,7 +514,7 @@ ZeroFS has the following theoretical limits:
 These limits come from the filesystem design:
 - File IDs use 48 bits for the inode number and 16 bits for hardlink position
 - File sizes are stored as 64-bit integers
-- The chunking system uses 16KB blocks with 64-bit indexing
+- The chunking system uses 256KB blocks with 64-bit indexing
 
 In practice, you'll encounter other constraints well before these theoretical limits, such as S3 provider limits, performance considerations with billions of objects, or simply running out of money.
 

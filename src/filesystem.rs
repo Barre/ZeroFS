@@ -16,8 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
 
-const SLATEDB_BLOCK_SIZE: usize = 4 * 1024;
-
 use crate::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +30,7 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 16 * 1024;
+pub const CHUNK_SIZE: usize = 256 * 1024;
 pub const STATS_SHARDS: usize = 100;
 
 // Maximum hardlinks per inode - limited by our encoding scheme (16 bits for position)
@@ -141,7 +139,7 @@ impl SlateDbFs {
         let slatedb_memory_cache_bytes = (slatedb_memory_cache_gb * 1_000_000_000.0) as usize;
 
         // Calculate number of blocks that can fit in memory cache
-        let slatedb_memory_blocks = slatedb_memory_cache_bytes / SLATEDB_BLOCK_SIZE;
+        let slatedb_memory_blocks = slatedb_memory_cache_bytes / CHUNK_SIZE;
 
         tracing::info!(
             "SlateDB in-memory block cache: {} blocks ({} MB)",
@@ -167,7 +165,7 @@ impl SlateDbFs {
         };
 
         let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: (slatedb_memory_blocks * SLATEDB_BLOCK_SIZE) as u64,
+            max_capacity: (slatedb_memory_blocks * CHUNK_SIZE) as u64,
         }));
 
         let db_path = Path::from(db_path);
@@ -561,9 +559,9 @@ impl SlateDbFs {
         };
 
         // For tests, calculate blocks for 50MB cache
-        let test_cache_blocks = (50_000_000 / SLATEDB_BLOCK_SIZE).max(100); // Min 100 blocks
+        let test_cache_blocks = (50_000_000 / CHUNK_SIZE).max(100); // Min 100 blocks
         let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: (test_cache_blocks * SLATEDB_BLOCK_SIZE) as u64,
+            max_capacity: (test_cache_blocks * CHUNK_SIZE) as u64,
         }));
 
         let db_path = Path::from("test_slatedb");
@@ -686,9 +684,9 @@ impl SlateDbFs {
         };
 
         // For unencrypted version, calculate blocks for 250MB cache
-        let unencrypted_cache_blocks = (250_000_000 / SLATEDB_BLOCK_SIZE).max(100); // Min 100 blocks
+        let unencrypted_cache_blocks = (250_000_000 / CHUNK_SIZE).max(100); // Min 100 blocks
         let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: (unencrypted_cache_blocks * SLATEDB_BLOCK_SIZE) as u64,
+            max_capacity: (unencrypted_cache_blocks * CHUNK_SIZE) as u64,
         }));
 
         let slatedb = Arc::new(
