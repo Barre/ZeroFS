@@ -31,20 +31,20 @@ We also [compile the Linux kernel on ZeroFS](https://github.com/Barre/ZeroFS/act
 
 Compiling the Linux Kernel in 16 seconds with a ZeroFS NBD volume + ext4
 
-<a href="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW" target="_blank"><img src="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW.svg" /></a>
+<a href="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW" target="_blank"><img src="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW.png" /></a>
 
 ### ZFS on S3 via NBD
 
 ZeroFS provides NBD block devices that ZFS can use directly - no intermediate filesystem needed. Here's ZFS running on S3 storage:
 
-<a href="https://asciinema.org/a/728234" target="_blank"><img src="https://asciinema.org/a/728234.svg" /></a>
+<a href="https://asciinema.org/a/728234" target="_blank"><img src="https://asciinema.org/a/728234.png" /></a>
 
 ### Ubuntu Running on ZeroFS
 
 Watch Ubuntu boot from ZeroFS:
 
 <p align="center">
-<a href="https://asciinema.org/a/728172" target="_blank"><img src="https://asciinema.org/a/728172.svg" /></a>
+<a href="https://asciinema.org/a/728172" target="_blank"><img src="https://asciinema.org/a/728172.png" /></a>
 </p>
 
 ### Self-Hosting ZeroFS
@@ -52,7 +52,7 @@ Watch Ubuntu boot from ZeroFS:
 ZeroFS can self-host! Here's a demo showing Rust's toolchain building ZeroFS while running on ZeroFS:
 
 <p align="center">
-<a href="https://asciinema.org/a/728101" target="_blank"><img src="https://asciinema.org/a/728101.svg" /></a>
+<a href="https://asciinema.org/a/728101" target="_blank"><img src="https://asciinema.org/a/728101.png" /></a>
 </p>
 
 ## Configuration
