@@ -2,10 +2,9 @@ name: Docker Build and Push
 
 on:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    tags: ["v*"]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -22,6 +21,31 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download PGO builds
+        run: |
+          # Determine which release to download
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Use the specific tag
+            TAG="${{ github.ref_name }}"
+            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${TAG}/zerofs-pgo-multiplatform.tar.gz"
+          else
+            # For PRs and workflow_dispatch, use latest
+            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-pgo-multiplatform.tar.gz"
+          fi
+
+          echo "Downloading PGO builds from: $DOWNLOAD_URL"
+
+          curl -fsSL "$DOWNLOAD_URL" | tar xz
+
+          echo "Extracted binaries:"
+          ls -la zerofs-linux-*-pgo
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
@@ -44,10 +68,12 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Docker image
+      - name: Build and push Docker images
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          file: ./Dockerfile.multiarch
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386
+          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

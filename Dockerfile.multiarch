@@ -1,0 +1,54 @@
+FROM debian:bookworm-slim
+
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the appropriate binary based on the target platform
+# Docker buildx provides TARGETPLATFORM in format like "linux/amd64", "linux/arm64", etc.
+COPY zerofs-linux-* /tmp/
+
+RUN case "${TARGETPLATFORM}" in \
+        "linux/amd64") \
+            mv /tmp/zerofs-linux-amd64-pgo /usr/local/bin/zerofs \
+            ;; \
+        "linux/arm64") \
+            mv /tmp/zerofs-linux-arm64-pgo /usr/local/bin/zerofs \
+            ;; \
+        "linux/arm/v7") \
+            mv /tmp/zerofs-linux-armv7-pgo /usr/local/bin/zerofs \
+            ;; \
+        "linux/386") \
+            mv /tmp/zerofs-linux-i686-pgo /usr/local/bin/zerofs \
+            ;; \
+        "linux/ppc64le") \
+            mv /tmp/zerofs-linux-ppc64le-pgo /usr/local/bin/zerofs \
+            ;; \
+        "linux/s390x") \
+            mv /tmp/zerofs-linux-s390x-pgo /usr/local/bin/zerofs \
+            ;; \
+        "linux/riscv64") \
+            mv /tmp/zerofs-linux-riscv64-pgo /usr/local/bin/zerofs \
+            ;; \
+        *) \
+            echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 \
+            ;; \
+    esac && \
+    rm -f /tmp/zerofs-linux-*-pgo && \
+    chmod +x /usr/local/bin/zerofs
+
+RUN useradd -m -u 1001 zerofs
+
+USER zerofs
+
+ENV ZEROFS_NFS_HOST=0.0.0.0
+ENV ZEROFS_NBD_HOST=0.0.0.0
+
+EXPOSE 2049 5564
+
+ENTRYPOINT ["zerofs"]
