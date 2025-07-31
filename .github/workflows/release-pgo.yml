@@ -10,8 +10,11 @@ env:
 
 jobs:
   collect-pgo-profile:
-    name: Collect PGO Profile Data
+    name: Collect PGO Profile Data - ${{ matrix.test }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test: [9p, zfs-on-zerofs, nfs-kernel-compile]
 
     steps:
       - uses: actions/checkout@v4
@@ -27,9 +30,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
 
-          sudo modprobe 9p
-          sudo modprobe 9pnet
-          sudo modprobe 9pnet_virtio
+          if [ "${{ matrix.test }}" = "9p" ]; then
+            sudo modprobe 9p
+            sudo modprobe 9pnet
+            sudo modprobe 9pnet_virtio
+          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+            sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+          elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
+            sudo apt-get install -y nfs-common
+          fi
 
       - name: Start MinIO
         run: |
@@ -53,7 +62,14 @@ jobs:
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/pgo-profile || true
+          
+          if [ "${{ matrix.test }}" = "9p" ]; then
+            ./mc mb myminio/pgo-profile || true
+          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+            ./mc mb myminio/pgo-zfs-test || true
+          elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
+            ./mc mb myminio/pgo-nfs-test || true
+          fi
 
       - name: Build with PGO instrumentation
         run: |
@@ -73,36 +89,85 @@ jobs:
           export SLATEDB_CACHE_SIZE_GB=5
           export ZEROFS_MEMORY_CACHE_SIZE_GB=10
           export ZEROFS_ENCRYPTION_PASSWORD=secret
-          ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-profile/test &
-          ZEROFS_PID=$!
-          echo "Waiting for ZeroFS 9P server to start..."
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 5564 2>/dev/null; then
-              echo "ZeroFS 9P server is ready"
-              break
-            fi
-            sleep 1
-          done
-          sudo mkdir -p /mnt/zerofs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
-          cd /mnt/zerofs
-          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
-          tar -xf linux-6.11.tar.xz
-          cd linux-6.11
-          make tinyconfig
-          make -j$(nproc)
-          cd /mnt/zerofs
-          dd if=/dev/urandom of=1gb.bin bs=1M count=1024
-          dd if=/dev/urandom of=500mb.bin bs=1M count=500
-          dd if=1gb.bin of=/dev/null bs=1M
-          cp 1gb.bin 1gb-copy.bin
 
-          cd /
-          sudo umount /mnt/zerofs || true
+          if [ "${{ matrix.test }}" = "9p" ]; then
+            ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-profile/test &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS 9P server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 5564 2>/dev/null; then
+                echo "ZeroFS 9P server is ready"
+                break
+              fi
+              sleep 1
+            done
+            sudo mkdir -p /mnt/zerofs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+            cd /mnt/zerofs
+            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            tar -xf linux-6.11.tar.xz
+            cd linux-6.11
+            make tinyconfig
+            make -j$(nproc)
+            cd /mnt/zerofs
+            dd if=/dev/urandom of=1gb.bin bs=1M count=1024
+            dd if=/dev/urandom of=500mb.bin bs=1M count=500
+            dd if=1gb.bin of=/dev/null bs=1M
+            cp 1gb.bin 1gb-copy.bin
+            cd /
+            sudo umount /mnt/zerofs || true
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
 
-          kill -TERM $ZEROFS_PID || true
+          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+            export ZEROFS_NBD_PORTS=10809
+            export ZEROFS_NBD_DEVICE_SIZES_GB=3
+            ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-zfs-test/zfs-test &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS NBD server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 10809; then
+                echo "ZeroFS NBD server is ready"
+                break
+              fi
+              sleep 1
+            done
+            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809
+            sudo zpool create testpool /dev/nbd0
+            sudo zfs create testpool/data
+            sudo zfs set mountpoint=/mnt/zfsdata testpool/data
+            cd /mnt/zfsdata
+            sudo wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            sudo tar -xf linux-6.11.tar.xz
+            sudo dd if=/dev/urandom of=random.dat bs=1M count=100
+            sudo zfs snapshot testpool/data@snapshot1
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
 
-          wait $ZEROFS_PID || true
+          elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
+            ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-nfs-test/test &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS NFS server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 2049; then
+                echo "ZeroFS NFS server is ready"
+                break
+              fi
+              sleep 1
+            done
+            sudo mkdir -p /mnt/zerofs
+            sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
+            cd /mnt/zerofs
+            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            tar -xf linux-6.11.tar.xz
+            cd linux-6.11
+            make tinyconfig
+            make -j$(nproc)
+            cd /
+            sudo umount /mnt/zerofs || true
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
+          fi
 
       - name: Generate PGO data
         run: |
@@ -122,12 +187,53 @@ jobs:
       - name: Upload PGO profile data
         uses: actions/upload-artifact@v4
         with:
-          name: pgo-profile-data
+          name: pgo-profile-data-${{ matrix.test }}
+          path: pgo-data/
+
+  merge-pgo-data:
+    name: Merge PGO Profile Data
+    needs: collect-pgo-profile
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with PGO support
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Download all PGO profile data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pgo-profile-data-*
+          path: pgo-artifacts/
+
+      - name: Merge PGO profiles
+        run: |
+          LLVM_PROFDATA=$(find ~/.rustup -name llvm-profdata | head -1)
+          echo "Using llvm-profdata: $LLVM_PROFDATA"
+          
+          PROFDATA_FILES=$(find pgo-artifacts -name "*.profdata" | tr '\n' ' ')
+          echo "Found profdata files: $PROFDATA_FILES"
+          
+          $LLVM_PROFDATA merge -o merged.profdata $PROFDATA_FILES
+          
+          mkdir -p pgo-data
+          cp merged.profdata pgo-data/
+          
+          cp pgo-artifacts/pgo-profile-data-*/Cargo.toml pgo-data/ || true
+          cp pgo-artifacts/pgo-profile-data-*/Cargo.lock pgo-data/ || true
+
+      - name: Upload merged PGO profile data
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profile-data-merged
           path: pgo-data/
 
   build-release:
     name: Build optimized for ${{ matrix.target }}
-    needs: collect-pgo-profile
+    needs: merge-pgo-data
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -184,7 +290,7 @@ jobs:
       - name: Download PGO profile data
         uses: actions/download-artifact@v4
         with:
-          name: pgo-profile-data
+          name: pgo-profile-data-merged
           path: pgo-data/
 
       - name: Install Rust
