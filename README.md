@@ -29,9 +29,9 @@ We also [compile the Linux kernel on ZeroFS](https://github.com/Barre/ZeroFS/act
 
 ### Compiling the linux kernel on top of S3
 
-Compiling the Linux Kernel in 16 seconds with a ZeroFS NBD volume + ext4
+Compiling the Linux Kernel in 16 seconds with a ZeroFS NBD volume + ZFS
 
-<a href="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW" target="_blank"><img src="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW.png" /></a>
+<a href="https://asciinema.org/a/730946" target="_blank"><img src="https://asciinema.org/a/730946.png" /></a>
 
 ### ZFS on S3 via NBD
 
