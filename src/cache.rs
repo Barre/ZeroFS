@@ -59,6 +59,7 @@ impl UnifiedCache {
 
         let cache = CacheBuilder::new(memory_capacity_bytes)
             .with_name("zerofs-unified-cache")
+            .with_shards(100_000)
             .with_weighter(|_key: &Vec<u8>, value: &Vec<u8>| -> usize { _key.len() + value.len() })
             .build();
 
