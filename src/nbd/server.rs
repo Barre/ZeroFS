@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use super::error::{NBDError, Result};
 use super::protocol::*;
-use crate::filesystem::SlateDbFs;
+use crate::filesystem::{EncodedFileId, SlateDbFs};
 
 #[derive(Clone)]
 pub struct NBDDevice {
@@ -508,7 +508,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup device file: {e:?}")))?;
 
         loop {
-            // Read request
             let mut request_buf = [0u8; 28];
             self.reader.read_exact(&mut request_buf).await?;
             let request = NBDRequest::from_bytes((&request_buf, 0))
@@ -548,8 +547,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBDCommand::Flush => self.handle_flush(request.cookie).await,
                 NBDCommand::Trim => {
+                    let device_inode_raw = EncodedFileId::from(device_inode).inode_id();
                     self.handle_trim(
-                        device_inode,
+                        device_inode_raw,
                         request.cookie,
                         request.offset,
                         request.length,
