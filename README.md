@@ -27,6 +27,12 @@ We also [compile the Linux kernel on ZeroFS](https://github.com/Barre/ZeroFS/act
 
 ## Demo
 
+### Compiling the linux kernel on top of S3
+
+Compiling the Linux Kernel in 16 seconds with a ZeroFS NBD volume + ext4
+
+<a href="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW" target="_blank"><img src="https://asciinema.org/a/1tn5c1TViGZQ9H9kAzssGXaXW.svg" /></a>
+
 ### ZFS on S3 via NBD
 
 ZeroFS provides NBD block devices that ZFS can use directly - no intermediate filesystem needed. Here's ZFS running on S3 storage:
