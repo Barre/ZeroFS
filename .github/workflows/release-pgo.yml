@@ -235,6 +235,10 @@ jobs:
     name: Build optimized for ${{ matrix.target }}
     needs: merge-pgo-data
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
     strategy:
       matrix:
         include:
@@ -327,6 +331,11 @@ jobs:
           cp target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
 
+      - name: Generate attestation for binary
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -338,6 +347,10 @@ jobs:
     name: Create release bundle
     needs: build-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
 
     steps:
       - name: Download all artifacts
@@ -366,3 +379,10 @@ jobs:
             zerofs-pgo-multiplatform.tar.gz
             zerofs-pgo-multiplatform.tar.gz.sha256
           retention-days: 90
+
+      - name: Generate attestations
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            zerofs-pgo-multiplatform.tar.gz
+            release/zerofs-*-pgo*
