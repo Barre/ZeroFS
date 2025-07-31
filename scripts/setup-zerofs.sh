@@ -32,9 +32,9 @@ case "$OS-$ARCH" in
 esac
 
 if [ "$ZEROFS_VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-multiplatform.tar.gz"
+    DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-pgo-multiplatform.tar.gz"
 else
-    DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${ZEROFS_VERSION}/zerofs-multiplatform.tar.gz"
+    DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${ZEROFS_VERSION}/zerofs-pgo-multiplatform.tar.gz"
 fi
 
 echo "Downloading ZeroFS archive from: $DOWNLOAD_URL"
