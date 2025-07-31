@@ -145,7 +145,10 @@ impl SlateDbFs {
         let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
 
         let settings = slatedb::config::Settings {
-            l0_max_ssts: 20,
+            flush_interval: Some(std::time::Duration::from_secs(5)),
+            l0_sst_size_bytes: 128 * 1024 * 1024,
+            l0_max_ssts: 30,
+            max_unflushed_bytes: 512 * 1024 * 1024,
             object_store_cache_options: ObjectStoreCacheOptions {
                 root_folder: Some(slatedb_cache_dir.clone().into()),
                 max_cache_size_bytes: Some(slatedb_disk_cache_size_bytes),
