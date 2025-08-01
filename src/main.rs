@@ -1,3 +1,4 @@
+mod bucket_identity;
 mod cache;
 mod encryption;
 mod filesystem;
@@ -203,14 +204,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &url.parse()?,
         std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v)),
     )?;
-    let object_store = Arc::new(object_store);
+    let object_store = Arc::from(object_store);
 
     let actual_db_path = path_from_url.to_string();
 
     info!("Starting ZeroFS NFS server with {} backend", object_store);
     info!("DB Path: {}", actual_db_path);
-    info!("Cache Directory: {}", cache_config.root_folder);
+    info!("Base Cache Directory: {}", cache_config.root_folder);
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
+
+    info!("Checking bucket identity...");
+    let bucket =
+        bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path).await?;
+
+    let original_cache_root = cache_config.root_folder.clone();
+    let cache_config = CacheConfig {
+        root_folder: format!("{}/{}", original_cache_root, bucket.cache_directory_name()),
+        ..cache_config
+    };
+
+    info!(
+        "Bucket ID: {}, Cache directory: {}",
+        bucket.id(),
+        cache_config.root_folder
+    );
 
     let password = std::env::var("ZEROFS_ENCRYPTION_PASSWORD")
         .expect("ZEROFS_ENCRYPTION_PASSWORD should be validated");
