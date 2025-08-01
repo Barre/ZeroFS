@@ -937,32 +937,13 @@ checksum = "0618db36554a0a5db538d7ff04427571b1f668d3e86a764aabe17985c02ea14c"
 dependencies = [
  "anyhow",
  "equivalent",
- "foyer-common 0.17.4",
- "foyer-memory 0.17.4",
- "foyer-storage 0.17.4",
+ "foyer-common",
+ "foyer-memory",
+ "foyer-storage",
  "madsim-tokio",
- "mixtrics 0.1.0",
+ "mixtrics",
  "pin-project",
  "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "foyer"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b4d8e96374206ff1b4265f2e2e6e1f80bc3048957b2a1e7fdeef929d68f318f"
-dependencies = [
- "equivalent",
- "foyer-common 0.18.0",
- "foyer-memory 0.18.0",
- "foyer-storage 0.18.0",
- "madsim-tokio",
- "mixtrics 0.2.0",
- "pin-project",
- "serde",
- "thiserror 2.0.12",
  "tokio",
  "tracing",
 ]
@@ -978,28 +959,10 @@ dependencies = [
  "cfg-if",
  "itertools",
  "madsim-tokio",
- "mixtrics 0.1.0",
+ "mixtrics",
  "parking_lot",
  "pin-project",
  "serde",
- "thiserror 2.0.12",
- "tokio",
- "twox-hash",
-]
-
-[[package]]
-name = "foyer-common"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "911b8e3f23d5fe55b0b240f75af1d2fa5cb7261d3f9b38ef1c57bbc9f0449317"
-dependencies = [
- "bytes",
- "cfg-if",
- "itertools",
- "madsim-tokio",
- "mixtrics 0.2.0",
- "parking_lot",
- "pin-project",
  "thiserror 2.0.12",
  "tokio",
  "twox-hash",
@@ -1024,36 +987,12 @@ dependencies = [
  "bitflags 2.9.1",
  "cmsketch",
  "equivalent",
- "foyer-common 0.17.4",
+ "foyer-common",
  "foyer-intrusive-collections",
  "hashbrown 0.15.4",
  "itertools",
  "madsim-tokio",
- "mixtrics 0.1.0",
- "parking_lot",
- "pin-project",
- "serde",
- "thiserror 2.0.12",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "foyer-memory"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "506883d5a8500dea1b1662f7180f3534bdcbfa718d3253db7179552ef83612fa"
-dependencies = [
- "arc-swap",
- "bitflags 2.9.1",
- "cmsketch",
- "equivalent",
- "foyer-common 0.18.0",
- "foyer-intrusive-collections",
- "hashbrown 0.15.4",
- "itertools",
- "madsim-tokio",
- "mixtrics 0.2.0",
+ "mixtrics",
  "parking_lot",
  "pin-project",
  "serde",
@@ -1076,8 +1015,8 @@ dependencies = [
  "clap",
  "equivalent",
  "flume",
- "foyer-common 0.17.4",
- "foyer-memory 0.17.4",
+ "foyer-common",
+ "foyer-memory",
  "fs4",
  "futures-core",
  "futures-util",
@@ -1091,39 +1030,6 @@ dependencies = [
  "pin-project",
  "rand 0.9.1",
  "serde",
- "thiserror 2.0.12",
- "tokio",
- "tracing",
- "twox-hash",
- "zstd",
-]
-
-[[package]]
-name = "foyer-storage"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ba8403a54a2f2032fb647e49c442e5feeb33f3989f7024f1b178341a016f06d"
-dependencies = [
- "allocator-api2",
- "anyhow",
- "auto_enums",
- "bytes",
- "equivalent",
- "flume",
- "foyer-common 0.18.0",
- "foyer-memory 0.18.0",
- "fs4",
- "futures-core",
- "futures-util",
- "itertools",
- "libc",
- "lz4",
- "madsim-tokio",
- "ordered_hash_map",
- "parking_lot",
- "paste",
- "pin-project",
- "rand 0.9.1",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
@@ -1901,16 +1807,6 @@ name = "mixtrics"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "749ed12bab176c8a42c13a679dd2de12876d5ad4abe7525548e31ae001a9ebbf"
-dependencies = [
- "itertools",
- "parking_lot",
-]
-
-[[package]]
-name = "mixtrics"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adbcddf5a90b959eea97ae505e0391f5c6dd411fbf546d43b9c59ad1c3bd4391"
 dependencies = [
  "itertools",
  "parking_lot",
@@ -2911,7 +2807,7 @@ dependencies = [
  "fail-parallel",
  "figment",
  "flatbuffers",
- "foyer 0.17.4",
+ "foyer",
  "futures",
  "log",
  "object_store",
@@ -3991,8 +3887,8 @@ dependencies = [
  "comfy-table",
  "dashmap",
  "deku",
- "foyer 0.18.0",
- "foyer-common 0.18.0",
+ "foyer",
+ "foyer-common",
  "futures",
  "hex",
  "hkdf",

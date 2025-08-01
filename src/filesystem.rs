@@ -4,8 +4,10 @@ use crate::filesystem_stats::{FileSystemGlobalStats, StatsShardData};
 use crate::lock_manager::LockManager;
 use crate::stats::FileSystemStats;
 use bytes::Bytes;
+use foyer::{DirectFsDeviceOptions, Engine, HybridCacheBuilder};
 use slatedb::config::ObjectStoreCacheOptions;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{ObjectStore, path::Path};
 use slatedb::{
     DbBuilder,
@@ -149,11 +151,6 @@ impl SlateDbFs {
             l0_sst_size_bytes: 128 * 1024 * 1024,
             l0_max_ssts: 30,
             max_unflushed_bytes: 512 * 1024 * 1024,
-            object_store_cache_options: ObjectStoreCacheOptions {
-                root_folder: Some(slatedb_cache_dir.clone().into()),
-                max_cache_size_bytes: Some(slatedb_disk_cache_size_bytes),
-                ..Default::default()
-            },
             compactor_options: Some(slatedb::config::CompactorOptions {
                 max_sst_size: 256 * 1024 * 1024,
                 max_concurrent_compactions: 32,
@@ -163,9 +160,17 @@ impl SlateDbFs {
             ..Default::default()
         };
 
-        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: slatedb_memory_cache_bytes,
-        }));
+        let hybrid_cache = Arc::new(FoyerHybridCache::new_with_cache(
+            HybridCacheBuilder::new()
+                .memory(slatedb_memory_cache_bytes as usize / CHUNK_SIZE)
+                .storage(Engine::Large)
+                .with_device_options(
+                    DirectFsDeviceOptions::new(slatedb_cache_dir)
+                        .with_capacity(slatedb_disk_cache_size_bytes),
+                )
+                .build()
+                .await?,
+        ));
 
         let db_path = Path::from(db_path);
 
@@ -186,7 +191,7 @@ impl SlateDbFs {
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_compaction_runtime(runtime_handle.clone())
-                .with_block_cache(cache)
+                .with_block_cache(hybrid_cache)
                 .build()
                 .await?,
         );
