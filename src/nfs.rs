@@ -776,8 +776,8 @@ mod tests {
 
             // Verify all files are present and in order
             all_entries.sort();
-            for i in 0..num_files {
-                assert_eq!(all_entries[i], format!("file_{i:04}.txt"));
+            for (i, entry) in all_entries.iter().enumerate().take(num_files) {
+                assert_eq!(entry, &format!("file_{i:04}.txt"));
             }
         }
     }

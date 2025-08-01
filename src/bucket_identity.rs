@@ -26,7 +26,7 @@ impl BucketIdentity {
                 let bytes = result.bytes().await?;
                 let id_str = String::from_utf8(bytes.to_vec())?;
                 let uuid = Uuid::parse_str(id_str.trim())
-                    .map_err(|e| format!("Invalid bucket ID format: {}", e))?;
+                    .map_err(|e| format!("Invalid bucket ID format: {e}"))?;
                 tracing::info!("Found existing bucket ID: {}", uuid);
                 uuid
             }
@@ -37,7 +37,7 @@ impl BucketIdentity {
                 object_store
                     .put(&marker_path, new_id.to_string().into())
                     .await
-                    .map_err(|e| format!("Failed to write bucket ID marker: {}", e))?;
+                    .map_err(|e| format!("Failed to write bucket ID marker: {e}"))?;
 
                 new_id
             }

@@ -146,11 +146,6 @@ mod tests {
 
         let _guard = manager.acquire_multiple_write(vec![0, 4, 8]).await;
         let _guard2 = manager.acquire_multiple_write(vec![1, 5, 9]).await;
-
-        assert!(
-            true,
-            "Successfully acquired multiple inodes without collision"
-        );
     }
 
     #[tokio::test]
