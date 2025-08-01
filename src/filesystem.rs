@@ -4,8 +4,12 @@ use crate::filesystem_stats::{FileSystemGlobalStats, StatsShardData};
 use crate::lock_manager::LockManager;
 use crate::stats::FileSystemStats;
 use bytes::Bytes;
+use foyer::{
+    DirectFsDeviceOptions, Engine, HybridCacheBuilder, RuntimeOptions, TokioRuntimeOptions,
+};
 use slatedb::config::ObjectStoreCacheOptions;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{ObjectStore, path::Path};
 use slatedb::{
     DbBuilder,
@@ -145,15 +149,15 @@ impl SlateDbFs {
         let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
 
         let settings = slatedb::config::Settings {
+            object_store_cache_options: ObjectStoreCacheOptions {
+                root_folder: Some(slatedb_cache_dir.clone().into()),
+                max_cache_size_bytes: Some(slatedb_disk_cache_size_bytes / 2),
+                ..Default::default()
+            },
             flush_interval: Some(std::time::Duration::from_secs(5)),
             l0_sst_size_bytes: 128 * 1024 * 1024,
             l0_max_ssts: 30,
             max_unflushed_bytes: 512 * 1024 * 1024,
-            object_store_cache_options: ObjectStoreCacheOptions {
-                root_folder: Some(slatedb_cache_dir.clone().into()),
-                max_cache_size_bytes: Some(slatedb_disk_cache_size_bytes),
-                ..Default::default()
-            },
             compactor_options: Some(slatedb::config::CompactorOptions {
                 max_sst_size: 256 * 1024 * 1024,
                 max_concurrent_compactions: 32,
@@ -163,9 +167,21 @@ impl SlateDbFs {
             ..Default::default()
         };
 
-        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: slatedb_memory_cache_bytes,
-        }));
+        let hybrid_cache = Arc::new(FoyerHybridCache::new_with_cache(
+            HybridCacheBuilder::new()
+                .memory(slatedb_memory_cache_bytes as usize / CHUNK_SIZE)
+                .storage(Engine::Large)
+                .with_runtime_options(RuntimeOptions::Separated {
+                    read_runtime_options: TokioRuntimeOptions::default(),
+                    write_runtime_options: TokioRuntimeOptions::default(),
+                })
+                .with_device_options(
+                    DirectFsDeviceOptions::new(slatedb_cache_dir)
+                        .with_capacity(slatedb_disk_cache_size_bytes / 2), // Half for SlateDB , half for ZeroFS
+                )
+                .build()
+                .await?,
+        ));
 
         let db_path = Path::from(db_path);
 
@@ -186,7 +202,7 @@ impl SlateDbFs {
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_compaction_runtime(runtime_handle.clone())
-                .with_block_cache(cache)
+                .with_block_cache(hybrid_cache)
                 .build()
                 .await?,
         );
@@ -665,24 +681,10 @@ impl SlateDbFs {
             cache_config.memory_cache_size_gb.unwrap_or(0.25)
         );
 
-        let slatedb_cache_size_bytes = (slatedb_cache_size_gb * 1_000_000_000.0) as usize;
-        let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
-
         let settings = slatedb::config::Settings {
-            object_store_cache_options: ObjectStoreCacheOptions {
-                root_folder: Some(slatedb_cache_dir.clone().into()),
-                max_cache_size_bytes: Some(slatedb_cache_size_bytes),
-                ..Default::default()
-            },
-            compactor_options: Some(slatedb::config::CompactorOptions {
-                max_concurrent_compactions: 16,
-                ..Default::default()
-            }),
-            compression_codec: None, // Disable compression - we handle it in encryption layer
             ..Default::default()
         };
 
-        // For unencrypted version, use 250MB cache
         let unencrypted_cache_bytes = 250_000_000u64;
         let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
             max_capacity: unencrypted_cache_bytes,

@@ -82,13 +82,49 @@ Would use Amazon S3 backend for `slatedb` bucket. See [`object_store`'s document
 
 ### Optional Environment Variables
 
-You can configure your object store with optional set of environment variables depending on your backing implementation. For example, if you're using an Amazon S3 backend:
+You can configure your object store with optional set of environment variables depending on your backing implementation.
 
-- `AWS_ENDPOINT`: S3-compatible endpoint URL
+#### Amazon S3 Backend
+
+For Amazon S3 or S3-compatible backends, use the `s3://` URL scheme:
+
+```bash
+zerofs s3://bucket/path
+```
+
+Required environment variables:
 - `AWS_ACCESS_KEY_ID`: AWS access key ID
 - `AWS_SECRET_ACCESS_KEY`: AWS secret access key
+
+Optional environment variables:
+- `AWS_ENDPOINT`: S3-compatible endpoint URL (for non-AWS S3 services)
 - `AWS_DEFAULT_REGION`: AWS region (default: `"us-east-1"`)
 - `AWS_ALLOW_HTTP`: Allow HTTP connections (default: `"false"`)
+
+#### Microsoft Azure Backend
+
+For Microsoft Azure Storage, use the `azure://` URL scheme:
+
+```bash
+zerofs azure://bucket/path
+```
+
+Required environment variables:
+- `AZURE_STORAGE_ACCOUNT_NAME`: Your Azure storage account name
+- `AZURE_STORAGE_ACCOUNT_KEY`: Your Azure storage account key
+
+#### Local Filesystem Backend
+
+For local filesystem storage, use the `file://` URL scheme:
+
+```bash
+zerofs file:///path/to/storage
+```
+
+No additional environment variables are required for local storage.
+
+#### ZeroFS-specific Configuration
+
 - `ZEROFS_NFS_HOST`: Address (IP or hostname) to bind the NFS TCP socket (default: `"127.0.0.1"`)
 - `ZEROFS_NFS_HOST_PORT`: Port to bind the NFS TCP socket (default: `2049`)
 - `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP sockets (default: `"127.0.0.1"`)
