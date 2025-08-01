@@ -83,18 +83,31 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!("  {BOLD}ZEROFS_ENCRYPTION_PASSWORD{RESET}     - Password for data encryption");
         eprintln!();
-        eprintln!("{YELLOW}Optional AWS S3 Configuration:{RESET}");
+        eprintln!("{YELLOW}Storage Backend Configuration:{RESET}");
+        eprintln!();
+        eprintln!("{CYAN}AWS S3 Backend (s3://bucket/path):{RESET}");
+        eprintln!("  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key (required)");
+        eprintln!("  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key (required)");
         eprintln!(
-            "  {BLUE}AWS_ENDPOINT{RESET}                   - S3 endpoint URL (default: AWS S3)"
-        );
-        eprintln!("  {BLUE}AWS_ACCESS_KEY_ID{RESET}              - AWS access key");
-        eprintln!("  {BLUE}AWS_SECRET_ACCESS_KEY{RESET}          - AWS secret key");
-        eprintln!(
-            "  {BLUE}AWS_DEFAULT_REGION{RESET}             - AWS region (default: us-east-1)"
+            "  {BLUE}AWS_ENDPOINT{RESET}                   - S3 endpoint URL (optional, for S3-compatible services)"
         );
         eprintln!(
-            "  {BLUE}AWS_ALLOW_HTTP{RESET}                 - Allow HTTP endpoints (default: false)"
+            "  {BLUE}AWS_DEFAULT_REGION{RESET}             - AWS region (optional, default: us-east-1)"
         );
+        eprintln!(
+            "  {BLUE}AWS_ALLOW_HTTP{RESET}                 - Allow HTTP endpoints (optional, default: false)"
+        );
+        eprintln!();
+        eprintln!("{CYAN}Azure Storage Backend (azure://bucket/path):{RESET}");
+        eprintln!(
+            "  {BLUE}AZURE_STORAGE_ACCOUNT_NAME{RESET}     - Azure storage account name (required)"
+        );
+        eprintln!(
+            "  {BLUE}AZURE_STORAGE_ACCOUNT_KEY{RESET}      - Azure storage account key (required)"
+        );
+        eprintln!();
+        eprintln!("{CYAN}Local Filesystem Backend (file:///path/to/storage):{RESET}");
+        eprintln!("  No additional configuration required");
         eprintln!();
         eprintln!("{YELLOW}Optional ZeroFS Configuration:{RESET}");
         eprintln!("  {BLUE}ZEROFS_MEMORY_CACHE_SIZE_GB{RESET}    - Memory cache size in GB");
@@ -140,6 +153,16 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  export AWS_SECRET_ACCESS_KEY='your-secret-key'");
         eprintln!("  # ... other required vars ...");
         eprintln!("  zerofs s3://my-bucket/prefix");
+        eprintln!();
+        eprintln!("{CYAN}With Azure backend:{RESET}");
+        eprintln!("  export AZURE_STORAGE_ACCOUNT_NAME='your-account'");
+        eprintln!("  export AZURE_STORAGE_ACCOUNT_KEY='your-key'");
+        eprintln!("  # ... other required vars ...");
+        eprintln!("  zerofs azure://my-container/prefix");
+        eprintln!();
+        eprintln!("{CYAN}With local filesystem backend:{RESET}");
+        eprintln!("  # ... required vars ...");
+        eprintln!("  zerofs file:///path/to/storage");
         eprintln!();
         eprintln!("{CYAN}Change encryption password:{RESET}");
         eprintln!("  export ZEROFS_NEW_PASSWORD='new-password'");
