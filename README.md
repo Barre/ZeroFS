@@ -510,7 +510,7 @@ This enables persistent storage across workflow runs, shared artifacts between j
 ZeroFS has the following theoretical limits:
 
 - **Maximum file size**: 16 EB (exabytes) per file
-- **Maximum number of files**: 281 trillion (2^48)
+- **Maximum number of files create over filesystem lifespan**: 281 trillion (2^48)
 - **Maximum hardlinks per file**: 65,535 (across all directories)
 - **Maximum filesystem size**: 4,096 geopbytes (2^112 bytes)
   - = 4 million yottabytes  
