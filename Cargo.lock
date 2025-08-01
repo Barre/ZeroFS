@@ -4011,6 +4011,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "zerofs_nfsserve",
 ]
 
