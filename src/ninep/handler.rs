@@ -1159,7 +1159,7 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
-        let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
+        let (used_bytes, _used_inodes) = self.filesystem.global_stats.get_totals();
 
         // Constants matching NFS implementation
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
@@ -1171,6 +1171,16 @@ impl NinePHandler {
         let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
+        // Get the next inode ID to determine how many IDs have been allocated
+        let next_inode_id = self
+            .filesystem
+            .next_inode_id
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Available inodes = total possible inodes - allocated inode IDs
+        // Note: We use next_inode_id because once allocated, inode IDs are never reused
+        let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
+
         let statfs = Rstatfs {
             r#type: 0x5a45524f,
             bsize: BLOCK_SIZE,
@@ -1178,7 +1188,7 @@ impl NinePHandler {
             bfree: free_blocks,
             bavail: free_blocks,
             files: TOTAL_INODES,
-            ffree: TOTAL_INODES - used_inodes,
+            ffree: available_inodes,
             fsid: 0,
             namelen: 255,
         };
@@ -1490,7 +1500,7 @@ mod tests {
         let statfs_msg = Message::Tstatfs(Tstatfs { fid: 1 });
         let initial_resp = handler.handle_message(2, statfs_msg.clone()).await;
 
-        let (initial_free_blocks, initial_free_inodes) = match &initial_resp.body {
+        let (initial_free_blocks, _initial_free_inodes) = match &initial_resp.body {
             Message::Rstatfs(rstatfs) => (rstatfs.bfree, rstatfs.ffree),
             _ => panic!("Expected Rstatfs"),
         };
@@ -1529,8 +1539,14 @@ mod tests {
 
         match &after_resp.body {
             Message::Rstatfs(rstatfs) => {
-                // Should have 1 less inode (file created)
-                assert_eq!(rstatfs.ffree, initial_free_inodes - 1);
+                // Should have fewer available inodes since we allocated one for the file
+                // Note: Available inodes are based on next_inode_id, not currently used inodes
+                const TOTAL_INODES: u64 = 1 << 48;
+                let next_inode_id = handler
+                    .filesystem
+                    .next_inode_id
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(rstatfs.ffree, TOTAL_INODES - next_inode_id);
 
                 // Should have fewer free blocks (10KB written = 3 blocks of 4KB)
                 let expected_blocks_used = 10240_u64.div_ceil(4096); // Round up
