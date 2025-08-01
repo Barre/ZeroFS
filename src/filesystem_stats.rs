@@ -542,12 +542,16 @@ mod tests {
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
         const TOTAL_INODES: u64 = 1 << 48;
 
+        // Get the next inode ID to verify available inodes calculation
+        let next_inode_id = fs.next_inode_id.load(std::sync::atomic::Ordering::Relaxed);
+
         assert_eq!(fsstat.tbytes, TOTAL_BYTES);
         assert_eq!(fsstat.fbytes, TOTAL_BYTES - 5_000_000);
         assert_eq!(fsstat.abytes, TOTAL_BYTES - 5_000_000);
         assert_eq!(fsstat.tfiles, TOTAL_INODES);
-        assert_eq!(fsstat.ffiles, TOTAL_INODES - 5); // 5 files
-        assert_eq!(fsstat.afiles, TOTAL_INODES - 5);
+        // Available inodes are based on next_inode_id, not currently used inodes
+        assert_eq!(fsstat.ffiles, TOTAL_INODES - next_inode_id);
+        assert_eq!(fsstat.afiles, TOTAL_INODES - next_inode_id);
     }
 
     #[tokio::test]

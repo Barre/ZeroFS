@@ -2,6 +2,7 @@ use crate::cache::{CacheKey, CacheValue};
 use crate::filesystem::{EncodedFileId, SlateDbFs};
 use crate::inode::Inode;
 use async_trait::async_trait;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -360,10 +361,17 @@ impl NFSFileSystem for SlateDbFs {
             Err(_) => post_op_attr::Void,
         };
 
-        let (used_bytes, used_inodes) = self.global_stats.get_totals();
+        let (used_bytes, _used_inodes) = self.global_stats.get_totals();
 
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
         const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
+
+        // Get the next inode ID to determine how many IDs have been allocated
+        let next_inode_id = self.next_inode_id.load(Ordering::Relaxed);
+
+        // Available inodes = total possible inodes - allocated inode IDs
+        // Note: We use next_inode_id because once allocated, inode IDs are never reused
+        let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
 
         let res = fsstat3 {
             obj_attributes: obj_attr,
@@ -371,8 +379,8 @@ impl NFSFileSystem for SlateDbFs {
             fbytes: TOTAL_BYTES.saturating_sub(used_bytes),
             abytes: TOTAL_BYTES.saturating_sub(used_bytes),
             tfiles: TOTAL_INODES,
-            ffiles: TOTAL_INODES.saturating_sub(used_inodes),
-            afiles: TOTAL_INODES.saturating_sub(used_inodes),
+            ffiles: available_inodes,
+            afiles: available_inodes,
             invarsec: 1,
         };
 
