@@ -295,10 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encryption_key =
         key_management::load_or_init_encryption_key(&temp_fs.db, &password).await?;
 
-    // Flush and properly close the temporary database to avoid fencing issues
     temp_fs.db.flush().await?;
-    // Give background tasks a moment to complete after flush
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     temp_fs.db.close().await?;
     drop(temp_fs);
 
