@@ -688,8 +688,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         match self.filesystem.write(&auth, inode, offset, &data).await {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0 {
-                    if let Err(e) = self.filesystem.db.flush().await {
-                        error!("NBD write FUA flush failed: {}", e);
+                    if let Err(e) = self.filesystem.flush().await {
+                        error!("NBD write FUA flush failed: {:?}", e);
                         let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                         return NBD_EIO;
                     }
@@ -712,7 +712,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn handle_flush(&mut self, cookie: u64) -> u32 {
-        match self.filesystem.db.flush().await {
+        match self.filesystem.flush().await {
             Ok(_) => {
                 if self
                     .send_simple_reply(cookie, NBD_SUCCESS, &[])
@@ -724,7 +724,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBD_SUCCESS
             }
             Err(e) => {
-                error!("NBD flush failed: {}", e);
+                error!("NBD flush failed: {:?}", e);
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                 NBD_EIO
             }
@@ -774,8 +774,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0 {
-                    if let Err(e) = self.filesystem.db.flush().await {
-                        error!("NBD trim FUA flush failed: {}", e);
+                    if let Err(e) = self.filesystem.flush().await {
+                        error!("NBD trim FUA flush failed: {:?}", e);
                         let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                         return NBD_EIO;
                     }
@@ -841,8 +841,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             Ok(_) => {
                 // Handle FUA flag - force unit access (flush after write_zeroes)
                 if (flags & NBD_CMD_FLAG_FUA) != 0 {
-                    if let Err(e) = self.filesystem.db.flush().await {
-                        error!("NBD write_zeroes FUA flush failed: {}", e);
+                    if let Err(e) = self.filesystem.flush().await {
+                        error!("NBD write_zeroes FUA flush failed: {:?}", e);
                         let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                         return NBD_EIO;
                     }
