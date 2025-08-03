@@ -16,6 +16,7 @@ use slatedb::{
     config::{PutOptions, WriteOptions},
 };
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
@@ -104,6 +105,7 @@ pub struct SlateDbFs {
     pub dir_entry_cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
+    pub last_flush: Arc<Mutex<std::time::Instant>>,
 }
 
 // Struct for temporary unencrypted access (only for key management)
@@ -290,6 +292,7 @@ impl SlateDbFs {
             dir_entry_cache,
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
+            last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
         };
 
         Ok(fs)
@@ -343,7 +346,39 @@ impl SlateDbFs {
     }
 
     pub async fn flush(&self) -> Result<(), nfsstat3> {
-        self.db.flush().await.map_err(|_| nfsstat3::NFS3ERR_IO)
+        let result = self.db.flush().await.map_err(|_| nfsstat3::NFS3ERR_IO);
+        if result.is_ok() {
+            *self.last_flush.lock().unwrap() = std::time::Instant::now();
+        }
+        result
+    }
+
+    pub fn start_auto_flush(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tracing::info!("Starting automatic flush task (flushes every 30 seconds if needed)");
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+            loop {
+                interval.tick().await;
+
+                // Check if it's been 30 seconds since last flush
+                let should_flush = {
+                    let last_flush = self.last_flush.lock().unwrap();
+                    last_flush.elapsed() >= std::time::Duration::from_secs(30)
+                };
+
+                if should_flush {
+                    match self.flush().await {
+                        Ok(_) => {
+                            tracing::debug!("Automatic flush completed successfully");
+                        }
+                        Err(e) => {
+                            tracing::error!("Automatic flush failed: {:?}", e);
+                        }
+                    }
+                }
+            }
+        })
     }
 
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, nfsstat3> {
@@ -658,6 +693,7 @@ impl SlateDbFs {
             dir_entry_cache,
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
+            last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
         };
 
         Ok(fs)
