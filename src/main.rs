@@ -190,10 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     validate_environment()?;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // Default: info for zerofs, error for slatedb to reduce noise
-        EnvFilter::new("error,zerofs=info")
-    });
+    let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
