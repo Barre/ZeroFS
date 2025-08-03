@@ -340,14 +340,14 @@ impl NFSFileSystem for SlateDbFs {
             count
         );
 
-        match self.db.flush().await {
+        match self.flush().await {
             Ok(_) => {
                 debug!("commit successful for file {}", real_fileid);
                 Ok(self.serverid())
             }
-            Err(e) => {
-                tracing::error!("commit failed for file {}: {}", real_fileid, e);
-                Err(nfsstat3::NFS3ERR_IO)
+            Err(nfsstat) => {
+                tracing::error!("commit failed for file {}: {:?}", real_fileid, nfsstat);
+                Err(nfsstat)
             }
         }
     }
