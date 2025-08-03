@@ -479,10 +479,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unreachable!("Flush task should never complete");
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down gracefully...");
+                info!("Received SIGINT, flushing and shutting down gracefully...");
+                fs_arc.db.flush().await?;
             }
             _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down gracefully...");
+                info!("Received SIGTERM, flushing and shutting down gracefully..");
+                fs_arc.db.flush().await?;
             }
         }
     } else {
@@ -506,10 +508,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unreachable!("Flush task should never complete");
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down gracefully...");
+                info!("Received SIGINT, flushing and shutting down gracefully...");
+                fs_arc.db.flush().await?;
             }
             _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down gracefully...");
+                info!("Received SIGTERM, flushing and shutting down gracefully..");
+                fs_arc.db.flush().await?;
             }
         }
     }
