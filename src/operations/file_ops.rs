@@ -13,6 +13,8 @@ use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
 use crate::inode::{FileInode, Inode, InodeId};
 use crate::permissions::{AccessMode, Credentials, check_access, validate_mode};
 
+const READ_CHUNK_BUFFER_SIZE: usize = 64;
+
 impl SlateDbFs {
     pub async fn process_write(
         &self,
@@ -412,9 +414,8 @@ impl SlateDbFs {
                     }
                 });
 
-                const BUFFER_SIZE: usize = 8;
                 let mut chunks: Vec<(usize, Option<Vec<u8>>)> = chunk_futures
-                    .buffered(BUFFER_SIZE)
+                    .buffered(READ_CHUNK_BUFFER_SIZE)
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
