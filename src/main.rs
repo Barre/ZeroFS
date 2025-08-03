@@ -494,17 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 result??;
             }
             result = futures::future::select_all(nbd_handles) => {
-                match result {
-                    (Ok(Ok(())), _, _) => {
-                        info!("NBD server completed successfully");
-                    }
-                    (Ok(Err(e)), _, _) => {
-                        return Err(e.into());
-                    }
-                    (Err(e), _, _) => {
-                        return Err(e.into());
-                    }
-                }
+                unreachable!("NBD server should never complete: {result:?}");
             }
             _ = gc_handle => {
                 unreachable!("GC task should never complete");
