@@ -1,0 +1,345 @@
+export const metadata = {
+  title: 'NBD Block Devices',
+  description: 'Access ZeroFS as raw block devices through NBD protocol for databases, ZFS, and more.',
+}
+
+# NBD Block Devices
+
+ZeroFS provides Network Block Device (NBD) servers that expose S3 storage as raw block devices. This enables advanced use cases like running ZFS pools, databases, or even entire operating systems directly on S3 storage with full TRIM/discard support. {{ className: 'lead' }}
+
+---
+
+## NBD Features
+
+- **Raw Block Access** - Present S3 storage as standard block devices (/dev/nbd*)
+- **Multiple Devices** - Configure multiple NBD devices with different sizes
+- **TRIM Support** - Full discard/TRIM support for efficient space management
+- **High Performance** - Same caching layers as 9P/NFS
+- **Any Filesystem** - Format with ext4, XFS, ZFS, or any other filesystem
+
+## Configuration
+
+Start ZeroFS with NBD support by specifying ports and device sizes:
+
+```bash
+# Configure 3 NBD devices of different sizes
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+ZEROFS_NBD_PORTS='10809,10810,10811' \
+ZEROFS_NBD_DEVICE_SIZES_GB='1,2,5' \
+zerofs s3://bucket/path
+```
+
+Environment variables:
+- `ZEROFS_NBD_HOST` - Bind address for NBD servers (default: 127.0.0.1)
+- `ZEROFS_NBD_PORTS` - Comma-separated list of ports for NBD servers
+- `ZEROFS_NBD_DEVICE_SIZES_GB` - Comma-separated list of device sizes in GB
+
+## Connecting to NBD Devices
+
+Once ZeroFS is running, connect to the NBD devices using `nbd-client`:
+
+```bash
+# Connect with recommended options for optimal performance
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
+nbd-client 127.0.0.1 10810 /dev/nbd1 -N device_10810 -persist -timeout 60 -block-size 4096 -connections 4
+nbd-client 127.0.0.1 10811 /dev/nbd2 -N device_10811 -persist -timeout 60 -block-size 4096 -connections 4
+
+# Verify devices are connected
+nbd-client -check /dev/nbd0
+lsblk | grep nbd
+```
+
+### Important Parameters
+
+- **`-N device_<port>`** - Specify the export name (required for ZeroFS)
+- **`-persist`** - Automatically reconnect if connection drops
+- **`-timeout <seconds>`** - Set connection timeout
+- **`-connections <num>`** - Use multiple connections for better performance
+- **`-readonly`** - Mount device as read-only
+- **`-block-size <size>`** - Block size (512, 1024, 2048, or 4096)
+
+## Using Block Devices
+
+### Creating Filesystems
+
+```bash
+# Format with ext4
+mkfs.ext4 /dev/nbd0
+mount /dev/nbd0 /mnt/block
+
+# Format with XFS
+mkfs.xfs /dev/nbd1
+mount /dev/nbd1 /mnt/xfs
+```
+
+### ZFS on S3
+
+Create ZFS pools backed by S3 storage:
+
+```bash
+# Create a ZFS pool
+zpool create mypool /dev/nbd0 /dev/nbd1 /dev/nbd2
+
+# Create datasets
+zfs create mypool/data
+zfs create mypool/backups
+
+# Enable compression
+zfs set compression=lz4 mypool
+```
+
+### TRIM/Discard Support
+
+ZeroFS NBD devices support TRIM operations, which delete corresponding chunks from S3:
+
+```bash
+# Manual TRIM
+fstrim /mnt/block
+
+# Enable automatic discard for filesystems
+mount -o discard /dev/nbd0 /mnt/block
+
+# ZFS automatic TRIM
+zpool set autotrim=on mypool
+zpool trim mypool
+```
+
+When blocks are trimmed:
+1. ZeroFS removes chunks from the LSM-tree database
+2. Compaction eventually frees space in S3
+3. Storage costs decrease automatically
+
+## NBD Device Files
+
+NBD devices appear as files in the `.nbd` directory when mounted via 9P and NFS:
+
+```bash
+# View NBD device files
+ls -la /mnt/zerofs/.nbd/
+# .nbd/device_10809  (1GB device)
+# .nbd/device_10810  (2GB device)
+# .nbd/device_10811  (5GB device)
+```
+
+**Important**: Device sizes cannot be changed after creation. To resize:
+```bash
+# Delete existing device
+rm /mnt/zerofs/.nbd/device_10809
+# Restart ZeroFS with new size configuration
+```
+
+## Advanced Use Cases
+
+### Geo-Distributed ZFS
+
+Create globally distributed ZFS pools across regions:
+
+```bash
+# US East region
+ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
+AWS_DEFAULT_REGION=us-east-1 \
+ZEROFS_NBD_PORTS='10809' \
+ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+zerofs s3://my-bucket/us-east-db
+
+# Connect with high timeout for cross-region latency
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 120 -block-size 4096 -connections 8
+
+# EU West region
+ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
+AWS_DEFAULT_REGION=eu-west-1 \
+ZEROFS_NBD_PORTS='10810' \
+ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+zerofs s3://my-bucket/eu-west-db
+
+# Connect with high timeout
+nbd-client 127.0.0.1 10810 /dev/nbd1 -N device_10810 -persist -timeout 120 -block-size 4096 -connections 8
+
+# Create mirrored pool across continents
+zpool create global-pool mirror /dev/nbd0 /dev/nbd1
+```
+
+Benefits:
+- **Disaster Recovery** - Data remains available if any region fails
+- **Geographic Redundancy** - Automatic replication across regions
+- **Infinite Scalability** - Add regions as needed
+
+### ZFS L2ARC Tiering
+
+Use local NVMe as cache for S3-backed storage:
+
+```bash
+# Create S3-backed pool
+zpool create mypool /dev/nbd0 /dev/nbd1
+
+# Add local NVMe as L2ARC cache
+zpool add mypool cache /dev/nvme0n1
+
+# Monitor cache performance
+zpool iostat -v mypool 1
+```
+
+Storage tiers:
+1. **NVMe L2ARC** - Hot data with SSD performance
+2. **ZeroFS Caches** - Warm data with sub-millisecond latency
+3. **S3 Storage** - Cold data at $0.023/GB/month
+
+### Database Storage
+
+Run databases on NBD devices:
+
+```bash
+# Create dedicated device for PostgreSQL
+nbd-client 127.0.0.1 10809 /dev/nbd0 \
+  -N device_10809 \
+  -persist \
+  -timeout 60 \
+  -connections 4 \
+  -block-size 4096
+
+mkfs.ext4 /dev/nbd0
+mount /dev/nbd0 /var/lib/postgresql
+
+# Initialize database
+sudo -u postgres initdb -D /var/lib/postgresql/16/main
+```
+
+### Virtual Machine Storage
+
+Boot VMs from NBD devices:
+
+```bash
+# Create VM disk
+qemu-img create -f raw /dev/nbd0 50G
+
+# Boot VM using NBD device
+qemu-system-x86_64 \
+  -drive file=/dev/nbd0,format=raw,cache=writeback \
+  -m 4G -enable-kvm
+```
+
+## Performance Considerations
+
+### Network Optimization
+
+```bash
+# High-performance connection with multiple connections
+nbd-client 127.0.0.1 10809 /dev/nbd0 \
+  -N device_10809 \
+  -persist \
+  -timeout 60 \
+  -connections 4 \
+  -block-size 4096
+
+# For high-latency connections (e.g., cross-region)
+nbd-client 127.0.0.1 10809 /dev/nbd0 \
+  -N device_10809 \
+  -persist \
+  -timeout 120 \
+  -connections 8
+```
+
+## Monitoring
+
+### Device Status
+
+```bash
+# Check if device is connected
+nbd-client -check /dev/nbd0
+
+# List all NBD exports from server
+nbd-client -list 127.0.0.1
+
+# View device statistics
+cat /sys/block/nbd0/stat
+
+# Monitor I/O performance
+iostat -x 1 /dev/nbd0
+
+# Disconnect device safely
+nbd-client -disconnect /dev/nbd0
+```
+
+### ZFS Monitoring
+
+```bash
+# Pool status
+zpool status
+
+# I/O statistics
+zpool iostat -v 1
+```
+
+## Troubleshooting
+
+### Connection Issues
+
+```bash
+# If connection fails, check:
+# 1. ZeroFS is running and NBD ports are configured
+ps aux | grep zerofs
+
+# 2. NBD module is loaded
+sudo modprobe nbd
+
+# 3. Export name matches port number
+nbd-client -list 127.0.0.1
+
+# 4. Try with explicit parameters
+nbd-client 127.0.0.1 10809 /dev/nbd0 \
+  -N device_10809 \
+  -nofork  # Stay in foreground for debugging
+```
+
+### Performance Issues
+
+```bash
+# Use multiple connections for better throughput
+nbd-client 127.0.0.1 10809 /dev/nbd0 \
+  -N device_10809 \
+  -connections 8 \
+  -persist \
+  -timeout 60
+
+# For large sequential workloads, increase block size
+nbd-client 127.0.0.1 10809 /dev/nbd0 \
+  -N device_10809 \
+  -block-size 4096 \
+  -persist
+```
+
+### Persistent Mount Configuration
+
+```bash
+# Add to /etc/rc.local or systemd service
+cat > /etc/systemd/system/zerofs-nbd.service << EOF
+[Unit]
+Description=ZeroFS NBD Client
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
+ExecStop=/usr/sbin/nbd-client -d /dev/nbd0
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable zerofs-nbd
+systemctl start zerofs-nbd
+```
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/filesystem-operations" arrow="right">
+    <>Learn about filesystem operations</>
+  </Button>
+  <Button href="/caching" variant="outline">
+    <>Understand caching architecture</>
+  </Button>
+</div>
