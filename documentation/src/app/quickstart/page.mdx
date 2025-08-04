@@ -1,0 +1,311 @@
+export const metadata = {
+  title: 'Quickstart',
+  description:
+    'Get up and running with ZeroFS in minutes. Learn how to install, configure, and mount your first S3-backed filesystem.',
+}
+
+# Quickstart
+
+This guide will get you up and running with ZeroFS in minutes. We'll cover installation, basic configuration, and mounting your first S3-backed filesystem. By the end, you'll have a fully functional filesystem that stores data in S3 while feeling like local storage. {{ className: 'lead' }}
+
+<Note>
+  Before you begin, ensure you have access to an S3-compatible storage service and the necessary credentials (access key ID and secret access key). For quick testing without external storage, you can use `file:///` URLs to store data locally.
+</Note>
+
+## Installation
+
+ZeroFS is distributed as a single static binary. Choose your installation method:
+
+<CodeGroup>
+
+```bash {{ title: 'Download Binary' }}
+# Download the latest release for your platform
+curl -LO https://github.com/Barre/ZeroFS/releases/latest/download/zerofs-pgo-multiplatform.tar.gz
+
+# Extract the archive
+tar -xzf zerofs-multiplatform.tar.gz
+
+# Make the binary executable and move it to PATH
+chmod +x zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)
+sudo mv zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m) /usr/local/bin/zerofs
+
+# Clean up the archive
+rm zerofs-multiplatform.tar.gz
+```
+
+```bash {{ title: 'Build from Source' }}
+# Requires Rust toolchain
+git clone https://github.com/Barre/ZeroFS
+cd ZeroFS
+cargo build --release
+sudo mv target/release/zerofs /usr/local/bin/
+```
+
+```bash {{ title: 'Docker' }}
+# Pull the ZeroFS Docker image
+docker pull ghcr.io/barre/zerofs:latest
+```
+
+```yaml {{ title: 'GitHub Action' }}
+# Use in your workflow
+- uses: Barre/zerofs@v1
+  with:
+    object-store-url: 's3://bucket/path'
+    encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+```
+
+</CodeGroup>
+
+## Configuration
+
+Set up the required environment variables for ZeroFS:
+
+```bash
+# Required: Encryption password
+export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'
+
+# Required: SlateDB cache configuration
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+export SLATEDB_CACHE_SIZE_GB='10'
+
+# Recommended: Memory cache for better performance
+export ZEROFS_MEMORY_CACHE_SIZE_GB='8' # 8GB memory cache
+
+# S3 credentials (for AWS S3)
+export AWS_ACCESS_KEY_ID='your-access-key'
+export AWS_SECRET_ACCESS_KEY='your-secret-key'
+export AWS_DEFAULT_REGION='us-east-1'
+
+# For custom S3-compatible endpoints (e.g., MinIO, Ceph)
+export AWS_ENDPOINT='https://s3.example.com'
+export AWS_ALLOW_HTTP='true' # Only if using HTTP endpoints
+
+# Azure credentials (for Azure Blob Storage)
+export AZURE_STORAGE_ACCOUNT='your-account-name'
+export AZURE_STORAGE_KEY='your-account-key'
+
+# Optional: NBD block device configuration
+export ZEROFS_NBD_PORTS='10809,10810' # Comma-separated list
+export ZEROFS_NBD_DEVICE_SIZES_GB='10,20' # Comma-separated list of sizes in GB
+```
+
+<div className="not-prose">
+  <Button href="/configuration" variant="text" arrow="right">
+    <>See all configuration options</>
+  </Button>
+</div>
+
+## Start ZeroFS
+
+Now start ZeroFS with your S3 bucket:
+
+<CodeGroup>
+
+```bash {{ title: 'Basic Start' }}
+# Start ZeroFS with an S3 bucket
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+SLATEDB_CACHE_DIR='/var/cache/zerofs' \
+SLATEDB_CACHE_SIZE_GB='10' \
+ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+AWS_ACCESS_KEY_ID='your-key' \
+AWS_SECRET_ACCESS_KEY='your-secret' \
+AWS_DEFAULT_REGION='us-east-1' \
+zerofs s3://my-bucket/zerofs-data
+
+# Start ZeroFS with Azure Blob Storage
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+SLATEDB_CACHE_DIR='/var/cache/zerofs' \
+SLATEDB_CACHE_SIZE_GB='10' \
+ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+AZURE_STORAGE_ACCOUNT='your-account' \
+AZURE_STORAGE_KEY='your-key' \
+zerofs azure://my-container/zerofs-data
+
+# Quick local testing without external storage
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+SLATEDB_CACHE_DIR='/var/cache/zerofs' \
+SLATEDB_CACHE_SIZE_GB='10' \
+ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+zerofs file:///tmp/zerofs-test
+
+# Custom S3-compatible endpoint (MinIO, Ceph, etc.)
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+SLATEDB_CACHE_DIR='/var/cache/zerofs' \
+SLATEDB_CACHE_SIZE_GB='10' \
+ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+AWS_ACCESS_KEY_ID='your-key' \
+AWS_SECRET_ACCESS_KEY='your-secret' \
+AWS_ENDPOINT='https://minio.example.com' \
+zerofs s3://my-bucket/zerofs-data
+```
+
+```bash {{ title: 'Export Variables First' }}
+# Export environment variables once
+export ZEROFS_ENCRYPTION_PASSWORD='your-password'
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+export SLATEDB_CACHE_SIZE_GB='10'
+export ZEROFS_MEMORY_CACHE_SIZE_GB='8'
+export AWS_ACCESS_KEY_ID='your-key'
+export AWS_SECRET_ACCESS_KEY='your-secret'
+export AWS_DEFAULT_REGION='us-east-1'
+
+# Then start ZeroFS
+zerofs s3://my-bucket/zerofs-data
+```
+
+```bash {{ title: 'With NBD Support' }}
+# Enable both NFS and NBD block devices
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+SLATEDB_CACHE_DIR='/var/cache/zerofs' \
+SLATEDB_CACHE_SIZE_GB='10' \
+ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+AWS_ACCESS_KEY_ID='your-key' \
+AWS_SECRET_ACCESS_KEY='your-secret' \
+AWS_DEFAULT_REGION='us-east-1' \
+ZEROFS_NBD_PORTS='10809,10810' \
+ZEROFS_NBD_DEVICE_SIZES_GB='10,20' \
+zerofs s3://my-bucket/zerofs-data
+```
+
+```bash {{ title: 'Docker' }}
+# Run with Docker
+docker run -d \
+  -e ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+  -e SLATEDB_CACHE_DIR='/cache' \
+  -e SLATEDB_CACHE_SIZE_GB='10' \
+  -e ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+  -e AWS_ACCESS_KEY_ID='your-key' \
+  -e AWS_SECRET_ACCESS_KEY='your-secret' \
+  -p 2049:2049 \
+  -v /tmp/cache:/cache \
+  ghcr.io/barre/zerofs:latest s3://bucket/path
+```
+
+</CodeGroup>
+
+## Mount the Filesystem
+
+With ZeroFS running, mount it using standard NFS tools. Linux users can also use 9P for better performance:
+
+<CodeGroup>
+
+```bash {{ title: 'macOS' }}
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Mount ZeroFS
+sudo mount -t nfs -o async,nolocks,vers=3,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Linux (NFS)' }}
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Mount ZeroFS via NFS
+sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Linux (9P)' }}
+# Create mount point
+sudo mkdir -p /mnt/9p
+
+# Mount ZeroFS via 9P (better performance on Linux)
+sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/9p
+```
+
+```bash {{ title: 'Persistent Mount (NFS)' }}
+# Add to /etc/fstab for automatic mounting
+echo "127.0.0.1:/ /mnt/zerofs nfs vers=3,async,nolock,tcp,port=2049,mountport=2049,_netdev 0 0" | sudo tee -a /etc/fstab
+```
+
+```bash {{ title: 'Persistent Mount (9P)' }}
+# Add to /etc/fstab for automatic mounting (Linux only)
+echo "127.0.0.1 /mnt/9p 9p trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user,_netdev 0 0" | sudo tee -a /etc/fstab
+```
+
+</CodeGroup>
+
+## Using NBD Block Devices
+
+If you enabled NBD support, you can also access ZeroFS as block devices:
+
+<CodeGroup>
+
+```bash {{ title: 'Connect NBD Device' }}
+# Install nbd-client if needed
+sudo apt-get install nbd-client  # Debian/Ubuntu
+sudo yum install nbd              # RHEL/CentOS
+
+# Connect to NBD device with optimal settings
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
+
+# Create filesystem
+sudo mkfs.ext4 /dev/nbd0
+
+# Mount the block device
+sudo mkdir -p /mnt/nbd0
+sudo mount /dev/nbd0 /mnt/nbd0
+```
+
+```bash {{ title: 'Multiple Devices' }}
+# If you configured multiple NBD ports
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
+sudo nbd-client 127.0.0.1 10810 /dev/nbd1 -N device_10810 -persist -timeout 60 -block-size 4096 -connections 4
+
+# Format and mount each device
+sudo mkfs.ext4 /dev/nbd0
+sudo mkfs.ext4 /dev/nbd1
+
+sudo mkdir -p /mnt/nbd0 /mnt/nbd1
+sudo mount /dev/nbd0 /mnt/nbd0
+sudo mount /dev/nbd1 /mnt/nbd1
+```
+
+```bash {{ title: 'Disconnect NBD' }}
+# Unmount first
+sudo umount /mnt/nbd0
+
+# Disconnect NBD device
+sudo nbd-client -d /dev/nbd0
+```
+
+</CodeGroup>
+
+<div className="not-prose">
+  <Button href="/nbd-devices" variant="text" arrow="right">
+    <>Learn more about NBD devices</>
+  </Button>
+</div>
+
+## Verify It's Working
+
+Test your new filesystem:
+
+```bash
+# Check mount
+df -h /mnt/zerofs
+
+# Create a test file
+echo "Hello from ZeroFS!" > /mnt/zerofs/test.txt
+
+# Read it back
+cat /mnt/zerofs/test.txt
+
+# Check file metadata
+ls -la /mnt/zerofs/
+```
+
+<div className="not-prose">
+  <Button href="/nfs-access" variant="text" arrow="right">
+    <>Learn about NFS operations</>
+  </Button>
+</div>
+
+## What's Next?
+
+Congratulations! You now have a fully functional filesystem backed by S3. Here are some next steps:
+
+- [Configure NBD block devices](/nbd-devices) for raw block storage
+- [Learn about encryption](/encryption) and how your data is protected
+- [Optimize performance](/caching) with caching configuration
+- [Explore advanced architectures](/advanced-use-cases) like geo-distributed storage
