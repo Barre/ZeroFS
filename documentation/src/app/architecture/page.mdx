@@ -1,0 +1,64 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'Architecture',
+  description:
+    'Deep dive into ZeroFS architecture, internal components, and the technology stack that enables high-performance S3-backed filesystems.',
+}
+
+export const sections = [
+  { title: 'System Overview', id: 'system-overview' },
+]
+
+# Architecture
+
+ZeroFS is built on a modern, modular architecture. This document provides a deep technical dive into the system's design, components, and implementation details. {{ className: 'lead' }}
+
+## System Overview {{ id: 'system-overview' }}
+
+ZeroFS bridges the gap between object storage and POSIX filesystems through a sophisticated layered architecture:
+
+<Mermaid chart={`
+graph TB
+    subgraph "Client Layer"
+        NFS[NFS Client]
+        P9[9P Client]
+        NBD[NBD Client]
+    end
+    
+    subgraph "ZeroFS Core"
+        NFSD[NFS Server]
+        P9D[9P Server]
+        NBDD[NBD Server]
+        VFS[Virtual Filesystem]
+        ENC[Encryption Manager]
+        CACHE[Cache Manager]
+        
+        NFSD --> VFS
+        P9D --> VFS
+        NBDD --> VFS
+        VFS --> ENC
+        ENC --> CACHE
+    end
+    
+    subgraph "Storage Backend"
+        SLATE[SlateDB]
+        LSM[LSM Tree]
+        S3[S3 Object Store]
+        
+        CACHE --> SLATE
+        SLATE --> LSM
+        LSM --> S3
+    end
+    
+    NFS --> NFSD
+    P9 --> P9D
+    NBD --> NBDD
+    `} />
+
+
+<div className="not-prose">
+  <Button href="/" variant="text" arrow="left">
+    <>Back to Introduction</>
+  </Button>
+</div>
