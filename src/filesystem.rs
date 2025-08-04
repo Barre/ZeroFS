@@ -172,7 +172,7 @@ impl SlateDbFs {
 
         let hybrid_cache = Arc::new(FoyerHybridCache::new_with_cache(
             HybridCacheBuilder::new()
-                .memory(slatedb_memory_cache_bytes as usize / CHUNK_SIZE)
+                .memory(slatedb_memory_cache_bytes as usize)
                 .with_weighter(|_, v: &CachedEntry| v.size())
                 .storage(Engine::Large)
                 .with_runtime_options(RuntimeOptions::Separated {
