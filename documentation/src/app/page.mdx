@@ -1,0 +1,43 @@
+import { Guides } from '@/components/Guides'
+import { Resources } from '@/components/Resources'
+import { HeroPattern } from '@/components/HeroPattern'
+
+export const metadata = {
+  title: 'ZeroFS Documentation',
+  description:
+    'The filesystem that makes S3 your primary storage. Mount S3 buckets as local filesystems with NFS or 9P or use them as block devices with NBD.',
+}
+
+export const sections = [
+  { title: 'Guides', id: 'guides' },
+  { title: 'Resources', id: 'resources' },
+]
+
+<HeroPattern />
+
+# ZeroFS Documentation
+
+ZeroFS makes S3 storage feel like a real filesystem. It provides file-level access via NFS and 9P and block-level access via NBD. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
+
+<div className="not-prose mt-6 mb-16 flex gap-3">
+  <Button href="/quickstart" arrow="right">
+    <>Get Started</>
+  </Button>
+  <Button href="/configuration" variant="outline">
+    <>Configuration</>
+  </Button>
+</div>
+
+## Why ZeroFS? {{ anchor: false }}
+
+Traditional filesystems are limited by local storage capacity and hardware constraints. ZeroFS breaks these limitations by turning S3 into a high-performance filesystem that's always encrypted, globally accessible, and infinitely scalable. Run databases, compile code, or even boot entire operating systems directly from S3 storage. {{ className: 'lead' }}
+
+<div className="not-prose">
+  <Button href="/encryption" variant="text" arrow="right">
+    <>Learn about encryption</>
+  </Button>
+</div>
+
+<Guides />
+
+<Resources />
