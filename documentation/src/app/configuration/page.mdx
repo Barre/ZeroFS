@@ -1,0 +1,318 @@
+export const metadata = {
+  title: 'Configuration Guide',
+  description:
+    'Complete guide to configuring ZeroFS, including environment variables, storage backends, and network settings.',
+}
+
+# Configuration Guide
+
+ZeroFS uses environment variables for all configuration. This guide covers all available settings to help you configure ZeroFS for your specific use case. {{ className: 'lead' }}
+
+## Required Configuration
+
+These environment variables must be set for ZeroFS to start:
+
+```bash
+# Required: Local directory for caching data
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+
+# Required: Maximum cache size in GB
+export SLATEDB_CACHE_SIZE_GB='10'
+
+# Required: Password for data encryption
+export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'
+```
+
+## Storage Backend Configuration
+
+### AWS S3 Backend
+
+For S3 and S3-compatible services:
+
+```bash
+# Required for S3
+export AWS_ACCESS_KEY_ID='your-access-key'
+export AWS_SECRET_ACCESS_KEY='your-secret-key'
+
+# Optional S3 settings
+export AWS_ENDPOINT='https://s3.us-east-1.amazonaws.com'  # For S3-compatible services
+export AWS_DEFAULT_REGION='us-east-1'  # Default: us-east-1
+export AWS_ALLOW_HTTP='true'  # Allow HTTP endpoints (default: false)
+
+# Usage
+zerofs s3://bucket/path
+```
+
+<Note>
+For S3-compatible services like MinIO, Wasabi, or Backblaze B2, set `AWS_ENDPOINT` to the service endpoint.
+</Note>
+
+### Azure Storage Backend
+
+For Azure Blob Storage:
+
+```bash
+# Required for Azure
+export AZURE_STORAGE_ACCOUNT_NAME='your-account-name'
+export AZURE_STORAGE_ACCOUNT_KEY='your-account-key'
+
+# Usage
+zerofs azure://container/path
+```
+
+### Local Filesystem Backend
+
+For local testing without cloud storage:
+
+```bash
+# No additional configuration required
+# Just use file:// URL
+
+# Usage
+zerofs file:///path/to/storage
+```
+
+## Optional Configuration
+
+### Memory Cache
+
+```bash
+# Memory cache size in GB (improves performance)
+export ZEROFS_MEMORY_CACHE_SIZE_GB='8'
+```
+
+### NBD Block Devices
+
+```bash
+# Comma-separated list of NBD server ports
+export ZEROFS_NBD_PORTS='10809,10810,10811'
+
+# Comma-separated list of device sizes in GB
+export ZEROFS_NBD_DEVICE_SIZES_GB='10,20,50'
+
+# NBD server bind address (default: 127.0.0.1)
+export ZEROFS_NBD_HOST='0.0.0.0'
+```
+
+### Network Services
+
+```bash
+# NFS server configuration
+export ZEROFS_NFS_HOST='0.0.0.0'  # Bind address (default: 127.0.0.1)
+export ZEROFS_NFS_HOST_PORT='2049'  # Port (default: 2049)
+
+# 9P server configuration
+export ZEROFS_9P_HOST='0.0.0.0'  # Bind address (default: 127.0.0.1)
+export ZEROFS_9P_PORT='5564'  # Port (default: 5564)
+```
+
+### Password Management
+
+To change the encryption password:
+
+```bash
+# Set both current and new password
+export ZEROFS_ENCRYPTION_PASSWORD='current-password'
+export ZEROFS_NEW_PASSWORD='new-secure-password'
+
+# Run ZeroFS - it will update the password and exit
+zerofs s3://bucket/path
+
+# Use the new password for future runs
+export ZEROFS_ENCRYPTION_PASSWORD='new-secure-password'
+```
+
+### Logging
+
+```bash
+# Set log level (default: error,zerofs=info)
+export RUST_LOG='zerofs=debug'
+
+# Common log levels:
+# - error: Only errors
+# - warn: Warnings and errors
+# - info: Informational messages (default for zerofs)
+# - debug: Detailed debugging
+# - trace: Very detailed tracing
+```
+
+## Complete Examples
+
+### Basic S3 Setup
+
+```bash
+#!/bin/bash
+# Required configuration
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+export SLATEDB_CACHE_SIZE_GB='10'
+export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'
+
+# S3 credentials
+export AWS_ACCESS_KEY_ID='AKIAIOSFODNN7EXAMPLE'
+export AWS_SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+
+# Start ZeroFS
+zerofs s3://my-bucket/zerofs-data
+```
+
+### High-Performance Configuration
+
+```bash
+#!/bin/bash
+# Cache configuration
+export SLATEDB_CACHE_DIR='/nvme/zerofs-cache'  # Use fast NVMe storage
+export SLATEDB_CACHE_SIZE_GB='100'
+export ZEROFS_MEMORY_CACHE_SIZE_GB='16'
+
+# Security
+export ZEROFS_ENCRYPTION_PASSWORD='very-secure-password'
+
+# Network configuration
+export ZEROFS_NFS_HOST='0.0.0.0'
+export ZEROFS_NBD_PORTS='10809,10810,10811'
+export ZEROFS_NBD_DEVICE_SIZES_GB='100,100,100'
+
+# S3 configuration
+export AWS_ACCESS_KEY_ID='your-key'
+export AWS_SECRET_ACCESS_KEY='your-secret'
+export AWS_DEFAULT_REGION='us-east-1'
+
+# Enable debug logging
+export RUST_LOG='zerofs=info'
+
+# Start ZeroFS
+zerofs s3://high-performance-bucket/data
+```
+
+### S3-Compatible Services
+
+<CodeGroup>
+
+```bash {{ title: 'MinIO' }}
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+export SLATEDB_CACHE_SIZE_GB='10'
+export ZEROFS_ENCRYPTION_PASSWORD='secure-password'
+
+# MinIO configuration
+export AWS_ENDPOINT='https://minio.example.com'
+export AWS_ACCESS_KEY_ID='minioadmin'
+export AWS_SECRET_ACCESS_KEY='minioadmin'
+export AWS_ALLOW_HTTP='false'  # Use 'true' for HTTP
+
+zerofs s3://my-bucket/path
+```
+
+```bash {{ title: 'Wasabi' }}
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+export SLATEDB_CACHE_SIZE_GB='10'
+export ZEROFS_ENCRYPTION_PASSWORD='secure-password'
+
+# Wasabi configuration
+export AWS_ENDPOINT='https://s3.wasabisys.com'
+export AWS_ACCESS_KEY_ID='your-wasabi-key'
+export AWS_SECRET_ACCESS_KEY='your-wasabi-secret'
+export AWS_DEFAULT_REGION='us-east-1'
+
+zerofs s3://wasabi-bucket/path
+```
+
+```bash {{ title: 'Backblaze B2' }}
+export SLATEDB_CACHE_DIR='/var/cache/zerofs'
+export SLATEDB_CACHE_SIZE_GB='10'
+export ZEROFS_ENCRYPTION_PASSWORD='secure-password'
+
+# Backblaze B2 S3 API
+export AWS_ENDPOINT='https://s3.us-west-000.backblazeb2.com'
+export AWS_ACCESS_KEY_ID='your-b2-key-id'
+export AWS_SECRET_ACCESS_KEY='your-b2-application-key'
+
+zerofs s3://b2-bucket/path
+```
+
+</CodeGroup>
+
+## System Integration
+
+### systemd Service
+
+Create `/etc/systemd/system/zerofs.service`:
+
+```ini
+[Unit]
+Description=ZeroFS S3 Filesystem
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zerofs/zerofs.env
+ExecStart=/usr/local/bin/zerofs s3://bucket/path
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create `/etc/zerofs/zerofs.env`:
+
+```bash
+SLATEDB_CACHE_DIR=/var/cache/zerofs
+SLATEDB_CACHE_SIZE_GB=50
+ZEROFS_ENCRYPTION_PASSWORD=your-secure-password
+AWS_ACCESS_KEY_ID=your-key
+AWS_SECRET_ACCESS_KEY=your-secret
+```
+
+### Docker
+
+```bash
+docker run -d \
+  -e SLATEDB_CACHE_DIR=/cache \
+  -e SLATEDB_CACHE_SIZE_GB=10 \
+  -e ZEROFS_ENCRYPTION_PASSWORD='secure-password' \
+  -e AWS_ACCESS_KEY_ID='your-key' \
+  -e AWS_SECRET_ACCESS_KEY='your-secret' \
+  -v /tmp/cache:/cache \
+  -p 2049:2049 \
+  ghcr.io/barre/zerofs:latest s3://bucket/path
+```
+
+### Environment File Best Practices
+
+1. **Restrict permissions**: `chmod 600 /etc/zerofs/zerofs.env`
+2. **Never commit to git**: Add `*.env` to `.gitignore`
+3. **Use strong passwords**: Generate with `openssl rand -base64 32`
+4. **Separate environments**: Use different passwords for dev/staging/prod
+
+## Validation
+
+After configuration, verify your setup:
+
+```bash
+# Check environment variables
+env | grep -E '(ZEROFS|SLATEDB|AWS|AZURE)'
+
+# Test storage backend connectivity
+# For S3
+aws s3 ls s3://your-bucket/
+
+# Verify cache directory exists and has space
+df -h $SLATEDB_CACHE_DIR
+
+# Start ZeroFS and check logs
+RUST_LOG=zerofs=debug zerofs s3://bucket/path
+```
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/quickstart" arrow="right">
+    <>Get started with ZeroFS</>
+  </Button>
+  <Button href="/troubleshooting" variant="outline">
+    <>Troubleshooting guide</>
+  </Button>
+</div>
