@@ -4,10 +4,49 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
+use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
+use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
 use super::error::{NBDError, Result};
 use super::protocol::*;
 use crate::filesystem::{EncodedFileId, SlateDbFs};
+
+const SHARD_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB shards
+
+#[derive(Debug, Clone)]
+struct ShardRange {
+    shard_index: u64,
+    offset_in_shard: u64,
+    length: u64,
+}
+
+/// Calculate which shards are affected by an I/O operation
+fn calculate_shard_ranges(offset: u64, length: u64) -> Vec<ShardRange> {
+    if length == 0 {
+        return vec![];
+    }
+
+    let mut ranges = Vec::new();
+    let start_shard = offset / SHARD_SIZE;
+    let end_offset = offset + length - 1;
+    let end_shard = end_offset / SHARD_SIZE;
+
+    for shard_idx in start_shard..=end_shard {
+        let shard_start = shard_idx * SHARD_SIZE;
+        let shard_end = shard_start + SHARD_SIZE - 1;
+
+        let range_start = offset.max(shard_start);
+        let range_end = end_offset.min(shard_end);
+
+        ranges.push(ShardRange {
+            shard_index: shard_idx,
+            offset_in_shard: range_start - shard_start,
+            length: range_end - range_start + 1,
+        });
+    }
+
+    ranges
+}
 
 #[derive(Clone)]
 pub struct NBDDevice {
@@ -76,7 +115,7 @@ impl NBDServer {
         let nbd_name = nfsstring(b".nbd".to_vec());
         let device_name = nfsstring(device.name.as_bytes().to_vec());
 
-        // Check if device file exists, create it if not
+        // Check if device directory exists
         let nbd_dir_inode = self
             .filesystem
             .lookup(&auth, 0, &nbd_name)
@@ -85,43 +124,24 @@ impl NBDServer {
                 std::io::Error::other(format!("Failed to lookup .nbd directory: {e:?}"))
             })?;
 
+        // Create device directory if it doesn't exist
         match self
             .filesystem
             .lookup(&auth, nbd_dir_inode, &device_name)
             .await
         {
-            Ok(device_inode) => {
-                let existing_attr =
-                    self.filesystem
-                        .getattr(&auth, device_inode)
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::other(format!("Failed to get device attributes: {e:?}"))
-                        })?;
-
-                if existing_attr.size != device.size {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "NBD device {} size mismatch: existing size is {} bytes, requested size is {} bytes. Cannot resize existing devices.",
-                            device.name, existing_attr.size, device.size
-                        ),
-                    ));
-                }
-
-                debug!(
-                    "NBD device file {} already exists with correct size {}",
-                    device.name, device.size
-                );
+            Ok(_device_dir_inode) => {
+                // Device directory already exists
+                debug!("NBD device directory {} already exists", device.name);
                 Ok(())
             }
             Err(_) => {
                 debug!(
-                    "Creating NBD device file {} with size {}",
+                    "Creating NBD device directory {} for size {}",
                     device.name, device.size
                 );
                 let attr = sattr3 {
-                    mode: set_mode3::mode(0o600),
+                    mode: set_mode3::mode(0o700), // Directory mode
                     uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
                     gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
                     size: zerofs_nfsserve::nfs::set_size3::Void,
@@ -129,24 +149,12 @@ impl NBDServer {
                     mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
                 };
 
-                let (device_inode, _) = self
-                    .filesystem
-                    .create(&auth, nbd_dir_inode, &device_name, attr)
+                self.filesystem
+                    .mkdir(&auth, nbd_dir_inode, &device_name, &attr)
                     .await
                     .map_err(|e| {
-                        std::io::Error::other(format!("Failed to create device file: {e:?}"))
+                        std::io::Error::other(format!("Failed to create device directory: {e:?}"))
                     })?;
-
-                // Set the file size by writing a zero byte at the end
-                if device.size > 0 {
-                    let data = vec![0u8; 1];
-                    self.filesystem
-                        .write(&auth, device_inode, device.size - 1, &data)
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::other(format!("Failed to set device size: {e:?}"))
-                        })?;
-                }
 
                 Ok(())
             }
@@ -494,18 +502,19 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let nbd_name = nfsstring(b".nbd".to_vec());
         let device_name = nfsstring(device.name.as_bytes().to_vec());
 
-        // Get device inode
         let nbd_dir_inode = self
             .filesystem
             .lookup(&auth, 0, &nbd_name)
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup .nbd directory: {e:?}")))?;
 
-        let device_inode = self
+        let device_dir_inode = self
             .filesystem
             .lookup(&auth, nbd_dir_inode, &device_name)
             .await
-            .map_err(|e| NBDError::Filesystem(format!("Failed to lookup device file: {e:?}")))?;
+            .map_err(|e| {
+                NBDError::Filesystem(format!("Failed to lookup device directory: {e:?}"))
+            })?;
 
         loop {
             let mut request_buf = [0u8; 28];
@@ -522,7 +531,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             let error = match request.cmd_type {
                 NBDCommand::Read => {
                     self.handle_read(
-                        device_inode,
+                        device_dir_inode,
                         request.cookie,
                         request.offset,
                         request.length,
@@ -532,7 +541,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBDCommand::Write => {
                     self.handle_write(
-                        device_inode,
+                        device_dir_inode,
                         request.cookie,
                         request.offset,
                         request.length,
@@ -547,9 +556,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBDCommand::Flush => self.handle_flush(request.cookie).await,
                 NBDCommand::Trim => {
-                    let device_inode_raw = EncodedFileId::from(device_inode).inode_id();
+                    let device_dir_inode_raw = EncodedFileId::from(device_dir_inode).inode_id();
                     self.handle_trim(
-                        device_inode_raw,
+                        device_dir_inode_raw,
                         request.cookie,
                         request.offset,
                         request.length,
@@ -560,7 +569,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBDCommand::WriteZeroes => {
                     self.handle_write_zeroes(
-                        device_inode,
+                        device_dir_inode,
                         request.cookie,
                         request.offset,
                         request.length,
@@ -590,23 +599,21 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_read(
         &mut self,
-        inode: u64,
+        device_dir_inode: u64,
         cookie: u64,
         offset: u64,
         length: u32,
         device_size: u64,
     ) -> u32 {
+        use zerofs_nfsserve::nfs::nfsstring;
         use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
-        // Check for out-of-bounds read
         if offset + length as u64 > device_size {
             let _ = self.send_simple_reply(cookie, NBD_EINVAL, &[]).await;
             return NBD_EINVAL;
         }
 
-        // Handle zero-length read
         if length == 0 {
-            // Spec says behavior is unspecified but server SHOULD NOT disconnect
             if self
                 .send_simple_reply(cookie, NBD_SUCCESS, &[])
                 .await
@@ -623,36 +630,75 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             gids: vec![],
         };
 
-        match self.filesystem.read(&auth, inode, offset, length).await {
-            Ok((data, _)) => {
-                if self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &data)
+        let shard_ranges = calculate_shard_ranges(offset, length as u64);
+
+        let mut read_futures = Vec::new();
+        for range in &shard_ranges {
+            let shard_name = nfsstring(format!("shard_{}", range.shard_index).into_bytes());
+            let filesystem = Arc::clone(&self.filesystem);
+            let auth_clone = auth.clone();
+            let range_clone = range.clone();
+
+            read_futures.push(async move {
+                match filesystem
+                    .lookup(&auth_clone, device_dir_inode, &shard_name)
                     .await
-                    .is_err()
                 {
+                    Ok(shard_inode) => {
+                        // Shard exists, read from it
+                        match filesystem
+                            .read(
+                                &auth_clone,
+                                shard_inode,
+                                range_clone.offset_in_shard,
+                                range_clone.length as u32,
+                            )
+                            .await
+                        {
+                            Ok((data, _)) => Ok(data),
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Err(_) => {
+                        // Shard doesn't exist - this is a hole, return zeros
+                        Ok(vec![0u8; range_clone.length as usize])
+                    }
+                }
+            });
+        }
+
+        let results = futures::future::join_all(read_futures).await;
+
+        let mut result_data = Vec::with_capacity(length as usize);
+        for result in results {
+            match result {
+                Ok(data) => result_data.extend_from_slice(&data),
+                Err(_) => {
+                    let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                     return NBD_EIO;
                 }
-                NBD_SUCCESS
-            }
-            Err(_) => {
-                let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                NBD_EIO
             }
         }
+
+        if self
+            .send_simple_reply(cookie, NBD_SUCCESS, &result_data)
+            .await
+            .is_err()
+        {
+            return NBD_EIO;
+        }
+        NBD_SUCCESS
     }
 
     async fn handle_write(
         &mut self,
-        inode: u64,
+        device_dir_inode: u64,
         cookie: u64,
         offset: u64,
         length: u32,
         flags: u16,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
-
-        // Check for out-of-bounds write
         if offset + length as u64 > device_size {
             // Must read and discard the data before sending error
             let mut data = vec![0u8; length as usize];
@@ -685,30 +731,78 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_EIO;
         }
 
-        match self.filesystem.write(&auth, inode, offset, &data).await {
-            Ok(_) => {
-                if (flags & NBD_CMD_FLAG_FUA) != 0 {
-                    if let Err(e) = self.filesystem.flush().await {
-                        error!("NBD write FUA flush failed: {:?}", e);
-                        let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                        return NBD_EIO;
-                    }
-                }
+        let shard_ranges = calculate_shard_ranges(offset, length as u64);
 
-                if self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &[])
+        let mut write_futures = Vec::new();
+        let mut data_offset = 0;
+
+        for range in shard_ranges {
+            let shard_name = nfsstring(format!("shard_{}", range.shard_index).into_bytes());
+            let filesystem = Arc::clone(&self.filesystem);
+            let auth_clone = auth.clone();
+            let shard_data = data[data_offset..data_offset + range.length as usize].to_vec();
+            data_offset += range.length as usize;
+
+            write_futures.push(async move {
+                // Get or create the shard
+                let shard_inode = match filesystem
+                    .lookup(&auth_clone, device_dir_inode, &shard_name)
                     .await
-                    .is_err()
                 {
-                    return NBD_EIO;
-                }
-                NBD_SUCCESS
-            }
-            Err(_) => {
+                    Ok(inode) => inode,
+                    Err(_) => {
+                        // Create the shard file
+                        let attr = sattr3 {
+                            mode: set_mode3::mode(0o600),
+                            uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
+                            gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
+                            size: zerofs_nfsserve::nfs::set_size3::Void,
+                            atime: zerofs_nfsserve::nfs::set_atime::DONT_CHANGE,
+                            mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
+                        };
+
+                        match filesystem
+                            .create(&auth_clone, device_dir_inode, &shard_name, attr)
+                            .await
+                        {
+                            Ok((inode, _)) => inode,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                };
+
+                // Write to the shard
+                filesystem
+                    .write(&auth_clone, shard_inode, range.offset_in_shard, &shard_data)
+                    .await
+            });
+        }
+
+        let results = futures::future::join_all(write_futures).await;
+
+        for result in results {
+            if result.is_err() {
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                NBD_EIO
+                return NBD_EIO;
             }
         }
+
+        if (flags & NBD_CMD_FLAG_FUA) != 0 {
+            if let Err(e) = self.filesystem.flush().await {
+                error!("NBD write FUA flush failed: {:?}", e);
+                let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
+                return NBD_EIO;
+            }
+        }
+
+        if self
+            .send_simple_reply(cookie, NBD_SUCCESS, &[])
+            .await
+            .is_err()
+        {
+            return NBD_EIO;
+        }
+        NBD_SUCCESS
     }
 
     async fn handle_flush(&mut self, cookie: u64) -> u32 {
@@ -800,13 +894,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_write_zeroes(
         &mut self,
-        inode: u64,
+        device_dir_inode: u64,
         cookie: u64,
         offset: u64,
         length: u32,
         flags: u16,
         device_size: u64,
     ) -> u32 {
+        use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
         use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
         if offset + length as u64 > device_size {
@@ -831,37 +926,75 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             gid: 0,
             gids: vec![],
         };
-        let zero_data = vec![0u8; length as usize];
 
-        match self
-            .filesystem
-            .write(&auth, inode, offset, &zero_data)
-            .await
-        {
-            Ok(_) => {
-                // Handle FUA flag - force unit access (flush after write_zeroes)
-                if (flags & NBD_CMD_FLAG_FUA) != 0 {
-                    if let Err(e) = self.filesystem.flush().await {
-                        error!("NBD write_zeroes FUA flush failed: {:?}", e);
-                        let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                        return NBD_EIO;
-                    }
-                }
+        let shard_ranges = calculate_shard_ranges(offset, length as u64);
 
-                if self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &[])
+        let mut write_futures = Vec::new();
+
+        for range in shard_ranges {
+            let shard_name = nfsstring(format!("shard_{}", range.shard_index).into_bytes());
+            let filesystem = Arc::clone(&self.filesystem);
+            let auth_clone = auth.clone();
+
+            write_futures.push(async move {
+                let shard_inode = match filesystem
+                    .lookup(&auth_clone, device_dir_inode, &shard_name)
                     .await
-                    .is_err()
                 {
-                    return NBD_EIO;
-                }
-                NBD_SUCCESS
-            }
-            Err(_) => {
+                    Ok(inode) => inode,
+                    Err(_) => {
+                        let attr = sattr3 {
+                            mode: set_mode3::mode(0o600),
+                            uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
+                            gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
+                            size: zerofs_nfsserve::nfs::set_size3::Void,
+                            atime: zerofs_nfsserve::nfs::set_atime::DONT_CHANGE,
+                            mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
+                        };
+
+                        match filesystem
+                            .create(&auth_clone, device_dir_inode, &shard_name, attr)
+                            .await
+                        {
+                            Ok((inode, _)) => inode,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                };
+
+                let zero_data = vec![0u8; range.length as usize];
+                filesystem
+                    .write(&auth_clone, shard_inode, range.offset_in_shard, &zero_data)
+                    .await
+            });
+        }
+
+        let results = futures::future::join_all(write_futures).await;
+
+        for result in results {
+            if result.is_err() {
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                NBD_EIO
+                return NBD_EIO;
             }
         }
+
+        // Handle FUA flag - force unit access (flush after write_zeroes)
+        if (flags & NBD_CMD_FLAG_FUA) != 0 {
+            if let Err(e) = self.filesystem.flush().await {
+                error!("NBD write_zeroes FUA flush failed: {:?}", e);
+                let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
+                return NBD_EIO;
+            }
+        }
+
+        if self
+            .send_simple_reply(cookie, NBD_SUCCESS, &[])
+            .await
+            .is_err()
+        {
+            return NBD_EIO;
+        }
+        NBD_SUCCESS
     }
 
     async fn handle_cache(
