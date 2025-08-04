@@ -21,6 +21,7 @@ pub const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
 pub const NBD_FLAG_SEND_FUA: u16 = 1 << 3;
 pub const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
 pub const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
+pub const NBD_FLAG_CAN_MULTI_CONN: u16 = 1 << 8;
 pub const NBD_FLAG_SEND_CACHE: u16 = 1 << 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
@@ -199,5 +200,6 @@ pub fn get_transmission_flags() -> u16 {
         | NBD_FLAG_SEND_FUA
         | NBD_FLAG_SEND_TRIM
         | NBD_FLAG_SEND_WRITE_ZEROES
+        | NBD_FLAG_CAN_MULTI_CONN
         | NBD_FLAG_SEND_CACHE
 }
