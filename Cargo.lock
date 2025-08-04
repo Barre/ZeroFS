@@ -1536,6 +1536,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "int-enum"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e366a1634cccc76b4cfd3e7580de9b605e4d93f1edac48d786c1f867c0def495"
+dependencies = [
+ "proc-macro2",
+ "proc-macro2-diagnostics",
+ "quote",
+ "syn 2.0.104",
+]
+
+[[package]]
 name = "io-uring"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3078,6 +3090,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-nbd"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a917f111985b88fb9f8f1cbee11c3d1787e613c3529e95c3e0bc300fbd6b1b68"
+dependencies = [
+ "bitflags 2.9.1",
+ "futures",
+ "int-enum",
+ "thiserror 2.0.12",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-rustls"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3904,6 +3929,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tikv-jemallocator",
  "tokio",
+ "tokio-nbd",
  "tracing",
  "tracing-subscriber",
  "url",

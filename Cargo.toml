@@ -45,6 +45,7 @@ libc = "0.2"
 rayon = "1.10"
 dashmap = "6.1"
 uuid = { version = "1.17", features = ["v4"] }
+tokio-nbd = "0.2.0"
 
 [patch.crates-io]
 object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4", features = [

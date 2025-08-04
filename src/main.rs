@@ -20,8 +20,9 @@ mod test_helpers;
 mod posix_tests;
 
 use crate::filesystem::{CacheConfig, SlateDbFs};
-use crate::nbd::NBDServer;
+use crate::nbd::DeviceManager;
 use std::sync::Arc;
+use tokio_nbd::server::NbdServer;
 use tracing::info;
 
 #[cfg(not(target_env = "msvc"))]
@@ -392,34 +393,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for (&port, &size) in ports.iter().zip(sizes.iter()) {
-            let mut nbd_server = NBDServer::new(Arc::clone(&fs_arc), nbd_host.clone(), port);
-            nbd_server.add_device(format!("device_{port}"), size);
+            let file_system = Arc::clone(&fs_arc);
+
+            let mut device_manager = DeviceManager::new(file_system);
+
+            device_manager.add_device(format!("device_{port}"), size);
+
+            let devices = device_manager.devices;
 
             info!(
                 "Starting NBD server on {}:{} with device size {} GB",
-                nbd_host,
+                &nbd_host,
                 port,
                 size as f64 / (1024.0 * 1024.0 * 1024.0)
             );
 
-            let nbd_handle = tokio::spawn(async move {
-                if let Err(e) = nbd_server.start().await {
-                    if e.kind() == std::io::ErrorKind::InvalidInput
-                        && e.to_string().contains("size mismatch")
-                    {
-                        eprintln!("NBD Device Size Error: {e}");
-                        eprintln!();
-                        eprintln!("To fix this issue:");
-                        eprintln!("   • Use the same device size as before, OR");
-                        eprintln!("   • Delete the existing device file via NFS and restart");
-                        eprintln!("   • Example: rm /mnt/zerofs/.nbd/device_{port}");
-                        std::process::exit(1);
-                    }
-                    Err(e)
-                } else {
-                    Ok(())
-                }
-            });
+            let host = nbd_host.clone();
+
+            let nbd_handle =
+                tokio::spawn(async move { NbdServer::listen(devices, &host, Some(port)).await });
             nbd_handles.push(nbd_handle);
         }
     }
