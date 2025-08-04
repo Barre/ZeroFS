@@ -1,0 +1,240 @@
+export const metadata = {
+  title: '9P File Access',
+  description: 'Mount ZeroFS using the 9P protocol for high-performance file access on Linux.',
+}
+
+# 9P File Access
+
+The 9P protocol provides an alternative way to mount ZeroFS on Linux systems. Originally from Plan 9, the 9P2000.L variant is optimized specifically for Linux and can offer better performance than NFS for certain workloads. {{ className: 'lead' }}
+
+<Note>
+9P provides correct fsync semantics, making it the preferred choice for applications that require durability guarantees (databases, transactional systems). NFS has limitations with fsync due to its COMMIT protocol design.
+</Note>
+
+## Installation
+
+9P support is included in the Linux kernel. You may need to load the module:
+
+```bash
+# Load 9P modules
+sudo modprobe 9p
+sudo modprobe 9pnet_tcp
+
+# Verify modules are loaded
+lsmod | grep 9p
+```
+
+## Basic Usage
+
+### Mounting ZeroFS
+
+```bash
+# Create mount point
+sudo mkdir -p /mnt/zerofs-9p
+
+# Mount via 9P
+sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs-9p
+```
+
+### Unmounting
+
+```bash
+sudo umount /mnt/zerofs-9p
+```
+
+## Mount Options
+
+### Required Options
+
+| Option | Description |
+|--------|-------------|
+| `trans=tcp` | Use TCP transport |
+| `port=5564` | ZeroFS 9P port |
+| `version=9p2000.L` | Use Linux-specific 9P version |
+
+### Performance Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `msize=N` | Maximum message size in bytes | 8192 |
+| `cache=mode` | Caching mode (see below) | none |
+| `access=mode` | Access check mode | user |
+
+### Cache Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `none` | No caching, direct I/O | Maximum consistency |
+| `loose` | Relaxed consistency | Best performance |
+| `fscache` | Persistent cache | Cache survives unmount |
+| `mmap` | Enable mmap support | Required for memory-mapped file access |
+
+<Note>
+The `cache=mmap` option doesn't create a cache - it enables support for memory-mapped files. Use this only if your applications use mmap() system calls. For general performance, use `cache=loose`.
+</Note>
+
+## Configuration
+
+### Persistent Mount
+
+Add to `/etc/fstab`:
+
+```bash
+# Basic persistent mount
+127.0.0.1 /mnt/zerofs-9p 9p trans=tcp,port=5564,version=9p2000.L,_netdev 0 0
+
+# With performance options
+127.0.0.1 /mnt/zerofs-9p 9p trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=loose,_netdev 0 0
+```
+
+### Systemd Mount Unit
+
+Create `/etc/systemd/system/mnt-zerofs-9p.mount`:
+
+```ini
+[Unit]
+Description=ZeroFS 9P Mount
+After=network.target
+
+[Mount]
+What=127.0.0.1
+Where=/mnt/zerofs-9p
+Type=9p
+Options=trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=loose,_netdev
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable mnt-zerofs-9p.mount
+sudo systemctl start mnt-zerofs-9p.mount
+```
+
+## Performance Tuning
+
+### Message Size
+
+Larger message sizes improve throughput for sequential I/O:
+
+```bash
+# Low (8KB)
+-o msize=8192
+
+# Recommended (1MB)
+-o msize=1048576
+```
+
+### Cache Mode Selection
+
+Choose based on your workload:
+
+```bash
+# Development - frequent file changes
+sudo mount -t 9p -o cache=none ...
+
+# Applications using mmap (databases, etc.)
+sudo mount -t 9p -o cache=mmap ...
+
+# Best performance, accept some inconsistency
+sudo mount -t 9p -o cache=loose ...
+```
+
+## Troubleshooting
+
+### Mount Fails
+
+```bash
+# Check if ZeroFS is running
+ps aux | grep zerofs
+
+# Verify 9P port is open
+nc -zv 127.0.0.1 5564
+
+# Check kernel modules
+lsmod | grep 9p
+
+# Enable debug messages
+sudo mount -t 9p -o trans=tcp,port=5564,debug=0x1ff 127.0.0.1 /mnt/test
+```
+
+### Performance Issues
+
+```bash
+# Check current mount options
+mount | grep 9p
+
+# Test with different cache modes
+for mode in none mmap loose; do
+    echo "Testing cache=$mode"
+    sudo umount /mnt/zerofs-9p
+    sudo mount -t 9p -o cache=$mode,msize=1048576,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-9p
+    # Run your benchmark
+done
+```
+
+## 9P vs NFS Comparison
+
+### When to Use 9P
+
+- Linux-only environments
+- Need maximum performance on Linux
+- Simpler protocol overhead is beneficial
+- Applications requiring correct fsync behavior (databases, transactional systems)
+
+### When to Use NFS
+
+- Cross-platform compatibility needed
+- macOS or Windows clients
+- Need automatic reconnection on network issues
+- Existing NFS infrastructure and tooling
+
+### Performance Characteristics
+
+| Aspect | 9P | NFS |
+|--------|----|----|
+| Protocol Overhead | Lower | Higher |
+| Linux Performance | Better | Good |
+| Cross-Platform | Linux only | Universal |
+| fsync Behavior | Correct | Limited* |
+
+*NFS COMMIT semantics may not provide expected durability guarantees for fsync operations
+
+## Security Considerations
+
+<Warning>
+Like the NFS server, ZeroFS's 9P server has no built-in authentication:
+- Bind to localhost only (default behavior)
+- Use firewall rules for network access
+- Consider SSH tunneling for remote access
+- No encryption - use VPN or tunnel for sensitive data
+</Warning>
+
+## Advanced Usage
+
+### Multiple Cache Modes
+
+Mount the same filesystem with different cache modes:
+
+```bash
+# Consistent mount for important operations
+sudo mount -t 9p -o cache=none,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-consistent
+
+# Performance mount for read-heavy operations  
+sudo mount -t 9p -o cache=loose,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-fast
+```
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/nbd-devices" arrow="right">
+    <>Explore NBD block devices</>
+  </Button>
+  <Button href="/nfs-access" variant="outline">
+    <>Compare with NFS</>
+  </Button>
+</div>
