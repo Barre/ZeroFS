@@ -8,6 +8,7 @@ use foyer::{
     DirectFsDeviceOptions, Engine, HybridCacheBuilder, RuntimeOptions, TokioRuntimeOptions,
 };
 use slatedb::config::ObjectStoreCacheOptions;
+use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{ObjectStore, path::Path};
@@ -172,6 +173,7 @@ impl SlateDbFs {
         let hybrid_cache = Arc::new(FoyerHybridCache::new_with_cache(
             HybridCacheBuilder::new()
                 .memory(slatedb_memory_cache_bytes as usize / CHUNK_SIZE)
+                .with_weighter(|_, v: &CachedEntry| v.size())
                 .storage(Engine::Large)
                 .with_runtime_options(RuntimeOptions::Separated {
                     read_runtime_options: TokioRuntimeOptions::default(),
