@@ -7,19 +7,6 @@ use tracing::{debug, error};
 use crate::filesystem::SlateDbFs;
 use zerofs_nfsserve::nfs::nfsstat3;
 
-#[derive(Clone)]
-pub struct NBDDevice {
-    pub name: String,
-    pub size: u64,
-}
-
-// pub struct ZeroFSDriver {
-//     filesystem: Arc<SlateDbFs>,
-//     devices: HashMap<String, NBDDevice>,
-//     host: String,
-//     port: u16,
-// }
-
 pub struct ZeroFSDevice {
     filesystem: Arc<SlateDbFs>,
     name: String,
@@ -78,17 +65,11 @@ impl NbdDriver for ZeroFSDevice {
 
     async fn read(
         &self,
-        flags: tokio_nbd::flags::CommandFlags,
+        _flags: tokio_nbd::flags::CommandFlags,
         offset: u64,
         length: u32,
     ) -> std::result::Result<Vec<u8>, ProtocolError> {
         use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
-
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
 
         // Handle zero-length read
         // TODO Consider having the driver handle this edge case
@@ -146,7 +127,7 @@ impl NbdDriver for ZeroFSDevice {
             // If FUA is set, we should flush the filesystem to ensure data is written
             self.filesystem.db.flush().await.map_err(|e| {
                 error!("Failed to flush database after write: {}", e);
-                map_err(e)
+                ProtocolError::IO
             })?;
         }
 
@@ -189,7 +170,7 @@ impl NbdDriver for ZeroFSDevice {
             // If FUA is set, we should flush the filesystem to ensure data is written
             self.filesystem.db.flush().await.map_err(|e| {
                 error!("Failed to flush database after trim: {}", e);
-                map_err(e)
+                ProtocolError::IO
             })?;
         }
 

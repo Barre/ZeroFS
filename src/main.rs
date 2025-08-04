@@ -397,7 +397,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut device_manager = DeviceManager::new(file_system);
 
-            device_manager.add_device(format!("device_{port}"), size);
+            device_manager
+                .add_device(format!("device_{port}"), size)
+                .await?;
 
             let devices = device_manager.devices;
 
