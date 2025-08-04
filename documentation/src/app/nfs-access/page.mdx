@@ -1,0 +1,230 @@
+export const metadata = {
+  title: 'NFS File Access',
+  description: 'Mount ZeroFS as a network filesystem using NFS protocol.',
+}
+
+# NFS File Access
+
+Network File System (NFS) allows ZeroFS to share directories and files with clients over a network. Users and programs can access files on the ZeroFS mount almost as if they were local files. {{ className: 'lead' }}
+
+## Installation
+
+No installation required - NFS clients are included in most operating systems:
+
+- **macOS**: Built-in NFS support
+- **Linux**: Usually pre-installed; if not: `sudo apt install nfs-common` (Debian/Ubuntu) or `sudo yum install nfs-utils` (RHEL/CentOS)
+- **Windows**: Enable "Services for NFS" in Windows Features
+
+## Basic Usage
+
+### Mounting ZeroFS
+
+<CodeGroup>
+
+```bash {{ title: 'macOS' }}
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Mount ZeroFS
+sudo mount -t nfs -o nolocks,vers=3,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Linux' }}
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Mount ZeroFS
+sudo mount -t nfs -o vers=3,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Windows' }}
+# In PowerShell as Administrator
+New-Item -ItemType Directory -Force -Path C:\mnt\zerofs
+mount -o anon \\127.0.0.1\zerofs Z:
+```
+
+</CodeGroup>
+
+### Unmounting
+
+```bash
+# macOS/Linux
+sudo umount /mnt/zerofs
+
+# Windows
+umount Z:
+```
+
+## Mount Options
+
+### Required Options
+
+| Option | Description |
+|--------|-------------|
+| `vers=3` | Use NFS version 3 (required by ZeroFS) |
+| `tcp` | Use TCP transport |
+| `port=2049` | ZeroFS NFS port |
+| `mountport=2049` | Mount protocol port |
+| `nolock`/`nolocks` | Disable NFS locking |
+
+### Performance Options
+
+| Option | Description |
+|--------|-------------|
+| `async` | Asynchronous I/O (better performance) |
+| `rsize=1048576` | Read buffer size (1MB) |
+| `wsize=1048576` | Write buffer size (1MB) |
+| `actimeo=120` | Cache attributes for 120 seconds |
+
+### Reliability Options
+
+| Option | Description |
+|--------|-------------|
+| `hard` | Retry indefinitely on failure |
+| `soft` | Fail after retrans attempts |
+| `timeo=600` | Timeout in deciseconds (60s) |
+| `retrans=3` | Number of retries |
+
+## Configuration
+
+### Persistent Mounts
+
+Add to `/etc/fstab` for automatic mounting:
+
+```bash
+# Linux
+127.0.0.1:/ /mnt/zerofs nfs vers=3,nolock,tcp,port=2049,mountport=2049,_netdev 0 0
+
+# With performance options
+127.0.0.1:/ /mnt/zerofs nfs vers=3,nolock,tcp,port=2049,mountport=2049,async,rsize=1048576,wsize=1048576,_netdev 0 0
+```
+
+<Note>
+The `_netdev` option ensures the mount waits for network availability during boot.
+</Note>
+
+### Multi-Client Access
+
+To allow access from multiple machines:
+
+```bash
+# Start ZeroFS listening on all interfaces
+ZEROFS_NFS_HOST=0.0.0.0 zerofs s3://bucket/path
+
+# From client machines
+sudo mount -t nfs -o vers=3,nolock,tcp server-ip:/ /mnt/zerofs
+```
+
+## Troubleshooting
+
+### Mount Fails
+
+```bash
+# Check if ZeroFS is running
+ps aux | grep zerofs
+
+# Verify port is open
+nc -zv 127.0.0.1 2049
+
+# Check for errors
+dmesg | tail -20
+
+# Try verbose mount
+mount -v -t nfs -o vers=3,nolock,tcp 127.0.0.1:/ /mnt/zerofs
+```
+
+### Permission Denied
+
+```bash
+# NFS uses numeric UIDs/GIDs
+# Check your UID
+id -u
+
+# Files created by different UIDs may not be accessible
+# Use consistent UIDs across systems or run ZeroFS with specific UID
+```
+
+### Stale File Handle
+
+```bash
+# Unmount and remount
+sudo umount -f /mnt/zerofs
+sudo mount -t nfs -o vers=3,nolock,tcp 127.0.0.1:/ /mnt/zerofs
+```
+
+### Performance Issues
+
+```bash
+# Check mount options
+mount | grep zerofs
+
+# Add performance options if missing
+sudo mount -o remount,async,rsize=1048576,wsize=1048576 /mnt/zerofs
+
+# Monitor NFS statistics
+nfsstat -c  # Client statistics
+```
+
+## Advanced Usage
+
+### Custom NFS Port
+
+```bash
+# Start ZeroFS on custom port
+ZEROFS_NFS_HOST_PORT=2050 zerofs s3://bucket/path
+
+# Mount using custom port
+sudo mount -t nfs -o vers=3,nolock,tcp,port=2050,mountport=2050 127.0.0.1:/ /mnt/zerofs
+```
+
+### Read-Only Mount
+
+```bash
+# Mount as read-only
+sudo mount -t nfs -o vers=3,nolock,tcp,ro 127.0.0.1:/ /mnt/zerofs-ro
+```
+
+### Autofs Configuration
+
+For on-demand mounting, configure autofs:
+
+```bash
+# /etc/auto.master
+/mnt/auto /etc/auto.zerofs --timeout=60
+
+# /etc/auto.zerofs
+zerofs -fstype=nfs,vers=3,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/
+```
+
+## Security Considerations
+
+<Warning>
+ZeroFS NFS server does not implement authentication or access control. Consider:
+- Binding to localhost only (default)
+- Using firewall rules to restrict access
+- Running ZeroFS in isolated networks
+- Using VPN for remote access
+</Warning>
+
+## NFS Limitations
+
+Be aware of these NFS characteristics:
+
+- **No File Locking**: ZeroFS doesn't support NFS locking protocols
+- **UID/GID Mapping**: NFS uses numeric IDs, not usernames
+- **Stateless Protocol**: No persistent connections
+- **Cache Coherency**: Multiple clients may see stale data briefly
+- **fsync Limitations**: Due to NFS COMMIT semantics, fsync operations may not provide the durability guarantees expected. Applications requiring strict fsync behavior should consider using 9P instead.
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/9p-access" arrow="right">
+    <>Try 9P for better Linux performance</>
+  </Button>
+  <Button href="/troubleshooting" variant="outline">
+    <>Troubleshooting guide</>
+  </Button>
+</div>
