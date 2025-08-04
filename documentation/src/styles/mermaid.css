@@ -1,0 +1,173 @@
+.mermaid-chart {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  --tw-prose-body: #374151;
+  --tw-prose-headings: #111827;
+  --tw-prose-links: #111827;
+  --tw-prose-code: #111827;
+}
+
+.mermaid-chart rect.actor,
+.mermaid-chart rect.note,
+.mermaid-chart rect.labelBox,
+.mermaid-chart .node rect,
+.mermaid-chart .node circle,
+.mermaid-chart .node ellipse,
+.mermaid-chart .node polygon {
+  stroke-width: 1px;
+  rx: 8px;
+}
+
+.mermaid-chart .cluster rect {
+  stroke-width: 1px;
+  rx: 12px;
+  stroke-dasharray: 2, 2;
+  opacity: 0.5;
+  fill: #fafafa !important;
+}
+
+.dark .mermaid-chart .cluster rect {
+  fill: rgba(255, 255, 255, 0.02) !important;
+}
+
+.mermaid-chart .cluster-label {
+  font-weight: 500;
+  font-size: 13px;
+  letter-spacing: -0.01em;
+}
+
+.mermaid-chart .node rect,
+.mermaid-chart .node circle,
+.mermaid-chart .node ellipse,
+.mermaid-chart .actor {
+  filter: none;
+}
+
+.mermaid-chart text {
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  text-rendering: optimizeLegibility;
+}
+
+.mermaid-chart .nodeLabel {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.mermaid-chart .edgeLabel {
+  font-size: 12px;
+  font-weight: 400;
+  background: var(--background, white);
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.dark .mermaid-chart .edgeLabel {
+  background: var(--background, #18181b);
+}
+
+.mermaid-chart .actor {
+  stroke-width: 1px;
+  rx: 6px;
+}
+
+.mermaid-chart .actor-line {
+  stroke-width: 1px;
+  opacity: 0.1;
+}
+
+.mermaid-chart .messageText {
+  font-size: 13px;
+  font-weight: 400;
+  fill: currentColor !important;
+}
+
+.mermaid-chart .note {
+  stroke-width: 1px;
+  rx: 8px;
+  opacity: 0.8;
+}
+
+.mermaid-chart .messageLine0,
+.mermaid-chart .messageLine1 {
+  stroke-width: 1.5px;
+  opacity: 0.4;
+}
+
+.mermaid-chart marker path {
+  stroke-width: 1px;
+  fill: currentColor !important;
+}
+
+.mermaid-chart .loopLine {
+  stroke-width: 1px;
+  stroke-dasharray: none;
+  opacity: 0.1;
+}
+
+.mermaid-chart .loopText {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  fill: #3b82f6 !important;
+}
+
+.dark .mermaid-chart .loopText {
+  fill: #60a5fa !important;
+}
+
+.mermaid-chart .flowchart-link {
+  stroke-width: 2px;
+}
+
+.mermaid-chart .node .label {
+  text-shadow: none;
+}
+
+.mermaid-chart text {
+  fill: currentColor;
+}
+
+.mermaid-chart .activation0,
+.mermaid-chart .activation1,
+.mermaid-chart .activation2 {
+  stroke-width: 1px !important;
+  opacity: 1 !important;
+}
+
+.mermaid-chart .edgeLabel rect {
+  fill: white !important;
+  stroke: none !important;
+}
+
+.dark .mermaid-chart .edgeLabel rect {
+  fill: #18181b !important;
+}
+
+.mermaid-chart .node rect,
+.mermaid-chart .node circle,
+.mermaid-chart .node ellipse {
+  rx: 4px;
+}
+
+.mermaid-chart svg {
+  background: transparent !important;
+}
+
+.mermaid-chart .edgeLabel rect {
+  rx: 4px;
+  stroke: none !important;
+}
+
+.mermaid-chart .node:hover {
+  cursor: pointer;
+  opacity: 0.9;
+}
+
+.mermaid-chart .activation0,
+.mermaid-chart .activation1,
+.mermaid-chart .activation2 {
+  stroke-width: 1px;
+}
