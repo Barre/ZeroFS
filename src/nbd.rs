@@ -6,6 +6,13 @@ use tracing::{debug, error};
 
 use crate::filesystem::SlateDbFs;
 use zerofs_nfsserve::nfs::nfsstat3;
+use zerofs_nfsserve::vfs::AuthContext;
+
+const ROOT_AUTH_CONTEXT: AuthContext = AuthContext {
+    uid: 0,
+    gid: 0,
+    gids: vec![],
+};
 
 pub struct ZeroFSDevice {
     filesystem: Arc<SlateDbFs>,
@@ -69,7 +76,7 @@ impl NbdDriver for ZeroFSDevice {
         offset: u64,
         length: u32,
     ) -> std::result::Result<Vec<u8>, ProtocolError> {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         // Handle zero-length read
         // TODO Consider having the driver handle this edge case
@@ -77,15 +84,9 @@ impl NbdDriver for ZeroFSDevice {
             return Ok(vec![]);
         }
 
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
-
         let (data, _eof) = self
             .filesystem
-            .read(&auth, self.device_inode, offset, length)
+            .read(&ROOT_AUTH_CONTEXT, self.device_inode, offset, length)
             .await
             .map_err(|e| {
                 error!("NBD read failed: {:?}", e);
@@ -101,7 +102,7 @@ impl NbdDriver for ZeroFSDevice {
         offset: u64,
         data: Vec<u8>,
     ) -> std::result::Result<(), ProtocolError> {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         // Handle zero-length write
         // TODO Consider having the driver handle this edge case
@@ -109,14 +110,8 @@ impl NbdDriver for ZeroFSDevice {
             return Ok(());
         }
 
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
-
         self.filesystem
-            .write(&auth, self.device_inode, offset, &data)
+            .write(&ROOT_AUTH_CONTEXT, self.device_inode, offset, &data)
             .await
             .map_err(|e| {
                 error!("NBD write failed: {:?}", e);
@@ -150,16 +145,8 @@ impl NbdDriver for ZeroFSDevice {
         offset: u64,
         length: u32,
     ) -> std::result::Result<(), ProtocolError> {
-        use zerofs_nfsserve::vfs::AuthContext;
-
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
-
         self.filesystem
-            .trim(&auth, self.device_inode, offset, length as u64)
+            .trim(&ROOT_AUTH_CONTEXT, self.device_inode, offset, length as u64)
             .await
             .map_err(|e| {
                 error!("NBD trim failed: {:?}", e);
@@ -183,22 +170,17 @@ impl NbdDriver for ZeroFSDevice {
         offset: u64,
         length: u32,
     ) -> std::result::Result<(), ProtocolError> {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         // Handle zero-length write_zeroes
         if length == 0 {
             return Ok(());
         }
 
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
         let zero_data = vec![0u8; length as usize];
 
         self.filesystem
-            .write(&auth, self.device_inode, offset, &zero_data)
+            .write(&ROOT_AUTH_CONTEXT, self.device_inode, offset, &zero_data)
             .await
             .map_err(|e| {
                 error!("NBD write_zeroes failed: {:?}", e);
@@ -272,26 +254,30 @@ impl DeviceManager {
         device_size: u64,
     ) -> std::io::Result<u64> {
         use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
         let nbd_name = nfsstring(b".nbd".to_vec());
         let device_name = nfsstring(device_name.as_bytes().to_vec());
 
         // Check if device file exists, create it if not
-        let nbd_dir_inode = filesystem.lookup(&auth, 0, &nbd_name).await.map_err(|e| {
-            std::io::Error::other(format!("Failed to lookup .nbd directory: {e:?}"))
-        })?;
+        let nbd_dir_inode = filesystem
+            .lookup(&ROOT_AUTH_CONTEXT, 0, &nbd_name)
+            .await
+            .map_err(|e| {
+                std::io::Error::other(format!("Failed to lookup .nbd directory: {e:?}"))
+            })?;
 
-        match filesystem.lookup(&auth, nbd_dir_inode, &device_name).await {
+        match filesystem
+            .lookup(&ROOT_AUTH_CONTEXT, nbd_dir_inode, &device_name)
+            .await
+        {
             Ok(device_inode) => {
-                let existing_attr = filesystem.getattr(&auth, device_inode).await.map_err(|e| {
-                    std::io::Error::other(format!("Failed to get device attributes: {e:?}"))
-                })?;
+                let existing_attr = filesystem
+                    .getattr(&ROOT_AUTH_CONTEXT, device_inode)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::other(format!("Failed to get device attributes: {e:?}"))
+                    })?;
 
                 if existing_attr.size != device_size {
                     return Err(std::io::Error::new(
@@ -324,7 +310,7 @@ impl DeviceManager {
                 };
 
                 let (device_inode, _) = filesystem
-                    .create(&auth, nbd_dir_inode, &device_name, attr)
+                    .create(&ROOT_AUTH_CONTEXT, nbd_dir_inode, &device_name, attr)
                     .await
                     .map_err(|e| {
                         std::io::Error::other(format!("Failed to create device file: {e:?}"))
@@ -334,7 +320,7 @@ impl DeviceManager {
                 if device_size > 0 {
                     let data = vec![0u8; 1];
                     filesystem
-                        .write(&auth, device_inode, device_size - 1, &data)
+                        .write(&ROOT_AUTH_CONTEXT, device_inode, device_size - 1, &data)
                         .await
                         .map_err(|e| {
                             std::io::Error::other(format!("Failed to set device size: {e:?}"))
