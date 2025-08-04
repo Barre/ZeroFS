@@ -1,0 +1,313 @@
+export const metadata = {
+  title: 'Troubleshooting',
+  description:
+    'Common issues and solutions for ZeroFS, including mount problems, performance issues, S3 connectivity errors, and debugging techniques.',
+}
+
+# Troubleshooting
+
+This guide helps you diagnose and resolve common issues with ZeroFS. From mount failures to performance problems, we'll walk through systematic debugging steps and solutions for the most frequent problems users encounter. {{ className: 'lead' }}
+
+<Note>
+  Enable debug logging with `export RUST_LOG=zerofs=debug` to get detailed information about what ZeroFS is doing internally.
+</Note>
+
+## Common Issues
+
+### Mount Failures
+
+<CodeGroup>
+
+```bash {{ title: 'Permission Denied' }}
+# Error: mount.nfs: access denied by server
+# Solution: Check NFS port and permissions
+
+# Verify ZeroFS is running
+ps aux | grep zerofs
+
+# Check if port is listening
+netstat -tlnp | grep 2049
+# or
+ss -tlnp | grep 2049
+
+# Try mounting with verbose output
+sudo mount -v -t nfs -o vers=3,tcp,port=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Connection Refused' }}
+# Error: mount.nfs: Connection refused
+# Solution: Ensure ZeroFS is running and bound to correct address
+
+# Check ZeroFS logs
+journalctl -u zerofs -f
+
+# Verify bind address
+export ZEROFS_NFS_HOST='0.0.0.0'  # Listen on all interfaces
+export ZEROFS_NFS_HOST_PORT='2049'
+
+# Test connectivity
+telnet 127.0.0.1 2049
+```
+
+```bash {{ title: 'Protocol Not Supported' }}
+# Error: mount.nfs: Protocol not supported
+# Solution: Use NFSv3 explicitly
+
+# macOS
+mount -t nfs -o vers=3,tcp 127.0.0.1:/ /mnt/zerofs
+
+# Linux
+mount -t nfs -o vers=3,tcp 127.0.0.1:/ /mnt/zerofs
+
+# Note: ZeroFS only supports NFSv3
+```
+
+</CodeGroup>
+
+### S3 Connectivity Issues
+
+<CodeGroup>
+
+```bash {{ title: 'Invalid Credentials' }}
+# Error: InvalidAccessKeyId or SignatureDoesNotMatch
+# Solution: Verify AWS credentials
+
+# Test credentials directly
+aws s3 ls s3://your-bucket/ --debug
+
+# Check environment variables
+echo $AWS_ACCESS_KEY_ID
+echo $AWS_SECRET_ACCESS_KEY
+echo $AWS_DEFAULT_REGION
+
+# For S3-compatible services
+export AWS_ENDPOINT='https://s3.wasabisys.com'
+export AWS_ALLOW_HTTP='false'
+```
+
+```bash {{ title: 'Bucket Not Found' }}
+# Error: NoSuchBucket
+# Solution: Verify bucket name and region
+
+# List available buckets
+aws s3 ls
+
+# Check bucket region
+aws s3api get-bucket-location --bucket your-bucket
+
+# Set correct region
+export AWS_DEFAULT_REGION='us-west-2'
+```
+
+```bash {{ title: 'Network Timeouts' }}
+# Error: Connection timeout
+# Solution: Check network and firewall
+
+# Test S3 connectivity
+curl -I https://s3.amazonaws.com
+
+# Check firewall rules
+sudo iptables -L -n | grep 443
+
+# For corporate networks, set proxy
+export HTTP_PROXY='http://proxy.company.com:8080'
+export HTTPS_PROXY='http://proxy.company.com:8080'
+```
+
+</CodeGroup>
+
+### Cache Problems
+
+<CodeGroup>
+
+```bash {{ title: 'Cache Directory Issues' }}
+# Error: Failed to create cache directory
+# Solution: Check permissions and disk space
+
+# Verify cache directory exists
+ls -la $SLATEDB_CACHE_DIR
+
+# Check disk space
+df -h $SLATEDB_CACHE_DIR
+
+# Fix permissions
+sudo mkdir -p /var/cache/zerofs
+sudo chown $USER:$USER /var/cache/zerofs
+chmod 755 /var/cache/zerofs
+
+# Verify write access
+touch $SLATEDB_CACHE_DIR/test && rm $SLATEDB_CACHE_DIR/test
+```
+
+```bash {{ title: 'Cache Size Errors' }}
+# Error: Invalid cache size
+# Solution: Use positive integer for GB
+
+# Correct format (integer only)
+export SLATEDB_CACHE_SIZE_GB='50'
+
+# Wrong formats:
+# export SLATEDB_CACHE_SIZE_GB='50GB'  # Don't include unit
+# export SLATEDB_CACHE_SIZE_GB='50.5'  # No decimals
+# export SLATEDB_CACHE_SIZE_GB=''      # Must be set
+```
+
+</CodeGroup>
+
+## Encryption Issues
+
+### Password Problems
+
+```bash
+# Error: Failed to decrypt
+# Wrong password or corrupted data
+
+# Verify password is correct
+export ZEROFS_ENCRYPTION_PASSWORD='correct-password'
+
+# Check for special characters that need escaping
+# Use single quotes to avoid shell interpretation
+export ZEROFS_ENCRYPTION_PASSWORD='p@$$w0rd!'
+
+# If password was changed, use new password
+export ZEROFS_ENCRYPTION_PASSWORD='new-password'
+```
+
+### Changing Passwords
+
+```bash
+# Error: Password change failed
+# Solution: Ensure both passwords are set correctly
+
+export ZEROFS_ENCRYPTION_PASSWORD='current-password'
+export ZEROFS_NEW_PASSWORD='new-password'
+zerofs s3://bucket/path
+
+# Verify change worked by running with new password
+unset ZEROFS_NEW_PASSWORD
+export ZEROFS_ENCRYPTION_PASSWORD='new-password'
+zerofs s3://bucket/path
+```
+
+## NBD Issues
+
+### Device Connection
+
+```bash
+# Error: nbd-client connection failed
+# Solution: Check ports and device availability
+
+# Verify NBD ports are configured
+echo $ZEROFS_NBD_PORTS
+echo $ZEROFS_NBD_DEVICE_SIZES_GB
+
+# Check if ports are listening
+ss -tlnp | grep 10809
+
+# Ensure NBD module is loaded (Linux)
+sudo modprobe nbd
+lsmod | grep nbd
+
+# Connect with explicit device name
+nbd-client -N device_10809 127.0.0.1 10809 /dev/nbd0
+```
+
+### Device Size Mismatches
+
+```bash
+# Error: Device size cannot be changed
+# Solution: Delete and recreate device
+
+# Remove existing device file
+rm /mnt/zerofs/.nbd/device_10809
+
+# Restart ZeroFS with new size
+export ZEROFS_NBD_DEVICE_SIZES_GB='100'
+zerofs s3://bucket/path
+```
+
+## Debugging Techniques
+
+### Enable Detailed Logging
+
+```bash
+# Maximum verbosity
+export RUST_LOG='zerofs=trace,slatedb=debug'
+
+# Log to file for analysis
+export RUST_LOG='zerofs=debug'
+zerofs s3://bucket/path 2>&1 | tee zerofs.log
+
+# Filter specific components
+export RUST_LOG='zerofs::nfs=trace,zerofs::cache=debug'
+```
+
+### System Monitoring
+
+<CodeGroup>
+
+```bash {{ title: 'Resource Usage' }}
+# Monitor CPU and memory
+htop
+# or
+top -p $(pgrep zerofs)
+
+# I/O statistics
+iotop -p $(pgrep zerofs)
+
+# Network traffic
+iftop -i eth0  # Watch for S3 traffic
+```
+
+```bash {{ title: 'Trace System Calls' }}
+# Trace ZeroFS system calls
+strace -f -p $(pgrep zerofs) -o zerofs-strace.log
+
+# Trace specific operations
+strace -f -e open,read,write -p $(pgrep zerofs)
+
+# Trace network calls
+strace -f -e network -p $(pgrep zerofs)
+```
+
+```bash {{ title: 'Performance Profiling' }}
+# CPU profiling
+perf record -p $(pgrep zerofs) -g -- sleep 60
+perf report
+
+# Flame graphs
+git clone https://github.com/brendangregg/FlameGraph
+perf record -F 99 -p $(pgrep zerofs) -g -- sleep 30
+perf script | FlameGraph/stackcollapse-perf.pl | FlameGraph/flamegraph.pl > zerofs-flame.svg
+```
+
+</CodeGroup>
+
+## Recovery Procedures
+
+### Corrupted Cache
+
+```bash
+# Symptoms: Crashes, data inconsistency
+# Solution: Clear and rebuild cache
+
+# Stop ZeroFS
+systemctl stop zerofs
+
+# Backup cache (optional)
+mv $SLATEDB_CACHE_DIR $SLATEDB_CACHE_DIR.backup
+
+# Clear cache
+rm -rf $SLATEDB_CACHE_DIR/*
+
+# Restart ZeroFS
+systemctl start zerofs
+
+# Cache will rebuild automatically
+```
+
+<div className="not-prose">
+  <Button href="/advanced-use-cases" variant="text" arrow="right">
+    <>Explore advanced use cases</>
+  </Button>
+</div>

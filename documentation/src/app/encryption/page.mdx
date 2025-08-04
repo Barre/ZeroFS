@@ -1,0 +1,198 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'Encryption & Security',
+  description:
+    'Learn how ZeroFS protects your data with ChaCha20-Poly1305 encryption, secure key management, and best practices for production deployments.',
+}
+
+# Encryption & Security
+
+ZeroFS encrypts all your data by default using ChaCha20-Poly1305. In this guide, we'll explore how encryption works, what's protected, and security best practices for deployments. {{ className: 'lead' }}
+
+## How Encryption Works
+
+<Row>
+  <Col>
+
+    ### Key Architecture
+
+    1. **Data Encryption Key (DEK)**: A 256-bit key that encrypts your actual data
+    2. **Key Encryption Key (KEK)**: Derived from your password using Argon2id
+    3. **Encrypted DEK Storage**: The DEK is encrypted with the KEK and stored in the database
+
+    This approach allows you to change your password without re-encrypting all data.
+
+    ### Encryption Algorithm
+
+    - **Algorithm**: ChaCha20-Poly1305
+    - **Compression**: LZ4 compression before encryption
+    - **Key Derivation**: Argon2id
+
+  </Col>
+  <Col>
+
+    ```bash {{ title: 'First Run' }}
+    # ZeroFS generates a new DEK on first run
+    export ZEROFS_ENCRYPTION_PASSWORD='strong-password'
+    zerofs s3://bucket/path
+    ```
+
+    ```bash {{ title: 'Password Change' }}
+    # Change password without re-encrypting data
+    ZEROFS_ENCRYPTION_PASSWORD='old-password' \
+    ZEROFS_NEW_PASSWORD='new-strong-password' \
+    zerofs s3://bucket/path
+
+    # ZeroFS re-encrypts only the DEK, not all data
+    ```
+
+  </Col>
+</Row>
+
+## What's Encrypted
+
+Understanding what ZeroFS encrypts helps you assess its security for your use case:
+
+<Row>
+  <Col>
+
+    ### Encrypted Data
+
+    <Properties>
+      <Property name="File Contents" type="encrypted">
+        All file data is encrypted in 256KB chunks using unique nonces
+      </Property>
+      <Property name="File Metadata" type="encrypted">
+        Permissions, timestamps, ownership, and other inode data
+      </Property>
+      <Property name="Symbolic Links" type="encrypted">
+        Link target paths are encrypted
+      </Property>
+    </Properties>
+
+    ### Not Encrypted
+
+    <Properties>
+      <Property name="Directory Structure" type="plaintext">
+        Directory names and hierarchy remain visible
+      </Property>
+      <Property name="File Names" type="plaintext">
+        Individual file names are not encrypted
+      </Property>
+      <Property name="Database Keys" type="plaintext">
+        LSM tree keys (inode IDs, chunk identifiers)
+      </Property>
+    </Properties>
+
+  </Col>
+  <Col>
+
+    ```bash {{ title: 'What S3 Sees' }}
+    # Encrypted file contents in S3:
+    s3://bucket/path/
+    ├── compacted
+    │   ├── 01K1JW549K0H0MV3FH28CKBWTY.sst
+    │   ├── 01K1JW54FCCA109H1RJEHZ5NYK.sst
+    │   ├── 01K1JW54KE1XMV5DQG9KQ5R9B5.sst
+    ├── manifest
+    │   ├── 00000000000000000001.manifest
+    │   ├── 00000000000000000002.manifest
+    │   ├── 00000000000000000003.manifest
+    │   ├── 00000000000000000004.manifest
+    └── wal
+    ├── 00000000000000000001.sst
+    ├── 00000000000000000002.sst
+    ├── 00000000000000000003.sst
+    └── 00000000000000000004.sst
+    # Each SST contains:
+    # - Keys: inode:123, chunk:123/0
+    # - Values: [encrypted data + auth tag]
+    ```
+
+  </Col>
+</Row>
+
+## Password Management
+
+Secure password management is critical for ZeroFS deployments:
+
+### Password Requirements
+
+- **Minimum Length**: No enforced minimum, but use 25+ characters
+- **Complexity**: Use a mix of characters or a passphrase
+
+### Secure Password Practices
+
+```bash
+# Generate a secure password
+openssl rand -base64 32
+
+# Store in a secret manager (AWS example)
+aws secretsmanager create-secret \
+  --name zerofs-prod-password \
+  --secret-string "$(openssl rand -base64 32)"
+
+# Use in production
+export ZEROFS_ENCRYPTION_PASSWORD=$(
+  aws secretsmanager get-secret-value \
+    --secret-id zerofs-prod-password \
+    --query SecretString --output text
+)
+```
+
+### Lost Password Recovery
+
+<Warning>
+  If you lose your password, your data is permanently inaccessible. ZeroFS cannot recover encrypted data without the correct password. Always maintain secure backups of your passwords.
+</Warning>
+
+## Security Best Practices
+
+### Network Security
+
+```bash
+# Bind to localhost only (default)
+export ZEROFS_NFS_HOST='127.0.0.1'
+export ZEROFS_NBD_HOST='127.0.0.1'
+
+# For remote access, use VPN or SSH tunneling
+ssh -L 2049:localhost:2049 user@zerofs-server
+```
+
+
+
+
+## Security Architecture
+
+<Mermaid chart={`
+graph TB
+    APP[Application]
+    NFS[NFS]
+    
+    subgraph ZEROFS["ZeroFS"]
+        ENC[ChaCha20 Poly1305<br/>Encryption Layer]
+        COMP[LZ4<br/>Compression Layer]
+        
+        ENC --> COMP
+    end
+    
+    SLATE[SlateDB<br/>LSM Tree Storage]
+    S3[S3 Storage<br/>Object Storage]
+    
+    APP --> NFS
+    NFS --> ENC
+    COMP --> SLATE
+    SLATE --> S3
+        
+    class SLATE,S3 storage
+    class ENC crypto
+    class COMP compress
+`} />
+
+
+<div className="not-prose">
+  <Button href="/troubleshooting" variant="text" arrow="right">
+    <>Learn about security-related errors</>
+  </Button>
+</div>
