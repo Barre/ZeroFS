@@ -12,6 +12,7 @@ mod ninep;
 mod operations;
 mod permissions;
 mod stats;
+mod write_tracker;
 
 #[cfg(test)]
 mod test_helpers;

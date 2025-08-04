@@ -1,17 +1,30 @@
 use crate::inode::InodeId;
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LockKey {
+    Inode(InodeId),
+    Chunk(InodeId, u64), // (inode_id, chunk_index)
+}
 
 #[derive(Clone)]
 pub struct LockManager {
-    locks: Arc<DashMap<InodeId, Arc<Mutex<()>>>>,
+    locks: Arc<DashMap<LockKey, Arc<RwLock<()>>>>,
 }
 
-pub struct LockGuard {
-    _guard: OwnedMutexGuard<()>,
-    inode_id: InodeId,
-    locks: Arc<DashMap<InodeId, Arc<Mutex<()>>>>,
+pub enum LockGuard {
+    Read {
+        _guard: OwnedRwLockReadGuard<()>,
+        lock_key: LockKey,
+        locks: Arc<DashMap<LockKey, Arc<RwLock<()>>>>,
+    },
+    Write {
+        _guard: OwnedRwLockWriteGuard<()>,
+        lock_key: LockKey,
+        locks: Arc<DashMap<LockKey, Arc<RwLock<()>>>>,
+    },
 }
 
 struct ShardLockGuard {
@@ -29,39 +42,84 @@ impl LockManager {
         }
     }
 
-    /// Get or create the lock for a given inode ID
-    fn get_or_create_lock(&self, inode_id: InodeId) -> Arc<Mutex<()>> {
+    /// Get or create the lock for a given key
+    fn get_or_create_lock(&self, key: LockKey) -> Arc<RwLock<()>> {
         self.locks
-            .entry(inode_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .entry(key)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
     }
 
-    /// Acquire a single lock for writing
-    pub async fn acquire_write(&self, inode_id: InodeId) -> LockGuard {
-        let lock = self.get_or_create_lock(inode_id);
-        let guard = lock.lock_owned().await;
-        LockGuard {
+    /// Acquire a single lock for reading (inode-level)
+    pub async fn acquire_read(&self, inode_id: InodeId) -> LockGuard {
+        let lock_key = LockKey::Inode(inode_id);
+        let lock = self.get_or_create_lock(lock_key);
+        let guard = lock.read_owned().await;
+        LockGuard::Read {
             _guard: guard,
-            inode_id,
+            lock_key,
             locks: self.locks.clone(),
         }
     }
 
-    /// Acquire multiple write locks with automatic ordering to prevent deadlocks.
-    pub async fn acquire_multiple_write(&self, mut inode_ids: Vec<InodeId>) -> MultiLockGuard {
-        // Sort by inode ID to ensure consistent ordering
-        inode_ids.sort();
-        inode_ids.dedup();
+    /// Acquire a single lock for writing (inode-level)
+    pub async fn acquire_write(&self, inode_id: InodeId) -> LockGuard {
+        let lock_key = LockKey::Inode(inode_id);
+        let lock = self.get_or_create_lock(lock_key);
+        let guard = lock.write_owned().await;
+        LockGuard::Write {
+            _guard: guard,
+            lock_key,
+            locks: self.locks.clone(),
+        }
+    }
 
-        let mut guards = Vec::with_capacity(inode_ids.len());
+    /// Acquire chunk locks for writing
+    pub async fn acquire_chunk_locks(
+        &self,
+        inode_id: InodeId,
+        chunk_indices: Vec<u64>,
+    ) -> MultiLockGuard {
+        let mut lock_keys: Vec<LockKey> = chunk_indices
+            .into_iter()
+            .map(|idx| LockKey::Chunk(inode_id, idx))
+            .collect();
 
-        for inode_id in inode_ids {
-            let lock = self.get_or_create_lock(inode_id);
-            let guard = lock.lock_owned().await;
-            let lock_guard = LockGuard {
+        // Sort to ensure consistent ordering and prevent deadlocks
+        lock_keys.sort();
+        lock_keys.dedup();
+
+        let mut guards = Vec::with_capacity(lock_keys.len());
+
+        for key in lock_keys {
+            let lock = self.get_or_create_lock(key);
+            let guard = lock.write_owned().await;
+            let lock_guard = LockGuard::Write {
                 _guard: guard,
-                inode_id,
+                lock_key: key,
+                locks: self.locks.clone(),
+            };
+            guards.push(ShardLockGuard { _guard: lock_guard });
+        }
+
+        MultiLockGuard { _guards: guards }
+    }
+
+    /// Acquire multiple write locks with automatic ordering to prevent deadlocks.
+    pub async fn acquire_multiple_write(&self, inode_ids: Vec<InodeId>) -> MultiLockGuard {
+        // Convert to LockKey and sort to ensure consistent ordering
+        let mut lock_keys: Vec<LockKey> = inode_ids.into_iter().map(LockKey::Inode).collect();
+        lock_keys.sort();
+        lock_keys.dedup();
+
+        let mut guards = Vec::with_capacity(lock_keys.len());
+
+        for key in lock_keys {
+            let lock = self.get_or_create_lock(key);
+            let guard = lock.write_owned().await;
+            let lock_guard = LockGuard::Write {
+                _guard: guard,
+                lock_key: key,
                 locks: self.locks.clone(),
             };
 
@@ -75,9 +133,18 @@ impl LockManager {
 /// Implement drop to clean up unused locks
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        let (lock_key, locks) = match self {
+            LockGuard::Read {
+                lock_key, locks, ..
+            } => (lock_key, locks),
+            LockGuard::Write {
+                lock_key, locks, ..
+            } => (lock_key, locks),
+        };
+
         // Try to remove the lock if it's no longer in use
-        self.locks.remove_if(&self.inode_id, |_, lock| {
-            // The guard holds one reference via OwnedMutexGuard
+        locks.remove_if(lock_key, |_, lock| {
+            // The guard holds one reference via OwnedRwLockGuard
             // DashMap holds another
             // If strong_count is 2 or less, we can safely remove
             Arc::strong_count(lock) <= 2
@@ -183,12 +250,15 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let manager_clone = manager.clone();
-            let handle = tokio::spawn(async move { manager_clone.get_or_create_lock(inode_id) });
+            let handle =
+                tokio::spawn(
+                    async move { manager_clone.get_or_create_lock(LockKey::Inode(inode_id)) },
+                );
             handles.push(handle);
         }
 
-        // Collect all the Arc<Mutex<()>> results
-        let locks: Vec<Arc<Mutex<()>>> = futures::future::join_all(handles)
+        // Collect all the Arc<RwLock<()>> results
+        let locks: Vec<Arc<RwLock<()>>> = futures::future::join_all(handles)
             .await
             .into_iter()
             .map(|r| r.unwrap())

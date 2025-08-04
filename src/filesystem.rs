@@ -3,6 +3,7 @@ use crate::encryption::{EncryptedDb, EncryptionManager};
 use crate::filesystem_stats::{FileSystemGlobalStats, StatsShardData};
 use crate::lock_manager::LockManager;
 use crate::stats::FileSystemStats;
+use crate::write_tracker::WriteTracker;
 use bytes::Bytes;
 use foyer::{
     DirectFsDeviceOptions, Engine, HybridCacheBuilder, RuntimeOptions, TokioRuntimeOptions,
@@ -107,6 +108,7 @@ pub struct SlateDbFs {
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub last_flush: Arc<Mutex<std::time::Instant>>,
+    pub write_tracker: Arc<WriteTracker>,
 }
 
 // Struct for temporary unencrypted access (only for key management)
@@ -294,6 +296,7 @@ impl SlateDbFs {
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
+            write_tracker: Arc::new(WriteTracker::new()),
         };
 
         Ok(fs)
@@ -694,6 +697,7 @@ impl SlateDbFs {
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
+            write_tracker: Arc::new(WriteTracker::new()),
         };
 
         Ok(fs)

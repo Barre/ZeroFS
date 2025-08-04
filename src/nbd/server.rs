@@ -1,13 +1,13 @@
+use super::error::{NBDError, Result};
+use super::protocol::*;
+use crate::filesystem::{EncodedFileId, SlateDbFs};
 use deku::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
-
-use super::error::{NBDError, Result};
-use super::protocol::*;
-use crate::filesystem::{EncodedFileId, SlateDbFs};
+use zerofs_nfsserve::nfs::{sattr3, set_mode3};
 
 #[derive(Clone)]
 pub struct NBDDevice {
@@ -65,7 +65,7 @@ impl NBDServer {
     }
 
     async fn initialize_device(&self, device: &NBDDevice) -> std::io::Result<()> {
-        use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
+        use zerofs_nfsserve::nfs::nfsstring;
         use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
         let auth = AuthContext {
@@ -120,6 +120,7 @@ impl NBDServer {
                     "Creating NBD device file {} with size {}",
                     device.name, device.size
                 );
+
                 let attr = sattr3 {
                     mode: set_mode3::mode(0o600),
                     uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
@@ -134,7 +135,7 @@ impl NBDServer {
                     .create(&auth, nbd_dir_inode, &device_name, attr)
                     .await
                     .map_err(|e| {
-                        std::io::Error::other(format!("Failed to create device file: {e:?}"))
+                        std::io::Error::other(format!("Failed to create NBD file: {e:?}"))
                     })?;
 
                 // Set the file size by writing a zero byte at the end
@@ -147,6 +148,11 @@ impl NBDServer {
                             std::io::Error::other(format!("Failed to set device size: {e:?}"))
                         })?;
                 }
+
+                debug!(
+                    "Created NBD device inode {} for {} with size {}",
+                    device_inode, device.name, device.size
+                );
 
                 Ok(())
             }

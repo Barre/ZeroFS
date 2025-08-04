@@ -16,6 +16,14 @@ use crate::permissions::{AccessMode, Credentials, check_access, validate_mode};
 const READ_CHUNK_BUFFER_SIZE: usize = 64;
 
 impl SlateDbFs {
+    /// Calculate which chunks are affected by an I/O operation
+    fn calculate_affected_chunks(offset: u64, length: u64) -> Vec<u64> {
+        let end_offset = offset + length;
+        let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
+        let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
+
+        (start_chunk..=end_chunk).map(|idx| idx as u64).collect()
+    }
     pub async fn process_write(
         &self,
         auth: &AuthContext,
@@ -31,8 +39,29 @@ impl SlateDbFs {
             offset
         );
 
-        let _guard = self.lock_manager.acquire_write(id).await;
+        // Acquire appropriate locks for all files:
+        // 1. Acquire read lock on inode (allows concurrent writes, blocks metadata changes)
+        //    This prevents: deletion, rename/move, link/unlink, chmod/chown, truncate
+        //    Ensures inode remains valid and chunks won't be orphaned
+        // 2. Lock only the affected chunks for writing
+        let chunk_indices = Self::calculate_affected_chunks(offset, data.len() as u64);
+
+        let _inode_guard = self.lock_manager.acquire_read(id).await;
+        let _chunk_guard = self
+            .lock_manager
+            .acquire_chunk_locks(id, chunk_indices)
+            .await;
+
         let mut inode = self.load_inode(id).await?;
+
+        // Start tracking this write with the current file size
+        let current_size = match &inode {
+            Inode::File(file) => file.size,
+            _ => 0,
+        };
+        let write_guard =
+            self.write_tracker
+                .track_write(id, current_size, offset, data.len() as u64);
 
         let creds = Credentials::from_auth_context(auth);
 
@@ -50,6 +79,7 @@ impl SlateDbFs {
 
         match &mut inode {
             Inode::File(file) => {
+                // Calculate everything after locks are acquired
                 let old_size = file.size;
                 let end_offset = offset + data.len() as u64;
                 let new_size = std::cmp::max(file.size, end_offset);
@@ -139,7 +169,8 @@ impl SlateDbFs {
                     chunk_processing_start.elapsed()
                 );
 
-                file.size = new_size;
+                // Use the maximum size from the tracker to prevent truncation
+                file.size = write_guard.get_max_size();
                 let (now_sec, now_nsec) = get_current_time();
                 file.mtime = now_sec;
                 file.mtime_nsec = now_nsec;
@@ -513,7 +544,17 @@ impl SlateDbFs {
             id, offset, length
         );
 
-        let _guard = self.lock_manager.acquire_write(id).await;
+        // Acquire appropriate locks for all files:
+        // 1. Acquire read lock on inode (allows concurrent trims, blocks metadata changes)
+        // 2. Lock only the affected chunks for writing
+        let chunk_indices = Self::calculate_affected_chunks(offset, length);
+
+        let _inode_guard = self.lock_manager.acquire_read(id).await;
+        let _chunk_guard = self
+            .lock_manager
+            .acquire_chunk_locks(id, chunk_indices)
+            .await;
+
         let inode = self.load_inode(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
