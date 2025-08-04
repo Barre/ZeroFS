@@ -12,9 +12,9 @@ export function Mermaid({ chart }: { chart: string }) {
     async function renderChart() {
       try {
         const mermaid = (await import('mermaid')).default
-        
+
         const isDark = resolvedTheme === 'dark'
-        
+
         mermaid.initialize({
           startOnLoad: true,
           theme: 'base',
@@ -23,53 +23,53 @@ export function Mermaid({ chart }: { chart: string }) {
             primaryColor: isDark ? 'rgba(255, 255, 255, 0.025)' : '#fafafa',
             primaryTextColor: isDark ? '#e5e7eb' : '#111827',
             primaryBorderColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
-            
+
             // Lines and connections - match border styles
             lineColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
-            
+
             // Background colors - match code block styling
             background: 'transparent',
             mainBkg: isDark ? '#18181b' : '#ffffff',
             secondBkg: isDark ? 'rgba(255, 255, 255, 0.025)' : '#f9fafb',
             tertiaryBkg: isDark ? 'rgba(255, 255, 255, 0.05)' : '#f3f4f6',
-            
+
             // Text colors - match prose
             textColor: isDark ? '#d1d5db' : '#4b5563',
             taskTextColor: isDark ? '#e5e7eb' : '#111827',
             taskTextDarkColor: isDark ? '#e5e7eb' : '#111827',
-            
+
             // Node colors - clean with subtle backgrounds
             nodeTextColor: isDark ? '#e5e7eb' : '#111827',
             defaultLinkColor: isDark ? 'rgba(255, 255, 255, 0.2)' : '#d1d5db',
             titleColor: isDark ? '#e5e7eb' : '#111827',
             edgeLabelBackground: isDark ? '#18181b' : '#ffffff',
-            
+
             // Borders - match documentation
             nodeBorder: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
             clusterBorder: isDark ? 'rgba(255, 255, 255, 0.075)' : '#e5e7eb',
             defaultBorderColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
-            
+
             // Special elements
             altBackground: isDark ? 'rgba(255, 255, 255, 0.025)' : '#f9fafb',
             errorBkgColor: isDark ? 'rgba(239, 68, 68, 0.1)' : '#fee2e2',
             errorTextColor: isDark ? '#f87171' : '#dc2626',
-            
+
             // Typography - match documentation
             fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
             fontSize: '14px',
-            
+
             // Graph specific
             labelColor: isDark ? '#9ca3af' : '#6b7280',
-            
+
             // Flowchart
             flowchartBackground: 'transparent',
-            
+
             // Sequence diagram - match tag styling
             actorTextColor: isDark ? '#e5e7eb' : '#111827',
             actorLineColor: isDark ? 'rgba(255, 255, 255, 0.075)' : '#e5e7eb',
             signalColor: isDark ? '#9ca3af' : '#6b7280',
             sequenceNumberColor: isDark ? '#e5e7eb' : '#111827',
-            
+
             // Additional sequence diagram colors
             activationBkgColor: isDark ? 'rgba(59, 130, 246, 0.1)' : '#dbeafe',
             activationBorderColor: isDark ? 'rgba(59, 130, 246, 0.2)' : '#93c5fd',
@@ -89,11 +89,6 @@ export function Mermaid({ chart }: { chart: string }) {
               top: 10,
               bottom: 5
             }
-          },
-          graph: {
-            defaultRenderer: 'dagre-wrapper',
-            clusterBkg: isDark ? 'rgba(255, 255, 255, 0.02)' : '#fafafa',
-            clusterBorder: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
           },
           sequence: {
             actorMargin: 50,
