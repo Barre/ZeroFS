@@ -7,6 +7,111 @@ on:
     branches: ["main"]
 
 jobs:
+  stress-ng-nfs:
+    name: Run stress-ng test on NFS
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nfs-common stress-ng
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-stress-test || true
+
+      - name: Build ZeroFS
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Start ZeroFS in the background
+          AWS_ENDPOINT=http://localhost:9000 \
+          AWS_ACCESS_KEY_ID=minioadmin \
+          AWS_SECRET_ACCESS_KEY=minioadmin \
+          AWS_ALLOW_HTTP=true \
+          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
+          SLATEDB_CACHE_SIZE_GB=1 \
+          ZEROFS_ENCRYPTION_PASSWORD=secret \
+          cargo run --profile ci s3://zerofs-stress-test/test &
+
+          # Wait for ZeroFS to start
+          echo "Waiting for ZeroFS to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 2049; then
+              echo "ZeroFS is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 2049; then
+            echo "ZeroFS failed to start"
+            exit 1
+          fi
+
+      - name: Mount NFS
+        run: |
+          # Create mount point
+          sudo mkdir -p /mnt/zerofs-nfs
+
+          # Mount ZeroFS via NFS
+          sudo mount -t nfs -o vers=3,sync,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs-nfs
+
+          # Verify mount
+          mount | grep zerofs
+
+      - name: Run stress-ng test
+        run: |
+          cd /mnt/zerofs-nfs
+          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
+          --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
+          --fd-fork 1 --filename 1 --fstat 1 \
+          --getdent 1 --link 1  \
+          --metamix 1 --open 1 --rename 1 --symlink 1  \
+          --touch 1 --utime 1 --timeout 60s
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount
+          sudo umount /mnt/zerofs-nfs || true
+
+          # Kill ZeroFS
+          pkill -f "cargo run --profile ci s3://zerofs-stress-test/test" || true
+
   stress-ng-9p:
     name: Run stress-ng test on 9P
     runs-on: ${{ matrix.os }}

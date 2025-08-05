@@ -132,7 +132,7 @@ jobs:
           sudo mkdir -p /mnt/zerofs
 
           # Mount ZeroFS via NFS
-          sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
+          sudo mount -t nfs -o vers=3,sync,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
 
           # Verify mount
           mount | grep zerofs
@@ -144,7 +144,7 @@ jobs:
           sudo mkdir -p /tmp/zerofs
 
           # Mount ZeroFS via NFS (macOS uses nolocks instead of nolock)
-          sudo mount -t nfs -o vers=3,nolocks,tcp,port=2049,mountport=2049,async,hard 127.0.0.1:/ /tmp/zerofs
+          sudo mount -t nfs -o vers=3,nolocks,tcp,port=2049,mountport=2049,sync,hard 127.0.0.1:/ /tmp/zerofs
 
           # Verify mount
           mount | grep zerofs

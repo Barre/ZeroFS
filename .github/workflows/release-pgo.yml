@@ -62,7 +62,7 @@ jobs:
           wget https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          
+
           if [ "${{ matrix.test }}" = "9p" ]; then
             ./mc mb myminio/pgo-profile || true
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
@@ -156,7 +156,7 @@ jobs:
               sleep 1
             done
             sudo mkdir -p /mnt/zerofs
-            sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
+            sudo mount -t nfs -o vers=3,sync,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
             cd /mnt/zerofs
             wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
             tar -xf linux-6.11.tar.xz
@@ -213,15 +213,15 @@ jobs:
         run: |
           LLVM_PROFDATA=$(find ~/.rustup -name llvm-profdata | head -1)
           echo "Using llvm-profdata: $LLVM_PROFDATA"
-          
+
           PROFDATA_FILES=$(find pgo-artifacts -name "*.profdata" | tr '\n' ' ')
           echo "Found profdata files: $PROFDATA_FILES"
-          
+
           $LLVM_PROFDATA merge -o merged.profdata $PROFDATA_FILES
-          
+
           mkdir -p pgo-data
           cp merged.profdata pgo-data/
-          
+
           cp pgo-artifacts/pgo-profile-data-*/Cargo.toml pgo-data/ || true
           cp pgo-artifacts/pgo-profile-data-*/Cargo.lock pgo-data/ || true
 
