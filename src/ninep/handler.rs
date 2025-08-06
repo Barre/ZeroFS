@@ -11,9 +11,9 @@ use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::NFSFileSystem;
 
 pub const DEFAULT_MSIZE: u32 = 1_048_576; // 1MB
-pub const DEFAULT_IOUNIT: u32 = 262_144; // 256KB
-pub const AT_REMOVEDIR: u32 = 0x200;
+pub const DEFAULT_IOUNIT: u32 = 1_048_576; // 1MB
 
+pub const AT_REMOVEDIR: u32 = 0x200;
 // Linux dirent type constants
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
