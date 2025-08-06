@@ -54,11 +54,10 @@ impl UnifiedCache {
         memory_capacity_gb: Option<f64>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let memory_capacity_bytes =
-            (memory_capacity_gb.unwrap_or(0.25) * 1024.0 * 1024.0 * 1024.0) as usize;
+            (memory_capacity_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
 
-        // Always use memory-only cache to avoid sync overhead
         let cache = CacheBuilder::new(memory_capacity_bytes)
-            .with_shards(256)
+            .with_shards(64)
             .with_weighter(|_key: &Vec<u8>, value: &Vec<u8>| -> usize { _key.len() + value.len() })
             .build();
 
