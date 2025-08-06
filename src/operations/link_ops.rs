@@ -145,7 +145,7 @@ impl SlateDbFs {
 
         self.global_stats.commit_update(&stats_update);
 
-        self.metadata_cache.remove(CacheKey::Metadata(dirid));
+        self.cache.remove(CacheKey::Metadata(dirid)).await;
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -275,8 +275,12 @@ impl SlateDbFs {
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
-        self.metadata_cache.remove(CacheKey::Metadata(fileid)); // File's metadata changed (nlink, ctime)
-        self.metadata_cache.remove(CacheKey::Metadata(linkdirid)); // Directory's metadata changed
+        self.cache
+            .remove_batch(vec![
+                CacheKey::Metadata(fileid),
+                CacheKey::Metadata(linkdirid),
+            ])
+            .await;
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);

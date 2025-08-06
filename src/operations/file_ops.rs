@@ -182,8 +182,9 @@ impl SlateDbFs {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.metadata_cache.remove(CacheKey::Metadata(id));
-                self.small_file_cache.remove(CacheKey::SmallFile(id));
+                self.cache
+                    .remove_batch(vec![CacheKey::Metadata(id), CacheKey::SmallFile(id)])
+                    .await;
 
                 let elapsed = start_time.elapsed();
                 debug!(
@@ -329,7 +330,7 @@ impl SlateDbFs {
                 // Update in-memory statistics after successful commit
                 self.global_stats.commit_update(&stats_update);
 
-                self.metadata_cache.remove(CacheKey::Metadata(dirid));
+                self.cache.remove(CacheKey::Metadata(dirid)).await;
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -384,7 +385,7 @@ impl SlateDbFs {
                 {
                     let cache_key = CacheKey::SmallFile(id);
                     if let Some(CacheValue::SmallFile(cached_data)) =
-                        self.small_file_cache.get(cache_key).await
+                        self.cache.get(cache_key).await
                     {
                         debug!("Serving file {} from small file cache", id);
                         let eof = file.size <= count as u64;
@@ -486,7 +487,7 @@ impl SlateDbFs {
                     let cache_key = crate::cache::CacheKey::SmallFile(id);
                     let cache_value =
                         crate::cache::CacheValue::SmallFile(std::sync::Arc::new(result.clone()));
-                    self.small_file_cache.insert(cache_key, cache_value, false);
+                    self.cache.insert(cache_key, cache_value, false).await;
                 }
 
                 self.stats
@@ -537,6 +538,7 @@ impl SlateDbFs {
         let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
 
         let mut batch = self.db.new_write_batch();
+        let mut cache_keys_to_remove = Vec::new();
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
@@ -557,7 +559,7 @@ impl SlateDbFs {
                     inode_id: id,
                     block_index: chunk_idx as u64,
                 };
-                self.metadata_cache.remove(cache_key);
+                cache_keys_to_remove.push(cache_key);
             } else {
                 // Partial trim - need to zero out the trimmed portion
                 let trim_start = if offset > chunk_start {
@@ -597,7 +599,7 @@ impl SlateDbFs {
                             inode_id: id,
                             block_index: chunk_idx as u64,
                         };
-                        self.metadata_cache.remove(cache_key);
+                        cache_keys_to_remove.push(cache_key);
                     } else {
                         let chunk_size_in_file =
                             std::cmp::min(CHUNK_SIZE, (file.size - chunk_start) as usize);
@@ -609,15 +611,19 @@ impl SlateDbFs {
                             inode_id: id,
                             block_index: chunk_idx as u64,
                         };
-                        self.metadata_cache.remove(cache_key);
+                        cache_keys_to_remove.push(cache_key);
                     }
                 }
             }
         }
 
         if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES {
-            let cache_key = CacheKey::SmallFile(id);
-            self.small_file_cache.remove(cache_key);
+            cache_keys_to_remove.push(CacheKey::SmallFile(id));
+        }
+
+        // Remove all cache keys in a single batch operation
+        if !cache_keys_to_remove.is_empty() {
+            self.cache.remove_batch(cache_keys_to_remove).await;
         }
 
         self.db

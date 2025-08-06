@@ -12,7 +12,7 @@ use zerofs_nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
 
 use super::common::validate_filename;
 use crate::cache::CacheKey;
-use crate::filesystem::{EncodedFileId, SlateDbFs, get_current_time};
+use crate::filesystem::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, SlateDbFs, get_current_time};
 use crate::inode::{DirectoryInode, Inode};
 use crate::permissions::{AccessMode, Credentials, check_access};
 
@@ -170,7 +170,7 @@ impl SlateDbFs {
 
                 self.global_stats.commit_update(&stats_update);
 
-                self.metadata_cache.remove(CacheKey::Metadata(dirid));
+                self.cache.remove(CacheKey::Metadata(dirid)).await;
 
                 self.stats
                     .directories_created
@@ -244,16 +244,22 @@ impl SlateDbFs {
                 // Use dirscan index for efficient pagination
                 let scan_prefix = Self::dir_scan_prefix(dirid);
                 let start_key = if start_after == 0 {
-                    scan_prefix.clone()
+                    Bytes::from(scan_prefix.clone())
                 } else {
                     // Resume from the exact inode we left off at
-                    format!("dirscan:{dirid}/{start_inode:020}")
+                    let mut key = scan_prefix.clone();
+                    key.extend_from_slice(&start_inode.to_be_bytes());
+                    Bytes::from(key)
                 };
-                let end_key = format!("dirscan:{dirid}0");
+
+                // End key: increment the directory ID to get all entries for this directory
+                let mut end_key = Vec::with_capacity(9);
+                end_key.push(PREFIX_DIR_SCAN);
+                end_key.extend_from_slice(&(dirid + 1).to_be_bytes());
 
                 let iter = self
                     .db
-                    .scan(Bytes::from(start_key)..Bytes::from(end_key))
+                    .scan(start_key..Bytes::from(end_key))
                     .await
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
                 pin_mut!(iter);
@@ -271,36 +277,31 @@ impl SlateDbFs {
                     }
 
                     let (key, _value) = result.map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                    let key_str = String::from_utf8_lossy(&key);
 
-                    // Extract the inode ID and filename from the key
-                    if let Some(suffix) = key_str.strip_prefix(&scan_prefix) {
-                        if let Some(slash_pos) = suffix.find('/') {
-                            let inode_str = &suffix[..slash_pos];
-                            let filename = &suffix[slash_pos + 1..];
+                    // Extract the inode ID and filename from the binary key
+                    let (inode_id, filename) = match ParsedKey::parse(&key) {
+                        Some(ParsedKey::DirScan { entry_id, name }) => (entry_id, name),
+                        _ => continue,
+                    };
 
-                            if let Ok(inode_id) = inode_str.parse::<u64>() {
-                                // If we're resuming, check if we need to skip entries
-                                if resuming {
-                                    if inode_id == start_inode {
-                                        // Same inode - check position
-                                        let pos = inode_positions.entry(inode_id).or_insert(0);
-                                        if *pos <= start_position {
-                                            *pos += 1;
-                                            continue;
-                                        }
-                                    } else if inode_id < start_inode {
-                                        // Earlier inode - skip
-                                        continue;
-                                    }
-                                    resuming = false;
-                                }
-
-                                debug!("readdir: found entry {} (inode {})", filename, inode_id);
-                                dir_entries.push((inode_id, filename.as_bytes().to_vec()));
+                    // If we're resuming, check if we need to skip entries
+                    if resuming {
+                        if inode_id == start_inode {
+                            // Same inode - check position
+                            let pos = inode_positions.entry(inode_id).or_insert(0);
+                            if *pos <= start_position {
+                                *pos += 1;
+                                continue;
                             }
+                        } else if inode_id < start_inode {
+                            // Earlier inode - skip
+                            continue;
                         }
+                        resuming = false;
                     }
+
+                    debug!("readdir: found entry {} (inode {})", filename, inode_id);
+                    dir_entries.push((inode_id, filename.as_bytes().to_vec()));
                 }
 
                 const BUFFER_SIZE: usize = 16;

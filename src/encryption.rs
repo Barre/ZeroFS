@@ -1,4 +1,5 @@
 use crate::cache::{CacheKey, CacheValue, UnifiedCache};
+use crate::filesystem::{PREFIX_CHUNK, ParsedKey};
 use anyhow::Result;
 use bytes::Bytes;
 use chacha20poly1305::{
@@ -36,12 +37,13 @@ impl EncryptionManager {
         }
     }
 
-    pub fn encrypt(&self, key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let data = if key.starts_with("chunk:") {
+        // Check if this is a chunk key to decide on compression
+        let data = if !key.is_empty() && key[0] == PREFIX_CHUNK {
             lz4_flex::compress_prepend_size(plaintext)
         } else {
             plaintext.to_vec()
@@ -59,7 +61,7 @@ impl EncryptionManager {
         Ok(result)
     }
 
-    pub fn decrypt(&self, key: &str, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < NONCE_SIZE {
             return Err(anyhow::anyhow!("Invalid ciphertext: too short"));
         }
@@ -75,7 +77,7 @@ impl EncryptionManager {
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         // Decompress chunks
-        if key.starts_with("chunk:") {
+        if !key.is_empty() && key[0] == PREFIX_CHUNK {
             lz4_flex::decompress_size_prepended(&decrypted)
                 .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
         } else {
@@ -104,11 +106,8 @@ impl EncryptedWriteBatch {
     }
 
     pub fn put_bytes(&mut self, key: &bytes::Bytes, value: &[u8]) -> Result<()> {
-        let key_str =
-            std::str::from_utf8(key).map_err(|e| anyhow::anyhow!("Invalid UTF8 in key: {}", e))?;
-
         // Queue cache operation if this is a chunk
-        if key_str.starts_with("chunk:") {
+        if !key.is_empty() && key[0] == PREFIX_CHUNK {
             self.cache_ops.push((key.clone(), Some(value.to_vec())));
         }
 
@@ -117,11 +116,8 @@ impl EncryptedWriteBatch {
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {
-        // Queue cache operation if this is a chunk
-        if let Ok(key_str) = std::str::from_utf8(key) {
-            if key_str.starts_with("chunk:") {
-                self.cache_ops.push((key.clone(), None));
-            }
+        if !key.is_empty() && key[0] == PREFIX_CHUNK {
+            self.cache_ops.push((key.clone(), None));
         }
 
         self.inner.delete(key);
@@ -139,9 +135,7 @@ impl EncryptedWriteBatch {
                 operations
                     .into_par_iter()
                     .map(|(key, value)| {
-                        let key_str = std::str::from_utf8(&key)
-                            .map_err(|e| anyhow::anyhow!("Invalid UTF8 in key: {}", e))?;
-                        let encrypted = encryptor.encrypt(key_str, &value)?;
+                        let encrypted = encryptor.encrypt(&key, &value)?;
                         Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -166,21 +160,6 @@ pub struct EncryptedDb {
 }
 
 impl EncryptedDb {
-    // Parse chunk key format: "chunk:<inode_id>/<block_index>"
-    fn parse_chunk_key(key: &str) -> Option<(u64, u64)> {
-        if !key.starts_with("chunk:") {
-            return None;
-        }
-        let chunk_part = &key[6..]; // Skip "chunk:"
-        let parts: Vec<&str> = chunk_part.split('/').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let inode_id = parts[0].parse::<u64>().ok()?;
-        let block_index = parts[1].parse::<u64>().ok()?;
-        Some((inode_id, block_index))
-    }
-
     pub fn new(db: Arc<slatedb::Db>, encryptor: Arc<EncryptionManager>) -> Self {
         Self {
             inner: db,
@@ -195,42 +174,47 @@ impl EncryptedDb {
     }
 
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
-        let key_str =
-            std::str::from_utf8(key).map_err(|e| anyhow::anyhow!("Invalid UTF8 in key: {}", e))?;
-
         // Check if this is a chunk and if we have cache
-        if let (Some(cache), Some((inode_id, block_index))) =
-            (&self.cache, Self::parse_chunk_key(key_str))
-        {
-            let cache_key = CacheKey::Block {
+        if let Some(cache) = &self.cache {
+            if let Some(ParsedKey::Chunk {
                 inode_id,
-                block_index,
-            };
-            if let Some(CacheValue::Block(cached_data)) = cache.get(cache_key.clone()).await {
-                return Ok(Some(bytes::Bytes::from(cached_data.as_ref().clone())));
+                chunk_index,
+            }) = ParsedKey::parse(key)
+            {
+                let cache_key = CacheKey::Block {
+                    inode_id,
+                    block_index: chunk_index,
+                };
+                if let Some(CacheValue::Block(cached_data)) = cache.get(cache_key.clone()).await {
+                    return Ok(Some(bytes::Bytes::from(cached_data.as_ref().clone())));
+                }
             }
         }
 
         match self.inner.get(key).await? {
             Some(encrypted) => {
                 let encryptor = self.encryptor.clone();
-                let key_string = key_str.to_string();
+                let key_bytes = key.to_vec();
                 let encrypted_data = encrypted.to_vec();
 
                 let decrypted =
-                    task::spawn_blocking(move || encryptor.decrypt(&key_string, &encrypted_data))
+                    task::spawn_blocking(move || encryptor.decrypt(&key_bytes, &encrypted_data))
                         .await
                         .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
 
-                if let (Some(cache), Some((inode_id, block_index))) =
-                    (&self.cache, Self::parse_chunk_key(key_str))
-                {
-                    let cache_key = CacheKey::Block {
+                if let Some(cache) = &self.cache {
+                    if let Some(ParsedKey::Chunk {
                         inode_id,
-                        block_index,
-                    };
-                    let cache_value = CacheValue::Block(Arc::new(decrypted.clone()));
-                    cache.insert(cache_key, cache_value, true);
+                        chunk_index,
+                    }) = ParsedKey::parse(key)
+                    {
+                        let cache_key = CacheKey::Block {
+                            inode_id,
+                            block_index: chunk_index,
+                        };
+                        let cache_value = CacheValue::Block(Arc::new(decrypted.clone()));
+                        cache.insert(cache_key, cache_value, true).await;
+                    }
                 }
 
                 Ok(Some(bytes::Bytes::from(decrypted)))
@@ -253,23 +237,14 @@ impl EncryptedDb {
                     Ok(Some(kv)) => {
                         let key = kv.key;
                         let encrypted_value = kv.value;
-                        let key_str = match std::str::from_utf8(&key) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return Some((
-                                    Err(anyhow::anyhow!("Invalid UTF-8 in key: {}", e)),
-                                    (iter, encryptor),
-                                ));
-                            }
-                        };
-                        match encryptor.decrypt(key_str, &encrypted_value) {
+                        match encryptor.decrypt(&key, &encrypted_value) {
                             Ok(decrypted) => {
                                 Some((Ok((key, Bytes::from(decrypted))), (iter, encryptor)))
                             }
                             Err(e) => Some((
                                 Err(anyhow::anyhow!(
-                                    "Decryption failed for key {}: {}",
-                                    key_str,
+                                    "Decryption failed for key {:?}: {}",
+                                    key,
                                     e
                                 )),
                                 (iter, encryptor),
@@ -299,26 +274,28 @@ impl EncryptedDb {
         // Update cache after successful write
         if let Some(cache) = &self.cache {
             for (key, value) in cache_ops {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some((inode_id, block_index)) = Self::parse_chunk_key(key_str) {
-                        match value {
-                            Some(data) => {
-                                // Insert chunk into cache with prefer_on_disk=true
-                                let cache_key = CacheKey::Block {
-                                    inode_id,
-                                    block_index,
-                                };
-                                let cache_value = CacheValue::Block(Arc::new(data));
-                                cache.insert(cache_key, cache_value, true);
-                            }
-                            None => {
-                                // Remove chunk from cache
-                                let cache_key = CacheKey::Block {
-                                    inode_id,
-                                    block_index,
-                                };
-                                cache.remove(cache_key);
-                            }
+                if let Some(ParsedKey::Chunk {
+                    inode_id,
+                    chunk_index,
+                }) = ParsedKey::parse(&key)
+                {
+                    match value {
+                        Some(data) => {
+                            // Insert chunk into cache with prefer_on_disk=true
+                            let cache_key = CacheKey::Block {
+                                inode_id,
+                                block_index: chunk_index,
+                            };
+                            let cache_value = CacheValue::Block(Arc::new(data));
+                            cache.insert(cache_key, cache_value, true).await;
+                        }
+                        None => {
+                            // Remove chunk from cache
+                            let cache_key = CacheKey::Block {
+                                inode_id,
+                                block_index: chunk_index,
+                            };
+                            cache.remove(cache_key).await;
                         }
                     }
                 }
@@ -339,9 +316,7 @@ impl EncryptedDb {
         put_options: &slatedb::config::PutOptions,
         write_options: &WriteOptions,
     ) -> Result<()> {
-        let key_str =
-            std::str::from_utf8(key).map_err(|e| anyhow::anyhow!("Invalid UTF8 in key: {}", e))?;
-        let encrypted = self.encryptor.encrypt(key_str, value)?;
+        let encrypted = self.encryptor.encrypt(key, value)?;
         self.inner
             .put_with_options(key, &encrypted, put_options, write_options)
             .await?;

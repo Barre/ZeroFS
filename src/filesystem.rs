@@ -25,6 +25,51 @@ use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
 use crate::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const PREFIX_INODE: u8 = 0x01;
+pub const PREFIX_CHUNK: u8 = 0x02;
+pub const PREFIX_DIR_ENTRY: u8 = 0x03;
+pub const PREFIX_DIR_SCAN: u8 = 0x04;
+pub const PREFIX_TOMBSTONE: u8 = 0x05;
+pub const PREFIX_STATS: u8 = 0x06;
+pub const PREFIX_SYSTEM: u8 = 0x07;
+
+/// Helper for parsing binary keys that we iterate over
+#[derive(Debug)]
+pub enum ParsedKey {
+    Chunk { inode_id: InodeId, chunk_index: u64 },
+    DirScan { entry_id: InodeId, name: String },
+    Tombstone { inode_id: InodeId },
+}
+
+impl ParsedKey {
+    pub fn parse(key: &[u8]) -> Option<Self> {
+        if key.is_empty() {
+            return None;
+        }
+
+        match key[0] {
+            PREFIX_CHUNK if key.len() == 17 => {
+                let inode_id = u64::from_be_bytes(key[1..9].try_into().ok()?);
+                let chunk_index = u64::from_be_bytes(key[9..17].try_into().ok()?);
+                Some(ParsedKey::Chunk {
+                    inode_id,
+                    chunk_index,
+                })
+            }
+            PREFIX_DIR_SCAN if key.len() > 17 => {
+                let entry_id = u64::from_be_bytes(key[9..17].try_into().ok()?);
+                let name = String::from_utf8(key[17..].to_vec()).ok()?;
+                Some(ParsedKey::DirScan { entry_id, name })
+            }
+            PREFIX_TOMBSTONE if key.len() == 17 => {
+                let inode_id = u64::from_be_bytes(key[9..17].try_into().ok()?);
+                Some(ParsedKey::Tombstone { inode_id })
+            }
+            _ => None,
+        }
+    }
+}
+
 fn get_current_uid_gid() -> (u32, u32) {
     (0, 0)
 }
@@ -101,9 +146,7 @@ pub struct SlateDbFs {
     pub db: Arc<EncryptedDb>,
     pub lock_manager: Arc<LockManager>,
     pub next_inode_id: Arc<AtomicU64>,
-    pub metadata_cache: Arc<UnifiedCache>,
-    pub small_file_cache: Arc<UnifiedCache>,
-    pub dir_entry_cache: Arc<UnifiedCache>,
+    pub cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub last_flush: Arc<Mutex<std::time::Instant>>,
@@ -129,20 +172,30 @@ impl SlateDbFs {
         db_path: String,
         encryption_key: [u8; 32],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let slatedb_disk_cache_size_gb = cache_config.max_cache_size_gb;
-        let zerofs_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
+        let total_disk_cache_gb = cache_config.max_cache_size_gb;
+        let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
-        // SlateDB in-memory block cache: use 1/4 of ZeroFS memory cache size, with min 50MB
-        let slatedb_memory_cache_gb = (zerofs_memory_cache_gb * 0.25).max(0.05);
+        // Split disk cache into thirds
+        let slatedb_object_cache_gb = total_disk_cache_gb / 3.0;
+        let slatedb_hybrid_cache_gb = total_disk_cache_gb / 3.0;
+        let zerofs_disk_cache_gb = total_disk_cache_gb / 3.0;
+
+        // Split memory cache: 50% for ZeroFS, 50% for SlateDB block cache
+        let zerofs_memory_cache_gb = total_memory_cache_gb * 0.5;
+        let slatedb_memory_cache_gb = total_memory_cache_gb * 0.5;
 
         tracing::info!(
-            "Cache allocation - Disk: {:.2}GB (all to SlateDB), Memory: SlateDB block cache: {:.2}GB, ZeroFS cache: {:.2}GB",
-            slatedb_disk_cache_size_gb,
+            "Cache allocation - Total disk: {:.2}GB, SlateDB object store: {:.2}GB, SlateDB hybrid: {:.2}GB, ZeroFS disk: {:.2}GB, Memory - SlateDB: {:.2}GB, ZeroFS: {:.2}GB",
+            total_disk_cache_gb,
+            slatedb_object_cache_gb,
+            slatedb_hybrid_cache_gb,
+            zerofs_disk_cache_gb,
             slatedb_memory_cache_gb,
             zerofs_memory_cache_gb
         );
 
-        let slatedb_disk_cache_size_bytes = (slatedb_disk_cache_size_gb * 1_000_000_000.0) as usize;
+        let slatedb_object_cache_bytes = (slatedb_object_cache_gb * 1_000_000_000.0) as usize;
+        let slatedb_hybrid_cache_bytes = (slatedb_hybrid_cache_gb * 1_000_000_000.0) as usize;
         let slatedb_memory_cache_bytes = (slatedb_memory_cache_gb * 1_000_000_000.0) as u64;
 
         tracing::info!(
@@ -154,7 +207,7 @@ impl SlateDbFs {
         let settings = slatedb::config::Settings {
             object_store_cache_options: ObjectStoreCacheOptions {
                 root_folder: Some(slatedb_cache_dir.clone().into()),
-                max_cache_size_bytes: Some(slatedb_disk_cache_size_bytes / 2),
+                max_cache_size_bytes: Some(slatedb_object_cache_bytes),
                 ..Default::default()
             },
             flush_interval: Some(std::time::Duration::from_secs(5)),
@@ -181,7 +234,7 @@ impl SlateDbFs {
                 })
                 .with_device_options(
                     DirectFsDeviceOptions::new(slatedb_cache_dir)
-                        .with_capacity(slatedb_disk_cache_size_bytes / 2), // Half for SlateDB , half for ZeroFS
+                        .with_capacity(slatedb_hybrid_cache_bytes),
                 )
                 .build()
                 .await?,
@@ -255,12 +308,12 @@ impl SlateDbFs {
 
         let lock_manager = Arc::new(LockManager::new());
 
-        // ZeroFS now uses only in-memory cache, no need for disk cache directory
+        let zerofs_cache_dir = format!("{}/zerofs", cache_config.root_folder);
         let unified_cache = Arc::new(
             UnifiedCache::new(
-                "",  // Not used for in-memory cache
-                0.0, // Not used for in-memory cache
-                cache_config.memory_cache_size_gb,
+                &zerofs_cache_dir,
+                zerofs_disk_cache_gb,
+                Some(zerofs_memory_cache_gb),
             )
             .await?,
         );
@@ -268,10 +321,6 @@ impl SlateDbFs {
         let db = Arc::new(
             EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
         );
-
-        let metadata_cache = unified_cache.clone();
-        let small_file_cache = unified_cache.clone();
-        let dir_entry_cache = unified_cache.clone();
 
         let global_stats = Arc::new(FileSystemGlobalStats::new());
 
@@ -288,9 +337,7 @@ impl SlateDbFs {
             db: db.clone(),
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
-            metadata_cache,
-            small_file_cache,
-            dir_entry_cache,
+            cache: unified_cache,
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
@@ -300,37 +347,61 @@ impl SlateDbFs {
     }
 
     pub fn inode_key(inode_id: InodeId) -> Bytes {
-        Bytes::from(format!("inode:{inode_id}"))
+        let mut key = Vec::with_capacity(9);
+        key.push(PREFIX_INODE);
+        key.extend_from_slice(&inode_id.to_be_bytes());
+        Bytes::from(key)
     }
 
     pub fn chunk_key_by_index(inode_id: InodeId, chunk_index: usize) -> Bytes {
-        Bytes::from(format!("chunk:{inode_id}/{chunk_index}"))
+        let mut key = Vec::with_capacity(17);
+        key.push(PREFIX_CHUNK);
+        key.extend_from_slice(&inode_id.to_be_bytes());
+        key.extend_from_slice(&(chunk_index as u64).to_be_bytes());
+        Bytes::from(key)
     }
 
     pub fn counter_key() -> Bytes {
-        Bytes::from("system:next_inode_id")
+        Bytes::from(vec![PREFIX_SYSTEM, 0x01]) // 0x01 for counter subtype
     }
 
     pub fn dir_entry_key(dir_inode_id: InodeId, name: &str) -> Bytes {
-        Bytes::from(format!("direntry:{dir_inode_id}/{name}"))
+        let mut key = Vec::with_capacity(9 + name.len());
+        key.push(PREFIX_DIR_ENTRY);
+        key.extend_from_slice(&dir_inode_id.to_be_bytes());
+        key.extend_from_slice(name.as_bytes());
+        Bytes::from(key)
     }
 
     pub fn dir_scan_key(dir_inode_id: InodeId, entry_inode_id: InodeId, name: &str) -> Bytes {
-        Bytes::from(format!(
-            "dirscan:{dir_inode_id}/{entry_inode_id:020}/{name}",
-        ))
+        let mut key = Vec::with_capacity(17 + name.len());
+        key.push(PREFIX_DIR_SCAN);
+        key.extend_from_slice(&dir_inode_id.to_be_bytes());
+        key.extend_from_slice(&entry_inode_id.to_be_bytes());
+        key.extend_from_slice(name.as_bytes());
+        Bytes::from(key)
     }
 
-    pub fn dir_scan_prefix(dir_inode_id: InodeId) -> String {
-        format!("dirscan:{dir_inode_id}/")
+    pub fn dir_scan_prefix(dir_inode_id: InodeId) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(9);
+        prefix.push(PREFIX_DIR_SCAN);
+        prefix.extend_from_slice(&dir_inode_id.to_be_bytes());
+        prefix
     }
 
     pub fn tombstone_key(timestamp: u64, inode_id: InodeId) -> Bytes {
-        Bytes::from(format!("tombstone:{timestamp}:{inode_id}"))
+        let mut key = Vec::with_capacity(17);
+        key.push(PREFIX_TOMBSTONE);
+        key.extend_from_slice(&timestamp.to_be_bytes());
+        key.extend_from_slice(&inode_id.to_be_bytes());
+        Bytes::from(key)
     }
 
     pub fn stats_shard_key(shard_id: usize) -> Bytes {
-        Bytes::from(format!("stats:shard:{shard_id}"))
+        let mut key = Vec::with_capacity(9);
+        key.push(PREFIX_STATS);
+        key.extend_from_slice(&(shard_id as u64).to_be_bytes());
+        Bytes::from(key)
     }
 
     pub async fn allocate_inode(&self) -> Result<InodeId, nfsstat3> {
@@ -384,7 +455,7 @@ impl SlateDbFs {
 
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, nfsstat3> {
         let cache_key = CacheKey::Metadata(inode_id);
-        if let Some(CacheValue::Metadata(cached_inode)) = self.metadata_cache.get(cache_key).await {
+        if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key).await {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((*cached_inode).clone());
         }
@@ -395,14 +466,17 @@ impl SlateDbFs {
             .db
             .get_bytes(&key)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| {
+                tracing::error!("Failed to get inode {}: {:?}", inode_id, e);
+                nfsstat3::NFS3ERR_IO
+            })?
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
         let inode: Inode = bincode::deserialize(&data).map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
-        self.metadata_cache.insert(cache_key, cache_value, false);
+        self.cache.insert(cache_key, cache_value, false).await;
 
         Ok(inode)
     }
@@ -423,13 +497,15 @@ impl SlateDbFs {
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
-        self.metadata_cache.remove(CacheKey::Metadata(inode_id));
+        let mut keys_to_remove = vec![CacheKey::Metadata(inode_id)];
 
         if let Inode::File(file) = inode {
             if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES {
-                self.small_file_cache.remove(CacheKey::SmallFile(inode_id));
+                keys_to_remove.push(CacheKey::SmallFile(inode_id));
             }
         }
+
+        self.cache.remove_batch(keys_to_remove).await;
 
         Ok(())
     }
@@ -440,8 +516,10 @@ impl SlateDbFs {
         self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
 
         loop {
-            let prefix = Bytes::from("tombstone:");
-            let range = prefix.clone()..Bytes::from("tombstone:~");
+            // Binary tombstone key prefix
+            let prefix = vec![PREFIX_TOMBSTONE];
+            let end_prefix = vec![PREFIX_TOMBSTONE + 1];
+            let range = Bytes::from(prefix.clone())..Bytes::from(end_prefix);
 
             let mut tombstones_to_update = Vec::new();
             let mut chunks_deleted_this_round = 0;
@@ -463,16 +541,10 @@ impl SlateDbFs {
                     break;
                 }
 
-                // Parse inode_id from key: "tombstone:<timestamp>:<inode_id>"
-                let key_str = String::from_utf8_lossy(&key);
-                let parts: Vec<&str> = key_str.split(':').collect();
-                if parts.len() != 3 {
-                    continue;
-                }
-
-                let inode_id = match parts[2].parse::<u64>() {
-                    Ok(id) => id,
-                    Err(_) => continue,
+                // Parse tombstone key
+                let inode_id = match ParsedKey::parse(&key) {
+                    Some(ParsedKey::Tombstone { inode_id }) => inode_id,
+                    _ => continue,
                 };
 
                 if value.len() != 8 {
@@ -662,16 +734,12 @@ impl SlateDbFs {
 
         let lock_manager = Arc::new(LockManager::new());
 
-        // ZeroFS uses only in-memory cache for tests (100MB)
+        // For tests, use memory-only cache (no disk backing needed)
         let unified_cache = Arc::new(UnifiedCache::new("", 0.0, Some(0.1)).await?);
 
         let db = Arc::new(
             EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
         );
-
-        let metadata_cache = unified_cache.clone();
-        let small_file_cache = unified_cache.clone();
-        let dir_entry_cache = unified_cache.clone();
 
         let global_stats = Arc::new(FileSystemGlobalStats::new());
 
@@ -688,9 +756,7 @@ impl SlateDbFs {
             db: db.clone(),
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
-            metadata_cache,
-            small_file_cache,
-            dir_entry_cache,
+            cache: unified_cache,
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
@@ -709,14 +775,13 @@ impl SlateDbFs {
     ) -> Result<DangerousUnencryptedSlateDbFs, Box<dyn std::error::Error>> {
         let total_cache_size_gb = cache_config.max_cache_size_gb;
 
-        // Since ZeroFS now uses only in-memory cache, allocate all disk cache to SlateDB
+        // For key management, all disk cache goes to SlateDB
         let slatedb_cache_size_gb = total_cache_size_gb;
 
         tracing::info!(
-            "Cache allocation - Total: {:.2}GB, SlateDB (disk): {:.2}GB, ZeroFS (memory): {:.2}GB",
+            "Cache allocation for key management - Total: {:.2}GB, SlateDB (disk): {:.2}GB",
             total_cache_size_gb,
-            slatedb_cache_size_gb,
-            cache_config.memory_cache_size_gb.unwrap_or(0.25)
+            slatedb_cache_size_gb
         );
 
         let settings = slatedb::config::Settings {
@@ -818,25 +883,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_inode_key_generation() {
-        assert_eq!(SlateDbFs::inode_key(0), Bytes::from("inode:0"));
-        assert_eq!(SlateDbFs::inode_key(42), Bytes::from("inode:42"));
-        assert_eq!(SlateDbFs::inode_key(999), Bytes::from("inode:999"));
+        // Test binary key format: [PREFIX_INODE | inode_id(8 bytes BE)]
+        let key0 = SlateDbFs::inode_key(0);
+        assert_eq!(key0[0], PREFIX_INODE);
+        assert_eq!(&key0[1..9], &0u64.to_be_bytes());
+
+        let key42 = SlateDbFs::inode_key(42);
+        assert_eq!(key42[0], PREFIX_INODE);
+        assert_eq!(&key42[1..9], &42u64.to_be_bytes());
+
+        let key999 = SlateDbFs::inode_key(999);
+        assert_eq!(key999[0], PREFIX_INODE);
+        assert_eq!(&key999[1..9], &999u64.to_be_bytes());
     }
 
     #[tokio::test]
     async fn test_chunk_key_generation() {
-        assert_eq!(
-            SlateDbFs::chunk_key_by_index(1, 0),
-            Bytes::from("chunk:1/0")
-        );
-        assert_eq!(
-            SlateDbFs::chunk_key_by_index(42, 10),
-            Bytes::from("chunk:42/10")
-        );
-        assert_eq!(
-            SlateDbFs::chunk_key_by_index(999, 999),
-            Bytes::from("chunk:999/999")
-        );
+        // Test binary key format: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
+        let key = SlateDbFs::chunk_key_by_index(1, 0);
+        assert_eq!(key[0], PREFIX_CHUNK);
+        assert_eq!(&key[1..9], &1u64.to_be_bytes());
+        assert_eq!(&key[9..17], &0u64.to_be_bytes());
+
+        let key = SlateDbFs::chunk_key_by_index(42, 10);
+        assert_eq!(key[0], PREFIX_CHUNK);
+        assert_eq!(&key[1..9], &42u64.to_be_bytes());
+        assert_eq!(&key[9..17], &10u64.to_be_bytes());
+
+        let key = SlateDbFs::chunk_key_by_index(999, 999);
+        assert_eq!(key[0], PREFIX_CHUNK);
+        assert_eq!(&key[1..9], &999u64.to_be_bytes());
+        assert_eq!(&key[9..17], &999u64.to_be_bytes());
     }
 
     #[tokio::test]
@@ -844,7 +921,10 @@ mod tests {
         let fs = SlateDbFs::new_in_memory().await.unwrap();
 
         let result = fs.load_inode(999).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
+        match result {
+            Err(nfsstat3::NFS3ERR_NOENT) => {} // Expected
+            other => panic!("Expected NFS3ERR_NOENT, got {other:?}"),
+        }
     }
 
     #[tokio::test]
