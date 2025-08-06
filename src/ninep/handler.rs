@@ -1,6 +1,7 @@
+use dashmap::DashMap;
 use deku::DekuContainerWrite;
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use tracing::debug;
 
 use super::protocol::*;
@@ -56,23 +57,24 @@ pub struct Fid {
     pub dir_last_cookie: u64, // Last cookie from process_readdir for continuation
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Session {
-    pub msize: u32,
-    pub fids: HashMap<u32, Fid>,
+    pub msize: AtomicU32,
+    pub fids: Arc<DashMap<u32, Fid>>,
 }
 
+#[derive(Clone)]
 pub struct NinePHandler {
     filesystem: Arc<SlateDbFs>,
-    session: Session,
+    session: Arc<Session>,
 }
 
 impl NinePHandler {
     pub fn new(filesystem: Arc<SlateDbFs>) -> Self {
-        let session = Session {
-            msize: DEFAULT_MSIZE,
-            fids: HashMap::new(),
-        };
+        let session = Arc::new(Session {
+            msize: AtomicU32::new(DEFAULT_MSIZE),
+            fids: Arc::new(DashMap::new()),
+        });
 
         Self {
             filesystem,
@@ -88,7 +90,7 @@ impl NinePHandler {
         }
     }
 
-    pub async fn handle_message(&mut self, tag: u16, msg: Message) -> P9Message {
+    pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
         match msg {
             Message::Tversion(tv) => self.handle_version(tag, tv).await,
             Message::Tattach(ta) => self.handle_attach(tag, ta).await,
@@ -117,7 +119,7 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_version(&mut self, tag: u16, tv: Tversion) -> P9Message {
+    async fn handle_version(&self, tag: u16, tv: Tversion) -> P9Message {
         let version_str = match tv.version.as_str() {
             Ok(s) => s,
             Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
@@ -137,18 +139,19 @@ impl NinePHandler {
             );
         }
 
-        self.session.msize = tv.msize.min(DEFAULT_MSIZE);
+        let msize = tv.msize.min(DEFAULT_MSIZE);
+        self.session.msize.store(msize, AtomicOrdering::Relaxed);
 
         P9Message::new(
             tag,
             Message::Rversion(Rversion {
-                msize: self.session.msize,
+                msize,
                 version: P9String::new(VERSION_9P2000L),
             }),
         )
     }
 
-    async fn handle_attach(&mut self, tag: u16, ta: Tattach) -> P9Message {
+    async fn handle_attach(&self, tag: u16, ta: Tattach) -> P9Message {
         let username = match ta.uname.as_str() {
             Ok(s) => s,
             Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
@@ -222,7 +225,7 @@ impl NinePHandler {
         P9Message::new(tag, Message::Rattach(Rattach { qid }))
     }
 
-    async fn handle_walk(&mut self, tag: u16, tw: Twalk) -> P9Message {
+    async fn handle_walk(&self, tag: u16, tw: Twalk) -> P9Message {
         let src_fid = match self.session.fids.get(&tw.fid) {
             Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
@@ -300,9 +303,9 @@ impl NinePHandler {
         )
     }
 
-    async fn handle_lopen(&mut self, tag: u16, tl: Tlopen) -> P9Message {
+    async fn handle_lopen(&self, tag: u16, tl: Tlopen) -> P9Message {
         let fid_entry = match self.session.fids.get(&tl.fid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -326,7 +329,7 @@ impl NinePHandler {
 
         let qid = inode_to_qid(&inode, inode_id);
 
-        if let Some(fid_entry) = self.session.fids.get_mut(&tl.fid) {
+        if let Some(mut fid_entry) = self.session.fids.get_mut(&tl.fid) {
             fid_entry.qid = qid.clone();
             fid_entry.opened = true;
             fid_entry.mode = Some(tl.flags);
@@ -339,12 +342,12 @@ impl NinePHandler {
         P9Message::new(tag, Message::Rlopen(Rlopen { qid, iounit }))
     }
 
-    async fn handle_clunk(&mut self, tag: u16, tc: Tclunk) -> P9Message {
+    async fn handle_clunk(&self, tag: u16, tc: Tclunk) -> P9Message {
         self.session.fids.remove(&tc.fid);
         P9Message::new(tag, Message::Rclunk(Rclunk))
     }
 
-    async fn handle_readdir(&mut self, tag: u16, tr: Treaddir) -> P9Message {
+    async fn handle_readdir(&self, tag: u16, tr: Treaddir) -> P9Message {
         let fid_entry = match self.session.fids.get(&tr.fid) {
             Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
@@ -442,7 +445,8 @@ impl NinePHandler {
         }
 
         // Update FID state for next sequential read
-        if let Some(fid) = self.session.fids.get_mut(&tr.fid) {
+
+        if let Some(mut fid) = self.session.fids.get_mut(&tr.fid) {
             fid.dir_last_offset = current_offset;
             fid.dir_last_cookie = cookie;
         }
@@ -532,10 +536,12 @@ impl NinePHandler {
         )
     }
 
-    async fn handle_lcreate(&mut self, tag: u16, tc: Tlcreate) -> P9Message {
-        let parent_fid = match self.session.fids.get(&tc.fid) {
-            Some(f) => f.clone(),
-            None => return P9Message::error(tag, libc::EBADF as u32),
+    async fn handle_lcreate(&self, tag: u16, tc: Tlcreate) -> P9Message {
+        let parent_fid = {
+            match self.session.fids.get(&tc.fid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            }
         };
 
         if parent_fid.opened {
@@ -577,7 +583,7 @@ impl NinePHandler {
 
                 let qid = inode_to_qid(&child_inode, child_id);
 
-                let fid_entry = self.session.fids.get_mut(&tc.fid).unwrap();
+                let mut fid_entry = self.session.fids.get_mut(&tc.fid).unwrap();
                 fid_entry.path.push(name.to_string());
                 fid_entry.inode_id = child_id;
                 fid_entry.qid = qid.clone();
@@ -598,7 +604,7 @@ impl NinePHandler {
 
     async fn handle_read(&self, tag: u16, tr: Tread) -> P9Message {
         let fid_entry = match self.session.fids.get(&tr.fid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -626,7 +632,7 @@ impl NinePHandler {
 
     async fn handle_write(&self, tag: u16, tw: Twrite) -> P9Message {
         let fid_entry = match self.session.fids.get(&tw.fid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -669,7 +675,7 @@ impl NinePHandler {
 
     async fn handle_getattr(&self, tag: u16, tg: Tgetattr) -> P9Message {
         let fid_entry = match self.session.fids.get(&tg.fid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -685,7 +691,7 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_setattr(&mut self, tag: u16, ts: Tsetattr) -> P9Message {
+    async fn handle_setattr(&self, tag: u16, ts: Tsetattr) -> P9Message {
         let (inode_id, creds) = {
             let fid_entry = match self.session.fids.get(&ts.fid) {
                 Some(f) => f,
@@ -749,9 +755,9 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_mkdir(&mut self, tag: u16, tm: Tmkdir) -> P9Message {
+    async fn handle_mkdir(&self, tag: u16, tm: Tmkdir) -> P9Message {
         let parent_fid = match self.session.fids.get(&tm.dfid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -803,9 +809,9 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_symlink(&mut self, tag: u16, ts: Tsymlink) -> P9Message {
+    async fn handle_symlink(&self, tag: u16, ts: Tsymlink) -> P9Message {
         let parent_fid = match self.session.fids.get(&ts.dfid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -857,9 +863,9 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_mknod(&mut self, tag: u16, tm: Tmknod) -> P9Message {
+    async fn handle_mknod(&self, tag: u16, tm: Tmknod) -> P9Message {
         let parent_fid = match self.session.fids.get(&tm.dfid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -924,7 +930,7 @@ impl NinePHandler {
 
     async fn handle_readlink(&self, tag: u16, tr: Treadlink) -> P9Message {
         let fid_entry = match self.session.fids.get(&tr.fid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -947,14 +953,17 @@ impl NinePHandler {
     }
 
     async fn handle_link(&self, tag: u16, tl: Tlink) -> P9Message {
-        let dir_fid = match self.session.fids.get(&tl.dfid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
-        };
+        let (dir_fid, file_fid) = {
+            let dir_fid = match self.session.fids.get(&tl.dfid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            };
+            let file_fid = match self.session.fids.get(&tl.fid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            };
 
-        let file_fid = match self.session.fids.get(&tl.fid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
+            (dir_fid, file_fid)
         };
 
         let dir_id = dir_fid.inode_id;
@@ -986,14 +995,16 @@ impl NinePHandler {
     }
 
     async fn handle_rename(&self, tag: u16, tr: Trename) -> P9Message {
-        let source_fid = match self.session.fids.get(&tr.fid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
-        };
-
-        let dest_fid = match self.session.fids.get(&tr.dfid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
+        let (source_fid, dest_fid) = {
+            let source_fid = match self.session.fids.get(&tr.fid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            };
+            let dest_fid = match self.session.fids.get(&tr.dfid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            };
+            (source_fid, dest_fid)
         };
 
         if source_fid.path.is_empty() {
@@ -1046,14 +1057,16 @@ impl NinePHandler {
     }
 
     async fn handle_renameat(&self, tag: u16, tr: Trenameat) -> P9Message {
-        let old_dir_fid = match self.session.fids.get(&tr.olddirfid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
-        };
-
-        let new_dir_fid = match self.session.fids.get(&tr.newdirfid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
+        let (old_dir_fid, new_dir_fid) = {
+            let old_dir_fid = match self.session.fids.get(&tr.olddirfid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            };
+            let new_dir_fid = match self.session.fids.get(&tr.newdirfid) {
+                Some(f) => f.clone(),
+                None => return P9Message::error(tag, libc::EBADF as u32),
+            };
+            (old_dir_fid, new_dir_fid)
         };
 
         let old_parent_id = old_dir_fid.inode_id;
@@ -1090,7 +1103,7 @@ impl NinePHandler {
 
     async fn handle_unlinkat(&self, tag: u16, tu: Tunlinkat) -> P9Message {
         let dir_fid = match self.session.fids.get(&tu.dirfid) {
-            Some(f) => f,
+            Some(f) => f.clone(),
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
@@ -1143,10 +1156,9 @@ impl NinePHandler {
     }
 
     async fn handle_fsync(&self, tag: u16, tf: Tfsync) -> P9Message {
-        let _fid_entry = match self.session.fids.get(&tf.fid) {
-            Some(f) => f,
-            None => return P9Message::error(tag, libc::EBADF as u32),
-        };
+        if !self.session.fids.contains_key(&tf.fid) {
+            return P9Message::error(tag, libc::EBADF as u32);
+        }
 
         match self.filesystem.flush().await {
             Ok(_) => P9Message::new(tag, Message::Rfsync(Rfsync)),
@@ -1417,7 +1429,7 @@ mod tests {
     #[tokio::test]
     async fn test_statfs() {
         let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
-        let mut handler = NinePHandler::new(fs.clone());
+        let handler = NinePHandler::new(fs.clone());
 
         let version_msg = Message::Tversion(Tversion {
             msize: DEFAULT_MSIZE,
@@ -1477,7 +1489,7 @@ mod tests {
     #[tokio::test]
     async fn test_statfs_with_files() {
         let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
-        let mut handler = NinePHandler::new(fs.clone());
+        let handler = NinePHandler::new(fs.clone());
 
         // Set up a session
         let version_msg = Message::Tversion(Tversion {
@@ -1576,7 +1588,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut handler = NinePHandler::new(fs);
+        let handler = NinePHandler::new(fs);
 
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,
@@ -1685,7 +1697,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut handler = NinePHandler::new(fs);
+        let handler = NinePHandler::new(fs);
 
         // Initialize
         let version_msg = Message::Tversion(Tversion {
@@ -1771,7 +1783,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut handler = NinePHandler::new(fs);
+        let handler = NinePHandler::new(fs);
 
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,
