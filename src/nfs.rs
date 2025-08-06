@@ -45,9 +45,7 @@ impl NFSFileSystem for SlateDbFs {
                     dir_id: real_dirid,
                     name: name.clone(),
                 };
-                if let Some(CacheValue::DirEntry(inode_id)) =
-                    self.dir_entry_cache.get(cache_key).await
-                {
+                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key).await {
                     debug!("lookup cache hit: {} -> inode {}", name, inode_id);
                     return Ok(EncodedFileId::from_inode(inode_id).into());
                 }
@@ -71,7 +69,7 @@ impl NFSFileSystem for SlateDbFs {
                             name: name.clone(),
                         };
                         let cache_value = crate::cache::CacheValue::DirEntry(inode_id);
-                        self.dir_entry_cache.insert(cache_key, cache_value, false);
+                        self.cache.insert(cache_key, cache_value, false).await;
 
                         Ok(EncodedFileId::from_inode(inode_id).into())
                     }

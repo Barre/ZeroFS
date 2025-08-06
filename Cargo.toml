@@ -53,6 +53,5 @@ object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev
     "gcp",
 ] }
 
-
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }

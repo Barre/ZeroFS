@@ -226,17 +226,21 @@ impl SlateDbFs {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.metadata_cache
-                    .remove(crate::cache::CacheKey::Metadata(file_id));
-                self.metadata_cache
-                    .remove(crate::cache::CacheKey::Metadata(dirid));
-                self.small_file_cache
-                    .remove(crate::cache::CacheKey::SmallFile(file_id));
-                self.dir_entry_cache
+                self.cache
+                    .remove(crate::cache::CacheKey::Metadata(file_id))
+                    .await;
+                self.cache
+                    .remove(crate::cache::CacheKey::Metadata(dirid))
+                    .await;
+                self.cache
+                    .remove(crate::cache::CacheKey::SmallFile(file_id))
+                    .await;
+                self.cache
                     .remove(crate::cache::CacheKey::DirEntry {
                         dir_id: dirid,
                         name: name.clone(),
-                    });
+                    })
+                    .await;
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 

@@ -222,8 +222,10 @@ impl SlateDbFs {
                             self.global_stats.commit_update(&update);
                         }
 
-                        self.metadata_cache.remove(CacheKey::Metadata(id));
-                        self.small_file_cache.remove(CacheKey::SmallFile(id));
+                        // Remove both cache entries in batch
+                        self.cache
+                            .remove_batch(vec![CacheKey::Metadata(id), CacheKey::SmallFile(id)])
+                            .await;
 
                         return Ok(inode.to_fattr3(id));
                     }
@@ -686,10 +688,9 @@ impl SlateDbFs {
                     .await
                     .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
-                // Update in-memory statistics after successful commit
                 self.global_stats.commit_update(&stats_update);
 
-                self.metadata_cache.remove(CacheKey::Metadata(dirid));
+                self.cache.remove(CacheKey::Metadata(dirid)).await;
 
                 Ok((special_id, inode.to_fattr3(special_id)))
             }
