@@ -1,3 +1,9 @@
+use crate::filesystem::{CacheConfig, SlateDbFs};
+use crate::nbd::NBDServer;
+use mimalloc::MiMalloc;
+use std::sync::Arc;
+use tracing::info;
+
 mod bucket_identity;
 mod cache;
 mod encryption;
@@ -19,17 +25,8 @@ mod test_helpers;
 #[cfg(test)]
 mod posix_tests;
 
-use crate::filesystem::{CacheConfig, SlateDbFs};
-use crate::nbd::NBDServer;
-use std::sync::Arc;
-use tracing::info;
-
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 const DEFAULT_NFS_HOST: &str = "127.0.0.1";
 const DEFAULT_NFS_PORT: u32 = 2049;
