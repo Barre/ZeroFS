@@ -1,26 +1,26 @@
-use slatedb::config::WriteOptions;
-use tracing::debug;
-use zerofs_nfsserve::nfs::{
-    fattr3, fileid3, ftype3, nfsstat3, sattr3, set_atime, set_gid3, set_mode3, set_mtime,
-    set_size3, set_uid3,
-};
-use zerofs_nfsserve::vfs::AuthContext;
-
 use super::common::validate_filename;
 use crate::filesystem::cache::CacheKey;
-use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
+use crate::filesystem::errors::FsError;
 use crate::filesystem::inode::{Inode, SpecialInode};
 use crate::filesystem::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
+use crate::filesystem::types::InodeWithId;
+use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
+use slatedb::config::WriteOptions;
+use tracing::debug;
+use zerofs_nfsserve::nfs::{
+    fattr3, fileid3, ftype3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
+};
+use zerofs_nfsserve::vfs::AuthContext;
 
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn process_setattr(
         &self,
         auth: &AuthContext,
         id: fileid3,
         setattr: sattr3,
-    ) -> Result<fattr3, nfsstat3> {
+    ) -> Result<fattr3, FsError> {
         debug!("process_setattr: id={}, setattr={:?}", id, setattr);
         let _guard = self.lock_manager.acquire_write(id).await;
         let mut inode = self.load_inode(id).await?;
@@ -29,14 +29,12 @@ impl SlateDbFs {
 
         self.check_parent_execute_permissions(id, &creds).await?;
 
-        // Check permissions for various operations
         // For chmod (mode change), must be owner
         if matches!(setattr.mode, set_mode3::mode(_)) {
             check_ownership(&inode, &creds)?;
         }
 
         // For chown/chgrp, must be root (or owner with restrictions)
-        // Note: If both uid and gid are not being changed (Void), allow the operation
         const DONT_CHANGE_ID: u32 = 0xFFFFFFFF;
 
         let changing_uid = match &setattr.uid {
@@ -48,33 +46,27 @@ impl SlateDbFs {
             set_gid3::Void => false,
         };
 
-        // If neither uid nor gid is being changed, skip permission checks for chown
         if (changing_uid || changing_gid) && creds.uid != 0 {
-            // First check ownership - non-root users can only chown files they own
             check_ownership(&inode, &creds)?;
 
-            // Non-root users cannot change uid to a different user
             if changing_uid {
                 if let set_uid3::uid(new_uid) = setattr.uid {
                     if new_uid != DONT_CHANGE_ID && new_uid != creds.uid {
-                        return Err(nfsstat3::NFS3ERR_PERM);
+                        return Err(FsError::PermissionDenied);
                     }
                 }
             }
 
-            // Non-root users can only change group if they own the file and are member of the new group
+            // POSIX: Owner can change group to any group they belong to
             if let set_gid3::gid(new_gid) = setattr.gid {
                 if new_gid != DONT_CHANGE_ID {
-                    // Check if user is member of the new group
-                    // POSIX: Owner can change group to any group they belong to
                     if !creds.is_member_of_group(new_gid) {
-                        return Err(nfsstat3::NFS3ERR_PERM);
+                        return Err(FsError::PermissionDenied);
                     }
                 }
             }
         }
 
-        // For setting times, check can_set_times
         match setattr.atime {
             set_atime::SET_TO_CLIENT_TIME(_) => {
                 can_set_times(&inode, &creds, false)?;
@@ -146,15 +138,13 @@ impl SlateDbFs {
                                     .db
                                     .get_bytes(&key)
                                     .await
-                                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                                    .map_err(|_| FsError::IoError)?
                                 {
                                     let mut new_chunk_data = vec![0u8; last_chunk_size];
                                     let copy_len = last_chunk_size.min(old_chunk_data.len());
                                     new_chunk_data[..copy_len]
                                         .copy_from_slice(&old_chunk_data[..copy_len]);
-                                    batch
-                                        .put_bytes(&key, &new_chunk_data)
-                                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                                    batch.put_bytes(&key, &new_chunk_data);
                                 }
                             }
                         } else if new_size > old_size && old_size > 0 {
@@ -167,7 +157,7 @@ impl SlateDbFs {
                                     .db
                                     .get_bytes(&key)
                                     .await
-                                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                                    .map_err(|_| FsError::IoError)?
                                 {
                                     let new_chunk_size = if (last_old_chunk_idx + 1) * CHUNK_SIZE
                                         <= new_size as usize
@@ -181,20 +171,15 @@ impl SlateDbFs {
                                         let mut extended_chunk = vec![0u8; new_chunk_size];
                                         extended_chunk[..old_chunk_data.len()]
                                             .copy_from_slice(&old_chunk_data);
-                                        batch
-                                            .put_bytes(&key, &extended_chunk)
-                                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                                        batch.put_bytes(&key, &extended_chunk);
                                     }
                                 }
                             }
                         }
 
                         let inode_key = Self::inode_key(id);
-                        let inode_data =
-                            bincode::serialize(&inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                        batch
-                            .put_bytes(&inode_key, &inode_data)
-                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                        let inode_data = bincode::serialize(&inode)?;
+                        batch.put_bytes(&inode_key, &inode_data);
 
                         let stats_update = if let Some(update) = self
                             .global_stats
@@ -215,7 +200,7 @@ impl SlateDbFs {
                                 },
                             )
                             .await
-                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            .map_err(|_| FsError::IoError)?;
 
                         // Update in-memory statistics after successful commit
                         if let Some(update) = stats_update {
@@ -227,7 +212,7 @@ impl SlateDbFs {
                             .remove_batch(vec![CacheKey::Metadata(id), CacheKey::SmallFile(id)])
                             .await;
 
-                        return Ok(inode.to_fattr3(id));
+                        return Ok(InodeWithId { inode: &inode, id }.into());
                     }
                 }
 
@@ -548,7 +533,7 @@ impl SlateDbFs {
         }
 
         self.save_inode(id, &inode).await?;
-        Ok(inode.to_fattr3(id))
+        Ok(InodeWithId { inode: &inode, id }.into())
     }
 
     pub async fn process_mknod(
@@ -559,7 +544,7 @@ impl SlateDbFs {
         ftype: ftype3,
         attr: &sattr3,
         rdev: Option<(u32, u32)>, // For device files
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
+    ) -> Result<(fileid3, fattr3), FsError> {
         validate_filename(filename)?;
 
         let filename_str = String::from_utf8_lossy(filename);
@@ -579,7 +564,7 @@ impl SlateDbFs {
             Inode::Directory(d) => (d.uid, d.gid, d.mode),
             _ => {
                 debug!("Parent is not a directory");
-                return Err(nfsstat3::NFS3ERR_NOTDIR);
+                return Err(FsError::NotDirectory);
             }
         };
 
@@ -592,11 +577,11 @@ impl SlateDbFs {
                     .db
                     .get_bytes(&entry_key)
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .map_err(|_| FsError::IoError)?
                     .is_some()
                 {
                     debug!("File already exists");
-                    return Err(nfsstat3::NFS3ERR_EXIST);
+                    return Err(FsError::Exists);
                 }
 
                 let special_id = self.allocate_inode().await?;
@@ -606,7 +591,7 @@ impl SlateDbFs {
                     ftype3::NF3FIFO => 0o666,
                     ftype3::NF3CHR | ftype3::NF3BLK => 0o666,
                     ftype3::NF3SOCK => 0o666,
-                    _ => return Err(nfsstat3::NFS3ERR_INVAL),
+                    _ => return Err(FsError::InvalidArgument),
                 };
 
                 let final_mode = if let set_mode3::mode(m) = attr.mode {
@@ -641,26 +626,19 @@ impl SlateDbFs {
                     ftype3::NF3CHR => Inode::CharDevice(special_inode),
                     ftype3::NF3BLK => Inode::BlockDevice(special_inode),
                     ftype3::NF3SOCK => Inode::Socket(special_inode),
-                    _ => return Err(nfsstat3::NFS3ERR_INVAL),
+                    _ => return Err(FsError::InvalidArgument),
                 };
 
                 let mut batch = self.db.new_write_batch();
 
                 let special_inode_key = Self::inode_key(special_id);
-                let special_inode_data =
-                    bincode::serialize(&inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&special_inode_key, &special_inode_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let special_inode_data = bincode::serialize(&inode)?;
+                batch.put_bytes(&special_inode_key, &special_inode_data);
 
-                batch
-                    .put_bytes(&entry_key, &special_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&entry_key, &special_id.to_le_bytes());
 
                 let scan_key = Self::dir_scan_key(dirid, special_id, &name);
-                batch
-                    .put_bytes(&scan_key, &special_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&scan_key, &special_id.to_le_bytes());
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -669,11 +647,8 @@ impl SlateDbFs {
                 dir.ctime_nsec = now_nsec;
 
                 let dir_inode_key = Self::inode_key(dirid);
-                let dir_inode_data =
-                    bincode::serialize(&dir_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&dir_inode_key, &dir_inode_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let dir_inode_data = bincode::serialize(&dir_inode)?;
+                batch.put_bytes(&dir_inode_key, &dir_inode_data);
 
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
@@ -686,15 +661,22 @@ impl SlateDbFs {
                         },
                     )
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|_| FsError::IoError)?;
 
                 self.global_stats.commit_update(&stats_update);
 
                 self.cache.remove(CacheKey::Metadata(dirid)).await;
 
-                Ok((special_id, inode.to_fattr3(special_id)))
+                Ok((
+                    special_id,
+                    InodeWithId {
+                        inode: &inode,
+                        id: special_id,
+                    }
+                    .into(),
+                ))
             }
-            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => Err(FsError::NotDirectory),
         }
     }
 }

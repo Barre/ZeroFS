@@ -1,73 +1,70 @@
-use slatedb::config::WriteOptions;
-use std::sync::atomic::Ordering;
-use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
-use zerofs_nfsserve::vfs::AuthContext;
-
 use super::common::validate_filename;
-use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
+use crate::filesystem::errors::FsError;
 use crate::filesystem::inode::Inode;
 use crate::filesystem::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
+use crate::filesystem::permissions::{
+    AccessMode, Credentials, check_access, check_sticky_bit_delete,
+};
+use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
+use slatedb::config::WriteOptions;
+use std::sync::atomic::Ordering;
+use zerofs_nfsserve::nfs::fileid3;
+use zerofs_nfsserve::vfs::AuthContext;
 
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn process_remove(
         &self,
         auth: &AuthContext,
         dirid: fileid3,
         filename: &[u8],
-    ) -> Result<(), nfsstat3> {
+    ) -> Result<(), FsError> {
         validate_filename(filename)?;
 
         let name = String::from_utf8_lossy(filename).to_string();
         let creds = Credentials::from_auth_context(auth);
 
-        // Look up the file_id without holding any locks
         let entry_key = Self::dir_entry_key(dirid, &name);
         let entry_data = self
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            .map_err(|_| FsError::IoError)?
+            .ok_or(FsError::NotFound)?;
 
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
         let file_id = u64::from_le_bytes(bytes);
 
-        // Now acquire both locks in sorted order
         let _guards = self
             .lock_manager
             .acquire_multiple_write(vec![dirid, file_id])
             .await;
 
-        // Verify everything is still valid after acquiring locks
         let dir_inode = self.load_inode(dirid).await?;
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
         let is_dir = matches!(dir_inode, Inode::Directory(_));
         if !is_dir {
-            return Err(nfsstat3::NFS3ERR_NOTDIR);
+            return Err(FsError::NotDirectory);
         }
 
-        // Re-verify the entry still exists and points to the same file
         let entry_data = self
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            .map_err(|_| FsError::IoError)?
+            .ok_or(FsError::NotFound)?;
 
         let mut verify_bytes = [0u8; 8];
         verify_bytes.copy_from_slice(&entry_data[..8]);
 
         if u64::from_le_bytes(verify_bytes) != file_id {
-            return Err(nfsstat3::NFS3ERR_NOENT);
+            return Err(FsError::NotFound);
         }
 
         let mut file_inode = self.load_inode(file_id).await?;
 
-        // Capture the original nlink before any modifications
         let original_nlink = match &file_inode {
             Inode::File(f) => f.nlink,
             Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
@@ -87,42 +84,31 @@ impl SlateDbFs {
 
                 match &mut file_inode {
                     Inode::File(file) => {
-                        // Check if this is the last hard link
                         if file.nlink > 1 {
-                            // Just decrement the link count, don't delete the file
                             file.nlink -= 1;
                             file.ctime = now_sec;
                             file.ctime_nsec = now_nsec;
 
                             let inode_key = Self::inode_key(file_id);
-                            let inode_data = bincode::serialize(&file_inode)
-                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                            batch
-                                .put_bytes(&inode_key, &inode_data)
-                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            let inode_data = bincode::serialize(&file_inode)?;
+                            batch.put_bytes(&inode_key, &inode_data);
                         } else {
-                            // Last link, check if we should delete immediately or defer
                             let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
 
                             if total_chunks <= SMALL_FILE_TOMBSTONE_THRESHOLD {
-                                // Small file, delete chunks immediately
                                 for chunk_idx in 0..total_chunks {
                                     let chunk_key = Self::chunk_key_by_index(file_id, chunk_idx);
                                     batch.delete_bytes(&chunk_key);
                                 }
                             } else {
-                                // Large file, create tombstone for deferred chunk deletion
                                 let (timestamp, _) = get_current_time();
                                 let tombstone_key = Self::tombstone_key(timestamp, file_id);
-                                batch
-                                    .put_bytes(&tombstone_key, &file.size.to_le_bytes())
-                                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                                batch.put_bytes(&tombstone_key, &file.size.to_le_bytes());
                                 self.stats
                                     .tombstones_created
                                     .fetch_add(1, Ordering::Relaxed);
                             }
 
-                            // Delete the inode
                             let inode_key = Self::inode_key(file_id);
                             batch.delete_bytes(&inode_key);
                             self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
@@ -130,19 +116,16 @@ impl SlateDbFs {
                     }
                     Inode::Directory(subdir) => {
                         if subdir.entry_count > 0 {
-                            return Err(nfsstat3::NFS3ERR_NOTEMPTY);
+                            return Err(FsError::NotEmpty);
                         }
-                        // Delete the directory inode
                         let inode_key = Self::inode_key(file_id);
                         batch.delete_bytes(&inode_key);
-                        // Decrement parent's nlink since we're removing a subdirectory
                         dir.nlink = dir.nlink.saturating_sub(1);
                         self.stats
                             .directories_deleted
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     Inode::Symlink(_) => {
-                        // Delete the symlink inode
                         let inode_key = Self::inode_key(file_id);
                         batch.delete_bytes(&inode_key);
                         self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
@@ -151,21 +134,15 @@ impl SlateDbFs {
                     | Inode::Socket(special)
                     | Inode::CharDevice(special)
                     | Inode::BlockDevice(special) => {
-                        // Check if this is the last hard link
                         if special.nlink > 1 {
-                            // Just decrement the link count, don't delete the inode
                             special.nlink -= 1;
                             special.ctime = now_sec;
                             special.ctime_nsec = now_nsec;
 
                             let inode_key = Self::inode_key(file_id);
-                            let inode_data = bincode::serialize(&file_inode)
-                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                            batch
-                                .put_bytes(&inode_key, &inode_data)
-                                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            let inode_data = bincode::serialize(&file_inode)?;
+                            batch.put_bytes(&inode_key, &inode_data);
                         } else {
-                            // Last link, delete the inode
                             let inode_key = Self::inode_key(file_id);
                             batch.delete_bytes(&inode_key);
                         }
@@ -184,18 +161,15 @@ impl SlateDbFs {
                 dir.ctime_nsec = now_nsec;
 
                 let dir_key = Self::inode_key(dirid);
-                let dir_data = bincode::serialize(&dir_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&dir_key, &dir_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let dir_data = bincode::serialize(&dir_inode)?;
+                batch.put_bytes(&dir_key, &dir_data);
 
-                // Prepare statistics update based on what we're deleting
                 // For directories and symlinks: always remove from stats
                 // For files and special files: only remove if this is the last link
                 let (file_size, should_always_remove_stats) = match &file_inode {
                     Inode::File(f) => (Some(f.size), false),
                     Inode::Directory(_) | Inode::Symlink(_) => (None, true),
-                    _ => (None, false), // Special files (Fifo, Socket, CharDevice, BlockDevice)
+                    _ => (None, false),
                 };
 
                 let stats_update = if should_always_remove_stats || original_nlink <= 1 {
@@ -220,7 +194,7 @@ impl SlateDbFs {
                         },
                     )
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|_| FsError::IoError)?;
 
                 if let Some(update) = stats_update {
                     self.global_stats.commit_update(&update);
@@ -246,7 +220,7 @@ impl SlateDbFs {
 
                 Ok(())
             }
-            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => Err(FsError::NotDirectory),
         }
     }
 }

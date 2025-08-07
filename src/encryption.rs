@@ -105,14 +105,13 @@ impl EncryptedWriteBatch {
         }
     }
 
-    pub fn put_bytes(&mut self, key: &bytes::Bytes, value: &[u8]) -> Result<()> {
+    pub fn put_bytes(&mut self, key: &bytes::Bytes, value: &[u8]) {
         // Queue cache operation if this is a chunk
         if !key.is_empty() && key[0] == PREFIX_CHUNK {
             self.cache_ops.push((key.clone(), Some(value.to_vec())));
         }
 
         self.pending_operations.push((key.clone(), value.to_vec()));
-        Ok(())
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {

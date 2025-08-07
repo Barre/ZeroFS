@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use zerofs_nfsserve::nfs::{fattr3, ftype3, nfstime3, specdata3};
 
 pub type InodeId = u64;
 
@@ -78,205 +77,12 @@ pub enum Inode {
     BlockDevice(SpecialInode),
 }
 
-impl Inode {
-    pub fn to_fattr3(&self, inode_id: InodeId) -> fattr3 {
-        match self {
-            Inode::File(file) => fattr3 {
-                ftype: ftype3::NF3REG,
-                mode: file.mode,
-                nlink: file.nlink,
-                uid: file.uid,
-                gid: file.gid,
-                size: file.size,
-                used: file.size,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: file.atime as u32,
-                    nseconds: file.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: file.mtime as u32,
-                    nseconds: file.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: file.ctime as u32,
-                    nseconds: file.ctime_nsec,
-                },
-            },
-            Inode::Directory(dir) => fattr3 {
-                ftype: ftype3::NF3DIR,
-                mode: dir.mode,
-                nlink: dir.nlink,
-                uid: dir.uid,
-                gid: dir.gid,
-                size: 4096,
-                used: 4096,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: dir.atime as u32,
-                    nseconds: dir.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: dir.mtime as u32,
-                    nseconds: dir.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: dir.ctime as u32,
-                    nseconds: dir.ctime_nsec,
-                },
-            },
-            Inode::Symlink(symlink) => fattr3 {
-                ftype: ftype3::NF3LNK,
-                mode: symlink.mode,
-                nlink: symlink.nlink,
-                uid: symlink.uid,
-                gid: symlink.gid,
-                size: symlink.target.len() as u64,
-                used: symlink.target.len() as u64,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: symlink.atime as u32,
-                    nseconds: symlink.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: symlink.mtime as u32,
-                    nseconds: symlink.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: symlink.ctime as u32,
-                    nseconds: symlink.ctime_nsec,
-                },
-            },
-            Inode::Fifo(special) => fattr3 {
-                ftype: ftype3::NF3FIFO,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: special.atime as u32,
-                    nseconds: special.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: special.mtime as u32,
-                    nseconds: special.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: special.ctime as u32,
-                    nseconds: special.ctime_nsec,
-                },
-            },
-            Inode::Socket(special) => fattr3 {
-                ftype: ftype3::NF3SOCK,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: special.atime as u32,
-                    nseconds: special.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: special.mtime as u32,
-                    nseconds: special.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: special.ctime as u32,
-                    nseconds: special.ctime_nsec,
-                },
-            },
-            Inode::CharDevice(special) => fattr3 {
-                ftype: ftype3::NF3CHR,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: specdata3 {
-                    specdata1: special.rdev.map(|(major, _)| major).unwrap_or(0),
-                    specdata2: special.rdev.map(|(_, minor)| minor).unwrap_or(0),
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: special.atime as u32,
-                    nseconds: special.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: special.mtime as u32,
-                    nseconds: special.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: special.ctime as u32,
-                    nseconds: special.ctime_nsec,
-                },
-            },
-            Inode::BlockDevice(special) => fattr3 {
-                ftype: ftype3::NF3BLK,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: specdata3 {
-                    specdata1: special.rdev.map(|(major, _)| major).unwrap_or(0),
-                    specdata2: special.rdev.map(|(_, minor)| minor).unwrap_or(0),
-                },
-                fsid: 0,
-                fileid: inode_id,
-                atime: nfstime3 {
-                    seconds: special.atime as u32,
-                    nseconds: special.atime_nsec,
-                },
-                mtime: nfstime3 {
-                    seconds: special.mtime as u32,
-                    nseconds: special.mtime_nsec,
-                },
-                ctime: nfstime3 {
-                    seconds: special.ctime as u32,
-                    nseconds: special.ctime_nsec,
-                },
-            },
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::types::InodeWithId;
+
+    use zerofs_nfsserve::nfs::{fattr3, ftype3};
 
     #[test]
     fn test_file_inode_to_fattr3() {
@@ -296,7 +102,11 @@ mod tests {
         };
 
         let inode = Inode::File(file_inode);
-        let fattr = inode.to_fattr3(42);
+        let fattr: fattr3 = InodeWithId {
+            inode: &inode,
+            id: 42,
+        }
+        .into();
 
         assert!(matches!(fattr.ftype, ftype3::NF3REG));
         assert_eq!(fattr.mode, 0o644);
@@ -326,7 +136,11 @@ mod tests {
         };
 
         let inode = Inode::Directory(dir_inode);
-        let fattr = inode.to_fattr3(1);
+        let fattr: fattr3 = InodeWithId {
+            inode: &inode,
+            id: 1,
+        }
+        .into();
 
         assert!(matches!(fattr.ftype, ftype3::NF3DIR));
         assert_eq!(fattr.mode, 0o755);
@@ -355,7 +169,11 @@ mod tests {
         };
 
         let inode = Inode::Symlink(symlink_inode.clone());
-        let fattr = inode.to_fattr3(99);
+        let fattr: fattr3 = InodeWithId {
+            inode: &inode,
+            id: 99,
+        }
+        .into();
 
         assert!(matches!(fattr.ftype, ftype3::NF3LNK));
         assert_eq!(fattr.mode, 0o777);

@@ -3,7 +3,7 @@ use foyer::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-pub const SMALL_FILE_THRESHOLD_BYTES: u64 = 512 * 1024; // 512KB
+pub const SMALL_FILE_THRESHOLD_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum CacheKey {

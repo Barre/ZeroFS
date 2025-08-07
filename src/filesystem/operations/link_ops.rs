@@ -1,16 +1,17 @@
+use super::common::validate_filename;
+use crate::filesystem::cache::CacheKey;
+use crate::filesystem::errors::FsError;
+use crate::filesystem::inode::{Inode, SymlinkInode};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
+use crate::filesystem::types::InodeWithId;
+use crate::filesystem::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
-use zerofs_nfsserve::nfs::{fattr3, fileid3, nfsstat3, sattr3, set_gid3, set_mode3, set_uid3};
+use zerofs_nfsserve::nfs::{fattr3, fileid3, sattr3, set_gid3, set_mode3, set_uid3};
 use zerofs_nfsserve::vfs::AuthContext;
 
-use super::common::validate_filename;
-use crate::filesystem::cache::CacheKey;
-use crate::filesystem::{MAX_HARDLINKS_PER_INODE, SlateDbFs, get_current_time};
-use crate::filesystem::inode::{Inode, SymlinkInode};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn process_symlink(
         &self,
         auth: &AuthContext,
@@ -18,7 +19,7 @@ impl SlateDbFs {
         linkname: &[u8],
         target: &[u8],
         attr: sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
+    ) -> Result<(fileid3, fattr3), FsError> {
         validate_filename(linkname)?;
 
         debug!(
@@ -35,7 +36,6 @@ impl SlateDbFs {
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
-        // Get parent directory's uid/gid as defaults before the mutable borrow
         let (_default_uid, _default_gid) = match &dir_inode {
             Inode::Directory(d) => (d.uid, d.gid),
             _ => (65534, 65534),
@@ -43,7 +43,7 @@ impl SlateDbFs {
 
         let dir = match &mut dir_inode {
             Inode::Directory(d) => d,
-            _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => return Err(FsError::NotDirectory),
         };
 
         let entry_key = Self::dir_entry_key(dirid, &linkname_str);
@@ -51,10 +51,10 @@ impl SlateDbFs {
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|_| FsError::IoError)?
             .is_some()
         {
-            return Err(nfsstat3::NFS3ERR_EXIST);
+            return Err(FsError::Exists);
         }
 
         let new_id = self.allocate_inode().await?;
@@ -96,21 +96,13 @@ impl SlateDbFs {
         let mut batch = self.db.new_write_batch();
 
         let inode_key = Self::inode_key(new_id);
-        let inode_data = bincode::serialize(&symlink_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        batch
-            .put_bytes(&inode_key, &inode_data)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let inode_data = bincode::serialize(&symlink_inode)?;
+        batch.put_bytes(&inode_key, &inode_data);
 
-        // Add directory entry (for lookup by name)
-        batch
-            .put_bytes(&entry_key, &new_id.to_le_bytes())
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put_bytes(&entry_key, &new_id.to_le_bytes());
 
-        // Add directory scan entry (for efficient readdir)
         let scan_key = Self::dir_scan_key(dirid, new_id, &linkname_str);
-        batch
-            .put_bytes(&scan_key, &new_id.to_le_bytes())
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put_bytes(&scan_key, &new_id.to_le_bytes());
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -120,15 +112,11 @@ impl SlateDbFs {
 
         let counter_key = Self::counter_key();
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        batch
-            .put_bytes(&counter_key, &next_id.to_le_bytes())
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put_bytes(&counter_key, &next_id.to_le_bytes());
 
         let dir_key = Self::inode_key(dirid);
-        let dir_data = bincode::serialize(&dir_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        batch
-            .put_bytes(&dir_key, &dir_data)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let dir_data = bincode::serialize(&dir_inode)?;
+        batch.put_bytes(&dir_key, &dir_data);
 
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
         self.global_stats.add_to_batch(&stats_update, &mut batch)?;
@@ -141,7 +129,7 @@ impl SlateDbFs {
                 },
             )
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|_| FsError::IoError)?;
 
         self.global_stats.commit_update(&stats_update);
 
@@ -150,7 +138,14 @@ impl SlateDbFs {
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-        Ok((new_id, symlink_inode.to_fattr3(new_id)))
+        Ok((
+            new_id,
+            InodeWithId {
+                inode: &symlink_inode,
+                id: new_id,
+            }
+            .into(),
+        ))
     }
 
     pub async fn process_link(
@@ -159,7 +154,7 @@ impl SlateDbFs {
         fileid: fileid3,
         linkdirid: fileid3,
         linkname: &[u8],
-    ) -> Result<(), nfsstat3> {
+    ) -> Result<(), FsError> {
         validate_filename(linkname)?;
 
         let linkname_str = String::from_utf8_lossy(linkname);
@@ -184,19 +179,17 @@ impl SlateDbFs {
 
         let mut link_dir = match link_dir_inode {
             Inode::Directory(d) => d,
-            _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => return Err(FsError::NotDirectory),
         };
 
         let mut file_inode = self.load_inode(fileid).await?;
 
-        // Don't allow hard links to directories
         if matches!(file_inode, Inode::Directory(_)) {
-            return Err(nfsstat3::NFS3ERR_INVAL);
+            return Err(FsError::InvalidArgument);
         }
 
-        // Don't allow hard links to symlinks (they're typically not allowed)
         if matches!(file_inode, Inode::Symlink(_)) {
-            return Err(nfsstat3::NFS3ERR_INVAL);
+            return Err(FsError::InvalidArgument);
         }
 
         let name = linkname_str.to_string();
@@ -206,27 +199,23 @@ impl SlateDbFs {
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|_| FsError::IoError)?
             .is_some()
         {
-            return Err(nfsstat3::NFS3ERR_EXIST);
+            return Err(FsError::Exists);
         }
 
         let mut batch = self.db.new_write_batch();
-        batch
-            .put_bytes(&entry_key, &fileid.to_le_bytes())
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put_bytes(&entry_key, &fileid.to_le_bytes());
 
         let scan_key = Self::dir_scan_key(linkdirid, fileid, &name);
-        batch
-            .put_bytes(&scan_key, &fileid.to_le_bytes())
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        batch.put_bytes(&scan_key, &fileid.to_le_bytes());
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
             Inode::File(file) => {
                 if file.nlink >= MAX_HARDLINKS_PER_INODE {
-                    return Err(nfsstat3::NFS3ERR_MLINK);
+                    return Err(FsError::TooManyLinks);
                 }
                 file.nlink += 1;
                 file.ctime = now_sec;
@@ -237,20 +226,18 @@ impl SlateDbFs {
             | Inode::CharDevice(special)
             | Inode::BlockDevice(special) => {
                 if special.nlink >= MAX_HARDLINKS_PER_INODE {
-                    return Err(nfsstat3::NFS3ERR_MLINK);
+                    return Err(FsError::TooManyLinks);
                 }
                 special.nlink += 1;
                 special.ctime = now_sec;
                 special.ctime_nsec = now_nsec;
             }
-            _ => unreachable!(), // We already filtered out directories and symlinks
+            _ => unreachable!(),
         }
 
         let file_inode_key = Self::inode_key(fileid);
-        let file_inode_data = bincode::serialize(&file_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        batch
-            .put_bytes(&file_inode_key, &file_inode_data)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let file_inode_data = bincode::serialize(&file_inode)?;
+        batch.put_bytes(&file_inode_key, &file_inode_data);
 
         link_dir.entry_count += 1;
         link_dir.mtime = now_sec;
@@ -259,11 +246,8 @@ impl SlateDbFs {
         link_dir.ctime_nsec = now_nsec;
 
         let dir_inode_key = Self::inode_key(linkdirid);
-        let dir_inode_data =
-            bincode::serialize(&Inode::Directory(link_dir)).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        batch
-            .put_bytes(&dir_inode_key, &dir_inode_data)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let dir_inode_data = bincode::serialize(&Inode::Directory(link_dir))?;
+        batch.put_bytes(&dir_inode_key, &dir_inode_data);
 
         self.db
             .write_with_options(
@@ -273,7 +257,7 @@ impl SlateDbFs {
                 },
             )
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|_| FsError::IoError)?;
 
         self.cache
             .remove_batch(vec![

@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use super::error::{NBDError, Result};
 use super::protocol::*;
-use crate::filesystem::{EncodedFileId, SlateDbFs};
+use crate::filesystem::{EncodedFileId, ZeroFS};
 
 #[derive(Clone)]
 pub struct NBDDevice {
@@ -16,14 +16,14 @@ pub struct NBDDevice {
 }
 
 pub struct NBDServer {
-    filesystem: Arc<SlateDbFs>,
+    filesystem: Arc<ZeroFS>,
     devices: HashMap<String, NBDDevice>,
     host: String,
     port: u16,
 }
 
 impl NBDServer {
-    pub fn new(filesystem: Arc<SlateDbFs>, host: String, port: u16) -> Self {
+    pub fn new(filesystem: Arc<ZeroFS>, host: String, port: u16) -> Self {
         Self {
             filesystem,
             devices: HashMap::new(),
@@ -156,7 +156,7 @@ impl NBDServer {
 
 async fn handle_client(
     stream: TcpStream,
-    filesystem: Arc<SlateDbFs>,
+    filesystem: Arc<ZeroFS>,
     devices: HashMap<String, NBDDevice>,
 ) -> Result<()> {
     let (reader, writer) = stream.into_split();
@@ -184,7 +184,7 @@ async fn handle_client(
 struct NBDSession<R, W> {
     reader: R,
     writer: W,
-    filesystem: Arc<SlateDbFs>,
+    filesystem: Arc<ZeroFS>,
     devices: HashMap<String, NBDDevice>,
     client_no_zeroes: bool,
 }
@@ -193,7 +193,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     fn new(
         reader: R,
         writer: W,
-        filesystem: Arc<SlateDbFs>,
+        filesystem: Arc<ZeroFS>,
         devices: HashMap<String, NBDDevice>,
     ) -> Self {
         Self {

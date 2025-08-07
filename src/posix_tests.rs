@@ -1,12 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use crate::filesystem::SlateDbFs;
+    use crate::filesystem::ZeroFS;
     use crate::test_helpers::test_helpers_mod::{filename, test_auth};
     use zerofs_nfsserve::nfs::*;
     use zerofs_nfsserve::vfs::NFSFileSystem;
 
-    async fn create_test_fs() -> SlateDbFs {
-        SlateDbFs::new_in_memory().await.unwrap()
+    async fn create_test_fs() -> ZeroFS {
+        ZeroFS::new_in_memory().await.unwrap()
     }
 
     #[tokio::test]

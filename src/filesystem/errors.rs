@@ -1,0 +1,79 @@
+use thiserror::Error;
+use zerofs_nfsserve::nfs::nfsstat3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum FsError {
+    #[error("Permission denied")]
+    PermissionDenied,
+    #[error("Not found")]
+    NotFound,
+    #[error("Already exists")]
+    Exists,
+    #[error("Invalid argument")]
+    InvalidArgument,
+    #[error("I/O error")]
+    IoError,
+    #[error("Directory not empty")]
+    NotEmpty,
+    #[error("Too many links")]
+    TooManyLinks,
+    #[error("No space left")]
+    NoSpace,
+    #[error("Is a directory")]
+    IsDirectory,
+    #[error("Not a directory")]
+    NotDirectory,
+    #[error("Name too long")]
+    NameTooLong,
+    #[error("Not supported")]
+    NotSupported,
+    #[error("Stale file handle")]
+    StaleHandle,
+}
+
+impl From<bincode::Error> for FsError {
+    fn from(_: bincode::Error) -> Self {
+        FsError::IoError
+    }
+}
+
+impl From<FsError> for nfsstat3 {
+    fn from(err: FsError) -> Self {
+        match err {
+            FsError::PermissionDenied => nfsstat3::NFS3ERR_ACCES,
+            FsError::NotFound => nfsstat3::NFS3ERR_NOENT,
+            FsError::Exists => nfsstat3::NFS3ERR_EXIST,
+            FsError::InvalidArgument => nfsstat3::NFS3ERR_INVAL,
+            FsError::IoError => nfsstat3::NFS3ERR_IO,
+            FsError::NotEmpty => nfsstat3::NFS3ERR_NOTEMPTY,
+            FsError::TooManyLinks => nfsstat3::NFS3ERR_MLINK,
+            FsError::NoSpace => nfsstat3::NFS3ERR_NOSPC,
+            FsError::IsDirectory => nfsstat3::NFS3ERR_ISDIR,
+            FsError::NotDirectory => nfsstat3::NFS3ERR_NOTDIR,
+            FsError::NameTooLong => nfsstat3::NFS3ERR_NAMETOOLONG,
+            FsError::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
+            FsError::StaleHandle => nfsstat3::NFS3ERR_STALE,
+        }
+    }
+}
+
+impl From<nfsstat3> for FsError {
+    fn from(status: nfsstat3) -> Self {
+        match status {
+            nfsstat3::NFS3ERR_PERM | nfsstat3::NFS3ERR_ACCES => FsError::PermissionDenied,
+            nfsstat3::NFS3ERR_NOENT => FsError::NotFound,
+            nfsstat3::NFS3ERR_EXIST => FsError::Exists,
+            nfsstat3::NFS3ERR_INVAL | nfsstat3::NFS3ERR_BADTYPE => FsError::InvalidArgument,
+            nfsstat3::NFS3ERR_IO | nfsstat3::NFS3ERR_ROFS => FsError::IoError,
+            nfsstat3::NFS3ERR_NOTEMPTY => FsError::NotEmpty,
+            nfsstat3::NFS3ERR_MLINK => FsError::TooManyLinks,
+            nfsstat3::NFS3ERR_NOSPC | nfsstat3::NFS3ERR_DQUOT => FsError::NoSpace,
+            nfsstat3::NFS3ERR_ISDIR => FsError::IsDirectory,
+            nfsstat3::NFS3ERR_NOTDIR => FsError::NotDirectory,
+            nfsstat3::NFS3ERR_NAMETOOLONG => FsError::NameTooLong,
+            nfsstat3::NFS3ERR_NOTSUPP => FsError::NotSupported,
+            nfsstat3::NFS3ERR_STALE => FsError::StaleHandle,
+            _ => FsError::IoError, // Default for unmapped errors
+        }
+    }
+}

@@ -1,28 +1,29 @@
+use super::common::validate_filename;
+use crate::filesystem::cache::{self, CacheKey, CacheValue};
+use crate::filesystem::errors::FsError;
+use crate::filesystem::inode::{FileInode, Inode, InodeId};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access, validate_mode};
+use crate::filesystem::types::InodeWithId;
+use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
-use zerofs_nfsserve::nfs::{fattr3, fileid3, nfsstat3, sattr3, set_gid3, set_mode3, set_uid3};
+use zerofs_nfsserve::nfs::{fattr3, fileid3, sattr3, set_gid3, set_mode3, set_uid3};
 use zerofs_nfsserve::vfs::AuthContext;
-
-use super::common::validate_filename;
-use crate::filesystem::cache::{self, CacheKey, CacheValue};
-use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
-use crate::filesystem::inode::{FileInode, Inode, InodeId};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access, validate_mode};
 
 const READ_CHUNK_BUFFER_SIZE: usize = 64;
 
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn process_write(
         &self,
         auth: &AuthContext,
         id: InodeId,
         offset: u64,
         data: &[u8],
-    ) -> Result<fattr3, nfsstat3> {
+    ) -> Result<fattr3, FsError> {
         let start_time = std::time::Instant::now();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
@@ -38,14 +39,12 @@ impl SlateDbFs {
 
         self.check_parent_execute_permissions(id, &creds).await?;
 
-        // NFS RFC 1813 section 4.4 suggests that servers should allow the owner of a file
-        // to access it regardless of permission settings, to better emulate POSIX semantics
-        // where a file descriptor retains its access rights even if the file mode changes.
+        // NFS RFC 1813 section 4.4: Allow owners to write to their files regardless of permission bits
         match &inode {
             Inode::File(file) if creds.uid != file.uid => {
                 check_access(&inode, &creds, AccessMode::Write)?;
             }
-            _ => {} // Owner can always write to their own files
+            _ => {}
         }
 
         match &mut inode {
@@ -129,9 +128,7 @@ impl SlateDbFs {
                     chunk_data[write_start..write_end]
                         .copy_from_slice(&data[data_offset..data_offset + data_len]);
 
-                    batch
-                        .put_bytes(&chunk_key, &chunk_data)
-                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    batch.put_bytes(&chunk_key, &chunk_data);
                 }
 
                 debug!(
@@ -144,16 +141,14 @@ impl SlateDbFs {
                 file.mtime = now_sec;
                 file.mtime_nsec = now_nsec;
 
-                // Clear SUID/SGID bits on write by non-owner
+                // POSIX: Clear SUID/SGID bits on write by non-owner
                 if creds.uid != file.uid && creds.uid != 0 {
-                    file.mode &= !0o6000; // Clear both SUID (4000) and SGID (2000)
+                    file.mode &= !0o6000;
                 }
 
                 let inode_key = Self::inode_key(id);
-                let inode_data = bincode::serialize(&inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&inode_key, &inode_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let inode_data = bincode::serialize(&inode)?;
+                batch.put_bytes(&inode_key, &inode_data);
 
                 let stats_update = if let Some(update) = self
                     .global_stats
@@ -175,7 +170,7 @@ impl SlateDbFs {
                         },
                     )
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|_| FsError::IoError)?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
                 if let Some(update) = stats_update {
@@ -198,9 +193,9 @@ impl SlateDbFs {
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                Ok(inode.to_fattr3(id))
+                Ok(InodeWithId { inode: &inode, id }.into())
             }
-            _ => Err(nfsstat3::NFS3ERR_ISDIR),
+            _ => Err(FsError::IsDirectory),
         }
     }
 
@@ -210,7 +205,7 @@ impl SlateDbFs {
         dirid: fileid3,
         filename: &[u8],
         attr: sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
+    ) -> Result<(fileid3, fattr3), FsError> {
         validate_filename(filename)?;
 
         let filename_str = String::from_utf8_lossy(filename);
@@ -232,20 +227,17 @@ impl SlateDbFs {
                     .db
                     .get_bytes(&entry_key)
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .map_err(|_| FsError::IoError)?
                     .is_some()
                 {
                     debug!("File {} already exists", name);
-                    return Err(nfsstat3::NFS3ERR_EXIST);
+                    return Err(FsError::Exists);
                 }
 
                 let file_id = self.allocate_inode().await?;
                 debug!("Allocated inode {} for file {}", file_id, name);
 
                 let (now_sec, now_nsec) = get_current_time();
-
-                // If parent has setgid bit set, file inherits parent's group
-                // (gid was already set correctly from parent in the match above)
 
                 let final_mode = match attr.mode {
                     set_mode3::mode(m) => validate_mode(m),
@@ -276,20 +268,13 @@ impl SlateDbFs {
                 let mut batch = self.db.new_write_batch();
 
                 let file_inode_key = Self::inode_key(file_id);
-                let file_inode_data = bincode::serialize(&Inode::File(file_inode.clone()))
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&file_inode_key, &file_inode_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let file_inode_data = bincode::serialize(&Inode::File(file_inode.clone()))?;
+                batch.put_bytes(&file_inode_key, &file_inode_data);
 
-                batch
-                    .put_bytes(&entry_key, &file_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&entry_key, &file_id.to_le_bytes());
 
                 let scan_key = Self::dir_scan_key(dirid, file_id, &name);
-                batch
-                    .put_bytes(&scan_key, &file_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&scan_key, &file_id.to_le_bytes());
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -300,15 +285,11 @@ impl SlateDbFs {
                 // Persist the counter
                 let counter_key = Self::counter_key();
                 let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch
-                    .put_bytes(&counter_key, &next_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&counter_key, &next_id.to_le_bytes());
 
                 let dir_key = Self::inode_key(dirid);
-                let dir_data = bincode::serialize(&dir_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&dir_key, &dir_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let dir_data = bincode::serialize(&dir_inode)?;
+                batch.put_bytes(&dir_key, &dir_data);
 
                 // Update statistics
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
@@ -324,10 +305,9 @@ impl SlateDbFs {
                     .await
                     .map_err(|e| {
                         error!("Failed to write batch: {:?}", e);
-                        nfsstat3::NFS3ERR_IO
+                        FsError::IoError
                     })?;
 
-                // Update in-memory statistics after successful commit
                 self.global_stats.commit_update(&stats_update);
 
                 self.cache.remove(CacheKey::Metadata(dirid)).await;
@@ -335,9 +315,17 @@ impl SlateDbFs {
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                Ok((file_id, Inode::File(file_inode).to_fattr3(file_id)))
+                let inode = Inode::File(file_inode);
+                Ok((
+                    file_id,
+                    InodeWithId {
+                        inode: &inode,
+                        id: file_id,
+                    }
+                    .into(),
+                ))
             }
-            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => Err(FsError::NotDirectory),
         }
     }
 
@@ -346,7 +334,7 @@ impl SlateDbFs {
         auth: &AuthContext,
         dirid: fileid3,
         filename: &[u8],
-    ) -> Result<fileid3, nfsstat3> {
+    ) -> Result<fileid3, FsError> {
         let (id, _) = self
             .process_create(auth, dirid, filename, sattr3::default())
             .await?;
@@ -359,7 +347,7 @@ impl SlateDbFs {
         id: fileid3,
         offset: u64,
         count: u32,
-    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+    ) -> Result<(Vec<u8>, bool), FsError> {
         debug!(
             "process_read_file: id={}, offset={}, count={}",
             id, offset, count
@@ -403,15 +391,14 @@ impl SlateDbFs {
                 let end_chunk = ((end - 1) / CHUNK_SIZE as u64) as usize;
                 let start_offset = (offset % CHUNK_SIZE as u64) as usize;
 
-                // Create a stream of futures for chunk reads
                 let chunk_futures = stream::iter(start_chunk..=end_chunk).map(|chunk_idx| {
                     let db = self.db.clone();
                     let key = Self::chunk_key_by_index(id, chunk_idx);
                     async move {
                         let chunk_data_opt =
-                            db.get_bytes(&key).await.map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                            db.get_bytes(&key).await.map_err(|_| FsError::IoError)?;
                         let chunk_vec_opt = chunk_data_opt.map(|bytes| bytes.to_vec());
-                        Ok::<(usize, Option<Vec<u8>>), nfsstat3>((chunk_idx, chunk_vec_opt))
+                        Ok::<(usize, Option<Vec<u8>>), FsError>((chunk_idx, chunk_vec_opt))
                     }
                 });
 
@@ -424,7 +411,6 @@ impl SlateDbFs {
 
                 chunks.sort_by_key(|(idx, _)| *idx);
 
-                // Assemble the result
                 let mut result = Vec::with_capacity((end - offset) as usize);
 
                 for (chunk_idx, chunk_data_opt) in chunks {
@@ -436,7 +422,6 @@ impl SlateDbFs {
                             if safe_start < safe_end {
                                 result.extend_from_slice(&chunk_data[safe_start..safe_end]);
                             }
-                            // If we need more data than the chunk contains, pad with zeros
                             if end_offset > chunk_data.len() && safe_start < chunk_data.len() {
                                 let zeros_needed = end_offset - chunk_data.len();
                                 result.extend(vec![0u8; zeros_needed]);
@@ -450,7 +435,6 @@ impl SlateDbFs {
                             let bytes_in_last = ((end - 1) % CHUNK_SIZE as u64 + 1) as usize;
                             let safe_bytes = std::cmp::min(bytes_in_last, chunk_data.len());
                             result.extend_from_slice(&chunk_data[..safe_bytes]);
-                            // If we need more data than the chunk contains, pad with zeros
                             if bytes_in_last > chunk_data.len() {
                                 let zeros_needed = bytes_in_last - chunk_data.len();
                                 result.extend(vec![0u8; zeros_needed]);
@@ -479,9 +463,7 @@ impl SlateDbFs {
 
                 let eof = end >= file.size;
 
-                if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES
-                    && offset == 0
-                    && end >= file.size
+                if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES && offset == 0 && end >= file.size
                 {
                     debug!("Caching small file {} ({} bytes)", id, file.size);
                     let cache_key = cache::CacheKey::SmallFile(id);
@@ -498,7 +480,7 @@ impl SlateDbFs {
 
                 Ok((result, eof))
             }
-            _ => Err(nfsstat3::NFS3ERR_ISDIR),
+            _ => Err(FsError::IsDirectory),
         }
     }
 
@@ -508,7 +490,7 @@ impl SlateDbFs {
         id: InodeId,
         offset: u64,
         length: u64,
-    ) -> Result<(), nfsstat3> {
+    ) -> Result<(), FsError> {
         debug!(
             "Processing trim on inode {} at offset {} length {}",
             id, offset, length
@@ -519,18 +501,17 @@ impl SlateDbFs {
 
         let creds = Credentials::from_auth_context(auth);
 
-        // Owner can always trim their files
         match &inode {
             Inode::File(file) if creds.uid != file.uid => {
                 check_access(&inode, &creds, AccessMode::Write)?;
             }
             Inode::File(_) => {}
-            _ => return Err(nfsstat3::NFS3ERR_ISDIR),
+            _ => return Err(FsError::IsDirectory),
         }
 
         let file = match &inode {
             Inode::File(f) => f,
-            _ => return Err(nfsstat3::NFS3ERR_ISDIR),
+            _ => return Err(FsError::IsDirectory),
         };
 
         let end_offset = offset + length;
@@ -550,9 +531,7 @@ impl SlateDbFs {
 
             let chunk_key = Self::chunk_key_by_index(id, chunk_idx);
 
-            // Check if entire chunk is being trimmed
             if offset <= chunk_start && end_offset >= chunk_end {
-                // Delete the entire chunk
                 batch.delete_bytes(&chunk_key);
 
                 let cache_key = CacheKey::Block {
@@ -561,7 +540,6 @@ impl SlateDbFs {
                 };
                 cache_keys_to_remove.push(cache_key);
             } else {
-                // Partial trim - need to zero out the trimmed portion
                 let trim_start = if offset > chunk_start {
                     (offset - chunk_start) as usize
                 } else {
@@ -574,7 +552,6 @@ impl SlateDbFs {
                     CHUNK_SIZE
                 };
 
-                // Load existing chunk data
                 let mut chunk_data = vec![0u8; CHUNK_SIZE];
                 let mut has_data = false;
 
@@ -582,7 +559,7 @@ impl SlateDbFs {
                     .db
                     .get_bytes(&chunk_key)
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .map_err(|_| FsError::IoError)?
                 {
                     let copy_len = existing_data.len().min(CHUNK_SIZE);
                     chunk_data[..copy_len].copy_from_slice(&existing_data[..copy_len]);
@@ -603,9 +580,7 @@ impl SlateDbFs {
                     } else {
                         let chunk_size_in_file =
                             std::cmp::min(CHUNK_SIZE, (file.size - chunk_start) as usize);
-                        batch
-                            .put_bytes(&chunk_key, &chunk_data[..chunk_size_in_file])
-                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                        batch.put_bytes(&chunk_key, &chunk_data[..chunk_size_in_file]);
 
                         let cache_key = CacheKey::Block {
                             inode_id: id,
@@ -621,7 +596,6 @@ impl SlateDbFs {
             cache_keys_to_remove.push(CacheKey::SmallFile(id));
         }
 
-        // Remove all cache keys in a single batch operation
         if !cache_keys_to_remove.is_empty() {
             self.cache.remove_batch(cache_keys_to_remove).await;
         }
@@ -636,7 +610,7 @@ impl SlateDbFs {
             .await
             .map_err(|e| {
                 error!("Failed to commit trim batch: {}", e);
-                nfsstat3::NFS3ERR_IO
+                FsError::IoError
             })?;
 
         debug!("Trim completed successfully for inode {}", id);

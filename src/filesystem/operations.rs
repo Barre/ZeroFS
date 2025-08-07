@@ -8,18 +8,18 @@ pub mod rename_ops;
 
 #[cfg(test)]
 mod tests {
-    use crate::filesystem::SlateDbFs;
-    use crate::filesystem::{CHUNK_SIZE, EncodedFileId};
+    use crate::filesystem::ZeroFS;
+    use crate::filesystem::errors::FsError;
     use crate::filesystem::inode::Inode;
+    use crate::filesystem::{CHUNK_SIZE, EncodedFileId};
     use crate::test_helpers::test_helpers_mod::test_auth;
     use zerofs_nfsserve::nfs::{
-        ftype3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3,
-        set_uid3,
+        ftype3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
     };
 
     #[tokio::test]
     async fn test_process_create_file() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let attr = sattr3 {
             mode: set_mode3::mode(0o644),
@@ -42,7 +42,7 @@ mod tests {
         assert_eq!(fattr.size, 0);
 
         // Check that the file was added to the directory
-        let entry_key = SlateDbFs::dir_entry_key(0, "test.txt");
+        let entry_key = ZeroFS::dir_entry_key(0, "test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -52,7 +52,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_create_file_already_exists() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let attr = sattr3::default();
 
@@ -62,12 +62,12 @@ mod tests {
             .unwrap();
 
         let result = fs.process_create(&test_auth(), 0, b"test.txt", attr).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_EXIST)));
+        assert!(matches!(result, Err(FsError::Exists)));
     }
 
     #[tokio::test]
     async fn test_process_mkdir() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, fattr) = fs
             .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
@@ -89,7 +89,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_mkdir_with_custom_attrs() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Test with custom mode
         let custom_attrs = sattr3 {
@@ -128,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_write_and_read() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
@@ -154,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_write_partial_chunks() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
@@ -183,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_write_across_chunks() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), 0, b"bigfile.txt", sattr3::default())
@@ -210,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_remove_file() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
@@ -226,17 +226,17 @@ mod tests {
             .unwrap();
 
         // Check that the file was removed from the directory
-        let entry_key = SlateDbFs::dir_entry_key(0, "test.txt");
+        let entry_key = ZeroFS::dir_entry_key(0, "test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap();
         assert!(entry_data.is_none());
 
         let result = fs.load_inode(file_id).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(matches!(result, Err(FsError::NotFound)));
     }
 
     #[tokio::test]
     async fn test_process_remove_empty_directory() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, _) = fs
             .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
@@ -248,12 +248,12 @@ mod tests {
             .unwrap();
 
         let result = fs.load_inode(dir_id).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(matches!(result, Err(FsError::NotFound)));
     }
 
     #[tokio::test]
     async fn test_process_remove_non_empty_directory() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, _) = fs
             .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
@@ -265,12 +265,12 @@ mod tests {
             .unwrap();
 
         let result = fs.process_remove(&test_auth(), 0, b"testdir").await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOTEMPTY)));
+        assert!(matches!(result, Err(FsError::NotEmpty)));
     }
 
     #[tokio::test]
     async fn test_process_rename_same_directory() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), 0, b"old.txt", sattr3::default())
@@ -282,10 +282,10 @@ mod tests {
             .unwrap();
 
         // Check old entry is gone and new entry exists
-        let old_entry_key = SlateDbFs::dir_entry_key(0, "old.txt");
+        let old_entry_key = ZeroFS::dir_entry_key(0, "old.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
-        let new_entry_key = SlateDbFs::dir_entry_key(0, "new.txt");
+        let new_entry_key = ZeroFS::dir_entry_key(0, "new.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -295,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_rename_replace_existing() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create two files
         let (file1_id, _) = fs
@@ -319,11 +319,11 @@ mod tests {
             .unwrap();
 
         // Check that file1.txt no longer exists
-        let old_entry_key = SlateDbFs::dir_entry_key(0, "file1.txt");
+        let old_entry_key = ZeroFS::dir_entry_key(0, "file1.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check that file2.txt exists and has file1's content
-        let new_entry_key = SlateDbFs::dir_entry_key(0, "file2.txt");
+        let new_entry_key = ZeroFS::dir_entry_key(0, "file2.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -339,12 +339,12 @@ mod tests {
 
         // Check that the original file2 inode is gone
         let result = fs.load_inode(file2_id).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOENT)));
+        assert!(matches!(result, Err(FsError::NotFound)));
     }
 
     #[tokio::test]
     async fn test_process_rename_across_directories() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir1_id, _) = fs
             .process_mkdir(&test_auth(), 0, b"dir1", &sattr3::default())
@@ -365,11 +365,11 @@ mod tests {
             .unwrap();
 
         // Check file removed from dir1
-        let old_entry_key = SlateDbFs::dir_entry_key(dir1_id, "file.txt");
+        let old_entry_key = ZeroFS::dir_entry_key(dir1_id, "file.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check file added to dir2
-        let new_entry_key = SlateDbFs::dir_entry_key(dir2_id, "moved.txt");
+        let new_entry_key = ZeroFS::dir_entry_key(dir2_id, "moved.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_rename_directory_entry_count() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a directory with two files
         let (dir_id, _) = fs
@@ -447,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_setattr_file_size() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
@@ -482,7 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_symlink() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let target = b"/path/to/target";
         let attr = sattr3::default();
@@ -507,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_readdir() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         fs.process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
             .await
@@ -538,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_readdir_pagination() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         for i in 0..10 {
             fs.process_create(
@@ -565,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_rename_prevent_directory_cycles() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create directory structure: /a/b/c
         let (a_id, _) = fs
@@ -585,19 +585,19 @@ mod tests {
         let result = fs
             .process_rename(&test_auth(), 0, b"a", b_id, b"a_moved")
             .await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_INVAL)));
+        assert!(matches!(result, Err(FsError::InvalidArgument)));
 
         // Test 2: Try to rename /a into /a/b/c (deeper descendant)
         let result = fs
             .process_rename(&test_auth(), 0, b"a", c_id, b"a_moved")
             .await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_INVAL)));
+        assert!(matches!(result, Err(FsError::InvalidArgument)));
 
         // Test 3: Try to rename /a/b into /a/b/c (moving into immediate child)
         let result = fs
             .process_rename(&test_auth(), a_id, b"b", c_id, b"b_moved")
             .await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_INVAL)));
+        assert!(matches!(result, Err(FsError::InvalidArgument)));
 
         // Test 4: Valid rename - moving /a/b/c to root
         let result = fs
@@ -618,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_ancestor_of() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create directory structure: /a/b/c/d
         let (a_id, _) = fs
@@ -668,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_readdir_encoding_with_hardlinks() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create files with hardlinks
         let (file1_id, _) = fs
@@ -722,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_hardlinks_limit() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file
         let (file_id, _) = fs
@@ -759,7 +759,7 @@ mod tests {
         let result = fs
             .process_link(&test_auth(), file_id, 0, b"one_too_many.txt")
             .await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_MLINK)));
+        assert!(matches!(result, Err(FsError::TooManyLinks)));
 
         // Verify the file still has MAX_HARDLINKS_PER_INODE links
         let inode = fs.load_inode(file_id).await.unwrap();
@@ -773,7 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parent_directory_execute_permissions() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, _) = fs
             .process_mkdir(&test_auth(), 0, b"test_dir", &sattr3::default())
@@ -812,15 +812,15 @@ mod tests {
         };
 
         let result = fs.process_setattr(&test_auth(), file_id, chmod_attrs).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_ACCES)));
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
 
         let result = fs.process_read_file(&test_auth(), file_id, 0, 100).await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_ACCES)));
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
 
         let result = fs
             .process_write(&test_auth(), file_id, 0, b"new data")
             .await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_ACCES)));
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
 
         let exec_attrs = sattr3 {
             mode: set_mode3::mode(0o755),
