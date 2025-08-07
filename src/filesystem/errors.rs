@@ -5,6 +5,8 @@ use zerofs_nfsserve::nfs::nfsstat3;
 pub enum FsError {
     #[error("Permission denied")]
     PermissionDenied,
+    #[error("Operation not permitted")]
+    OperationNotPermitted,
     #[error("Not found")]
     NotFound,
     #[error("Already exists")]
@@ -41,6 +43,7 @@ impl From<FsError> for nfsstat3 {
     fn from(err: FsError) -> Self {
         match err {
             FsError::PermissionDenied => nfsstat3::NFS3ERR_ACCES,
+            FsError::OperationNotPermitted => nfsstat3::NFS3ERR_PERM,
             FsError::NotFound => nfsstat3::NFS3ERR_NOENT,
             FsError::Exists => nfsstat3::NFS3ERR_EXIST,
             FsError::InvalidArgument => nfsstat3::NFS3ERR_INVAL,
@@ -82,6 +85,7 @@ impl FsError {
     pub fn to_errno(self) -> u32 {
         match self {
             FsError::PermissionDenied => libc::EACCES as u32,
+            FsError::OperationNotPermitted => libc::EPERM as u32,
             FsError::NotFound => libc::ENOENT as u32,
             FsError::Exists => libc::EEXIST as u32,
             FsError::InvalidArgument => libc::EINVAL as u32,
