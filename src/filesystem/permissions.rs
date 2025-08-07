@@ -69,11 +69,10 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
     };
 
     if creds.uid == 0 {
-        if let AccessMode::Execute = mode {
-            if file_mode & 0o111 == 0 {
+        if let AccessMode::Execute = mode
+            && file_mode & 0o111 == 0 {
                 return Err(FsError::PermissionDenied);
             }
-        }
         return Ok(());
     }
 
@@ -121,8 +120,8 @@ pub fn check_sticky_bit_delete(
     target: &Inode,
     creds: &Credentials,
 ) -> Result<(), FsError> {
-    if let Inode::Directory(parent_dir) = parent {
-        if parent_dir.mode & S_ISVTX != 0 {
+    if let Inode::Directory(parent_dir) = parent
+        && parent_dir.mode & S_ISVTX != 0 {
             let target_uid = match target {
                 Inode::File(f) => f.uid,
                 Inode::Directory(d) => d.uid,
@@ -137,7 +136,6 @@ pub fn check_sticky_bit_delete(
                 return Err(FsError::PermissionDenied);
             }
         }
-    }
     Ok(())
 }
 

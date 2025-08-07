@@ -174,8 +174,8 @@ impl EncryptedDb {
 
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         // Check if this is a chunk and if we have cache
-        if let Some(cache) = &self.cache {
-            if let Some(ParsedKey::Chunk {
+        if let Some(cache) = &self.cache
+            && let Some(ParsedKey::Chunk {
                 inode_id,
                 chunk_index,
             }) = ParsedKey::parse(key)
@@ -188,7 +188,6 @@ impl EncryptedDb {
                     return Ok(Some(bytes::Bytes::from(cached_data.as_ref().clone())));
                 }
             }
-        }
 
         match self.inner.get(key).await? {
             Some(encrypted) => {
@@ -201,8 +200,8 @@ impl EncryptedDb {
                         .await
                         .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
 
-                if let Some(cache) = &self.cache {
-                    if let Some(ParsedKey::Chunk {
+                if let Some(cache) = &self.cache
+                    && let Some(ParsedKey::Chunk {
                         inode_id,
                         chunk_index,
                     }) = ParsedKey::parse(key)
@@ -214,7 +213,6 @@ impl EncryptedDb {
                         let cache_value = CacheValue::Block(Arc::new(decrypted.clone()));
                         cache.insert(cache_key, cache_value, true).await;
                     }
-                }
 
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
