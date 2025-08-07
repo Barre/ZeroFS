@@ -39,13 +39,13 @@ impl ZeroFS {
 
             if let SetUid::Set(new_uid) = setattr.uid
                 && new_uid != creds.uid {
-                    return Err(FsError::PermissionDenied);
+                    return Err(FsError::OperationNotPermitted);
                 }
 
             // POSIX: Owner can change group to any group they belong to
             if let SetGid::Set(new_gid) = setattr.gid
                 && !creds.is_member_of_group(new_gid) {
-                    return Err(FsError::PermissionDenied);
+                    return Err(FsError::OperationNotPermitted);
                 }
         }
 

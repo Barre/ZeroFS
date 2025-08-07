@@ -111,7 +111,7 @@ pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError
     if creds.uid == 0 || creds.uid == uid {
         Ok(())
     } else {
-        Err(FsError::PermissionDenied)
+        Err(FsError::OperationNotPermitted)
     }
 }
 
