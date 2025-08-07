@@ -6,11 +6,11 @@ use crate::filesystem::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::filesystem::permissions::{
     AccessMode, Credentials, check_access, check_sticky_bit_delete,
 };
+use crate::filesystem::types::AuthContext;
 use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
-use zerofs_nfsserve::vfs::AuthContext;
 
 impl ZeroFS {
     pub async fn process_rename(

@@ -5,94 +5,78 @@ use crate::filesystem::inode::{Inode, SpecialInode};
 use crate::filesystem::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
-use crate::filesystem::types::InodeWithId;
-use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
+use crate::filesystem::types::{
+    FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
+};
+use crate::filesystem::{CHUNK_SIZE, InodeId, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use tracing::debug;
-use zerofs_nfsserve::nfs::{
-    fattr3, fileid3, ftype3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
-};
-use zerofs_nfsserve::vfs::AuthContext;
 
 impl ZeroFS {
     pub async fn process_setattr(
         &self,
-        auth: &AuthContext,
-        id: fileid3,
-        setattr: sattr3,
-    ) -> Result<fattr3, FsError> {
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+    ) -> Result<FileAttributes, FsError> {
         debug!("process_setattr: id={}, setattr={:?}", id, setattr);
         let _guard = self.lock_manager.acquire_write(id).await;
         let mut inode = self.load_inode(id).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-
-        self.check_parent_execute_permissions(id, &creds).await?;
+        self.check_parent_execute_permissions(id, creds).await?;
 
         // For chmod (mode change), must be owner
-        if matches!(setattr.mode, set_mode3::mode(_)) {
-            check_ownership(&inode, &creds)?;
+        if matches!(setattr.mode, SetMode::Set(_)) {
+            check_ownership(&inode, creds)?;
         }
 
         // For chown/chgrp, must be root (or owner with restrictions)
-        const DONT_CHANGE_ID: u32 = 0xFFFFFFFF;
-
-        let changing_uid = match &setattr.uid {
-            set_uid3::uid(uid) => *uid != DONT_CHANGE_ID,
-            set_uid3::Void => false,
-        };
-        let changing_gid = match &setattr.gid {
-            set_gid3::gid(gid) => *gid != DONT_CHANGE_ID,
-            set_gid3::Void => false,
-        };
+        let changing_uid = matches!(&setattr.uid, SetUid::Set(_));
+        let changing_gid = matches!(&setattr.gid, SetGid::Set(_));
 
         if (changing_uid || changing_gid) && creds.uid != 0 {
-            check_ownership(&inode, &creds)?;
+            check_ownership(&inode, creds)?;
 
-            if changing_uid {
-                if let set_uid3::uid(new_uid) = setattr.uid {
-                    if new_uid != DONT_CHANGE_ID && new_uid != creds.uid {
-                        return Err(FsError::PermissionDenied);
-                    }
+            if let SetUid::Set(new_uid) = setattr.uid {
+                if new_uid != creds.uid {
+                    return Err(FsError::PermissionDenied);
                 }
             }
 
             // POSIX: Owner can change group to any group they belong to
-            if let set_gid3::gid(new_gid) = setattr.gid {
-                if new_gid != DONT_CHANGE_ID {
-                    if !creds.is_member_of_group(new_gid) {
-                        return Err(FsError::PermissionDenied);
-                    }
+            if let SetGid::Set(new_gid) = setattr.gid {
+                if !creds.is_member_of_group(new_gid) {
+                    return Err(FsError::PermissionDenied);
                 }
             }
         }
 
         match setattr.atime {
-            set_atime::SET_TO_CLIENT_TIME(_) => {
-                can_set_times(&inode, &creds, false)?;
+            SetTime::SetToClientTime(_) => {
+                can_set_times(&inode, creds, false)?;
             }
-            set_atime::SET_TO_SERVER_TIME => {
-                can_set_times(&inode, &creds, true)?;
+            SetTime::SetToServerTime => {
+                can_set_times(&inode, creds, true)?;
             }
-            set_atime::DONT_CHANGE => {}
+            SetTime::NoChange => {}
         }
         match setattr.mtime {
-            set_mtime::SET_TO_CLIENT_TIME(_) => {
-                can_set_times(&inode, &creds, false)?;
+            SetTime::SetToClientTime(_) => {
+                can_set_times(&inode, creds, false)?;
             }
-            set_mtime::SET_TO_SERVER_TIME => {
-                can_set_times(&inode, &creds, true)?;
+            SetTime::SetToServerTime => {
+                can_set_times(&inode, creds, true)?;
             }
-            set_mtime::DONT_CHANGE => {}
+            SetTime::NoChange => {}
         }
 
-        if matches!(setattr.size, set_size3::size(_)) {
-            check_access(&inode, &creds, AccessMode::Write)?;
+        if matches!(setattr.size, SetSize::Set(_)) {
+            check_access(&inode, creds, AccessMode::Write)?;
         }
 
         match &mut inode {
             Inode::File(file) => {
-                if let set_size3::size(new_size) = setattr.size {
+                if let SetSize::Set(new_size) = setattr.size {
                     let old_size = file.size;
                     if new_size != old_size {
                         file.size = new_size;
@@ -105,22 +89,7 @@ impl ZeroFS {
                         let mut batch = self.db.new_write_batch();
 
                         if new_size < old_size {
-                            // NOTE: We intentionally do NOT use tombstones for deferred deletion here,
-                            // unlike in process_remove. This is because truncation can be followed by
-                            // file extension and writes to the same chunk positions, which would create
-                            // race conditions with garbage collection. Consider this sequence:
-                            // 1. Truncate 10MB -> 1MB (would create tombstone for chunks 64-640)
-                            // 2. Extend to 10MB (file.size = 10MB)
-                            // 3. Write at offset 9MB (creates new chunk 576)
-                            // 4. GC deletes old chunk 576 from tombstone
-                            // 5. Read at offset 9MB fails or returns wrong data!
-                            //
-                            // By deleting chunks immediately, we ensure correctness at the cost of
-                            // potentially blocking the operation for large files. This is acceptable
-                            // because:
-                            // - Truncation is less common than removal
-                            // - Correctness is more important than performance
-                            // - The operation is still atomic within the write batch
+                            // Truncation logic - delete chunks beyond new size
                             let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
                             let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
 
@@ -148,6 +117,7 @@ impl ZeroFS {
                                 }
                             }
                         } else if new_size > old_size && old_size > 0 {
+                            // Extension logic - extend the last chunk if needed
                             let last_old_chunk_idx = ((old_size - 1) / CHUNK_SIZE as u64) as usize;
                             let last_old_chunk_end = (old_size % CHUNK_SIZE as u64) as usize;
 
@@ -216,7 +186,7 @@ impl ZeroFS {
                     }
                 }
 
-                if let set_mode3::mode(mode) = setattr.mode {
+                if let SetMode::Set(mode) = setattr.mode {
                     debug!("Setting file mode from {} to {:#o}", file.mode, mode);
                     file.mode = validate_mode(mode);
                     // POSIX: If non-root user sets mode with setgid bit and doesn't belong to file's group, clear setgid
@@ -227,69 +197,56 @@ impl ZeroFS {
                         file.mode &= !0o2000;
                     }
                 }
-                if let set_uid3::uid(uid) = setattr.uid {
-                    if uid != DONT_CHANGE_ID {
-                        file.uid = uid;
-                        if creds.uid != 0 {
-                            file.mode &= !0o4000;
-                        }
+                if let SetUid::Set(uid) = setattr.uid {
+                    file.uid = uid;
+                    if creds.uid != 0 {
+                        file.mode &= !0o4000;
                     }
                 }
-                if let set_gid3::gid(gid) = setattr.gid {
-                    if gid != DONT_CHANGE_ID {
-                        file.gid = gid;
-                        // Clear SUID/SGID bits when non-root user calls chown with a gid
-                        // This happens even if the gid doesn't actually change (POSIX behavior)
-                        if creds.uid != 0 {
-                            file.mode &= !0o6000;
-                        }
+                if let SetGid::Set(gid) = setattr.gid {
+                    file.gid = gid;
+                    // Clear SUID/SGID bits when non-root user calls chown with a gid
+                    // This happens even if the gid doesn't actually change (POSIX behavior)
+                    if creds.uid != 0 {
+                        file.mode &= !0o6000;
                     }
                 }
                 match setattr.atime {
-                    set_atime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         file.atime = t.seconds as u64;
-                        file.atime_nsec = t.nseconds;
+                        file.atime_nsec = t.nanoseconds;
                     }
-                    set_atime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (now_sec, now_nsec) = get_current_time();
                         file.atime = now_sec;
                         file.atime_nsec = now_nsec;
                     }
-                    set_atime::DONT_CHANGE => {}
+                    SetTime::NoChange => {}
                 }
                 match setattr.mtime {
-                    set_mtime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         file.mtime = t.seconds as u64;
-                        file.mtime_nsec = t.nseconds;
+                        file.mtime_nsec = t.nanoseconds;
                     }
-                    set_mtime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (now_sec, now_nsec) = get_current_time();
                         file.mtime = now_sec;
                         file.mtime_nsec = now_nsec;
                     }
-                    set_mtime::DONT_CHANGE => {}
+                    SetTime::NoChange => {}
                 }
 
-                let uid_changed = match &setattr.uid {
-                    set_uid3::uid(uid) => *uid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-                let gid_changed = match &setattr.gid {
-                    set_gid3::gid(gid) => *gid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-
-                let attribute_changed = matches!(setattr.mode, set_mode3::mode(_))
-                    || uid_changed
-                    || gid_changed
-                    || matches!(setattr.size, set_size3::size(_))
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
+                    || matches!(setattr.size, SetSize::Set(_))
                     || matches!(
                         setattr.atime,
-                        set_atime::SET_TO_CLIENT_TIME(_) | set_atime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     )
                     || matches!(
                         setattr.mtime,
-                        set_mtime::SET_TO_CLIENT_TIME(_) | set_mtime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     );
 
                 if attribute_changed {
@@ -297,12 +254,9 @@ impl ZeroFS {
                     file.ctime = now_sec;
                     file.ctime_nsec = now_nsec;
                 }
-                let (now_sec, now_nsec) = get_current_time();
-                file.ctime = now_sec;
-                file.ctime_nsec = now_nsec;
             }
             Inode::Directory(dir) => {
-                if let set_mode3::mode(mode) = setattr.mode {
+                if let SetMode::Set(mode) = setattr.mode {
                     debug!("Setting directory mode from {} to {:#o}", dir.mode, mode);
                     dir.mode = validate_mode(mode);
                     // POSIX: If non-root user sets mode with setgid bit and doesn't belong to directory's group, clear setgid
@@ -313,68 +267,55 @@ impl ZeroFS {
                         dir.mode &= !0o2000;
                     }
                 }
-                if let set_uid3::uid(uid) = setattr.uid {
-                    if uid != DONT_CHANGE_ID {
-                        dir.uid = uid;
-                        if creds.uid != 0 {
-                            dir.mode &= !0o4000;
-                        }
+                if let SetUid::Set(uid) = setattr.uid {
+                    dir.uid = uid;
+                    if creds.uid != 0 {
+                        dir.mode &= !0o4000;
                     }
                 }
-                if let set_gid3::gid(gid) = setattr.gid {
-                    if gid != DONT_CHANGE_ID {
-                        dir.gid = gid;
-                        // Clear SUID/SGID bits when non-root user calls chown with a gid
-                        // This happens even if the gid doesn't actually change (POSIX behavior)
-                        if creds.uid != 0 {
-                            dir.mode &= !0o6000;
-                        }
+                if let SetGid::Set(gid) = setattr.gid {
+                    dir.gid = gid;
+                    // Clear SUID/SGID bits when non-root user calls chown with a gid
+                    // This happens even if the gid doesn't actually change (POSIX behavior)
+                    if creds.uid != 0 {
+                        dir.mode &= !0o6000;
                     }
                 }
                 match setattr.atime {
-                    set_atime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         dir.atime = t.seconds as u64;
-                        dir.atime_nsec = t.nseconds;
+                        dir.atime_nsec = t.nanoseconds;
                     }
-                    set_atime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (now_sec, now_nsec) = get_current_time();
                         dir.atime = now_sec;
                         dir.atime_nsec = now_nsec;
                     }
-                    set_atime::DONT_CHANGE => {}
+                    SetTime::NoChange => {}
                 }
                 match setattr.mtime {
-                    set_mtime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         dir.mtime = t.seconds as u64;
-                        dir.mtime_nsec = t.nseconds;
+                        dir.mtime_nsec = t.nanoseconds;
                     }
-                    set_mtime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (now_sec, now_nsec) = get_current_time();
                         dir.mtime = now_sec;
                         dir.mtime_nsec = now_nsec;
                     }
-                    set_mtime::DONT_CHANGE => {}
+                    SetTime::NoChange => {}
                 }
 
-                let uid_changed = match &setattr.uid {
-                    set_uid3::uid(uid) => *uid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-                let gid_changed = match &setattr.gid {
-                    set_gid3::gid(gid) => *gid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-
-                let attribute_changed = matches!(setattr.mode, set_mode3::mode(_))
-                    || uid_changed
-                    || gid_changed
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
                     || matches!(
                         setattr.atime,
-                        set_atime::SET_TO_CLIENT_TIME(_) | set_atime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     )
                     || matches!(
                         setattr.mtime,
-                        set_mtime::SET_TO_CLIENT_TIME(_) | set_mtime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     );
 
                 if attribute_changed {
@@ -384,69 +325,56 @@ impl ZeroFS {
                 }
             }
             Inode::Symlink(symlink) => {
-                if let set_mode3::mode(mode) = setattr.mode {
+                if let SetMode::Set(mode) = setattr.mode {
                     symlink.mode = validate_mode(mode);
                 }
-                if let set_uid3::uid(uid) = setattr.uid {
-                    if uid != DONT_CHANGE_ID {
-                        symlink.uid = uid;
-                        if creds.uid != 0 {
-                            symlink.mode &= !0o4000;
-                        }
+                if let SetUid::Set(uid) = setattr.uid {
+                    symlink.uid = uid;
+                    if creds.uid != 0 {
+                        symlink.mode &= !0o4000;
                     }
                 }
-                if let set_gid3::gid(gid) = setattr.gid {
-                    if gid != DONT_CHANGE_ID {
-                        symlink.gid = gid;
-                        if creds.uid != 0 {
-                            symlink.mode &= !0o6000;
-                        }
+                if let SetGid::Set(gid) = setattr.gid {
+                    symlink.gid = gid;
+                    if creds.uid != 0 {
+                        symlink.mode &= !0o6000;
                     }
                 }
                 match setattr.atime {
-                    set_atime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         symlink.atime = t.seconds as u64;
-                        symlink.atime_nsec = t.nseconds;
+                        symlink.atime_nsec = t.nanoseconds;
                     }
-                    set_atime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (now_sec, now_nsec) = get_current_time();
                         symlink.atime = now_sec;
                         symlink.atime_nsec = now_nsec;
                     }
-                    set_atime::DONT_CHANGE => {}
+                    SetTime::NoChange => {}
                 }
                 match setattr.mtime {
-                    set_mtime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         symlink.mtime = t.seconds as u64;
-                        symlink.mtime_nsec = t.nseconds;
+                        symlink.mtime_nsec = t.nanoseconds;
                     }
-                    set_mtime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (now_sec, now_nsec) = get_current_time();
                         symlink.mtime = now_sec;
                         symlink.mtime_nsec = now_nsec;
                     }
-                    set_mtime::DONT_CHANGE => {}
+                    SetTime::NoChange => {}
                 }
 
-                let uid_changed = match &setattr.uid {
-                    set_uid3::uid(uid) => *uid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-                let gid_changed = match &setattr.gid {
-                    set_gid3::gid(gid) => *gid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-
-                let attribute_changed = matches!(setattr.mode, set_mode3::mode(_))
-                    || uid_changed
-                    || gid_changed
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
                     || matches!(
                         setattr.atime,
-                        set_atime::SET_TO_CLIENT_TIME(_) | set_atime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     )
                     || matches!(
                         setattr.mtime,
-                        set_mtime::SET_TO_CLIENT_TIME(_) | set_mtime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     );
 
                 if attribute_changed {
@@ -459,31 +387,27 @@ impl ZeroFS {
             | Inode::Socket(special)
             | Inode::CharDevice(special)
             | Inode::BlockDevice(special) => {
-                if let set_mode3::mode(mode) = setattr.mode {
+                if let SetMode::Set(mode) = setattr.mode {
                     special.mode = validate_mode(mode);
                 }
-                if let set_uid3::uid(uid) = setattr.uid {
-                    if uid != DONT_CHANGE_ID {
-                        special.uid = uid;
-                        if creds.uid != 0 {
-                            special.mode &= !0o4000;
-                        }
+                if let SetUid::Set(uid) = setattr.uid {
+                    special.uid = uid;
+                    if creds.uid != 0 {
+                        special.mode &= !0o4000;
                     }
                 }
-                if let set_gid3::gid(gid) = setattr.gid {
-                    if gid != DONT_CHANGE_ID {
-                        special.gid = gid;
-                        if creds.uid != 0 {
-                            special.mode &= !0o6000;
-                        }
+                if let SetGid::Set(gid) = setattr.gid {
+                    special.gid = gid;
+                    if creds.uid != 0 {
+                        special.mode &= !0o6000;
                     }
                 }
                 match setattr.atime {
-                    set_atime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         special.atime = t.seconds as u64;
-                        special.atime_nsec = t.nseconds;
+                        special.atime_nsec = t.nanoseconds;
                     }
-                    set_atime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (sec, nsec) = get_current_time();
                         special.atime = sec;
                         special.atime_nsec = nsec;
@@ -491,11 +415,11 @@ impl ZeroFS {
                     _ => {}
                 }
                 match setattr.mtime {
-                    set_mtime::SET_TO_CLIENT_TIME(t) => {
+                    SetTime::SetToClientTime(t) => {
                         special.mtime = t.seconds as u64;
-                        special.mtime_nsec = t.nseconds;
+                        special.mtime_nsec = t.nanoseconds;
                     }
-                    set_mtime::SET_TO_SERVER_TIME => {
+                    SetTime::SetToServerTime => {
                         let (sec, nsec) = get_current_time();
                         special.mtime = sec;
                         special.mtime_nsec = nsec;
@@ -503,25 +427,16 @@ impl ZeroFS {
                     _ => {}
                 }
 
-                let uid_changed = match &setattr.uid {
-                    set_uid3::uid(uid) => *uid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-                let gid_changed = match &setattr.gid {
-                    set_gid3::gid(gid) => *gid != DONT_CHANGE_ID,
-                    _ => false,
-                };
-
-                let attribute_changed = matches!(setattr.mode, set_mode3::mode(_))
-                    || uid_changed
-                    || gid_changed
+                let attribute_changed = matches!(setattr.mode, SetMode::Set(_))
+                    || matches!(setattr.uid, SetUid::Set(_))
+                    || matches!(setattr.gid, SetGid::Set(_))
                     || matches!(
                         setattr.atime,
-                        set_atime::SET_TO_CLIENT_TIME(_) | set_atime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     )
                     || matches!(
                         setattr.mtime,
-                        set_mtime::SET_TO_CLIENT_TIME(_) | set_mtime::SET_TO_SERVER_TIME
+                        SetTime::SetToClientTime(_) | SetTime::SetToServerTime
                     );
 
                 if attribute_changed {
@@ -538,13 +453,13 @@ impl ZeroFS {
 
     pub async fn process_mknod(
         &self,
-        auth: &AuthContext,
-        dirid: fileid3,
+        creds: &Credentials,
+        dirid: InodeId,
         filename: &[u8],
-        ftype: ftype3,
-        attr: &sattr3,
+        ftype: FileType,
+        attr: &SetAttributes,
         rdev: Option<(u32, u32)>, // For device files
-    ) -> Result<(fileid3, fattr3), FsError> {
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(filename)?;
 
         let filename_str = String::from_utf8_lossy(filename);
@@ -556,9 +471,8 @@ impl ZeroFS {
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-        check_access(&dir_inode, &creds, AccessMode::Write)?;
-        check_access(&dir_inode, &creds, AccessMode::Execute)?;
+        check_access(&dir_inode, creds, AccessMode::Write)?;
+        check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         let (_default_uid, _default_gid, _parent_mode) = match &dir_inode {
             Inode::Directory(d) => (d.uid, d.gid, d.mode),
@@ -588,13 +502,13 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 let base_mode = match ftype {
-                    ftype3::NF3FIFO => 0o666,
-                    ftype3::NF3CHR | ftype3::NF3BLK => 0o666,
-                    ftype3::NF3SOCK => 0o666,
+                    FileType::Fifo => 0o666,
+                    FileType::CharDevice | FileType::BlockDevice => 0o666,
+                    FileType::Socket => 0o666,
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let final_mode = if let set_mode3::mode(m) = attr.mode {
+                let final_mode = if let SetMode::Set(m) = attr.mode {
                     validate_mode(m)
                 } else {
                     base_mode
@@ -609,12 +523,12 @@ impl ZeroFS {
                     atime_nsec: now_nsec,
                     mode: final_mode,
                     uid: match attr.uid {
-                        set_uid3::uid(u) => u,
-                        _ => auth.uid,
+                        SetUid::Set(u) => u,
+                        _ => creds.uid,
                     },
                     gid: match attr.gid {
-                        set_gid3::gid(g) => g,
-                        _ => auth.gid,
+                        SetGid::Set(g) => g,
+                        _ => creds.gid,
                     },
                     parent: dirid,
                     nlink: 1,
@@ -622,10 +536,10 @@ impl ZeroFS {
                 };
 
                 let inode = match ftype {
-                    ftype3::NF3FIFO => Inode::Fifo(special_inode),
-                    ftype3::NF3CHR => Inode::CharDevice(special_inode),
-                    ftype3::NF3BLK => Inode::BlockDevice(special_inode),
-                    ftype3::NF3SOCK => Inode::Socket(special_inode),
+                    FileType::Fifo => Inode::Fifo(special_inode),
+                    FileType::CharDevice => Inode::CharDevice(special_inode),
+                    FileType::BlockDevice => Inode::BlockDevice(special_inode),
+                    FileType::Socket => Inode::Socket(special_inode),
                     _ => return Err(FsError::InvalidArgument),
                 };
 

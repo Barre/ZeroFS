@@ -5,17 +5,16 @@ use crate::filesystem::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::filesystem::permissions::{
     AccessMode, Credentials, check_access, check_sticky_bit_delete,
 };
+use crate::filesystem::types::{AuthContext, InodeId};
 use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
-use zerofs_nfsserve::nfs::fileid3;
-use zerofs_nfsserve::vfs::AuthContext;
 
 impl ZeroFS {
     pub async fn process_remove(
         &self,
         auth: &AuthContext,
-        dirid: fileid3,
+        dirid: InodeId,
         filename: &[u8],
     ) -> Result<(), FsError> {
         validate_filename(filename)?;

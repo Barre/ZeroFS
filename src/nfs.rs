@@ -1,13 +1,14 @@
 use crate::filesystem::cache::{CacheKey, CacheValue};
 use crate::filesystem::inode::Inode;
-use crate::filesystem::types::InodeWithId;
+use crate::filesystem::permissions::Credentials;
+use crate::filesystem::types::{FileType, InodeWithId, SetAttributes};
 use crate::filesystem::{EncodedFileId, ZeroFS};
 use async_trait::async_trait;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
 
 const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
 const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
@@ -24,7 +25,7 @@ impl NFSFileSystem for ZeroFS {
 
     async fn lookup(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
@@ -41,7 +42,8 @@ impl NFSFileSystem for ZeroFS {
         match dir_inode {
             Inode::Directory(ref _dir) => {
                 use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-                let creds = Credentials::from_auth_context(auth);
+                let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+                let creds = Credentials::from_auth_context(&auth_ctx);
                 check_access(&dir_inode, &creds, AccessMode::Execute)?;
                 let name = filename_str.to_string();
 
@@ -87,7 +89,7 @@ impl NFSFileSystem for ZeroFS {
         }
     }
 
-    async fn getattr(&self, _auth: &AuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
+    async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
         let encoded_id = EncodedFileId::from(id);
         let real_id = encoded_id.inode_id();
@@ -101,21 +103,22 @@ impl NFSFileSystem for ZeroFS {
 
     async fn read(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         id: fileid3,
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
         let real_id = EncodedFileId::from(id).inode_id();
-        self.process_read_file(auth, real_id, offset, count)
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        self.process_read_file(&auth_ctx, real_id, offset, count)
             .await
             .map_err(|e| e.into())
     }
 
     async fn write(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         id: fileid3,
         offset: u64,
         data: &[u8],
@@ -128,14 +131,15 @@ impl NFSFileSystem for ZeroFS {
             offset
         );
 
-        self.process_write(auth, real_id, offset, data)
-            .await
-            .map_err(|e| e.into())
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let file_attrs: crate::filesystem::types::FileAttributes =
+            self.process_write(&auth_ctx, real_id, offset, data).await?;
+        Ok((&file_attrs).into())
     }
 
     async fn create(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         filename: &filename3,
         attr: sattr3,
@@ -148,15 +152,21 @@ impl NFSFileSystem for ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        let (id, fattr) = self
-            .process_create(auth, real_dirid, filename, attr)
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let creds = Credentials::from_auth_context(&auth_ctx);
+        let fs_attr = SetAttributes::from(attr);
+
+        let (id, file_attrs): (u64, crate::filesystem::types::FileAttributes) = self
+            .process_create(&creds, real_dirid, filename, &fs_attr)
             .await?;
+
+        let fattr: fattr3 = (&file_attrs).into();
         Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
     async fn create_exclusive(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
@@ -168,7 +178,7 @@ impl NFSFileSystem for ZeroFS {
         );
 
         let id = self
-            .process_create_exclusive(auth, real_dirid, filename)
+            .process_create_exclusive(&auth.into(), real_dirid, filename)
             .await?;
 
         Ok(EncodedFileId::from_inode(id).into())
@@ -176,7 +186,7 @@ impl NFSFileSystem for ZeroFS {
 
     async fn mkdir(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         dirname: &filename3,
         attr: &sattr3,
@@ -189,13 +199,18 @@ impl NFSFileSystem for ZeroFS {
             String::from_utf8_lossy(dirname)
         );
 
-        let (id, fattr) = self.process_mkdir(auth, real_dirid, dirname, attr).await?;
-        Ok((EncodedFileId::from_inode(id).into(), fattr))
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let creds = Credentials::from_auth_context(&auth_ctx);
+        let fs_attr = SetAttributes::from(*attr);
+        let (id, file_attrs): (u64, crate::filesystem::types::FileAttributes) = self
+            .process_mkdir(&creds, real_dirid, dirname, &fs_attr)
+            .await?;
+        Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
     }
 
     async fn remove(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<(), nfsstat3> {
@@ -206,12 +221,13 @@ impl NFSFileSystem for ZeroFS {
             real_dirid, filename
         );
 
-        Ok(self.process_remove(auth, real_dirid, filename).await?)
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        Ok(self.process_remove(&auth_ctx, real_dirid, filename).await?)
     }
 
     async fn rename(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         from_dirid: fileid3,
         from_filename: &filename3,
         to_dirid: fileid3,
@@ -226,7 +242,7 @@ impl NFSFileSystem for ZeroFS {
         );
 
         self.process_rename(
-            auth,
+            &auth.into(),
             real_from_dirid,
             from_filename,
             real_to_dirid,
@@ -238,11 +254,11 @@ impl NFSFileSystem for ZeroFS {
 
     async fn readdir(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
-    ) -> Result<ReadDirResult, nfsstat3> {
+    ) -> Result<zerofs_nfsserve::vfs::ReadDirResult, nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
 
         debug!(
@@ -250,14 +266,28 @@ impl NFSFileSystem for ZeroFS {
             real_dirid, start_after, max_entries
         );
 
-        Ok(self
-            .process_readdir(auth, real_dirid, start_after, max_entries)
-            .await?)
+        let result = self
+            .process_readdir(&auth.into(), real_dirid, start_after, max_entries)
+            .await?;
+
+        // Convert our ReadDirResult to NFS ReadDirResult
+        Ok(zerofs_nfsserve::vfs::ReadDirResult {
+            entries: result
+                .entries
+                .into_iter()
+                .map(|e| zerofs_nfsserve::vfs::DirEntry {
+                    fileid: e.fileid,
+                    name: e.name.into(),
+                    attr: (&e.attr).into(),
+                })
+                .collect(),
+            end: result.end,
+        })
     }
 
     async fn setattr(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         id: fileid3,
         setattr: sattr3,
     ) -> Result<fattr3, nfsstat3> {
@@ -265,12 +295,16 @@ impl NFSFileSystem for ZeroFS {
 
         debug!("setattr called: id={}, setattr={:?}", real_id, setattr);
 
-        Ok(self.process_setattr(auth, real_id, setattr).await?)
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let creds = Credentials::from_auth_context(&auth_ctx);
+        let fs_attr = SetAttributes::from(setattr);
+        let file_attrs = self.process_setattr(&creds, real_id, &fs_attr).await?;
+        Ok((&file_attrs).into())
     }
 
     async fn symlink(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         linkname: &filename3,
         symlink: &nfspath3,
@@ -283,15 +317,18 @@ impl NFSFileSystem for ZeroFS {
             real_dirid, linkname, symlink
         );
 
-        let (id, fattr) = self
-            .process_symlink(auth, real_dirid, &linkname.0, &symlink.0, *attr)
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let creds = Credentials::from_auth_context(&auth_ctx);
+        let fs_attr = SetAttributes::from(*attr);
+        let (id, file_attrs) = self
+            .process_symlink(&creds, real_dirid, &linkname.0, &symlink.0, &fs_attr)
             .await
             .map_err(|e: crate::filesystem::errors::FsError| -> nfsstat3 { e.into() })?;
 
-        Ok((EncodedFileId::from_inode(id).into(), fattr))
+        Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
     }
 
-    async fn readlink(&self, _auth: &AuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
+    async fn readlink(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         debug!("readlink called: id={}", id);
         let real_id = EncodedFileId::from(id).inode_id();
 
@@ -305,7 +342,7 @@ impl NFSFileSystem for ZeroFS {
 
     async fn mknod(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         dirid: fileid3,
         filename: &filename3,
         ftype: ftype3,
@@ -327,16 +364,20 @@ impl NFSFileSystem for ZeroFS {
             _ => None,
         };
 
-        let (id, fattr) = self
-            .process_mknod(auth, real_dirid, &filename.0, ftype, attr, rdev)
+        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let creds = Credentials::from_auth_context(&auth_ctx);
+        let fs_attr = SetAttributes::from(*attr);
+        let fs_type = FileType::from(ftype);
+        let (id, file_attrs) = self
+            .process_mknod(&creds, real_dirid, &filename.0, fs_type, &fs_attr, rdev)
             .await?;
 
-        Ok((EncodedFileId::from_inode(id).into(), fattr))
+        Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
     }
 
     async fn link(
         &self,
-        auth: &AuthContext,
+        auth: &NfsAuthContext,
         fileid: fileid3,
         linkdirid: fileid3,
         linkname: &filename3,
@@ -349,13 +390,13 @@ impl NFSFileSystem for ZeroFS {
         );
 
         Ok(self
-            .process_link(auth, real_fileid, real_linkdirid, &linkname.0)
+            .process_link(&auth.into(), real_fileid, real_linkdirid, &linkname.0)
             .await?)
     }
 
     async fn commit(
         &self,
-        _auth: &AuthContext,
+        _auth: &NfsAuthContext,
         fileid: fileid3,
         offset: u64,
         count: u32,
@@ -382,7 +423,7 @@ impl NFSFileSystem for ZeroFS {
         }
     }
 
-    async fn fsstat(&self, auth: &AuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
+    async fn fsstat(&self, auth: &NfsAuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
         let real_fileid = EncodedFileId::from(fileid).inode_id();
 
         debug!("fsstat called: fileid={}", real_fileid);

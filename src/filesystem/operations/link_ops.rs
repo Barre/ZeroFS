@@ -3,23 +3,23 @@ use crate::filesystem::cache::CacheKey;
 use crate::filesystem::errors::FsError;
 use crate::filesystem::inode::{Inode, SymlinkInode};
 use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-use crate::filesystem::types::InodeWithId;
+use crate::filesystem::types::{
+    AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
+};
 use crate::filesystem::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
-use zerofs_nfsserve::nfs::{fattr3, fileid3, sattr3, set_gid3, set_mode3, set_uid3};
-use zerofs_nfsserve::vfs::AuthContext;
 
 impl ZeroFS {
     pub async fn process_symlink(
         &self,
-        auth: &AuthContext,
-        dirid: fileid3,
+        creds: &Credentials,
+        dirid: InodeId,
         linkname: &[u8],
         target: &[u8],
-        attr: sattr3,
-    ) -> Result<(fileid3, fattr3), FsError> {
+        attr: &SetAttributes,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(linkname)?;
 
         debug!(
@@ -32,9 +32,8 @@ impl ZeroFS {
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-        check_access(&dir_inode, &creds, AccessMode::Write)?;
-        check_access(&dir_inode, &creds, AccessMode::Execute)?;
+        check_access(&dir_inode, creds, AccessMode::Write)?;
+        check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         let (_default_uid, _default_gid) = match &dir_inode {
             Inode::Directory(d) => (d.uid, d.gid),
@@ -59,22 +58,19 @@ impl ZeroFS {
 
         let new_id = self.allocate_inode().await?;
 
-        let mode = if let set_mode3::mode(m) = attr.mode {
-            m | 0o120000
-        } else {
-            0o120777
+        let mode = match &attr.mode {
+            SetMode::Set(m) => *m | 0o120000,
+            SetMode::NoChange => 0o120777,
         };
 
-        let uid = if let set_uid3::uid(u) = attr.uid {
-            u
-        } else {
-            auth.uid
+        let uid = match &attr.uid {
+            SetUid::Set(u) => *u,
+            SetUid::NoChange => creds.uid,
         };
 
-        let gid = if let set_gid3::gid(g) = attr.gid {
-            g
-        } else {
-            auth.gid
+        let gid = match &attr.gid {
+            SetGid::Set(g) => *g,
+            SetGid::NoChange => creds.gid,
         };
 
         let (now_sec, now_nsec) = get_current_time();
@@ -151,8 +147,8 @@ impl ZeroFS {
     pub async fn process_link(
         &self,
         auth: &AuthContext,
-        fileid: fileid3,
-        linkdirid: fileid3,
+        fileid: InodeId,
+        linkdirid: InodeId,
         linkname: &[u8],
     ) -> Result<(), FsError> {
         validate_filename(linkname)?;
