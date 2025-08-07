@@ -1,9 +1,9 @@
 use super::STATS_SHARDS;
+use super::errors::FsError;
 use super::inode::InodeId;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
-use zerofs_nfsserve::nfs::nfsstat3;
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatsShardData {
@@ -140,12 +140,10 @@ impl FileSystemGlobalStats {
         &self,
         update: &StatsUpdate,
         batch: &mut crate::encryption::EncryptedWriteBatch,
-    ) -> Result<(), nfsstat3> {
-        let shard_bytes =
-            bincode::serialize(&update.shard_data).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        batch
-            .put_bytes(&update.shard_key, &shard_bytes)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+    ) -> Result<(), FsError> {
+        let shard_bytes = bincode::serialize(&update.shard_data)?;
+        batch.put_bytes(&update.shard_key, &shard_bytes);
+
         Ok(())
     }
 
@@ -180,14 +178,14 @@ fn stats_shard_key(shard_id: usize) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::SlateDbFs;
+    use crate::filesystem::ZeroFS;
     use crate::test_helpers::test_helpers_mod::{filename, test_auth};
     use zerofs_nfsserve::nfs::sattr3;
     use zerofs_nfsserve::vfs::NFSFileSystem;
 
     #[tokio::test]
     async fn test_stats_initialization() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
         let (bytes, inodes) = fs.global_stats.get_totals();
 
         // Should start empty - root directory is created during filesystem setup
@@ -198,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_file_creation() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file
         let (_file_id, _) = fs
@@ -213,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_file_write() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file
         let (file_id, _) = fs
@@ -240,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_file_overwrite() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file and write initial data
         let (file_id, _) = fs
@@ -262,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_sparse_file() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file
         let (file_id, _) = fs
@@ -284,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_file_removal() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create and write to a file
         let (file_id, _) = fs
@@ -311,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_directory_operations() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create directories
         let (dir1_id, _) = fs
@@ -336,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_symlink() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a symlink
         let (_link_id, _) = fs
@@ -357,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_hard_links() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file with content
         let (file_id, _) = fs
@@ -403,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_file_truncate() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file with content
         let (file_id, _) = fs
@@ -453,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_concurrent_operations() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create multiple files concurrently
         let mut handles = vec![];
@@ -517,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fsstat_reporting() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create some files
         for i in 0..5 {
@@ -556,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_without_replacement() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .create(
@@ -593,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_replacing_file() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create source file with 1000 bytes
         let (file1_id, _) = fs
@@ -633,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_replacing_file_with_hard_links() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create source file
         let (source_id, _) = fs
@@ -682,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_replacing_directory() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create source directory
         let (_source_dir_id, _) = fs
@@ -718,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_replacing_symlink() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a file to rename
         let (file_id, _) = fs
@@ -762,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_cross_directory() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create two directories
         let (dir1_id, _) = fs
@@ -824,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_rename_special_files() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a FIFO
         let (_fifo_id, _) = fs

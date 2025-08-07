@@ -1,16 +1,18 @@
 pub mod cache;
+pub mod errors;
 pub mod inode;
 pub mod lock_manager;
 pub mod metrics;
 pub mod operations;
 pub mod permissions;
 pub mod stats;
+pub mod types;
 
 use self::cache::{CacheKey, CacheValue, UnifiedCache};
-use crate::encryption::{EncryptedDb, EncryptionManager};
-use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
+use self::stats::{FileSystemGlobalStats, StatsShardData};
+use crate::encryption::{EncryptedDb, EncryptionManager};
 use bytes::Bytes;
 use foyer::{
     DirectFsDeviceOptions, Engine, HybridCacheBuilder, RuntimeOptions, TokioRuntimeOptions,
@@ -28,8 +30,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
-use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
+use zerofs_nfsserve::nfs::fileid3;
 
+use self::errors::FsError;
 use self::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,7 +44,6 @@ pub const PREFIX_TOMBSTONE: u8 = 0x05;
 pub const PREFIX_STATS: u8 = 0x06;
 pub const PREFIX_SYSTEM: u8 = 0x07;
 
-/// Helper for parsing binary keys that we iterate over
 #[derive(Debug)]
 pub enum ParsedKey {
     Chunk { inode_id: InodeId, chunk_index: u64 },
@@ -97,41 +99,33 @@ pub const MAX_HARDLINKS_PER_INODE: u32 = u16::MAX as u32;
 // Maximum inode ID - limited by our encoding scheme (48 bits for inode ID)
 pub const MAX_INODE_ID: u64 = (1u64 << 48) - 1;
 
-/// Encoded file ID for NFS operations
-/// High 48 bits: real inode ID
-/// Low 16 bits: position within entries that share the same inode ID (for hardlinks)
+// Encoded file ID for NFS operations: High 48 bits = inode ID, Low 16 bits = position for hardlinks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EncodedFileId(u64);
 
 impl EncodedFileId {
-    /// Create a new encoded file ID from inode and position
     pub fn new(inode_id: u64, position: u16) -> Self {
         Self((inode_id << 16) | (position as u64))
     }
 
-    /// Create an encoded file ID for a regular file (position 0)
     pub fn from_inode(inode_id: u64) -> Self {
         Self::new(inode_id, 0)
     }
 
-    /// Decode into (inode_id, position)
     pub fn decode(self) -> (u64, u16) {
         let inode = self.0 >> 16;
         let position = (self.0 & 0xFFFF) as u16;
         (inode, position)
     }
 
-    /// Get the raw u64 value
     pub fn as_raw(self) -> u64 {
         self.0
     }
 
-    /// Get just the inode ID part
     pub fn inode_id(self) -> u64 {
         self.0 >> 16
     }
 
-    /// Get just the position part
     pub fn position(self) -> u16 {
         (self.0 & 0xFFFF) as u16
     }
@@ -150,7 +144,7 @@ impl From<EncodedFileId> for fileid3 {
 }
 
 #[derive(Clone)]
-pub struct SlateDbFs {
+pub struct ZeroFS {
     pub db: Arc<EncryptedDb>,
     pub lock_manager: Arc<LockManager>,
     pub next_inode_id: Arc<AtomicU64>,
@@ -160,9 +154,8 @@ pub struct SlateDbFs {
     pub last_flush: Arc<Mutex<std::time::Instant>>,
 }
 
-// Struct for temporary unencrypted access (only for key management)
-// Only use for initial key setup and password changes
-pub struct DangerousUnencryptedSlateDbFs {
+// DANGEROUS: Temporary unencrypted access only for initial key setup and password changes
+pub struct DangerousUnencryptedZeroFS {
     pub db: Arc<slatedb::Db>,
 }
 
@@ -173,7 +166,7 @@ pub struct CacheConfig {
     pub memory_cache_size_gb: Option<f64>,
 }
 
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn new_with_object_store(
         object_store: Arc<dyn ObjectStore>,
         cache_config: CacheConfig,
@@ -412,21 +405,19 @@ impl SlateDbFs {
         Bytes::from(key)
     }
 
-    pub async fn allocate_inode(&self) -> Result<InodeId, nfsstat3> {
+    pub async fn allocate_inode(&self) -> Result<InodeId, FsError> {
         let id = self.next_inode_id.fetch_add(1, Ordering::SeqCst);
 
-        // Check if we exceeded the maximum
         if id > MAX_INODE_ID {
-            // We've gone over the limit, try to set it back to indicate we're full
             self.next_inode_id.store(MAX_INODE_ID + 2, Ordering::SeqCst);
-            return Err(nfsstat3::NFS3ERR_NOSPC);
+            return Err(FsError::NoSpace);
         }
 
         Ok(id)
     }
 
-    pub async fn flush(&self) -> Result<(), nfsstat3> {
-        let result = self.db.flush().await.map_err(|_| nfsstat3::NFS3ERR_IO);
+    pub async fn flush(&self) -> Result<(), FsError> {
+        let result = self.db.flush().await.map_err(|_| FsError::IoError);
         if result.is_ok() {
             *self.last_flush.lock().unwrap() = std::time::Instant::now();
         }
@@ -441,7 +432,6 @@ impl SlateDbFs {
             loop {
                 interval.tick().await;
 
-                // Check if it's been 30 seconds since last flush
                 let should_flush = {
                     let last_flush = self.last_flush.lock().unwrap();
                     last_flush.elapsed() >= std::time::Duration::from_secs(30)
@@ -461,7 +451,7 @@ impl SlateDbFs {
         })
     }
 
-    pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, nfsstat3> {
+    pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, FsError> {
         let cache_key = CacheKey::Metadata(inode_id);
         if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key).await {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -476,11 +466,11 @@ impl SlateDbFs {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to get inode {}: {:?}", inode_id, e);
-                nfsstat3::NFS3ERR_IO
+                FsError::IoError
             })?
-            .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            .ok_or(FsError::NotFound)?;
 
-        let inode: Inode = bincode::deserialize(&data).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let inode: Inode = bincode::deserialize(&data)?;
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
@@ -489,9 +479,9 @@ impl SlateDbFs {
         Ok(inode)
     }
 
-    pub async fn save_inode(&self, inode_id: InodeId, inode: &Inode) -> Result<(), nfsstat3> {
+    pub async fn save_inode(&self, inode_id: InodeId, inode: &Inode) -> Result<(), FsError> {
         let key = Self::inode_key(inode_id);
-        let data = bincode::serialize(inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let data = bincode::serialize(inode)?;
 
         self.db
             .put_with_options(
@@ -503,7 +493,7 @@ impl SlateDbFs {
                 },
             )
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|_| FsError::IoError)?;
 
         let mut keys_to_remove = vec![CacheKey::Metadata(inode_id)];
 
@@ -518,7 +508,7 @@ impl SlateDbFs {
         Ok(())
     }
 
-    pub async fn run_garbage_collection(&self) -> Result<(), nfsstat3> {
+    pub async fn run_garbage_collection(&self) -> Result<(), FsError> {
         const MAX_CHUNKS_PER_ROUND: usize = 10_000;
 
         self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
@@ -534,11 +524,7 @@ impl SlateDbFs {
             let mut tombstones_completed_this_round = 0;
             let mut found_incomplete_tombstones = false;
 
-            let iter = self
-                .db
-                .scan(range)
-                .await
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let iter = self.db.scan(range).await.map_err(|_| FsError::IoError)?;
             futures::pin_mut!(iter);
 
             let mut chunks_remaining_in_round = MAX_CHUNKS_PER_ROUND;
@@ -597,7 +583,7 @@ impl SlateDbFs {
                             },
                         )
                         .await
-                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                        .map_err(|_| FsError::IoError)?;
 
                     chunks_deleted_this_round += chunks_to_delete;
                     chunks_remaining_in_round -= chunks_to_delete;
@@ -624,9 +610,7 @@ impl SlateDbFs {
                         let remaining_chunks = start_chunk;
                         let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
-                        batch
-                            .put_bytes(&key, &actual_remaining.to_le_bytes())
-                            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                        batch.put_bytes(&key, &actual_remaining.to_le_bytes());
                     }
                 }
 
@@ -638,7 +622,7 @@ impl SlateDbFs {
                         },
                     )
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|_| FsError::IoError)?;
 
                 self.stats
                     .tombstones_processed
@@ -774,13 +758,13 @@ impl SlateDbFs {
     }
 }
 
-impl SlateDbFs {
+impl ZeroFS {
     /// DANGEROUS: Creates an unencrypted database connection. Only use for key management!
     pub async fn dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store: Arc<dyn ObjectStore>,
         cache_config: CacheConfig,
         db_path: String,
-    ) -> Result<DangerousUnencryptedSlateDbFs, Box<dyn std::error::Error>> {
+    ) -> Result<DangerousUnencryptedZeroFS, Box<dyn std::error::Error>> {
         let total_cache_size_gb = cache_config.max_cache_size_gb;
 
         // For key management, all disk cache goes to SlateDB
@@ -809,7 +793,7 @@ impl SlateDbFs {
                 .await?,
         );
 
-        Ok(DangerousUnencryptedSlateDbFs { db: slatedb })
+        Ok(DangerousUnencryptedZeroFS { db: slatedb })
     }
 }
 
@@ -820,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_filesystem() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let root_inode = fs.load_inode(0).await.unwrap();
         match root_inode {
@@ -837,7 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_allocate_inode() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let inode1 = fs.allocate_inode().await.unwrap();
         let inode2 = fs.allocate_inode().await.unwrap();
@@ -853,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_load_inode() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let file_inode = FileInode {
             size: 1024,
@@ -892,15 +876,15 @@ mod tests {
     #[tokio::test]
     async fn test_inode_key_generation() {
         // Test binary key format: [PREFIX_INODE | inode_id(8 bytes BE)]
-        let key0 = SlateDbFs::inode_key(0);
+        let key0 = ZeroFS::inode_key(0);
         assert_eq!(key0[0], PREFIX_INODE);
         assert_eq!(&key0[1..9], &0u64.to_be_bytes());
 
-        let key42 = SlateDbFs::inode_key(42);
+        let key42 = ZeroFS::inode_key(42);
         assert_eq!(key42[0], PREFIX_INODE);
         assert_eq!(&key42[1..9], &42u64.to_be_bytes());
 
-        let key999 = SlateDbFs::inode_key(999);
+        let key999 = ZeroFS::inode_key(999);
         assert_eq!(key999[0], PREFIX_INODE);
         assert_eq!(&key999[1..9], &999u64.to_be_bytes());
     }
@@ -908,17 +892,17 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_key_generation() {
         // Test binary key format: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
-        let key = SlateDbFs::chunk_key_by_index(1, 0);
+        let key = ZeroFS::chunk_key_by_index(1, 0);
         assert_eq!(key[0], PREFIX_CHUNK);
         assert_eq!(&key[1..9], &1u64.to_be_bytes());
         assert_eq!(&key[9..17], &0u64.to_be_bytes());
 
-        let key = SlateDbFs::chunk_key_by_index(42, 10);
+        let key = ZeroFS::chunk_key_by_index(42, 10);
         assert_eq!(key[0], PREFIX_CHUNK);
         assert_eq!(&key[1..9], &42u64.to_be_bytes());
         assert_eq!(&key[9..17], &10u64.to_be_bytes());
 
-        let key = SlateDbFs::chunk_key_by_index(999, 999);
+        let key = ZeroFS::chunk_key_by_index(999, 999);
         assert_eq!(key[0], PREFIX_CHUNK);
         assert_eq!(&key[1..9], &999u64.to_be_bytes());
         assert_eq!(&key[9..17], &999u64.to_be_bytes());
@@ -926,18 +910,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent_inode() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let result = fs.load_inode(999).await;
         match result {
-            Err(nfsstat3::NFS3ERR_NOENT) => {} // Expected
+            Err(FsError::NotFound) => {} // Expected
             other => panic!("Expected NFS3ERR_NOENT, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn test_max_inode_id_limit() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Set the counter to MAX_INODE_ID (next allocation will get this value)
         fs.next_inode_id.store(MAX_INODE_ID, Ordering::SeqCst);
@@ -948,7 +932,7 @@ mod tests {
 
         // Next allocation should fail
         let result = fs.allocate_inode().await;
-        assert!(matches!(result, Err(nfsstat3::NFS3ERR_NOSPC)));
+        assert!(matches!(result, Err(FsError::NoSpace)));
 
         // Verify the counter is set to indicate we're full
         assert!(fs.next_inode_id.load(Ordering::SeqCst) > MAX_INODE_ID);

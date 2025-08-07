@@ -1,4 +1,4 @@
-use crate::filesystem::{CacheConfig, SlateDbFs};
+use crate::filesystem::{CacheConfig, ZeroFS};
 use crate::nbd::NBDServer;
 use mimalloc::MiMalloc;
 use std::sync::Arc;
@@ -244,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Loading or initializing encryption key");
 
-    let temp_fs = SlateDbFs::dangerous_new_with_object_store_unencrypted_for_key_management_only(
+    let temp_fs = ZeroFS::dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store.clone(),
         cache_config.clone(),
         actual_db_path.clone(),
@@ -291,13 +291,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Encryption key loaded successfully");
 
-    let fs = SlateDbFs::new_with_object_store(
-        object_store,
-        cache_config,
-        actual_db_path,
-        encryption_key,
-    )
-    .await?;
+    let fs =
+        ZeroFS::new_with_object_store(object_store, cache_config, actual_db_path, encryption_key)
+            .await?;
 
     // Parse NBD device configuration from environment
     let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());

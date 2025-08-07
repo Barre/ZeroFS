@@ -1,6 +1,7 @@
 use crate::filesystem::cache::{CacheKey, CacheValue};
-use crate::filesystem::{EncodedFileId, SlateDbFs};
 use crate::filesystem::inode::Inode;
+use crate::filesystem::types::InodeWithId;
+use crate::filesystem::{EncodedFileId, ZeroFS};
 use async_trait::async_trait;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
@@ -8,8 +9,11 @@ use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
+const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
+const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
+
 #[async_trait]
-impl NFSFileSystem for SlateDbFs {
+impl NFSFileSystem for ZeroFS {
     fn root_dir(&self) -> fileid3 {
         0
     }
@@ -50,7 +54,7 @@ impl NFSFileSystem for SlateDbFs {
                     return Ok(EncodedFileId::from_inode(inode_id).into());
                 }
 
-                let entry_key = SlateDbFs::dir_entry_key(real_dirid, &name);
+                let entry_key = ZeroFS::dir_entry_key(real_dirid, &name);
 
                 match self
                     .db
@@ -88,7 +92,11 @@ impl NFSFileSystem for SlateDbFs {
         let encoded_id = EncodedFileId::from(id);
         let real_id = encoded_id.inode_id();
         let inode = self.load_inode(real_id).await?;
-        Ok(inode.to_fattr3(real_id))
+        Ok(InodeWithId {
+            inode: &inode,
+            id: real_id,
+        }
+        .into())
     }
 
     async fn read(
@@ -100,7 +108,9 @@ impl NFSFileSystem for SlateDbFs {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
         let real_id = EncodedFileId::from(id).inode_id();
-        self.process_read_file(auth, real_id, offset, count).await
+        self.process_read_file(auth, real_id, offset, count)
+            .await
+            .map_err(|e| e.into())
     }
 
     async fn write(
@@ -118,7 +128,9 @@ impl NFSFileSystem for SlateDbFs {
             offset
         );
 
-        self.process_write(auth, real_id, offset, data).await
+        self.process_write(auth, real_id, offset, data)
+            .await
+            .map_err(|e| e.into())
     }
 
     async fn create(
@@ -129,10 +141,11 @@ impl NFSFileSystem for SlateDbFs {
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
-        let filename_str = String::from_utf8_lossy(filename);
+
         debug!(
             "create called: dirid={}, filename={}",
-            real_dirid, filename_str
+            real_dirid,
+            String::from_utf8_lossy(filename)
         );
 
         let (id, fattr) = self
@@ -148,6 +161,7 @@ impl NFSFileSystem for SlateDbFs {
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
+
         debug!(
             "create_exclusive called: dirid={}, filename={:?}",
             real_dirid, filename
@@ -156,6 +170,7 @@ impl NFSFileSystem for SlateDbFs {
         let id = self
             .process_create_exclusive(auth, real_dirid, filename)
             .await?;
+
         Ok(EncodedFileId::from_inode(id).into())
     }
 
@@ -167,10 +182,11 @@ impl NFSFileSystem for SlateDbFs {
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
-        let dirname_str = String::from_utf8_lossy(dirname);
+
         debug!(
             "mkdir called: dirid={}, dirname={}",
-            real_dirid, dirname_str
+            real_dirid,
+            String::from_utf8_lossy(dirname)
         );
 
         let (id, fattr) = self.process_mkdir(auth, real_dirid, dirname, attr).await?;
@@ -184,12 +200,13 @@ impl NFSFileSystem for SlateDbFs {
         filename: &filename3,
     ) -> Result<(), nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
+
         debug!(
             "remove called: dirid={}, filename={:?}",
             real_dirid, filename
         );
 
-        self.process_remove(auth, real_dirid, filename).await
+        Ok(self.process_remove(auth, real_dirid, filename).await?)
     }
 
     async fn rename(
@@ -202,6 +219,7 @@ impl NFSFileSystem for SlateDbFs {
     ) -> Result<(), nfsstat3> {
         let real_from_dirid = EncodedFileId::from(from_dirid).inode_id();
         let real_to_dirid = EncodedFileId::from(to_dirid).inode_id();
+
         debug!(
             "rename called: from_dirid={}, to_dirid={}",
             real_from_dirid, real_to_dirid
@@ -215,6 +233,7 @@ impl NFSFileSystem for SlateDbFs {
             to_filename,
         )
         .await
+        .map_err(|e| e.into())
     }
 
     async fn readdir(
@@ -225,12 +244,15 @@ impl NFSFileSystem for SlateDbFs {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
+
         debug!(
             "readdir called: dirid={}, start_after={}, max_entries={}",
             real_dirid, start_after, max_entries
         );
-        self.process_readdir(auth, real_dirid, start_after, max_entries)
-            .await
+
+        Ok(self
+            .process_readdir(auth, real_dirid, start_after, max_entries)
+            .await?)
     }
 
     async fn setattr(
@@ -240,9 +262,10 @@ impl NFSFileSystem for SlateDbFs {
         setattr: sattr3,
     ) -> Result<fattr3, nfsstat3> {
         let real_id = EncodedFileId::from(id).inode_id();
+
         debug!("setattr called: id={}, setattr={:?}", real_id, setattr);
 
-        self.process_setattr(auth, real_id, setattr).await
+        Ok(self.process_setattr(auth, real_id, setattr).await?)
     }
 
     async fn symlink(
@@ -254,6 +277,7 @@ impl NFSFileSystem for SlateDbFs {
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let real_dirid = EncodedFileId::from(dirid).inode_id();
+
         debug!(
             "symlink called: dirid={}, linkname={:?}, target={:?}",
             real_dirid, linkname, symlink
@@ -261,7 +285,9 @@ impl NFSFileSystem for SlateDbFs {
 
         let (id, fattr) = self
             .process_symlink(auth, real_dirid, &linkname.0, &symlink.0, *attr)
-            .await?;
+            .await
+            .map_err(|e: crate::filesystem::errors::FsError| -> nfsstat3 { e.into() })?;
+
         Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
@@ -270,6 +296,7 @@ impl NFSFileSystem for SlateDbFs {
         let real_id = EncodedFileId::from(id).inode_id();
 
         let inode = self.load_inode(real_id).await?;
+
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
             _ => Err(nfsstat3::NFS3ERR_INVAL),
@@ -303,6 +330,7 @@ impl NFSFileSystem for SlateDbFs {
         let (id, fattr) = self
             .process_mknod(auth, real_dirid, &filename.0, ftype, attr, rdev)
             .await?;
+
         Ok((EncodedFileId::from_inode(id).into(), fattr))
     }
 
@@ -319,8 +347,10 @@ impl NFSFileSystem for SlateDbFs {
             "link called: fileid={}, linkdirid={}, linkname={:?}",
             real_fileid, real_linkdirid, linkname
         );
-        self.process_link(auth, real_fileid, real_linkdirid, &linkname.0)
-            .await
+
+        Ok(self
+            .process_link(auth, real_fileid, real_linkdirid, &linkname.0)
+            .await?)
     }
 
     async fn commit(
@@ -331,6 +361,7 @@ impl NFSFileSystem for SlateDbFs {
         count: u32,
     ) -> Result<writeverf3, nfsstat3> {
         let real_fileid = EncodedFileId::from(fileid).inode_id();
+
         tracing::debug!(
             "commit called: fileid={}, offset={}, count={}",
             real_fileid,
@@ -343,7 +374,8 @@ impl NFSFileSystem for SlateDbFs {
                 debug!("commit successful for file {}", real_fileid);
                 Ok(self.serverid())
             }
-            Err(nfsstat) => {
+            Err(fs_error) => {
+                let nfsstat: nfsstat3 = fs_error.into();
                 tracing::error!("commit failed for file {}: {:?}", real_fileid, nfsstat);
                 Err(nfsstat)
             }
@@ -352,6 +384,7 @@ impl NFSFileSystem for SlateDbFs {
 
     async fn fsstat(&self, auth: &AuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
         let real_fileid = EncodedFileId::from(fileid).inode_id();
+
         debug!("fsstat called: fileid={}", real_fileid);
 
         let obj_attr = match self.getattr(auth, fileid).await {
@@ -360,9 +393,6 @@ impl NFSFileSystem for SlateDbFs {
         };
 
         let (used_bytes, _used_inodes) = self.global_stats.get_totals();
-
-        const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
-        const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
 
         // Get the next inode ID to determine how many IDs have been allocated
         let next_inode_id = self.next_inode_id.load(Ordering::Relaxed);
@@ -387,12 +417,14 @@ impl NFSFileSystem for SlateDbFs {
 }
 
 pub async fn start_nfs_server_with_config(
-    filesystem: SlateDbFs,
+    filesystem: ZeroFS,
     host: &str,
     port: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = NFSTcpListener::bind(&format!("{host}:{port}"), filesystem).await?;
+
     info!("NFS server listening on {}:{}", host, port);
+
     listener
         .handle_forever()
         .await
@@ -410,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_nfs_filesystem_trait() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         assert_eq!(fs.root_dir(), 0);
         assert!(matches!(fs.capabilities(), VFSCapabilities::ReadWrite));
@@ -418,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lookup() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
@@ -429,6 +461,7 @@ mod tests {
             .lookup(&test_auth(), 0, &filename(b"test.txt"))
             .await
             .unwrap();
+
         assert_eq!(found_id, file_id);
 
         let result = fs
@@ -439,16 +472,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_getattr() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let fattr = fs.getattr(&test_auth(), 0).await.unwrap();
+
         assert!(matches!(fattr.ftype, ftype3::NF3DIR));
         assert_eq!(fattr.fileid, 0);
     }
 
     #[tokio::test]
     async fn test_read_write() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
@@ -457,24 +491,27 @@ mod tests {
 
         let data = b"Hello, NFS!";
         let fattr = fs.write(&test_auth(), file_id, 0, data).await.unwrap();
+
         assert_eq!(fattr.size, data.len() as u64);
 
         let (read_data, eof) = fs
             .read(&test_auth(), file_id, 0, data.len() as u32)
             .await
             .unwrap();
+
         assert_eq!(read_data, data);
         assert!(eof);
     }
 
     #[tokio::test]
     async fn test_create_exclusive() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let file_id = fs
             .create_exclusive(&test_auth(), 0, &filename(b"exclusive.txt"))
             .await
             .unwrap();
+
         assert!(file_id > 0);
 
         let result = fs
@@ -485,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mkdir_and_readdir() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, fattr) = fs
             .mkdir(&test_auth(), 0, &filename(b"mydir"), &sattr3::default())
@@ -507,6 +544,7 @@ mod tests {
         assert!(result.end);
 
         let names: Vec<&[u8]> = result.entries.iter().map(|e| e.name.0.as_ref()).collect();
+
         assert!(names.contains(&b".".as_ref()));
         assert!(names.contains(&b"..".as_ref()));
         assert!(names.contains(&b"file_in_dir.txt".as_ref()));
@@ -514,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rename() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .create(
@@ -552,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
             .create(
@@ -579,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_setattr() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, initial_fattr) = fs
             .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
@@ -625,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_symlink_and_readlink() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let target = nfspath3 {
             0: b"/path/to/target".to_vec(),
@@ -644,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complex_filesystem_operations() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (docs_dir, _) = fs
             .mkdir(&test_auth(), 0, &filename(b"documents"), &sattr3::default())
@@ -715,7 +753,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_directory_pagination() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create a large number of files
         let num_files = 100;
@@ -782,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pagination_with_many_hardlinks() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create original files
         let num_files = 5;
@@ -860,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pagination_edge_cases() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Test 1: Empty directory (only . and ..)
         let (empty_dir, _) = fs
@@ -937,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_readdir_operations() {
-        let fs = SlateDbFs::new_in_memory().await.unwrap();
+        let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create some files
         for i in 0..20 {

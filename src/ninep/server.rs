@@ -8,16 +8,16 @@ use tracing::{debug, error, info, warn};
 
 use super::handler::NinePHandler;
 use super::protocol::P9Message;
-use crate::filesystem::SlateDbFs;
+use crate::filesystem::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
 
 pub struct NinePServer {
-    filesystem: Arc<SlateDbFs>,
+    filesystem: Arc<ZeroFS>,
     addr: SocketAddr,
 }
 
 impl NinePServer {
-    pub fn new(filesystem: Arc<SlateDbFs>, addr: SocketAddr) -> Self {
+    pub fn new(filesystem: Arc<ZeroFS>, addr: SocketAddr) -> Self {
         Self { filesystem, addr }
     }
 
@@ -44,7 +44,7 @@ impl NinePServer {
 
 async fn handle_client(
     stream: TcpStream,
-    filesystem: Arc<SlateDbFs>,
+    filesystem: Arc<ZeroFS>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handler = Arc::new(NinePHandler::new(filesystem));
 

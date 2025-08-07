@@ -1,5 +1,5 @@
+use super::errors::FsError;
 use super::inode::Inode;
-use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::AuthContext;
 
 const S_IRUSR: u32 = 0o400;
@@ -57,7 +57,7 @@ pub enum AccessMode {
     Execute,
 }
 
-pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Result<(), nfsstat3> {
+pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Result<(), FsError> {
     let (uid, gid, file_mode) = match inode {
         Inode::File(f) => (f.uid, f.gid, f.mode),
         Inode::Directory(d) => (d.uid, d.gid, d.mode),
@@ -71,7 +71,7 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
     if creds.uid == 0 {
         if let AccessMode::Execute = mode {
             if file_mode & 0o111 == 0 {
-                return Err(nfsstat3::NFS3ERR_ACCES);
+                return Err(FsError::PermissionDenied);
             }
         }
         return Ok(());
@@ -95,10 +95,10 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
         return Ok(());
     }
 
-    Err(nfsstat3::NFS3ERR_ACCES)
+    Err(FsError::PermissionDenied)
 }
 
-pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), nfsstat3> {
+pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
     let uid = match inode {
         Inode::File(f) => f.uid,
         Inode::Directory(d) => d.uid,
@@ -112,7 +112,7 @@ pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), nfsstat
     if creds.uid == 0 || creds.uid == uid {
         Ok(())
     } else {
-        Err(nfsstat3::NFS3ERR_PERM)
+        Err(FsError::PermissionDenied)
     }
 }
 
@@ -120,7 +120,7 @@ pub fn check_sticky_bit_delete(
     parent: &Inode,
     target: &Inode,
     creds: &Credentials,
-) -> Result<(), nfsstat3> {
+) -> Result<(), FsError> {
     if let Inode::Directory(parent_dir) = parent {
         if parent_dir.mode & S_ISVTX != 0 {
             let target_uid = match target {
@@ -134,7 +134,7 @@ pub fn check_sticky_bit_delete(
             };
 
             if creds.uid != 0 && creds.uid != parent_dir.uid && creds.uid != target_uid {
-                return Err(nfsstat3::NFS3ERR_PERM);
+                return Err(FsError::PermissionDenied);
             }
         }
     }
@@ -149,7 +149,7 @@ pub fn can_set_times(
     inode: &Inode,
     creds: &Credentials,
     setting_to_current_time: bool,
-) -> Result<(), nfsstat3> {
+) -> Result<(), FsError> {
     let uid = match inode {
         Inode::File(f) => f.uid,
         Inode::Directory(d) => d.uid,
@@ -168,5 +168,5 @@ pub fn can_set_times(
         return check_access(inode, creds, AccessMode::Write);
     }
 
-    Err(nfsstat3::NFS3ERR_PERM)
+    Err(FsError::PermissionDenied)
 }

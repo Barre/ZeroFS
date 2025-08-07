@@ -1,3 +1,10 @@
+use super::common::validate_filename;
+use crate::filesystem::cache::CacheKey;
+use crate::filesystem::errors::FsError;
+use crate::filesystem::inode::{DirectoryInode, Inode};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
+use crate::filesystem::types::InodeWithId;
+use crate::filesystem::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, ZeroFS, get_current_time};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
@@ -5,25 +12,18 @@ use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 use zerofs_nfsserve::nfs::{
-    fattr3, fileid3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime,
-    set_uid3,
+    fattr3, fileid3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_uid3,
 };
 use zerofs_nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
 
-use super::common::validate_filename;
-use crate::filesystem::cache::CacheKey;
-use crate::filesystem::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, SlateDbFs, get_current_time};
-use crate::filesystem::inode::{DirectoryInode, Inode};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn process_mkdir(
         &self,
         auth: &AuthContext,
         dirid: fileid3,
         dirname: &[u8],
         attr: &sattr3,
-    ) -> Result<(fileid3, fattr3), nfsstat3> {
+    ) -> Result<(fileid3, fattr3), FsError> {
         validate_filename(dirname)?;
 
         let dirname_str = String::from_utf8_lossy(dirname);
@@ -45,10 +45,10 @@ impl SlateDbFs {
                     .db
                     .get_bytes(&entry_key)
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                    .map_err(|_| FsError::IoError)?
                     .is_some()
                 {
-                    return Err(nfsstat3::NFS3ERR_EXIST);
+                    return Err(FsError::Exists);
                 }
 
                 let new_dir_id = self.allocate_inode().await?;
@@ -65,7 +65,6 @@ impl SlateDbFs {
                     new_mode |= 0o2000;
                 }
 
-                // Apply uid/gid from attributes, with defaults
                 let new_uid = match attr.uid {
                     set_uid3::uid(u) => u,
                     set_uid3::Void => auth.uid,
@@ -74,7 +73,6 @@ impl SlateDbFs {
                 let new_gid = match attr.gid {
                     set_gid3::gid(g) => g,
                     set_gid3::Void => {
-                        // If parent has setgid bit, inherit parent's gid
                         if parent_mode & 0o2000 != 0 {
                             dir.gid
                         } else {
@@ -83,7 +81,6 @@ impl SlateDbFs {
                     }
                 };
 
-                // Apply time attributes
                 let (atime_sec, atime_nsec) = match attr.atime {
                     set_atime::SET_TO_CLIENT_TIME(nfstime3 { seconds, nseconds }) => {
                         (seconds as u64, nseconds)
@@ -110,50 +107,37 @@ impl SlateDbFs {
                     gid: new_gid,
                     entry_count: 0,
                     parent: dirid,
-                    nlink: 2, // . and parent's reference
+                    nlink: 2,
                 };
 
                 let mut batch = self.db.new_write_batch();
 
                 let new_dir_key = Self::inode_key(new_dir_id);
-                let new_dir_data = bincode::serialize(&Inode::Directory(new_dir_inode.clone()))
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&new_dir_key, &new_dir_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let new_dir_data = bincode::serialize(&Inode::Directory(new_dir_inode.clone()))?;
+                batch.put_bytes(&new_dir_key, &new_dir_data);
 
-                batch
-                    .put_bytes(&entry_key, &new_dir_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&entry_key, &new_dir_id.to_le_bytes());
 
                 let scan_key = Self::dir_scan_key(dirid, new_dir_id, &name);
-                batch
-                    .put_bytes(&scan_key, &new_dir_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&scan_key, &new_dir_id.to_le_bytes());
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
-                    return Err(nfsstat3::NFS3ERR_NOSPC);
+                    return Err(FsError::NoSpace);
                 }
-                dir.nlink += 1; // New subdirectory's ".." points to this directory
+                dir.nlink += 1;
                 dir.mtime = now_sec;
                 dir.mtime_nsec = now_nsec;
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                // Persist the counter
                 let counter_key = Self::counter_key();
                 let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch
-                    .put_bytes(&counter_key, &next_id.to_le_bytes())
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                batch.put_bytes(&counter_key, &next_id.to_le_bytes());
 
                 let parent_dir_key = Self::inode_key(dirid);
-                let parent_dir_data =
-                    bincode::serialize(&dir_inode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                batch
-                    .put_bytes(&parent_dir_key, &parent_dir_data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let parent_dir_data = bincode::serialize(&dir_inode)?;
+                batch.put_bytes(&parent_dir_key, &parent_dir_data);
 
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
@@ -166,7 +150,7 @@ impl SlateDbFs {
                         },
                     )
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|_| FsError::IoError)?;
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -177,12 +161,15 @@ impl SlateDbFs {
                     .fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                Ok((
-                    new_dir_id,
-                    Inode::Directory(new_dir_inode).to_fattr3(new_dir_id),
-                ))
+                let new_inode = Inode::Directory(new_dir_inode);
+                let attrs = InodeWithId {
+                    inode: &new_inode,
+                    id: new_dir_id,
+                }
+                .into();
+                Ok((new_dir_id, attrs))
             }
-            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => Err(FsError::NotDirectory),
         }
     }
 
@@ -192,7 +179,7 @@ impl SlateDbFs {
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
-    ) -> Result<ReadDirResult, nfsstat3> {
+    ) -> Result<ReadDirResult, FsError> {
         debug!(
             "process_readdir: dirid={}, start_after={}, max_entries={}",
             dirid, start_after, max_entries
@@ -221,17 +208,33 @@ impl SlateDbFs {
                     entries.push(DirEntry {
                         fileid: dirid,
                         name: b".".to_vec().into(),
-                        attr: dir_inode.to_fattr3(dirid),
+                        attr: InodeWithId {
+                            inode: &dir_inode,
+                            id: dirid,
+                        }
+                        .into(),
                     });
 
                     debug!("readdir: adding .. entry for parent directory");
                     let parent_id = if dirid == 0 { 0 } else { dir.parent };
                     let parent_attr = if parent_id == dirid {
-                        dir_inode.to_fattr3(dirid)
+                        InodeWithId {
+                            inode: &dir_inode,
+                            id: dirid,
+                        }
+                        .into()
                     } else {
                         match self.load_inode(parent_id).await {
-                            Ok(parent_inode) => parent_inode.to_fattr3(parent_id),
-                            Err(_) => dir_inode.to_fattr3(dirid),
+                            Ok(parent_inode) => InodeWithId {
+                                inode: &parent_inode,
+                                id: parent_id,
+                            }
+                            .into(),
+                            Err(_) => InodeWithId {
+                                inode: &dir_inode,
+                                id: dirid,
+                            }
+                            .into(),
                         }
                     };
                     entries.push(DirEntry {
@@ -241,18 +244,15 @@ impl SlateDbFs {
                     });
                 }
 
-                // Use dirscan index for efficient pagination
                 let scan_prefix = Self::dir_scan_prefix(dirid);
                 let start_key = if start_after == 0 {
                     Bytes::from(scan_prefix.clone())
                 } else {
-                    // Resume from the exact inode we left off at
                     let mut key = scan_prefix.clone();
                     key.extend_from_slice(&start_inode.to_be_bytes());
                     Bytes::from(key)
                 };
 
-                // End key: increment the directory ID to get all entries for this directory
                 let mut end_key = Vec::with_capacity(9);
                 end_key.push(PREFIX_DIR_SCAN);
                 end_key.extend_from_slice(&(dirid + 1).to_be_bytes());
@@ -261,7 +261,7 @@ impl SlateDbFs {
                     .db
                     .scan(start_key..Bytes::from(end_key))
                     .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|_| FsError::IoError)?;
                 pin_mut!(iter);
 
                 let mut dir_entries = Vec::new();
@@ -269,32 +269,27 @@ impl SlateDbFs {
                 let mut has_more = false;
 
                 while let Some(result) = iter.next().await {
-                    // Check if we already have enough entries
                     if dir_entries.len() >= max_entries - entries.len() {
                         debug!("readdir: reached max_entries limit, found one more entry");
                         has_more = true;
                         break;
                     }
 
-                    let (key, _value) = result.map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    let (key, _value) = result.map_err(|_| FsError::IoError)?;
 
-                    // Extract the inode ID and filename from the binary key
                     let (inode_id, filename) = match ParsedKey::parse(&key) {
                         Some(ParsedKey::DirScan { entry_id, name }) => (entry_id, name),
                         _ => continue,
                     };
 
-                    // If we're resuming, check if we need to skip entries
                     if resuming {
                         if inode_id == start_inode {
-                            // Same inode - check position
                             let pos = inode_positions.entry(inode_id).or_insert(0);
                             if *pos <= start_position {
                                 *pos += 1;
                                 continue;
                             }
                         } else if inode_id < start_inode {
-                            // Earlier inode - skip
                             continue;
                         }
                         resuming = false;
@@ -310,7 +305,7 @@ impl SlateDbFs {
                         debug!("readdir: loading inode {} for entry", inode_id);
                         let inode = self.load_inode(inode_id).await?;
                         debug!("readdir: loaded inode {} successfully", inode_id);
-                        Ok::<(u64, Vec<u8>, Inode), nfsstat3>((inode_id, name, inode))
+                        Ok::<(u64, Vec<u8>, Inode), FsError>((inode_id, name, inode))
                     });
 
                 let loaded_entries: Vec<_> = inode_futures
@@ -320,7 +315,6 @@ impl SlateDbFs {
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Add the loaded entries to results with encoded fileids
                 for (inode_id, name, inode) in loaded_entries {
                     let position = inode_positions.entry(inode_id).or_insert(0);
                     let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
@@ -329,12 +323,15 @@ impl SlateDbFs {
                     entries.push(DirEntry {
                         fileid: encoded_id,
                         name: name.into(),
-                        attr: inode.to_fattr3(inode_id),
+                        attr: InodeWithId {
+                            inode: &inode,
+                            id: inode_id,
+                        }
+                        .into(),
                     });
                     debug!("readdir: added entry with encoded id {}", encoded_id);
                 }
 
-                // We're at the end if there are no more entries
                 let end = !has_more;
 
                 let result = ReadDirResult { end, entries };
@@ -349,7 +346,7 @@ impl SlateDbFs {
 
                 Ok(result)
             }
-            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
+            _ => Err(FsError::NotDirectory),
         }
     }
 }

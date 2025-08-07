@@ -1,26 +1,26 @@
-use crate::filesystem::SlateDbFs;
+use crate::filesystem::ZeroFS;
+use crate::filesystem::errors::FsError;
 use crate::filesystem::inode::{Inode, InodeId};
 use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-use zerofs_nfsserve::nfs::nfsstat3;
 
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 
-// POSIX limits
-pub const NAME_MAX: usize = 255; // Maximum filename length
+pub const NAME_MAX: usize = 255;
 
-pub fn validate_filename(filename: &[u8]) -> Result<(), nfsstat3> {
+pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
     if filename.len() > NAME_MAX {
-        return Err(nfsstat3::NFS3ERR_NAMETOOLONG);
+        Err(FsError::NameTooLong)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
-impl SlateDbFs {
+impl ZeroFS {
     pub async fn is_ancestor_of(
         &self,
         ancestor_id: InodeId,
         descendant_id: InodeId,
-    ) -> Result<bool, nfsstat3> {
+    ) -> Result<bool, FsError> {
         if ancestor_id == descendant_id {
             return Ok(true);
         }
@@ -61,7 +61,7 @@ impl SlateDbFs {
         &self,
         id: InodeId,
         creds: &Credentials,
-    ) -> Result<(), nfsstat3> {
+    ) -> Result<(), FsError> {
         if id == 0 {
             return Ok(());
         }
@@ -85,7 +85,7 @@ impl SlateDbFs {
 
             current_id = match &parent_inode {
                 Inode::Directory(d) => d.parent,
-                _ => return Err(nfsstat3::NFS3ERR_NOTDIR),
+                _ => return Err(FsError::NotDirectory),
             };
         }
 

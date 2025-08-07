@@ -7,7 +7,7 @@ use tracing::debug;
 use super::protocol::*;
 use crate::filesystem::inode::{Inode, InodeId};
 use crate::filesystem::permissions::Credentials;
-use crate::filesystem::{EncodedFileId, SlateDbFs};
+use crate::filesystem::{EncodedFileId, ZeroFS};
 use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::NFSFileSystem;
 
@@ -65,12 +65,12 @@ pub struct Session {
 
 #[derive(Clone)]
 pub struct NinePHandler {
-    filesystem: Arc<SlateDbFs>,
+    filesystem: Arc<ZeroFS>,
     session: Arc<Session>,
 }
 
 impl NinePHandler {
-    pub fn new(filesystem: Arc<SlateDbFs>) -> Self {
+    pub fn new(filesystem: Arc<ZeroFS>) -> Self {
         let session = Arc::new(Session {
             msize: AtomicU32::new(DEFAULT_MSIZE),
             fids: Arc::new(DashMap::new()),
@@ -197,7 +197,7 @@ impl NinePHandler {
 
         let root_inode = match self.filesystem.load_inode(0).await {
             Ok(i) => i,
-            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
         };
 
         let qid = inode_to_qid(&root_inode, 0);
@@ -245,7 +245,7 @@ impl NinePHandler {
 
             let inode = match self.filesystem.load_inode(current_id).await {
                 Ok(i) => i,
-                Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
             };
 
             match inode {
@@ -261,7 +261,9 @@ impl NinePHandler {
                             let child_id = EncodedFileId::from(encoded_id).inode_id();
                             let child_inode = match self.filesystem.load_inode(child_id).await {
                                 Ok(i) => i,
-                                Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                                Err(e) => {
+                                    return P9Message::error(tag, errno_from_nfsstat(e.into()));
+                                }
                             };
 
                             wqids.push(inode_to_qid(&child_inode, child_id));
@@ -324,7 +326,7 @@ impl NinePHandler {
 
         let inode = match self.filesystem.load_inode(inode_id).await {
             Ok(i) => i,
-            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
         };
 
         let qid = inode_to_qid(&inode, inode_id);
@@ -440,7 +442,7 @@ impl NinePHandler {
                         break; // Either end of dir or we have enough entries
                     }
                 }
-                Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
             }
         }
 
@@ -578,7 +580,7 @@ impl NinePHandler {
             Ok((child_id, _post_attr)) => {
                 let child_inode = match self.filesystem.load_inode(child_id).await {
                     Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
                 };
 
                 let qid = inode_to_qid(&child_inode, child_id);
@@ -598,7 +600,7 @@ impl NinePHandler {
                     }),
                 )
             }
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -626,7 +628,7 @@ impl NinePHandler {
                     data,
                 }),
             ),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -668,7 +670,7 @@ impl NinePHandler {
             }
             Err(e) => {
                 debug!("handle_write: write failed with error: {:?}", e);
-                P9Message::error(tag, errno_from_nfsstat(e))
+                P9Message::error(tag, errno_from_nfsstat(e.into()))
             }
         }
     }
@@ -687,7 +689,7 @@ impl NinePHandler {
                     stat: inode_to_stat(&inode, fid_entry.inode_id),
                 }),
             ),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -751,7 +753,7 @@ impl NinePHandler {
 
         match self.filesystem.process_setattr(&auth, inode_id, attr).await {
             Ok(_post_attr) => P9Message::new(tag, Message::Rsetattr(Rsetattr)),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -799,13 +801,13 @@ impl NinePHandler {
             Ok((new_id, _post_attr)) => {
                 let new_inode = match self.filesystem.load_inode(new_id).await {
                     Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
                 };
 
                 let qid = inode_to_qid(&new_inode, new_id);
                 P9Message::new(tag, Message::Rmkdir(Rmkdir { qid }))
             }
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -853,13 +855,13 @@ impl NinePHandler {
             Ok((new_id, _post_attr)) => {
                 let new_inode = match self.filesystem.load_inode(new_id).await {
                     Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
                 };
 
                 let qid = inode_to_qid(&new_inode, new_id);
                 P9Message::new(tag, Message::Rsymlink(Rsymlink { qid }))
             }
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -914,7 +916,7 @@ impl NinePHandler {
             Ok((child_id, _post_attr)) => {
                 let child_inode = match self.filesystem.load_inode(child_id).await {
                     Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+                    Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
                 };
 
                 P9Message::new(
@@ -924,7 +926,7 @@ impl NinePHandler {
                     }),
                 )
             }
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -938,7 +940,7 @@ impl NinePHandler {
 
         let inode = match self.filesystem.load_inode(inode_id).await {
             Ok(i) => i,
-            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
         };
 
         match inode {
@@ -990,7 +992,7 @@ impl NinePHandler {
             .await
         {
             Ok(_post_attr) => P9Message::new(tag, Message::Rlink(Rlink)),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -1052,7 +1054,7 @@ impl NinePHandler {
             .await
         {
             Ok(_) => P9Message::new(tag, Message::Rrename(Rrename)),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -1097,7 +1099,7 @@ impl NinePHandler {
             .await
         {
             Ok(_) => P9Message::new(tag, Message::Rrenameat(Rrenameat)),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -1128,7 +1130,7 @@ impl NinePHandler {
 
         let child_inode = match self.filesystem.load_inode(child_id).await {
             Ok(i) => i,
-            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => return P9Message::error(tag, errno_from_nfsstat(e.into())),
         };
 
         let is_dir = matches!(child_inode, Inode::Directory(_));
@@ -1151,7 +1153,7 @@ impl NinePHandler {
             .await
         {
             Ok(_) => P9Message::new(tag, Message::Runlinkat(Runlinkat)),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -1162,7 +1164,7 @@ impl NinePHandler {
 
         match self.filesystem.flush().await {
             Ok(_) => P9Message::new(tag, Message::Rfsync(Rfsync)),
-            Err(e) => P9Message::error(tag, errno_from_nfsstat(e)),
+            Err(e) => P9Message::error(tag, errno_from_nfsstat(e.into())),
         }
     }
 
@@ -1421,14 +1423,14 @@ pub fn errno_from_nfsstat(e: nfsstat3) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::SlateDbFs;
+    use crate::filesystem::ZeroFS;
     use libc::O_RDONLY;
     use std::sync::Arc;
     use zerofs_nfsserve::vfs::AuthContext;
 
     #[tokio::test]
     async fn test_statfs() {
-        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = NinePHandler::new(fs.clone());
 
         let version_msg = Message::Tversion(Tversion {
@@ -1488,7 +1490,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_statfs_with_files() {
-        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = NinePHandler::new(fs.clone());
 
         // Set up a session
@@ -1570,7 +1572,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_readdir_random_pagination() {
-        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
         let auth = AuthContext {
             uid: 1000,
@@ -1678,7 +1680,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_readdir_backwards_seek() {
-        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
         // Create a few files
         let auth = AuthContext {
@@ -1766,7 +1768,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_readdir_empty_directory() {
-        let fs = Arc::new(SlateDbFs::new_in_memory().await.unwrap());
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
         let auth = AuthContext {
             uid: 1000,
