@@ -213,7 +213,7 @@ impl ZeroFS {
                 }
                 match setattr.atime {
                     SetTime::SetToClientTime(t) => {
-                        file.atime = t.seconds as u64;
+                        file.atime = t.seconds;
                         file.atime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -225,7 +225,7 @@ impl ZeroFS {
                 }
                 match setattr.mtime {
                     SetTime::SetToClientTime(t) => {
-                        file.mtime = t.seconds as u64;
+                        file.mtime = t.seconds;
                         file.mtime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -283,7 +283,7 @@ impl ZeroFS {
                 }
                 match setattr.atime {
                     SetTime::SetToClientTime(t) => {
-                        dir.atime = t.seconds as u64;
+                        dir.atime = t.seconds;
                         dir.atime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -295,7 +295,7 @@ impl ZeroFS {
                 }
                 match setattr.mtime {
                     SetTime::SetToClientTime(t) => {
-                        dir.mtime = t.seconds as u64;
+                        dir.mtime = t.seconds;
                         dir.mtime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -342,7 +342,7 @@ impl ZeroFS {
                 }
                 match setattr.atime {
                     SetTime::SetToClientTime(t) => {
-                        symlink.atime = t.seconds as u64;
+                        symlink.atime = t.seconds;
                         symlink.atime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -354,7 +354,7 @@ impl ZeroFS {
                 }
                 match setattr.mtime {
                     SetTime::SetToClientTime(t) => {
-                        symlink.mtime = t.seconds as u64;
+                        symlink.mtime = t.seconds;
                         symlink.mtime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -404,7 +404,7 @@ impl ZeroFS {
                 }
                 match setattr.atime {
                     SetTime::SetToClientTime(t) => {
-                        special.atime = t.seconds as u64;
+                        special.atime = t.seconds;
                         special.atime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {
@@ -416,7 +416,7 @@ impl ZeroFS {
                 }
                 match setattr.mtime {
                     SetTime::SetToClientTime(t) => {
-                        special.mtime = t.seconds as u64;
+                        special.mtime = t.seconds;
                         special.mtime_nsec = t.nanoseconds;
                     }
                     SetTime::SetToServerTime => {

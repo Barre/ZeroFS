@@ -572,9 +572,7 @@ impl NinePHandler {
                     mode: SetMode::Set(tc.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
                     gid: SetGid::Set(tc.gid),
-                    size: SetSize::NoChange,
-                    atime: SetTime::NoChange,
-                    mtime: SetTime::NoChange,
+                    ..Default::default()
                 },
             )
             .await
@@ -790,11 +788,8 @@ impl NinePHandler {
                     mode: SetMode::Set(tm.mode),
                     uid: SetUid::Set(creds.uid),
                     gid: SetGid::Set(tm.gid),
-                    size: SetSize::NoChange,
-                    atime: SetTime::NoChange,
-                    mtime: SetTime::NoChange,
-                }
-                .into(),
+                    ..Default::default()
+                },
             )
             .await
         {
@@ -844,9 +839,7 @@ impl NinePHandler {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(creds.uid),
                     gid: SetGid::Set(ts.gid),
-                    size: SetSize::NoChange,
-                    atime: SetTime::NoChange,
-                    mtime: SetTime::NoChange,
+                    ..Default::default()
                 },
             )
             .await
@@ -898,9 +891,7 @@ impl NinePHandler {
                     mode: SetMode::Set(tm.mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
                     gid: SetGid::Set(tm.gid),
-                    size: SetSize::NoChange,
-                    atime: SetTime::NoChange,
-                    mtime: SetTime::NoChange,
+                    ..Default::default()
                 },
                 match device_type {
                     FileType::CharDevice | FileType::BlockDevice => Some((tm.major, tm.minor)),
