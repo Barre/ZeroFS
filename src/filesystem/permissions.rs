@@ -1,4 +1,4 @@
-use crate::inode::Inode;
+use super::inode::Inode;
 use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::AuthContext;
 

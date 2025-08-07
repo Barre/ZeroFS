@@ -7,10 +7,10 @@ use zerofs_nfsserve::nfs::{
 use zerofs_nfsserve::vfs::AuthContext;
 
 use super::common::validate_filename;
-use crate::cache::CacheKey;
+use crate::filesystem::cache::CacheKey;
 use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
-use crate::inode::{Inode, SpecialInode};
-use crate::permissions::{
+use crate::filesystem::inode::{Inode, SpecialInode};
+use crate::filesystem::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
 

@@ -11,10 +11,10 @@ use zerofs_nfsserve::nfs::{
 use zerofs_nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
 
 use super::common::validate_filename;
-use crate::cache::CacheKey;
+use crate::filesystem::cache::CacheKey;
 use crate::filesystem::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, SlateDbFs, get_current_time};
-use crate::inode::{DirectoryInode, Inode};
-use crate::permissions::{AccessMode, Credentials, check_access};
+use crate::filesystem::inode::{DirectoryInode, Inode};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
 
 impl SlateDbFs {
     pub async fn process_mkdir(

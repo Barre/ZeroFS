@@ -1,5 +1,5 @@
-use crate::filesystem::STATS_SHARDS;
-use crate::inode::InodeId;
+use super::STATS_SHARDS;
+use super::inode::InodeId;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;

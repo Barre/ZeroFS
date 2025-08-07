@@ -5,11 +5,11 @@ use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::AuthContext;
 
 use super::common::validate_filename;
-use crate::cache::CacheKey;
+use crate::filesystem::cache::CacheKey;
 use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
-use crate::inode::Inode;
-use crate::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
-use crate::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
+use crate::filesystem::inode::Inode;
+use crate::filesystem::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 
 impl SlateDbFs {
     pub async fn process_rename(

@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use tracing::debug;
 
 use super::protocol::*;
+use crate::filesystem::inode::{Inode, InodeId};
+use crate::filesystem::permissions::Credentials;
 use crate::filesystem::{EncodedFileId, SlateDbFs};
-use crate::inode::{Inode, InodeId};
-use crate::permissions::Credentials;
 use zerofs_nfsserve::nfs::nfsstat3;
 use zerofs_nfsserve::vfs::NFSFileSystem;
 
