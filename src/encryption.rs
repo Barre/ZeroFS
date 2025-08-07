@@ -179,15 +179,15 @@ impl EncryptedDb {
                 inode_id,
                 chunk_index,
             }) = ParsedKey::parse(key)
-            {
-                let cache_key = CacheKey::Block {
-                    inode_id,
-                    block_index: chunk_index,
-                };
-                if let Some(CacheValue::Block(cached_data)) = cache.get(cache_key.clone()).await {
-                    return Ok(Some(bytes::Bytes::from(cached_data.as_ref().clone())));
-                }
+        {
+            let cache_key = CacheKey::Block {
+                inode_id,
+                block_index: chunk_index,
+            };
+            if let Some(CacheValue::Block(cached_data)) = cache.get(cache_key.clone()).await {
+                return Ok(Some(bytes::Bytes::from(cached_data.as_ref().clone())));
             }
+        }
 
         match self.inner.get(key).await? {
             Some(encrypted) => {
@@ -205,14 +205,14 @@ impl EncryptedDb {
                         inode_id,
                         chunk_index,
                     }) = ParsedKey::parse(key)
-                    {
-                        let cache_key = CacheKey::Block {
-                            inode_id,
-                            block_index: chunk_index,
-                        };
-                        let cache_value = CacheValue::Block(Arc::new(decrypted.clone()));
-                        cache.insert(cache_key, cache_value, true).await;
-                    }
+                {
+                    let cache_key = CacheKey::Block {
+                        inode_id,
+                        block_index: chunk_index,
+                    };
+                    let cache_value = CacheValue::Block(Arc::new(decrypted.clone()));
+                    cache.insert(cache_key, cache_value, true).await;
+                }
 
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }

@@ -38,15 +38,17 @@ impl ZeroFS {
             check_ownership(&inode, creds)?;
 
             if let SetUid::Set(new_uid) = setattr.uid
-                && new_uid != creds.uid {
-                    return Err(FsError::OperationNotPermitted);
-                }
+                && new_uid != creds.uid
+            {
+                return Err(FsError::OperationNotPermitted);
+            }
 
             // POSIX: Owner can change group to any group they belong to
             if let SetGid::Set(new_gid) = setattr.gid
-                && !creds.is_member_of_group(new_gid) {
-                    return Err(FsError::OperationNotPermitted);
-                }
+                && !creds.is_member_of_group(new_gid)
+            {
+                return Err(FsError::OperationNotPermitted);
+            }
         }
 
         match setattr.atime {

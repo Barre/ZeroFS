@@ -163,12 +163,13 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Ok(size_str) = std::env::var("SLATEDB_CACHE_SIZE_GB")
-        && size_str.parse::<f64>().is_err() {
-            eprintln!("{BOLD}{RED}Error:{RESET} SLATEDB_CACHE_SIZE_GB must be a valid number");
-            eprintln!("Current value: {RED}'{size_str}'{RESET}");
-            eprintln!("Example: {GREEN}SLATEDB_CACHE_SIZE_GB=10{RESET}");
-            std::process::exit(1);
-        }
+        && size_str.parse::<f64>().is_err()
+    {
+        eprintln!("{BOLD}{RED}Error:{RESET} SLATEDB_CACHE_SIZE_GB must be a valid number");
+        eprintln!("Current value: {RED}'{size_str}'{RESET}");
+        eprintln!("Example: {GREEN}SLATEDB_CACHE_SIZE_GB=10{RESET}");
+        std::process::exit(1);
+    }
 
     Ok(())
 }
