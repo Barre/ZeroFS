@@ -79,7 +79,7 @@ impl From<nfsstat3> for FsError {
 }
 
 impl FsError {
-    pub fn to_errno(&self) -> u32 {
+    pub fn to_errno(self) -> u32 {
         match self {
             FsError::PermissionDenied => libc::EACCES as u32,
             FsError::NotFound => libc::ENOENT as u32,
