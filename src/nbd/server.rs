@@ -66,7 +66,8 @@ impl NBDServer {
 
     async fn initialize_device(&self, device: &NBDDevice) -> std::io::Result<()> {
         use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::AuthContext;
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         let auth = AuthContext {
             uid: 0,
@@ -484,7 +485,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
         use zerofs_nfsserve::nfs::nfsstring;
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::AuthContext;
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         let auth = AuthContext {
             uid: 0,
@@ -596,7 +598,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         length: u32,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::AuthContext;
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         // Check for out-of-bounds read
         if offset + length as u64 > device_size {
@@ -650,7 +653,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         flags: u16,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::AuthContext;
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         // Check for out-of-bounds write
         if offset + length as u64 > device_size {
@@ -740,8 +744,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         flags: u16,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::AuthContext;
-
         // Check for out-of-bounds trim
         if offset + length as u64 > device_size {
             let _ = self.send_simple_reply(cookie, NBD_EINVAL, &[]).await;
@@ -761,7 +763,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = AuthContext {
+        let auth = crate::filesystem::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -807,7 +809,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         flags: u16,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
+        use zerofs_nfsserve::vfs::AuthContext;
+        use zerofs_nfsserve::vfs::NFSFileSystem;
 
         if offset + length as u64 > device_size {
             let _ = self.send_simple_reply(cookie, NBD_ENOSPC, &[]).await;

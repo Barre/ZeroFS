@@ -1,6 +1,6 @@
 use super::errors::FsError;
 use super::inode::Inode;
-use zerofs_nfsserve::vfs::AuthContext;
+use super::types::AuthContext;
 
 const S_IRUSR: u32 = 0o400;
 const S_IWUSR: u32 = 0o200;

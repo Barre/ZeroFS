@@ -11,27 +11,32 @@ mod tests {
     use crate::filesystem::ZeroFS;
     use crate::filesystem::errors::FsError;
     use crate::filesystem::inode::Inode;
+    use crate::filesystem::permissions::Credentials;
+    use crate::filesystem::types::{
+        FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
+    };
     use crate::filesystem::{CHUNK_SIZE, EncodedFileId};
     use crate::test_helpers::test_helpers_mod::test_auth;
-    use zerofs_nfsserve::nfs::{
-        ftype3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
-    };
+
+    fn test_creds() -> Credentials {
+        Credentials::from_auth_context(&(&test_auth()).into())
+    }
 
     #[tokio::test]
     async fn test_process_create_file() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let attr = sattr3 {
-            mode: set_mode3::mode(0o644),
-            uid: set_uid3::uid(1000),
-            gid: set_gid3::gid(1000),
-            size: set_size3::Void,
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
+        let attr = SetAttributes {
+            mode: SetMode::Set(0o644),
+            uid: SetUid::Set(1000),
+            gid: SetGid::Set(1000),
+            size: SetSize::NoChange,
+            atime: SetTime::NoChange,
+            mtime: SetTime::NoChange,
         };
 
         let (file_id, fattr) = fs
-            .process_create(&test_auth(), 0, b"test.txt", attr)
+            .process_create(&test_creds(), 0, b"test.txt", &attr)
             .await
             .unwrap();
 
@@ -54,14 +59,14 @@ mod tests {
     async fn test_process_create_file_already_exists() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let attr = sattr3::default();
+        let attr = &SetAttributes::default();
 
         let _ = fs
-            .process_create(&test_auth(), 0, b"test.txt", attr)
+            .process_create(&test_creds(), 0, b"test.txt", attr)
             .await
             .unwrap();
 
-        let result = fs.process_create(&test_auth(), 0, b"test.txt", attr).await;
+        let result = fs.process_create(&test_creds(), 0, b"test.txt", attr).await;
         assert!(matches!(result, Err(FsError::Exists)));
     }
 
@@ -70,13 +75,13 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, fattr) = fs
-            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
 
         assert!(dir_id > 0);
         assert_eq!(fattr.mode, 0o777);
-        assert!(matches!(fattr.ftype, ftype3::NF3DIR));
+        assert_eq!(fattr.file_type, FileType::Directory);
 
         let new_dir_inode = fs.load_inode(dir_id).await.unwrap();
         match new_dir_inode {
@@ -92,23 +97,23 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Test with custom mode
-        let custom_attrs = sattr3 {
-            mode: set_mode3::mode(0o700),
-            uid: set_uid3::uid(1001),
-            gid: set_gid3::gid(1001),
-            size: set_size3::Void,
-            atime: set_atime::SET_TO_CLIENT_TIME(nfstime3 {
+        let custom_attrs = SetAttributes {
+            mode: SetMode::Set(0o700),
+            uid: SetUid::Set(1001),
+            gid: SetGid::Set(1001),
+            size: SetSize::NoChange,
+            atime: SetTime::SetToClientTime(crate::filesystem::types::Timestamp {
                 seconds: 1234567890,
-                nseconds: 0,
+                nanoseconds: 0,
             }),
-            mtime: set_mtime::SET_TO_CLIENT_TIME(nfstime3 {
+            mtime: SetTime::SetToClientTime(crate::filesystem::types::Timestamp {
                 seconds: 1234567890,
-                nseconds: 0,
+                nanoseconds: 0,
             }),
         };
 
         let (_dir_id, fattr) = fs
-            .process_mkdir(&test_auth(), 0, b"customdir", &custom_attrs)
+            .process_mkdir(&test_creds(), 0, b"customdir", &custom_attrs)
             .await
             .unwrap();
 
@@ -131,20 +136,20 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = b"Hello, World!";
         let fattr = fs
-            .process_write(&test_auth(), file_id, 0, data)
+            .process_write(&(&test_auth()).into(), file_id, 0, data)
             .await
             .unwrap();
 
         assert_eq!(fattr.size, data.len() as u64);
 
         let (read_data, eof) = fs
-            .process_read_file(&test_auth(), file_id, 0, data.len() as u32)
+            .process_read_file(&(&test_auth()).into(), file_id, 0, data.len() as u32)
             .await
             .unwrap();
 
@@ -157,22 +162,22 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data1 = vec![b'A'; 100];
-        fs.process_write(&test_auth(), file_id, 0, &data1)
+        fs.process_write(&(&test_auth()).into(), file_id, 0, &data1)
             .await
             .unwrap();
 
         let data2 = vec![b'B'; 50];
-        fs.process_write(&test_auth(), file_id, 50, &data2)
+        fs.process_write(&(&test_auth()).into(), file_id, 50, &data2)
             .await
             .unwrap();
 
         let (read_data, _) = fs
-            .process_read_file(&test_auth(), file_id, 0, 100)
+            .process_read_file(&(&test_auth()).into(), file_id, 0, 100)
             .await
             .unwrap();
 
@@ -186,7 +191,7 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"bigfile.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"bigfile.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -194,13 +199,13 @@ mod tests {
         let data = vec![b'X'; chunk_size * 2 + 1024];
 
         let fattr = fs
-            .process_write(&test_auth(), file_id, 0, &data)
+            .process_write(&(&test_auth()).into(), file_id, 0, &data)
             .await
             .unwrap();
         assert_eq!(fattr.size, data.len() as u64);
 
         let (read_data, eof) = fs
-            .process_read_file(&test_auth(), file_id, 0, data.len() as u32)
+            .process_read_file(&(&test_auth()).into(), file_id, 0, data.len() as u32)
             .await
             .unwrap();
 
@@ -213,15 +218,15 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(&test_auth(), file_id, 0, b"some data")
+        fs.process_write(&(&test_auth()).into(), file_id, 0, b"some data")
             .await
             .unwrap();
 
-        fs.process_remove(&test_auth(), 0, b"test.txt")
+        fs.process_remove(&(&test_auth()).into(), 0, b"test.txt")
             .await
             .unwrap();
 
@@ -239,11 +244,11 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_remove(&test_auth(), 0, b"testdir")
+        fs.process_remove(&(&test_auth()).into(), 0, b"testdir")
             .await
             .unwrap();
 
@@ -256,15 +261,22 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_create(&test_auth(), dir_id, b"file.txt", sattr3::default())
-            .await
-            .unwrap();
+        fs.process_create(
+            &test_creds(),
+            dir_id,
+            b"file.txt",
+            &SetAttributes::default(),
+        )
+        .await
+        .unwrap();
 
-        let result = fs.process_remove(&test_auth(), 0, b"testdir").await;
+        let result = fs
+            .process_remove(&(&test_auth()).into(), 0, b"testdir")
+            .await;
         assert!(matches!(result, Err(FsError::NotEmpty)));
     }
 
@@ -273,11 +285,11 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"old.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"old.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_rename(&test_auth(), 0, b"old.txt", 0, b"new.txt")
+        fs.process_rename(&(&test_auth()).into(), 0, b"old.txt", 0, b"new.txt")
             .await
             .unwrap();
 
@@ -299,22 +311,22 @@ mod tests {
 
         // Create two files
         let (file1_id, _) = fs
-            .process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"file1.txt", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_write(&test_auth(), file1_id, 0, b"content1")
+        fs.process_write(&(&test_auth()).into(), file1_id, 0, b"content1")
             .await
             .unwrap();
 
         let (file2_id, _) = fs
-            .process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"file2.txt", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_write(&test_auth(), file2_id, 0, b"content2")
+        fs.process_write(&(&test_auth()).into(), file2_id, 0, b"content2")
             .await
             .unwrap();
 
-        fs.process_rename(&test_auth(), 0, b"file1.txt", 0, b"file2.txt")
+        fs.process_rename(&(&test_auth()).into(), 0, b"file1.txt", 0, b"file2.txt")
             .await
             .unwrap();
 
@@ -332,7 +344,7 @@ mod tests {
 
         // Verify content
         let (read_data, _) = fs
-            .process_read_file(&test_auth(), file1_id, 0, 100)
+            .process_read_file(&(&test_auth()).into(), file1_id, 0, 100)
             .await
             .unwrap();
         assert_eq!(read_data, b"content1");
@@ -347,22 +359,33 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir1_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"dir1", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
         let (dir2_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"dir2", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), dir1_id, b"file.txt", sattr3::default())
+            .process_create(
+                &test_creds(),
+                dir1_id,
+                b"file.txt",
+                &SetAttributes::default(),
+            )
             .await
             .unwrap();
 
-        fs.process_rename(&test_auth(), dir1_id, b"file.txt", dir2_id, b"moved.txt")
-            .await
-            .unwrap();
+        fs.process_rename(
+            &(&test_auth()).into(),
+            dir1_id,
+            b"file.txt",
+            dir2_id,
+            b"moved.txt",
+        )
+        .await
+        .unwrap();
 
         // Check file removed from dir1
         let old_entry_key = ZeroFS::dir_entry_key(dir1_id, "file.txt");
@@ -400,15 +423,25 @@ mod tests {
 
         // Create a directory with two files
         let (dir_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"testdir", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_create(&test_auth(), dir_id, b"file1.txt", sattr3::default())
-            .await
-            .unwrap();
-        fs.process_create(&test_auth(), dir_id, b"file2.txt", sattr3::default())
-            .await
-            .unwrap();
+        fs.process_create(
+            &test_creds(),
+            dir_id,
+            b"file1.txt",
+            &SetAttributes::default(),
+        )
+        .await
+        .unwrap();
+        fs.process_create(
+            &test_creds(),
+            dir_id,
+            b"file2.txt",
+            &SetAttributes::default(),
+        )
+        .await
+        .unwrap();
 
         // Check initial entry count
         let dir_inode = fs.load_inode(dir_id).await.unwrap();
@@ -417,9 +450,15 @@ mod tests {
             _ => panic!("Should be a directory"),
         }
 
-        fs.process_rename(&test_auth(), dir_id, b"file1.txt", dir_id, b"file2.txt")
-            .await
-            .unwrap();
+        fs.process_rename(
+            &(&test_auth()).into(),
+            dir_id,
+            b"file1.txt",
+            dir_id,
+            b"file2.txt",
+        )
+        .await
+        .unwrap();
 
         // Check that entry count decreased by 1
         let dir_inode = fs.load_inode(dir_id).await.unwrap();
@@ -428,7 +467,7 @@ mod tests {
             _ => panic!("Should be a directory"),
         }
 
-        fs.process_remove(&test_auth(), dir_id, b"file2.txt")
+        fs.process_remove(&(&test_auth()).into(), dir_id, b"file2.txt")
             .await
             .unwrap();
 
@@ -440,7 +479,7 @@ mod tests {
         }
 
         // Should be able to remove the empty directory
-        fs.process_remove(&test_auth(), 0, b"testdir")
+        fs.process_remove(&(&test_auth()).into(), 0, b"testdir")
             .await
             .unwrap();
     }
@@ -450,31 +489,31 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"test.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(&test_auth(), file_id, 0, &vec![b'A'; 1000])
+        fs.process_write(&(&test_auth()).into(), file_id, 0, &vec![b'A'; 1000])
             .await
             .unwrap();
 
-        let setattr = sattr3 {
-            size: set_size3::size(500),
-            mode: set_mode3::Void,
-            uid: set_uid3::Void,
-            gid: set_gid3::Void,
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
+        let setattr = SetAttributes {
+            size: SetSize::Set(500),
+            mode: SetMode::NoChange,
+            uid: SetUid::NoChange,
+            gid: SetGid::NoChange,
+            atime: SetTime::NoChange,
+            mtime: SetTime::NoChange,
         };
 
         let fattr = fs
-            .process_setattr(&test_auth(), file_id, setattr)
+            .process_setattr(&test_creds(), file_id, &setattr)
             .await
             .unwrap();
         assert_eq!(fattr.size, 500);
 
         let (read_data, _) = fs
-            .process_read_file(&test_auth(), file_id, 0, 1000)
+            .process_read_file(&(&test_auth()).into(), file_id, 0, 1000)
             .await
             .unwrap();
         assert_eq!(read_data.len(), 500);
@@ -485,15 +524,15 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let target = b"/path/to/target";
-        let attr = sattr3::default();
+        let attr = &SetAttributes::default();
 
         let (link_id, fattr) = fs
-            .process_symlink(&test_auth(), 0, b"link", target, attr)
+            .process_symlink(&test_creds(), 0, b"link", target, attr)
             .await
             .unwrap();
 
         assert!(link_id > 0);
-        assert!(matches!(fattr.ftype, ftype3::NF3LNK));
+        assert_eq!(fattr.file_type, FileType::Symlink);
         assert_eq!(fattr.size, target.len() as u64);
 
         let link_inode = fs.load_inode(link_id).await.unwrap();
@@ -509,27 +548,30 @@ mod tests {
     async fn test_process_readdir() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        fs.process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
+        fs.process_create(&test_creds(), 0, b"file1.txt", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
+        fs.process_create(&test_creds(), 0, b"file2.txt", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_mkdir(&test_auth(), 0, b"dir1", &sattr3::default())
+        fs.process_mkdir(&test_creds(), 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
 
-        let result = fs.process_readdir(&test_auth(), 0, 0, 10).await.unwrap();
+        let result = fs
+            .process_readdir(&(&test_auth()).into(), 0, 0, 10)
+            .await
+            .unwrap();
 
         assert!(result.end);
         assert_eq!(result.entries.len(), 5);
 
-        assert_eq!(result.entries[0].name.0, b".");
-        assert_eq!(result.entries[1].name.0, b"..");
+        assert_eq!(result.entries[0].name, b".");
+        assert_eq!(result.entries[1].name, b"..");
 
         let names: Vec<&[u8]> = result.entries[2..]
             .iter()
-            .map(|e| e.name.0.as_ref())
+            .map(|e| e.name.as_ref())
             .collect();
         assert!(names.contains(&b"file1.txt".as_ref()));
         assert!(names.contains(&b"file2.txt".as_ref()));
@@ -542,22 +584,25 @@ mod tests {
 
         for i in 0..10 {
             fs.process_create(
-                &test_auth(),
+                &test_creds(),
                 0,
                 format!("file{i}.txt").as_bytes(),
-                sattr3::default(),
+                &SetAttributes::default(),
             )
             .await
             .unwrap();
         }
 
-        let result1 = fs.process_readdir(&test_auth(), 0, 0, 5).await.unwrap();
+        let result1 = fs
+            .process_readdir(&(&test_auth()).into(), 0, 0, 5)
+            .await
+            .unwrap();
         assert!(!result1.end);
         assert_eq!(result1.entries.len(), 5);
 
         let last_id = result1.entries.last().unwrap().fileid;
         let result2 = fs
-            .process_readdir(&test_auth(), 0, last_id, 10)
+            .process_readdir(&(&test_auth()).into(), 0, last_id, 10)
             .await
             .unwrap();
         assert!(result2.end);
@@ -569,49 +614,55 @@ mod tests {
 
         // Create directory structure: /a/b/c
         let (a_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"a", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"a", &SetAttributes::default())
             .await
             .unwrap();
         let (b_id, _) = fs
-            .process_mkdir(&test_auth(), a_id, b"b", &sattr3::default())
+            .process_mkdir(&test_creds(), a_id, b"b", &SetAttributes::default())
             .await
             .unwrap();
         let (c_id, _) = fs
-            .process_mkdir(&test_auth(), b_id, b"c", &sattr3::default())
+            .process_mkdir(&test_creds(), b_id, b"c", &SetAttributes::default())
             .await
             .unwrap();
 
         // Test 1: Try to rename /a into /a/b (direct descendant)
         let result = fs
-            .process_rename(&test_auth(), 0, b"a", b_id, b"a_moved")
+            .process_rename(&(&test_auth()).into(), 0, b"a", b_id, b"a_moved")
             .await;
         assert!(matches!(result, Err(FsError::InvalidArgument)));
 
         // Test 2: Try to rename /a into /a/b/c (deeper descendant)
         let result = fs
-            .process_rename(&test_auth(), 0, b"a", c_id, b"a_moved")
+            .process_rename(&(&test_auth()).into(), 0, b"a", c_id, b"a_moved")
             .await;
         assert!(matches!(result, Err(FsError::InvalidArgument)));
 
         // Test 3: Try to rename /a/b into /a/b/c (moving into immediate child)
         let result = fs
-            .process_rename(&test_auth(), a_id, b"b", c_id, b"b_moved")
+            .process_rename(&(&test_auth()).into(), a_id, b"b", c_id, b"b_moved")
             .await;
         assert!(matches!(result, Err(FsError::InvalidArgument)));
 
         // Test 4: Valid rename - moving /a/b/c to root
         let result = fs
-            .process_rename(&test_auth(), b_id, b"c", 0, b"c_moved")
+            .process_rename(&(&test_auth()).into(), b_id, b"c", 0, b"c_moved")
             .await;
         assert!(result.is_ok());
 
         // Test 5: Valid rename - moving a file (not a directory) should work
         let (_file_id, _) = fs
-            .process_create(&test_auth(), a_id, b"file.txt", sattr3::default())
+            .process_create(&test_creds(), a_id, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
         let result = fs
-            .process_rename(&test_auth(), a_id, b"file.txt", b_id, b"file_moved.txt")
+            .process_rename(
+                &(&test_auth()).into(),
+                a_id,
+                b"file.txt",
+                b_id,
+                b"file_moved.txt",
+            )
             .await;
         assert!(result.is_ok());
     }
@@ -622,19 +673,19 @@ mod tests {
 
         // Create directory structure: /a/b/c/d
         let (a_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"a", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"a", &SetAttributes::default())
             .await
             .unwrap();
         let (b_id, _) = fs
-            .process_mkdir(&test_auth(), a_id, b"b", &sattr3::default())
+            .process_mkdir(&test_creds(), a_id, b"b", &SetAttributes::default())
             .await
             .unwrap();
         let (c_id, _) = fs
-            .process_mkdir(&test_auth(), b_id, b"c", &sattr3::default())
+            .process_mkdir(&test_creds(), b_id, b"c", &SetAttributes::default())
             .await
             .unwrap();
         let (d_id, _) = fs
-            .process_mkdir(&test_auth(), c_id, b"d", &sattr3::default())
+            .process_mkdir(&test_creds(), c_id, b"d", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -672,26 +723,29 @@ mod tests {
 
         // Create files with hardlinks
         let (file1_id, _) = fs
-            .process_create(&test_auth(), 0, b"file1.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"file1.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         // Create hardlinks
-        fs.process_link(&test_auth(), file1_id, 0, b"hardlink1.txt")
+        fs.process_link(&(&test_auth()).into(), file1_id, 0, b"hardlink1.txt")
             .await
             .unwrap();
-        fs.process_link(&test_auth(), file1_id, 0, b"hardlink2.txt")
+        fs.process_link(&(&test_auth()).into(), file1_id, 0, b"hardlink2.txt")
             .await
             .unwrap();
 
         // Create another file
         let (_file2_id, _) = fs
-            .process_create(&test_auth(), 0, b"file2.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"file2.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         // First readdir - get all entries
-        let result1 = fs.process_readdir(&test_auth(), 0, 0, 10).await.unwrap();
+        let result1 = fs
+            .process_readdir(&(&test_auth()).into(), 0, 0, 10)
+            .await
+            .unwrap();
         assert_eq!(result1.entries.len(), 6); // . .. file1.txt hardlink1.txt hardlink2.txt file2.txt
 
         // Check that hardlinks have different encoded fileids
@@ -712,12 +766,12 @@ mod tests {
 
         // Test pagination - start after the first hardlink
         let result2 = fs
-            .process_readdir(&test_auth(), 0, hardlink1_encoded, 10)
+            .process_readdir(&(&test_auth()).into(), 0, hardlink1_encoded, 10)
             .await
             .unwrap();
         assert_eq!(result2.entries.len(), 2); // hardlink2.txt file2.txt
-        assert_eq!(result2.entries[0].name.0, b"hardlink2.txt");
-        assert_eq!(result2.entries[1].name.0, b"file2.txt");
+        assert_eq!(result2.entries[0].name, b"hardlink2.txt");
+        assert_eq!(result2.entries[1].name, b"file2.txt");
     }
 
     #[tokio::test]
@@ -726,7 +780,7 @@ mod tests {
 
         // Create a file
         let (file_id, _) = fs
-            .process_create(&test_auth(), 0, b"original.txt", sattr3::default())
+            .process_create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -742,7 +796,7 @@ mod tests {
 
         // Create one more hardlink - should succeed
         let result = fs
-            .process_link(&test_auth(), file_id, 0, b"last_link.txt")
+            .process_link(&(&test_auth()).into(), file_id, 0, b"last_link.txt")
             .await;
         assert!(result.is_ok());
 
@@ -757,7 +811,7 @@ mod tests {
 
         // Try to create one more hardlink - should fail
         let result = fs
-            .process_link(&test_auth(), file_id, 0, b"one_too_many.txt")
+            .process_link(&(&test_auth()).into(), file_id, 0, b"one_too_many.txt")
             .await;
         assert!(matches!(result, Err(FsError::TooManyLinks)));
 
@@ -776,76 +830,85 @@ mod tests {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (dir_id, _) = fs
-            .process_mkdir(&test_auth(), 0, b"test_dir", &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"test_dir", &SetAttributes::default())
             .await
             .unwrap();
 
         let (file_id, _) = fs
-            .process_create(&test_auth(), dir_id, b"test.txt", sattr3::default())
+            .process_create(
+                &test_creds(),
+                dir_id,
+                b"test.txt",
+                &SetAttributes::default(),
+            )
             .await
             .unwrap();
 
-        fs.process_write(&test_auth(), file_id, 0, b"initial data")
+        fs.process_write(&(&test_auth()).into(), file_id, 0, b"initial data")
             .await
             .unwrap();
 
-        let no_exec_attrs = sattr3 {
-            mode: set_mode3::mode(0o644),
-            uid: set_uid3::Void,
-            gid: set_gid3::Void,
-            size: set_size3::Void,
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
+        let no_exec_attrs = SetAttributes {
+            mode: SetMode::Set(0o644),
+            uid: SetUid::NoChange,
+            gid: SetGid::NoChange,
+            size: SetSize::NoChange,
+            atime: SetTime::NoChange,
+            mtime: SetTime::NoChange,
         };
 
-        fs.process_setattr(&test_auth(), dir_id, no_exec_attrs)
+        fs.process_setattr(&test_creds(), dir_id, &no_exec_attrs)
             .await
             .unwrap();
 
-        let chmod_attrs = sattr3 {
-            mode: set_mode3::mode(0o600),
-            uid: set_uid3::Void,
-            gid: set_gid3::Void,
-            size: set_size3::Void,
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
+        let chmod_attrs = SetAttributes {
+            mode: SetMode::Set(0o600),
+            uid: SetUid::NoChange,
+            gid: SetGid::NoChange,
+            size: SetSize::NoChange,
+            atime: SetTime::NoChange,
+            mtime: SetTime::NoChange,
         };
-
-        let result = fs.process_setattr(&test_auth(), file_id, chmod_attrs).await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs.process_read_file(&test_auth(), file_id, 0, 100).await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
 
         let result = fs
-            .process_write(&test_auth(), file_id, 0, b"new data")
+            .process_setattr(&test_creds(), file_id, &chmod_attrs)
             .await;
         assert!(matches!(result, Err(FsError::PermissionDenied)));
 
-        let exec_attrs = sattr3 {
-            mode: set_mode3::mode(0o755),
-            uid: set_uid3::Void,
-            gid: set_gid3::Void,
-            size: set_size3::Void,
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
+        let result = fs
+            .process_read_file(&(&test_auth()).into(), file_id, 0, 100)
+            .await;
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
+
+        let result = fs
+            .process_write(&(&test_auth()).into(), file_id, 0, b"new data")
+            .await;
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
+
+        let exec_attrs = SetAttributes {
+            mode: SetMode::Set(0o755),
+            uid: SetUid::NoChange,
+            gid: SetGid::NoChange,
+            size: SetSize::NoChange,
+            atime: SetTime::NoChange,
+            mtime: SetTime::NoChange,
         };
 
-        fs.process_setattr(&test_auth(), dir_id, exec_attrs)
+        fs.process_setattr(&test_creds(), dir_id, &exec_attrs)
             .await
             .unwrap();
 
-        fs.process_setattr(&test_auth(), file_id, chmod_attrs)
+        fs.process_setattr(&test_creds(), file_id, &chmod_attrs)
             .await
             .unwrap();
 
         let (data, _) = fs
-            .process_read_file(&test_auth(), file_id, 0, 100)
+            .process_read_file(&(&test_auth()).into(), file_id, 0, 100)
             .await
             .unwrap();
         assert_eq!(data, b"initial data");
 
-        fs.process_write(&test_auth(), file_id, 0, b"updated data")
+        fs.process_write(&(&test_auth()).into(), file_id, 0, b"updated data")
             .await
             .unwrap();
     }

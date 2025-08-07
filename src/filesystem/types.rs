@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use zerofs_nfsserve::nfs::{fattr3, ftype3, nfstime3, specdata3};
+use zerofs_nfsserve::nfs::{
+    fattr3, ftype3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_size3,
+    set_uid3, specdata3,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileType {
@@ -303,6 +306,159 @@ impl From<InodeWithId<'_>> for FileAttributes {
                     nanoseconds: special.ctime_nsec,
                 },
             },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SetMode {
+    Set(u32),
+    NoChange,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetUid {
+    Set(u32),
+    NoChange,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetGid {
+    Set(u32),
+    NoChange,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetSize {
+    Set(u64),
+    NoChange,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetTime {
+    SetToClientTime(Timestamp),
+    SetToServerTime,
+    NoChange,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetAttributes {
+    pub mode: SetMode,
+    pub uid: SetUid,
+    pub gid: SetGid,
+    pub size: SetSize,
+    pub atime: SetTime,
+    pub mtime: SetTime,
+}
+
+impl Default for SetAttributes {
+    fn default() -> Self {
+        Self {
+            mode: SetMode::NoChange,
+            uid: SetUid::NoChange,
+            gid: SetGid::NoChange,
+            size: SetSize::NoChange,
+            atime: SetTime::NoChange,
+            mtime: SetTime::NoChange,
+        }
+    }
+}
+
+impl From<SetAttributes> for sattr3 {
+    fn from(attrs: SetAttributes) -> Self {
+        sattr3 {
+            mode: match attrs.mode {
+                SetMode::Set(m) => set_mode3::mode(m),
+                SetMode::NoChange => set_mode3::Void,
+            },
+            uid: match attrs.uid {
+                SetUid::Set(u) => set_uid3::uid(u),
+                SetUid::NoChange => set_uid3::Void,
+            },
+            gid: match attrs.gid {
+                SetGid::Set(g) => set_gid3::gid(g),
+                SetGid::NoChange => set_gid3::Void,
+            },
+            size: match attrs.size {
+                SetSize::Set(s) => set_size3::size(s),
+                SetSize::NoChange => set_size3::Void,
+            },
+            atime: match attrs.atime {
+                SetTime::SetToClientTime(t) => set_atime::SET_TO_CLIENT_TIME(t.into()),
+                SetTime::SetToServerTime => set_atime::SET_TO_SERVER_TIME,
+                SetTime::NoChange => set_atime::DONT_CHANGE,
+            },
+            mtime: match attrs.mtime {
+                SetTime::SetToClientTime(t) => set_mtime::SET_TO_CLIENT_TIME(t.into()),
+                SetTime::SetToServerTime => set_mtime::SET_TO_SERVER_TIME,
+                SetTime::NoChange => set_mtime::DONT_CHANGE,
+            },
+        }
+    }
+}
+
+impl From<sattr3> for SetAttributes {
+    fn from(attrs: sattr3) -> Self {
+        Self {
+            mode: match attrs.mode {
+                set_mode3::mode(m) => SetMode::Set(m),
+                set_mode3::Void => SetMode::NoChange,
+            },
+            uid: match attrs.uid {
+                set_uid3::uid(u) => SetUid::Set(u),
+                set_uid3::Void => SetUid::NoChange,
+            },
+            gid: match attrs.gid {
+                set_gid3::gid(g) => SetGid::Set(g),
+                set_gid3::Void => SetGid::NoChange,
+            },
+            size: match attrs.size {
+                set_size3::size(s) => SetSize::Set(s),
+                set_size3::Void => SetSize::NoChange,
+            },
+            atime: match attrs.atime {
+                set_atime::SET_TO_CLIENT_TIME(t) => SetTime::SetToClientTime(t.into()),
+                set_atime::SET_TO_SERVER_TIME => SetTime::SetToServerTime,
+                set_atime::DONT_CHANGE => SetTime::NoChange,
+            },
+            mtime: match attrs.mtime {
+                set_mtime::SET_TO_CLIENT_TIME(t) => SetTime::SetToClientTime(t.into()),
+                set_mtime::SET_TO_SERVER_TIME => SetTime::SetToServerTime,
+                set_mtime::DONT_CHANGE => SetTime::NoChange,
+            },
+        }
+    }
+}
+
+pub type InodeId = u64;
+
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub fileid: InodeId,
+    pub name: Vec<u8>,
+    pub attr: FileAttributes,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadDirResult {
+    pub entries: Vec<DirEntry>,
+    pub end: bool,
+}
+
+/// Protocol-agnostic authentication context
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub uid: u32,
+    pub gid: u32,
+    pub gids: Vec<u32>,
+}
+
+impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
+    fn from(auth: &zerofs_nfsserve::vfs::AuthContext) -> Self {
+        Self {
+            uid: auth.uid,
+            gid: auth.gid,
+            gids: auth.gids.clone(),
         }
     }
 }

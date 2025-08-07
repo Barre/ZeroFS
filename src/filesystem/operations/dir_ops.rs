@@ -3,7 +3,10 @@ use crate::filesystem::cache::CacheKey;
 use crate::filesystem::errors::FsError;
 use crate::filesystem::inode::{DirectoryInode, Inode};
 use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-use crate::filesystem::types::InodeWithId;
+use crate::filesystem::types::{
+    AuthContext, DirEntry, FileAttributes, InodeId, InodeWithId, ReadDirResult, SetAttributes,
+    SetGid, SetMode, SetTime, SetUid,
+};
 use crate::filesystem::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, ZeroFS, get_current_time};
 use bytes::Bytes;
 use futures::pin_mut;
@@ -11,19 +14,15 @@ use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
-use zerofs_nfsserve::nfs::{
-    fattr3, fileid3, nfstime3, sattr3, set_atime, set_gid3, set_mode3, set_mtime, set_uid3,
-};
-use zerofs_nfsserve::vfs::{AuthContext, DirEntry, ReadDirResult};
 
 impl ZeroFS {
     pub async fn process_mkdir(
         &self,
-        auth: &AuthContext,
-        dirid: fileid3,
+        creds: &Credentials,
+        dirid: InodeId,
         dirname: &[u8],
-        attr: &sattr3,
-    ) -> Result<(fileid3, fattr3), FsError> {
+        attr: &SetAttributes,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(dirname)?;
 
         let dirname_str = String::from_utf8_lossy(dirname);
@@ -32,9 +31,8 @@ impl ZeroFS {
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-        check_access(&dir_inode, &creds, AccessMode::Write)?;
-        check_access(&dir_inode, &creds, AccessMode::Execute)?;
+        check_access(&dir_inode, creds, AccessMode::Write)?;
+        check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -55,9 +53,9 @@ impl ZeroFS {
 
                 let (now_sec, now_nsec) = get_current_time();
 
-                let mut new_mode = match attr.mode {
-                    set_mode3::mode(m) => m,
-                    set_mode3::Void => 0o777,
+                let mut new_mode = match &attr.mode {
+                    SetMode::Set(m) => *m,
+                    SetMode::NoChange => 0o777,
                 };
 
                 let parent_mode = dir.mode;
@@ -65,34 +63,30 @@ impl ZeroFS {
                     new_mode |= 0o2000;
                 }
 
-                let new_uid = match attr.uid {
-                    set_uid3::uid(u) => u,
-                    set_uid3::Void => auth.uid,
+                let new_uid = match &attr.uid {
+                    SetUid::Set(u) => *u,
+                    SetUid::NoChange => creds.uid,
                 };
 
-                let new_gid = match attr.gid {
-                    set_gid3::gid(g) => g,
-                    set_gid3::Void => {
+                let new_gid = match &attr.gid {
+                    SetGid::Set(g) => *g,
+                    SetGid::NoChange => {
                         if parent_mode & 0o2000 != 0 {
                             dir.gid
                         } else {
-                            auth.gid
+                            creds.gid
                         }
                     }
                 };
 
-                let (atime_sec, atime_nsec) = match attr.atime {
-                    set_atime::SET_TO_CLIENT_TIME(nfstime3 { seconds, nseconds }) => {
-                        (seconds as u64, nseconds)
-                    }
-                    set_atime::SET_TO_SERVER_TIME | set_atime::DONT_CHANGE => (now_sec, now_nsec),
+                let (atime_sec, atime_nsec) = match &attr.atime {
+                    SetTime::SetToClientTime(ts) => (ts.seconds, ts.nanoseconds),
+                    SetTime::SetToServerTime | SetTime::NoChange => (now_sec, now_nsec),
                 };
 
-                let (mtime_sec, mtime_nsec) = match attr.mtime {
-                    set_mtime::SET_TO_CLIENT_TIME(nfstime3 { seconds, nseconds }) => {
-                        (seconds as u64, nseconds)
-                    }
-                    set_mtime::SET_TO_SERVER_TIME | set_mtime::DONT_CHANGE => (now_sec, now_nsec),
+                let (mtime_sec, mtime_nsec) = match &attr.mtime {
+                    SetTime::SetToClientTime(ts) => (ts.seconds, ts.nanoseconds),
+                    SetTime::SetToServerTime | SetTime::NoChange => (now_sec, now_nsec),
                 };
 
                 let new_dir_inode = DirectoryInode {
@@ -176,8 +170,8 @@ impl ZeroFS {
     pub async fn process_readdir(
         &self,
         auth: &AuthContext,
-        dirid: fileid3,
-        start_after: fileid3,
+        dirid: InodeId,
+        start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
         debug!(
@@ -207,7 +201,7 @@ impl ZeroFS {
                     debug!("readdir: adding . entry for current directory");
                     entries.push(DirEntry {
                         fileid: dirid,
-                        name: b".".to_vec().into(),
+                        name: b".".to_vec(),
                         attr: InodeWithId {
                             inode: &dir_inode,
                             id: dirid,
@@ -239,7 +233,7 @@ impl ZeroFS {
                     };
                     entries.push(DirEntry {
                         fileid: parent_id,
-                        name: b"..".to_vec().into(),
+                        name: b"..".to_vec(),
                         attr: parent_attr,
                     });
                 }
@@ -322,7 +316,7 @@ impl ZeroFS {
 
                     entries.push(DirEntry {
                         fileid: encoded_id,
-                        name: name.into(),
+                        name: name,
                         attr: InodeWithId {
                             inode: &inode,
                             id: inode_id,

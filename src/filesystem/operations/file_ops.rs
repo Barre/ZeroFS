@@ -1,9 +1,11 @@
 use super::common::validate_filename;
 use crate::filesystem::cache::{self, CacheKey, CacheValue};
 use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{FileInode, Inode, InodeId};
+use crate::filesystem::inode::{FileInode, Inode};
 use crate::filesystem::permissions::{AccessMode, Credentials, check_access, validate_mode};
-use crate::filesystem::types::InodeWithId;
+use crate::filesystem::types::{
+    AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
+};
 use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
@@ -11,8 +13,6 @@ use slatedb::config::WriteOptions;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
-use zerofs_nfsserve::nfs::{fattr3, fileid3, sattr3, set_gid3, set_mode3, set_uid3};
-use zerofs_nfsserve::vfs::AuthContext;
 
 const READ_CHUNK_BUFFER_SIZE: usize = 64;
 
@@ -23,7 +23,7 @@ impl ZeroFS {
         id: InodeId,
         offset: u64,
         data: &[u8],
-    ) -> Result<fattr3, FsError> {
+    ) -> Result<FileAttributes, FsError> {
         let start_time = std::time::Instant::now();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
@@ -201,11 +201,11 @@ impl ZeroFS {
 
     pub async fn process_create(
         &self,
-        auth: &AuthContext,
-        dirid: fileid3,
+        creds: &Credentials,
+        dirid: InodeId,
         filename: &[u8],
-        attr: sattr3,
-    ) -> Result<(fileid3, fattr3), FsError> {
+        attr: &SetAttributes,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(filename)?;
 
         let filename_str = String::from_utf8_lossy(filename);
@@ -214,9 +214,8 @@ impl ZeroFS {
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.load_inode(dirid).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-        check_access(&dir_inode, &creds, AccessMode::Write)?;
-        check_access(&dir_inode, &creds, AccessMode::Execute)?;
+        check_access(&dir_inode, creds, AccessMode::Write)?;
+        check_access(&dir_inode, creds, AccessMode::Execute)?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -239,9 +238,9 @@ impl ZeroFS {
 
                 let (now_sec, now_nsec) = get_current_time();
 
-                let final_mode = match attr.mode {
-                    set_mode3::mode(m) => validate_mode(m),
-                    _ => 0o666,
+                let final_mode = match &attr.mode {
+                    SetMode::Set(m) => validate_mode(*m),
+                    SetMode::NoChange => 0o666,
                 };
 
                 let file_inode = FileInode {
@@ -253,13 +252,13 @@ impl ZeroFS {
                     atime: now_sec,
                     atime_nsec: now_nsec,
                     mode: final_mode,
-                    uid: match attr.uid {
-                        set_uid3::uid(u) => u,
-                        _ => auth.uid,
+                    uid: match &attr.uid {
+                        SetUid::Set(u) => *u,
+                        SetUid::NoChange => creds.uid,
                     },
-                    gid: match attr.gid {
-                        set_gid3::gid(g) => g,
-                        _ => auth.gid,
+                    gid: match &attr.gid {
+                        SetGid::Set(g) => *g,
+                        SetGid::NoChange => creds.gid,
                     },
                     parent: dirid,
                     nlink: 1,
@@ -316,14 +315,12 @@ impl ZeroFS {
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 let inode = Inode::File(file_inode);
-                Ok((
-                    file_id,
-                    InodeWithId {
-                        inode: &inode,
-                        id: file_id,
-                    }
-                    .into(),
-                ))
+                let file_attrs = InodeWithId {
+                    inode: &inode,
+                    id: file_id,
+                }
+                .into();
+                Ok((file_id, file_attrs))
             }
             _ => Err(FsError::NotDirectory),
         }
@@ -332,11 +329,16 @@ impl ZeroFS {
     pub async fn process_create_exclusive(
         &self,
         auth: &AuthContext,
-        dirid: fileid3,
+        dirid: InodeId,
         filename: &[u8],
-    ) -> Result<fileid3, FsError> {
+    ) -> Result<InodeId, FsError> {
         let (id, _) = self
-            .process_create(auth, dirid, filename, sattr3::default())
+            .process_create(
+                &Credentials::from_auth_context(auth),
+                dirid,
+                filename,
+                &SetAttributes::default(),
+            )
             .await?;
         Ok(id)
     }
@@ -344,7 +346,7 @@ impl ZeroFS {
     pub async fn process_read_file(
         &self,
         auth: &AuthContext,
-        id: fileid3,
+        id: InodeId,
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), FsError> {

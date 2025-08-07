@@ -77,3 +77,23 @@ impl From<nfsstat3> for FsError {
         }
     }
 }
+
+impl FsError {
+    pub fn to_errno(&self) -> u32 {
+        match self {
+            FsError::PermissionDenied => libc::EACCES as u32,
+            FsError::NotFound => libc::ENOENT as u32,
+            FsError::Exists => libc::EEXIST as u32,
+            FsError::InvalidArgument => libc::EINVAL as u32,
+            FsError::IoError => libc::EIO as u32,
+            FsError::NotEmpty => libc::ENOTEMPTY as u32,
+            FsError::TooManyLinks => libc::EMLINK as u32,
+            FsError::NoSpace => libc::ENOSPC as u32,
+            FsError::IsDirectory => libc::EISDIR as u32,
+            FsError::NotDirectory => libc::ENOTDIR as u32,
+            FsError::NameTooLong => libc::ENAMETOOLONG as u32,
+            FsError::NotSupported => libc::ENOSYS as u32,
+            FsError::StaleHandle => libc::ESTALE as u32,
+        }
+    }
+}
