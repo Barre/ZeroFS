@@ -316,7 +316,7 @@ impl ZeroFS {
 
                     entries.push(DirEntry {
                         fileid: encoded_id,
-                        name: name,
+                        name,
                         attr: InodeWithId {
                             inode: &inode,
                             id: inode_id,

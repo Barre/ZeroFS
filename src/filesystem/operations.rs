@@ -30,9 +30,7 @@ mod tests {
             mode: SetMode::Set(0o644),
             uid: SetUid::Set(1000),
             gid: SetGid::Set(1000),
-            size: SetSize::NoChange,
-            atime: SetTime::NoChange,
-            mtime: SetTime::NoChange,
+            ..Default::default()
         };
 
         let (file_id, fattr) = fs
@@ -499,11 +497,7 @@ mod tests {
 
         let setattr = SetAttributes {
             size: SetSize::Set(500),
-            mode: SetMode::NoChange,
-            uid: SetUid::NoChange,
-            gid: SetGid::NoChange,
-            atime: SetTime::NoChange,
-            mtime: SetTime::NoChange,
+            ..Default::default()
         };
 
         let fattr = fs
@@ -850,11 +844,7 @@ mod tests {
 
         let no_exec_attrs = SetAttributes {
             mode: SetMode::Set(0o644),
-            uid: SetUid::NoChange,
-            gid: SetGid::NoChange,
-            size: SetSize::NoChange,
-            atime: SetTime::NoChange,
-            mtime: SetTime::NoChange,
+            ..Default::default()
         };
 
         fs.process_setattr(&test_creds(), dir_id, &no_exec_attrs)
@@ -863,11 +853,7 @@ mod tests {
 
         let chmod_attrs = SetAttributes {
             mode: SetMode::Set(0o600),
-            uid: SetUid::NoChange,
-            gid: SetGid::NoChange,
-            size: SetSize::NoChange,
-            atime: SetTime::NoChange,
-            mtime: SetTime::NoChange,
+            ..Default::default()
         };
 
         let result = fs
@@ -887,11 +873,7 @@ mod tests {
 
         let exec_attrs = SetAttributes {
             mode: SetMode::Set(0o755),
-            uid: SetUid::NoChange,
-            gid: SetGid::NoChange,
-            size: SetSize::NoChange,
-            atime: SetTime::NoChange,
-            mtime: SetTime::NoChange,
+            ..Default::default()
         };
 
         fs.process_setattr(&test_creds(), dir_id, &exec_attrs)
