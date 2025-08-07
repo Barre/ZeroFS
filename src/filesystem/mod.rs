@@ -14,13 +14,8 @@ use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use crate::encryption::{EncryptedDb, EncryptionManager};
 use bytes::Bytes;
-use foyer::{
-    DirectFsDeviceOptions, Engine, HybridCacheBuilder, RuntimeOptions, TokioRuntimeOptions,
-};
 use slatedb::config::ObjectStoreCacheOptions;
-use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
-use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{ObjectStore, path::Path};
 use slatedb::{
     DbBuilder,
@@ -176,27 +171,21 @@ impl ZeroFS {
         let total_disk_cache_gb = cache_config.max_cache_size_gb;
         let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
-        // Split disk cache into thirds
-        let slatedb_object_cache_gb = total_disk_cache_gb / 3.0;
-        let slatedb_hybrid_cache_gb = total_disk_cache_gb / 3.0;
-        let zerofs_disk_cache_gb = total_disk_cache_gb / 3.0;
+        let slatedb_object_cache_gb = total_disk_cache_gb;
 
         // Split memory cache: 50% for ZeroFS, 50% for SlateDB block cache
         let zerofs_memory_cache_gb = total_memory_cache_gb * 0.5;
         let slatedb_memory_cache_gb = total_memory_cache_gb * 0.5;
 
         tracing::info!(
-            "Cache allocation - Total disk: {:.2}GB, SlateDB object store: {:.2}GB, SlateDB hybrid: {:.2}GB, ZeroFS disk: {:.2}GB, Memory - SlateDB: {:.2}GB, ZeroFS: {:.2}GB",
+            "Cache allocation - Total disk: {:.2}GB, SlateDB object store: {:.2}GB, Memory - SlateDB: {:.2}GB, ZeroFS: {:.2}GB",
             total_disk_cache_gb,
             slatedb_object_cache_gb,
-            slatedb_hybrid_cache_gb,
-            zerofs_disk_cache_gb,
             slatedb_memory_cache_gb,
             zerofs_memory_cache_gb
         );
 
         let slatedb_object_cache_bytes = (slatedb_object_cache_gb * 1_000_000_000.0) as usize;
-        let slatedb_hybrid_cache_bytes = (slatedb_hybrid_cache_gb * 1_000_000_000.0) as usize;
         let slatedb_memory_cache_bytes = (slatedb_memory_cache_gb * 1_000_000_000.0) as u64;
 
         tracing::info!(
@@ -224,22 +213,9 @@ impl ZeroFS {
             ..Default::default()
         };
 
-        let hybrid_cache = Arc::new(FoyerHybridCache::new_with_cache(
-            HybridCacheBuilder::new()
-                .memory(slatedb_memory_cache_bytes as usize)
-                .with_weighter(|_, v: &CachedEntry| v.size())
-                .storage(Engine::Large)
-                .with_runtime_options(RuntimeOptions::Separated {
-                    read_runtime_options: TokioRuntimeOptions::default(),
-                    write_runtime_options: TokioRuntimeOptions::default(),
-                })
-                .with_device_options(
-                    DirectFsDeviceOptions::new(slatedb_cache_dir)
-                        .with_capacity(slatedb_hybrid_cache_bytes),
-                )
-                .build()
-                .await?,
-        ));
+        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+            max_capacity: slatedb_memory_cache_bytes,
+        }));
 
         let db_path = Path::from(db_path);
 
@@ -260,7 +236,7 @@ impl ZeroFS {
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_compaction_runtime(runtime_handle.clone())
-                .with_block_cache(hybrid_cache)
+                .with_block_cache(cache)
                 .build()
                 .await?,
         );
@@ -311,12 +287,7 @@ impl ZeroFS {
 
         let zerofs_cache_dir = format!("{}/zerofs", cache_config.root_folder);
         let unified_cache = Arc::new(
-            UnifiedCache::new(
-                &zerofs_cache_dir,
-                zerofs_disk_cache_gb,
-                Some(zerofs_memory_cache_gb),
-            )
-            .await?,
+            UnifiedCache::new(&zerofs_cache_dir, 0.0, Some(zerofs_memory_cache_gb)).await?,
         );
 
         let db = Arc::new(
