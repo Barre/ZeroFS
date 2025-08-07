@@ -1,12 +1,21 @@
+use super::error::{NBDError, Result};
+use super::protocol::{
+    NBD_CMD_FLAG_FUA, NBD_EINVAL, NBD_EIO, NBD_ENOSPC, NBD_FLAG_C_FIXED_NEWSTYLE,
+    NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_NO_ZEROES, NBD_IHAVEOPT,
+    NBD_INFO_EXPORT, NBD_MAGIC, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
+    NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand,
+    NBDInfoExport, NBDOption, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake,
+    NBDSimpleReply, get_transmission_flags,
+};
+use crate::filesystem::permissions::Credentials;
+use crate::filesystem::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
+use crate::filesystem::{EncodedFileId, ZeroFS};
 use deku::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
-use super::error::{NBDError, Result};
-use super::protocol::*;
-use crate::filesystem::{EncodedFileId, ZeroFS};
 
 #[derive(Clone)]
 pub struct NBDDevice {
@@ -64,22 +73,17 @@ impl NBDServer {
     }
 
     async fn initialize_device(&self, device: &NBDDevice) -> std::io::Result<()> {
-        use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
-        use zerofs_nfsserve::vfs::AuthContext;
-        use zerofs_nfsserve::vfs::NFSFileSystem;
-
         let auth = AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
         };
-        let nbd_name = nfsstring(b".nbd".to_vec());
-        let device_name = nfsstring(device.name.as_bytes().to_vec());
+        let creds = Credentials::from_auth_context(&auth);
 
         // Check if device file exists, create it if not
         let nbd_dir_inode = self
             .filesystem
-            .lookup(&auth, 0, &nbd_name)
+            .lookup_by_name(0, ".nbd")
             .await
             .map_err(|e| {
                 std::io::Error::other(format!("Failed to lookup .nbd directory: {e:?}"))
@@ -87,24 +91,29 @@ impl NBDServer {
 
         match self
             .filesystem
-            .lookup(&auth, nbd_dir_inode, &device_name)
+            .lookup_by_name(nbd_dir_inode, &device.name)
             .await
         {
             Ok(device_inode) => {
-                let existing_attr =
+                let existing_inode =
                     self.filesystem
-                        .getattr(&auth, device_inode)
+                        .load_inode(device_inode)
                         .await
                         .map_err(|e| {
                             std::io::Error::other(format!("Failed to get device attributes: {e:?}"))
                         })?;
 
-                if existing_attr.size != device.size {
+                let existing_size = match &existing_inode {
+                    crate::filesystem::inode::Inode::File(f) => f.size,
+                    _ => 0,
+                };
+
+                if existing_size != device.size {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
                             "NBD device {} size mismatch: existing size is {} bytes, requested size is {} bytes. Cannot resize existing devices.",
-                            device.name, existing_attr.size, device.size
+                            device.name, existing_size, device.size
                         ),
                     ));
                 }
@@ -120,18 +129,16 @@ impl NBDServer {
                     "Creating NBD device file {} with size {}",
                     device.name, device.size
                 );
-                let attr = sattr3 {
-                    mode: set_mode3::mode(0o600),
-                    uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
-                    gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
-                    size: zerofs_nfsserve::nfs::set_size3::Void,
-                    atime: zerofs_nfsserve::nfs::set_atime::DONT_CHANGE,
-                    mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
+                let attr = SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    uid: SetUid::Set(0),
+                    gid: SetGid::Set(0),
+                    ..Default::default()
                 };
 
                 let (device_inode, _) = self
                     .filesystem
-                    .create(&auth, nbd_dir_inode, &device_name, attr)
+                    .process_create(&creds, nbd_dir_inode, device.name.as_bytes(), &attr)
                     .await
                     .map_err(|e| {
                         std::io::Error::other(format!("Failed to create device file: {e:?}"))
@@ -141,7 +148,7 @@ impl NBDServer {
                 if device.size > 0 {
                     let data = vec![0u8; 1];
                     self.filesystem
-                        .write(&auth, device_inode, device.size - 1, &data)
+                        .process_write(&auth, device_inode, device.size - 1, &data)
                         .await
                         .map_err(|e| {
                             std::io::Error::other(format!("Failed to set device size: {e:?}"))
@@ -270,7 +277,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     self.handle_info_option(header.length).await?;
                 }
                 7 => {
-                    // NBD_OPT_GO
                     return self.handle_go_option(header.length).await;
                 }
                 8 => {
@@ -297,13 +303,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn handle_list_option(&mut self, length: u32) -> Result<()> {
-        // Skip any data
         if length > 0 {
             let mut buf = vec![0u8; length as usize];
             self.reader.read_exact(&mut buf).await?;
         }
 
-        // Send device list
         let devices: Vec<_> = self.devices.values().cloned().collect();
         for device in devices {
             let name_bytes = device.name.as_bytes();
@@ -315,7 +319,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 .await?;
         }
 
-        // Send final ACK
         self.send_option_reply(NBDOption::List as u32, NBD_REP_ACK, &[])
             .await?;
         self.writer.flush().await?;
@@ -339,7 +342,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .ok_or_else(|| NBDError::DeviceNotFound(name.to_string()))?
             .clone();
 
-        // Write export info
         self.writer.write_all(&device.size.to_be_bytes()).await?;
         self.writer
             .write_all(&get_transmission_flags().to_be_bytes())
@@ -458,7 +460,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn handle_structured_reply_option(&mut self, length: u32) -> Result<()> {
-        // Skip any data
         if length > 0 {
             let mut buf = vec![0u8; length as usize];
             self.reader.read_exact(&mut buf).await?;
@@ -483,28 +484,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
-        use zerofs_nfsserve::nfs::nfsstring;
-        use zerofs_nfsserve::vfs::AuthContext;
-        use zerofs_nfsserve::vfs::NFSFileSystem;
-
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
-        let nbd_name = nfsstring(b".nbd".to_vec());
-        let device_name = nfsstring(device.name.as_bytes().to_vec());
-
-        // Get device inode
         let nbd_dir_inode = self
             .filesystem
-            .lookup(&auth, 0, &nbd_name)
+            .lookup_by_name(0, ".nbd")
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup .nbd directory: {e:?}")))?;
 
         let device_inode = self
             .filesystem
-            .lookup(&auth, nbd_dir_inode, &device_name)
+            .lookup_by_name(nbd_dir_inode, &device.name)
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup device file: {e:?}")))?;
 
@@ -597,9 +585,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         length: u32,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::AuthContext;
-        use zerofs_nfsserve::vfs::NFSFileSystem;
-
         // Check for out-of-bounds read
         if offset + length as u64 > device_size {
             let _ = self.send_simple_reply(cookie, NBD_EINVAL, &[]).await;
@@ -619,13 +604,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = AuthContext {
+        let auth = crate::filesystem::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
         };
 
-        match self.filesystem.read(&auth, inode, offset, length).await {
+        match self
+            .filesystem
+            .process_read_file(&auth, inode, offset, length)
+            .await
+        {
             Ok((data, _)) => {
                 if self
                     .send_simple_reply(cookie, NBD_SUCCESS, &data)
@@ -652,9 +641,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         flags: u16,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::AuthContext;
-        use zerofs_nfsserve::vfs::NFSFileSystem;
-
         // Check for out-of-bounds write
         if offset + length as u64 > device_size {
             // Must read and discard the data before sending error
@@ -676,7 +662,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = AuthContext {
+        let auth = crate::filesystem::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -688,7 +674,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_EIO;
         }
 
-        match self.filesystem.write(&auth, inode, offset, &data).await {
+        match self
+            .filesystem
+            .process_write(&auth, inode, offset, &data)
+            .await
+        {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0 {
                     if let Err(e) = self.filesystem.flush().await {
@@ -808,9 +798,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         flags: u16,
         device_size: u64,
     ) -> u32 {
-        use zerofs_nfsserve::vfs::AuthContext;
-        use zerofs_nfsserve::vfs::NFSFileSystem;
-
         if offset + length as u64 > device_size {
             let _ = self.send_simple_reply(cookie, NBD_ENOSPC, &[]).await;
             return NBD_ENOSPC;
@@ -828,7 +815,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = AuthContext {
+        let auth = crate::filesystem::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -837,7 +824,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         match self
             .filesystem
-            .write(&auth, inode, offset, &zero_data)
+            .process_write(&auth, inode, offset, &zero_data)
             .await
         {
             Ok(_) => {

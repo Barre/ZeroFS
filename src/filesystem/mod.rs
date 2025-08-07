@@ -759,6 +759,21 @@ impl ZeroFS {
 }
 
 impl ZeroFS {
+    /// Helper method to lookup an entry by name in a directory
+    pub async fn lookup_by_name(&self, dir_id: u64, name: &str) -> Result<u64, errors::FsError> {
+        let entry_key = Self::dir_entry_key(dir_id, name);
+        let entry_data = self
+            .db
+            .get_bytes(&entry_key)
+            .await
+            .map_err(|_| errors::FsError::IoError)?
+            .ok_or(errors::FsError::NotFound)?;
+
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&entry_data[..8]);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     /// DANGEROUS: Creates an unencrypted database connection. Only use for key management!
     pub async fn dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store: Arc<dyn ObjectStore>,
