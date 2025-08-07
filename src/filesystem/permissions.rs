@@ -166,5 +166,5 @@ pub fn can_set_times(
         return check_access(inode, creds, AccessMode::Write);
     }
 
-    Err(FsError::PermissionDenied)
+    Err(FsError::OperationNotPermitted)
 }
