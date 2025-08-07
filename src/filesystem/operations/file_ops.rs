@@ -8,10 +8,10 @@ use zerofs_nfsserve::nfs::{fattr3, fileid3, nfsstat3, sattr3, set_gid3, set_mode
 use zerofs_nfsserve::vfs::AuthContext;
 
 use super::common::validate_filename;
-use crate::cache::{self, CacheKey, CacheValue};
+use crate::filesystem::cache::{self, CacheKey, CacheValue};
 use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
-use crate::inode::{FileInode, Inode, InodeId};
-use crate::permissions::{AccessMode, Credentials, check_access, validate_mode};
+use crate::filesystem::inode::{FileInode, Inode, InodeId};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access, validate_mode};
 
 const READ_CHUNK_BUFFER_SIZE: usize = 64;
 
@@ -479,14 +479,14 @@ impl SlateDbFs {
 
                 let eof = end >= file.size;
 
-                if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES
+                if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES
                     && offset == 0
                     && end >= file.size
                 {
                     debug!("Caching small file {} ({} bytes)", id, file.size);
-                    let cache_key = crate::cache::CacheKey::SmallFile(id);
+                    let cache_key = cache::CacheKey::SmallFile(id);
                     let cache_value =
-                        crate::cache::CacheValue::SmallFile(std::sync::Arc::new(result.clone()));
+                        cache::CacheValue::SmallFile(std::sync::Arc::new(result.clone()));
                     self.cache.insert(cache_key, cache_value, false).await;
                 }
 
@@ -617,7 +617,7 @@ impl SlateDbFs {
             }
         }
 
-        if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES {
+        if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES {
             cache_keys_to_remove.push(CacheKey::SmallFile(id));
         }
 

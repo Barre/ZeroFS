@@ -1,6 +1,6 @@
-use crate::cache::{CacheKey, CacheValue};
+use crate::filesystem::cache::{CacheKey, CacheValue};
 use crate::filesystem::{EncodedFileId, SlateDbFs};
-use crate::inode::Inode;
+use crate::filesystem::inode::Inode;
 use async_trait::async_trait;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
@@ -36,7 +36,7 @@ impl NFSFileSystem for SlateDbFs {
 
         match dir_inode {
             Inode::Directory(ref _dir) => {
-                use crate::permissions::{AccessMode, Credentials, check_access};
+                use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
                 let creds = Credentials::from_auth_context(auth);
                 check_access(&dir_inode, &creds, AccessMode::Execute)?;
                 let name = filename_str.to_string();
@@ -64,11 +64,11 @@ impl NFSFileSystem for SlateDbFs {
                         let inode_id = u64::from_le_bytes(bytes);
                         debug!("lookup found: {} -> inode {}", name, inode_id);
 
-                        let cache_key = crate::cache::CacheKey::DirEntry {
+                        let cache_key = crate::filesystem::cache::CacheKey::DirEntry {
                             dir_id: real_dirid,
                             name: name.clone(),
                         };
-                        let cache_value = crate::cache::CacheValue::DirEntry(inode_id);
+                        let cache_value = crate::filesystem::cache::CacheValue::DirEntry(inode_id);
                         self.cache.insert(cache_key, cache_value, false).await;
 
                         Ok(EncodedFileId::from_inode(inode_id).into())

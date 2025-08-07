@@ -1,6 +1,6 @@
 use crate::filesystem::SlateDbFs;
-use crate::inode::{Inode, InodeId};
-use crate::permissions::{AccessMode, Credentials, check_access};
+use crate::filesystem::inode::{Inode, InodeId};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
 use zerofs_nfsserve::nfs::nfsstat3;
 
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;

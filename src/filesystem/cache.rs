@@ -1,4 +1,4 @@
-use crate::inode::{Inode, InodeId};
+use super::inode::{Inode, InodeId};
 use foyer::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

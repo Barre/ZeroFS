@@ -5,9 +5,9 @@ use zerofs_nfsserve::vfs::AuthContext;
 
 use super::common::validate_filename;
 use crate::filesystem::{CHUNK_SIZE, SlateDbFs, get_current_time};
-use crate::inode::Inode;
-use crate::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
-use crate::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
+use crate::filesystem::inode::Inode;
+use crate::filesystem::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 
 impl SlateDbFs {
     pub async fn process_remove(
@@ -227,16 +227,16 @@ impl SlateDbFs {
                 }
 
                 self.cache
-                    .remove(crate::cache::CacheKey::Metadata(file_id))
+                    .remove(crate::filesystem::cache::CacheKey::Metadata(file_id))
                     .await;
                 self.cache
-                    .remove(crate::cache::CacheKey::Metadata(dirid))
+                    .remove(crate::filesystem::cache::CacheKey::Metadata(dirid))
                     .await;
                 self.cache
-                    .remove(crate::cache::CacheKey::SmallFile(file_id))
+                    .remove(crate::filesystem::cache::CacheKey::SmallFile(file_id))
                     .await;
                 self.cache
-                    .remove(crate::cache::CacheKey::DirEntry {
+                    .remove(crate::filesystem::cache::CacheKey::DirEntry {
                         dir_id: dirid,
                         name: name.clone(),
                     })

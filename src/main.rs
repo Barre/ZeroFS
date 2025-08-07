@@ -5,19 +5,12 @@ use std::sync::Arc;
 use tracing::info;
 
 mod bucket_identity;
-mod cache;
 mod encryption;
 mod filesystem;
-mod filesystem_stats;
-mod inode;
 mod key_management;
-mod lock_manager;
 mod nbd;
 mod nfs;
 mod ninep;
-mod operations;
-mod permissions;
-mod stats;
 
 #[cfg(test)]
 mod test_helpers;

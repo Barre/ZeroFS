@@ -1,8 +1,16 @@
-use crate::cache::{CacheKey, CacheValue, UnifiedCache};
+pub mod cache;
+pub mod inode;
+pub mod lock_manager;
+pub mod metrics;
+pub mod operations;
+pub mod permissions;
+pub mod stats;
+
+use self::cache::{CacheKey, CacheValue, UnifiedCache};
 use crate::encryption::{EncryptedDb, EncryptionManager};
-use crate::filesystem_stats::{FileSystemGlobalStats, StatsShardData};
-use crate::lock_manager::LockManager;
-use crate::stats::FileSystemStats;
+use self::stats::{FileSystemGlobalStats, StatsShardData};
+use self::lock_manager::LockManager;
+use self::metrics::FileSystemStats;
 use bytes::Bytes;
 use foyer::{
     DirectFsDeviceOptions, Engine, HybridCacheBuilder, RuntimeOptions, TokioRuntimeOptions,
@@ -22,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::{fileid3, nfsstat3};
 
-use crate::inode::{DirectoryInode, Inode, InodeId};
+use self::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PREFIX_INODE: u8 = 0x01;
@@ -500,7 +508,7 @@ impl SlateDbFs {
         let mut keys_to_remove = vec![CacheKey::Metadata(inode_id)];
 
         if let Inode::File(file) = inode {
-            if file.size <= crate::cache::SMALL_FILE_THRESHOLD_BYTES {
+            if file.size <= self::cache::SMALL_FILE_THRESHOLD_BYTES {
                 keys_to_remove.push(CacheKey::SmallFile(inode_id));
             }
         }
@@ -808,7 +816,7 @@ impl SlateDbFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inode::FileInode;
+    use crate::filesystem::inode::FileInode;
 
     #[tokio::test]
     async fn test_create_filesystem() {

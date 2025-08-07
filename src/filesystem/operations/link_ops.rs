@@ -5,10 +5,10 @@ use zerofs_nfsserve::nfs::{fattr3, fileid3, nfsstat3, sattr3, set_gid3, set_mode
 use zerofs_nfsserve::vfs::AuthContext;
 
 use super::common::validate_filename;
-use crate::cache::CacheKey;
+use crate::filesystem::cache::CacheKey;
 use crate::filesystem::{MAX_HARDLINKS_PER_INODE, SlateDbFs, get_current_time};
-use crate::inode::{Inode, SymlinkInode};
-use crate::permissions::{AccessMode, Credentials, check_access};
+use crate::filesystem::inode::{Inode, SymlinkInode};
+use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
 
 impl SlateDbFs {
     pub async fn process_symlink(
