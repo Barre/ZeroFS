@@ -130,24 +130,27 @@ impl ZeroFS {
         check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
 
         // POSIX: Moving directories in sticky directories requires ownership of the moved directory
-        if from_dirid != to_dirid && matches!(source_inode, Inode::Directory(_))
+        if from_dirid != to_dirid
+            && matches!(source_inode, Inode::Directory(_))
             && let Inode::Directory(from_dir_data) = &from_dir
-                && from_dir_data.mode & 0o1000 != 0 {
-                    let source_uid = match &source_inode {
-                        Inode::Directory(d) => d.uid,
-                        _ => unreachable!(),
-                    };
-                    if creds.uid != 0 && creds.uid != source_uid {
-                        return Err(FsError::PermissionDenied);
-                    }
-                }
+            && from_dir_data.mode & 0o1000 != 0
+        {
+            let source_uid = match &source_inode {
+                Inode::Directory(d) => d.uid,
+                _ => unreachable!(),
+            };
+            if creds.uid != 0 && creds.uid != source_uid {
+                return Err(FsError::PermissionDenied);
+            }
+        }
 
         if let Some(target_id) = target_inode_id {
             let target_inode = self.load_inode(target_id).await?;
             if let Inode::Directory(dir) = &target_inode
-                && dir.entry_count > 0 {
-                    return Err(FsError::NotEmpty);
-                }
+                && dir.entry_count > 0
+            {
+                return Err(FsError::NotEmpty);
+            }
 
             let target_dir = if let Some(ref to_dir) = to_dir {
                 to_dir

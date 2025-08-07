@@ -116,10 +116,11 @@ impl ZeroFS {
                     };
 
                     if (write_start > 0 || write_end < CHUNK_SIZE)
-                        && let Some(existing_data) = existing_chunks.get(&chunk_idx) {
-                            let copy_len = existing_data.len().min(CHUNK_SIZE);
-                            chunk_data[..copy_len].copy_from_slice(&existing_data[..copy_len]);
-                        }
+                        && let Some(existing_data) = existing_chunks.get(&chunk_idx)
+                    {
+                        let copy_len = existing_data.len().min(CHUNK_SIZE);
+                        chunk_data[..copy_len].copy_from_slice(&existing_data[..copy_len]);
+                    }
 
                     let data_offset = (chunk_idx - start_chunk) * CHUNK_SIZE + write_start
                         - (offset % CHUNK_SIZE as u64) as usize;

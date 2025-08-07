@@ -1,11 +1,11 @@
 use super::error::{NBDError, Result};
 use super::protocol::{
     NBD_CMD_FLAG_FUA, NBD_EINVAL, NBD_EIO, NBD_ENOSPC, NBD_FLAG_C_FIXED_NEWSTYLE,
-    NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_NO_ZEROES,
-    NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
-    NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand,
-    NBDInfoExport, NBDOption, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake,
-    NBDSimpleReply, get_transmission_flags,
+    NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_NO_ZEROES, NBD_INFO_EXPORT,
+    NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_ERR_UNSUP, NBD_REP_INFO,
+    NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand, NBDInfoExport, NBDOption,
+    NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
+    get_transmission_flags,
 };
 use crate::filesystem::permissions::Credentials;
 use crate::filesystem::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
@@ -681,11 +681,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0
-                    && let Err(e) = self.filesystem.flush().await {
-                        error!("NBD write FUA flush failed: {:?}", e);
-                        let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                        return NBD_EIO;
-                    }
+                    && let Err(e) = self.filesystem.flush().await
+                {
+                    error!("NBD write FUA flush failed: {:?}", e);
+                    let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
+                    return NBD_EIO;
+                }
 
                 if self
                     .send_simple_reply(cookie, NBD_SUCCESS, &[])
@@ -764,11 +765,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0
-                    && let Err(e) = self.filesystem.flush().await {
-                        error!("NBD trim FUA flush failed: {:?}", e);
-                        let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                        return NBD_EIO;
-                    }
+                    && let Err(e) = self.filesystem.flush().await
+                {
+                    error!("NBD trim FUA flush failed: {:?}", e);
+                    let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
+                    return NBD_EIO;
+                }
 
                 if self
                     .send_simple_reply(cookie, NBD_SUCCESS, &[])
@@ -828,11 +830,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             Ok(_) => {
                 // Handle FUA flag - force unit access (flush after write_zeroes)
                 if (flags & NBD_CMD_FLAG_FUA) != 0
-                    && let Err(e) = self.filesystem.flush().await {
-                        error!("NBD write_zeroes FUA flush failed: {:?}", e);
-                        let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                        return NBD_EIO;
-                    }
+                    && let Err(e) = self.filesystem.flush().await
+                {
+                    error!("NBD write_zeroes FUA flush failed: {:?}", e);
+                    let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
+                    return NBD_EIO;
+                }
 
                 if self
                     .send_simple_reply(cookie, NBD_SUCCESS, &[])
