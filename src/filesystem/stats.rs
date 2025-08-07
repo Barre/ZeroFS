@@ -51,7 +51,7 @@ impl FileSystemGlobalStats {
     }
 
     /// Prepare a statistics update for a new inode creation
-    pub async fn prepare_inode_create(&self, inode_id: InodeId) -> StatsUpdate {
+    pub async fn prepare_inode_create(&self, inode_id: InodeId) -> StatsUpdate<'_> {
         let shard_id = inode_id as usize % STATS_SHARDS;
         let shard = &self.shards[shard_id];
 
@@ -76,7 +76,7 @@ impl FileSystemGlobalStats {
         &self,
         inode_id: InodeId,
         file_size: Option<u64>,
-    ) -> StatsUpdate {
+    ) -> StatsUpdate<'_> {
         let shard_id = inode_id as usize % STATS_SHARDS;
         let shard = &self.shards[shard_id];
 
@@ -106,7 +106,7 @@ impl FileSystemGlobalStats {
         inode_id: InodeId,
         old_size: u64,
         new_size: u64,
-    ) -> Option<StatsUpdate> {
+    ) -> Option<StatsUpdate<'_>> {
         if old_size == new_size {
             return None;
         }
