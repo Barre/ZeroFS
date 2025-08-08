@@ -48,11 +48,7 @@ dashmap = "6.1"
 uuid = { version = "1.17", features = ["v4"] }
 
 [patch.crates-io]
-object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4", features = [
-    "aws",
-    "azure",
-    "gcp",
-] }
+object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }
