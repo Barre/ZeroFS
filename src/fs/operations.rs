@@ -8,14 +8,12 @@ pub mod rename_ops;
 
 #[cfg(test)]
 mod tests {
-    use crate::filesystem::ZeroFS;
-    use crate::filesystem::errors::FsError;
-    use crate::filesystem::inode::Inode;
-    use crate::filesystem::permissions::Credentials;
-    use crate::filesystem::types::{
-        FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
-    };
-    use crate::filesystem::{CHUNK_SIZE, EncodedFileId};
+    use crate::fs::ZeroFS;
+    use crate::fs::errors::FsError;
+    use crate::fs::inode::Inode;
+    use crate::fs::permissions::Credentials;
+    use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
+    use crate::fs::{CHUNK_SIZE, EncodedFileId};
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     fn test_creds() -> Credentials {
@@ -100,11 +98,11 @@ mod tests {
             uid: SetUid::Set(1001),
             gid: SetGid::Set(1001),
             size: SetSize::NoChange,
-            atime: SetTime::SetToClientTime(crate::filesystem::types::Timestamp {
+            atime: SetTime::SetToClientTime(crate::fs::types::Timestamp {
                 seconds: 1234567890,
                 nanoseconds: 0,
             }),
-            mtime: SetTime::SetToClientTime(crate::filesystem::types::Timestamp {
+            mtime: SetTime::SetToClientTime(crate::fs::types::Timestamp {
                 seconds: 1234567890,
                 nanoseconds: 0,
             }),
@@ -782,7 +780,7 @@ mod tests {
         let mut inode = fs.load_inode(file_id).await.unwrap();
         match &mut inode {
             Inode::File(file) => {
-                file.nlink = crate::filesystem::MAX_HARDLINKS_PER_INODE - 1;
+                file.nlink = crate::fs::MAX_HARDLINKS_PER_INODE - 1;
             }
             _ => panic!("Expected file inode"),
         }
@@ -798,7 +796,7 @@ mod tests {
         let inode = fs.load_inode(file_id).await.unwrap();
         match inode {
             Inode::File(file) => {
-                assert_eq!(file.nlink, crate::filesystem::MAX_HARDLINKS_PER_INODE);
+                assert_eq!(file.nlink, crate::fs::MAX_HARDLINKS_PER_INODE);
             }
             _ => panic!("Expected file inode"),
         }
@@ -813,7 +811,7 @@ mod tests {
         let inode = fs.load_inode(file_id).await.unwrap();
         match inode {
             Inode::File(file) => {
-                assert_eq!(file.nlink, crate::filesystem::MAX_HARDLINKS_PER_INODE);
+                assert_eq!(file.nlink, crate::fs::MAX_HARDLINKS_PER_INODE);
             }
             _ => panic!("Expected file inode"),
         }

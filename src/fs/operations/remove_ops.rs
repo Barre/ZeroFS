@@ -1,12 +1,10 @@
 use super::common::validate_filename;
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::Inode;
-use crate::filesystem::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
-use crate::filesystem::permissions::{
-    AccessMode, Credentials, check_access, check_sticky_bit_delete,
-};
-use crate::filesystem::types::{AuthContext, InodeId};
-use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
+use crate::fs::errors::FsError;
+use crate::fs::inode::Inode;
+use crate::fs::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
+use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
+use crate::fs::types::{AuthContext, InodeId};
+use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 
@@ -200,16 +198,16 @@ impl ZeroFS {
                 }
 
                 self.cache
-                    .remove(crate::filesystem::cache::CacheKey::Metadata(file_id))
+                    .remove(crate::fs::cache::CacheKey::Metadata(file_id))
                     .await;
                 self.cache
-                    .remove(crate::filesystem::cache::CacheKey::Metadata(dirid))
+                    .remove(crate::fs::cache::CacheKey::Metadata(dirid))
                     .await;
                 self.cache
-                    .remove(crate::filesystem::cache::CacheKey::SmallFile(file_id))
+                    .remove(crate::fs::cache::CacheKey::SmallFile(file_id))
                     .await;
                 self.cache
-                    .remove(crate::filesystem::cache::CacheKey::DirEntry {
+                    .remove(crate::fs::cache::CacheKey::DirEntry {
                         dir_id: dirid,
                         name: name.clone(),
                     })

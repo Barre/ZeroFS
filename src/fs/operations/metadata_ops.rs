@@ -1,14 +1,14 @@
 use super::common::validate_filename;
-use crate::filesystem::cache::CacheKey;
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{Inode, SpecialInode};
-use crate::filesystem::permissions::{
+use crate::fs::cache::CacheKey;
+use crate::fs::errors::FsError;
+use crate::fs::inode::{Inode, SpecialInode};
+use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
-use crate::filesystem::types::{
+use crate::fs::types::{
     FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
 };
-use crate::filesystem::{CHUNK_SIZE, InodeId, ZeroFS, get_current_time};
+use crate::fs::{CHUNK_SIZE, InodeId, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use tracing::debug;
 

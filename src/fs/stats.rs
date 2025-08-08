@@ -178,7 +178,7 @@ fn stats_shard_key(shard_id: usize) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::ZeroFS;
+    use crate::fs::ZeroFS;
     use crate::test_helpers::test_helpers_mod::{filename, test_auth};
     use zerofs_nfsserve::nfs::sattr3;
     use zerofs_nfsserve::vfs::NFSFileSystem;

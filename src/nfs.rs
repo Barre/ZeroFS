@@ -1,8 +1,8 @@
-use crate::filesystem::cache::{CacheKey, CacheValue};
-use crate::filesystem::inode::Inode;
-use crate::filesystem::permissions::Credentials;
-use crate::filesystem::types::{FileType, InodeWithId, SetAttributes};
-use crate::filesystem::{EncodedFileId, ZeroFS};
+use crate::fs::cache::{CacheKey, CacheValue};
+use crate::fs::inode::Inode;
+use crate::fs::permissions::Credentials;
+use crate::fs::types::{FileType, InodeWithId, SetAttributes};
+use crate::fs::{EncodedFileId, ZeroFS};
 use async_trait::async_trait;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
@@ -41,8 +41,8 @@ impl NFSFileSystem for ZeroFS {
 
         match dir_inode {
             Inode::Directory(ref _dir) => {
-                use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-                let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+                use crate::fs::permissions::{AccessMode, Credentials, check_access};
+                let auth_ctx: crate::fs::types::AuthContext = auth.into();
                 let creds = Credentials::from_auth_context(&auth_ctx);
                 check_access(&dir_inode, &creds, AccessMode::Execute)?;
                 let name = filename_str.to_string();
@@ -70,11 +70,11 @@ impl NFSFileSystem for ZeroFS {
                         let inode_id = u64::from_le_bytes(bytes);
                         debug!("lookup found: {} -> inode {}", name, inode_id);
 
-                        let cache_key = crate::filesystem::cache::CacheKey::DirEntry {
+                        let cache_key = crate::fs::cache::CacheKey::DirEntry {
                             dir_id: real_dirid,
                             name: name.clone(),
                         };
-                        let cache_value = crate::filesystem::cache::CacheValue::DirEntry(inode_id);
+                        let cache_value = crate::fs::cache::CacheValue::DirEntry(inode_id);
                         self.cache.insert(cache_key, cache_value, false).await;
 
                         Ok(EncodedFileId::from_inode(inode_id).into())
@@ -110,7 +110,7 @@ impl NFSFileSystem for ZeroFS {
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
         let real_id = EncodedFileId::from(id).inode_id();
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         self.process_read_file(&auth_ctx, real_id, offset, count)
             .await
             .map_err(|e| e.into())
@@ -131,8 +131,8 @@ impl NFSFileSystem for ZeroFS {
             offset
         );
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
-        let file_attrs: crate::filesystem::types::FileAttributes =
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let file_attrs: crate::fs::types::FileAttributes =
             self.process_write(&auth_ctx, real_id, offset, data).await?;
         Ok((&file_attrs).into())
     }
@@ -152,11 +152,11 @@ impl NFSFileSystem for ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(attr);
 
-        let (id, file_attrs): (u64, crate::filesystem::types::FileAttributes) = self
+        let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
             .process_create(&creds, real_dirid, filename, &fs_attr)
             .await?;
 
@@ -199,10 +199,10 @@ impl NFSFileSystem for ZeroFS {
             String::from_utf8_lossy(dirname)
         );
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
-        let (id, file_attrs): (u64, crate::filesystem::types::FileAttributes) = self
+        let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
             .process_mkdir(&creds, real_dirid, dirname, &fs_attr)
             .await?;
         Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
@@ -221,7 +221,7 @@ impl NFSFileSystem for ZeroFS {
             real_dirid, filename
         );
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         Ok(self.process_remove(&auth_ctx, real_dirid, filename).await?)
     }
 
@@ -295,7 +295,7 @@ impl NFSFileSystem for ZeroFS {
 
         debug!("setattr called: id={}, setattr={:?}", real_id, setattr);
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(setattr);
         let file_attrs = self.process_setattr(&creds, real_id, &fs_attr).await?;
@@ -317,13 +317,13 @@ impl NFSFileSystem for ZeroFS {
             real_dirid, linkname, symlink
         );
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs) = self
             .process_symlink(&creds, real_dirid, &linkname.0, &symlink.0, &fs_attr)
             .await
-            .map_err(|e: crate::filesystem::errors::FsError| -> nfsstat3 { e.into() })?;
+            .map_err(|e: crate::fs::errors::FsError| -> nfsstat3 { e.into() })?;
 
         Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
     }
@@ -364,7 +364,7 @@ impl NFSFileSystem for ZeroFS {
             _ => None,
         };
 
-        let auth_ctx: crate::filesystem::types::AuthContext = auth.into();
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
         let fs_type = FileType::from(ftype);

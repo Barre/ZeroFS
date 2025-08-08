@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::filesystem::ZeroFS;
+    use crate::fs::ZeroFS;
     use crate::test_helpers::test_helpers_mod::{filename, test_auth};
     use zerofs_nfsserve::nfs::*;
     use zerofs_nfsserve::vfs::NFSFileSystem;

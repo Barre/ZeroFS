@@ -1,4 +1,4 @@
-use crate::filesystem::{CacheConfig, ZeroFS};
+use crate::fs::{CacheConfig, ZeroFS};
 use crate::nbd::NBDServer;
 use mimalloc::MiMalloc;
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use tracing::info;
 
 mod bucket_identity;
 mod encryption;
-mod filesystem;
+mod fs;
 mod key_management;
 mod nbd;
 mod nfs;

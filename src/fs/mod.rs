@@ -786,7 +786,7 @@ impl ZeroFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::inode::FileInode;
+    use crate::fs::inode::FileInode;
 
     #[tokio::test]
     async fn test_create_filesystem() {
