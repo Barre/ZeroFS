@@ -179,10 +179,10 @@ pub struct P9String {
 
 impl P9String {
     pub fn new(s: &str) -> Self {
-        let data = s.as_bytes().to_vec();
+        let bytes = s.as_bytes();
         Self {
-            len: data.len() as u16,
-            data,
+            len: bytes.len() as u16,
+            data: bytes.to_vec(),
         }
     }
 
