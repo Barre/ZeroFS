@@ -185,7 +185,7 @@ impl EncryptedDb {
                 block_index: chunk_index,
             };
             if let Some(CacheValue::Block(cached_data)) = cache.get(cache_key.clone()).await {
-                return Ok(Some(bytes::Bytes::from(cached_data.as_ref().clone())));
+                return Ok(Some(cached_data.clone()));
             }
         }
 
@@ -210,7 +210,7 @@ impl EncryptedDb {
                         inode_id,
                         block_index: chunk_index,
                     };
-                    let cache_value = CacheValue::Block(Arc::new(decrypted.clone()));
+                    let cache_value = CacheValue::Block(bytes::Bytes::from(decrypted.clone()));
                     cache.insert(cache_key, cache_value, true).await;
                 }
 
@@ -283,7 +283,7 @@ impl EncryptedDb {
                                 inode_id,
                                 block_index: chunk_index,
                             };
-                            let cache_value = CacheValue::Block(Arc::new(data));
+                            let cache_value = CacheValue::Block(bytes::Bytes::from(data));
                             cache.insert(cache_key, cache_value, true).await;
                         }
                         None => {

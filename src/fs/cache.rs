@@ -1,4 +1,5 @@
 use super::inode::{Inode, InodeId};
+use bytes::Bytes;
 use foyer::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -16,9 +17,9 @@ pub enum CacheKey {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum CacheValue {
     Metadata(#[serde(with = "serde_arc")] Arc<Inode>),
-    SmallFile(#[serde(with = "serde_arc")] Arc<Vec<u8>>),
+    SmallFile(Bytes),
     DirEntry(InodeId),
-    Block(#[serde(with = "serde_arc")] Arc<Vec<u8>>),
+    Block(Bytes),
 }
 
 mod serde_arc {
