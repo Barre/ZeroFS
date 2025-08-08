@@ -467,10 +467,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, flushing and shutting down gracefully...");
                 fs_arc.db.flush().await?;
+                fs_arc.mark_clean_shutdown().await?;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, flushing and shutting down gracefully..");
                 fs_arc.db.flush().await?;
+                fs_arc.mark_clean_shutdown().await?;
             }
         }
     } else {
@@ -496,10 +498,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, flushing and shutting down gracefully...");
                 fs_arc.db.flush().await?;
+                fs_arc.mark_clean_shutdown().await?;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, flushing and shutting down gracefully..");
                 fs_arc.db.flush().await?;
+                fs_arc.mark_clean_shutdown().await?;
             }
         }
     }

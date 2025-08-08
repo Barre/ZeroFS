@@ -5,6 +5,7 @@ pub mod lock_manager;
 pub mod metrics;
 pub mod operations;
 pub mod permissions;
+pub mod recovery;
 pub mod stats;
 pub mod types;
 
@@ -38,6 +39,7 @@ pub const PREFIX_DIR_SCAN: u8 = 0x04;
 pub const PREFIX_TOMBSTONE: u8 = 0x05;
 pub const PREFIX_STATS: u8 = 0x06;
 pub const PREFIX_SYSTEM: u8 = 0x07;
+pub const PREFIX_RECOVERY: u8 = 0x08;
 
 #[derive(Debug)]
 pub enum ParsedKey {
@@ -305,7 +307,7 @@ impl ZeroFS {
             }
         }
 
-        let fs = Self {
+        let mut fs = Self {
             db: db.clone(),
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
@@ -314,6 +316,8 @@ impl ZeroFS {
             global_stats,
             last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
         };
+
+        fs.run_recovery_if_needed().await?;
 
         Ok(fs)
     }
@@ -335,6 +339,10 @@ impl ZeroFS {
 
     pub fn counter_key() -> Bytes {
         Bytes::from(vec![PREFIX_SYSTEM, 0x01]) // 0x01 for counter subtype
+    }
+
+    pub fn clean_shutdown_key() -> Bytes {
+        Bytes::from(vec![PREFIX_RECOVERY])
     }
 
     pub fn dir_entry_key(dir_inode_id: InodeId, name: &str) -> Bytes {
