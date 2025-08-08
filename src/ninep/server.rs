@@ -2,6 +2,7 @@ use super::handler::NinePHandler;
 use super::protocol::P9Message;
 use crate::fs::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
+use bytes::BytesMut;
 use deku::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -85,12 +86,11 @@ async fn handle_client(
             return Err("Invalid message size".into());
         }
 
-        let mut msg_buf = vec![0u8; (size - 4) as usize];
-        read_stream.read_exact(&mut msg_buf).await?;
-
-        let mut full_buf = Vec::with_capacity(size as usize);
+        let mut full_buf = BytesMut::with_capacity(size as usize);
         full_buf.extend_from_slice(&size_buf);
-        full_buf.extend_from_slice(&msg_buf);
+        full_buf.resize(size as usize, 0);
+
+        read_stream.read_exact(&mut full_buf[4..]).await?;
 
         match P9Message::from_bytes((&full_buf, 0)) {
             Ok((_, parsed)) => {

@@ -11,6 +11,7 @@ use crate::fs::inode::Inode;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
 use crate::fs::{EncodedFileId, ZeroFS};
+use bytes::BytesMut;
 use deku::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -147,7 +148,7 @@ impl NBDServer {
 
                 // Set the file size by writing a zero byte at the end
                 if device.size > 0 {
-                    let data = vec![0u8; 1];
+                    let data = [0u8; 1];
                     self.filesystem
                         .process_write(&auth, device_inode, device.size - 1, &data)
                         .await
@@ -645,7 +646,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // Check for out-of-bounds write
         if offset + length as u64 > device_size {
             // Must read and discard the data before sending error
-            let mut data = vec![0u8; length as usize];
+            let mut data = BytesMut::zeroed(length as usize);
             let _ = self.reader.read_exact(&mut data).await;
             let _ = self.send_simple_reply(cookie, NBD_ENOSPC, &[]).await;
             return NBD_ENOSPC;
@@ -669,7 +670,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             gids: vec![],
         };
 
-        let mut data = vec![0u8; length as usize];
+        let mut data = BytesMut::zeroed(length as usize);
         if self.reader.read_exact(&mut data).await.is_err() {
             let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
             return NBD_EIO;
@@ -821,36 +822,58 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             gid: 0,
             gids: vec![],
         };
-        let zero_data = vec![0u8; length as usize];
 
-        match self
-            .filesystem
-            .process_write(&auth, inode, offset, &zero_data)
-            .await
-        {
-            Ok(_) => {
-                // Handle FUA flag - force unit access (flush after write_zeroes)
-                if (flags & NBD_CMD_FLAG_FUA) != 0
-                    && let Err(e) = self.filesystem.flush().await
-                {
-                    error!("NBD write_zeroes FUA flush failed: {:?}", e);
-                    let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                    return NBD_EIO;
-                }
+        const ZERO_CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+        let zero_chunk = vec![0u8; ZERO_CHUNK_SIZE.min(length as usize)];
 
-                if self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                    .await
-                    .is_err()
-                {
-                    return NBD_EIO;
-                }
-                NBD_SUCCESS
+        // Write zeros in chunks to avoid huge allocations
+        let mut remaining = length as usize;
+        let mut current_offset = offset;
+        let mut write_succeeded = true;
+
+        while remaining > 0 && write_succeeded {
+            let chunk_size = remaining.min(ZERO_CHUNK_SIZE);
+            let chunk_data = if chunk_size == zero_chunk.len() {
+                &zero_chunk
+            } else {
+                &zero_chunk[..chunk_size]
+            };
+
+            if self
+                .filesystem
+                .process_write(&auth, inode, current_offset, chunk_data)
+                .await
+                .is_err()
+            {
+                write_succeeded = false;
+                break;
             }
-            Err(_) => {
+
+            remaining -= chunk_size;
+            current_offset += chunk_size as u64;
+        }
+
+        if write_succeeded {
+            // Handle FUA flag - force unit access (flush after write_zeroes)
+            if (flags & NBD_CMD_FLAG_FUA) != 0
+                && let Err(e) = self.filesystem.flush().await
+            {
+                error!("NBD write_zeroes FUA flush failed: {:?}", e);
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
-                NBD_EIO
+                return NBD_EIO;
             }
+
+            if self
+                .send_simple_reply(cookie, NBD_SUCCESS, &[])
+                .await
+                .is_err()
+            {
+                return NBD_EIO;
+            }
+            NBD_SUCCESS
+        } else {
+            let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
+            NBD_EIO
         }
     }
 
