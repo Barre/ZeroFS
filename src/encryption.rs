@@ -1,5 +1,5 @@
-use crate::filesystem::cache::{CacheKey, CacheValue, UnifiedCache};
-use crate::filesystem::{PREFIX_CHUNK, ParsedKey};
+use crate::fs::cache::{CacheKey, CacheValue, UnifiedCache};
+use crate::fs::{PREFIX_CHUNK, ParsedKey};
 use anyhow::Result;
 use bytes::Bytes;
 use chacha20poly1305::{

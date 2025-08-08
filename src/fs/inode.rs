@@ -80,7 +80,7 @@ pub enum Inode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::types::InodeWithId;
+    use crate::fs::types::InodeWithId;
 
     use zerofs_nfsserve::nfs::{fattr3, ftype3};
 

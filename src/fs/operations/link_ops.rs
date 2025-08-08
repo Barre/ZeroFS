@@ -1,12 +1,12 @@
 use super::common::validate_filename;
-use crate::filesystem::cache::CacheKey;
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{Inode, SymlinkInode};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-use crate::filesystem::types::{
+use crate::fs::cache::CacheKey;
+use crate::fs::errors::FsError;
+use crate::fs::inode::{Inode, SymlinkInode};
+use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
-use crate::filesystem::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
+use crate::fs::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;

@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use tracing::debug;
 
 use super::protocol::*;
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{Inode, InodeId};
-use crate::filesystem::permissions::Credentials;
-use crate::filesystem::types::{
+use crate::fs::errors::FsError;
+use crate::fs::inode::{Inode, InodeId};
+use crate::fs::permissions::Credentials;
+use crate::fs::types::{
     FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
 };
-use crate::filesystem::{EncodedFileId, ZeroFS};
+use crate::fs::{EncodedFileId, ZeroFS};
 use zerofs_nfsserve::vfs::NFSFileSystem;
 
 pub const DEFAULT_MSIZE: u32 = 1_048_576; // 1MB
@@ -1376,7 +1376,7 @@ pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::ZeroFS;
+    use crate::fs::ZeroFS;
     use libc::O_RDONLY;
     use std::sync::Arc;
     use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};

@@ -1,13 +1,13 @@
 use super::common::validate_filename;
-use crate::filesystem::cache::CacheKey;
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{DirectoryInode, Inode};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
-use crate::filesystem::types::{
+use crate::fs::cache::CacheKey;
+use crate::fs::errors::FsError;
+use crate::fs::inode::{DirectoryInode, Inode};
+use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::types::{
     AuthContext, DirEntry, FileAttributes, InodeId, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetTime, SetUid,
 };
-use crate::filesystem::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, ZeroFS, get_current_time};
+use crate::fs::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, ZeroFS, get_current_time};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};

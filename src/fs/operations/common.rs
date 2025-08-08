@@ -1,7 +1,7 @@
-use crate::filesystem::ZeroFS;
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{Inode, InodeId};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::ZeroFS;
+use crate::fs::errors::FsError;
+use crate::fs::inode::{Inode, InodeId};
+use crate::fs::permissions::{AccessMode, Credentials, check_access};
 
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 

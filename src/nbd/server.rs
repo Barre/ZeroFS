@@ -7,9 +7,10 @@ use super::protocol::{
     NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     get_transmission_flags,
 };
-use crate::filesystem::permissions::Credentials;
-use crate::filesystem::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
-use crate::filesystem::{EncodedFileId, ZeroFS};
+use crate::fs::inode::Inode;
+use crate::fs::permissions::Credentials;
+use crate::fs::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
+use crate::fs::{EncodedFileId, ZeroFS};
 use deku::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,7 +105,7 @@ impl NBDServer {
                         })?;
 
                 let existing_size = match &existing_inode {
-                    crate::filesystem::inode::Inode::File(f) => f.size,
+                    Inode::File(f) => f.size,
                     _ => 0,
                 };
 
@@ -604,7 +605,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = crate::filesystem::types::AuthContext {
+        let auth = crate::fs::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -662,7 +663,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = crate::filesystem::types::AuthContext {
+        let auth = crate::fs::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -752,7 +753,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = crate::filesystem::types::AuthContext {
+        let auth = crate::fs::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],
@@ -815,7 +816,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_SUCCESS;
         }
 
-        let auth = crate::filesystem::types::AuthContext {
+        let auth = crate::fs::types::AuthContext {
             uid: 0,
             gid: 0,
             gids: vec![],

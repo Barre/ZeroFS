@@ -1,12 +1,12 @@
 use super::common::validate_filename;
-use crate::filesystem::cache::{self, CacheKey, CacheValue};
-use crate::filesystem::errors::FsError;
-use crate::filesystem::inode::{FileInode, Inode};
-use crate::filesystem::permissions::{AccessMode, Credentials, check_access, validate_mode};
-use crate::filesystem::types::{
+use crate::fs::cache::{self, CacheKey, CacheValue};
+use crate::fs::errors::FsError;
+use crate::fs::inode::{FileInode, Inode};
+use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
+use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
-use crate::filesystem::{CHUNK_SIZE, ZeroFS, get_current_time};
+use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
