@@ -293,7 +293,8 @@ impl ZeroFS {
                     dir_entries.push((inode_id, filename.as_bytes().to_vec()));
                 }
 
-                const BUFFER_SIZE: usize = 16;
+                const BUFFER_SIZE: usize = 256;
+
                 let inode_futures =
                     stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
                         debug!("readdir: loading inode {} for entry", inode_id);
