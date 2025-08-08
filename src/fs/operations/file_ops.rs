@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
 
-const READ_CHUNK_BUFFER_SIZE: usize = 64;
+const READ_CHUNK_BUFFER_SIZE: usize = 256;
 
 impl ZeroFS {
     pub async fn process_write(
