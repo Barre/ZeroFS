@@ -433,21 +433,25 @@ impl NFSFileSystem for ZeroFS {
             Err(_) => post_op_attr::Void,
         };
 
-        let (used_bytes, _used_inodes) = self.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self.global_stats.get_totals();
 
-        // Get the next inode ID to determine how many IDs have been allocated
+        // Get the next inode ID to determine how many more IDs can be allocated
         let next_inode_id = self.next_inode_id.load(Ordering::Relaxed);
 
         // Available inodes = total possible inodes - allocated inode IDs
-        // Note: We use next_inode_id because once allocated, inode IDs are never reused
+        // This represents how many more inodes can be created (never increases since IDs aren't reused)
         let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
+
+        // Total inodes for NFS = currently used + available to allocate
+        // This will be less than TOTAL_INODES if some allocated IDs have been freed
+        let total_inodes = used_inodes + available_inodes;
 
         let res = fsstat3 {
             obj_attributes: obj_attr,
             tbytes: TOTAL_BYTES,
             fbytes: TOTAL_BYTES.saturating_sub(used_bytes),
             abytes: TOTAL_BYTES.saturating_sub(used_bytes),
-            tfiles: TOTAL_INODES,
+            tfiles: total_inodes,
             ffiles: available_inodes,
             afiles: available_inodes,
             invarsec: 1,

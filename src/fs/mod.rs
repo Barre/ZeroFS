@@ -716,10 +716,10 @@ impl ZeroFS {
 
         for i in 0..STATS_SHARDS {
             let shard_key = Self::stats_shard_key(i);
-            if let Some(data) = db.get_bytes(&shard_key).await? {
-                if let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data) {
-                    global_stats.load_shard(i, &shard_data);
-                }
+            if let Some(data) = db.get_bytes(&shard_key).await?
+                && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
+            {
+                global_stats.load_shard(i, &shard_data);
             }
         }
 

@@ -1160,7 +1160,7 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
-        let (used_bytes, _used_inodes) = self.filesystem.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
 
         // Constants matching NFS implementation
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
@@ -1172,15 +1172,19 @@ impl NinePHandler {
         let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
-        // Get the next inode ID to determine how many IDs have been allocated
+        // Get the next inode ID to determine how many more IDs can be allocated
         let next_inode_id = self
             .filesystem
             .next_inode_id
             .load(std::sync::atomic::Ordering::Relaxed);
 
         // Available inodes = total possible inodes - allocated inode IDs
-        // Note: We use next_inode_id because once allocated, inode IDs are never reused
+        // This represents how many more inodes can be created (never increases since IDs aren't reused)
         let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
+
+        // Total inodes for df = currently used + available to allocate
+        // This will be less than TOTAL_INODES if some allocated IDs have been freed
+        let total_inodes = used_inodes + available_inodes;
 
         let statfs = Rstatfs {
             r#type: 0x5a45524f,
@@ -1188,7 +1192,7 @@ impl NinePHandler {
             blocks: total_blocks,
             bfree: free_blocks,
             bavail: free_blocks,
-            files: TOTAL_INODES,
+            files: total_inodes,
             ffree: available_inodes,
             fsid: 0,
             namelen: 255,
@@ -1424,7 +1428,9 @@ mod tests {
                 const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
                 const TOTAL_INODES: u64 = 1 << 48;
                 assert_eq!(rstatfs.blocks * 4096, TOTAL_BYTES);
-                assert_eq!(rstatfs.files, TOTAL_INODES);
+                // Total files = used + free, which will be <= TOTAL_INODES
+                assert!(rstatfs.files <= TOTAL_INODES);
+                assert_eq!(rstatfs.files, rstatfs.ffree); // Since no files created yet, all are free
             }
             _ => panic!("Expected Rstatfs, got {:?}", statfs_resp.body),
         }

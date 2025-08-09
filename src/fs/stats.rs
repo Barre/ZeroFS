@@ -65,7 +65,7 @@ impl FileSystemGlobalStats {
 
         StatsUpdate {
             shard_id,
-            shard_key: stats_shard_key(shard_id),
+            shard_key: super::ZeroFS::stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         }
@@ -94,7 +94,7 @@ impl FileSystemGlobalStats {
 
         StatsUpdate {
             shard_id,
-            shard_key: stats_shard_key(shard_id),
+            shard_key: super::ZeroFS::stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         }
@@ -129,7 +129,7 @@ impl FileSystemGlobalStats {
 
         Some(StatsUpdate {
             shard_id,
-            shard_key: stats_shard_key(shard_id),
+            shard_key: super::ZeroFS::stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         })
@@ -169,10 +169,6 @@ impl FileSystemGlobalStats {
                 .store(data.used_inodes, Ordering::Relaxed);
         }
     }
-}
-
-fn stats_shard_key(shard_id: usize) -> Bytes {
-    Bytes::from(format!("stats:shard:{shard_id}"))
 }
 
 #[cfg(test)]
@@ -546,7 +542,11 @@ mod tests {
         assert_eq!(fsstat.tbytes, TOTAL_BYTES);
         assert_eq!(fsstat.fbytes, TOTAL_BYTES - 5_000_000);
         assert_eq!(fsstat.abytes, TOTAL_BYTES - 5_000_000);
-        assert_eq!(fsstat.tfiles, TOTAL_INODES);
+        // Total files = used_inodes + available_inodes
+        // Since we created one file, used_inodes = 1
+        // available = TOTAL_INODES - next_inode_id
+        let (_, used_inodes) = fs.global_stats.get_totals();
+        assert_eq!(fsstat.tfiles, used_inodes + (TOTAL_INODES - next_inode_id));
         // Available inodes are based on next_inode_id, not currently used inodes
         assert_eq!(fsstat.ffiles, TOTAL_INODES - next_inode_id);
         assert_eq!(fsstat.afiles, TOTAL_INODES - next_inode_id);
