@@ -7,10 +7,12 @@ RUN apt-get update && apt-get install -y \
     make \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/zerofs
+WORKDIR /usr/src
 
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY zerofs/Cargo.toml zerofs/Cargo.lock ./zerofs/
+COPY zerofs/src ./zerofs/src
+
+WORKDIR /usr/src/zerofs
 
 RUN cargo build --release
 

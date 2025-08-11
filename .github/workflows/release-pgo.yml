@@ -72,6 +72,7 @@ jobs:
           fi
 
       - name: Build with PGO instrumentation
+        working-directory: zerofs
         run: |
           rm -rf /tmp/pgo-data
 
@@ -91,7 +92,7 @@ jobs:
           export ZEROFS_ENCRYPTION_PASSWORD=secret
 
           if [ "${{ matrix.test }}" = "9p" ]; then
-            ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-profile/test &
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-profile/test &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS 9P server to start..."
             for i in {1..30}; do
@@ -122,7 +123,7 @@ jobs:
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
             export ZEROFS_NBD_PORTS=10809
             export ZEROFS_NBD_DEVICE_SIZES_GB=3
-            ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-zfs-test/zfs-test &
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-zfs-test/zfs-test &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NBD server to start..."
             for i in {1..30}; do
@@ -145,7 +146,7 @@ jobs:
             wait $ZEROFS_PID || true
 
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
-            ./target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-nfs-test/test &
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-nfs-test/test &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NFS server to start..."
             for i in {1..30}; do
@@ -316,19 +317,19 @@ jobs:
       - name: Build with PGO (cross)
         if: matrix.use_cross
         run: |
-          export RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata"
+          export RUSTFLAGS="-C profile-use=$(pwd)/../pgo-data/merged.profdata"
           cross build --release --target ${{ matrix.target }}
 
       - name: Build with PGO (cargo)
         if: matrix.use_cross == false
         run: |
-          export RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata"
+          export RUSTFLAGS="-C profile-use=$(pwd)/../pgo-data/merged.profdata"
           cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
 
       - name: Generate attestation for binary
