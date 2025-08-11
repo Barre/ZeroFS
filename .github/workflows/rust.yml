@@ -13,6 +13,9 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
     steps:
       - uses: actions/checkout@v4
       - name: Check formatting
@@ -21,6 +24,9 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,6 +36,9 @@ jobs:
   build:
     name: Build and Test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
