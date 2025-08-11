@@ -96,7 +96,6 @@ export const Header = forwardRef<
           <Link
             href="https://github.com/Barre/ZeroFS"
             target="_blank"
-            rel="noopener noreferrer"
             className="group flex h-8 w-8 items-center justify-center rounded-lg shadow-sm shadow-zinc-800/5 ring-1 ring-zinc-900/5 transition hover:shadow-md hover:shadow-zinc-800/5 hover:ring-zinc-900/10 dark:ring-white/10 dark:hover:ring-white/20"
             aria-label="View ZeroFS on GitHub"
           >
