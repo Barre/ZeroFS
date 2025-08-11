@@ -182,8 +182,8 @@ jobs:
 
           mkdir -p pgo-data
           cp merged.profdata pgo-data/
-          cp Cargo.toml pgo-data/
-          cp Cargo.lock pgo-data/
+          cp zerofs/Cargo.toml pgo-data/
+          cp zerofs/Cargo.lock pgo-data/
 
       - name: Upload PGO profile data
         uses: actions/upload-artifact@v4
