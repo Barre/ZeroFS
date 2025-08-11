@@ -54,9 +54,11 @@ jobs:
           ./mc mb myminio/zerofs-test || true
 
       - name: Build ZeroFS
+        working-directory: zerofs
         run: cargo build --profile ci
 
       - name: Start ZeroFS with 9P support
+        working-directory: zerofs
         run: |
           # Create cache directory
           mkdir -p /tmp/zerofs-cache

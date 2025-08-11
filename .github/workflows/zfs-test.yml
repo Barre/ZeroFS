@@ -46,9 +46,11 @@ jobs:
           ./mc mb myminio/zerofs-zfs-test || true
 
       - name: Build ZeroFS
+        working-directory: zerofs
         run: cargo build --profile ci
 
       - name: Start ZeroFS
+        working-directory: zerofs
         run: |
           # Create cache directory
           mkdir -p /tmp/zerofs-cache
@@ -287,6 +289,7 @@ jobs:
           fi
 
       - name: Restart ZeroFS
+        working-directory: zerofs
         run: |
           echo "Starting ZeroFS again..."
           AWS_ENDPOINT=http://localhost:9000 \
