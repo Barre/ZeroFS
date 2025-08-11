@@ -33,13 +33,12 @@ export function ThemeToggle() {
   return (
     <button
       type="button"
-      className="flex size-6 items-center justify-center rounded-md transition hover:bg-zinc-900/5 dark:hover:bg-white/5"
+      className="group flex h-8 w-8 items-center justify-center rounded-lg shadow-sm shadow-zinc-800/5 ring-1 ring-zinc-900/5 transition hover:shadow-md hover:shadow-zinc-800/5 hover:ring-zinc-900/10 dark:ring-white/10 dark:hover:ring-white/20"
       aria-label={mounted ? `Switch to ${otherTheme} theme` : 'Toggle theme'}
       onClick={() => setTheme(otherTheme)}
     >
-      <span className="absolute size-12 pointer-fine:hidden" />
-      <SunIcon className="h-5 w-5 stroke-zinc-900 dark:hidden" />
-      <MoonIcon className="hidden h-5 w-5 stroke-white dark:block" />
+      <SunIcon className="h-5 w-5 stroke-zinc-900 transition group-hover:stroke-zinc-700 dark:hidden" />
+      <MoonIcon className="hidden h-5 w-5 stroke-zinc-400 transition group-hover:stroke-white dark:block" />
     </button>
   )
 }
