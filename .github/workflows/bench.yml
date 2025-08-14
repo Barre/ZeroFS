@@ -1,0 +1,78 @@
+name: Benchmark Suite Rust
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "bench/**"
+      - ".github/workflows/bench.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "bench/**"
+      - ".github/workflows/bench.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --verbose
+      - name: Build release
+        run: cargo build --release --verbose
+      - name: Verify CLI works
+        run: cargo run -- run --list
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux-x64
+          path: bench/target/release/bench
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release --verbose
+      - name: Upload benchmark binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-macos-arm64
+          path: bench/target/release/bench
