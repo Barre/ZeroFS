@@ -22,18 +22,18 @@ impl Benchmark for FileDeletionBenchmark {
     fn name(&self) -> &str {
         "file-deletion"
     }
-    
+
     fn description(&self) -> &str {
         "Deletes files"
     }
-    
+
     fn setup(&mut self, config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
         self.work_dir = config.work_dir.join("file_deletion");
         if self.work_dir.exists() {
             fs::remove_dir_all(&self.work_dir)?;
         }
         fs::create_dir_all(&self.work_dir)?;
-        
+
         self.data = vec![0u8; config.size];
         for (i, byte) in self.data.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
@@ -44,19 +44,19 @@ impl Benchmark for FileDeletionBenchmark {
             file.write_all(&self.data)?;
             file.sync_all()?;
         }
-        
+
         Ok(())
     }
-    
+
     fn run_operation(&mut self, operation_id: usize) -> OperationResult {
         let file_path = self.work_dir.join(format!("file_{:06}.dat", operation_id));
-        
+
         let start = Instant::now();
-        
+
         let result = fs::remove_file(&file_path);
-        
+
         let duration = start.elapsed();
-        
+
         match result {
             Ok(_) => OperationResult {
                 duration,
@@ -70,7 +70,7 @@ impl Benchmark for FileDeletionBenchmark {
             },
         }
     }
-    
+
     fn cleanup(&mut self, _config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
         if self.work_dir.exists() {
             fs::remove_dir_all(&self.work_dir)?;

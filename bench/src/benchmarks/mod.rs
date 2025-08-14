@@ -1,13 +1,13 @@
 pub mod data_modifications;
+pub mod directory_traversal;
 pub mod empty_dirs;
 pub mod empty_files;
+pub mod file_deletion;
 pub mod file_moves;
+pub mod metadata_ops;
+pub mod random_reads;
 pub mod sequential_writes;
 pub mod single_file_append;
-pub mod random_reads;
-pub mod file_deletion;
-pub mod directory_traversal;
-pub mod metadata_ops;
 
 use crate::benchmark::Benchmark;
 
