@@ -55,6 +55,47 @@ ZeroFS can self-host! Here's a demo showing Rust's toolchain building ZeroFS whi
 <a href="https://asciinema.org/a/728101" target="_blank"><img src="https://asciinema.org/a/728101.png" /></a>
 </p>
 
+## Architecture
+
+```mermaid
+
+graph TB
+    subgraph "Client Layer"
+        NFS[NFS Client]
+        P9[9P Client]
+        NBD[NBD Client]
+    end
+    
+    subgraph "ZeroFS Core"
+        NFSD[NFS Server]
+        P9D[9P Server]
+        NBDD[NBD Server]
+        VFS[Virtual Filesystem]
+        ENC[Encryption Manager]
+        CACHE[Cache Manager]
+        
+        NFSD --> VFS
+        P9D --> VFS
+        NBDD --> VFS
+        VFS --> ENC
+        ENC --> CACHE
+    end
+    
+    subgraph "Storage Backend"
+        SLATE[SlateDB]
+        LSM[LSM Tree]
+        S3[S3 Object Store]
+        
+        CACHE --> SLATE
+        SLATE --> LSM
+        LSM --> S3
+    end
+    
+    NFS --> NFSD
+    P9 --> P9D
+    NBD --> NBDD
+```
+
 ## Configuration
 
 ZeroFS supports multiple access modes to the same S3-backed storage:
