@@ -47,7 +47,7 @@ impl Benchmark for SingleFileAppendBenchmark {
         for (i, byte) in self.data.iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        
+
         self.appends_since_sync = 0;
 
         Ok(())
@@ -59,14 +59,14 @@ impl Benchmark for SingleFileAppendBenchmark {
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut file = OpenOptions::new().append(true).open(&self.file_path)?;
             file.write_all(&self.data)?;
-            
+
             self.appends_since_sync += 1;
-            
+
             if self.appends_since_sync >= self.sync_interval {
                 file.sync_data()?;
                 self.appends_since_sync = 0;
             }
-            
+
             Ok(())
         })();
 
@@ -91,7 +91,7 @@ impl Benchmark for SingleFileAppendBenchmark {
             let file = OpenOptions::new().append(true).open(&self.file_path)?;
             file.sync_data()?;
         }
-        
+
         if self.work_dir.exists() {
             fs::remove_dir_all(&self.work_dir)?;
         }

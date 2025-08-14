@@ -53,9 +53,9 @@ impl Benchmark for SequentialWritesBenchmark {
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut file = File::create(&file_path)?;
             file.write_all(&self.data)?;
-            
+
             self.open_files.push(file);
-            
+
             // Batch sync every N files to amortize fsync cost
             if self.open_files.len() >= self.sync_interval {
                 for file in &mut self.open_files {
@@ -63,7 +63,7 @@ impl Benchmark for SequentialWritesBenchmark {
                 }
                 self.open_files.clear();
             }
-            
+
             Ok(())
         })();
 
@@ -89,7 +89,7 @@ impl Benchmark for SequentialWritesBenchmark {
             file.sync_all()?;
         }
         self.open_files.clear();
-        
+
         if self.work_dir.exists() {
             fs::remove_dir_all(&self.work_dir)?;
         }

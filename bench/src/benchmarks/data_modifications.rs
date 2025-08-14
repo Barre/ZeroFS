@@ -53,7 +53,7 @@ impl Benchmark for DataModificationsBenchmark {
         self.modification_data = vec![0u8; config.size];
         let mut rng = rand::rng();
         rng.fill(&mut self.modification_data[..]);
-        
+
         self.modifications_since_sync = 0;
 
         Ok(())
@@ -74,15 +74,15 @@ impl Benchmark for DataModificationsBenchmark {
             let mut file = OpenOptions::new().write(true).open(&self.file_path)?;
             file.seek(SeekFrom::Start(offset as u64))?;
             file.write_all(&self.modification_data)?;
-            
+
             self.modifications_since_sync += 1;
-            
+
             // Batch sync to amortize cost
             if self.modifications_since_sync >= self.sync_interval {
                 file.sync_data()?;
                 self.modifications_since_sync = 0;
             }
-            
+
             Ok(())
         })();
 
@@ -108,7 +108,7 @@ impl Benchmark for DataModificationsBenchmark {
             let file = OpenOptions::new().write(true).open(&self.file_path)?;
             file.sync_data()?;
         }
-        
+
         if self.work_dir.exists() {
             fs::remove_dir_all(&self.work_dir)?;
         }
