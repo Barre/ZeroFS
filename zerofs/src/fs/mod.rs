@@ -205,9 +205,7 @@ impl ZeroFS {
                 ..Default::default()
             },
             flush_interval: Some(std::time::Duration::from_secs(30)),
-            l0_sst_size_bytes: 128 * 1024 * 1024,
-            l0_max_ssts: 30,
-            max_unflushed_bytes: 512 * 1024 * 1024,
+            max_unflushed_bytes: 1024 * 1024 * 1024,
             compactor_options: Some(slatedb::config::CompactorOptions {
                 max_sst_size: 256 * 1024 * 1024,
                 max_concurrent_compactions: 64,
