@@ -180,7 +180,7 @@ pub async fn load_or_init_encryption_key(db: &slatedb::Db, password: &str) -> Re
                 &serialized,
                 &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await?;

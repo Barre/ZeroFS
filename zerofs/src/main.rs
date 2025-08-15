@@ -288,8 +288,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     temp_fs.db.close().await?;
     drop(temp_fs);
 
-    info!("Encryption key loaded successfully");
-
     let fs =
         ZeroFS::new_with_object_store(object_store, cache_config, actual_db_path, encryption_key)
             .await?;
@@ -427,7 +425,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Start 9P server
     let ninep_host =
         std::env::var("ZEROFS_9P_HOST").unwrap_or_else(|_| DEFAULT_9P_HOST.to_string());
     let ninep_port = std::env::var("ZEROFS_9P_PORT")
