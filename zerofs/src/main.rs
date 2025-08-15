@@ -246,7 +246,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let temp_fs = ZeroFS::dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store.clone(),
-        cache_config.clone(),
         actual_db_path.clone(),
     )
     .await?;

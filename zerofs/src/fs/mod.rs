@@ -758,34 +758,16 @@ impl ZeroFS {
     /// DANGEROUS: Creates an unencrypted database connection. Only use for key management!
     pub async fn dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store: Arc<dyn ObjectStore>,
-        cache_config: CacheConfig,
         db_path: String,
     ) -> Result<DangerousUnencryptedZeroFS, Box<dyn std::error::Error>> {
-        let total_cache_size_gb = cache_config.max_cache_size_gb;
-
-        // For key management, all disk cache goes to SlateDB
-        let slatedb_cache_size_gb = total_cache_size_gb;
-
-        tracing::info!(
-            "Cache allocation for key management - Total: {:.2}GB, SlateDB (disk): {:.2}GB",
-            total_cache_size_gb,
-            slatedb_cache_size_gb
-        );
-
         let settings = slatedb::config::Settings {
             wal_enabled: false,
             ..Default::default()
         };
 
-        let unencrypted_cache_bytes = 250_000_000u64;
-        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: unencrypted_cache_bytes,
-        }));
-
         let slatedb = Arc::new(
             DbBuilder::new(Path::from(db_path), object_store)
                 .with_settings(settings)
-                .with_block_cache(cache)
                 .build()
                 .await?,
         );
