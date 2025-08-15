@@ -209,7 +209,6 @@ impl ZeroFS {
             max_unflushed_bytes: 1024 * 1024 * 1024,
             compactor_options: Some(slatedb::config::CompactorOptions {
                 max_sst_size: 256 * 1024 * 1024,
-                max_concurrent_compactions: 64,
                 ..Default::default()
             }),
             compression_codec: None, // Disable compression - we handle it in encryption layer
@@ -621,7 +620,6 @@ impl ZeroFS {
             wal_enabled: false,
             compression_codec: None, // Disable compression - we handle it in encryption layer
             compactor_options: Some(slatedb::config::CompactorOptions {
-                max_concurrent_compactions: 64,
                 ..Default::default()
             }),
             ..Default::default()
