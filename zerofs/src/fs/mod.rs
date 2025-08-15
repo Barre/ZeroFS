@@ -197,6 +197,7 @@ impl ZeroFS {
         let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
 
         let settings = slatedb::config::Settings {
+            wal_enabled: false,
             object_store_cache_options: ObjectStoreCacheOptions {
                 root_folder: Some(slatedb_cache_dir.clone().into()),
                 max_cache_size_bytes: Some(slatedb_object_cache_bytes),
@@ -645,6 +646,7 @@ impl ZeroFS {
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
 
         let settings = slatedb::config::Settings {
+            wal_enabled: false,
             compression_codec: None, // Disable compression - we handle it in encryption layer
             compactor_options: Some(slatedb::config::CompactorOptions {
                 max_concurrent_compactions: 32,
@@ -771,6 +773,7 @@ impl ZeroFS {
         );
 
         let settings = slatedb::config::Settings {
+            wal_enabled: false,
             ..Default::default()
         };
 
