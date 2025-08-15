@@ -10,8 +10,6 @@ pub struct DataModificationsBenchmark {
     file_path: PathBuf,
     modification_data: Vec<u8>,
     file_size: usize,
-    modifications_since_sync: usize,
-    sync_interval: usize,
 }
 
 impl DataModificationsBenchmark {
@@ -21,8 +19,6 @@ impl DataModificationsBenchmark {
             file_path: PathBuf::new(),
             modification_data: Vec::new(),
             file_size: 0,
-            modifications_since_sync: 0,
-            sync_interval: 100,
         }
     }
 }
@@ -54,8 +50,6 @@ impl Benchmark for DataModificationsBenchmark {
         let mut rng = rand::rng();
         rng.fill(&mut self.modification_data[..]);
 
-        self.modifications_since_sync = 0;
-
         Ok(())
     }
 
@@ -74,15 +68,6 @@ impl Benchmark for DataModificationsBenchmark {
             let mut file = OpenOptions::new().write(true).open(&self.file_path)?;
             file.seek(SeekFrom::Start(offset as u64))?;
             file.write_all(&self.modification_data)?;
-
-            self.modifications_since_sync += 1;
-
-            // Batch sync to amortize cost
-            if self.modifications_since_sync >= self.sync_interval {
-                file.sync_data()?;
-                self.modifications_since_sync = 0;
-            }
-
             Ok(())
         })();
 

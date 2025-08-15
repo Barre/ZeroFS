@@ -8,8 +8,6 @@ pub struct SingleFileAppendBenchmark {
     work_dir: PathBuf,
     file_path: PathBuf,
     data: Vec<u8>,
-    appends_since_sync: usize,
-    sync_interval: usize,
 }
 
 impl SingleFileAppendBenchmark {
@@ -18,8 +16,6 @@ impl SingleFileAppendBenchmark {
             work_dir: PathBuf::new(),
             file_path: PathBuf::new(),
             data: Vec::new(),
-            appends_since_sync: 0,
-            sync_interval: 100,
         }
     }
 }
@@ -48,8 +44,6 @@ impl Benchmark for SingleFileAppendBenchmark {
             *byte = (i % 256) as u8;
         }
 
-        self.appends_since_sync = 0;
-
         Ok(())
     }
 
@@ -59,14 +53,6 @@ impl Benchmark for SingleFileAppendBenchmark {
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             let mut file = OpenOptions::new().append(true).open(&self.file_path)?;
             file.write_all(&self.data)?;
-
-            self.appends_since_sync += 1;
-
-            if self.appends_since_sync >= self.sync_interval {
-                file.sync_data()?;
-                self.appends_since_sync = 0;
-            }
-
             Ok(())
         })();
 
