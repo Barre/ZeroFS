@@ -63,11 +63,10 @@ fn execute_benchmark(
     println!("{}", benchmark.description());
 
     print!("Setting up... ");
-
-    let total_start = Instant::now();
     benchmark.setup(config)?;
     println!("done");
 
+    let total_start = Instant::now();
     let pb = ProgressBar::new(config.ops as u64);
     pb.set_style(
         ProgressStyle::default_bar()
