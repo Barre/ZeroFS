@@ -17,6 +17,7 @@ use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use crate::encryption::{EncryptedDb, EncryptionManager};
 use bytes::Bytes;
+use slatedb::SstBlockSize;
 use slatedb::config::ObjectStoreCacheOptions;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::object_store::{ObjectStore, path::Path};
@@ -238,6 +239,7 @@ impl ZeroFS {
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_compaction_runtime(runtime_handle.clone())
+                .with_sst_block_size(SstBlockSize::Block16Kib)
                 .with_block_cache(cache)
                 .build()
                 .await?,
@@ -625,7 +627,6 @@ impl ZeroFS {
             ..Default::default()
         };
 
-        // For tests, use 50MB cache
         let test_cache_bytes = 50_000_000u64;
         let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
             max_capacity: test_cache_bytes,
@@ -636,6 +637,7 @@ impl ZeroFS {
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
                 .with_block_cache(cache)
+                .with_sst_block_size(SstBlockSize::Block16Kib)
                 .build()
                 .await?,
         );
@@ -740,6 +742,7 @@ impl ZeroFS {
         let slatedb = Arc::new(
             DbBuilder::new(Path::from(db_path), object_store)
                 .with_settings(settings)
+                .with_sst_block_size(SstBlockSize::Block16Kib)
                 .build()
                 .await?,
         );
