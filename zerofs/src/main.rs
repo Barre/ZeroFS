@@ -294,7 +294,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ZeroFS::new_with_object_store(object_store, cache_config, actual_db_path, encryption_key)
             .await?;
 
-    // Parse NBD device configuration from environment
     let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());
     let nbd_device_sizes =
         std::env::var("ZEROFS_NBD_DEVICE_SIZES_GB").unwrap_or_else(|_| "".to_string());
@@ -302,10 +301,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fs_arc = Arc::new(fs);
 
-    // Start automatic flush task
     let flush_handle = fs_arc.clone().start_auto_flush();
 
-    // Start NFS server
     let zerofs_nfs_host =
         std::env::var("ZEROFS_NFS_HOST").unwrap_or_else(|_| DEFAULT_NFS_HOST.to_string());
 
