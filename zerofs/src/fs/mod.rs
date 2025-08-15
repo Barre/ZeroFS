@@ -203,7 +203,7 @@ impl ZeroFS {
                 max_cache_size_bytes: Some(slatedb_object_cache_bytes),
                 ..Default::default()
             },
-            flush_interval: Some(std::time::Duration::from_secs(5)),
+            flush_interval: Some(std::time::Duration::from_secs(30)),
             l0_sst_size_bytes: 128 * 1024 * 1024,
             l0_max_ssts: 30,
             max_unflushed_bytes: 512 * 1024 * 1024,
