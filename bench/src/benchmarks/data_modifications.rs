@@ -101,17 +101,4 @@ impl Benchmark for DataModificationsBenchmark {
             },
         }
     }
-
-    fn cleanup(&mut self, _config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // Sync remaining modifications
-        if self.modifications_since_sync > 0 && self.file_path.exists() {
-            let file = OpenOptions::new().write(true).open(&self.file_path)?;
-            file.sync_data()?;
-        }
-
-        if self.work_dir.exists() {
-            fs::remove_dir_all(&self.work_dir)?;
-        }
-        Ok(())
-    }
 }

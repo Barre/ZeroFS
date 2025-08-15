@@ -51,7 +51,6 @@ impl Benchmark for FileMovesBenchmark {
             let file_path = self.src_dir.join(format!("file_{:06}.dat", i));
             let mut file = File::create(&file_path)?;
             file.write_all(&self.data)?;
-            file.sync_all()?;
         }
 
         Ok(())
@@ -79,12 +78,5 @@ impl Benchmark for FileMovesBenchmark {
                 error: Some(e.to_string()),
             },
         }
-    }
-
-    fn cleanup(&mut self, _config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if self.work_dir.exists() {
-            fs::remove_dir_all(&self.work_dir)?;
-        }
-        Ok(())
     }
 }

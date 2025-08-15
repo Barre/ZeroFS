@@ -94,11 +94,4 @@ impl Benchmark for DirectoryTraversalBenchmark {
             },
         }
     }
-
-    fn cleanup(&mut self, _config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if self.work_dir.exists() {
-            fs::remove_dir_all(&self.work_dir)?;
-        }
-        Ok(())
-    }
 }

@@ -44,7 +44,6 @@ impl Benchmark for MetadataOpsBenchmark {
 
             let mut file = File::create(&file_path)?;
             file.write_all(&data)?;
-            file.sync_all()?;
 
             self.file_paths.push(file_path);
         }
@@ -81,13 +80,5 @@ impl Benchmark for MetadataOpsBenchmark {
                 error: Some(e.to_string()),
             },
         }
-    }
-
-    fn cleanup(&mut self, _config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.file_paths.clear();
-        if self.work_dir.exists() {
-            fs::remove_dir_all(&self.work_dir)?;
-        }
-        Ok(())
     }
 }

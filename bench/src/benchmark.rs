@@ -35,5 +35,10 @@ pub trait Benchmark: Send + Sync {
     fn description(&self) -> &str;
     fn setup(&mut self, config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>>;
     fn run_operation(&mut self, operation_id: usize) -> OperationResult;
-    fn cleanup(&mut self, config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>>;
+    fn finalize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            libc::sync();
+        }
+        Ok(())
+    }
 }

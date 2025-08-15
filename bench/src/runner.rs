@@ -97,12 +97,10 @@ fn execute_benchmark(
         pb.inc(1);
     }
 
+    benchmark.finalize()?;
+
     let total_duration = total_start.elapsed();
     pb.finish_with_message("Complete");
-
-    print!("Cleaning up... ");
-    benchmark.cleanup(config)?;
-    println!("done");
     let (mean_duration, min_duration, max_duration) = if !durations.is_empty() {
         let sum: Duration = durations.iter().sum();
         let mean = sum / durations.len() as u32;

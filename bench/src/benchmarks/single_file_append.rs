@@ -85,16 +85,4 @@ impl Benchmark for SingleFileAppendBenchmark {
             },
         }
     }
-
-    fn cleanup(&mut self, _config: &BenchmarkConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if self.appends_since_sync > 0 && self.file_path.exists() {
-            let file = OpenOptions::new().append(true).open(&self.file_path)?;
-            file.sync_data()?;
-        }
-
-        if self.work_dir.exists() {
-            fs::remove_dir_all(&self.work_dir)?;
-        }
-        Ok(())
-    }
 }

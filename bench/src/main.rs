@@ -109,6 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!("{}", formatter.format(&results));
+
+            if work_dir.exists() {
+                fs::remove_dir_all(&work_dir)?;
+            }
         }
         Commands::Clean { work_dir } => {
             if work_dir.exists() {
