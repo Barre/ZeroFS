@@ -53,7 +53,7 @@ impl ZeroFS {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -156,7 +156,7 @@ impl ZeroFS {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -312,7 +312,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -393,7 +393,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -471,7 +471,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -556,7 +556,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -589,7 +589,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -664,7 +664,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
@@ -770,7 +770,7 @@ mod tests {
             .write_with_options(
                 batch,
                 &WriteOptions {
-                    await_durable: true,
+                    await_durable: false,
                 },
             )
             .await
