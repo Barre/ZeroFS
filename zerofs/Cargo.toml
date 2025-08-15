@@ -21,7 +21,9 @@ tokio = { version = "1.46", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "1ee73098e93ad9b40854963c7dae44dd628e48c2" }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "1ee73098e93ad9b40854963c7dae44dd628e48c2", features = [
+    "wal_disable",
+] }
 object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
 bytes = "1.5"
 serde = { version = "1.0", features = ["derive"] }
