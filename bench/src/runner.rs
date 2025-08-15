@@ -63,6 +63,8 @@ fn execute_benchmark(
     println!("{}", benchmark.description());
 
     print!("Setting up... ");
+
+    let total_start = Instant::now();
     benchmark.setup(config)?;
     println!("done");
 
@@ -78,8 +80,6 @@ fn execute_benchmark(
     let mut errors = HashSet::new();
     let mut successful_ops = 0;
     let mut failed_ops = 0;
-
-    let total_start = Instant::now();
 
     for i in 0..config.ops {
         let result = benchmark.run_operation(i);
