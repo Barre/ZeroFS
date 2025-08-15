@@ -457,14 +457,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fs_arc.db.flush().await?;
                 fs_arc.mark_clean_shutdown().await?;
                 fs_arc.db.flush().await?;
-
+                fs_arc.db.close().await?;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, flushing and shutting down gracefully..");
                 fs_arc.db.flush().await?;
                 fs_arc.mark_clean_shutdown().await?;
                 fs_arc.db.flush().await?;
-
+                fs_arc.db.close().await?;
             }
         }
     } else {
