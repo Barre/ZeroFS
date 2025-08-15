@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod errors;
+pub mod flush_coordinator;
 pub mod inode;
 pub mod lock_manager;
 pub mod metrics;
@@ -10,6 +11,7 @@ pub mod stats;
 pub mod types;
 
 use self::cache::{CacheKey, CacheValue, UnifiedCache};
+use self::flush_coordinator::FlushCoordinator;
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
@@ -23,7 +25,6 @@ use slatedb::{
     config::{PutOptions, WriteOptions},
 };
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::fileid3;
@@ -148,7 +149,7 @@ pub struct ZeroFS {
     pub cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
-    pub last_flush: Arc<Mutex<std::time::Instant>>,
+    flush_coordinator: FlushCoordinator,
 }
 
 // DANGEROUS: Temporary unencrypted access only for initial key setup and password changes
@@ -308,6 +309,8 @@ impl ZeroFS {
             }
         }
 
+        let flush_coordinator = FlushCoordinator::new(db.clone());
+
         let mut fs = Self {
             db: db.clone(),
             lock_manager,
@@ -315,7 +318,7 @@ impl ZeroFS {
             cache: unified_cache,
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
-            last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
+            flush_coordinator,
         };
 
         fs.run_recovery_if_needed().await?;
@@ -397,38 +400,7 @@ impl ZeroFS {
     }
 
     pub async fn flush(&self) -> Result<(), FsError> {
-        let result = self.db.flush().await.map_err(|_| FsError::IoError);
-        if result.is_ok() {
-            *self.last_flush.lock().unwrap() = std::time::Instant::now();
-        }
-        result
-    }
-
-    pub fn start_auto_flush(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            tracing::info!("Starting automatic flush task (flushes every 30 seconds if needed)");
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-
-            loop {
-                interval.tick().await;
-
-                let should_flush = {
-                    let last_flush = self.last_flush.lock().unwrap();
-                    last_flush.elapsed() >= std::time::Duration::from_secs(30)
-                };
-
-                if should_flush {
-                    match self.flush().await {
-                        Ok(_) => {
-                            tracing::debug!("Automatic flush completed successfully");
-                        }
-                        Err(e) => {
-                            tracing::error!("Automatic flush failed: {:?}", e);
-                        }
-                    }
-                }
-            }
-        })
+        self.flush_coordinator.flush().await
     }
 
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, FsError> {
@@ -725,6 +697,8 @@ impl ZeroFS {
             }
         }
 
+        let flush_coordinator = FlushCoordinator::new(db.clone());
+
         let fs = Self {
             db: db.clone(),
             lock_manager,
@@ -732,7 +706,7 @@ impl ZeroFS {
             cache: unified_cache,
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
-            last_flush: Arc::new(Mutex::new(std::time::Instant::now())),
+            flush_coordinator,
         };
 
         Ok(fs)

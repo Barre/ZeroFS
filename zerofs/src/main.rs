@@ -299,8 +299,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fs_arc = Arc::new(fs);
 
-    let flush_handle = fs_arc.clone().start_auto_flush();
-
     let zerofs_nfs_host =
         std::env::var("ZEROFS_NFS_HOST").unwrap_or_else(|_| DEFAULT_NFS_HOST.to_string());
 
@@ -454,9 +452,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = stats_handle => {
                 unreachable!("Stats task should never complete");
             }
-            _ = flush_handle => {
-                unreachable!("Flush task should never complete");
-            }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, flushing and shutting down gracefully...");
                 fs_arc.db.flush().await?;
@@ -488,9 +483,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = stats_handle => {
                 unreachable!("Stats task should never complete");
-            }
-            _ = flush_handle => {
-                unreachable!("Flush task should never complete");
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, flushing and shutting down gracefully...");
