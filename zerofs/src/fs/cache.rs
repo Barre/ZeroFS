@@ -1,25 +1,18 @@
 use super::inode::{Inode, InodeId};
-use bytes::Bytes;
 use foyer::{Cache, CacheBuilder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-pub const SMALL_FILE_THRESHOLD_BYTES: u64 = 512 * 1024;
-
 #[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum CacheKey {
     Metadata(InodeId),
-    SmallFile(InodeId),
     DirEntry { dir_id: InodeId, name: String },
-    Block { inode_id: InodeId, block_index: u64 },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum CacheValue {
     Metadata(#[serde(with = "serde_arc")] Arc<Inode>),
-    SmallFile(Bytes),
     DirEntry(InodeId),
-    Block(Bytes),
 }
 
 mod serde_arc {

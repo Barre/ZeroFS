@@ -45,7 +45,7 @@ pub const PREFIX_RECOVERY: u8 = 0x08;
 
 #[derive(Debug)]
 pub enum ParsedKey {
-    Chunk { inode_id: InodeId, chunk_index: u64 },
+    Chunk,
     DirScan { entry_id: InodeId, name: String },
     Tombstone { inode_id: InodeId },
 }
@@ -57,14 +57,7 @@ impl ParsedKey {
         }
 
         match key[0] {
-            PREFIX_CHUNK if key.len() == 17 => {
-                let inode_id = u64::from_be_bytes(key[1..9].try_into().ok()?);
-                let chunk_index = u64::from_be_bytes(key[9..17].try_into().ok()?);
-                Some(ParsedKey::Chunk {
-                    inode_id,
-                    chunk_index,
-                })
-            }
+            PREFIX_CHUNK if key.len() == 17 => Some(ParsedKey::Chunk),
             PREFIX_DIR_SCAN if key.len() > 17 => {
                 let entry_id = u64::from_be_bytes(key[9..17].try_into().ok()?);
                 let name = String::from_utf8(key[17..].to_vec()).ok()?;
@@ -448,15 +441,7 @@ impl ZeroFS {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        let mut keys_to_remove = vec![CacheKey::Metadata(inode_id)];
-
-        if let Inode::File(file) = inode
-            && file.size <= self::cache::SMALL_FILE_THRESHOLD_BYTES
-        {
-            keys_to_remove.push(CacheKey::SmallFile(inode_id));
-        }
-
-        self.cache.remove_batch(keys_to_remove).await;
+        self.cache.remove(CacheKey::Metadata(inode_id)).await;
 
         Ok(())
     }

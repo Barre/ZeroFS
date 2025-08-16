@@ -177,10 +177,7 @@ impl ZeroFS {
                             self.global_stats.commit_update(&update);
                         }
 
-                        // Remove both cache entries in batch
-                        self.cache
-                            .remove_batch(vec![CacheKey::Metadata(id), CacheKey::SmallFile(id)])
-                            .await;
+                        self.cache.remove(CacheKey::Metadata(id)).await;
 
                         return Ok(InodeWithId { inode: &inode, id }.into());
                     }
