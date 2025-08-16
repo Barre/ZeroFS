@@ -3,7 +3,7 @@
   "rewrites": [
     { 
         "source": "/va/:match*", 
-        "destination": "https://www.zerofs.net/_vercel/insights/:match*" 
+        "destination": "https://www.zerofs.net/_vercel/:match*" 
     }
   ]
 }
