@@ -284,9 +284,11 @@ impl ZeroFS {
         let lock_manager = Arc::new(LockManager::new());
 
         let zerofs_cache_dir = format!("{}/zerofs", cache_config.root_folder);
-        let unified_cache = Arc::new(
-            UnifiedCache::new(&zerofs_cache_dir, 0.0, Some(zerofs_memory_cache_gb)).await?,
-        );
+        let unified_cache = Arc::new(UnifiedCache::new(
+            &zerofs_cache_dir,
+            0.0,
+            Some(zerofs_memory_cache_gb),
+        )?);
 
         let db = Arc::new(
             EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
@@ -399,7 +401,7 @@ impl ZeroFS {
 
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, FsError> {
         let cache_key = CacheKey::Metadata(inode_id);
-        if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key).await {
+        if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((*cached_inode).clone());
         }
@@ -420,7 +422,7 @@ impl ZeroFS {
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
-        self.cache.insert(cache_key, cache_value, false).await;
+        self.cache.insert(cache_key, cache_value, false);
 
         Ok(inode)
     }
@@ -441,7 +443,7 @@ impl ZeroFS {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        self.cache.remove(CacheKey::Metadata(inode_id)).await;
+        self.cache.remove(CacheKey::Metadata(inode_id));
 
         Ok(())
     }
@@ -665,7 +667,7 @@ impl ZeroFS {
         let lock_manager = Arc::new(LockManager::new());
 
         // For tests, use memory-only cache (no disk backing needed)
-        let unified_cache = Arc::new(UnifiedCache::new("", 0.0, Some(0.1)).await?);
+        let unified_cache = Arc::new(UnifiedCache::new("", 0.0, Some(0.1))?);
 
         let db = Arc::new(
             EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),

@@ -148,7 +148,7 @@ impl ZeroFS {
 
                 self.global_stats.commit_update(&stats_update);
 
-                self.cache.remove(CacheKey::Metadata(dirid)).await;
+                self.cache.remove(CacheKey::Metadata(dirid));
 
                 self.stats
                     .directories_created
