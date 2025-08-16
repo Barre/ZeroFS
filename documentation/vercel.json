@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { 
+        "source": "/va/:match*", 
+        "destination": "https://www.zerofs.net/_vercel/insights/:match*" 
+    }
+  ]
+}

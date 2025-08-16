@@ -1,6 +1,6 @@
 import glob from 'fast-glob'
 import { type Metadata } from 'next'
-import { Analytics } from "@vercel/analytics/next"
+import { Analytics } from '@vercel/analytics/react';
 import { Providers } from '@/app/providers'
 import { Layout } from '@/components/Layout'
 import { type Section } from '@/components/SectionProvider'
@@ -50,7 +50,7 @@ export default async function RootLayout({
             <Layout allSections={allSections}>{children}</Layout>
           </div>
         </Providers>
-        <Analytics />
+        <Analytics basePath="/va" />
       </body>
     </html>
   )
