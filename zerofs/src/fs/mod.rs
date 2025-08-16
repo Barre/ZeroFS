@@ -241,7 +241,7 @@ impl ZeroFS {
                 .with_gc_runtime(runtime_handle.clone())
                 .with_compaction_runtime(runtime_handle.clone())
                 .with_sst_block_size(SstBlockSize::Block16Kib)
-                .with_block_cache(cache)
+                .with_memory_cache(cache)
                 .build()
                 .await?,
         );
@@ -636,7 +636,7 @@ impl ZeroFS {
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
-                .with_block_cache(cache)
+                .with_memory_cache(cache)
                 .with_sst_block_size(SstBlockSize::Block16Kib)
                 .build()
                 .await?,
