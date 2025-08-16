@@ -8,6 +8,7 @@ use crate::fs::types::{
 };
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use bytes::{Bytes, BytesMut};
+use futures::TryStreamExt;
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
@@ -432,11 +433,9 @@ impl ZeroFS {
                 });
 
                 let mut chunks: Vec<(usize, Option<Bytes>)> = chunk_futures
-                    .buffered(READ_CHUNK_BUFFER_SIZE)
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE) // ← More efficient
+                    .try_collect::<Vec<_>>()
+                    .await?;
 
                 chunks.sort_by_key(|(idx, _)| *idx);
 
