@@ -204,9 +204,6 @@ impl ZeroFS {
                     .remove(crate::fs::cache::CacheKey::Metadata(dirid))
                     .await;
                 self.cache
-                    .remove(crate::fs::cache::CacheKey::SmallFile(file_id))
-                    .await;
-                self.cache
                     .remove(crate::fs::cache::CacheKey::DirEntry {
                         dir_id: dirid,
                         name: name.clone(),

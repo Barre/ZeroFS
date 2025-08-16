@@ -1,5 +1,5 @@
-use crate::fs::cache::{CacheKey, CacheValue, UnifiedCache};
-use crate::fs::{PREFIX_CHUNK, ParsedKey};
+use crate::fs::PREFIX_CHUNK;
+use crate::fs::cache::UnifiedCache;
 use anyhow::Result;
 use bytes::Bytes;
 use chacha20poly1305::{
@@ -173,22 +173,6 @@ impl EncryptedDb {
     }
 
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
-        // Check if this is a chunk and if we have cache
-        if let Some(cache) = &self.cache
-            && let Some(ParsedKey::Chunk {
-                inode_id,
-                chunk_index,
-            }) = ParsedKey::parse(key)
-        {
-            let cache_key = CacheKey::Block {
-                inode_id,
-                block_index: chunk_index,
-            };
-            if let Some(CacheValue::Block(cached_data)) = cache.get(cache_key.clone()).await {
-                return Ok(Some(cached_data.clone()));
-            }
-        }
-
         match self.inner.get(key).await? {
             Some(encrypted) => {
                 let encryptor = self.encryptor.clone();
@@ -199,20 +183,6 @@ impl EncryptedDb {
                     task::spawn_blocking(move || encryptor.decrypt(&key_bytes, &encrypted_data))
                         .await
                         .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
-
-                if let Some(cache) = &self.cache
-                    && let Some(ParsedKey::Chunk {
-                        inode_id,
-                        chunk_index,
-                    }) = ParsedKey::parse(key)
-                {
-                    let cache_key = CacheKey::Block {
-                        inode_id,
-                        block_index: chunk_index,
-                    };
-                    let cache_value = CacheValue::Block(bytes::Bytes::from(decrypted.clone()));
-                    cache.insert(cache_key, cache_value, true).await;
-                }
 
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
@@ -263,41 +233,9 @@ impl EncryptedDb {
         batch: EncryptedWriteBatch,
         options: &WriteOptions,
     ) -> Result<()> {
-        let (inner_batch, cache_ops) = batch.into_inner().await?;
+        let (inner_batch, _cache_ops) = batch.into_inner().await?;
 
-        // Write to database first
         self.inner.write_with_options(inner_batch, options).await?;
-
-        // Update cache after successful write
-        if let Some(cache) = &self.cache {
-            for (key, value) in cache_ops {
-                if let Some(ParsedKey::Chunk {
-                    inode_id,
-                    chunk_index,
-                }) = ParsedKey::parse(&key)
-                {
-                    match value {
-                        Some(data) => {
-                            // Insert chunk into cache with prefer_on_disk=true
-                            let cache_key = CacheKey::Block {
-                                inode_id,
-                                block_index: chunk_index,
-                            };
-                            let cache_value = CacheValue::Block(bytes::Bytes::from(data));
-                            cache.insert(cache_key, cache_value, true).await;
-                        }
-                        None => {
-                            // Remove chunk from cache
-                            let cache_key = CacheKey::Block {
-                                inode_id,
-                                block_index: chunk_index,
-                            };
-                            cache.remove(cache_key).await;
-                        }
-                    }
-                }
-            }
-        }
 
         Ok(())
     }

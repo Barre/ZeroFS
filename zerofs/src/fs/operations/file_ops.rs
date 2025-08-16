@@ -1,5 +1,5 @@
 use super::common::validate_filename;
-use crate::fs::cache::{self, CacheKey, CacheValue};
+use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{FileInode, Inode};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
@@ -197,9 +197,7 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.cache
-                    .remove_batch(vec![CacheKey::Metadata(id), CacheKey::SmallFile(id)])
-                    .await;
+                self.cache.remove(CacheKey::Metadata(id)).await;
 
                 let elapsed = start_time.elapsed();
                 debug!(
@@ -389,25 +387,6 @@ impl ZeroFS {
                     return Ok((vec![], true));
                 }
 
-                if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES
-                    && offset == 0
-                    && count as u64 >= file.size
-                {
-                    let cache_key = CacheKey::SmallFile(id);
-                    if let Some(CacheValue::SmallFile(cached_data)) =
-                        self.cache.get(cache_key).await
-                    {
-                        debug!("Serving file {} from small file cache", id);
-                        let eof = file.size <= count as u64;
-                        self.stats
-                            .bytes_read
-                            .fetch_add(cached_data.len() as u64, Ordering::Relaxed);
-                        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
-                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
-                        return Ok((cached_data.to_vec(), eof));
-                    }
-                }
-
                 let end = std::cmp::min(offset + count as u64, file.size);
                 let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
                 let end_chunk = ((end - 1) / CHUNK_SIZE as u64) as usize;
@@ -484,14 +463,6 @@ impl ZeroFS {
                 let result_bytes = result.freeze();
                 let eof = end >= file.size;
 
-                if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES && offset == 0 && end >= file.size
-                {
-                    debug!("Caching small file {} ({} bytes)", id, file.size);
-                    let cache_key = cache::CacheKey::SmallFile(id);
-                    let cache_value = cache::CacheValue::SmallFile(result_bytes.clone());
-                    self.cache.insert(cache_key, cache_value, false).await;
-                }
-
                 self.stats
                     .bytes_read
                     .fetch_add(result_bytes.len() as u64, Ordering::Relaxed);
@@ -539,7 +510,7 @@ impl ZeroFS {
         let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
 
         let mut batch = self.db.new_write_batch();
-        let mut cache_keys_to_remove = Vec::new();
+        let cache_keys_to_remove = Vec::new();
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
@@ -553,12 +524,6 @@ impl ZeroFS {
 
             if offset <= chunk_start && end_offset >= chunk_end {
                 batch.delete_bytes(&chunk_key);
-
-                let cache_key = CacheKey::Block {
-                    inode_id: id,
-                    block_index: chunk_idx as u64,
-                };
-                cache_keys_to_remove.push(cache_key);
             } else {
                 let trim_start = if offset > chunk_start {
                     (offset - chunk_start) as usize
@@ -591,29 +556,13 @@ impl ZeroFS {
 
                     if chunk_data.iter().all(|&b| b == 0) {
                         batch.delete_bytes(&chunk_key);
-
-                        let cache_key = CacheKey::Block {
-                            inode_id: id,
-                            block_index: chunk_idx as u64,
-                        };
-                        cache_keys_to_remove.push(cache_key);
                     } else {
                         let chunk_size_in_file =
                             std::cmp::min(CHUNK_SIZE, (file.size - chunk_start) as usize);
                         batch.put_bytes(&chunk_key, &chunk_data[..chunk_size_in_file]);
-
-                        let cache_key = CacheKey::Block {
-                            inode_id: id,
-                            block_index: chunk_idx as u64,
-                        };
-                        cache_keys_to_remove.push(cache_key);
                     }
                 }
             }
-        }
-
-        if file.size <= cache::SMALL_FILE_THRESHOLD_BYTES {
-            cache_keys_to_remove.push(CacheKey::SmallFile(id));
         }
 
         if !cache_keys_to_remove.is_empty() {

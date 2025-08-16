@@ -371,7 +371,6 @@ impl ZeroFS {
         self.cache.remove(CacheKey::Metadata(source_inode_id)).await;
         if let Some(target_id) = target_inode_id {
             self.cache.remove(CacheKey::Metadata(target_id)).await;
-            self.cache.remove(CacheKey::SmallFile(target_id)).await;
         }
         self.cache.remove(CacheKey::Metadata(from_dirid)).await;
         if from_dirid != to_dirid {
