@@ -9,7 +9,6 @@ use crate::fs::types::{
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
-use futures::future::join_all;
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::collections::HashMap;
@@ -62,27 +61,24 @@ impl ZeroFS {
 
                 let chunk_processing_start = std::time::Instant::now();
 
-                let partial_chunks: Vec<_> = (start_chunk..=end_chunk)
-                    .filter(|&chunk_idx| {
-                        let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-                        let write_start = if offset > chunk_start {
-                            (offset - chunk_start) as usize
-                        } else {
-                            0
-                        };
-                        let write_end = if end_offset < chunk_start + CHUNK_SIZE as u64 {
-                            (end_offset - chunk_start) as usize
-                        } else {
-                            CHUNK_SIZE
-                        };
+                let partial_chunks = (start_chunk..=end_chunk).filter(|&chunk_idx| {
+                    let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
+                    let write_start = if offset > chunk_start {
+                        (offset - chunk_start) as usize
+                    } else {
+                        0
+                    };
+                    let write_end = if end_offset < chunk_start + CHUNK_SIZE as u64 {
+                        (end_offset - chunk_start) as usize
+                    } else {
+                        CHUNK_SIZE
+                    };
 
-                        write_start > 0 || write_end < CHUNK_SIZE
-                    })
-                    .collect();
+                    write_start > 0 || write_end < CHUNK_SIZE
+                });
 
-                let prefetch_futures: Vec<_> = partial_chunks
-                    .iter()
-                    .map(|&chunk_idx| {
+                let existing_chunks: HashMap<usize, Bytes> = stream::iter(partial_chunks)
+                    .map(|chunk_idx| {
                         let chunk_key = Self::chunk_key_by_index(id, chunk_idx);
                         let db = self.db.clone();
                         async move {
@@ -90,13 +86,10 @@ impl ZeroFS {
                             (chunk_idx, data)
                         }
                     })
-                    .collect();
-
-                let prefetched_data = join_all(prefetch_futures).await;
-                let existing_chunks: HashMap<usize, Bytes> = prefetched_data
-                    .into_iter()
-                    .filter_map(|(idx, data)| data.map(|d| (idx, d)))
-                    .collect();
+                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
+                    .filter_map(|(idx, data)| async move { data.map(|d| (idx, d)) })
+                    .collect()
+                    .await;
 
                 for chunk_idx in start_chunk..=end_chunk {
                     let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
