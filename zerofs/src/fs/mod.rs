@@ -637,7 +637,7 @@ impl ZeroFS {
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
                 .with_memory_cache(cache)
-                .with_sst_block_size(SstBlockSize::Block16Kib)
+                .with_sst_block_size(SstBlockSize::Block64Kib)
                 .build()
                 .await?,
         );
