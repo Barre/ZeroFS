@@ -10,7 +10,7 @@ use super::protocol::{
 use crate::fs::inode::Inode;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
-use crate::fs::{EncodedFileId, ZeroFS};
+use crate::fs::ZeroFS;
 use bytes::BytesMut;
 use deku::prelude::*;
 use std::collections::HashMap;
