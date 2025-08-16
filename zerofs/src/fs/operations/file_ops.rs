@@ -87,7 +87,7 @@ impl ZeroFS {
                         let db = self.db.clone();
                         async move {
                             let data = db.get_bytes(&chunk_key).await.ok().flatten();
-                            (chunk_idx, data.map(|d| Bytes::from(d.to_vec())))
+                            (chunk_idx, data)
                         }
                     })
                     .collect();
@@ -426,9 +426,8 @@ impl ZeroFS {
                     async move {
                         let chunk_data_opt =
                             db.get_bytes(&key).await.map_err(|_| FsError::IoError)?;
-                        let chunk_bytes_opt =
-                            chunk_data_opt.map(|bytes| Bytes::from(bytes.to_vec()));
-                        Ok::<(usize, Option<Bytes>), FsError>((chunk_idx, chunk_bytes_opt))
+
+                        Ok::<(usize, Option<Bytes>), FsError>((chunk_idx, chunk_data_opt))
                     }
                 });
 
