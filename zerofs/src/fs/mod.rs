@@ -200,6 +200,7 @@ impl ZeroFS {
 
         let settings = slatedb::config::Settings {
             wal_enabled: false,
+            l0_max_ssts: 16,
             object_store_cache_options: ObjectStoreCacheOptions {
                 root_folder: Some(slatedb_cache_dir.clone().into()),
                 max_cache_size_bytes: Some(slatedb_object_cache_bytes),
@@ -208,6 +209,7 @@ impl ZeroFS {
             flush_interval: Some(std::time::Duration::from_secs(30)),
             max_unflushed_bytes: 1024 * 1024 * 1024,
             compactor_options: Some(slatedb::config::CompactorOptions {
+                max_concurrent_compactions: 8,
                 max_sst_size: 256 * 1024 * 1024,
                 ..Default::default()
             }),
