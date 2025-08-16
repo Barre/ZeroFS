@@ -538,9 +538,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBDCommand::Flush => self.handle_flush(request.cookie).await,
                 NBDCommand::Trim => {
-                    let device_inode_raw = EncodedFileId::from(device_inode).inode_id();
                     self.handle_trim(
-                        device_inode_raw,
+                        device_inode,
                         request.cookie,
                         request.offset,
                         request.length,
