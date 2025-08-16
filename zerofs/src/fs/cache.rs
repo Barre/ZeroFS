@@ -42,7 +42,7 @@ pub struct UnifiedCache {
 }
 
 impl UnifiedCache {
-    pub async fn new(
+    pub fn new(
         _cache_dir: &str,
         _disk_capacity_gb: f64,
         memory_capacity_gb: Option<f64>,
@@ -60,7 +60,7 @@ impl UnifiedCache {
         })
     }
 
-    pub async fn get(&self, key: CacheKey) -> Option<CacheValue> {
+    pub fn get(&self, key: CacheKey) -> Option<CacheValue> {
         let serialized_key = bincode::serialize(&key).ok()?;
         let value = self
             .cache
@@ -69,7 +69,7 @@ impl UnifiedCache {
         bincode::deserialize(&value).ok()
     }
 
-    pub async fn insert(&self, key: CacheKey, value: CacheValue, _prefer_on_disk: bool) {
+    pub fn insert(&self, key: CacheKey, value: CacheValue, _prefer_on_disk: bool) {
         if let (Ok(serialized_key), Ok(serialized_value)) =
             (bincode::serialize(&key), bincode::serialize(&value))
         {
@@ -77,13 +77,13 @@ impl UnifiedCache {
         }
     }
 
-    pub async fn remove(&self, key: CacheKey) {
+    pub fn remove(&self, key: CacheKey) {
         if let Ok(serialized_key) = bincode::serialize(&key) {
             self.cache.remove(&serialized_key);
         }
     }
 
-    pub async fn remove_batch(&self, keys: Vec<CacheKey>) {
+    pub fn remove_batch(&self, keys: Vec<CacheKey>) {
         for key in keys {
             if let Ok(serialized_key) = bincode::serialize(&key) {
                 self.cache.remove(&serialized_key);

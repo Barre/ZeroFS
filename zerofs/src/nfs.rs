@@ -51,7 +51,7 @@ impl NFSFileSystem for ZeroFS {
                     dir_id: real_dirid,
                     name: name.clone(),
                 };
-                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key).await {
+                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key) {
                     debug!("lookup cache hit: {} -> inode {}", name, inode_id);
                     return Ok(EncodedFileId::from_inode(inode_id).into());
                 }
@@ -75,7 +75,7 @@ impl NFSFileSystem for ZeroFS {
                             name: name.clone(),
                         };
                         let cache_value = crate::fs::cache::CacheValue::DirEntry(inode_id);
-                        self.cache.insert(cache_key, cache_value, false).await;
+                        self.cache.insert(cache_key, cache_value, false);
 
                         Ok(EncodedFileId::from_inode(inode_id).into())
                     }

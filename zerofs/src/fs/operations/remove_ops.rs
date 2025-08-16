@@ -198,17 +198,13 @@ impl ZeroFS {
                 }
 
                 self.cache
-                    .remove(crate::fs::cache::CacheKey::Metadata(file_id))
-                    .await;
+                    .remove(crate::fs::cache::CacheKey::Metadata(file_id));
                 self.cache
-                    .remove(crate::fs::cache::CacheKey::Metadata(dirid))
-                    .await;
-                self.cache
-                    .remove(crate::fs::cache::CacheKey::DirEntry {
-                        dir_id: dirid,
-                        name: name.clone(),
-                    })
-                    .await;
+                    .remove(crate::fs::cache::CacheKey::Metadata(dirid));
+                self.cache.remove(crate::fs::cache::CacheKey::DirEntry {
+                    dir_id: dirid,
+                    name: name.clone(),
+                });
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
