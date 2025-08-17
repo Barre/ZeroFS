@@ -2916,7 +2916,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.7.0"
-source = "git+https://github.com/slatedb/slatedb.git?rev=257e3c7ccb041352f401134378829ff838987939#257e3c7ccb041352f401134378829ff838987939"
+source = "git+https://github.com/slatedb/slatedb.git?rev=6e138682013a192bc55e8a2b925ad65d0599a4ef#6e138682013a192bc55e8a2b925ad65d0599a4ef"
 dependencies = [
  "anyhow",
  "async-trait",
