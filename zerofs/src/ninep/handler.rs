@@ -367,7 +367,6 @@ impl NinePHandler {
         let is_sequential = tr.offset == fid_entry.dir_last_offset;
 
         let mut entries_to_return = Vec::new();
-        let mut current_offset;
 
         let parent_id = match self.filesystem.load_inode(fid_entry.inode_id).await {
             Ok(Inode::Directory(dir)) => {
@@ -381,30 +380,38 @@ impl NinePHandler {
         };
 
         // Handle special entries . and .. based on offset
-        if tr.offset == 0 {
-            // Add both . and ..
-            entries_to_return.push((0, ".".to_string(), fid_entry.inode_id));
-            entries_to_return.push((1, "..".to_string(), parent_id));
-            current_offset = 2;
-        } else if tr.offset == 1 {
-            // Add only ..
-            entries_to_return.push((1, "..".to_string(), parent_id));
-            current_offset = 2;
-        } else {
-            // Start from offset 2 (after special entries)
-            current_offset = 2;
-        }
+        let mut current_offset: u64;
+        let mut cookie: u64;
 
-        // Now read regular entries if needed
-        let mut cookie = if tr.offset == 0 {
-            // Always reset cookie when rewinding to beginning
-            0
-        } else if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
-            fid_entry.dir_last_cookie
+        if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
+            // For sequential reads continuing from a previous position,
+            // use the saved offset and cookie
+            current_offset = tr.offset;
+            cookie = fid_entry.dir_last_cookie;
         } else {
-            // Always start from 0 to get all entries, we'll filter special ones
-            0
-        };
+            // For non-sequential reads or starting fresh
+            if tr.offset == 0 {
+                // Add both . and ..
+                entries_to_return.push((0, ".".to_string(), fid_entry.inode_id));
+                entries_to_return.push((1, "..".to_string(), parent_id));
+                current_offset = 2;
+            } else if tr.offset == 1 {
+                // Add only ..
+                entries_to_return.push((1, "..".to_string(), parent_id));
+                current_offset = 2;
+            } else {
+                // Start from offset 2 (after special entries)
+                current_offset = 2;
+            }
+
+            // Set initial cookie
+            cookie = if tr.offset == 0 {
+                0
+            } else {
+                // Always start from 0 to get all entries, we'll filter special ones
+                0
+            };
+        }
 
         // Read regular entries - continue until we hit the end
         loop {
@@ -419,6 +426,8 @@ impl NinePHandler {
                     if result.entries.is_empty() && result.end {
                         break;
                     }
+
+                    let was_end = result.end;
 
                     for entry in result.entries {
                         let name = String::from_utf8_lossy(&entry.name).to_string();
@@ -440,10 +449,19 @@ impl NinePHandler {
                         cookie = entry.fileid;
                     }
 
-                    // Only break if we have collected entries past the requested offset
-                    if result.end || (!entries_to_return.is_empty() && current_offset > tr.offset) {
-                        break; // Either end of dir or we have enough entries
+                    // If we've reached the end of the directory, we're done
+                    if was_end {
+                        break;
                     }
+
+                    // Continue fetching if:
+                    // 1. We haven't reached the requested offset yet (current_offset < tr.offset)
+                    // 2. OR we haven't collected any entries yet (entries_to_return.is_empty())
+                    // Only break if we have some entries to return
+                    if !entries_to_return.is_empty() {
+                        break;
+                    }
+                    // Otherwise continue to the next batch
                 }
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             }
@@ -1723,6 +1741,187 @@ mod tests {
             }
             _ => panic!("Expected Rreaddir"),
         };
+    }
+
+    #[tokio::test]
+    async fn test_readdir_pagination_duplicates_at_boundary() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+
+        let auth = AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+        };
+
+        for i in 0..1002 {
+            fs.create(
+                &auth,
+                0,
+                &format!("file_{:06}.txt", i).as_bytes().into(),
+                SetAttributes::default().into(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let handler = NinePHandler::new(fs);
+
+        let version_msg = Message::Tversion(Tversion {
+            msize: DEFAULT_MSIZE,
+            version: P9String::new(VERSION_9P2000L),
+        });
+        handler.handle_message(0, version_msg).await;
+
+        let attach_msg = Message::Tattach(Tattach {
+            fid: 1,
+            afid: u32::MAX,
+            uname: P9String::new("test"),
+            aname: P9String::new(""),
+            n_uname: 1000,
+        });
+        handler.handle_message(1, attach_msg).await;
+
+        let open_msg = Message::Tlopen(Tlopen {
+            fid: 1,
+            flags: O_RDONLY as u32,
+        });
+        handler.handle_message(2, open_msg).await;
+
+        let mut all_names = Vec::new();
+        let mut seen_offsets = std::collections::HashSet::new();
+        let mut current_offset = 0u64;
+        let mut iterations = 0;
+
+        loop {
+            iterations += 1;
+            if iterations > 10 {
+                panic!("Too many iterations, likely infinite loop");
+            }
+
+            println!(
+                "Iteration {}: Reading from offset {}",
+                iterations, current_offset
+            );
+
+            let readdir_msg = Message::Treaddir(Treaddir {
+                fid: 1,
+                offset: current_offset,
+                count: 8192, // Typical buffer size
+            });
+            let resp = handler
+                .handle_message(iterations as u16 + 2, readdir_msg)
+                .await;
+
+            match &resp.body {
+                Message::Rreaddir(rreaddir) => {
+                    if rreaddir.data.is_empty() {
+                        println!("Got empty response, ending");
+                        break;
+                    }
+
+                    // Parse entries
+                    let mut pos = 0;
+                    let mut batch_count = 0;
+
+                    while pos < rreaddir.data.len() {
+                        if pos + 24 > rreaddir.data.len() {
+                            break;
+                        }
+
+                        // Skip qid (13 bytes), read offset (8 bytes)
+                        let entry_offset = u64::from_le_bytes([
+                            rreaddir.data[pos + 13],
+                            rreaddir.data[pos + 14],
+                            rreaddir.data[pos + 15],
+                            rreaddir.data[pos + 16],
+                            rreaddir.data[pos + 17],
+                            rreaddir.data[pos + 18],
+                            rreaddir.data[pos + 19],
+                            rreaddir.data[pos + 20],
+                        ]);
+
+                        // Skip type (1 byte), read name length (2 bytes)
+                        let name_len =
+                            u16::from_le_bytes([rreaddir.data[pos + 22], rreaddir.data[pos + 23]])
+                                as usize;
+
+                        if pos + 24 + name_len > rreaddir.data.len() {
+                            break;
+                        }
+
+                        let name =
+                            String::from_utf8_lossy(&rreaddir.data[pos + 24..pos + 24 + name_len])
+                                .to_string();
+
+                        // Check for duplicate offsets
+                        if !seen_offsets.insert(entry_offset) {
+                            println!(
+                                "WARNING: Duplicate offset {} for entry: {}",
+                                entry_offset, name
+                            );
+                        }
+
+                        if name != "." && name != ".." {
+                            all_names.push(name.clone());
+                            batch_count += 1;
+
+                            // Debug: print entries near the boundary
+                            if entry_offset >= 998 && entry_offset <= 1004 {
+                                println!("  Entry at offset {}: {}", entry_offset, name);
+                            }
+                        }
+
+                        current_offset = entry_offset;
+                        pos += 24 + name_len;
+                    }
+
+                    println!(
+                        "Got {} entries in this batch, last offset: {}",
+                        batch_count, current_offset
+                    );
+
+                    // If we got less than a reasonable amount, we might be at the end
+                    if batch_count == 0 {
+                        break;
+                    }
+                }
+                _ => panic!("Expected Rreaddir"),
+            };
+        }
+
+        // Check for duplicates
+        let mut name_counts = std::collections::HashMap::new();
+        for name in &all_names {
+            *name_counts.entry(name.clone()).or_insert(0) += 1;
+        }
+
+        let mut duplicates = Vec::new();
+        for (name, count) in &name_counts {
+            if *count > 1 {
+                duplicates.push((name.clone(), *count));
+            }
+        }
+
+        if !duplicates.is_empty() {
+            println!("Found {} duplicate entries:", duplicates.len());
+            for (name, count) in &duplicates {
+                println!("  {} appears {} times", name, count);
+            }
+        }
+
+        // We should have exactly 1002 unique files
+        assert_eq!(
+            duplicates.len(),
+            0,
+            "Found duplicate entries: {:?}",
+            duplicates
+        );
+        assert_eq!(
+            all_names.len(),
+            1002,
+            "Expected 1002 entries, got {}",
+            all_names.len()
+        );
     }
 
     #[tokio::test]
