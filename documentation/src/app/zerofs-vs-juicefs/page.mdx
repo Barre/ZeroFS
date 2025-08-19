@@ -1,0 +1,130 @@
+import { BenchmarkCharts } from './BenchmarkCharts'
+
+export const metadata = {
+  title: 'ZeroFS vs JuiceFS Benchmarks',
+  description: 'Performance comparison between ZeroFS and JuiceFS',
+}
+
+# ZeroFS vs JuiceFS Benchmarks
+
+Performance comparison conducted on Azure D48lds v6 (48 vCPUs, 96 GiB RAM) with Cloudflare R2 backend.
+
+## Test Setup
+
+- **VM**: Azure Standard D48lds v6, West Europe (Zone 1)
+- **Storage**: Cloudflare R2 (S3-compatible)
+- **Benchmark suite**: [github.com/Barre/ZeroFS/bench](https://github.com/Barre/ZeroFS/tree/main/bench)
+- **Operations per test**: 10,000
+
+## Architecture Differences
+
+**ZeroFS**: Direct S3-only architecture. No additional infrastructure required.
+
+**JuiceFS**: Requires separate metadata database (SQLite/Redis/TiKV) plus S3 storage. Despite this additional complexity and dedicated metadata layer, JuiceFS performs 175-227x slower than ZeroFS in our tests.
+
+<BenchmarkCharts />
+
+## Benchmark Results
+
+### Synthetic Benchmarks
+
+| Test | ZeroFS | JuiceFS | Difference |
+| --- | --- | --- | --- |
+| **Sequential Writes** | | | |
+| Operations/sec | 984.29 | 5.62 | 175x |
+| Mean latency | 1.01ms | 177.76ms | |
+| Success rate | 100% | 100% | |
+| | | | |
+| **Data Modifications** | | | |
+| Operations/sec | 1,098.62 | 5.98 | 183x |
+| Mean latency | 0.91ms | 166.25ms | |
+| Success rate | 100% | 7.94% | |
+| | | | |
+| **Single File Append** | | | |
+| Operations/sec | 1,203.56 | 5.29 | 227x |
+| Mean latency | 0.83ms | 186.16ms | |
+| Success rate | 100% | 2.57% | |
+| | | | |
+| **Empty Files** | | | |
+| Operations/sec | 1,350.66 | 1,150.57 | 1.17x |
+| Mean latency | 0.59ms | 0.83ms | |
+| Success rate | 100% | 100% | |
+
+### Real-World Operations
+
+| Operation | ZeroFS | JuiceFS | Notes |
+| --- | --- | --- | --- |
+| Git clone | 2.6s | 34.4s | ZeroFS repository |
+| Cargo build | 3m 4s | >69m | JuiceFS aborted - no progress |
+| tar -xf (ZFS source) | 8.2s | 10m 26s | ZFS 2.3.3 release tarball |
+
+## Key Observations
+
+### ZeroFS
+- Consistent sub-millisecond latencies for file operations
+- 100% success rate across all benchmarks
+- Completed all real-world tests
+
+### JuiceFS  
+- Failed 92% of data modification operations
+- Failed 97% of append operations  
+- Unable to complete Rust compilation after 69 minutes
+- Errors: "No such file or directory (os error 2)" on file operations
+
+## Technical Details
+
+### Sequential Writes
+Creates files in sequence. Tests metadata performance and write throughput.
+
+**ZeroFS**: 10,000 files in 10.16 seconds  
+**JuiceFS**: 10,000 files in 29 minutes 37 seconds
+
+### Data Modifications
+Random writes to existing files. Tests consistency and caching.
+
+**ZeroFS**: All operations succeeded  
+**JuiceFS**: 9,206 failures out of 10,000 operations
+
+### Single File Append
+Appends to a single file. Tests lock contention and write ordering.
+
+**ZeroFS**: All operations succeeded  
+**JuiceFS**: 9,743 failures out of 10,000 operations
+
+### Empty File Creation
+Pure metadata operations without data writes.
+
+**ZeroFS**: 7.4 seconds total  
+**JuiceFS**: 8.7 seconds total
+
+This was JuiceFS's best result, suggesting the bottleneck is in data operations rather than metadata.
+
+### Compilation Workload
+Rust compilation of ZeroFS codebase. Tests mixed read/write patterns.
+
+**ZeroFS**: Completed in 3 minutes 4 seconds  
+**JuiceFS**: Aborted after 69 minutes with no progress past initial dependencies
+
+### Archive Extraction
+Extracting ZFS 2.3.3 source tarball. Tests sequential file creation with varying sizes.
+
+**ZeroFS**: 8.2 seconds  
+**JuiceFS**: 10 minutes 26 seconds (76x slower)
+
+## Storage Efficiency
+
+### Final Bucket Statistics
+
+| Metric | ZeroFS | JuiceFS | Difference |
+| --- | --- | --- | --- |
+| **Bucket Size** | 7.57 GB | 238.99 GB | 31.6x larger |
+| **Class A Operations** | 6.15k | 359.21k | 58.4x more |
+| **Class B Operations** | 1.84k | 539.3k | 293x more |
+
+JuiceFS consumed 31x more storage and performed 58-293x more S3 operations for the same workload. This translates directly to higher storage costs and API charges.
+
+## Summary
+
+In our benchmarks, ZeroFS demonstrated 175-227x higher throughput for write operations while using only S3 for storage. JuiceFS, which requires both S3 and a separate metadata database, experienced high failure rates and significantly slower performance across all tests.
+
+The tests also revealed differences in resource consumption: JuiceFS used 31x more storage space and generated up to 293x more S3 API calls for the same workload, which would impact operational costs in production environments.

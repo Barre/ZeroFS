@@ -246,6 +246,12 @@ export const navigation: Array<NavGroup> = [
     ],
   },
   {
+    title: 'Benchmarks',
+    links: [
+      { title: 'ZeroFS vs JuiceFS', href: '/zerofs-vs-juicefs' },
+    ],
+  },
+  {
     title: 'Resources',
     links: [
       { title: 'NFS File Access', href: '/nfs-access' },
