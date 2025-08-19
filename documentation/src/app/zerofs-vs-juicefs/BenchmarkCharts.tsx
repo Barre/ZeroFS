@@ -166,23 +166,25 @@ export function BenchmarkCharts() {
   return (
     <div className="my-8 space-y-6">
       <TabGroup>
-        <TabList className="not-prose flex gap-4 rounded-full bg-zinc-100 p-1 text-xs font-semibold dark:bg-zinc-800">
-          {tabs.map((tab) => (
-            <Tab
-              key={tab.key}
-              className={({ selected }) =>
-                clsx(
-                  'rounded-full px-3 py-1.5 transition focus:outline-none',
-                  selected
-                    ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-700 dark:text-white'
-                    : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200'
-                )
-              }
-            >
-              {tab.name}
-            </Tab>
-          ))}
-        </TabList>
+        <div className="not-prose border-b border-zinc-200 dark:border-zinc-700">
+          <TabList className="-mb-px flex flex-wrap gap-x-4 text-xs font-medium">
+            {tabs.map((tab) => (
+              <Tab
+                key={tab.key}
+                className={({ selected }) =>
+                  clsx(
+                    'border-b-2 py-2.5 transition focus:outline-none',
+                    selected
+                      ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                      : 'border-transparent text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-300'
+                  )
+                }
+              >
+                {tab.name}
+              </Tab>
+            ))}
+          </TabList>
+        </div>
 
         <TabPanels className="mt-6">
           <TabPanel className="space-y-6">
