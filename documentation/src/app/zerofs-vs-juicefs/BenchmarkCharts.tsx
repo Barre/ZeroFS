@@ -217,7 +217,7 @@ export function BenchmarkCharts() {
                   { key: 'juicefs', label: 'JuiceFS (ops/sec)' },
                   {
                     key: 'ratio',
-                    label: 'Difference',
+                    label: 'Multiplier',
                     className: (val: number) => val > 10 ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'
                   },
                 ]}
