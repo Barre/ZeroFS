@@ -504,6 +504,10 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
   <a href="https://asciinema.org/a/ovxTV0zTpjE1xcxn5CXehCTTN" target="_blank">View SQLite Benchmark Demo</a>
 </p>
 
+## ZeroFS vs JuiceFS
+
+[Benchmarks comparing ZeroFS to JuiceFS](https://www.zerofs.net/zerofs-vs-juicefs)
+
 ## Key Differences from S3FS
 
 ### 1. **Storage Architecture**
