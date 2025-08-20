@@ -11,7 +11,10 @@ use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use rayon::prelude::*;
 use sha2::Sha256;
-use slatedb::{WriteBatch, config::WriteOptions};
+use slatedb::{
+    WriteBatch,
+    config::{ScanOptions, WriteOptions},
+};
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -195,7 +198,11 @@ impl EncryptedDb {
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
         let encryptor = self.encryptor.clone();
-        let iter = self.inner.scan(range).await?;
+        let scan_options = ScanOptions {
+            read_ahead_bytes: 32 * 1024 * 1024, // 32MB read-ahead
+            ..Default::default()
+        };
+        let iter = self.inner.scan_with_options(range, &scan_options).await?;
 
         Ok(Box::pin(futures::stream::unfold(
             (iter, encryptor),
