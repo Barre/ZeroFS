@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use sha2::Sha256;
 use slatedb::{
     WriteBatch,
-    config::{ScanOptions, WriteOptions},
+    config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions},
 };
 use std::ops::RangeBounds;
 use std::pin::Pin;
@@ -176,7 +176,12 @@ impl EncryptedDb {
     }
 
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
-        match self.inner.get(key).await? {
+        let read_options = ReadOptions {
+            durability_filter: DurabilityLevel::Memory,
+            ..Default::default()
+        };
+
+        match self.inner.get_with_options(key, &read_options).await? {
             Some(encrypted) => {
                 let encryptor = self.encryptor.clone();
                 let key_bytes = key.to_vec();
@@ -199,6 +204,7 @@ impl EncryptedDb {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
         let encryptor = self.encryptor.clone();
         let scan_options = ScanOptions {
+            durability_filter: DurabilityLevel::Memory,
             read_ahead_bytes: 32 * 1024 * 1024, // 32MB read-ahead
             ..Default::default()
         };
