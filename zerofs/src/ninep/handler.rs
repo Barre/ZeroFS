@@ -1866,7 +1866,7 @@ mod tests {
                             batch_count += 1;
 
                             // Debug: print entries near the boundary
-                            if entry_offset >= 998 && entry_offset <= 1004 {
+                            if (998..=1004).contains(&entry_offset) {
                                 println!("  Entry at offset {}: {}", entry_offset, name);
                             }
                         }
