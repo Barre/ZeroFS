@@ -216,19 +216,6 @@ export AWS_DEFAULT_REGION='us-east-1'
 zerofs s3://wasabi-bucket/path
 ```
 
-```bash {{ title: 'Backblaze B2' }}
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-export SLATEDB_CACHE_SIZE_GB='10'
-export ZEROFS_ENCRYPTION_PASSWORD='secure-password'
-
-# Backblaze B2 S3 API
-export AWS_ENDPOINT='https://s3.us-west-000.backblazeb2.com'
-export AWS_ACCESS_KEY_ID='your-b2-key-id'
-export AWS_SECRET_ACCESS_KEY='your-b2-application-key'
-
-zerofs s3://b2-bucket/path
-```
-
 </CodeGroup>
 
 ## System Integration
