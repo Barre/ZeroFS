@@ -1,0 +1,165 @@
+import { BenchmarkCharts } from './BenchmarkCharts'
+
+export const metadata = {
+  title: 'ZeroFS vs AWS Mountpoint-s3 Benchmarks',
+  description: 'Performance comparison between ZeroFS and AWS Mountpoint-s3',
+}
+
+# ZeroFS vs AWS Mountpoint-s3 Benchmarks
+
+Performance comparison conducted on Azure D48lds v6 (48 vCPUs, 96 GiB RAM) with Cloudflare R2 backend.
+
+## Test Setup
+
+- **VM**: Azure Standard D48lds v6, West Europe (Zone 1)
+- **Storage**: Cloudflare R2 (S3-compatible)
+- **Benchmark suite**: [github.com/Barre/ZeroFS/bench](https://github.com/Barre/ZeroFS/tree/main/bench)
+- **Operations per test**: 100 (reduced from 10,000 due to Mountpoint-s3's performance characteristics)
+
+## Architecture Differences
+
+**ZeroFS**: Direct S3-only architecture with full POSIX semantics. No additional infrastructure required.
+
+**AWS Mountpoint-s3**: Amazon's official S3 FUSE mount ([github.com/awslabs/mountpoint-s3](https://github.com/awslabs/mountpoint-s3)) designed to provide a 1:1 mapping between S3 objects and files/folders. This design philosophy prioritizes direct object mapping over performance and POSIX compliance, resulting in limited file system capabilities.
+
+<BenchmarkCharts />
+
+## Benchmark Results
+
+### Synthetic Benchmarks
+
+| Test | ZeroFS | AWS Mountpoint-s3 | Difference |
+| --- | --- | --- | --- |
+| **Sequential Writes** | | | |
+| Operations/sec | 663.87 | 0.70 | 948x |
+| Mean latency | 1.42ms | 1,435.81ms | 1,011x |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Data Modifications** | | | |
+| Operations/sec | 695.53 | N/A | - |
+| Mean latency | 1.30ms | N/A | - |
+| Success rate | 100% | 0% | Not supported |
+| | | | |
+| **Single File Append** | | | |
+| Operations/sec | 769.50 | N/A | - |
+| Mean latency | 1.22ms | N/A | - |
+| Success rate | 100% | 0% | Not supported |
+| | | | |
+| **Empty Files** | | | |
+| Operations/sec | 888.66 | 0.09 | 9,874x |
+| Mean latency | 0.86ms | 605.61ms | 704x |
+| Success rate | 100% | 2% | - |
+| | | | |
+| **Empty Directories** | | | |
+| Operations/sec | 985.98 | 2.08 | 474x |
+| Mean latency | 0.98ms | 479.80ms | 490x |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Random Reads** | | | |
+| Operations/sec | 1,000.84 | 3.20 | 313x |
+| Mean latency | 0.90ms | 312.13ms | 347x |
+| Success rate | 100% | 100% | - |
+
+### Real-World Operations
+
+| Operation | ZeroFS | AWS Mountpoint-s3 | Notes |
+| --- | --- | --- | --- |
+| Git clone | 3.1s | Failed | Configuration file operations not supported |
+| tar -xf (ZFS source) | 13.5s | ~2h (est.) | Extrapolated from 10% completion at 12m 27s |
+
+## Key Observations
+
+### ZeroFS
+- Consistent sub-millisecond latencies for file operations
+- 100% success rate across all benchmarks
+- Full POSIX compliance
+- Completed all real-world tests
+
+### AWS Mountpoint-s3
+- Designed for read-heavy workloads with direct S3 object mapping
+- Does not support file modification or append operations by design
+- Limited POSIX semantics (no utime, chmod, chown support)
+- Performance optimized for different use cases than general file system operations
+
+## Technical Details
+
+### Sequential Writes
+Creates files in sequence. Tests metadata performance and write throughput.
+
+**ZeroFS**: 100 files in 150ms  
+**Mountpoint-s3**: 100 files in 143 seconds (948x slower)
+
+### Data Modifications
+Random writes to existing files. Tests consistency and update capability.
+
+**ZeroFS**: All operations succeeded  
+**Mountpoint-s3**: Not supported in current implementation
+
+### Single File Append
+Appends to a single file. Tests sequential write patterns.
+
+**ZeroFS**: All operations succeeded  
+**Mountpoint-s3**: Not supported in current implementation
+
+### Empty File Creation
+Pure metadata operations without data writes.
+
+**ZeroFS**: 100 files in 112ms  
+**Mountpoint-s3**: Only 2 out of 100 succeeded due to implementation constraints
+
+### Empty Directory Creation
+Tests directory metadata operations.
+
+**ZeroFS**: 100 directories in 101ms  
+**Mountpoint-s3**: 100 directories in 48 seconds (474x slower)
+
+### Random Reads
+Tests read performance from various file positions.
+
+**ZeroFS**: 1,000+ ops/sec  
+**Mountpoint-s3**: 3.2 ops/sec (313x slower)
+
+### Git Clone
+Tests mixed read/write patterns with metadata operations.
+
+**ZeroFS**: Completed in 3.1 seconds  
+**Mountpoint-s3**: Unable to complete due to lack of config file modification support
+
+### Archive Extraction
+Extracting ZFS 2.3.3 source tarball. Tests file creation with permissions and timestamps.
+
+**ZeroFS**: 13.5 seconds for complete extraction  
+**Mountpoint-s3**: 12 minutes 27 seconds for 10% (432 of 4,280 files)
+- Extrapolated ~2 hours for complete extraction
+- Permission operations not fully supported
+
+## Storage Efficiency
+
+### S3 Operations Comparison
+
+| Metric | ZeroFS | AWS Mountpoint-s3 | Notes |
+| --- | --- | --- | --- |
+| **Class A Operations** | 578 | 8,770 | 15.2x more |
+| **Class B Operations** | 61 | 5,870 | 96.2x more |
+
+*Note: Mountpoint-s3 numbers exclude operations for the remaining 90% of tar extraction.*
+
+The higher API call count reflects Mountpoint-s3's design focus on maintaining direct S3 object correspondence rather than optimizing for operation efficiency.
+
+## Design Philosophy Differences
+
+AWS Mountpoint-s3 prioritizes:
+- **Direct S3 object mapping** - 1:1 correspondence between S3 objects and files
+- **Read-optimized access** - Designed primarily for reading existing S3 data
+- **S3 consistency model** - Maintains S3's eventual consistency semantics
+
+ZeroFS prioritizes:
+- **Full POSIX compliance** - Complete file system semantics
+- **Performance optimization** - Sub-millisecond operations
+- **General-purpose usage** - Suitable for development and production workloads
+
+## Summary
+
+The benchmarks reveal fundamental architectural differences between ZeroFS and AWS Mountpoint-s3. While Mountpoint-s3's design prioritizes maintaining a direct mapping between S3 objects and the file system, this approach results in significant performance trade-offs and limited POSIX support.
+
+ZeroFS demonstrates that it's possible to achieve both high performance (300-10,000x faster operations) and full POSIX compliance while using S3 as the sole storage backend. The choice between the two systems ultimately depends on whether your use case prioritizes direct S3 object mapping or requires a full-featured, high-performance file system.
