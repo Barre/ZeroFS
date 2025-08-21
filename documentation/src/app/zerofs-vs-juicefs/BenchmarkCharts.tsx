@@ -77,13 +77,16 @@ function ComparisonBar({ label, zerofs, juicefs, ratio, type = 'performance' }: 
   const isHigherBetter = type === 'performance'
   const maxVal = Math.max(zerofsVal, juicefsVal)
 
-  // Calculate bar widths proportionally
-  const zerofsWidth = Math.max((zerofsVal / maxVal) * 300, 5)
-  const juicefsWidth = Math.max((juicefsVal / maxVal) * 300, 5)
+  // Calculate bar widths proportionally (responsive max width)
+  const maxBarWidth = typeof window !== 'undefined' 
+    ? window.innerWidth < 400 ? 80 : window.innerWidth < 500 ? 120 : window.innerWidth < 640 ? 150 : 200
+    : 200
+  const zerofsWidth = Math.max((zerofsVal / maxVal) * maxBarWidth, 5)
+  const juicefsWidth = Math.max((juicefsVal / maxVal) * maxBarWidth, 5)
 
   return (
     <div className="space-y-2">
-      <div className="flex justify-between text-sm">
+      <div className="flex flex-col sm:flex-row sm:justify-between gap-1 text-sm">
         <span className="font-medium text-zinc-700 dark:text-zinc-300">{label}</span>
         {ratio > 1.5 && (
           <span className="text-xs text-zinc-500 dark:text-zinc-400">
@@ -91,22 +94,30 @@ function ComparisonBar({ label, zerofs, juicefs, ratio, type = 'performance' }: 
           </span>
         )}
       </div>
-      <div className="space-y-1 text-xs">
-        <div className="flex items-center gap-2">
-          <span className="w-16 text-right text-zinc-600 dark:text-zinc-400">ZeroFS</span>
-          <div
-            className="h-6 bg-blue-500 dark:bg-blue-600 rounded"
-            style={{ width: `${zerofsWidth}px` }}
-          />
-          <span className="font-mono text-zinc-700 dark:text-zinc-300">{zerofs}</span>
+      <div className="space-y-3 text-xs">
+        <div className="space-y-1">
+          <div className="flex flex-col min-[400px]:flex-row min-[400px]:items-center gap-1 min-[400px]:gap-2">
+            <span className="w-14 shrink-0 min-[400px]:text-right text-zinc-600 dark:text-zinc-400">ZeroFS</span>
+            <div className="flex items-center gap-2 min-w-0">
+              <div
+                className="h-6 bg-blue-500 dark:bg-blue-600 rounded shrink-0"
+                style={{ width: `${zerofsWidth}px` }}
+              />
+              <span className="font-mono text-zinc-700 dark:text-zinc-300 whitespace-nowrap min-[400px]:truncate">{zerofs}</span>
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="w-16 text-right text-zinc-600 dark:text-zinc-400">JuiceFS</span>
-          <div
-            className="h-6 bg-red-500 dark:bg-red-600 rounded"
-            style={{ width: `${juicefsWidth}px` }}
-          />
-          <span className="font-mono text-zinc-700 dark:text-zinc-300">{juicefs}</span>
+        <div className="space-y-1">
+          <div className="flex flex-col min-[400px]:flex-row min-[400px]:items-center gap-1 min-[400px]:gap-2">
+            <span className="w-14 shrink-0 min-[400px]:text-right text-zinc-600 dark:text-zinc-400">JuiceFS</span>
+            <div className="flex items-center gap-2 min-w-0">
+              <div
+                className="h-6 bg-red-500 dark:bg-red-600 rounded shrink-0"
+                style={{ width: `${juicefsWidth}px` }}
+              />
+              <span className="font-mono text-zinc-700 dark:text-zinc-300 whitespace-nowrap min-[400px]:truncate">{juicefs}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -194,11 +205,11 @@ export function BenchmarkCharts() {
 
             <div className="space-y-4 rounded-lg border border-zinc-200 bg-zinc-50 p-6 dark:border-zinc-700 dark:bg-zinc-800/50">
               <h4 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Key Performance Differences</h4>
-              <ComparisonBar label="Sequential Writes" zerofs="984 ops/s" juicefs="5.6 ops/s" ratio={175} type="performance" />
-              <ComparisonBar label="Data Modifications" zerofs="1099 ops/s" juicefs="6 ops/s" ratio={183} type="performance" />
-              <ComparisonBar label="File Append" zerofs="1204 ops/s" juicefs="5.3 ops/s" ratio={227} type="performance" />
-              <ComparisonBar label="Storage Used" zerofs="7.6 GB" juicefs="239 GB" ratio={31.6} type="resource" />
-              <ComparisonBar label="API Operations" zerofs="8k" juicefs="898k" ratio={112} type="resource" />
+              <ComparisonBar label="Sequential Writes (higher is better)" zerofs="984 ops/s" juicefs="5.6 ops/s" ratio={175} type="performance" />
+              <ComparisonBar label="Data Modifications (higher is better)" zerofs="1099 ops/s" juicefs="6 ops/s" ratio={183} type="performance" />
+              <ComparisonBar label="File Append (higher is better)" zerofs="1204 ops/s" juicefs="5.3 ops/s" ratio={227} type="performance" />
+              <ComparisonBar label="Storage Used (lower is better)" zerofs="7.6 GB" juicefs="239 GB" ratio={31.6} type="resource" />
+              <ComparisonBar label="API Operations (lower is better)" zerofs="8k" juicefs="898k" ratio={112} type="resource" />
             </div>
           </TabPanel>
 
@@ -206,7 +217,14 @@ export function BenchmarkCharts() {
             <div className="space-y-6">
               <div className="prose prose-zinc dark:prose-invert max-w-none">
                 <h3>Operations Per Second</h3>
-                <p>Higher is better. Tests measure sustainable operation rates.</p>
+                <p>Tests measure sustainable operation rates.</p>
+              </div>
+              
+              <div className="inline-flex items-center gap-2 rounded-lg bg-green-50 dark:bg-green-950/30 px-3 py-1.5 text-xs font-medium text-green-700 dark:text-green-400">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                </svg>
+                Higher is better
               </div>
 
               <SimpleTable
@@ -229,7 +247,14 @@ export function BenchmarkCharts() {
             <div className="space-y-6">
               <div className="prose prose-zinc dark:prose-invert max-w-none">
                 <h3>Operation Latency</h3>
-                <p>Lower is better. Time per individual operation in milliseconds.</p>
+                <p>Time per individual operation in milliseconds.</p>
+              </div>
+              
+              <div className="inline-flex items-center gap-2 rounded-lg bg-blue-50 dark:bg-blue-950/30 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-400">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
+                </svg>
+                Lower is better
               </div>
 
               <SimpleTable
@@ -253,6 +278,13 @@ export function BenchmarkCharts() {
               <div className="prose prose-zinc dark:prose-invert max-w-none">
                 <h3>Operation Success Rate</h3>
                 <p>Percentage of operations that completed successfully.</p>
+              </div>
+              
+              <div className="inline-flex items-center gap-2 rounded-lg bg-green-50 dark:bg-green-950/30 px-3 py-1.5 text-xs font-medium text-green-700 dark:text-green-400">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+                </svg>
+                Higher is better
               </div>
 
               <SimpleTable
@@ -281,6 +313,13 @@ export function BenchmarkCharts() {
                 <h3>Real-World Operations</h3>
                 <p>Common development and deployment tasks.</p>
               </div>
+              
+              <div className="inline-flex items-center gap-2 rounded-lg bg-blue-50 dark:bg-blue-950/30 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-400">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
+                </svg>
+                Lower time is better
+              </div>
 
               <SimpleTable
                 data={benchmarkData.realworld}
@@ -303,6 +342,13 @@ export function BenchmarkCharts() {
               <div className="prose prose-zinc dark:prose-invert max-w-none">
                 <h3>Storage & API Efficiency</h3>
                 <p>Resource consumption for identical workloads.</p>
+              </div>
+              
+              <div className="inline-flex items-center gap-2 rounded-lg bg-blue-50 dark:bg-blue-950/30 px-3 py-1.5 text-xs font-medium text-blue-700 dark:text-blue-400">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
+                </svg>
+                Lower is better
               </div>
 
               <SimpleTable
