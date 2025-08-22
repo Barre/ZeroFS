@@ -248,6 +248,7 @@ export const navigation: Array<NavGroup> = [
   {
     title: 'Benchmarks',
     links: [
+      { title: 'ZeroFS vs AWS EFS', href: '/zerofs-vs-aws-efs' },
       { title: 'ZeroFS vs JuiceFS', href: '/zerofs-vs-juicefs' },
       { title: 'ZeroFS vs AWS Mountpoint-s3', href: '/zerofs-vs-mountpoint-s3' },
     ],
