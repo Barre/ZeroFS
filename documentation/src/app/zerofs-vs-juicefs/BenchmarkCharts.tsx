@@ -208,6 +208,10 @@ export function BenchmarkCharts() {
               <ComparisonBar label="Sequential Writes (higher is better)" zerofs="984 ops/s" juicefs="5.6 ops/s" ratio={175} type="performance" />
               <ComparisonBar label="Data Modifications (higher is better)" zerofs="1099 ops/s" juicefs="6 ops/s" ratio={183} type="performance" />
               <ComparisonBar label="File Append (higher is better)" zerofs="1204 ops/s" juicefs="5.3 ops/s" ratio={227} type="performance" />
+              <ComparisonBar label="Empty Files (higher is better)" zerofs="1351 ops/s" juicefs="1151 ops/s" ratio={1.17} type="performance" />
+              <ComparisonBar label="Git Clone (lower is better)" zerofs="2.6s" juicefs="34.4s" ratio={13} type="performance" />
+              <ComparisonBar label="Cargo Build (lower is better)" zerofs="3m 4s" juicefs=">69m" ratio={22} type="performance" />
+              <ComparisonBar label="TAR Extract (lower is better)" zerofs="8.2s" juicefs="10m 26s" ratio={76} type="performance" />
               <ComparisonBar label="Storage Used (lower is better)" zerofs="7.6 GB" juicefs="239 GB" ratio={31.6} type="resource" />
               <ComparisonBar label="API Operations (lower is better)" zerofs="8k" juicefs="898k" ratio={112} type="resource" />
             </div>
