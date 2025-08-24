@@ -404,7 +404,7 @@ impl ZeroFS {
                 });
 
                 let mut chunks: Vec<(usize, Option<Bytes>)> = chunk_futures
-                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE) // ← More efficient
+                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
                     .try_collect::<Vec<_>>()
                     .await?;
 
