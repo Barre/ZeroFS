@@ -4,6 +4,7 @@ import { Analytics } from '@vercel/analytics/react';
 import { Providers } from '@/app/providers'
 import { Layout } from '@/components/Layout'
 import { type Section } from '@/components/SectionProvider'
+import PlausibleProvider from 'next-plausible'
 
 import '@/styles/tailwind.css'
 import '@/styles/mermaid.css'
@@ -44,6 +45,12 @@ export default async function RootLayout({
 
   return (
     <html lang="en" className="h-full" suppressHydrationWarning>
+      <head>
+        <PlausibleProvider
+          domain="merklemap.com"
+          customDomain="https://p.merklemap.com"
+        />
+      </head>
       <body className="flex min-h-full bg-white antialiased dark:bg-zinc-900">
         <Providers>
           <div className="w-full">
