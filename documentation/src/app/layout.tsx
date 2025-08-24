@@ -1,6 +1,5 @@
 import glob from 'fast-glob'
 import { type Metadata } from 'next'
-import { Analytics } from '@vercel/analytics/react';
 import { Providers } from '@/app/providers'
 import { Layout } from '@/components/Layout'
 import { type Section } from '@/components/SectionProvider'
@@ -47,7 +46,7 @@ export default async function RootLayout({
     <html lang="en" className="h-full" suppressHydrationWarning>
       <head>
         <PlausibleProvider
-          domain="merklemap.com"
+          domain="zerofs.net"
           customDomain="https://p.merklemap.com"
         />
       </head>
@@ -57,7 +56,6 @@ export default async function RootLayout({
             <Layout allSections={allSections}>{children}</Layout>
           </div>
         </Providers>
-        <Analytics basePath="/va" />
       </body>
     </html>
   )
