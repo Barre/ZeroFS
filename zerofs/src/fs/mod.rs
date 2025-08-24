@@ -216,6 +216,7 @@ impl ZeroFS {
 
         let db_path = Path::from(db_path);
 
+        // This may look weird, but this is required to not drop the runtime handle from the async context
         let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
             let runtime = Runtime::new().unwrap();
             let handle = runtime.handle().clone();
