@@ -1,0 +1,57 @@
+export const metadata = {
+  title: 'Licensing',
+  description: 'ZeroFS licensing options - GNU AGPL v3 for open source and commercial licenses for enterprise use.',
+}
+
+# Licensing
+
+ZeroFS is dual licensed under GNU AGPL v3 and commercial license.
+
+The GNU AGPL v3 is designed for developers building open source applications in compliance with the GNU AGPL v3 license. It is fully featured. If you distribute, host or create derivative works of ZeroFS over a network, the GNU AGPL v3 license requires that you provide the complete corresponding source code of the combined work under the same GNU AGPL v3 license. This requirement applies whether or not you modified ZeroFS.
+
+Commercial licenses are available for organizations requiring different terms.
+
+**License Text:** The full GNU AGPL v3 license text is available at [https://github.com/Barre/ZeroFS/blob/main/LICENSE](https://github.com/Barre/ZeroFS/blob/main/LICENSE)
+
+## Licensing FAQs
+
+### What is the GNU AGPL v3?
+
+The GNU AGPL v3 is the GNU Affero General Public License v3, a FOSS license certified by the Free Software Foundation and the Open Source Initiative. The license extends GPL v3 protections to network services, ensuring that software improvements benefit the entire community.
+
+### When does AGPL apply to my use of ZeroFS?
+
+When you host or distribute ZeroFS over a network, the AGPL v3 applies. Any distribution or network provisioning of ZeroFS (modified or not) must comply with AGPL v3 obligations. This includes providing source code access to users of your network service.
+
+### Making combined or derivative works
+
+Creating combined or derivative works of ZeroFS requires such works to be released under AGPL v3.
+
+If ZeroFS source code is included in the same executable or if modules are designed to run linked together in a shared address space, they are likely combined into one program.
+
+Network protocols (NBD, NFS, 9P) and command-line arguments are communication mechanisms normally used between separate programs. However, if the semantics of the communication involve exchanging complex internal data structures or intimate operational knowledge, this could constitute a combined work.
+
+Merely aggregating ZeroFS in your distribution does not necessarily constitute a derivative work.
+
+### What about internal use?
+
+Internal use of ZeroFS within your organization, without network service exposure to external users, does not trigger AGPL distribution requirements.
+
+### Commercial Licensing
+
+For organizations requiring:
+- Exemption from AGPL obligations
+- Priority support and SLAs
+- Deployment assistance
+
+Commercial licenses are available. Please contact: pierre@barre.sh
+
+### Legal Consultation
+
+We recommend consulting your legal counsel regarding AGPL compliance for your specific use case. Commercial licensing removes AGPL obligations and provides legal clarity.
+
+## Legal Disclaimer
+
+This page provides general information about ZeroFS licensing options and does not constitute legal advice. The information presented here is for informational purposes only. For legal advice regarding your specific use case and licensing obligations, please consult with qualified legal counsel. While we strive to keep this information accurate and up-to-date, licensing interpretations may vary based on jurisdiction and specific circumstances.
+
+export const sections = []

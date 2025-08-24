@@ -605,6 +605,12 @@ These limits come from the filesystem design:
 
 In practice, you'll encounter other constraints well before these theoretical limits, such as S3 provider limits, performance considerations with billions of objects, or simply running out of money.
 
+## Licensing
+
+ZeroFS is dual-licensed under GNU AGPL v3 and commercial licenses. The AGPL license is suitable for open source projects, while commercial licenses are available for organizations requiring different terms.
+
+For detailed licensing information, see our [Licensing Documentation](https://www.zerofs.net/licensing).
+
 ## Future Enhancements
 
 - [ ] Snapshot capabilities using SlateDB's checkpoints
