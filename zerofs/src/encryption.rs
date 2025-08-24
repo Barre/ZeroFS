@@ -18,7 +18,6 @@ use slatedb::{
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::task;
 
 const NONCE_SIZE: usize = 12;
 
@@ -133,19 +132,15 @@ impl EncryptedWriteBatch {
             let operations = self.pending_operations;
             let encryptor = self.encryptor.clone();
 
-            let encrypted_operations = task::spawn_blocking(move || {
-                operations
-                    .into_par_iter()
-                    .map(|(key, value)| {
-                        let encrypted = encryptor.encrypt(&key, &value)?;
-                        Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
+            let encrypted_operations: Result<Vec<_>, _> = operations
+                .into_par_iter()
+                .map(|(key, value)| {
+                    let encrypted = encryptor.encrypt(&key, &value)?;
+                    Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
+                })
+                .collect();
 
-            for (key, encrypted) in encrypted_operations {
+            for (key, encrypted) in encrypted_operations? {
                 inner.put(&key, &encrypted);
             }
         }
@@ -183,15 +178,7 @@ impl EncryptedDb {
 
         match self.inner.get_with_options(key, &read_options).await? {
             Some(encrypted) => {
-                let encryptor = self.encryptor.clone();
-                let key_bytes = key.to_vec();
-                let encrypted_data = encrypted.to_vec();
-
-                let decrypted =
-                    task::spawn_blocking(move || encryptor.decrypt(&key_bytes, &encrypted_data))
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Join error: {}", e))??;
-
+                let decrypted = self.encryptor.decrypt(key, &encrypted)?;
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
             None => Ok(None),
