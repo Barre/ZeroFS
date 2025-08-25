@@ -9,7 +9,6 @@ use chacha20poly1305::{
 use futures::stream::Stream;
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
-use rayon::prelude::*;
 use sha2::Sha256;
 use slatedb::{
     WriteBatch,
@@ -133,7 +132,7 @@ impl EncryptedWriteBatch {
             let encryptor = self.encryptor.clone();
 
             let encrypted_operations: Result<Vec<_>, _> = operations
-                .into_par_iter()
+                .into_iter()
                 .map(|(key, value)| {
                     let encrypted = encryptor.encrypt(&key, &value)?;
                     Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
