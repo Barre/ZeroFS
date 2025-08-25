@@ -1,6 +1,14 @@
 <p align="center">
-  <img src="assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+  <a href="https://www.zerofs.net">
+    <img src="assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+  </a>
 </p>
+
+<div align="center">
+
+**[Documentation](https://www.zerofs.net)** | **[QuickStart](https://www.zerofs.net/quickstart)** | **[ZeroFS vs AWS EFS](https://www.zerofs.net/zerofs-vs-aws-efs)**
+
+</div>
 
 # ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
