@@ -43,6 +43,9 @@ impl ZeroFS {
 
     pub async fn mark_clean_shutdown(&self) -> Result<(), FsError> {
         info!("Marking clean shutdown");
+
+        self.db.flush().await.map_err(|_| FsError::IoError)?;
+
         let clean_shutdown_key = Self::clean_shutdown_key();
 
         let mut batch = self.db.new_write_batch();
@@ -58,6 +61,10 @@ impl ZeroFS {
             )
             .await
             .map_err(|_| FsError::IoError)?;
+
+        self.db.flush().await.map_err(|_| FsError::IoError)?;
+
+        self.db.close().await.map_err(|_| FsError::IoError)?;
 
         Ok(())
     }
@@ -264,7 +271,20 @@ mod tests {
     async fn test_fsck_lost_found_repair() {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
 
-        fs.mark_clean_shutdown().await.unwrap();
+        // Manually set clean shutdown flag without closing the DB
+        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let mut batch = fs.db.new_write_batch();
+        let true_bytes = bincode::serialize(&true).unwrap();
+        batch.put_bytes(&clean_shutdown_key, &true_bytes);
+        fs.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
 
         let current_counter = fs.next_inode_id.load(Ordering::SeqCst);
         println!("Current inode counter: {}", current_counter);
@@ -367,9 +387,21 @@ mod tests {
     async fn test_clean_shutdown_skips_recovery() {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
 
-        fs.mark_clean_shutdown().await.unwrap();
-
+        // Manually set clean shutdown flag without closing the DB
         let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let mut batch = fs.db.new_write_batch();
+        let true_bytes = bincode::serialize(&true).unwrap();
+        batch.put_bytes(&clean_shutdown_key, &true_bytes);
+        fs.db
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .unwrap();
+
         let flag_data = fs.db.get_bytes(&clean_shutdown_key).await.unwrap().unwrap();
         let is_clean: bool = bincode::deserialize(&flag_data).unwrap();
         assert!(is_clean, "Clean shutdown flag should be true");

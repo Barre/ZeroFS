@@ -453,18 +453,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unreachable!("Stats task should never complete");
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, flushing and shutting down gracefully...");
-                fs_arc.db.flush().await?;
+                info!("Received SIGINT, shutting down gracefully...");
                 fs_arc.mark_clean_shutdown().await?;
-                fs_arc.db.flush().await?;
-                fs_arc.db.close().await?;
             }
             _ = sigterm.recv() => {
-                info!("Received SIGTERM, flushing and shutting down gracefully..");
-                fs_arc.db.flush().await?;
+                info!("Received SIGTERM, shutting down gracefully...");
                 fs_arc.mark_clean_shutdown().await?;
-                fs_arc.db.flush().await?;
-                fs_arc.db.close().await?;
             }
         }
     } else {
@@ -485,13 +479,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unreachable!("Stats task should never complete");
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, flushing and shutting down gracefully...");
-                fs_arc.db.flush().await?;
+                info!("Received SIGINT, shutting down gracefully...");
                 fs_arc.mark_clean_shutdown().await?;
             }
             _ = sigterm.recv() => {
-                info!("Received SIGTERM, flushing and shutting down gracefully..");
-                fs_arc.db.flush().await?;
+                info!("Received SIGTERM, shutting down gracefully...");
                 fs_arc.mark_clean_shutdown().await?;
             }
         }
