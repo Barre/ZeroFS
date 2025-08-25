@@ -1,0 +1,199 @@
+import { BenchmarkCharts } from './BenchmarkCharts'
+
+export const metadata = {
+  title: 'ZeroFS vs Azure Files Benchmarks',
+  description: 'Performance comparison between ZeroFS and Azure Files',
+}
+
+# ZeroFS vs Azure Files Benchmarks
+
+Performance comparison conducted on Azure Standard D8ads v6 (8 vCPUs, 32 GiB memory) in West Europe region.
+
+## Test Setup
+
+- **VM**: Azure Standard D8ads v6, West Europe
+- **ZeroFS Storage**: Azure Blob Storage (Hot tier)
+- **Azure Files Configuration**: Hot tier, Standard performance
+- **Azure Files Mount**: CIFS/SMB with cache=none (for fair comparison)
+- **Benchmark suite**: [github.com/Barre/ZeroFS/bench](https://github.com/Barre/ZeroFS/tree/main/bench)
+- **Operations per test**: 10,000
+
+## Architecture Differences
+
+**ZeroFS**: Direct Azure Blob Storage architecture. No additional infrastructure required. Full POSIX compliance via 9p protocol.
+
+**Azure Files**: Managed SMB/CIFS service with NFS support.
+
+<BenchmarkCharts />
+
+## Benchmark Results
+
+### Synthetic Benchmarks
+
+| Test | ZeroFS | Azure Files | Difference |
+| --- | --- | --- | --- |
+| **Sequential Writes** | | | |
+| Operations/sec | 988.18 | 28.32 | 34.9x faster |
+| Mean latency | 1.01ms | 35.28ms | 34.9x slower |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Data Modifications** | | | |
+| Operations/sec | 1,063.00 | 67.64 | 15.7x faster |
+| Mean latency | 0.94ms | 14.78ms | 15.7x slower |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Single File Append** | | | |
+| Operations/sec | 1,118.04 | 67.31 | 16.6x faster |
+| Mean latency | 0.89ms | 14.85ms | 16.7x slower |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Empty Files** | | | |
+| Operations/sec | 1,374.44 | 33.12 | 41.5x faster |
+| Mean latency | 0.53ms | 30.17ms | 56.9x slower |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Empty Directories** | | | |
+| Operations/sec | 1,597.71 | 41.08 | 38.9x faster |
+| Mean latency | 0.62ms | 24.33ms | 39.2x slower |
+| Success rate | 100% | 100% | - |
+| | | | |
+| **Random Reads** | | | |
+| Operations/sec | 1,389.42 | 327.18 | 4.2x faster |
+| Mean latency | 0.72ms | 3.05ms | 4.2x slower |
+| Success rate | 100% | 100% | - |
+
+### Real-World Operations
+
+| Operation | ZeroFS | Azure Files | Notes |
+| --- | --- | --- | --- |
+| Git clone | 2.2s | 18.3s | ZeroFS repository |
+| Cargo build | 2m 03s | Failed | Build artifacts corrupted |
+| tar -xf (ZFS source) | 9.1s | 2m 41.6s | ZFS 2.3.3 release tarball |
+
+## Issues with Azure Files
+
+### Build Corruption
+Azure Files demonstrated reliability issues during testing:
+```
+error: linking with `cc` failed: exit status: 1
+  = note: /media/bench/ZeroFS/zerofs/target/debug/deps/serde_derive-44a05269d948f943.serde_derive.f1ce333ee4d08087-cgu.12.rcgu.o: 
+          file not recognized: file format not recognized
+          collect2: error: ld returned 1 exit status
+```
+The cargo build process failed on Azure Files due to corrupted build artifacts.
+
+## Cost Analysis
+
+### Storage Cost Comparison
+
+Based on Azure pricing (West Europe region):
+
+**Azure Files Pricing:**
+- Storage: **$0.0271/GB-Month** (Hot tier)
+- LRS redundancy included
+- Additional transaction costs apply
+
+**Azure Blob Storage Pricing (for ZeroFS):**
+- Storage: **$0.0196/GB-Month** (Hot tier)
+- LRS redundancy included
+- Minimal transaction costs for object operations
+
+### Raw Storage Cost Comparison
+
+| Storage Size | ZeroFS (Blob) Monthly | Azure Files Monthly | Cost Difference |
+| --- | --- | --- | --- |
+| **100 GB** | $1.96 | $2.71 | **1.4x more expensive** |
+| **1 TB** | $19.60 | $27.10 | **1.4x more expensive** |
+| **10 TB** | $196.00 | $271.00 | **1.4x more expensive** |
+| **100 TB** | $1,960.00 | $2,710.00 | **1.4x more expensive** |
+
+### Annual Storage Cost Projection
+
+| Storage Size | ZeroFS (Blob) Annual | Azure Files Annual | Annual Savings with ZeroFS |
+| --- | --- | --- | --- |
+| **100 GB** | $23.52 | $32.52 | **$9.00** |
+| **1 TB** | $235.20 | $325.20 | **$90.00** |
+| **10 TB** | $2,352.00 | $3,252.00 | **$900.00** |
+| **100 TB** | $23,520.00 | $32,520.00 | **$9,000.00** |
+
+**Important Notes:**
+- **ZeroFS**: Primary cost is Azure Blob storage at $0.0196/GB-month. Transaction costs are minimal.
+- **Azure Files**: Storage cost is 1.4x higher at $0.0271/GB-month, plus additional transaction charges.
+- Both solutions include LRS (Locally Redundant Storage) in the base price.
+
+## Key Observations
+
+### ZeroFS Advantages
+- **34.9x faster** for sequential writes
+- **15.7x faster** for data modifications
+- **41.5x faster** for empty file creation
+- **38.9x faster** for directory operations
+- **4.2x faster** for random reads
+- **17.8x faster** for archive extraction
+- **8.3x faster** for git clone operations
+- **38% lower storage costs**
+- **Reliable for build artifacts** (cargo build successful)
+
+## Technical Details
+
+### Sequential Writes
+Creates files in sequence. Tests metadata performance and write throughput.
+
+**ZeroFS**: 10,000 files in 10.1 seconds  
+**Azure Files**: 10,000 files in 353.1 seconds (34.9x slower)
+
+### Data Modifications
+Random writes to existing files. Tests consistency and caching.
+
+**ZeroFS**: 10,000 operations in 9.4 seconds  
+**Azure Files**: 10,000 operations in 147.8 seconds (15.7x slower)
+
+### Single File Append
+Appends to a single file. Tests lock contention and write ordering.
+
+**ZeroFS**: 10,000 operations in 8.9 seconds  
+**Azure Files**: 10,000 operations in 148.6 seconds (16.6x slower)
+
+### Empty File Creation
+Pure metadata operations without data writes.
+
+**ZeroFS**: 10,000 files in 7.3 seconds  
+**Azure Files**: 10,000 files in 301.9 seconds (41.5x slower)
+
+### Empty Directory Creation
+Tests directory metadata operations.
+
+**ZeroFS**: 10,000 directories in 6.3 seconds  
+**Azure Files**: 10,000 directories in 243.4 seconds (38.9x slower)
+
+### Random Reads
+Tests read performance from various file positions.
+
+**ZeroFS**: 1,389.42 ops/sec  
+**Azure Files**: 327.18 ops/sec (4.2x slower)
+
+### Git Clone
+Tests mixed read/write patterns with metadata operations.
+
+**ZeroFS**: Completed in 2.2 seconds  
+**Azure Files**: Completed in 18.3 seconds (8.3x slower)
+
+### Compilation Workload
+Rust compilation of ZeroFS codebase. Tests mixed read/write patterns and file consistency.
+
+**ZeroFS**: 2 minutes 3 seconds (successful)  
+**Azure Files**: Failed - corrupted build artifacts
+
+### Archive Extraction
+Extracting ZFS 2.3.3 source tarball. Tests sequential file creation with varying sizes.
+
+**ZeroFS**: 9.1 seconds  
+**Azure Files**: 161.6 seconds (17.8x slower)
+
+## Summary
+
+ZeroFS demonstrated significantly better performance compared to Azure Files in our benchmarks, with improvements ranging from 4.2x to 41.5x across different operations. The performance advantage is most pronounced in metadata operations where Azure Files shows latencies of 30-35ms compared to sub-millisecond latencies for ZeroFS.
+
+In addition to the performance benefits, ZeroFS offers 38% lower storage costs using Azure Blob Storage. However, it's worth noting that Azure Files did encounter issues with the cargo build test in our specific configuration, which may require further investigation for development workloads.
+
+For workloads requiring high-performance file operations, especially those with intensive metadata operations, ZeroFS presents a cost-effective alternative to Azure Files when using Azure cloud infrastructure.
