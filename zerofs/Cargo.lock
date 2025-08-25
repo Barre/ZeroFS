@@ -540,15 +540,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-epoch"
 version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2448,15 +2439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_xorshift"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
-dependencies = [
- "rand_core 0.9.3",
-]
-
-[[package]]
 name = "rand_xoshiro"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2886,7 +2868,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.7.0"
-source = "git+https://github.com/slatedb/slatedb.git?rev=6e138682013a192bc55e8a2b925ad65d0599a4ef#6e138682013a192bc55e8a2b925ad65d0599a4ef"
+source = "git+https://github.com/Barre/slatedb.git?rev=177b6fa3728ff4f6f6083de5270a94a0478c1add#177b6fa3728ff4f6f6083de5270a94a0478c1add"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2896,7 +2878,6 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
- "crossbeam-channel",
  "crossbeam-skiplist",
  "dotenvy",
  "duration-str",
@@ -2912,7 +2893,6 @@ dependencies = [
  "parking_lot",
  "radix_trie",
  "rand 0.9.2",
- "rand_xorshift",
  "rand_xoshiro 0.7.0",
  "serde",
  "serde_json",
