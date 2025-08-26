@@ -176,6 +176,9 @@ No additional environment variables are required for local storage.
 
 - `ZEROFS_NFS_HOST`: Address (IP or hostname) to bind the NFS TCP socket (default: `"127.0.0.1"`)
 - `ZEROFS_NFS_HOST_PORT`: Port to bind the NFS TCP socket (default: `2049`)
+- `ZEROFS_9P_HOST`: Address (IP or hostname) to bind the 9P TCP socket (default: `"127.0.0.1"`)
+- `ZEROFS_9P_PORT`: Port to bind the 9P TCP socket (default: `5564`)
+- `ZEROFS_9P_SOCKET`: Path for 9P Unix domain socket (optional, enables Unix socket server in addition to TCP)
 - `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP sockets (default: `"127.0.0.1"`)
 - `ZEROFS_NBD_PORTS`: Comma-separated list of ports for NBD servers (optional)
 - `ZEROFS_NBD_DEVICE_SIZES_GB`: Comma-separated list of device sizes in GB (optional, must match `ZEROFS_NBD_PORTS` count)
@@ -229,9 +232,23 @@ This should be fine for most use-cases but if you need to hide directory structu
 
 **Note on durability:** With NFS, ZeroFS reports writes as "stable" to the client even though they are actually unstable (buffered in memory/cache). This is done to avoid performance degradation, as otherwise each write would translate to an fsync-like operation (COMMIT in NFS terms). During testing, we expected clients to call COMMIT on FSYNC, but tested clients (macOS and Linux) don't follow this pattern. If you require strong durability guarantees, 9P is strongly recommended over NFS.
 
+#### TCP Mount (default)
 ```bash
 mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
+
+#### Unix Socket Mount (lower latency for local access)
+For improved performance when mounting locally, you can use Unix domain sockets which eliminate TCP/IP stack overhead:
+
+```bash
+# Start ZeroFS with Unix socket support
+ZEROFS_9P_SOCKET=/tmp/zerofs.sock zerofs s3://bucket/path
+
+# Mount using Unix socket
+mount -t 9p -o trans=unix,version=9p2000.L,msize=1048576,cache=mmap,access=user /tmp/zerofs.sock /mnt/9p
+```
+
+Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.
 
 ### NFS
 
