@@ -28,12 +28,26 @@ lsmod | grep 9p
 
 ### Mounting ZeroFS
 
+#### TCP Mount (default)
+
 ```bash
 # Create mount point
 sudo mkdir -p /mnt/zerofs-9p
 
-# Mount via 9P
+# Mount via 9P over TCP
 sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs-9p
+```
+
+#### Unix Socket Mount (lower latency)
+
+For improved performance when mounting locally, you can use Unix domain sockets:
+
+```bash
+# Start ZeroFS with Unix socket support
+ZEROFS_9P_SOCKET=/tmp/zerofs.sock zerofs s3://bucket/path
+
+# Mount via Unix socket
+sudo mount -t 9p -o trans=unix,version=9p2000.L /tmp/zerofs.sock /mnt/zerofs-9p
 ```
 
 ### Unmounting
@@ -48,8 +62,8 @@ sudo umount /mnt/zerofs-9p
 
 | Option | Description |
 |--------|-------------|
-| `trans=tcp` | Use TCP transport |
-| `port=5564` | ZeroFS 9P port |
+| `trans=tcp` or `trans=unix` | Use TCP or Unix socket transport |
+| `port=5564` | ZeroFS 9P port (TCP only) |
 | `version=9p2000.L` | Use Linux-specific 9P version |
 
 ### Performance Options
