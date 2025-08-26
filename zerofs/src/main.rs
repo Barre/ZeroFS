@@ -123,6 +123,9 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
             "  {BLUE}ZEROFS_9P_HOST{RESET}                 - 9P server bind address (default: 127.0.0.1)"
         );
         eprintln!("  {BLUE}ZEROFS_9P_PORT{RESET}                 - 9P server port (default: 5564)");
+        eprintln!(
+            "  {BLUE}ZEROFS_9P_SOCKET{RESET}               - Unix socket path for 9P (optional)"
+        );
         eprintln!();
         eprintln!("{YELLOW}Logging Configuration:{RESET}");
         eprintln!(
@@ -433,59 +436,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ninep_addr = format!("{ninep_host}:{ninep_port}")
         .parse()
         .expect("Invalid 9P server address");
-    let ninep_server = crate::ninep::NinePServer::new(ninep_fs, ninep_addr);
-    let ninep_handle = tokio::spawn(async move { ninep_server.start().await });
+    let ninep_tcp_server = crate::ninep::NinePServer::new(ninep_fs, ninep_addr);
+    let ninep_tcp_handle = tokio::spawn(async move { ninep_tcp_server.start().await });
+
+    let ninep_unix_handle = if let Ok(socket_path) = std::env::var("ZEROFS_9P_SOCKET") {
+        info!("Starting 9P server on Unix socket: {}", socket_path);
+        let ninep_unix_fs = Arc::clone(&fs_arc);
+        let ninep_unix_server = crate::ninep::NinePServer::new_unix(
+            ninep_unix_fs,
+            std::path::PathBuf::from(socket_path),
+        );
+        Some(tokio::spawn(async move { ninep_unix_server.start().await }))
+    } else {
+        None
+    };
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    if nbd_handles.is_empty() {
-        tokio::select! {
-            result = nfs_handle => {
-                result??;
-            }
-            result = ninep_handle => {
-                result??;
-            }
-            _ = gc_handle => {
-                unreachable!("GC task should never complete");
-            }
-            _ = stats_handle => {
-                unreachable!("Stats task should never complete");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down gracefully...");
-                fs_arc.mark_clean_shutdown().await?;
-            }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down gracefully...");
-                fs_arc.mark_clean_shutdown().await?;
-            }
+    let mut server_handles = vec![nfs_handle, ninep_tcp_handle];
+    if let Some(ninep_unix) = ninep_unix_handle {
+        server_handles.push(ninep_unix);
+    }
+    server_handles.extend(nbd_handles);
+
+    tokio::select! {
+        result = futures::future::select_all(server_handles) => {
+            let (result, _, _) = result;
+            result??;
         }
-    } else {
-        tokio::select! {
-            result = nfs_handle => {
-                result??;
-            }
-            result = ninep_handle => {
-                result??;
-            }
-            result = futures::future::select_all(nbd_handles) => {
-                unreachable!("NBD server should never complete: {result:?}");
-            }
-            _ = gc_handle => {
-                unreachable!("GC task should never complete");
-            }
-            _ = stats_handle => {
-                unreachable!("Stats task should never complete");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down gracefully...");
-                fs_arc.mark_clean_shutdown().await?;
-            }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down gracefully...");
-                fs_arc.mark_clean_shutdown().await?;
-            }
+        _ = gc_handle => {
+            unreachable!("GC task should never complete");
+        }
+        _ = stats_handle => {
+            unreachable!("Stats task should never complete");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down gracefully...");
+            fs_arc.mark_clean_shutdown().await?;
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down gracefully...");
+            fs_arc.mark_clean_shutdown().await?;
         }
     }
 
