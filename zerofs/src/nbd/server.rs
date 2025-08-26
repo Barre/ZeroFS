@@ -63,6 +63,8 @@ impl NBDServer {
             let (stream, addr) = listener.accept().await?;
             info!("NBD client connected from {}", addr);
 
+            stream.set_nodelay(true)?;
+
             let filesystem = Arc::clone(&self.filesystem);
             let devices = self.devices.clone();
 
