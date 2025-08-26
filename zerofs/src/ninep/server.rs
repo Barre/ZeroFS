@@ -5,50 +5,90 @@ use crate::ninep::handler::DEFAULT_MSIZE;
 use bytes::BytesMut;
 use deku::prelude::*;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+pub enum Transport {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
 pub struct NinePServer {
     filesystem: Arc<ZeroFS>,
-    addr: SocketAddr,
+    transport: Transport,
 }
 
 impl NinePServer {
     pub fn new(filesystem: Arc<ZeroFS>, addr: SocketAddr) -> Self {
-        Self { filesystem, addr }
+        Self {
+            filesystem,
+            transport: Transport::Tcp(addr),
+        }
+    }
+
+    pub fn new_unix(filesystem: Arc<ZeroFS>, path: PathBuf) -> Self {
+        Self {
+            filesystem,
+            transport: Transport::Unix(path),
+        }
     }
 
     pub async fn start(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(self.addr).await?;
-        info!("9P server listening on {}", self.addr);
+        match &self.transport {
+            Transport::Tcp(addr) => {
+                let listener = TcpListener::bind(addr).await?;
+                info!("9P server listening on TCP {}", addr);
 
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            info!("9P client connected from {}", addr);
+                loop {
+                    let (stream, peer_addr) = listener.accept().await?;
+                    info!("9P client connected from {}", peer_addr);
 
-            // Set TCP_NODELAY for better latency
-            stream.set_nodelay(true)?;
+                    stream.set_nodelay(true)?;
 
-            let filesystem = Arc::clone(&self.filesystem);
-            tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, filesystem).await {
-                    error!("Error handling 9P client {}: {}", addr, e);
+                    let filesystem = Arc::clone(&self.filesystem);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client_stream(stream, filesystem).await {
+                            error!("Error handling 9P client {}: {}", peer_addr, e);
+                        }
+                    });
                 }
-            });
+            }
+            Transport::Unix(path) => {
+                let _ = std::fs::remove_file(path);
+
+                let listener = UnixListener::bind(path)?;
+                info!("9P server listening on Unix socket {:?}", path);
+
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    info!("9P client connected via Unix socket");
+
+                    let filesystem = Arc::clone(&self.filesystem);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client_stream(stream, filesystem).await {
+                            error!("Error handling 9P Unix client: {}", e);
+                        }
+                    });
+                }
+            }
         }
     }
 }
 
-async fn handle_client(
-    stream: TcpStream,
+async fn handle_client_stream<S>(
+    stream: S,
     filesystem: Arc<ZeroFS>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let handler = Arc::new(NinePHandler::new(filesystem));
 
-    let (mut read_stream, mut write_stream) = stream.into_split();
+    let (mut read_stream, mut write_stream) = tokio::io::split(stream);
 
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(100);
 
