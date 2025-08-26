@@ -27,6 +27,19 @@ impl ZeroFS {
 
         let dirname_str = String::from_utf8_lossy(dirname);
         debug!("process_mkdir: dirid={}, dirname={}", dirid, dirname_str);
+        let name = dirname_str.to_string();
+
+        // Optimistic existence check without holding lock
+        let entry_key = Self::dir_entry_key(dirid, &name);
+        if self
+            .db
+            .get_bytes(&entry_key)
+            .await
+            .map_err(|_| FsError::IoError)?
+            .is_some()
+        {
+            return Err(FsError::Exists);
+        }
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.load_inode(dirid).await?;
@@ -36,9 +49,7 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                let name = dirname_str.to_string();
-
-                let entry_key = Self::dir_entry_key(dirid, &name);
+                // Re-check existence inside lock (should hit cache and be fast)
                 if self
                     .db
                     .get_bytes(&entry_key)
