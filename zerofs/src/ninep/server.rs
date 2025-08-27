@@ -60,7 +60,12 @@ impl NinePServer {
             Transport::Unix(path) => {
                 let _ = std::fs::remove_file(path);
 
-                let listener = UnixListener::bind(path)?;
+                let listener = UnixListener::bind(path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to bind Unix socket at {:?}: {}", path, e),
+                    )
+                })?;
                 info!("9P server listening on Unix socket {:?}", path);
 
                 loop {
