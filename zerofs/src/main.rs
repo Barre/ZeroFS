@@ -306,8 +306,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ZEROFS_NFS_HOST").unwrap_or_else(|_| DEFAULT_NFS_HOST.to_string());
 
     let zerofs_nfs_host_port = std::env::var("ZEROFS_NFS_HOST_PORT")
-        .map_or_else(|_| Ok(DEFAULT_NFS_PORT), |port| port.parse::<u32>())
-        .expect("ZEROFS_NFS_HOST_PORT must be a valid port number");
+        .ok()
+        .map(|port| {
+            port.parse::<u32>().unwrap_or_else(|e| {
+                eprintln!(
+                    "Error: ZEROFS_NFS_HOST_PORT='{}' is not a valid port number: {}",
+                    port, e
+                );
+                std::process::exit(1);
+            })
+        })
+        .unwrap_or(DEFAULT_NFS_PORT);
 
     let nfs_fs = Arc::clone(&fs_arc);
     let nfs_handle = tokio::spawn(async move {
@@ -359,12 +368,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let ports: Vec<u16> = nbd_ports
             .split(',')
-            .filter_map(|s| s.trim().parse().ok())
+            .map(|s| {
+                let trimmed = s.trim();
+                trimmed.parse().unwrap_or_else(|e| {
+                    eprintln!("Error: Invalid NBD port '{}': {}", trimmed, e);
+                    std::process::exit(1);
+                })
+            })
             .collect();
 
         let sizes: Vec<u64> = nbd_device_sizes
             .split(',')
-            .filter_map(|s| s.trim().parse::<f64>().ok())
+            .map(|s| {
+                let trimmed = s.trim();
+                trimmed.parse::<f64>().unwrap_or_else(|e| {
+                    eprintln!("Error: Invalid NBD device size '{}': {}", trimmed, e);
+                    std::process::exit(1);
+                })
+            })
             .map(|gb| (gb * 1024.0 * 1024.0 * 1024.0) as u64)
             .collect();
 
@@ -429,13 +450,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ninep_host =
         std::env::var("ZEROFS_9P_HOST").unwrap_or_else(|_| DEFAULT_9P_HOST.to_string());
     let ninep_port = std::env::var("ZEROFS_9P_PORT")
-        .map_or_else(|_| Ok(DEFAULT_9P_PORT), |port| port.parse::<u16>())
-        .expect("ZEROFS_9P_PORT must be a valid port number");
+        .ok()
+        .map(|port| {
+            port.parse::<u16>().unwrap_or_else(|e| {
+                eprintln!(
+                    "Error: ZEROFS_9P_PORT='{}' is not a valid port number: {}",
+                    port, e
+                );
+                std::process::exit(1);
+            })
+        })
+        .unwrap_or(DEFAULT_9P_PORT);
 
     let ninep_fs = Arc::clone(&fs_arc);
     let ninep_addr = format!("{ninep_host}:{ninep_port}")
         .parse()
-        .expect("Invalid 9P server address");
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Error: Invalid 9P server address '{}:{}': {}",
+                ninep_host, ninep_port, e
+            );
+            std::process::exit(1);
+        });
     let ninep_tcp_server = crate::ninep::NinePServer::new(ninep_fs, ninep_addr);
     let ninep_tcp_handle = tokio::spawn(async move { ninep_tcp_server.start().await });
 
