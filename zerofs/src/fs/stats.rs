@@ -1,6 +1,7 @@
 use super::STATS_SHARDS;
 use super::errors::FsError;
 use super::inode::InodeId;
+use super::key_codec::KeyCodec;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
@@ -65,7 +66,7 @@ impl FileSystemGlobalStats {
 
         StatsUpdate {
             shard_id,
-            shard_key: super::ZeroFS::stats_shard_key(shard_id),
+            shard_key: KeyCodec::stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         }
@@ -94,7 +95,7 @@ impl FileSystemGlobalStats {
 
         StatsUpdate {
             shard_id,
-            shard_key: super::ZeroFS::stats_shard_key(shard_id),
+            shard_key: KeyCodec::stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         }
@@ -129,7 +130,7 @@ impl FileSystemGlobalStats {
 
         Some(StatsUpdate {
             shard_id,
-            shard_key: super::ZeroFS::stats_shard_key(shard_id),
+            shard_key: KeyCodec::stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         })

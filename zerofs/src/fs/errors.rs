@@ -31,6 +31,8 @@ pub enum FsError {
     NotSupported,
     #[error("Stale file handle")]
     StaleHandle,
+    #[error("Invalid data")]
+    InvalidData,
 }
 
 impl From<bincode::Error> for FsError {
@@ -56,6 +58,7 @@ impl From<FsError> for nfsstat3 {
             FsError::NameTooLong => nfsstat3::NFS3ERR_NAMETOOLONG,
             FsError::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
             FsError::StaleHandle => nfsstat3::NFS3ERR_STALE,
+            FsError::InvalidData => nfsstat3::NFS3ERR_IO,
         }
     }
 }
@@ -98,6 +101,7 @@ impl FsError {
             FsError::NameTooLong => libc::ENAMETOOLONG as u32,
             FsError::NotSupported => libc::ENOSYS as u32,
             FsError::StaleHandle => libc::ESTALE as u32,
+            FsError::InvalidData => libc::EIO as u32,
         }
     }
 }
