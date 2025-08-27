@@ -1,5 +1,6 @@
 use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::inode::Inode;
+use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use crate::fs::{EncodedFileId, ZeroFS};
@@ -56,7 +57,7 @@ impl NFSFileSystem for ZeroFS {
                     return Ok(EncodedFileId::from_inode(inode_id).into());
                 }
 
-                let entry_key = ZeroFS::dir_entry_key(real_dirid, &name);
+                let entry_key = KeyCodec::dir_entry_key(real_dirid, &name);
 
                 match self
                     .db

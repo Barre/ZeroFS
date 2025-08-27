@@ -1,5 +1,6 @@
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
+use crate::fs::key_codec::{KeyCodec, PREFIX_INODE};
 use crate::fs::{ZeroFS, get_current_time};
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
@@ -7,7 +8,7 @@ use tracing::{info, warn};
 
 impl ZeroFS {
     pub async fn run_recovery_if_needed(&mut self) -> Result<(), FsError> {
-        let clean_shutdown_key = Self::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
 
         let was_clean = self
             .db
@@ -46,7 +47,7 @@ impl ZeroFS {
 
         self.db.flush().await.map_err(|_| FsError::IoError)?;
 
-        let clean_shutdown_key = Self::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
 
         let mut batch = self.db.new_write_batch();
         let true_bytes = bincode::serialize(&true)?;
@@ -132,20 +133,20 @@ impl ZeroFS {
                 | Inode::BlockDevice(s) => s.parent = lost_found_id,
             }
 
-            let inode_key = Self::inode_key(inode_id);
+            let inode_key = KeyCodec::inode_key(inode_id);
             let inode_data = bincode::serialize(&inode)?;
             batch.put_bytes(&inode_key, &inode_data);
 
             let name = format!("orphan_{}", inode_id);
-            let entry_key = Self::dir_entry_key(lost_found_id, &name);
-            batch.put_bytes(&entry_key, &inode_id.to_le_bytes());
+            let entry_key = KeyCodec::dir_entry_key(lost_found_id, &name);
+            batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(inode_id));
 
-            let scan_key = Self::dir_scan_key(lost_found_id, inode_id, &name);
-            batch.put_bytes(&scan_key, &inode_id.to_le_bytes());
+            let scan_key = KeyCodec::dir_scan_key(lost_found_id, inode_id, &name);
+            batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(inode_id));
         }
 
-        let counter_key = Self::counter_key();
-        batch.put_bytes(&counter_key, &(max_inode + 1).to_le_bytes());
+        let counter_key = KeyCodec::system_counter_key();
+        batch.put_bytes(&counter_key, &KeyCodec::encode_counter(max_inode + 1));
 
         let mut lost_found_inode = self.load_inode(lost_found_id).await?;
         if let Inode::Directory(ref mut dir) = lost_found_inode {
@@ -154,7 +155,7 @@ impl ZeroFS {
             dir.mtime = now_sec;
             dir.mtime_nsec = now_nsec;
 
-            let lost_found_key = Self::inode_key(lost_found_id);
+            let lost_found_key = KeyCodec::inode_key(lost_found_id);
             let lost_found_data = bincode::serialize(&lost_found_inode)?;
             batch.put_bytes(&lost_found_key, &lost_found_data);
         }
@@ -184,9 +185,10 @@ impl ZeroFS {
 
         // Create a range from the counter to scan all inodes with IDs >= counter
         // We scan the inode keyspace starting from the counter value
-        let start_key = Self::inode_key(counter);
+        let start_key = KeyCodec::inode_key(counter);
         // End at the next prefix (inodes are PREFIX_INODE = 0x01, so end at 0x02)
-        let end_key = Bytes::from(vec![crate::fs::PREFIX_INODE + 1]);
+
+        let end_key = Bytes::from(vec![PREFIX_INODE + 1]);
         let range = start_key..end_key;
 
         let iter = self.db.scan(range).await.map_err(|_| FsError::IoError)?;
@@ -194,7 +196,7 @@ impl ZeroFS {
 
         while let Some(Ok((key, value))) = futures::StreamExt::next(&mut iter).await {
             // Parse the inode ID from the key
-            if key.len() == 9 && key[0] == crate::fs::PREFIX_INODE {
+            if key.len() == 9 && key[0] == PREFIX_INODE {
                 let mut id_bytes = [0u8; 8];
                 id_bytes.copy_from_slice(&key[1..9]);
                 let inode_id = u64::from_be_bytes(id_bytes);
@@ -272,7 +274,7 @@ mod tests {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Manually set clean shutdown flag without closing the DB
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let true_bytes = bincode::serialize(&true).unwrap();
         batch.put_bytes(&clean_shutdown_key, &true_bytes);
@@ -306,13 +308,13 @@ mod tests {
             nlink: 1,
         });
 
-        let inode_key = ZeroFS::inode_key(orphaned_id);
+        let inode_key = KeyCodec::inode_key(orphaned_id);
         let inode_data = bincode::serialize(&orphaned_inode).unwrap();
         let mut batch = fs.db.new_write_batch();
         batch.put_bytes(&inode_key, &inode_data);
 
-        let entry_key = ZeroFS::dir_entry_key(0, "orphaned_file.txt");
-        batch.put_bytes(&entry_key, &orphaned_id.to_le_bytes());
+        let entry_key = KeyCodec::dir_entry_key(0, "orphaned_file.txt");
+        batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(orphaned_id));
 
         fs.db
             .write_with_options(
@@ -324,7 +326,7 @@ mod tests {
             .await
             .unwrap();
 
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let false_bytes = bincode::serialize(&false).unwrap();
         batch.put_bytes(&clean_shutdown_key, &false_bytes);
@@ -347,7 +349,7 @@ mod tests {
         );
         println!("Counter updated to: {}", new_counter);
 
-        let lost_found_entry = ZeroFS::dir_entry_key(0, "lost+found"); // Root is at inode 0
+        let lost_found_entry = KeyCodec::dir_entry_key(0, "lost+found"); // Root is at inode 0
         let lost_found_data = fs.db.get_bytes(&lost_found_entry).await.unwrap();
         assert!(lost_found_data.is_some(), "lost+found should exist");
 
@@ -357,7 +359,7 @@ mod tests {
         println!("lost+found created with inode: {}", lost_found_id);
 
         let orphan_entry_key =
-            ZeroFS::dir_entry_key(lost_found_id, &format!("orphan_{}", orphaned_id));
+            KeyCodec::dir_entry_key(lost_found_id, &format!("orphan_{}", orphaned_id));
         let orphan_entry = fs.db.get_bytes(&orphan_entry_key).await.unwrap();
         assert!(
             orphan_entry.is_some(),
@@ -388,7 +390,7 @@ mod tests {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Manually set clean shutdown flag without closing the DB
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let true_bytes = bincode::serialize(&true).unwrap();
         batch.put_bytes(&clean_shutdown_key, &true_bytes);
@@ -417,7 +419,7 @@ mod tests {
     async fn test_recovery_with_no_orphans() {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let false_bytes = bincode::serialize(&false).unwrap();
         batch.put_bytes(&clean_shutdown_key, &false_bytes);
@@ -441,7 +443,7 @@ mod tests {
             "Counter should not change when no orphans"
         );
 
-        let lost_found_entry = ZeroFS::dir_entry_key(0, "lost+found");
+        let lost_found_entry = KeyCodec::dir_entry_key(0, "lost+found");
         let lost_found_data = fs.db.get_bytes(&lost_found_entry).await.unwrap();
         assert!(
             lost_found_data.is_none(),
@@ -481,7 +483,7 @@ mod tests {
                 parent: 0,
                 nlink: 1,
             });
-            let key = ZeroFS::inode_key(id);
+            let key = KeyCodec::inode_key(id);
             let data = bincode::serialize(&inode).unwrap();
             batch.put_bytes(&key, &data);
         }
@@ -495,7 +497,7 @@ mod tests {
             .await
             .unwrap();
 
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let false_bytes = bincode::serialize(&false).unwrap();
         batch.put_bytes(&clean_shutdown_key, &false_bytes);
@@ -521,7 +523,7 @@ mod tests {
         );
 
         // Verify lost+found was created
-        let lost_found_entry = ZeroFS::dir_entry_key(0, "lost+found");
+        let lost_found_entry = KeyCodec::dir_entry_key(0, "lost+found");
         let lost_found_data = fs.db.get_bytes(&lost_found_entry).await.unwrap();
         assert!(lost_found_data.is_some(), "lost+found should exist");
 
@@ -531,7 +533,7 @@ mod tests {
 
         // Verify all orphans are in lost+found, including the far one
         for &id in &orphan_ids {
-            let orphan_entry = ZeroFS::dir_entry_key(lost_found_id, &format!("orphan_{}", id));
+            let orphan_entry = KeyCodec::dir_entry_key(lost_found_id, &format!("orphan_{}", id));
             let entry_data = fs.db.get_bytes(&orphan_entry).await.unwrap();
             assert!(
                 entry_data.is_some(),
@@ -565,7 +567,7 @@ mod tests {
             nlink: 1,
         });
 
-        let key = ZeroFS::inode_key(orphaned_id);
+        let key = KeyCodec::inode_key(orphaned_id);
         let data = bincode::serialize(&inode).unwrap();
         let mut batch = fs.db.new_write_batch();
         batch.put_bytes(&key, &data);
@@ -580,7 +582,7 @@ mod tests {
             .unwrap();
 
         // Set unclean shutdown
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let false_bytes = bincode::serialize(&false).unwrap();
         batch.put_bytes(&clean_shutdown_key, &false_bytes);
@@ -600,14 +602,15 @@ mod tests {
         let counter_after_first = fs.next_inode_id.load(Ordering::SeqCst);
 
         // Verify lost+found was created and has the orphan
-        let lost_found_entry = ZeroFS::dir_entry_key(0, "lost+found");
+        let lost_found_entry = KeyCodec::dir_entry_key(0, "lost+found");
         let lost_found_data = fs.db.get_bytes(&lost_found_entry).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&lost_found_data[..8]);
         let lost_found_id = u64::from_le_bytes(bytes);
 
         // Verify orphan is in lost+found after first recovery
-        let orphan_entry = ZeroFS::dir_entry_key(lost_found_id, &format!("orphan_{}", orphaned_id));
+        let orphan_entry =
+            KeyCodec::dir_entry_key(lost_found_id, &format!("orphan_{}", orphaned_id));
         let entry_data = fs.db.get_bytes(&orphan_entry).await.unwrap();
         assert!(
             entry_data.is_some(),
@@ -673,7 +676,7 @@ mod tests {
                 parent: 0,
                 nlink: 1,
             });
-            let key = ZeroFS::inode_key(id);
+            let key = KeyCodec::inode_key(id);
             let data = bincode::serialize(&inode).unwrap();
             batch.put_bytes(&key, &data);
         }
@@ -688,7 +691,7 @@ mod tests {
             .unwrap();
 
         // Set unclean shutdown
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let false_bytes = bincode::serialize(&false).unwrap();
         batch.put_bytes(&clean_shutdown_key, &false_bytes);
@@ -715,7 +718,7 @@ mod tests {
         );
 
         // Verify lost+found was created
-        let lost_found_entry = ZeroFS::dir_entry_key(0, "lost+found");
+        let lost_found_entry = KeyCodec::dir_entry_key(0, "lost+found");
         let lost_found_data = fs.db.get_bytes(&lost_found_entry).await.unwrap();
         assert!(lost_found_data.is_some(), "lost+found should exist");
 
@@ -725,7 +728,7 @@ mod tests {
 
         // Verify both orphans are in lost+found despite the large gap
         for &id in &orphan_ids {
-            let orphan_entry = ZeroFS::dir_entry_key(lost_found_id, &format!("orphan_{}", id));
+            let orphan_entry = KeyCodec::dir_entry_key(lost_found_id, &format!("orphan_{}", id));
             let entry_data = fs.db.get_bytes(&orphan_entry).await.unwrap();
             assert!(
                 entry_data.is_some(),
@@ -780,7 +783,7 @@ mod tests {
         });
 
         let mut batch = fs.db.new_write_batch();
-        let key = ZeroFS::inode_key(orphaned_id);
+        let key = KeyCodec::inode_key(orphaned_id);
         let data = bincode::serialize(&orphaned_inode).unwrap();
         batch.put_bytes(&key, &data);
         fs.db
@@ -794,7 +797,7 @@ mod tests {
             .unwrap();
 
         // Set unclean shutdown
-        let clean_shutdown_key = ZeroFS::clean_shutdown_key();
+        let clean_shutdown_key = KeyCodec::recovery_key();
         let mut batch = fs.db.new_write_batch();
         let false_bytes = bincode::serialize(&false).unwrap();
         batch.put_bytes(&clean_shutdown_key, &false_bytes);
@@ -812,7 +815,7 @@ mod tests {
         fs.run_recovery_if_needed().await.unwrap();
 
         // Verify the existing lost+found was used
-        let entry_key = ZeroFS::dir_entry_key(0, "lost+found");
+        let entry_key = KeyCodec::dir_entry_key(0, "lost+found");
         let lost_found_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&lost_found_data[..8]);
@@ -820,7 +823,8 @@ mod tests {
         assert_eq!(found_id, lost_found_id, "Should reuse existing lost+found");
 
         // Verify orphan was added to it
-        let orphan_entry = ZeroFS::dir_entry_key(lost_found_id, &format!("orphan_{}", orphaned_id));
+        let orphan_entry =
+            KeyCodec::dir_entry_key(lost_found_id, &format!("orphan_{}", orphaned_id));
         let entry_data = fs.db.get_bytes(&orphan_entry).await.unwrap();
         assert!(
             entry_data.is_some(),

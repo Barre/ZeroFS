@@ -11,6 +11,7 @@ mod tests {
     use crate::fs::ZeroFS;
     use crate::fs::errors::FsError;
     use crate::fs::inode::Inode;
+    use crate::fs::key_codec::KeyCodec;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
     use crate::fs::{CHUNK_SIZE, EncodedFileId};
@@ -43,7 +44,7 @@ mod tests {
         assert_eq!(fattr.size, 0);
 
         // Check that the file was added to the directory
-        let entry_key = ZeroFS::dir_entry_key(0, "test.txt");
+        let entry_key = KeyCodec::dir_entry_key(0, "test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -227,7 +228,7 @@ mod tests {
             .unwrap();
 
         // Check that the file was removed from the directory
-        let entry_key = ZeroFS::dir_entry_key(0, "test.txt");
+        let entry_key = KeyCodec::dir_entry_key(0, "test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap();
         assert!(entry_data.is_none());
 
@@ -290,10 +291,10 @@ mod tests {
             .unwrap();
 
         // Check old entry is gone and new entry exists
-        let old_entry_key = ZeroFS::dir_entry_key(0, "old.txt");
+        let old_entry_key = KeyCodec::dir_entry_key(0, "old.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
-        let new_entry_key = ZeroFS::dir_entry_key(0, "new.txt");
+        let new_entry_key = KeyCodec::dir_entry_key(0, "new.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -327,11 +328,11 @@ mod tests {
             .unwrap();
 
         // Check that file1.txt no longer exists
-        let old_entry_key = ZeroFS::dir_entry_key(0, "file1.txt");
+        let old_entry_key = KeyCodec::dir_entry_key(0, "file1.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check that file2.txt exists and has file1's content
-        let new_entry_key = ZeroFS::dir_entry_key(0, "file2.txt");
+        let new_entry_key = KeyCodec::dir_entry_key(0, "file2.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -384,11 +385,11 @@ mod tests {
         .unwrap();
 
         // Check file removed from dir1
-        let old_entry_key = ZeroFS::dir_entry_key(dir1_id, "file.txt");
+        let old_entry_key = KeyCodec::dir_entry_key(dir1_id, "file.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check file added to dir2
-        let new_entry_key = ZeroFS::dir_entry_key(dir2_id, "moved.txt");
+        let new_entry_key = KeyCodec::dir_entry_key(dir2_id, "moved.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);

@@ -2,6 +2,7 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, SpecialInode};
+use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
@@ -94,7 +95,7 @@ impl ZeroFS {
                             let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
 
                             for chunk_idx in new_chunks..old_chunks {
-                                let key = Self::chunk_key_by_index(id, chunk_idx);
+                                let key = KeyCodec::chunk_key(id, chunk_idx as u64);
                                 batch.delete_bytes(&key);
                             }
 
@@ -102,7 +103,7 @@ impl ZeroFS {
                                 let last_chunk_idx = new_chunks - 1;
                                 let last_chunk_size = (new_size % CHUNK_SIZE as u64) as usize;
 
-                                let key = Self::chunk_key_by_index(id, last_chunk_idx);
+                                let key = KeyCodec::chunk_key(id, last_chunk_idx as u64);
                                 if let Some(old_chunk_data) = self
                                     .db
                                     .get_bytes(&key)
@@ -122,7 +123,7 @@ impl ZeroFS {
                             let last_old_chunk_end = (old_size % CHUNK_SIZE as u64) as usize;
 
                             if last_old_chunk_end > 0 {
-                                let key = Self::chunk_key_by_index(id, last_old_chunk_idx);
+                                let key = KeyCodec::chunk_key(id, last_old_chunk_idx as u64);
                                 if let Some(old_chunk_data) = self
                                     .db
                                     .get_bytes(&key)
@@ -147,7 +148,7 @@ impl ZeroFS {
                             }
                         }
 
-                        let inode_key = Self::inode_key(id);
+                        let inode_key = KeyCodec::inode_key(id);
                         let inode_data = bincode::serialize(&inode)?;
                         batch.put_bytes(&inode_key, &inode_data);
 
@@ -482,7 +483,7 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 let name = filename_str.to_string();
-                let entry_key = Self::dir_entry_key(dirid, &name);
+                let entry_key = KeyCodec::dir_entry_key(dirid, &name);
 
                 if self
                     .db
@@ -542,14 +543,14 @@ impl ZeroFS {
 
                 let mut batch = self.db.new_write_batch();
 
-                let special_inode_key = Self::inode_key(special_id);
+                let special_inode_key = KeyCodec::inode_key(special_id);
                 let special_inode_data = bincode::serialize(&inode)?;
                 batch.put_bytes(&special_inode_key, &special_inode_data);
 
-                batch.put_bytes(&entry_key, &special_id.to_le_bytes());
+                batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(special_id));
 
-                let scan_key = Self::dir_scan_key(dirid, special_id, &name);
-                batch.put_bytes(&scan_key, &special_id.to_le_bytes());
+                let scan_key = KeyCodec::dir_scan_key(dirid, special_id, &name);
+                batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(special_id));
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -557,7 +558,7 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                let dir_inode_key = Self::inode_key(dirid);
+                let dir_inode_key = KeyCodec::inode_key(dirid);
                 let dir_inode_data = bincode::serialize(&dir_inode)?;
                 batch.put_bytes(&dir_inode_key, &dir_inode_data);
 

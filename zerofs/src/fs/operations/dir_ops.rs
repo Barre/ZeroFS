@@ -2,12 +2,13 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode};
+use crate::fs::key_codec::{KeyCodec, ParsedKey};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::types::{
     AuthContext, DirEntry, FileAttributes, InodeId, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetTime, SetUid,
 };
-use crate::fs::{EncodedFileId, PREFIX_DIR_SCAN, ParsedKey, ZeroFS, get_current_time};
+use crate::fs::{EncodedFileId, ZeroFS, get_current_time};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
@@ -30,7 +31,7 @@ impl ZeroFS {
         let name = dirname_str.to_string();
 
         // Optimistic existence check without holding lock
-        let entry_key = Self::dir_entry_key(dirid, &name);
+        let entry_key = KeyCodec::dir_entry_key(dirid, &name);
         if self
             .db
             .get_bytes(&entry_key)
@@ -117,14 +118,14 @@ impl ZeroFS {
 
                 let mut batch = self.db.new_write_batch();
 
-                let new_dir_key = Self::inode_key(new_dir_id);
+                let new_dir_key = KeyCodec::inode_key(new_dir_id);
                 let new_dir_data = bincode::serialize(&Inode::Directory(new_dir_inode.clone()))?;
                 batch.put_bytes(&new_dir_key, &new_dir_data);
 
-                batch.put_bytes(&entry_key, &new_dir_id.to_le_bytes());
+                batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(new_dir_id));
 
-                let scan_key = Self::dir_scan_key(dirid, new_dir_id, &name);
-                batch.put_bytes(&scan_key, &new_dir_id.to_le_bytes());
+                let scan_key = KeyCodec::dir_scan_key(dirid, new_dir_id, &name);
+                batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(new_dir_id));
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -136,11 +137,11 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                let counter_key = Self::counter_key();
+                let counter_key = KeyCodec::system_counter_key();
                 let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch.put_bytes(&counter_key, &next_id.to_le_bytes());
+                batch.put_bytes(&counter_key, &KeyCodec::encode_counter(next_id));
 
-                let parent_dir_key = Self::inode_key(dirid);
+                let parent_dir_key = KeyCodec::inode_key(dirid);
                 let parent_dir_data = bincode::serialize(&dir_inode)?;
                 batch.put_bytes(&parent_dir_key, &parent_dir_data);
 
@@ -249,22 +250,17 @@ impl ZeroFS {
                     });
                 }
 
-                let scan_prefix = Self::dir_scan_prefix(dirid);
                 let start_key = if start_after == 0 {
-                    Bytes::from(scan_prefix.clone())
+                    Bytes::from(KeyCodec::dir_scan_prefix(dirid))
                 } else {
-                    let mut key = scan_prefix.clone();
-                    key.extend_from_slice(&start_inode.to_be_bytes());
-                    Bytes::from(key)
+                    KeyCodec::dir_scan_resume_key(dirid, start_inode)
                 };
 
-                let mut end_key = Vec::with_capacity(9);
-                end_key.push(PREFIX_DIR_SCAN);
-                end_key.extend_from_slice(&(dirid + 1).to_be_bytes());
+                let end_key = KeyCodec::dir_scan_end_key(dirid);
 
                 let iter = self
                     .db
-                    .scan(start_key..Bytes::from(end_key))
+                    .scan(start_key..end_key)
                     .await
                     .map_err(|_| FsError::IoError)?;
                 pin_mut!(iter);
@@ -282,8 +278,8 @@ impl ZeroFS {
 
                     let (key, _value) = result.map_err(|_| FsError::IoError)?;
 
-                    let (inode_id, filename) = match ParsedKey::parse(&key) {
-                        Some(ParsedKey::DirScan { entry_id, name }) => (entry_id, name),
+                    let (inode_id, filename) = match KeyCodec::parse_key(&key) {
+                        ParsedKey::DirScan { entry_id, name } => (entry_id, name),
                         _ => continue,
                     };
 

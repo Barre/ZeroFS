@@ -2,6 +2,7 @@ pub mod cache;
 pub mod errors;
 pub mod flush_coordinator;
 pub mod inode;
+pub mod key_codec;
 pub mod lock_manager;
 pub mod metrics;
 pub mod operations;
@@ -12,11 +13,11 @@ pub mod types;
 
 use self::cache::{CacheKey, CacheValue, UnifiedCache};
 use self::flush_coordinator::FlushCoordinator;
+use self::key_codec::{KeyCodec, ParsedKey};
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use crate::encryption::{EncryptedDb, EncryptionManager};
-use bytes::Bytes;
 use slatedb::SstBlockSize;
 use slatedb::config::ObjectStoreCacheOptions;
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
@@ -33,44 +34,6 @@ use zerofs_nfsserve::nfs::fileid3;
 use self::errors::FsError;
 use self::inode::{DirectoryInode, Inode, InodeId};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-pub const PREFIX_INODE: u8 = 0x01;
-pub const PREFIX_CHUNK: u8 = 0x02;
-pub const PREFIX_DIR_ENTRY: u8 = 0x03;
-pub const PREFIX_DIR_SCAN: u8 = 0x04;
-pub const PREFIX_TOMBSTONE: u8 = 0x05;
-pub const PREFIX_STATS: u8 = 0x06;
-pub const PREFIX_SYSTEM: u8 = 0x07;
-pub const PREFIX_RECOVERY: u8 = 0x08;
-
-#[derive(Debug)]
-pub enum ParsedKey {
-    Chunk,
-    DirScan { entry_id: InodeId, name: String },
-    Tombstone { inode_id: InodeId },
-}
-
-impl ParsedKey {
-    pub fn parse(key: &[u8]) -> Option<Self> {
-        if key.is_empty() {
-            return None;
-        }
-
-        match key[0] {
-            PREFIX_CHUNK if key.len() == 17 => Some(ParsedKey::Chunk),
-            PREFIX_DIR_SCAN if key.len() > 17 => {
-                let entry_id = u64::from_be_bytes(key[9..17].try_into().ok()?);
-                let name = String::from_utf8(key[17..].to_vec()).ok()?;
-                Some(ParsedKey::DirScan { entry_id, name })
-            }
-            PREFIX_TOMBSTONE if key.len() == 17 => {
-                let inode_id = u64::from_be_bytes(key[9..17].try_into().ok()?);
-                Some(ParsedKey::Tombstone { inode_id })
-            }
-            _ => None,
-        }
-    }
-}
 
 fn get_current_uid_gid() -> (u32, u32) {
     (0, 0)
@@ -243,16 +206,13 @@ impl ZeroFS {
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
         let db = Arc::new(EncryptedDb::new(slatedb.clone(), encryptor.clone()));
 
-        let counter_key = Self::counter_key();
+        let counter_key = KeyCodec::system_counter_key();
         let next_inode_id = match db.get_bytes(&counter_key).await? {
-            Some(data) => {
-                let bytes: [u8; 8] = data[..8].try_into().map_err(|_| "Invalid counter data")?;
-                u64::from_le_bytes(bytes)
-            }
+            Some(data) => KeyCodec::decode_counter(&data)?,
             None => 1,
         };
 
-        let root_inode_key = Self::inode_key(0);
+        let root_inode_key = KeyCodec::inode_key(0);
         if db.get_bytes(&root_inode_key).await?.is_none() {
             let (uid, gid) = get_current_uid_gid();
             let (now_sec, now_nsec) = get_current_time();
@@ -298,7 +258,7 @@ impl ZeroFS {
         let global_stats = Arc::new(FileSystemGlobalStats::new());
 
         for i in 0..STATS_SHARDS {
-            let shard_key = Self::stats_shard_key(i);
+            let shard_key = KeyCodec::stats_shard_key(i);
             if let Some(data) = db.get_bytes(&shard_key).await?
                 && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
             {
@@ -321,68 +281,6 @@ impl ZeroFS {
         fs.run_recovery_if_needed().await?;
 
         Ok(fs)
-    }
-
-    pub fn inode_key(inode_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(9);
-        key.push(PREFIX_INODE);
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        Bytes::from(key)
-    }
-
-    pub fn chunk_key_by_index(inode_id: InodeId, chunk_index: usize) -> Bytes {
-        let mut key = Vec::with_capacity(17);
-        key.push(PREFIX_CHUNK);
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        key.extend_from_slice(&(chunk_index as u64).to_be_bytes());
-        Bytes::from(key)
-    }
-
-    pub fn counter_key() -> Bytes {
-        Bytes::from(vec![PREFIX_SYSTEM, 0x01]) // 0x01 for counter subtype
-    }
-
-    pub fn clean_shutdown_key() -> Bytes {
-        Bytes::from(vec![PREFIX_RECOVERY])
-    }
-
-    pub fn dir_entry_key(dir_inode_id: InodeId, name: &str) -> Bytes {
-        let mut key = Vec::with_capacity(9 + name.len());
-        key.push(PREFIX_DIR_ENTRY);
-        key.extend_from_slice(&dir_inode_id.to_be_bytes());
-        key.extend_from_slice(name.as_bytes());
-        Bytes::from(key)
-    }
-
-    pub fn dir_scan_key(dir_inode_id: InodeId, entry_inode_id: InodeId, name: &str) -> Bytes {
-        let mut key = Vec::with_capacity(17 + name.len());
-        key.push(PREFIX_DIR_SCAN);
-        key.extend_from_slice(&dir_inode_id.to_be_bytes());
-        key.extend_from_slice(&entry_inode_id.to_be_bytes());
-        key.extend_from_slice(name.as_bytes());
-        Bytes::from(key)
-    }
-
-    pub fn dir_scan_prefix(dir_inode_id: InodeId) -> Vec<u8> {
-        let mut prefix = Vec::with_capacity(9);
-        prefix.push(PREFIX_DIR_SCAN);
-        prefix.extend_from_slice(&dir_inode_id.to_be_bytes());
-        prefix
-    }
-
-    pub fn tombstone_key(timestamp: u64, inode_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(17);
-        key.push(PREFIX_TOMBSTONE);
-        key.extend_from_slice(&timestamp.to_be_bytes());
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        Bytes::from(key)
-    }
-
-    pub fn stats_shard_key(shard_id: usize) -> Bytes {
-        let mut key = Vec::with_capacity(9);
-        key.push(PREFIX_STATS);
-        key.extend_from_slice(&(shard_id as u64).to_be_bytes());
-        Bytes::from(key)
     }
 
     pub async fn allocate_inode(&self) -> Result<InodeId, FsError> {
@@ -408,7 +306,7 @@ impl ZeroFS {
         }
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        let key = Self::inode_key(inode_id);
+        let key = KeyCodec::inode_key(inode_id);
         let data = self
             .db
             .get_bytes(&key)
@@ -429,7 +327,7 @@ impl ZeroFS {
     }
 
     pub async fn save_inode(&self, inode_id: InodeId, inode: &Inode) -> Result<(), FsError> {
-        let key = Self::inode_key(inode_id);
+        let key = KeyCodec::inode_key(inode_id);
         let data = bincode::serialize(inode)?;
 
         self.db
@@ -455,10 +353,8 @@ impl ZeroFS {
         self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
 
         loop {
-            // Binary tombstone key prefix
-            let prefix = vec![PREFIX_TOMBSTONE];
-            let end_prefix = vec![PREFIX_TOMBSTONE + 1];
-            let range = Bytes::from(prefix.clone())..Bytes::from(end_prefix);
+            let (start, end) = KeyCodec::prefix_range(key_codec::PREFIX_TOMBSTONE);
+            let range = start..end;
 
             let mut tombstones_to_update = Vec::new();
             let mut chunks_deleted_this_round = 0;
@@ -477,21 +373,14 @@ impl ZeroFS {
                 }
 
                 // Parse tombstone key
-                let inode_id = match ParsedKey::parse(&key) {
-                    Some(ParsedKey::Tombstone { inode_id }) => inode_id,
+                let inode_id = match KeyCodec::parse_key(&key) {
+                    ParsedKey::Tombstone { inode_id } => inode_id,
                     _ => continue,
                 };
 
-                if value.len() != 8 {
-                    panic!(
-                        "Corrupted tombstone found for inode {}: expected 8 bytes, got {}",
-                        inode_id,
-                        value.len()
-                    );
-                }
-
-                let size_bytes: [u8; 8] = value.as_ref().try_into().unwrap();
-                let size = u64::from_le_bytes(size_bytes);
+                // Safe to unwrap: tombstone values are always 8 bytes written by encode_tombstone_size
+                let size = KeyCodec::decode_tombstone_size(&value)
+                    .expect("tombstone size should always be valid 8-byte value");
 
                 if size == 0 {
                     // No chunks left, just delete the tombstone
@@ -511,7 +400,7 @@ impl ZeroFS {
 
                 let mut batch = self.db.new_write_batch();
                 for chunk_idx in start_chunk..total_chunks {
-                    let chunk_key = Self::chunk_key_by_index(inode_id, chunk_idx);
+                    let chunk_key = KeyCodec::chunk_key(inode_id, chunk_idx as u64);
                     batch.delete_bytes(&chunk_key);
                 }
 
@@ -551,7 +440,7 @@ impl ZeroFS {
                         let remaining_chunks = start_chunk;
                         let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
-                        batch.put_bytes(&key, &actual_remaining.to_le_bytes());
+                        batch.put_bytes(&key, &KeyCodec::encode_tombstone_size(actual_remaining));
                     }
                 }
 
@@ -635,7 +524,7 @@ impl ZeroFS {
 
         let next_inode_id = 1;
 
-        let root_inode_key = Self::inode_key(0);
+        let root_inode_key = KeyCodec::inode_key(0);
         if db.get_bytes(&root_inode_key).await?.is_none() {
             let (uid, gid) = get_current_uid_gid();
             let (now_sec, now_nsec) = get_current_time();
@@ -677,7 +566,7 @@ impl ZeroFS {
         let global_stats = Arc::new(FileSystemGlobalStats::new());
 
         for i in 0..STATS_SHARDS {
-            let shard_key = Self::stats_shard_key(i);
+            let shard_key = KeyCodec::stats_shard_key(i);
             if let Some(data) = db.get_bytes(&shard_key).await?
                 && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
             {
@@ -704,7 +593,7 @@ impl ZeroFS {
 impl ZeroFS {
     /// Helper method to lookup an entry by name in a directory
     pub async fn lookup_by_name(&self, dir_id: u64, name: &str) -> Result<u64, errors::FsError> {
-        let entry_key = Self::dir_entry_key(dir_id, name);
+        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
         let entry_data = self
             .db
             .get_bytes(&entry_key)
@@ -712,9 +601,7 @@ impl ZeroFS {
             .map_err(|_| errors::FsError::IoError)?
             .ok_or(errors::FsError::NotFound)?;
 
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&entry_data[..8]);
-        Ok(u64::from_le_bytes(bytes))
+        KeyCodec::decode_dir_entry(&entry_data)
     }
 
     /// DANGEROUS: Creates an unencrypted database connection. Only use for key management!
@@ -817,34 +704,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_inode_key_generation() {
+        use crate::fs::key_codec::{KeyCodec, PREFIX_INODE};
         // Test binary key format: [PREFIX_INODE | inode_id(8 bytes BE)]
-        let key0 = ZeroFS::inode_key(0);
+        let key0 = KeyCodec::inode_key(0);
         assert_eq!(key0[0], PREFIX_INODE);
         assert_eq!(&key0[1..9], &0u64.to_be_bytes());
 
-        let key42 = ZeroFS::inode_key(42);
+        let key42 = KeyCodec::inode_key(42);
         assert_eq!(key42[0], PREFIX_INODE);
         assert_eq!(&key42[1..9], &42u64.to_be_bytes());
 
-        let key999 = ZeroFS::inode_key(999);
+        let key999 = KeyCodec::inode_key(999);
         assert_eq!(key999[0], PREFIX_INODE);
         assert_eq!(&key999[1..9], &999u64.to_be_bytes());
     }
 
     #[tokio::test]
     async fn test_chunk_key_generation() {
+        use crate::fs::key_codec::{KeyCodec, PREFIX_CHUNK};
         // Test binary key format: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
-        let key = ZeroFS::chunk_key_by_index(1, 0);
+        let key = KeyCodec::chunk_key(1, 0);
         assert_eq!(key[0], PREFIX_CHUNK);
         assert_eq!(&key[1..9], &1u64.to_be_bytes());
         assert_eq!(&key[9..17], &0u64.to_be_bytes());
 
-        let key = ZeroFS::chunk_key_by_index(42, 10);
+        let key = KeyCodec::chunk_key(42, 10);
         assert_eq!(key[0], PREFIX_CHUNK);
         assert_eq!(&key[1..9], &42u64.to_be_bytes());
         assert_eq!(&key[9..17], &10u64.to_be_bytes());
 
-        let key = ZeroFS::chunk_key_by_index(999, 999);
+        let key = KeyCodec::chunk_key(999, 999);
         assert_eq!(key[0], PREFIX_CHUNK);
         assert_eq!(&key[1..9], &999u64.to_be_bytes());
         assert_eq!(&key[9..17], &999u64.to_be_bytes());

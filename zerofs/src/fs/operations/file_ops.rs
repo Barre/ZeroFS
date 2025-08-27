@@ -2,6 +2,7 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{FileInode, Inode};
+use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
 use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
@@ -81,7 +82,7 @@ impl ZeroFS {
 
                 let existing_chunks: HashMap<usize, Bytes> = stream::iter(partial_chunks)
                     .map(|chunk_idx| {
-                        let chunk_key = Self::chunk_key_by_index(id, chunk_idx);
+                        let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
                         let db = self.db.clone();
                         async move {
                             let data = db.get_bytes(&chunk_key).await.ok().flatten();
@@ -97,7 +98,7 @@ impl ZeroFS {
                     let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
                     let chunk_end = chunk_start + CHUNK_SIZE as u64;
 
-                    let chunk_key = Self::chunk_key_by_index(id, chunk_idx);
+                    let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
 
                     let write_start = if offset > chunk_start {
                         (offset - chunk_start) as usize
@@ -168,7 +169,7 @@ impl ZeroFS {
                     file.mode &= !0o6000;
                 }
 
-                let inode_key = Self::inode_key(id);
+                let inode_key = KeyCodec::inode_key(id);
                 let inode_data = bincode::serialize(&inode)?;
                 batch.put_bytes(&inode_key, &inode_data);
 
@@ -233,7 +234,7 @@ impl ZeroFS {
         let name = filename_str.to_string();
 
         // Optimistic existence check without holding lock
-        let entry_key = Self::dir_entry_key(dirid, &name);
+        let entry_key = KeyCodec::dir_entry_key(dirid, &name);
         if self
             .db
             .get_bytes(&entry_key)
@@ -296,14 +297,14 @@ impl ZeroFS {
 
                 let mut batch = self.db.new_write_batch();
 
-                let file_inode_key = Self::inode_key(file_id);
+                let file_inode_key = KeyCodec::inode_key(file_id);
                 let file_inode_data = bincode::serialize(&Inode::File(file_inode.clone()))?;
                 batch.put_bytes(&file_inode_key, &file_inode_data);
 
-                batch.put_bytes(&entry_key, &file_id.to_le_bytes());
+                batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(file_id));
 
-                let scan_key = Self::dir_scan_key(dirid, file_id, &name);
-                batch.put_bytes(&scan_key, &file_id.to_le_bytes());
+                let scan_key = KeyCodec::dir_scan_key(dirid, file_id, &name);
+                batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(file_id));
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -312,11 +313,11 @@ impl ZeroFS {
                 dir.ctime_nsec = now_nsec;
 
                 // Persist the counter
-                let counter_key = Self::counter_key();
+                let counter_key = KeyCodec::system_counter_key();
                 let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch.put_bytes(&counter_key, &next_id.to_le_bytes());
+                batch.put_bytes(&counter_key, &KeyCodec::encode_counter(next_id));
 
-                let dir_key = Self::inode_key(dirid);
+                let dir_key = KeyCodec::inode_key(dirid);
                 let dir_data = bincode::serialize(&dir_inode)?;
                 batch.put_bytes(&dir_key, &dir_data);
 
@@ -406,7 +407,7 @@ impl ZeroFS {
 
                 let chunk_futures = stream::iter(start_chunk..=end_chunk).map(|chunk_idx| {
                     let db = self.db.clone();
-                    let key = Self::chunk_key_by_index(id, chunk_idx);
+                    let key = KeyCodec::chunk_key(id, chunk_idx as u64);
                     async move {
                         let chunk_data_opt =
                             db.get_bytes(&key).await.map_err(|_| FsError::IoError)?;
@@ -532,7 +533,7 @@ impl ZeroFS {
                 continue;
             }
 
-            let chunk_key = Self::chunk_key_by_index(id, chunk_idx);
+            let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
 
             if offset <= chunk_start && end_offset >= chunk_end {
                 batch.delete_bytes(&chunk_key);
