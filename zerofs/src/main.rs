@@ -111,6 +111,9 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
             "  {BLUE}ZEROFS_NBD_HOST{RESET}                - NBD server bind address (default: 127.0.0.1)"
         );
         eprintln!(
+            "  {BLUE}ZEROFS_NBD_SOCKET{RESET}              - Unix socket path for NBD (optional)"
+        );
+        eprintln!(
             "                                    NBD devices: truncate -s <size> <mountpoint>/.nbd/<name>"
         );
         eprintln!(
@@ -298,18 +301,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ZeroFS::new_with_object_store(object_store, cache_config, actual_db_path, encryption_key)
             .await?;
 
-    let nbd_enabled =
-        std::env::var("ZEROFS_NBD_PORT").is_ok() || std::env::var("ZEROFS_NBD_HOST").is_ok();
-    let nbd_port = std::env::var("ZEROFS_NBD_PORT")
-        .unwrap_or_else(|_| DEFAULT_NBD_PORT.to_string())
-        .parse::<u16>()
-        .map_err(|e| {
-            format!(
-                "Error: ZEROFS_NBD_PORT='{}' is not a valid port number: {}",
-                std::env::var("ZEROFS_NBD_PORT").unwrap_or_default(),
-                e
-            )
-        })?;
+    let nbd_socket_path = std::env::var("ZEROFS_NBD_SOCKET").ok();
+    let nbd_tcp_enabled = nbd_socket_path.is_none()
+        && (std::env::var("ZEROFS_NBD_PORT").is_ok() || std::env::var("ZEROFS_NBD_HOST").is_ok());
+
+    let nbd_enabled = nbd_socket_path.is_some() || nbd_tcp_enabled;
+
+    let nbd_port = if nbd_tcp_enabled {
+        Some(
+            std::env::var("ZEROFS_NBD_PORT")
+                .unwrap_or_else(|_| DEFAULT_NBD_PORT.to_string())
+                .parse::<u16>()
+                .map_err(|e| {
+                    format!(
+                        "Error: ZEROFS_NBD_PORT='{}' is not a valid port number: {}",
+                        std::env::var("ZEROFS_NBD_PORT").unwrap_or_default(),
+                        e
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
     let nbd_host = std::env::var("ZEROFS_NBD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
     let fs_arc = Arc::new(fs);
@@ -373,12 +387,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let nbd_server = NBDServer::new(Arc::clone(&fs_arc), nbd_host.clone(), nbd_port);
-
-        info!(
-            "Starting NBD server on {}:{} (devices dynamically discovered from .nbd/)",
-            nbd_host, nbd_port
-        );
+        let nbd_server = if let Some(socket_path) = &nbd_socket_path {
+            info!(
+                "Starting NBD server on Unix socket {:?} (devices dynamically discovered from .nbd/)",
+                socket_path
+            );
+            NBDServer::new_unix(Arc::clone(&fs_arc), socket_path.clone())
+        } else if let Some(port) = nbd_port {
+            info!(
+                "Starting NBD server on {}:{} (devices dynamically discovered from .nbd/)",
+                nbd_host, port
+            );
+            NBDServer::new_tcp(Arc::clone(&fs_arc), nbd_host.clone(), port)
+        } else {
+            unreachable!("NBD enabled but no transport configured")
+        };
 
         Some(tokio::spawn(async move {
             if let Err(e) = nbd_server.start().await {
