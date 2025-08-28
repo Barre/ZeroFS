@@ -14,7 +14,7 @@ use bytes::BytesMut;
 use deku::prelude::*;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, UnixListener};
 use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
@@ -23,44 +23,86 @@ pub struct NBDDevice {
     pub size: u64,
 }
 
+pub enum Transport {
+    Tcp { host: String, port: u16 },
+    Unix(String),
+}
+
 pub struct NBDServer {
     filesystem: Arc<ZeroFS>,
-    host: String,
-    port: u16,
+    transport: Transport,
 }
 
 impl NBDServer {
-    pub fn new(filesystem: Arc<ZeroFS>, host: String, port: u16) -> Self {
+    pub fn new_tcp(filesystem: Arc<ZeroFS>, host: String, port: u16) -> Self {
         Self {
             filesystem,
-            host,
-            port,
+            transport: Transport::Tcp { host, port },
+        }
+    }
+
+    pub fn new_unix(filesystem: Arc<ZeroFS>, socket_path: String) -> Self {
+        Self {
+            filesystem,
+            transport: Transport::Unix(socket_path),
         }
     }
 
     pub async fn start(&self) -> std::io::Result<()> {
-        let listener = TcpListener::bind(format!("{}:{}", self.host, self.port)).await?;
-        info!("NBD server listening on {}:{}", self.host, self.port);
+        match &self.transport {
+            Transport::Tcp { host, port } => {
+                let listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
+                info!("NBD server listening on {}:{}", host, port);
 
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            info!("NBD client connected from {}", addr);
+                loop {
+                    let (stream, addr) = listener.accept().await?;
+                    info!("NBD client connected from {}", addr);
 
-            stream.set_nodelay(true)?;
+                    stream.set_nodelay(true)?;
 
-            let filesystem = Arc::clone(&self.filesystem);
+                    let filesystem = Arc::clone(&self.filesystem);
 
-            tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, filesystem).await {
-                    error!("Error handling NBD client {}: {}", addr, e);
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client_stream(stream, filesystem).await {
+                            error!("Error handling NBD client {}: {}", addr, e);
+                        }
+                    });
                 }
-            });
+            }
+            Transport::Unix(path) => {
+                // Remove existing socket file if it exists
+                let _ = std::fs::remove_file(path);
+
+                let listener = UnixListener::bind(path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to bind NBD Unix socket at {:?}: {}", path, e),
+                    )
+                })?;
+                info!("NBD server listening on Unix socket {:?}", path);
+
+                loop {
+                    let (stream, _) = listener.accept().await?;
+                    info!("NBD client connected via Unix socket");
+
+                    let filesystem = Arc::clone(&self.filesystem);
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client_stream(stream, filesystem).await {
+                            error!("Error handling NBD Unix client: {}", e);
+                        }
+                    });
+                }
+            }
         }
     }
 }
 
-async fn handle_client(stream: TcpStream, filesystem: Arc<ZeroFS>) -> Result<()> {
-    let (reader, writer) = stream.into_split();
+async fn handle_client_stream<S>(stream: S, filesystem: Arc<ZeroFS>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
     let reader = BufReader::new(reader);
     let writer = BufWriter::new(writer);
 
