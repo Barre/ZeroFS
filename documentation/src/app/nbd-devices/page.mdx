@@ -12,37 +12,74 @@ ZeroFS provides Network Block Device (NBD) servers that expose S3 storage as raw
 ## NBD Features
 
 - **Raw Block Access** - Present S3 storage as standard block devices (/dev/nbd*)
-- **Multiple Devices** - Configure multiple NBD devices with different sizes
+- **Dynamic Device Management** - Create/delete devices through the filesystem without restart
+- **Multiple Devices** - Single NBD server supports unlimited devices
+- **Unix Socket Support** - Connect via TCP or Unix socket for better performance
 - **TRIM Support** - Full discard/TRIM support for efficient space management
 - **High Performance** - Same caching layers as 9P/NFS
 - **Any Filesystem** - Format with ext4, XFS, ZFS, or any other filesystem
 
 ## Configuration
 
-Start ZeroFS with NBD support by specifying ports and device sizes:
+Start ZeroFS with NBD support using either TCP or Unix socket (or both):
 
 ```bash
-# Configure 3 NBD devices of different sizes
+# TCP mode (default port 10809)
 ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_PORTS='10809,10810,10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='1,2,5' \
+ZEROFS_NBD_PORT='10809' \
+zerofs s3://bucket/path
+
+# Unix socket mode (better performance for local access)
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock' \
+zerofs s3://bucket/path
+
+# Both TCP and Unix socket
+ZEROFS_ENCRYPTION_PASSWORD='your-password' \
+ZEROFS_NBD_PORT='10809' \
+ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock' \
 zerofs s3://bucket/path
 ```
 
 Environment variables:
-- `ZEROFS_NBD_HOST` - Bind address for NBD servers (default: 127.0.0.1)
-- `ZEROFS_NBD_PORTS` - Comma-separated list of ports for NBD servers
-- `ZEROFS_NBD_DEVICE_SIZES_GB` - Comma-separated list of device sizes in GB
+- `ZEROFS_NBD_HOST` - Bind address for NBD TCP server (default: 127.0.0.1)
+- `ZEROFS_NBD_PORT` - Port for NBD server (default: 10809)
+- `ZEROFS_NBD_SOCKET` - Unix socket path for NBD (optional)
+
+## Device Management
+
+NBD devices are managed as regular files in the `.nbd/` directory. First, mount ZeroFS via NFS or 9P:
+
+```bash
+# Mount via NFS
+mount -t nfs 127.0.0.1:/ /mnt/zerofs
+
+# Or mount via 9P
+mount -t 9p -o trans=tcp,port=5564 127.0.0.1 /mnt/zerofs
+
+# Create devices dynamically
+mkdir -p /mnt/zerofs/.nbd
+truncate -s 1G /mnt/zerofs/.nbd/database
+truncate -s 5G /mnt/zerofs/.nbd/storage
+truncate -s 10G /mnt/zerofs/.nbd/backup
+
+# List devices
+ls -lh /mnt/zerofs/.nbd/
+```
 
 ## Connecting to NBD Devices
 
-Once ZeroFS is running, connect to the NBD devices using `nbd-client`:
+Connect to devices using `nbd-client` with the device name:
 
 ```bash
-# Connect with recommended options for optimal performance
-nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
-nbd-client 127.0.0.1 10810 /dev/nbd1 -N device_10810 -persist -timeout 60 -block-size 4096 -connections 4
-nbd-client 127.0.0.1 10811 /dev/nbd2 -N device_10811 -persist -timeout 60 -block-size 4096 -connections 4
+# Connect via TCP (recommended settings for optimal performance)
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N database -persist -timeout 600 -connections 4
+nbd-client 127.0.0.1 10809 /dev/nbd1 -N storage -persist -timeout 600 -connections 4
+nbd-client 127.0.0.1 10809 /dev/nbd2 -N backup -persist -timeout 600 -connections 4
+
+# Or connect via Unix socket (better performance for local access)
+nbd-client -unix /tmp/zerofs-nbd.sock /dev/nbd0 -N database -persist -timeout 600 -connections 4
+nbd-client -unix /tmp/zerofs-nbd.sock /dev/nbd1 -N storage -persist -timeout 600 -connections 4
 
 # Verify devices are connected
 nbd-client -check /dev/nbd0
@@ -51,10 +88,11 @@ lsblk | grep nbd
 
 ### Important Parameters
 
-- **`-N device_<port>`** - Specify the export name (required for ZeroFS)
-- **`-persist`** - Automatically reconnect if connection drops
-- **`-timeout <seconds>`** - Set connection timeout
-- **`-connections <num>`** - Use multiple connections for better performance
+- **`-N <name>`** - Device name from `.nbd/` directory (required)
+- **`-unix <path>`** - Use Unix socket instead of TCP
+- **`-persist`** - Automatically reconnect if connection drops (recommended)
+- **`-timeout 600`** - Use high timeout for S3 latency (recommended: 600 seconds)
+- **`-connections 4`** - Use multiple connections for better performance (recommended: 4-8)
 - **`-readonly`** - Mount device as read-only
 - **`-block-size <size>`** - Block size (512, 1024, 2048, or 4096)
 
@@ -109,23 +147,34 @@ When blocks are trimmed:
 2. Compaction eventually frees space in S3
 3. Storage costs decrease automatically
 
-## NBD Device Files
+## Managing Device Files
 
-NBD devices appear as files in the `.nbd` directory when mounted via 9P and NFS:
+NBD devices are regular files in the `.nbd` directory:
 
 ```bash
 # View NBD device files
-ls -la /mnt/zerofs/.nbd/
-# .nbd/device_10809  (1GB device)
-# .nbd/device_10810  (2GB device)
-# .nbd/device_10811  (5GB device)
+ls -lh /mnt/zerofs/.nbd/
+# -rw-r--r--  1 root root 1.0G  database
+# -rw-r--r--  1 root root 5.0G  storage
+# -rw-r--r--  1 root root 10G   backup
+
+# Add a new device (no restart needed!)
+truncate -s 20G /mnt/zerofs/.nbd/new-device
+
+# Remove a device (disconnect NBD client first)
+nbd-client -d /dev/nbd3
+rm /mnt/zerofs/.nbd/old-device
 ```
 
 **Important**: Device sizes cannot be changed after creation. To resize:
 ```bash
-# Delete existing device
-rm /mnt/zerofs/.nbd/device_10809
-# Restart ZeroFS with new size configuration
+# Disconnect the NBD client
+nbd-client -d /dev/nbd0
+# Delete and recreate with new size
+rm /mnt/zerofs/.nbd/database
+truncate -s 2G /mnt/zerofs/.nbd/database
+# Reconnect NBD client with optimal settings
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N database -persist -timeout 600 -connections 4
 ```
 
 ## Advanced Use Cases
@@ -135,25 +184,31 @@ rm /mnt/zerofs/.nbd/device_10809
 Create globally distributed ZFS pools across regions:
 
 ```bash
-# US East region
+# Machine 1 - US East (10.0.1.5)
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=us-east-1 \
-ZEROFS_NBD_PORTS='10809' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+ZEROFS_NBD_HOST='0.0.0.0' \
 zerofs s3://my-bucket/us-east-db
 
-# Connect with high timeout for cross-region latency
-nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 120 -block-size 4096 -connections 8
+# Create device
+mount -t nfs 10.0.1.5:/ /mnt/zerofs
+truncate -s 100G /mnt/zerofs/.nbd/storage
+umount /mnt/zerofs
 
-# EU West region
+# Machine 2 - EU West (10.0.2.5)
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=eu-west-1 \
-ZEROFS_NBD_PORTS='10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+ZEROFS_NBD_HOST='0.0.0.0' \
 zerofs s3://my-bucket/eu-west-db
 
-# Connect with high timeout
-nbd-client 127.0.0.1 10810 /dev/nbd1 -N device_10810 -persist -timeout 120 -block-size 4096 -connections 8
+# Create device
+mount -t nfs 10.0.2.5:/ /mnt/zerofs
+truncate -s 100G /mnt/zerofs/.nbd/storage
+umount /mnt/zerofs
+
+# From a client machine, connect to both regions with optimal settings
+nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist -timeout 600 -connections 8
 
 # Create mirrored pool across continents
 zpool create global-pool mirror /dev/nbd0 /dev/nbd1

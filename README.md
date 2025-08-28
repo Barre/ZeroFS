@@ -179,9 +179,9 @@ No additional environment variables are required for local storage.
 - `ZEROFS_9P_HOST`: Address (IP or hostname) to bind the 9P TCP socket (default: `"127.0.0.1"`)
 - `ZEROFS_9P_PORT`: Port to bind the 9P TCP socket (default: `5564`)
 - `ZEROFS_9P_SOCKET`: Path for 9P Unix domain socket (optional, enables Unix socket server in addition to TCP)
-- `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP sockets (default: `"127.0.0.1"`)
-- `ZEROFS_NBD_PORTS`: Comma-separated list of ports for NBD servers (optional)
-- `ZEROFS_NBD_DEVICE_SIZES_GB`: Comma-separated list of device sizes in GB (optional, must match `ZEROFS_NBD_PORTS` count)
+- `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP socket (default: `"127.0.0.1"`)
+- `ZEROFS_NBD_PORT`: Port for NBD server (default: `10809`)
+- `ZEROFS_NBD_SOCKET`: Unix socket path for NBD (optional, can be used alongside TCP)
 - `ZEROFS_MEMORY_CACHE_SIZE_GB`: Size of ZeroFS in-memory cache in GB (optional, default: 0.25GB)
 
 See [Available `ObjectStore` Implementations](https://docs.rs/object_store/0.12.3/object_store/index.html#available-objectstore-implementations) for other environment variables.
@@ -267,16 +267,29 @@ mount -t nfs -o async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport
 In addition to NFS, ZeroFS can provide raw block devices through NBD with full TRIM/discard support:
 
 ```bash
-# Start ZeroFS with both NFS and NBD support
+# Start ZeroFS with NBD support (TCP, Unix socket, or both)
 ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_PORTS='10809,10810,10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='1,2,5' \
+ZEROFS_NBD_PORT='10809' \
+ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock' \
 zerofs s3://bucket/path
 
-# Connect to NBD devices
-nbd-client 127.0.0.1 10809 /dev/nbd0  # 1GB device
-nbd-client 127.0.0.1 10810 /dev/nbd1  # 2GB device
-nbd-client 127.0.0.1 10811 /dev/nbd2  # 5GB device
+# Mount ZeroFS via NFS or 9P to manage devices
+mount -t nfs 127.0.0.1:/ /mnt/zerofs
+# or
+mount -t 9p -o trans=tcp,port=5564 127.0.0.1 /mnt/zerofs
+
+# Create NBD devices dynamically
+mkdir -p /mnt/zerofs/.nbd
+truncate -s 1G /mnt/zerofs/.nbd/device1
+truncate -s 2G /mnt/zerofs/.nbd/device2
+truncate -s 5G /mnt/zerofs/.nbd/device3
+
+# Connect via TCP with optimal settings (high timeout, multiple connections)
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1 -persist -timeout 600 -connections 4
+nbd-client 127.0.0.1 10809 /dev/nbd1 -N device2 -persist -timeout 600 -connections 4
+
+# Or connect via Unix socket (better local performance)
+nbd-client -unix /tmp/zerofs-nbd.sock /dev/nbd2 -N device3 -persist -timeout 600 -connections 4
 
 # Use the block devices
 mkfs.ext4 /dev/nbd0
@@ -304,56 +317,58 @@ zpool trim mypool
 
 When blocks are trimmed, ZeroFS removes the corresponding chunks from ZeroFS' LSM-tree, which eventually results in freed space in S3 storage through compaction. This reduces storage costs for any filesystem or application that issues TRIM commands.
 
-### NBD Device Files
+### NBD Device Management
 
-NBD devices appear as files in the `.nbd` directory when mounted via NFS:
-- `.nbd/device_10809` - 1GB device accessible on port 10809
-- `.nbd/device_10810` - 2GB device accessible on port 10810
-- `.nbd/device_10811` - 5GB device accessible on port 10811
+NBD devices are managed as regular files in the `.nbd` directory:
 
-You can read/write these files directly through NFS, or access them as block devices through NBD.
-
-**Important**: Once an NBD device is created with a specific size, the size cannot be changed. If you need to resize a device, you must delete the device file first:
 ```bash
-# Delete existing device and recreate with new size
-rm /mnt/zerofs/.nbd/device_10809
-# Then restart ZeroFS with the new size
+# List devices
+ls -lh /mnt/zerofs/.nbd/
+
+# Create a new device
+truncate -s 10G /mnt/zerofs/.nbd/my-device
+
+# Remove a device (must disconnect NBD client first)
+nbd-client -d /dev/nbd0
+rm /mnt/zerofs/.nbd/my-device
 ```
+
+Devices are discovered dynamically by the NBD server - no restart needed! You can read/write these files directly through NFS/9P, or access them as block devices through NBD.
+
+**Important**: Once an NBD device is created with a specific size, the size cannot be changed. To resize, delete and recreate the device.
 
 ## Geo-Distributed Storage with ZFS
 
 Since ZeroFS makes S3 regions look like local block devices, you can create globally distributed ZFS pools by running multiple ZeroFS instances across different regions:
 
 ```bash
-# Terminal 1 - US East
+# Machine 1 - US East (10.0.1.5)
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=us-east-1 \
-ZEROFS_NBD_PORTS='10809' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+ZEROFS_NBD_HOST='0.0.0.0' \
 zerofs s3://my-bucket/us-east-db
 
-# Terminal 2 - EU West
+# Create device via mount (from same or another machine)
+mount -t nfs 10.0.1.5:/ /mnt/zerofs
+truncate -s 100G /mnt/zerofs/.nbd/storage
+umount /mnt/zerofs
+
+# Machine 2 - EU West (10.0.2.5)
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=eu-west-1 \
-ZEROFS_NBD_PORTS='10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+ZEROFS_NBD_HOST='0.0.0.0' \
 zerofs s3://my-bucket/eu-west-db
 
-# Terminal 3 - Asia Pacific
+# Machine 3 - Asia Pacific (10.0.3.5)
 ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
 AWS_DEFAULT_REGION=ap-southeast-1 \
-ZEROFS_NBD_PORTS='10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
+ZEROFS_NBD_HOST='0.0.0.0' \
 zerofs s3://my-bucket/asia-db
-```
 
-Then connect to all three NBD devices and create a geo-distributed ZFS pool:
-
-```bash
-# Connect to NBD devices from each region
-nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809  # US East
-nbd-client 127.0.0.2 10810 /dev/nbd1 -N device_10810  # EU West
-nbd-client 127.0.0.3 10811 /dev/nbd2 -N device_10811  # Asia Pacific
+# From a client machine, connect to all three NBD devices with optimal settings
+nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist -timeout 600 -connections 8
 
 # Create a mirrored pool across continents using raw block devices
 zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2
