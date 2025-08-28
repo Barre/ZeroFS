@@ -121,8 +121,7 @@ jobs:
             wait $ZEROFS_PID || true
 
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            export ZEROFS_NBD_PORTS=10809
-            export ZEROFS_NBD_DEVICE_SIZES_GB=3
+            export ZEROFS_NBD_PORT=10809
             ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-zfs-test/zfs-test &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NBD server to start..."
@@ -133,7 +132,12 @@ jobs:
               fi
               sleep 1
             done
-            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809
+            sudo mkdir -p /mnt/zerofs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
+            sudo mkdir -p /mnt/zerofs/.nbd
+            sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
+            sudo umount /mnt/zerofs
+            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
             sudo zpool create testpool /dev/nbd0
             sudo zfs create testpool/data
             sudo zfs set mountpoint=/mnt/zfsdata testpool/data
