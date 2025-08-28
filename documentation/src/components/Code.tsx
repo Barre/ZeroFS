@@ -142,7 +142,16 @@ function CodePanel({
   label?: string
   code?: string
 }) {
-  let child = Children.only(children)
+  // Filter out empty text nodes and get the first valid element
+  const validChildren = Children.toArray(children).filter(
+    (child) => isValidElement(child) || (typeof child === 'string' && child.trim())
+  )
+  
+  if (validChildren.length === 0) {
+    throw new Error('`CodePanel` requires at least one child element.')
+  }
+  
+  const child = validChildren[0]
 
   if (isValidElement(child)) {
     tag = child.props.tag ?? tag
@@ -160,7 +169,7 @@ function CodePanel({
     <div className="group dark:bg-white/2.5">
       <CodePanelHeader tag={tag} label={label} />
       <div className="relative">
-        <pre className="overflow-x-auto p-4 text-xs text-white">{children}</pre>
+        <pre className="overflow-x-auto p-4 text-xs text-white">{child}</pre>
         <CopyButton code={code} />
       </div>
     </div>
@@ -308,9 +317,9 @@ const CodeGroupContext = createContext(false)
 
 export function CodeGroup({
   children,
-  title,
+  title = '',
   ...props
-}: React.ComponentPropsWithoutRef<typeof CodeGroupPanels> & { title: string }) {
+}: React.ComponentPropsWithoutRef<typeof CodeGroupPanels> & { title?: string }) {
   let languages =
     Children.map(children, (child) =>
       getPanelTitle(isValidElement(child) ? child.props : {}),
