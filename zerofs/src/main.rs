@@ -3,6 +3,8 @@ use crate::nbd::NBDServer;
 use mimalloc::MiMalloc;
 use std::sync::Arc;
 use tracing::info;
+use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
+use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
 mod bucket_identity;
 mod encryption;
@@ -23,6 +25,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const DEFAULT_NFS_HOST: &str = "127.0.0.1";
 const DEFAULT_NFS_PORT: u32 = 2049;
+const DEFAULT_NBD_PORT: u16 = 10809;
 const DEFAULT_9P_HOST: &str = "127.0.0.1";
 const DEFAULT_9P_PORT: u16 = 5564;
 
@@ -102,13 +105,13 @@ fn validate_environment() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{YELLOW}Optional ZeroFS Configuration:{RESET}");
         eprintln!("  {BLUE}ZEROFS_MEMORY_CACHE_SIZE_GB{RESET}    - Memory cache size in GB");
         eprintln!(
-            "  {BLUE}ZEROFS_NBD_PORTS{RESET}               - Comma-separated NBD server ports"
-        );
-        eprintln!(
-            "  {BLUE}ZEROFS_NBD_DEVICE_SIZES_GB{RESET}     - Comma-separated NBD device sizes in GB"
+            "  {BLUE}ZEROFS_NBD_PORT{RESET}                - NBD server port (default: 10809)"
         );
         eprintln!(
             "  {BLUE}ZEROFS_NBD_HOST{RESET}                - NBD server bind address (default: 127.0.0.1)"
+        );
+        eprintln!(
+            "                                    NBD devices: truncate -s <size> <mountpoint>/.nbd/<name>"
         );
         eprintln!(
             "  {BLUE}ZEROFS_NEW_PASSWORD{RESET}            - New password when changing encryption"
@@ -295,9 +298,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ZeroFS::new_with_object_store(object_store, cache_config, actual_db_path, encryption_key)
             .await?;
 
-    let nbd_ports = std::env::var("ZEROFS_NBD_PORTS").unwrap_or_else(|_| "".to_string());
-    let nbd_device_sizes =
-        std::env::var("ZEROFS_NBD_DEVICE_SIZES_GB").unwrap_or_else(|_| "".to_string());
+    let nbd_enabled =
+        std::env::var("ZEROFS_NBD_PORT").is_ok() || std::env::var("ZEROFS_NBD_HOST").is_ok();
+    let nbd_port = std::env::var("ZEROFS_NBD_PORT")
+        .unwrap_or_else(|_| DEFAULT_NBD_PORT.to_string())
+        .parse::<u16>()
+        .map_err(|e| {
+            format!(
+                "Error: ZEROFS_NBD_PORT='{}' is not a valid port number: {}",
+                std::env::var("ZEROFS_NBD_PORT").unwrap_or_default(),
+                e
+            )
+        })?;
     let nbd_host = std::env::var("ZEROFS_NBD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
     let fs_arc = Arc::new(fs);
@@ -332,14 +344,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Start NBD servers if configured
-    let mut nbd_handles = Vec::new();
-    if !nbd_ports.is_empty() {
-        // Create .nbd directory once before starting any NBD servers
+    let nbd_handle = if nbd_enabled {
         {
-            use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
-            use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
-
             let auth = AuthContext {
                 uid: 0,
                 gid: 0,
@@ -362,69 +368,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .mkdir(&auth, 0, &nbd_name, &attr)
                         .await
                         .map_err(|e| format!("Failed to create .nbd directory: {e:?}"))?;
-                    info!("Created .nbd directory");
+                    info!("Created .nbd directory for NBD device management");
                 }
             }
         }
-        let ports: Vec<u16> = nbd_ports
-            .split(',')
-            .map(|s| {
-                let trimmed = s.trim();
-                trimmed.parse().unwrap_or_else(|e| {
-                    eprintln!("Error: Invalid NBD port '{}': {}", trimmed, e);
-                    std::process::exit(1);
-                })
-            })
-            .collect();
 
-        let sizes: Vec<u64> = nbd_device_sizes
-            .split(',')
-            .map(|s| {
-                let trimmed = s.trim();
-                trimmed.parse::<f64>().unwrap_or_else(|e| {
-                    eprintln!("Error: Invalid NBD device size '{}': {}", trimmed, e);
-                    std::process::exit(1);
-                })
-            })
-            .map(|gb| (gb * 1024.0 * 1024.0 * 1024.0) as u64)
-            .collect();
+        let nbd_server = NBDServer::new(Arc::clone(&fs_arc), nbd_host.clone(), nbd_port);
 
-        if ports.len() != sizes.len() {
-            return Err("ZEROFS_NBD_PORTS and ZEROFS_NBD_DEVICE_SIZES_GB must have the same number of entries".into());
-        }
+        info!(
+            "Starting NBD server on {}:{} (devices dynamically discovered from .nbd/)",
+            nbd_host, nbd_port
+        );
 
-        for (&port, &size) in ports.iter().zip(sizes.iter()) {
-            let mut nbd_server = NBDServer::new(Arc::clone(&fs_arc), nbd_host.clone(), port);
-            nbd_server.add_device(format!("device_{port}"), size);
-
-            info!(
-                "Starting NBD server on {}:{} with device size {} GB",
-                nbd_host,
-                port,
-                size as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-
-            let nbd_handle = tokio::spawn(async move {
-                if let Err(e) = nbd_server.start().await {
-                    if e.kind() == std::io::ErrorKind::InvalidInput
-                        && e.to_string().contains("size mismatch")
-                    {
-                        eprintln!("NBD Device Size Error: {e}");
-                        eprintln!();
-                        eprintln!("To fix this issue:");
-                        eprintln!("   • Use the same device size as before, OR");
-                        eprintln!("   • Delete the existing device file via NFS and restart");
-                        eprintln!("   • Example: rm /mnt/zerofs/.nbd/device_{port}");
-                        std::process::exit(1);
-                    }
-                    Err(e)
-                } else {
-                    Ok(())
-                }
-            });
-            nbd_handles.push(nbd_handle);
-        }
-    }
+        Some(tokio::spawn(async move {
+            if let Err(e) = nbd_server.start().await {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        }))
+    } else {
+        None
+    };
 
     let gc_fs = Arc::clone(&fs_arc);
     let gc_handle = tokio::spawn(async move {
@@ -493,7 +458,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ninep_unix) = ninep_unix_handle {
         server_handles.push(ninep_unix);
     }
-    server_handles.extend(nbd_handles);
+    if let Some(handle) = nbd_handle {
+        server_handles.push(handle);
+    }
 
     tokio::select! {
         result = futures::future::select_all(server_handles) => {
