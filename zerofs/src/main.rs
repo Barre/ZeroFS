@@ -301,28 +301,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ZeroFS::new_with_object_store(object_store, cache_config, actual_db_path, encryption_key)
             .await?;
 
+    // NBD configuration - always start TCP on default port (like 9P), optionally add Unix socket
     let nbd_socket_path = std::env::var("ZEROFS_NBD_SOCKET").ok();
-    let nbd_tcp_enabled = nbd_socket_path.is_none()
-        && (std::env::var("ZEROFS_NBD_PORT").is_ok() || std::env::var("ZEROFS_NBD_HOST").is_ok());
 
-    let nbd_enabled = nbd_socket_path.is_some() || nbd_tcp_enabled;
-
-    let nbd_port = if nbd_tcp_enabled {
-        Some(
-            std::env::var("ZEROFS_NBD_PORT")
-                .unwrap_or_else(|_| DEFAULT_NBD_PORT.to_string())
-                .parse::<u16>()
-                .map_err(|e| {
-                    format!(
-                        "Error: ZEROFS_NBD_PORT='{}' is not a valid port number: {}",
-                        std::env::var("ZEROFS_NBD_PORT").unwrap_or_default(),
-                        e
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
+    let nbd_port = std::env::var("ZEROFS_NBD_PORT")
+        .unwrap_or_else(|_| DEFAULT_NBD_PORT.to_string())
+        .parse::<u16>()
+        .map_err(|e| {
+            format!(
+                "Error: ZEROFS_NBD_PORT='{}' is not a valid port number: {}",
+                std::env::var("ZEROFS_NBD_PORT").unwrap_or_default(),
+                e
+            )
+        })?;
 
     let nbd_host = std::env::var("ZEROFS_NBD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
@@ -358,61 +349,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let nbd_handle = if nbd_enabled {
-        {
-            let auth = AuthContext {
-                uid: 0,
-                gid: 0,
-                gids: vec![],
-            };
-            let nbd_name = nfsstring(b".nbd".to_vec());
+    // Create .nbd directory for NBD device management
+    {
+        let auth = AuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![],
+        };
+        let nbd_name = nfsstring(b".nbd".to_vec());
 
-            match fs_arc.lookup(&auth, 0, &nbd_name).await {
-                Ok(_) => info!(".nbd directory already exists"),
-                Err(_) => {
-                    let attr = sattr3 {
-                        mode: set_mode3::mode(0o755),
-                        uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
-                        gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
-                        size: zerofs_nfsserve::nfs::set_size3::Void,
-                        atime: zerofs_nfsserve::nfs::set_atime::DONT_CHANGE,
-                        mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
-                    };
-                    fs_arc
-                        .mkdir(&auth, 0, &nbd_name, &attr)
-                        .await
-                        .map_err(|e| format!("Failed to create .nbd directory: {e:?}"))?;
-                    info!("Created .nbd directory for NBD device management");
-                }
+        match fs_arc.lookup(&auth, 0, &nbd_name).await {
+            Ok(_) => info!(".nbd directory already exists"),
+            Err(_) => {
+                let attr = sattr3 {
+                    mode: set_mode3::mode(0o755),
+                    uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
+                    gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
+                    size: zerofs_nfsserve::nfs::set_size3::Void,
+                    atime: zerofs_nfsserve::nfs::set_atime::DONT_CHANGE,
+                    mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
+                };
+                fs_arc
+                    .mkdir(&auth, 0, &nbd_name, &attr)
+                    .await
+                    .map_err(|e| format!("Failed to create .nbd directory: {e:?}"))?;
+                info!("Created .nbd directory for NBD device management");
             }
         }
+    }
 
-        let nbd_server = if let Some(socket_path) = &nbd_socket_path {
-            info!(
-                "Starting NBD server on Unix socket {:?} (devices dynamically discovered from .nbd/)",
-                socket_path
-            );
-            NBDServer::new_unix(Arc::clone(&fs_arc), socket_path.clone())
-        } else if let Some(port) = nbd_port {
-            info!(
-                "Starting NBD server on {}:{} (devices dynamically discovered from .nbd/)",
-                nbd_host, port
-            );
-            NBDServer::new_tcp(Arc::clone(&fs_arc), nbd_host.clone(), port)
+    // Start NBD servers (always TCP on default port, optionally Unix socket)
+    let mut nbd_handles = Vec::new();
+
+    // Always start NBD TCP server (like 9P)
+    info!(
+        "Starting NBD server on {}:{} (devices dynamically discovered from .nbd/)",
+        nbd_host, nbd_port
+    );
+    let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs_arc), nbd_host.clone(), nbd_port);
+    nbd_handles.push(tokio::spawn(async move {
+        if let Err(e) = nbd_tcp_server.start().await {
+            Err(e)
         } else {
-            unreachable!("NBD enabled but no transport configured")
-        };
+            Ok(())
+        }
+    }));
 
-        Some(tokio::spawn(async move {
-            if let Err(e) = nbd_server.start().await {
+    // Additionally start NBD Unix socket server if configured
+    if let Some(socket_path) = nbd_socket_path {
+        info!(
+            "Starting NBD server on Unix socket {:?} (devices dynamically discovered from .nbd/)",
+            socket_path
+        );
+        let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs_arc), socket_path);
+        nbd_handles.push(tokio::spawn(async move {
+            if let Err(e) = nbd_unix_server.start().await {
                 Err(e)
             } else {
                 Ok(())
             }
-        }))
-    } else {
-        None
-    };
+        }));
+    }
 
     let gc_fs = Arc::clone(&fs_arc);
     let gc_handle = tokio::spawn(async move {
@@ -481,9 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ninep_unix) = ninep_unix_handle {
         server_handles.push(ninep_unix);
     }
-    if let Some(handle) = nbd_handle {
-        server_handles.push(handle);
-    }
+    server_handles.extend(nbd_handles);
 
     tokio::select! {
         result = futures::future::select_all(server_handles) => {
