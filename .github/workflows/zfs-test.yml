@@ -63,8 +63,7 @@ jobs:
           SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
           SLATEDB_CACHE_SIZE_GB=2 \
           ZEROFS_ENCRYPTION_PASSWORD=secret \
-          ZEROFS_NBD_PORTS=10809 \
-          ZEROFS_NBD_DEVICE_SIZES_GB=3 \
+          ZEROFS_NBD_PORT=10809 \
           cargo run --profile ci s3://zerofs-zfs-test/zfs-test &
 
           # Wait for ZeroFS NBD server to start
@@ -83,13 +82,23 @@ jobs:
             exit 1
           fi
 
+      - name: Mount 9P and create NBD device
+        run: |
+          echo "Mounting ZeroFS via 9P..."
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
+
+          echo "Creating NBD device file..."
+          sudo mkdir -p /mnt/zerofs/.nbd
+          sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
+
+          sudo umount /mnt/zerofs
+
       - name: Connect NBD device
         run: |
-          # Connect to NBD device
           echo "Connecting to NBD device..."
-          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
 
-          # Verify NBD device is available
           sudo blockdev --getsize64 /dev/nbd0
           sudo fdisk -l /dev/nbd0
 
@@ -110,7 +119,7 @@ jobs:
 
           # Set mountpoint
           sudo zfs set mountpoint=/mnt/zfsdata testpool/data
-          
+
           # Set copies=2 for redundancy (allows scrub to detect/repair corruption)
           sudo zfs set copies=2 testpool/data
 
@@ -161,11 +170,11 @@ jobs:
           echo "Creating tarball of ZFS data..."
           cd /mnt/zfsdata
           sudo tar -I pigz -cf /tmp/zfsdata-backup.tar.gz .
-          
+
           echo "Calculating checksum..."
           sudo sha256sum /tmp/zfsdata-backup.tar.gz > /tmp/zfsdata-backup.sha256
           cat /tmp/zfsdata-backup.sha256
-          
+
           # Also create checksum of individual files for comparison
           sudo find . -type f -print0 | parallel -0 -j+0 sha256sum | sort > /tmp/file-checksums.txt
           echo "Number of files checksummed: $(wc -l < /tmp/file-checksums.txt)"
@@ -175,10 +184,10 @@ jobs:
           echo "Syncing filesystem..."
           sync
           sudo zpool sync testpool
-          
+
           echo "Running ZFS TRIM..."
           sudo zpool trim testpool
-          
+
           # Wait for trim to complete
           echo "Waiting for TRIM to complete..."
           while sudo zpool status testpool | grep -q 'trimming'; do
@@ -190,7 +199,7 @@ jobs:
 
           echo "Starting ZFS scrub..."
           sudo zpool scrub testpool
-          
+
           # Wait for scrub to complete
           echo "Waiting for scrub to complete..."
           while sudo zpool status testpool | grep -q 'scrub in progress'; do
@@ -199,7 +208,7 @@ jobs:
             sudo zpool status testpool
           done
           echo "Scrub completed"
-          
+
           # Show final pool status before restart
           sudo zpool status testpool
 
@@ -207,10 +216,10 @@ jobs:
         run: |
           echo "Unmounting ZFS filesystem..."
           sudo zfs unmount testpool/data
-          
+
           echo "Exporting ZFS pool..."
           sudo zpool export testpool
-          
+
           # Verify pool is exported
           if sudo zpool list testpool 2>/dev/null; then
             echo "ERROR: Pool still imported!"
@@ -222,7 +231,7 @@ jobs:
         run: |
           echo "Disconnecting NBD device..."
           sudo nbd-client -d /dev/nbd0
-          
+
           # Wait for NBD to fully disconnect - check if device is actually in use
           echo "Waiting for NBD device to disconnect..."
           for i in {1..10}; do
@@ -235,14 +244,14 @@ jobs:
             echo "Waiting for NBD disconnect... attempt $i/10"
             sleep 1
           done
-          
+
           # Also check using nbd-client -c to see if device is connected
           if sudo nbd-client -c /dev/nbd0 2>/dev/null; then
             echo "WARNING: NBD device reports as still connected, but continuing..."
           else
             echo "NBD device confirmed disconnected"
           fi
-          
+
           echo "Stopping ZeroFS..."
           # Find and kill the actual zerofs process (not cargo)
           # First try to find the process
@@ -253,7 +262,7 @@ jobs:
           else
             echo "No ZeroFS process found (may have already stopped)"
           fi
-          
+
           # Wait for ZeroFS to stop
           for i in {1..10}; do
             if ! pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" > /dev/null; then
@@ -263,14 +272,14 @@ jobs:
             echo "Waiting for ZeroFS to stop... attempt $i/10"
             sleep 1
           done
-          
+
           # Final check if ZeroFS stopped
           if pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" > /dev/null; then
             echo "WARNING: ZeroFS may still be running, forcing kill..."
             pkill -KILL -f "zerofs.*s3://zerofs-zfs-test/zfs-test" || true
             sleep 1
           fi
-          
+
           # Ensure port is free
           echo "Waiting for port 10809 to be free..."
           for i in {1..10}; do
@@ -281,7 +290,7 @@ jobs:
             echo "Waiting for port to be released... attempt $i/10"
             sleep 1
           done
-          
+
           # Final check
           if nc -z 127.0.0.1 10809 2>/dev/null; then
             echo "ERROR: Port 10809 still in use after 10 seconds!"
@@ -299,10 +308,9 @@ jobs:
           SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
           SLATEDB_CACHE_SIZE_GB=2 \
           ZEROFS_ENCRYPTION_PASSWORD=secret \
-          ZEROFS_NBD_PORTS=10809 \
-          ZEROFS_NBD_DEVICE_SIZES_GB=3 \
+          ZEROFS_NBD_PORT=10809 \
           cargo run --profile ci s3://zerofs-zfs-test/zfs-test &
-          
+
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to restart..."
           for i in {1..30}; do
@@ -312,7 +320,7 @@ jobs:
             fi
             sleep 1
           done
-          
+
           # Verify ZeroFS NBD server is running
           if ! nc -z 127.0.0.1 10809; then
             echo "ZeroFS NBD server failed to restart"
@@ -322,15 +330,15 @@ jobs:
       - name: Reconnect NBD and import pool
         run: |
           echo "Reconnecting NBD device..."
-          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809
-          
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+
           # Verify NBD device is available
           sudo blockdev --getsize64 /dev/nbd0
           sudo fdisk -l /dev/nbd0
-          
+
           echo "Importing ZFS pool..."
           sudo zpool import testpool
-          
+
           # Check pool status
           sudo zpool status testpool
           sudo zfs list
@@ -340,16 +348,16 @@ jobs:
           echo "Creating new tarball of restored data..."
           cd /mnt/zfsdata
           sudo tar -I pigz -cf /tmp/zfsdata-restored.tar.gz .
-          
+
           echo "Calculating checksum of restored data..."
           sudo sha256sum /tmp/zfsdata-restored.tar.gz > /tmp/zfsdata-restored.sha256
           cat /tmp/zfsdata-restored.sha256
-          
+
           # Compare checksums
           echo "Comparing tarball checksums..."
           ORIGINAL_SUM=$(cut -d' ' -f1 < /tmp/zfsdata-backup.sha256)
           RESTORED_SUM=$(cut -d' ' -f1 < /tmp/zfsdata-restored.sha256)
-          
+
           if [ "$ORIGINAL_SUM" = "$RESTORED_SUM" ]; then
             echo "SUCCESS: Checksums match! Data integrity verified."
           else
@@ -358,11 +366,11 @@ jobs:
             echo "Restored: $RESTORED_SUM"
             exit 1
           fi
-          
+
           # Also verify individual file checksums
           echo "Verifying individual file checksums..."
           sudo find . -type f -print0 | parallel -0 -j+0 sha256sum | sort > /tmp/file-checksums-restored.txt
-          
+
           if diff /tmp/file-checksums.txt /tmp/file-checksums-restored.txt; then
             echo "SUCCESS: All individual file checksums match!"
           else
