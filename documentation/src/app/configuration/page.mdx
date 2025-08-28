@@ -84,14 +84,15 @@ export ZEROFS_MEMORY_CACHE_SIZE_GB='8'
 ### NBD Block Devices
 
 ```bash
-# Comma-separated list of NBD server ports
-export ZEROFS_NBD_PORTS='10809,10810,10811'
+# NBD TCP server configuration
+export ZEROFS_NBD_PORT='10809'      # Port (default: 10809)
+export ZEROFS_NBD_HOST='0.0.0.0'    # Bind address (default: 127.0.0.1)
 
-# Comma-separated list of device sizes in GB
-export ZEROFS_NBD_DEVICE_SIZES_GB='10,20,50'
+# NBD Unix socket (optional, can be used alongside TCP)
+export ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock'
 
-# NBD server bind address (default: 127.0.0.1)
-export ZEROFS_NBD_HOST='0.0.0.0'
+# Note: NBD devices are managed dynamically via the .nbd/ directory
+# Create devices: truncate -s <size> /mnt/zerofs/.nbd/<device-name>
 ```
 
 ### Network Services
@@ -170,8 +171,10 @@ export ZEROFS_ENCRYPTION_PASSWORD='very-secure-password'
 
 # Network configuration
 export ZEROFS_NFS_HOST='0.0.0.0'
-export ZEROFS_NBD_PORTS='10809,10810,10811'
-export ZEROFS_NBD_DEVICE_SIZES_GB='100,100,100'
+export ZEROFS_NBD_HOST='0.0.0.0'
+export ZEROFS_NBD_PORT='10809'
+# Optional: Use Unix socket for better local performance
+# export ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock'
 
 # S3 configuration
 export AWS_ACCESS_KEY_ID='your-key'
