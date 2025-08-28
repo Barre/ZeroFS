@@ -9,11 +9,9 @@ use super::protocol::{
 };
 use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
-use crate::fs::permissions::Credentials;
-use crate::fs::types::{AuthContext, SetAttributes, SetGid, SetMode, SetUid};
+use crate::fs::types::AuthContext;
 use bytes::BytesMut;
 use deku::prelude::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,7 +25,6 @@ pub struct NBDDevice {
 
 pub struct NBDServer {
     filesystem: Arc<ZeroFS>,
-    devices: HashMap<String, NBDDevice>,
     host: String,
     port: u16,
 }
@@ -36,26 +33,12 @@ impl NBDServer {
     pub fn new(filesystem: Arc<ZeroFS>, host: String, port: u16) -> Self {
         Self {
             filesystem,
-            devices: HashMap::new(),
             host,
             port,
         }
     }
 
-    pub fn add_device(&mut self, name: String, size: u64) {
-        let device = NBDDevice {
-            name: name.clone(),
-            size,
-        };
-        self.devices.insert(name, device);
-    }
-
     pub async fn start(&self) -> std::io::Result<()> {
-        // Initialize device files (.nbd directory created in main)
-        for device in self.devices.values() {
-            self.initialize_device(device).await?;
-        }
-
         let listener = TcpListener::bind(format!("{}:{}", self.host, self.port)).await?;
         info!("NBD server listening on {}:{}", self.host, self.port);
 
@@ -66,115 +49,22 @@ impl NBDServer {
             stream.set_nodelay(true)?;
 
             let filesystem = Arc::clone(&self.filesystem);
-            let devices = self.devices.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, filesystem, devices).await {
+                if let Err(e) = handle_client(stream, filesystem).await {
                     error!("Error handling NBD client {}: {}", addr, e);
                 }
             });
         }
     }
-
-    async fn initialize_device(&self, device: &NBDDevice) -> std::io::Result<()> {
-        let auth = AuthContext {
-            uid: 0,
-            gid: 0,
-            gids: vec![],
-        };
-        let creds = Credentials::from_auth_context(&auth);
-
-        // Check if device file exists, create it if not
-        let nbd_dir_inode = self
-            .filesystem
-            .lookup_by_name(0, ".nbd")
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!("Failed to lookup .nbd directory: {e:?}"))
-            })?;
-
-        match self
-            .filesystem
-            .lookup_by_name(nbd_dir_inode, &device.name)
-            .await
-        {
-            Ok(device_inode) => {
-                let existing_inode =
-                    self.filesystem
-                        .load_inode(device_inode)
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::other(format!("Failed to get device attributes: {e:?}"))
-                        })?;
-
-                let existing_size = match &existing_inode {
-                    Inode::File(f) => f.size,
-                    _ => 0,
-                };
-
-                if existing_size != device.size {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "NBD device {} size mismatch: existing size is {} bytes, requested size is {} bytes. Cannot resize existing devices.",
-                            device.name, existing_size, device.size
-                        ),
-                    ));
-                }
-
-                debug!(
-                    "NBD device file {} already exists with correct size {}",
-                    device.name, device.size
-                );
-                Ok(())
-            }
-            Err(_) => {
-                debug!(
-                    "Creating NBD device file {} with size {}",
-                    device.name, device.size
-                );
-                let attr = SetAttributes {
-                    mode: SetMode::Set(0o600),
-                    uid: SetUid::Set(0),
-                    gid: SetGid::Set(0),
-                    ..Default::default()
-                };
-
-                let (device_inode, _) = self
-                    .filesystem
-                    .process_create(&creds, nbd_dir_inode, device.name.as_bytes(), &attr)
-                    .await
-                    .map_err(|e| {
-                        std::io::Error::other(format!("Failed to create device file: {e:?}"))
-                    })?;
-
-                // Set the file size by writing a zero byte at the end
-                if device.size > 0 {
-                    let data = [0u8; 1];
-                    self.filesystem
-                        .process_write(&auth, device_inode, device.size - 1, &data)
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::other(format!("Failed to set device size: {e:?}"))
-                        })?;
-                }
-
-                Ok(())
-            }
-        }
-    }
 }
 
-async fn handle_client(
-    stream: TcpStream,
-    filesystem: Arc<ZeroFS>,
-    devices: HashMap<String, NBDDevice>,
-) -> Result<()> {
+async fn handle_client(stream: TcpStream, filesystem: Arc<ZeroFS>) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let reader = BufReader::new(reader);
     let writer = BufWriter::new(writer);
 
-    let mut session = NBDSession::new(reader, writer, filesystem, devices);
+    let mut session = NBDSession::new(reader, writer, filesystem);
     session.perform_handshake().await?;
 
     match session.negotiate_options().await {
@@ -196,23 +86,121 @@ struct NBDSession<R, W> {
     reader: R,
     writer: W,
     filesystem: Arc<ZeroFS>,
-    devices: HashMap<String, NBDDevice>,
     client_no_zeroes: bool,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
-    fn new(
-        reader: R,
-        writer: W,
-        filesystem: Arc<ZeroFS>,
-        devices: HashMap<String, NBDDevice>,
-    ) -> Self {
+    fn new(reader: R, writer: W, filesystem: Arc<ZeroFS>) -> Self {
         Self {
             reader,
             writer,
             filesystem,
-            devices,
             client_no_zeroes: false,
+        }
+    }
+
+    async fn get_available_devices(&self) -> Result<Vec<NBDDevice>> {
+        let auth = AuthContext {
+            uid: 0,
+            gid: 0,
+            gids: vec![],
+        };
+
+        // Look up .nbd directory
+        let nbd_dir_inode = self
+            .filesystem
+            .lookup_by_name(0, ".nbd")
+            .await
+            .map_err(|e| {
+                NBDError::Io(std::io::Error::other(format!(
+                    "Failed to lookup .nbd directory: {e:?}"
+                )))
+            })?;
+
+        // List files in .nbd directory
+        let entries = self
+            .filesystem
+            .process_readdir(&auth, nbd_dir_inode, 0, 1000)
+            .await
+            .map_err(|e| {
+                NBDError::Io(std::io::Error::other(format!(
+                    "Failed to read .nbd directory: {e:?}"
+                )))
+            })?;
+
+        let mut devices = Vec::new();
+        for entry in &entries.entries {
+            // Skip . and ..
+            let name = String::from_utf8_lossy(&entry.name);
+            if name == "." || name == ".." {
+                continue;
+            }
+
+            // Get file size from the inode
+            let inode = self
+                .filesystem
+                .load_inode(entry.fileid)
+                .await
+                .map_err(|e| {
+                    NBDError::Io(std::io::Error::other(format!(
+                        "Failed to load inode for {}: {e:?}",
+                        name
+                    )))
+                })?;
+
+            if let Inode::File(file_inode) = inode {
+                devices.push(NBDDevice {
+                    name: name.to_string(),
+                    size: file_inode.size,
+                });
+            }
+        }
+
+        Ok(devices)
+    }
+
+    async fn get_device_by_name(&self, name: &str) -> Result<NBDDevice> {
+        let nbd_dir_inode = self
+            .filesystem
+            .lookup_by_name(0, ".nbd")
+            .await
+            .map_err(|e| {
+                NBDError::Io(std::io::Error::other(format!(
+                    "Failed to lookup .nbd directory: {e:?}"
+                )))
+            })?;
+
+        let device_inode = self
+            .filesystem
+            .lookup_by_name(nbd_dir_inode, name)
+            .await
+            .map_err(|_| {
+                NBDError::Io(std::io::Error::other(format!(
+                    "NBD device '{}' not found",
+                    name
+                )))
+            })?;
+
+        let inode = self
+            .filesystem
+            .load_inode(device_inode)
+            .await
+            .map_err(|e| {
+                NBDError::Io(std::io::Error::other(format!(
+                    "Failed to load inode for {}: {e:?}",
+                    name
+                )))
+            })?;
+
+        match inode {
+            Inode::File(file_inode) => Ok(NBDDevice {
+                name: name.to_string(),
+                size: file_inode.size,
+            }),
+            _ => Err(NBDError::Io(std::io::Error::other(format!(
+                "NBD device '{}' is not a regular file",
+                name
+            )))),
         }
     }
 
@@ -312,7 +300,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             self.reader.read_exact(&mut buf).await?;
         }
 
-        let devices: Vec<_> = self.devices.values().cloned().collect();
+        let devices = self.get_available_devices().await?;
         for device in devices {
             let name_bytes = device.name.as_bytes();
             let mut reply_data = Vec::new();
@@ -335,16 +323,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let name = String::from_utf8_lossy(&name_buf);
 
         debug!("Client requested export: '{}' (length: {})", name, length);
-        debug!(
-            "Available devices: {:?}",
-            self.devices.keys().collect::<Vec<_>>()
-        );
 
         let device = self
-            .devices
-            .get(name.as_ref())
-            .ok_or_else(|| NBDError::DeviceNotFound(name.to_string()))?
-            .clone();
+            .get_device_by_name(&name)
+            .await
+            .map_err(|_| NBDError::DeviceNotFound(name.to_string()))?;
 
         self.writer.write_all(&device.size.to_be_bytes()).await?;
         self.writer
@@ -386,8 +369,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             name, name_len
         );
 
-        match self.devices.get(name.as_ref()) {
-            Some(device) => {
+        match self.get_device_by_name(&name).await {
+            Ok(device) => {
                 let info = NBDInfoExport {
                     info_type: NBD_INFO_EXPORT,
                     size: device.size,
@@ -401,7 +384,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 self.writer.flush().await?;
                 Ok(())
             }
-            None => {
+            Err(_) => {
                 self.send_option_reply(NBDOption::Info as u32, NBD_REP_ERR_UNKNOWN, &[])
                     .await?;
                 self.writer.flush().await?;
@@ -438,9 +421,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             4 + name_len + 2
         );
 
-        match self.devices.get(name.as_ref()) {
-            Some(device) => {
-                let device = device.clone();
+        match self.get_device_by_name(&name).await {
+            Ok(device) => {
                 let info = NBDInfoExport {
                     info_type: NBD_INFO_EXPORT,
                     size: device.size,
@@ -454,7 +436,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 self.writer.flush().await?;
                 Ok(device)
             }
-            None => {
+            Err(_) => {
                 self.send_option_reply(NBDOption::Go as u32, NBD_REP_ERR_UNKNOWN, &[])
                     .await?;
                 self.writer.flush().await?;
