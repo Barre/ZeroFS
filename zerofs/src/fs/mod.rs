@@ -19,7 +19,7 @@ use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use crate::encryption::{EncryptedDb, EncryptionManager};
 use slatedb::SstBlockSize;
-use slatedb::config::ObjectStoreCacheOptions;
+use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::object_store::{ObjectStore, path::Path};
 use slatedb::{
@@ -170,6 +170,9 @@ impl ZeroFS {
                 ..Default::default()
             }),
             compression_codec: None, // Disable compression - we handle it in encryption layer
+            garbage_collector_options: Some(GarbageCollectorOptions {
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
