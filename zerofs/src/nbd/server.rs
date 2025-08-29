@@ -7,6 +7,7 @@ use super::protocol::{
     NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     get_transmission_flags,
 };
+use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
 use crate::fs::types::AuthContext;
 use crate::fs::{EncodedFileId, ZeroFS};
@@ -210,16 +211,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 )))
             })?;
 
-        let device_inode = self
-            .filesystem
-            .lookup_by_name(nbd_dir_inode, name)
-            .await
-            .map_err(|_| {
-                NBDError::Io(std::io::Error::other(format!(
-                    "NBD device '{}' not found",
-                    name
-                )))
-            })?;
+        let device_inode = match self.filesystem.lookup_by_name(nbd_dir_inode, name).await {
+            Ok(inode) => inode,
+            Err(FsError::NotFound) => {
+                return Err(NBDError::DeviceNotFound(name.to_string()));
+            }
+            Err(e) => {
+                return Err(NBDError::Io(std::io::Error::other(format!(
+                    "Failed to lookup device: {e:?}"
+                ))));
+            }
+        };
 
         let inode = self
             .filesystem
