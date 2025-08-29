@@ -328,6 +328,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     debug!("Handling ABORT option");
                     self.send_option_reply(header.option, NBD_REP_ACK, &[])
                         .await?;
+                    self.writer.flush().await?;
                     return Err(NBDError::Protocol("Client aborted".to_string()));
                 }
                 _ => {
@@ -338,6 +339,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     }
                     self.send_option_reply(header.option, NBD_REP_ERR_UNSUP, &[])
                         .await?;
+                    self.writer.flush().await?;
                 }
             }
         }
@@ -409,6 +411,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         if data.len() < 4 + name_len + 2 {
             self.send_option_reply(NBDOption::Info as u32, NBD_REP_ERR_INVALID, &[])
                 .await?;
+            self.writer.flush().await?;
             return Err(NBDError::Protocol("Invalid INFO option length".to_string()));
         }
 
@@ -449,6 +452,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         if data.len() < 4 {
             self.send_option_reply(NBDOption::Go as u32, NBD_REP_ERR_INVALID, &[])
                 .await?;
+            self.writer.flush().await?;
             return Err(NBDError::Protocol("Invalid GO option".to_string()));
         }
 
@@ -456,6 +460,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         if data.len() < 4 + name_len + 2 {
             self.send_option_reply(NBDOption::Go as u32, NBD_REP_ERR_INVALID, &[])
                 .await?;
+            self.writer.flush().await?;
             return Err(NBDError::Protocol("Invalid GO option length".to_string()));
         }
 
