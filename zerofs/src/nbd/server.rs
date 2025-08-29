@@ -309,7 +309,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     self.handle_info_option(header.length).await?;
                 }
                 7 => {
-                    return self.handle_go_option(header.length).await;
+                    match self.handle_go_option(header.length).await {
+                        Ok(device) => return Ok(device),
+                        Err(NBDError::DeviceNotFound(_)) => {
+                            // Device not found - stay in negotiation loop
+                            // Error reply already sent by handle_go_option
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 8 => {
                     debug!("Handling STRUCTURED_REPLY option");
@@ -428,7 +435,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 self.send_option_reply(NBDOption::Info as u32, NBD_REP_ERR_UNKNOWN, &[])
                     .await?;
                 self.writer.flush().await?;
-                Err(NBDError::DeviceNotFound(name.to_string()))
+                Ok(())
             }
         }
     }
