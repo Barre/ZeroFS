@@ -2,105 +2,6 @@ use deku::prelude::*;
 
 pub const VERSION_9P2000L: &str = "9P2000.L";
 
-#[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
-#[deku(id_type = "u8", endian = "little")]
-pub enum MessageType {
-    #[deku(id = "100")]
-    Tversion,
-    #[deku(id = "101")]
-    Rversion,
-    #[deku(id = "104")]
-    Tattach,
-    #[deku(id = "105")]
-    Rattach,
-    #[deku(id = "108")]
-    Tflush,
-    #[deku(id = "109")]
-    Rflush,
-    #[deku(id = "110")]
-    Twalk,
-    #[deku(id = "111")]
-    Rwalk,
-    #[deku(id = "114")]
-    Tread,
-    #[deku(id = "115")]
-    Rread,
-    #[deku(id = "116")]
-    Twrite,
-    #[deku(id = "117")]
-    Rwrite,
-    #[deku(id = "118")]
-    Tclunk,
-    #[deku(id = "119")]
-    Rclunk,
-
-    // 9P2000.L extensions
-    #[deku(id = "12")]
-    Tlopen,
-    #[deku(id = "13")]
-    Rlopen,
-    #[deku(id = "14")]
-    Tlcreate,
-    #[deku(id = "15")]
-    Rlcreate,
-    #[deku(id = "16")]
-    Tsymlink,
-    #[deku(id = "17")]
-    Rsymlink,
-    #[deku(id = "18")]
-    Tmknod,
-    #[deku(id = "19")]
-    Rmknod,
-    #[deku(id = "20")]
-    Trename,
-    #[deku(id = "21")]
-    Rrename,
-    #[deku(id = "22")]
-    Treadlink,
-    #[deku(id = "23")]
-    Rreadlink,
-    #[deku(id = "24")]
-    Tgetattr,
-    #[deku(id = "25")]
-    Rgetattr,
-    #[deku(id = "26")]
-    Tsetattr,
-    #[deku(id = "27")]
-    Rsetattr,
-    #[deku(id = "30")]
-    Txattrwalk,
-    #[deku(id = "31")]
-    Rxattrwalk,
-    #[deku(id = "40")]
-    Treaddir,
-    #[deku(id = "41")]
-    Rreaddir,
-    #[deku(id = "50")]
-    Tfsync,
-    #[deku(id = "51")]
-    Rfsync,
-    #[deku(id = "70")]
-    Tlink,
-    #[deku(id = "71")]
-    Rlink,
-    #[deku(id = "72")]
-    Tmkdir,
-    #[deku(id = "73")]
-    Rmkdir,
-    #[deku(id = "74")]
-    Trenameat,
-    #[deku(id = "75")]
-    Rrenameat,
-    #[deku(id = "76")]
-    Tunlinkat,
-    #[deku(id = "77")]
-    Runlinkat,
-    #[deku(id = "8")]
-    Tstatfs,
-    #[deku(id = "9")]
-    Rstatfs,
-}
-
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
 pub const QID_TYPE_SYMLINK: u8 = 0x02;
@@ -189,15 +90,6 @@ impl P9String {
     pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
         std::str::from_utf8(&self.data)
     }
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct MessageHeader {
-    #[deku(endian = "little")]
-    pub size: u32,
-    pub type_: MessageType,
-    #[deku(endian = "little")]
-    pub tag: u16,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
