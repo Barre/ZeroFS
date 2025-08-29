@@ -375,10 +375,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         debug!("Client requested export: '{}' (length: {})", name, length);
 
-        let device = self
-            .get_device_by_name(&name)
-            .await
-            .map_err(|_| NBDError::DeviceNotFound(name.to_string()))?;
+        // For NBD_OPT_EXPORT_NAME, we can't send an error reply
+        // We must either send the export info or close the connection
+        let device = match self.get_device_by_name(&name).await {
+            Ok(device) => device,
+            Err(_) => {
+                error!("Export '{}' not found, closing connection", name);
+                return Err(NBDError::DeviceNotFound(name.to_string()));
+            }
+        };
 
         self.writer.write_all(&device.size.to_be_bytes()).await?;
         self.writer
