@@ -7,9 +7,9 @@ use super::protocol::{
     NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     get_transmission_flags,
 };
-use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
 use crate::fs::types::AuthContext;
+use crate::fs::{EncodedFileId, ZeroFS};
 use bytes::BytesMut;
 use deku::prelude::*;
 use std::sync::Arc;
@@ -178,17 +178,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 continue;
             }
 
-            // Get file size from the inode
-            let inode = self
-                .filesystem
-                .load_inode(entry.fileid)
-                .await
-                .map_err(|e| {
-                    NBDError::Io(std::io::Error::other(format!(
-                        "Failed to load inode for {}: {e:?}",
-                        name
-                    )))
-                })?;
+            let encoded_id = EncodedFileId::from(entry.fileid);
+            let real_id = encoded_id.inode_id();
+
+            let inode = self.filesystem.load_inode(real_id).await.map_err(|e| {
+                NBDError::Io(std::io::Error::other(format!(
+                    "Failed to load inode for {}: {e:?}",
+                    name
+                )))
+            })?;
 
             if let Inode::File(file_inode) = inode {
                 devices.push(NBDDevice {
