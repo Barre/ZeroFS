@@ -19,6 +19,32 @@ pub const SETATTR_MTIME: u32 = 0x00000020;
 pub const SETATTR_ATIME_SET: u32 = 0x00000080;
 pub const SETATTR_MTIME_SET: u32 = 0x00000100;
 
+#[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
+#[deku(id_type = "u8")]
+pub enum LockType {
+    #[deku(id = "0")]
+    ReadLock, // F_RDLCK
+    #[deku(id = "1")]
+    WriteLock, // F_WRLCK
+    #[deku(id = "2")]
+    Unlock, // F_UNLCK
+}
+
+pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
+
+#[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
+#[deku(id_type = "u8")]
+pub enum LockStatus {
+    #[deku(id = "0")]
+    Success,
+    #[deku(id = "1")]
+    Blocked,
+    #[deku(id = "2")]
+    LockError,
+    #[deku(id = "3")]
+    Grace,
+}
+
 // Basic structures
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Qid {
@@ -337,9 +363,56 @@ pub struct Txattrwalk {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tlock {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    pub lock_type: LockType,
+    #[deku(endian = "little")]
+    pub flags: u32,
+    #[deku(endian = "little")]
+    pub start: u64,
+    #[deku(endian = "little")]
+    pub length: u64,
+    #[deku(endian = "little")]
+    pub proc_id: u32,
+    pub client_id: P9String,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tgetlock {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    pub lock_type: LockType,
+    #[deku(endian = "little")]
+    pub start: u64,
+    #[deku(endian = "little")]
+    pub length: u64,
+    #[deku(endian = "little")]
+    pub proc_id: u32,
+    pub client_id: P9String,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rxattrwalk {
     #[deku(endian = "little")]
     pub size: u64,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rlock {
+    pub status: LockStatus,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rgetlock {
+    pub lock_type: LockType,
+    #[deku(endian = "little")]
+    pub start: u64,
+    #[deku(endian = "little")]
+    pub length: u64,
+    #[deku(endian = "little")]
+    pub proc_id: u32,
+    pub client_id: P9String,
 }
 
 // Response messages
@@ -561,6 +634,14 @@ pub enum Message {
     Tfsync(Tfsync),
     #[deku(id = "51")]
     Rfsync(Rfsync),
+    #[deku(id = "52")]
+    Tlock(Tlock),
+    #[deku(id = "53")]
+    Rlock(Rlock),
+    #[deku(id = "54")]
+    Tgetlock(Tgetlock),
+    #[deku(id = "55")]
+    Rgetlock(Rgetlock),
     #[deku(id = "7")]
     Rlerror(Rlerror),
     #[deku(id = "108")]
@@ -652,6 +733,10 @@ impl P9Message {
             Message::Runlinkat(_) => 77,
             Message::Tfsync(_) => 50,
             Message::Rfsync(_) => 51,
+            Message::Tlock(_) => 52,
+            Message::Rlock(_) => 53,
+            Message::Tgetlock(_) => 54,
+            Message::Rgetlock(_) => 55,
             Message::Rlerror(_) => 7,
             Message::Tflush(_) => 108,
             Message::Rflush(_) => 109,
