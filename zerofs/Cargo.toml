@@ -21,7 +21,7 @@ tokio = { version = "1.46", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "e7416ba08a1b5004f6067da12e265bbfd0a4b86e", features = [
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "788013b5960089b25419753a4f159fa2176f1777", features = [
     "wal_disable",
 ] }
 object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
@@ -47,9 +47,6 @@ num-format = "0.4"
 libc = "0.2"
 dashmap = "6.1"
 uuid = { version = "1.17", features = ["v4"] }
-
-[patch.crates-io]
-object_store = { git = "https://github.com/Barre/arrow-rs-object-store.git", rev = "ffa9a60a71a9f7e54ff1f18b0a21eaf08fba5ec4" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }
