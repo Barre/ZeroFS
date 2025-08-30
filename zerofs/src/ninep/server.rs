@@ -1,4 +1,5 @@
 use super::handler::NinePHandler;
+use super::lock_manager::FileLockManager;
 use super::protocol::P9Message;
 use crate::fs::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
@@ -20,6 +21,7 @@ pub enum Transport {
 pub struct NinePServer {
     filesystem: Arc<ZeroFS>,
     transport: Transport,
+    lock_manager: Arc<FileLockManager>,
 }
 
 impl NinePServer {
@@ -27,6 +29,7 @@ impl NinePServer {
         Self {
             filesystem,
             transport: Transport::Tcp(addr),
+            lock_manager: Arc::new(FileLockManager::new()),
         }
     }
 
@@ -34,6 +37,7 @@ impl NinePServer {
         Self {
             filesystem,
             transport: Transport::Unix(path),
+            lock_manager: Arc::new(FileLockManager::new()),
         }
     }
 
@@ -50,8 +54,10 @@ impl NinePServer {
                     stream.set_nodelay(true)?;
 
                     let filesystem = Arc::clone(&self.filesystem);
+                    let lock_manager = Arc::clone(&self.lock_manager);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client_stream(stream, filesystem).await {
+                        if let Err(e) = handle_client_stream(stream, filesystem, lock_manager).await
+                        {
                             error!("Error handling 9P client {}: {}", peer_addr, e);
                         }
                     });
@@ -73,8 +79,10 @@ impl NinePServer {
                     info!("9P client connected via Unix socket");
 
                     let filesystem = Arc::clone(&self.filesystem);
+                    let lock_manager = Arc::clone(&self.lock_manager);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client_stream(stream, filesystem).await {
+                        if let Err(e) = handle_client_stream(stream, filesystem, lock_manager).await
+                        {
                             error!("Error handling 9P Unix client: {}", e);
                         }
                     });
@@ -87,11 +95,13 @@ impl NinePServer {
 async fn handle_client_stream<S>(
     stream: S,
     filesystem: Arc<ZeroFS>,
-) -> Result<(), Box<dyn std::error::Error>>
+    lock_manager: Arc<FileLockManager>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let handler = Arc::new(NinePHandler::new(filesystem));
+    let handler = Arc::new(NinePHandler::new(filesystem, lock_manager.clone()));
+    let handler_id = handler.handler_id();
 
     let (mut read_stream, mut write_stream) = tokio::io::split(stream);
 
@@ -106,19 +116,32 @@ where
         }
     });
 
+    let result = handle_client_loop(handler, &mut read_stream, tx).await;
+
+    lock_manager.release_session_locks(handler_id).await;
+
+    let _ = writer_task.await;
+
+    result
+}
+
+async fn handle_client_loop<R>(
+    handler: Arc<NinePHandler>,
+    read_stream: &mut R,
+    tx: mpsc::Sender<(u16, Vec<u8>)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         let mut size_buf = [0u8; 4];
         match read_stream.read_exact(&mut size_buf).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 debug!("Client disconnected");
-                drop(tx);
-                writer_task.await?;
                 return Ok(());
             }
             Err(e) => {
-                drop(tx);
-                writer_task.await?;
                 return Err(e.into());
             }
         }
@@ -126,8 +149,6 @@ where
         let size = u32::from_le_bytes(size_buf);
         if !(7..=DEFAULT_MSIZE).contains(&size) {
             error!("Invalid message size: {}", size);
-            drop(tx);
-            writer_task.await?;
             return Err("Invalid message size".into());
         }
 
@@ -184,14 +205,10 @@ where
 
                     if let Err(e) = tx.send((tag, response_bytes)).await {
                         error!("Failed to send error response: {}", e);
-                        drop(tx);
-                        writer_task.await?;
                         return Err(e.into());
                     }
                 } else {
                     debug!("Message too short to parse: {:?}", e);
-                    drop(tx);
-                    writer_task.await?;
                     return Err(format!("Failed to parse message: {e:?}").into());
                 }
             }

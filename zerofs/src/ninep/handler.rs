@@ -1,9 +1,10 @@
 use dashmap::DashMap;
 use deku::DekuContainerWrite;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use tracing::debug;
 
+use super::lock_manager::{FileLock, FileLockManager};
 use super::protocol::*;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
@@ -70,10 +71,14 @@ pub struct Session {
 pub struct NinePHandler {
     filesystem: Arc<ZeroFS>,
     session: Arc<Session>,
+    lock_manager: Arc<FileLockManager>,
+    handler_id: u64, // Unique ID for this handler/connection
 }
 
 impl NinePHandler {
-    pub fn new(filesystem: Arc<ZeroFS>) -> Self {
+    pub fn new(filesystem: Arc<ZeroFS>, lock_manager: Arc<FileLockManager>) -> Self {
+        static HANDLER_COUNTER: AtomicU64 = AtomicU64::new(1);
+
         let session = Arc::new(Session {
             msize: AtomicU32::new(DEFAULT_MSIZE),
             fids: Arc::new(DashMap::new()),
@@ -82,7 +87,13 @@ impl NinePHandler {
         Self {
             filesystem,
             session,
+            lock_manager,
+            handler_id: HANDLER_COUNTER.fetch_add(1, AtomicOrdering::SeqCst),
         }
+    }
+
+    pub fn handler_id(&self) -> u64 {
+        self.handler_id
     }
 
     fn make_auth_context(&self, creds: &Credentials) -> zerofs_nfsserve::vfs::AuthContext {
@@ -118,6 +129,8 @@ impl NinePHandler {
             Message::Tflush(tf) => self.handle_tflush(tag, tf).await,
             Message::Txattrwalk(tx) => self.handle_txattrwalk(tag, tx).await,
             Message::Tstatfs(ts) => self.handle_statfs(tag, ts).await,
+            Message::Tlock(tl) => self.handle_lock(tag, tl).await,
+            Message::Tgetlock(tg) => self.handle_getlock(tag, tg).await,
             _ => P9Message::error(tag, libc::ENOSYS as u32),
         }
     }
@@ -1229,6 +1242,111 @@ impl NinePHandler {
         // Return ENOTSUP error
         P9Message::error(tag, libc::ENOTSUP as u32)
     }
+
+    async fn handle_lock(&self, tag: u16, tl: Tlock) -> P9Message {
+        let fid = match self.session.fids.get(&tl.fid) {
+            Some(fid) => fid.clone(),
+            None => return P9Message::error(tag, libc::EBADF as u32),
+        };
+
+        if matches!(tl.lock_type, LockType::Unlock) {
+            self.lock_manager
+                .unlock_range(fid.inode_id, tl.fid, tl.start, tl.length, self.handler_id)
+                .await;
+
+            return P9Message::new(
+                tag,
+                Message::Rlock(Rlock {
+                    status: LockStatus::Success,
+                }),
+            );
+        }
+
+        let new_lock = FileLock {
+            lock_type: tl.lock_type,
+            start: tl.start,
+            length: tl.length,
+            proc_id: tl.proc_id,
+            client_id: tl.client_id.as_str().unwrap_or("").to_string(),
+            fid: tl.fid,
+            inode_id: fid.inode_id,
+        };
+
+        match self
+            .lock_manager
+            .try_add_lock(self.handler_id, new_lock)
+            .await
+        {
+            Ok(_lock_id) => {
+                // Lock acquired successfully
+            }
+            Err(_) => {
+                // Conflict detected
+                if (tl.flags & P9_LOCK_FLAGS_BLOCK) != 0 {
+                    return P9Message::new(
+                        tag,
+                        Message::Rlock(Rlock {
+                            status: LockStatus::Blocked,
+                        }),
+                    );
+                } else {
+                    return P9Message::error(tag, libc::EAGAIN as u32);
+                }
+            }
+        }
+
+        P9Message::new(
+            tag,
+            Message::Rlock(Rlock {
+                status: LockStatus::Success,
+            }),
+        )
+    }
+
+    async fn handle_getlock(&self, tag: u16, tg: Tgetlock) -> P9Message {
+        let fid = match self.session.fids.get(&tg.fid) {
+            Some(fid) => fid.clone(),
+            None => return P9Message::error(tag, libc::EBADF as u32),
+        };
+
+        let test_lock = FileLock {
+            lock_type: tg.lock_type,
+            start: tg.start,
+            length: tg.length,
+            proc_id: tg.proc_id,
+            client_id: tg.client_id.as_str().unwrap_or("").to_string(),
+            fid: tg.fid,
+            inode_id: fid.inode_id,
+        };
+
+        if let Some(conflicting_lock) = self
+            .lock_manager
+            .check_would_block(fid.inode_id, &test_lock, self.handler_id)
+            .await
+        {
+            P9Message::new(
+                tag,
+                Message::Rgetlock(Rgetlock {
+                    lock_type: conflicting_lock.lock_type,
+                    start: conflicting_lock.start,
+                    length: conflicting_lock.length,
+                    proc_id: conflicting_lock.proc_id,
+                    client_id: P9String::new(&conflicting_lock.client_id),
+                }),
+            )
+        } else {
+            P9Message::new(
+                tag,
+                Message::Rgetlock(Rgetlock {
+                    lock_type: LockType::Unlock,
+                    start: tg.start,
+                    length: tg.length,
+                    proc_id: 0,
+                    client_id: P9String::new(""),
+                }),
+            )
+        }
+    }
 }
 
 pub fn inode_to_qid(inode: &Inode, inode_id: u64) -> Qid {
@@ -1397,6 +1515,7 @@ pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
 
 #[cfg(test)]
 mod tests {
+    use super::FileLockManager;
     use super::*;
     use crate::fs::ZeroFS;
     use libc::O_RDONLY;
@@ -1406,7 +1525,8 @@ mod tests {
     #[tokio::test]
     async fn test_statfs() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let handler = NinePHandler::new(fs.clone());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs.clone(), lock_manager);
 
         let version_msg = Message::Tversion(Tversion {
             msize: DEFAULT_MSIZE,
@@ -1468,7 +1588,8 @@ mod tests {
     #[tokio::test]
     async fn test_statfs_with_files() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-        let handler = NinePHandler::new(fs.clone());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs.clone(), lock_manager);
 
         // Set up a session
         let version_msg = Message::Tversion(Tversion {
@@ -1567,7 +1688,8 @@ mod tests {
             .unwrap();
         }
 
-        let handler = NinePHandler::new(fs);
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs, lock_manager);
 
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,
@@ -1676,7 +1798,8 @@ mod tests {
             .unwrap();
         }
 
-        let handler = NinePHandler::new(fs);
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs, lock_manager);
 
         // Initialize
         let version_msg = Message::Tversion(Tversion {
@@ -1764,7 +1887,8 @@ mod tests {
             .unwrap();
         }
 
-        let handler = NinePHandler::new(fs);
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs, lock_manager);
 
         let version_msg = Message::Tversion(Tversion {
             msize: DEFAULT_MSIZE,
@@ -1943,7 +2067,8 @@ mod tests {
             .await
             .unwrap();
 
-        let handler = NinePHandler::new(fs);
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs, lock_manager);
 
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,

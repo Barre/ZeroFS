@@ -1,4 +1,5 @@
 pub mod handler;
+pub mod lock_manager;
 pub mod protocol;
 pub mod server;
 
