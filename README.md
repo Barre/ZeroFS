@@ -13,9 +13,8 @@
 # ZeroFS - The Filesystem That Makes S3 your Primary Storage
 ## File systems AND block devices on S3 storage
 
-ZeroFS makes S3 storage feel like a real filesystem. Built on [SlateDB](https://github.com/slatedb/slatedb), it provides **file-level access via NFS and 9P** and **block-level access via NBD**. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
+ZeroFS makes S3 storage feel like a real filesystem. It provides **file-level access via NFS and 9P** and **block-level access via NBD**.
 
-Join our community on Discord: https://discord.gg/eGKNQTbG
 
 **Key Features:**
 - **NFS Server** - Mount as a network filesystem on any OS
