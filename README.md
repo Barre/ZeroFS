@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://www.zerofs.net">
-    <img src="assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/readme_logo.png" alt="ZeroFS Logo" width="500">
   </a>
 </p>
 
