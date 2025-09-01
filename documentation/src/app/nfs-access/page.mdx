@@ -110,8 +110,7 @@ To allow access from multiple machines:
 ```toml
 # Configure ZeroFS to listen on all interfaces in zerofs.toml
 [servers.nfs]
-host = "0.0.0.0"  # Listen on all interfaces
-port = 2049
+addresses = ["0.0.0.0:2049"]  # Listen on all interfaces
 
 # Start ZeroFS
 # zerofs run --config zerofs.toml
@@ -177,8 +176,7 @@ nfsstat -c  # Client statistics
 ```toml
 # Configure custom port in zerofs.toml
 [servers.nfs]
-host = "127.0.0.1"
-port = 2050  # Custom port
+addresses = ["127.0.0.1:2050"]  # Custom port
 
 # Start ZeroFS
 # zerofs run --config zerofs.toml

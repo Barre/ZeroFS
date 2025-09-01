@@ -104,8 +104,7 @@ url = "$OBJECT_STORE_URL"
 encryption_password = "$ZEROFS_ENCRYPTION_PASSWORD"
 
 [servers.nfs]
-host = "$ZEROFS_NFS_HOST"
-port = $ZEROFS_NFS_HOST_PORT
+addresses = ["$ZEROFS_NFS_HOST:$ZEROFS_NFS_HOST_PORT"]
 EOF
 
 # Add AWS config if credentials are provided

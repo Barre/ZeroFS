@@ -44,8 +44,7 @@ journalctl -u zerofs -f
 # Verify bind address in config file
 # Edit zerofs.toml:
 # [servers.nfs]
-# host = "0.0.0.0"  # Listen on all interfaces
-# port = 2049
+# addresses = ["0.0.0.0:2049"]  # Listen on all interfaces
 
 # Test connectivity
 telnet 127.0.0.1 2049
@@ -222,8 +221,7 @@ zerofs change-password --config zerofs.toml
 
 # Verify NBD is configured in zerofs.toml:
 # [servers.nbd]
-# host = "127.0.0.1"
-# port = 10809
+# addresses = ["127.0.0.1:10809"]
 
 # Check if port is listening
 ss -tlnp | grep 10809

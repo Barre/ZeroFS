@@ -32,7 +32,7 @@ encryption_password = "shared-key"
 region = "us-east-1"
 
 [servers.nbd]
-port = 10809
+addresses = ["127.0.0.1:10809"]
 
 # Start: zerofs run -c zerofs-us-east.toml
 ```
@@ -51,7 +51,7 @@ encryption_password = "shared-key"
 region = "eu-west-1"
 
 [servers.nbd]
-port = 10810
+addresses = ["127.0.0.1:10810"]
 
 # Start: zerofs run -c zerofs-eu-west.toml
 ```
@@ -70,7 +70,7 @@ encryption_password = "shared-key"
 region = "ap-southeast-1"
 
 [servers.nbd]
-port = 10811
+addresses = ["127.0.0.1:10811"]
 
 # Start: zerofs run -c zerofs-asia.toml
 ```
