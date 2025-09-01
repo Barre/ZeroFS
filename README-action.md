@@ -27,6 +27,9 @@ This GitHub Action provides persistent volumes backed by S3-compatible storage f
 | `aws-secret-access-key` | AWS secret access key (for S3) | No | - |
 | `aws-region` | AWS region | No | `us-east-1` |
 | `aws-endpoint` | S3-compatible endpoint URL | No | - |
+| `aws-allow-http` | Allow HTTP connections (for MinIO, etc.) | No | `false` |
+| `azure-storage-account-name` | Azure storage account name | No | - |
+| `azure-storage-account-key` | Azure storage account key | No | - |
 | `nfs-host` | NFS server host address | No | `127.0.0.1` |
 | `nfs-port` | NFS server port | No | `2049` |
 | `zerofs-version` | ZeroFS version to use | No | `latest` |
