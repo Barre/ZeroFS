@@ -55,6 +55,14 @@ inputs:
     required: false
     default: 'false'
   
+  azure-storage-account-name:
+    description: 'Azure storage account name'
+    required: false
+  
+  azure-storage-account-key:
+    description: 'Azure storage account key'
+    required: false
+  
   nfs-host:
     description: 'NFS server host address'
     required: false
@@ -99,5 +107,7 @@ runs:
         AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
         AWS_ENDPOINT: ${{ inputs.aws-endpoint }}
         AWS_ALLOW_HTTP: ${{ inputs.aws-allow-http }}
+        AZURE_STORAGE_ACCOUNT_NAME: ${{ inputs.azure-storage-account-name }}
+        AZURE_STORAGE_ACCOUNT_KEY: ${{ inputs.azure-storage-account-key }}
         ZEROFS_NFS_HOST: ${{ inputs.nfs-host }}
         ZEROFS_NFS_HOST_PORT: ${{ inputs.nfs-port }}

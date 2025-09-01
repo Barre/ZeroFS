@@ -92,7 +92,52 @@ fi
 
 sudo mkdir -p "$MOUNT_PATH"
 
-nohup /usr/local/bin/zerofs "$OBJECT_STORE_URL" > zerofs.log 2>&1 &
+# Create ZeroFS configuration file
+cat > zerofs-action.toml << EOF
+[cache]
+dir = "$SLATEDB_CACHE_DIR"
+disk_size_gb = $SLATEDB_CACHE_SIZE_GB
+memory_size_gb = $ZEROFS_MEMORY_CACHE_SIZE_GB
+
+[storage]
+url = "$OBJECT_STORE_URL"
+encryption_password = "$ZEROFS_ENCRYPTION_PASSWORD"
+
+[servers.nfs]
+host = "$ZEROFS_NFS_HOST"
+port = $ZEROFS_NFS_HOST_PORT
+EOF
+
+# Add AWS config if credentials are provided
+if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+    cat >> zerofs-action.toml << EOF
+
+[aws]
+access_key_id = "$AWS_ACCESS_KEY_ID"
+secret_access_key = "$AWS_SECRET_ACCESS_KEY"
+default_region = "$AWS_DEFAULT_REGION"
+EOF
+    
+    # Add optional AWS settings
+    if [ -n "${AWS_ENDPOINT:-}" ]; then
+        echo "endpoint = \"$AWS_ENDPOINT\"" >> zerofs-action.toml
+    fi
+    if [ "$AWS_ALLOW_HTTP" = "true" ]; then
+        echo "allow_http = \"true\"" >> zerofs-action.toml
+    fi
+fi
+
+# Add Azure config if credentials are provided
+if [ -n "${AZURE_STORAGE_ACCOUNT_NAME:-}" ] && [ -n "${AZURE_STORAGE_ACCOUNT_KEY:-}" ]; then
+    cat >> zerofs-action.toml << EOF
+
+[azure]
+storage_account_name = "$AZURE_STORAGE_ACCOUNT_NAME"
+storage_account_key = "$AZURE_STORAGE_ACCOUNT_KEY"
+EOF
+fi
+
+nohup /usr/local/bin/zerofs run -c zerofs-action.toml > zerofs.log 2>&1 &
 ZEROFS_PID=$!
 echo $ZEROFS_PID > zerofs.pid
 
