@@ -14,7 +14,7 @@ jobs:
       
       # Setup persistent cache volume
       - name: Setup ZeroFS Cache
-        uses: Barre/ZeroFS@v1
+        uses: Barre/ZeroFS@main
         with:
           object-store-url: 's3://my-bucket/ci-cache'
           mount-path: '/mnt/cache'
