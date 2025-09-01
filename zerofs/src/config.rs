@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashSet;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -49,19 +50,15 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NfsConfig {
-    #[serde(default = "default_host")]
-    pub host: IpAddr,
-    #[serde(default = "default_nfs_port")]
-    pub port: u32,
+    #[serde(default = "default_nfs_addresses")]
+    pub addresses: HashSet<SocketAddr>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NinePConfig {
-    #[serde(default = "default_host")]
-    pub host: IpAddr,
-    #[serde(default = "default_9p_port")]
-    pub port: u16,
+    #[serde(default = "default_9p_addresses")]
+    pub addresses: HashSet<SocketAddr>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
@@ -73,10 +70,8 @@ pub struct NinePConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NbdConfig {
-    #[serde(default = "default_host")]
-    pub host: IpAddr,
-    #[serde(default = "default_nbd_port")]
-    pub port: u16,
+    #[serde(default = "default_nbd_addresses")]
+    pub addresses: HashSet<SocketAddr>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
@@ -109,20 +104,31 @@ impl<'de> Deserialize<'de> for AzureConfig {
     }
 }
 
-const fn default_host() -> IpAddr {
-    IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+fn default_nfs_addresses() -> HashSet<SocketAddr> {
+    let mut set = HashSet::new();
+    set.insert(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        2049,
+    ));
+    set
 }
 
-const fn default_nfs_port() -> u32 {
-    2049
+fn default_9p_addresses() -> HashSet<SocketAddr> {
+    let mut set = HashSet::new();
+    set.insert(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        5564,
+    ));
+    set
 }
 
-const fn default_9p_port() -> u16 {
-    5564
-}
-
-const fn default_nbd_port() -> u16 {
-    10809
+fn default_nbd_addresses() -> HashSet<SocketAddr> {
+    let mut set = HashSet::new();
+    set.insert(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        10809,
+    ));
+    set
 }
 
 fn deserialize_expandable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -232,17 +238,14 @@ impl Settings {
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
-                    host: default_host(),
-                    port: default_nfs_port(),
+                    addresses: default_nfs_addresses(),
                 }),
                 ninep: Some(NinePConfig {
-                    host: default_host(),
-                    port: default_9p_port(),
+                    addresses: default_9p_addresses(),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
                 }),
                 nbd: Some(NbdConfig {
-                    host: default_host(),
-                    port: default_nbd_port(),
+                    addresses: default_nbd_addresses(),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
                 }),
             },
@@ -293,6 +296,13 @@ impl Settings {
              # - To disable a server, remove or comment out its entire section\n\
              # - Unix sockets are optional for 9P and NBD servers\n\
              # - NFS only supports TCP connections\n\
+             # - Each protocol supports multiple bind addresses\n\
+             # \n\
+             # Examples:\n\
+             #   addresses = [\"127.0.0.1:2049\"]                  # IPv4 localhost only\n\
+             #   addresses = [\"0.0.0.0:2049\"]                    # All IPv4 interfaces\n\
+             #   addresses = [\"[::]:2049\"]                       # All IPv6 interfaces\n\
+             #   addresses = [\"127.0.0.1:2049\", \"[::1]:2049\"]  # Both IPv4 and IPv6 localhost\n\
              #\n\
              # ============================================================================\n\
              # CLOUD STORAGE\n\

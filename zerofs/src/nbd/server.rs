@@ -13,6 +13,7 @@ use crate::fs::types::AuthContext;
 use crate::fs::{EncodedFileId, ZeroFS};
 use bytes::BytesMut;
 use deku::prelude::*;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
@@ -25,7 +26,7 @@ pub struct NBDDevice {
 }
 
 pub enum Transport {
-    Tcp { host: String, port: u16 },
+    Tcp(SocketAddr),
     Unix(String),
 }
 
@@ -35,10 +36,10 @@ pub struct NBDServer {
 }
 
 impl NBDServer {
-    pub fn new_tcp(filesystem: Arc<ZeroFS>, host: String, port: u16) -> Self {
+    pub fn new_tcp(filesystem: Arc<ZeroFS>, socket: SocketAddr) -> Self {
         Self {
             filesystem,
-            transport: Transport::Tcp { host, port },
+            transport: Transport::Tcp(socket),
         }
     }
 
@@ -51,9 +52,9 @@ impl NBDServer {
 
     pub async fn start(&self) -> std::io::Result<()> {
         match &self.transport {
-            Transport::Tcp { host, port } => {
-                let listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
-                info!("NBD server listening on {}:{}", host, port);
+            Transport::Tcp(socket) => {
+                let listener = TcpListener::bind(socket).await?;
+                info!("NBD server listening on {}", socket);
 
                 loop {
                     let (stream, addr) = listener.accept().await?;

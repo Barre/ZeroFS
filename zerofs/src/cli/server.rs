@@ -11,20 +11,29 @@ use tracing::info;
 use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
 use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
-async fn start_nfs_server(
+async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NfsConfig>,
-) -> Option<JoinHandle<Result<(), std::io::Error>>> {
-    let config = config?;
-    let host = config.host.to_string();
-    let port = config.port;
+) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
+    let config = match config {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let mut handles = Vec::new();
 
-    Some(tokio::spawn(async move {
-        match crate::nfs::start_nfs_server_with_config((*fs).clone(), &host, port).await {
-            Ok(()) => Ok(()),
-            Err(e) => Err(std::io::Error::other(e.to_string())),
-        }
-    }))
+    for addr in &config.addresses {
+        info!("Starting NFS server on {}", addr);
+        let fs_clone = Arc::clone(&fs);
+        let addr = *addr;
+        handles.push(tokio::spawn(async move {
+            match crate::nfs::start_nfs_server_with_config((*fs_clone).clone(), addr).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(std::io::Error::other(e.to_string())),
+            }
+        }));
+    }
+
+    handles
 }
 
 async fn start_ninep_servers(
@@ -37,18 +46,11 @@ async fn start_ninep_servers(
     };
     let mut handles = Vec::new();
 
-    let host = config.host.to_string();
-    let port = config.port;
-    let ninep_addr = format!("{host}:{port}").parse().unwrap_or_else(|e| {
-        eprintln!(
-            "Error: Invalid 9P server address '{}:{}': {}",
-            host, port, e
-        );
-        std::process::exit(1);
-    });
-
-    let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), ninep_addr);
-    handles.push(tokio::spawn(async move { ninep_tcp_server.start().await }));
+    for addr in &config.addresses {
+        info!("Starting 9P server on {}", addr);
+        let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
+        handles.push(tokio::spawn(async move { ninep_tcp_server.start().await }));
+    }
 
     if let Some(socket_path) = config.unix_socket.as_ref() {
         info!(
@@ -102,21 +104,20 @@ async fn start_nbd_servers(
     };
     let mut handles = Vec::new();
 
-    let host = config.host.to_string();
-    let port = config.port;
-
-    info!(
-        "Starting NBD server on {}:{} (devices dynamically discovered from .nbd/)",
-        host, port
-    );
-    let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), host, port);
-    handles.push(tokio::spawn(async move {
-        if let Err(e) = nbd_tcp_server.start().await {
-            Err(e)
-        } else {
-            Ok(())
-        }
-    }));
+    for addr in &config.addresses {
+        info!(
+            "Starting NBD server on {} (devices dynamically discovered from .nbd/)",
+            addr
+        );
+        let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = nbd_tcp_server.start().await {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        }));
+    }
 
     if let Some(socket_path) = config.unix_socket.as_ref() {
         info!(
@@ -253,7 +254,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         ensure_nbd_directory(&fs).await?;
     }
 
-    let nfs_handle = start_nfs_server(Arc::clone(&fs), settings.servers.nfs.as_ref()).await;
+    let nfs_handles = start_nfs_servers(Arc::clone(&fs), settings.servers.nfs.as_ref()).await;
 
     let ninep_handles =
         start_ninep_servers(Arc::clone(&fs), settings.servers.ninep.as_ref()).await?;
@@ -266,9 +267,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut server_handles = Vec::new();
-    if let Some(handle) = nfs_handle {
-        server_handles.push(handle);
-    }
+    server_handles.extend(nfs_handles);
     server_handles.extend(ninep_handles);
     server_handles.extend(nbd_handles);
 

@@ -5,6 +5,7 @@ use crate::fs::permissions::Credentials;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use crate::fs::{EncodedFileId, ZeroFS};
 use async_trait::async_trait;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
@@ -464,12 +465,11 @@ impl NFSFileSystem for ZeroFS {
 
 pub async fn start_nfs_server_with_config(
     filesystem: ZeroFS,
-    host: &str,
-    port: u32,
+    socket: SocketAddr,
 ) -> anyhow::Result<()> {
-    let listener = NFSTcpListener::bind(&format!("{host}:{port}"), filesystem).await?;
+    let listener = NFSTcpListener::bind(socket, filesystem).await?;
 
-    info!("NFS server listening on {}:{}", host, port);
+    info!("NFS server listening on {}", socket);
 
     listener.handle_forever().await?;
     Ok(())
