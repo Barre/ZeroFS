@@ -209,6 +209,8 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
         cache_config.root_folder
     );
 
+    crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path).await?;
+
     let password = settings.storage.encryption_password.clone();
 
     super::password::validate_password(&password)

@@ -11,6 +11,7 @@ mod key_management;
 mod nbd;
 mod nfs;
 mod ninep;
+mod storage_compatibility;
 
 #[cfg(test)]
 mod test_helpers;
