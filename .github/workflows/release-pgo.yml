@@ -89,7 +89,7 @@ jobs:
           [cache]
           dir = "/tmp/zerofs-cache"
           disk_size_gb = 5.0
-          memory_size_gb = 10.0
+          memory_size_gb = 2.0
 
           [storage]
           url = "s3://pgo-profile/test"
@@ -138,7 +138,7 @@ jobs:
           [cache]
           dir = "/tmp/zerofs-cache"
           disk_size_gb = 5.0
-          memory_size_gb = 10.0
+          memory_size_gb = 2.0
 
           [storage]
           url = "s3://pgo-zfs-test/zfs-test"
@@ -190,7 +190,7 @@ jobs:
           [cache]
           dir = "/tmp/zerofs-cache"
           disk_size_gb = 5.0
-          memory_size_gb = 10.0
+          memory_size_gb = 2.0
 
           [storage]
           url = "s3://pgo-nfs-test/test"
