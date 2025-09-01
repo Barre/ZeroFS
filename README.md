@@ -163,17 +163,14 @@ url = "s3://my-bucket/zerofs-data"
 encryption_password = "${ZEROFS_PASSWORD}"
 
 [servers.nfs]
-host = "127.0.0.1"
-port = 2049
+addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
 
 [servers.ninep]
-host = "127.0.0.1"  
-port = 5564
+addresses = ["127.0.0.1:5564"]
 unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 
 [servers.nbd]
-host = "127.0.0.1"
-port = 10809
+addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
 [aws]
@@ -238,17 +235,16 @@ You can enable or disable individual servers by including or commenting out thei
 ```toml
 # To disable a server, comment out or remove its entire section
 [servers.nfs]
-host = "0.0.0.0"  # Bind to all interfaces
-port = 2049
+addresses = ["0.0.0.0:2049"]  # Bind to all IPv4 interfaces
+# addresses = ["[::]:2049"]  # Bind to all IPv6 interfaces
+# addresses = ["127.0.0.1:2049", "[::1]:2049"]  # Dual-stack localhost
 
 [servers.ninep]
-host = "127.0.0.1"
-port = 5564
+addresses = ["127.0.0.1:5564"]
 unix_socket = "/tmp/zerofs.9p.sock"  # Optional: adds Unix socket support
 
 [servers.nbd]
-host = "127.0.0.1"
-port = 10809
+addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
 ```
 
@@ -338,8 +334,7 @@ In addition to file-level access, ZeroFS provides raw block devices through NBD 
 ```bash
 # Configure NBD in zerofs.toml
 # [servers.nbd]
-# host = "127.0.0.1"
-# port = 10809
+# addresses = ["127.0.0.1:10809"]
 # unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
 # Start ZeroFS
@@ -420,7 +415,7 @@ Since ZeroFS makes S3 regions look like local block devices, you can create glob
 # url = "s3://my-bucket/us-east-db"
 # encryption_password = "${SHARED_KEY}"
 # [servers.nbd]
-# host = "0.0.0.0"
+# addresses = ["0.0.0.0:10809"]
 # [aws]
 # default_region = "us-east-1"
 

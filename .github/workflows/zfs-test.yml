@@ -67,12 +67,10 @@ jobs:
           encryption_password = "test-password-123"
 
           [servers.ninep]
-          host = "127.0.0.1"
-          port = 5564
+          addresses = ["127.0.0.1:5564"]
 
           [servers.nbd]
-          host = "127.0.0.1"
-          port = 10809
+          addresses = ["127.0.0.1:10809"]
 
           [aws]
           access_key_id = "minioadmin"

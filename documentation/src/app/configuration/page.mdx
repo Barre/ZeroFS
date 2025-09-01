@@ -84,16 +84,14 @@ encryption_password = "secure-password-here"
 
 ```toml
 [servers.nfs]
-host = "0.0.0.0"     # Bind address (default: 127.0.0.1)
-port = 2049          # Port (default: 2049)
+addresses = ["0.0.0.0:2049"]  # Bind addresses (default: ["127.0.0.1:2049"])
 ```
 
 ### 9P Server
 
 ```toml
 [servers.ninep]
-host = "0.0.0.0"     # Bind address (default: 127.0.0.1)
-port = 5564          # Port (default: 5564)
+addresses = ["0.0.0.0:5564"]  # Bind addresses (default: ["127.0.0.1:5564"])
 socket = "/tmp/zerofs.sock"  # Unix socket path (optional)
 ```
 
@@ -101,8 +99,7 @@ socket = "/tmp/zerofs.sock"  # Unix socket path (optional)
 
 ```toml
 [servers.nbd]
-host = "0.0.0.0"     # Bind address (default: 127.0.0.1)
-port = 10809         # Port (default: 10809)
+addresses = ["0.0.0.0:10809"]  # Bind addresses (default: ["127.0.0.1:10809"])
 socket = "/tmp/zerofs-nbd.sock"  # Unix socket path (optional)
 ```
 
@@ -125,8 +122,7 @@ access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 [servers.nfs]
-host = "0.0.0.0"
-port = 2049
+addresses = ["0.0.0.0:2049"]
 ```
 
 ### High-Performance Configuration
@@ -148,12 +144,10 @@ secret_access_key = "your-secret"
 region = "us-east-1"
 
 [servers.nfs]
-host = "0.0.0.0"
-port = 2049
+addresses = ["0.0.0.0:2049"]
 
 [servers.nbd]
-host = "0.0.0.0"
-port = 10809
+addresses = ["0.0.0.0:10809"]
 socket = "/tmp/zerofs-nbd.sock"  # Unix socket for better local performance
 ```
 
@@ -294,8 +288,7 @@ access_key_id = "\${AWS_ACCESS_KEY_ID}"
 secret_access_key = "\${AWS_SECRET_ACCESS_KEY}"
 
 [servers.nfs]
-host = "0.0.0.0"
-port = 2049
+addresses = ["0.0.0.0:2049"]
 EOF
 
 # Run container

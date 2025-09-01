@@ -26,8 +26,7 @@ Configure NBD support in your ZeroFS configuration file:
 ```toml
 # TCP mode (default port 10809)
 [servers.nbd]
-host = "127.0.0.1"
-port = 10809
+addresses = ["127.0.0.1:10809"]
 
 # Unix socket mode (better performance for local access)
 [servers.nbd]
@@ -35,8 +34,7 @@ socket = "/tmp/zerofs-nbd.sock"
 
 # Both TCP and Unix socket
 [servers.nbd]
-host = "127.0.0.1"
-port = 10809
+addresses = ["127.0.0.1:10809"]
 socket = "/tmp/zerofs-nbd.sock"
 ```
 
@@ -46,8 +44,7 @@ zerofs run --config zerofs.toml
 ```
 
 Configuration options:
-- `host` - Bind address for NBD TCP server (default: 127.0.0.1)
-- `port` - Port for NBD server (default: 10809)
+- `addresses` - Array of bind addresses for NBD TCP server (default: ["127.0.0.1:10809"])
 - `socket` - Unix socket path for NBD (optional)
 
 ## Device Management
@@ -198,8 +195,7 @@ encryption_password = "shared-key"
 region = "us-east-1"
 
 [servers.nbd]
-host = "0.0.0.0"
-port = 10809
+addresses = ["0.0.0.0:10809"]
 
 # Start: zerofs run -c zerofs-us-east.toml
 ```
@@ -215,8 +211,7 @@ encryption_password = "shared-key"
 region = "eu-west-1"
 
 [servers.nbd]
-host = "0.0.0.0"
-port = 10809
+addresses = ["0.0.0.0:10809"]
 
 # Start: zerofs run -c zerofs-eu-west.toml
 ```

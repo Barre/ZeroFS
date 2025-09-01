@@ -70,8 +70,7 @@ jobs:
           encryption_password = "test-password-123"
 
           [servers.nfs]
-          host = "127.0.0.1"
-          port = 2049
+          addresses = ["127.0.0.1:2049"]
 
           [aws]
           access_key_id = "minioadmin"
@@ -200,8 +199,7 @@ jobs:
           encryption_password = "test-password-123"
 
           [servers.ninep]
-          host = "127.0.0.1"
-          port = 5564
+          addresses = ["127.0.0.1:5564"]
 
           [aws]
           access_key_id = "minioadmin"

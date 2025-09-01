@@ -93,8 +93,7 @@ secret_access_key = "your-secret-key"
 region = "us-east-1"
 
 [servers.nfs]
-host = "127.0.0.1"
-port = 2049
+addresses = ["127.0.0.1:2049"]
 ```
 
 ```toml {{ title: 'Azure Configuration' }}
@@ -112,8 +111,7 @@ storage_account_name = "your-account"
 storage_account_key = "your-key"
 
 [servers.nfs]
-host = "127.0.0.1"
-port = 2049
+addresses = ["127.0.0.1:2049"]
 ```
 
 ```toml {{ title: 'Local Testing' }}
@@ -127,12 +125,10 @@ url = "file:///tmp/zerofs-test"
 encryption_password = "your-secure-password"
 
 [servers.nfs]
-host = "127.0.0.1"
-port = 2049
+addresses = ["127.0.0.1:2049"]
 
 [servers.ninep]
-host = "127.0.0.1"
-port = 5564
+addresses = ["127.0.0.1:5564"]
 ```
 
 ```toml {{ title: 'MinIO/S3-Compatible' }}
@@ -152,8 +148,7 @@ endpoint = "https://minio.example.com"
 allow_http = true    # For HTTP endpoints
 
 [servers.nfs]
-host = "127.0.0.1"
-port = 2049
+addresses = ["127.0.0.1:2049"]
 ```
 
 </CodeGroup>
@@ -195,8 +190,7 @@ zerofs run -c zerofs.toml
 # Add NBD configuration to your TOML file
 cat >> zerofs.toml <<EOF
 [servers.nbd]
-host = "127.0.0.1"
-port = 10809
+addresses = ["127.0.0.1:10809"]
 EOF
 
 # Start ZeroFS
@@ -223,8 +217,7 @@ access_key_id = "\${AWS_ACCESS_KEY_ID}"
 secret_access_key = "\${AWS_SECRET_ACCESS_KEY}"
 
 [servers.nfs]
-host = "0.0.0.0"
-port = 2049
+addresses = ["0.0.0.0:2049"]
 EOF
 
 # Run with Docker
@@ -265,8 +258,7 @@ sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:
 ```bash {{ title: 'Linux (9P)' }}
 # Make sure 9P is configured in your TOML file:
 # [servers.ninep]
-# host = "127.0.0.1"
-# port = 5564
+# addresses = ["127.0.0.1:5564"]
 
 # Create mount point
 sudo mkdir -p /mnt/9p
@@ -296,8 +288,7 @@ If you enabled NBD support, you can create and access block devices dynamically:
 ```bash {{ title: 'Create & Connect NBD Device' }}
 # First, ensure NBD is configured in your TOML:
 # [servers.nbd]
-# host = "127.0.0.1"
-# port = 10809
+# addresses = ["127.0.0.1:10809"]
 
 # Mount the filesystem (if not already mounted)
 sudo mount -t nfs -o vers=3,async,nolock 127.0.0.1:/ /mnt/zerofs
