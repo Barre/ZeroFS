@@ -181,28 +181,11 @@ zerofs run --config /path/to/zerofs.toml
 zerofs run -c zerofs.toml
 ```
 
-### Invalid TOML Syntax
-
-```bash
-# Error: Failed to parse config file
-# Solution: Check TOML syntax
-
-# Validate TOML syntax
-cat zerofs.toml | python -m toml
-
-# Common issues:
-# - Missing quotes around strings
-# - Invalid indentation
-# - Missing section headers [section]
-# - Duplicate keys
-```
-
 ## Encryption Issues
 
 ### Password Problems
 
 ```toml
-# Error: Failed to decrypt
 # Wrong password or corrupted data
 
 # Verify password in config file:
