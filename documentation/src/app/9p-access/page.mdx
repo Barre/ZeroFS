@@ -28,7 +28,7 @@ lsmod | grep 9p
 
 ### Mounting ZeroFS
 
-#### TCP Mount (default)
+### TCP Mount (default)
 
 ```bash
 # Create mount point
@@ -38,7 +38,9 @@ sudo mkdir -p /mnt/zerofs-9p
 sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs-9p
 ```
 
-#### Unix Socket Mount (lower latency)
+
+### Unix Socket Mount (lower latency)
+
 
 For improved performance when mounting locally, you can use Unix domain sockets:
 
@@ -194,33 +196,6 @@ for mode in none mmap loose; do
     # Run your benchmark
 done
 ```
-
-## 9P vs NFS Comparison
-
-### When to Use 9P
-
-- Linux-only environments
-- Need maximum performance on Linux
-- Simpler protocol overhead is beneficial
-- Applications requiring correct fsync behavior (databases, transactional systems)
-
-### When to Use NFS
-
-- Cross-platform compatibility needed
-- macOS or Windows clients
-- Need automatic reconnection on network issues
-- Existing NFS infrastructure and tooling
-
-### Performance Characteristics
-
-| Aspect | 9P | NFS |
-|--------|----|----|
-| Protocol Overhead | Lower | Higher |
-| Linux Performance | Better | Good |
-| Cross-Platform | Linux only | Universal |
-| fsync Behavior | Correct | Limited* |
-
-*NFS COMMIT semantics may not provide expected durability guarantees for fsync operations
 
 ## Security Considerations
 

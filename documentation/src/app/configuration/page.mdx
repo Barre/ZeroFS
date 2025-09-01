@@ -13,7 +13,7 @@ ZeroFS uses TOML configuration files for all settings. This guide covers all ava
 Create a configuration file using the `init` command:
 
 ```bash
-zerofs init --config zerofs.toml
+zerofs init
 ```
 
 This creates a template configuration file that you can customize.
@@ -177,20 +177,20 @@ endpoint = "https://minio.example.com"
 allow_http = true  # Set to true if using HTTP
 ```
 
-```toml {{ title: 'Wasabi' }}
+```toml {{ title: 'Cloudflare R2' }}
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 10.0
 
 [storage]
-url = "s3://wasabi-bucket/path"
+url = "s3://r2-bucket/path"
 encryption_password = "secure-password"
 
 [aws]
-access_key_id = "your-wasabi-key"
-secret_access_key = "your-wasabi-secret"
-endpoint = "https://s3.wasabisys.com"
-region = "us-east-1"
+access_key_id = "your-r2-access-key"
+secret_access_key = "your-r2-secret-key"
+endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+region = "auto"  # R2 uses "auto" for region
 ```
 
 </CodeGroup>
@@ -334,24 +334,6 @@ export RUST_LOG='zerofs=debug'
 
 # Run with custom logging
 RUST_LOG=zerofs=debug zerofs run -c zerofs.toml
-```
-
-## Validation
-
-After creating your configuration, verify it:
-
-```bash
-# Initialize a template config
-zerofs init --config test.toml
-
-# Test the configuration
-zerofs run --config test.toml
-
-# Check connectivity (for S3)
-aws s3 ls s3://your-bucket/
-
-# Verify cache directory
-df -h /var/cache/zerofs
 ```
 
 ---
