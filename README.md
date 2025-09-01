@@ -103,95 +103,149 @@ graph TB
     NBD --> NBDD
 ```
 
+## Quick Start
+
+```bash
+# Install ZeroFS
+cargo install zerofs
+
+# Generate a configuration file
+zerofs init
+
+# Edit the configuration with your S3 credentials
+$EDITOR zerofs.toml
+
+# Run ZeroFS
+zerofs run -c zerofs.toml
+```
+
 ## Configuration
 
-ZeroFS supports multiple access modes to the same S3-backed storage:
+ZeroFS uses a TOML configuration file that supports environment variable substitution. This makes it easy to manage secrets and customize paths.
 
-- **NFS Mode** - Traditional file-level access for general filesystem use
-- **9P Mode** - High-performance file-level access with better POSIX FSYNC semantics
-- **NBD Mode** - Block-level access for ZFS pools, databases, and raw storage applications
+### Creating a Configuration
 
-All modes share the same encrypted, compressed, cached storage backend.
-
-You can also use ZeroFS with any supported object store backend by [object_store](https://crates.io/crates/object_store) crate.
-
-You need to pass a URL as the argument to configure your backend, for example:
+Generate a default configuration file:
 ```bash
-zerofs s3://bucket/path
+zerofs init  # Creates zerofs.toml
 ```
 
-Would use Amazon S3 backend for `slatedb` bucket. See [`object_store`'s documentation](https://docs.rs/object_store/0.12.3/object_store/enum.ObjectStoreScheme.html#supported-formats) for all supported formats.
+The configuration file has sections for:
+- **Cache** - Local cache settings for performance
+- **Storage** - S3/Azure/local backend configuration and encryption
+- **Servers** - Enable/disable NFS, 9P, and NBD servers
+- **Cloud credentials** - AWS or Azure authentication
 
-### Required Environment Variables
+### Example Configuration
 
-- `SLATEDB_CACHE_DIR`: Directory path for SlateDB disk cache (required)
-- `SLATEDB_CACHE_SIZE_GB`: SlateDB disk cache size in gigabytes (required, must be a positive number)
-- `ZEROFS_ENCRYPTION_PASSWORD`: Password for filesystem encryption (required)
+```toml
+[cache]
+dir = "${HOME}/.cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 1.0  # Optional, defaults to 0.25
 
-### Optional Environment Variables
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "${ZEROFS_PASSWORD}"
 
-You can configure your object store with optional set of environment variables depending on your backing implementation.
+[servers.nfs]
+host = "127.0.0.1"
+port = 2049
 
-#### Amazon S3 Backend
+[servers.ninep]
+host = "127.0.0.1"  
+port = 5564
+unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 
-For Amazon S3 or S3-compatible backends, use the `s3://` URL scheme:
+[servers.nbd]
+host = "127.0.0.1"
+port = 10809
+unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
-```bash
-zerofs s3://bucket/path
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+# endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
+# default_region = "us-east-1"
+# allow_http = "true"  # For non-HTTPS endpoints
+
+# [azure]
+# storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
+# storage_account_key = "${AZURE_STORAGE_ACCOUNT_KEY}"
 ```
 
-Required environment variables:
-- `AWS_ACCESS_KEY_ID`: AWS access key ID
-- `AWS_SECRET_ACCESS_KEY`: AWS secret access key
+### Environment Variable Substitution
 
-Optional environment variables:
-- `AWS_ENDPOINT`: S3-compatible endpoint URL (for non-AWS S3 services)
-- `AWS_DEFAULT_REGION`: AWS region (default: `"us-east-1"`)
-- `AWS_ALLOW_HTTP`: Allow HTTP connections (default: `"false"`)
+The configuration supports `${VAR}` syntax for environment variables. This is useful for:
+- Keeping secrets out of configuration files
+- Using different settings per environment
+- Sharing configurations across systems
 
-#### Microsoft Azure Backend
+All referenced environment variables must be set when running ZeroFS.
 
-For Microsoft Azure Storage, use the `azure://` URL scheme:
+### Storage Backends
 
-```bash
-zerofs azure://bucket/path
+ZeroFS supports multiple storage backends through the `url` field in `[storage]`:
+
+#### Amazon S3
+```toml
+[storage]
+url = "s3://my-bucket/path"
+
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+# endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
+# default_region = "us-east-1"
+# allow_http = "true"  # For non-HTTPS endpoints (e.g., MinIO)
 ```
 
-Required environment variables:
-- `AZURE_STORAGE_ACCOUNT_NAME`: Your Azure storage account name
-- `AZURE_STORAGE_ACCOUNT_KEY`: Your Azure storage account key
+#### Microsoft Azure
+```toml
+[storage]
+url = "azure://container/path"
 
-#### Local Filesystem Backend
-
-For local filesystem storage, use the `file://` URL scheme:
-
-```bash
-zerofs file:///path/to/storage
+[azure]
+storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
+storage_account_key = "${AZURE_STORAGE_ACCOUNT_KEY}"
 ```
 
-No additional environment variables are required for local storage.
+#### Local Filesystem
+```toml
+[storage]
+url = "file:///path/to/storage"
+# No additional configuration needed
+```
 
-#### ZeroFS-specific Configuration
+### Server Configuration
 
-- `ZEROFS_NFS_HOST`: Address (IP or hostname) to bind the NFS TCP socket (default: `"127.0.0.1"`)
-- `ZEROFS_NFS_HOST_PORT`: Port to bind the NFS TCP socket (default: `2049`)
-- `ZEROFS_9P_HOST`: Address (IP or hostname) to bind the 9P TCP socket (default: `"127.0.0.1"`)
-- `ZEROFS_9P_PORT`: Port to bind the 9P TCP socket (default: `5564`)
-- `ZEROFS_9P_SOCKET`: Path for 9P Unix domain socket (optional, enables Unix socket server in addition to TCP)
-- `ZEROFS_NBD_HOST`: Address (IP or hostname) to bind the NBD TCP socket (default: `"127.0.0.1"`)
-- `ZEROFS_NBD_PORT`: Port for NBD server (default: `10809`)
-- `ZEROFS_NBD_SOCKET`: Unix socket path for NBD (optional, can be used alongside TCP)
-- `ZEROFS_MEMORY_CACHE_SIZE_GB`: Size of ZeroFS in-memory cache in GB (optional, default: 0.25GB)
+You can enable or disable individual servers by including or commenting out their sections:
 
-See [Available `ObjectStore` Implementations](https://docs.rs/object_store/0.12.3/object_store/index.html#available-objectstore-implementations) for other environment variables.
+```toml
+# To disable a server, comment out or remove its entire section
+[servers.nfs]
+host = "0.0.0.0"  # Bind to all interfaces
+port = 2049
+
+[servers.ninep]
+host = "127.0.0.1"
+port = 5564
+unix_socket = "/tmp/zerofs.9p.sock"  # Optional: adds Unix socket support
+
+[servers.nbd]
+host = "127.0.0.1"
+port = 10809
+unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
+```
 
 ### Encryption
 
-Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with lz4 compression. A password is required to start the filesystem:
+Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
 
-```bash
-# Start ZeroFS with encryption password
-ZEROFS_ENCRYPTION_PASSWORD='your-secure-password' zerofs s3://bucket/path
+```toml
+[storage]
+url = "s3://my-bucket/data"
+encryption_password = "${ZEROFS_PASSWORD}"  # Or use a literal password (not recommended)
 ```
 
 #### Password Management
@@ -201,13 +255,14 @@ On first run, ZeroFS generates a 256-bit data encryption key (DEK) and encrypts 
 To change your password:
 
 ```bash
-# Change the encryption password
-ZEROFS_ENCRYPTION_PASSWORD='current-password' \
-ZEROFS_NEW_PASSWORD='new-password' \
-zerofs s3://bucket/path
+# Change the encryption password (reads new password from stdin)
+echo "new-secure-password" | zerofs change-password -c zerofs.toml
+
+# Or read from a file
+zerofs change-password -c zerofs.toml < new-password.txt
 ```
 
-The program will change the password and exit. Then you can use the new password for future runs.
+After changing the password, update your configuration file or environment variable to use the new password for future runs.
 
 #### What's Encrypted vs What's Not
 
@@ -240,11 +295,12 @@ mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,acc
 For improved performance when mounting locally, you can use Unix domain sockets which eliminate TCP/IP stack overhead:
 
 ```bash
-# Start ZeroFS with Unix socket support
-ZEROFS_9P_SOCKET=/tmp/zerofs.sock zerofs s3://bucket/path
+# Configure Unix socket in zerofs.toml
+# [servers.ninep]
+# unix_socket = "/tmp/zerofs.9p.sock"
 
 # Mount using Unix socket
-mount -t 9p -o trans=unix,version=9p2000.L,msize=1048576,cache=mmap,access=user /tmp/zerofs.sock /mnt/9p
+mount -t 9p -o trans=unix,version=9p2000.L,msize=1048576,cache=mmap,access=user /tmp/zerofs.9p.sock /mnt/9p
 ```
 
 Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.
@@ -263,14 +319,17 @@ mount -t nfs -o async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport
 
 ## NBD Configuration and Usage
 
-In addition to NFS, ZeroFS can provide raw block devices through NBD with full TRIM/discard support:
+In addition to file-level access, ZeroFS provides raw block devices through NBD with full TRIM/discard support:
 
 ```bash
-# Start ZeroFS with NBD support (TCP, Unix socket, or both)
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_PORT='10809' \
-ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock' \
-zerofs s3://bucket/path
+# Configure NBD in zerofs.toml
+# [servers.nbd]
+# host = "127.0.0.1"
+# port = 10809
+# unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
+
+# Start ZeroFS
+zerofs run -c zerofs.toml
 
 # Mount ZeroFS via NFS or 9P to manage devices
 mount -t nfs 127.0.0.1:/ /mnt/zerofs
@@ -288,7 +347,7 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1 -persist -timeout 600 -connectio
 nbd-client 127.0.0.1 10809 /dev/nbd1 -N device2 -persist -timeout 600 -connections 4
 
 # Or connect via Unix socket (better local performance)
-nbd-client -unix /tmp/zerofs-nbd.sock /dev/nbd2 -N device3 -persist -timeout 600 -connections 4
+nbd-client -unix /tmp/zerofs.nbd.sock /dev/nbd2 -N device3 -persist -timeout 600 -connections 4
 
 # Use the block devices
 mkfs.ext4 /dev/nbd0
@@ -342,10 +401,16 @@ Since ZeroFS makes S3 regions look like local block devices, you can create glob
 
 ```bash
 # Machine 1 - US East (10.0.1.5)
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=us-east-1 \
-ZEROFS_NBD_HOST='0.0.0.0' \
-zerofs s3://my-bucket/us-east-db
+# zerofs-us-east.toml:
+# [storage]
+# url = "s3://my-bucket/us-east-db"
+# encryption_password = "${SHARED_KEY}"
+# [servers.nbd]
+# host = "0.0.0.0"
+# [aws]
+# default_region = "us-east-1"
+
+zerofs run -c zerofs-us-east.toml
 
 # Create device via mount (from same or another machine)
 mount -t nfs 10.0.1.5:/ /mnt/zerofs
@@ -353,16 +418,12 @@ truncate -s 100G /mnt/zerofs/.nbd/storage
 umount /mnt/zerofs
 
 # Machine 2 - EU West (10.0.2.5)
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=eu-west-1 \
-ZEROFS_NBD_HOST='0.0.0.0' \
-zerofs s3://my-bucket/eu-west-db
+# Similar config with url = "s3://my-bucket/eu-west-db" and default_region = "eu-west-1"
+zerofs run -c zerofs-eu-west.toml
 
 # Machine 3 - Asia Pacific (10.0.3.5)
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=ap-southeast-1 \
-ZEROFS_NBD_HOST='0.0.0.0' \
-zerofs s3://my-bucket/asia-db
+# Similar config with url = "s3://my-bucket/asia-db" and default_region = "ap-southeast-1"
+zerofs run -c zerofs-asia.toml
 
 # From a client machine, connect to all three NBD devices with optimal settings
 nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist -timeout 600 -connections 8
