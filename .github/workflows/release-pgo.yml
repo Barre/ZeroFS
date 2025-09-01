@@ -93,7 +93,7 @@ jobs:
 
           [storage]
           url = "s3://pgo-profile/test"
-          encryption_password = "secret"
+          encryption_password = "test-password-123"
 
           [servers.ninep]
           host = "127.0.0.1"
@@ -142,7 +142,7 @@ jobs:
 
           [storage]
           url = "s3://pgo-zfs-test/zfs-test"
-          encryption_password = "secret"
+          encryption_password = "test-password-123"
 
           [servers.ninep]
           host = "127.0.0.1"
@@ -194,7 +194,7 @@ jobs:
 
           [storage]
           url = "s3://pgo-nfs-test/test"
-          encryption_password = "secret"
+          encryption_password = "test-password-123"
 
           [servers.nfs]
           host = "127.0.0.1"

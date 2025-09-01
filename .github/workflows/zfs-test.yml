@@ -64,7 +64,7 @@ jobs:
 
           [storage]
           url = "s3://zerofs-zfs-test/zfs-test"
-          encryption_password = "secret"
+          encryption_password = "test-password-123"
 
           [servers.ninep]
           host = "127.0.0.1"
