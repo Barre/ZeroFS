@@ -1,111 +1,210 @@
 export const metadata = {
   title: 'Configuration Guide',
   description:
-    'Complete guide to configuring ZeroFS, including environment variables, storage backends, and network settings.',
+    'Complete guide to configuring ZeroFS using TOML configuration files, including storage backends and network settings.',
 }
 
 # Configuration Guide
 
-ZeroFS uses environment variables for all configuration. This guide covers all available settings to help you configure ZeroFS for your specific use case. {{ className: 'lead' }}
+ZeroFS uses TOML configuration files for all settings. This guide covers all available configuration options to help you configure ZeroFS for your specific use case. {{ className: 'lead' }}
 
-## Required Configuration
+## Getting Started
 
-These environment variables must be set for ZeroFS to start:
+Create a configuration file using the `init` command:
 
 ```bash
-# Required: Local directory for caching data
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-
-# Required: Maximum cache size in GB
-export SLATEDB_CACHE_SIZE_GB='10'
-
-# Required: Password for data encryption
-export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'
+zerofs init --config zerofs.toml
 ```
 
-## Storage Backend Configuration
+This creates a template configuration file that you can customize.
 
-### AWS S3 Backend
+## Configuration File Structure
 
-For S3 and S3-compatible services:
+### Basic Configuration
 
-```bash
-# Required for S3
-export AWS_ACCESS_KEY_ID='your-access-key'
-export AWS_SECRET_ACCESS_KEY='your-secret-key'
+```toml
+# Cache configuration (required)
+[cache]
+dir = "/var/cache/zerofs"        # Directory for caching data
+disk_size_gb = 10.0              # Maximum disk cache size in GB
+memory_size_gb = 2.0             # Memory cache size in GB (optional)
 
-# Optional S3 settings
-export AWS_ENDPOINT='https://s3.us-east-1.amazonaws.com'  # For S3-compatible services
-export AWS_DEFAULT_REGION='us-east-1'  # Default: us-east-1
-export AWS_ALLOW_HTTP='true'  # Allow HTTP endpoints (default: false)
+# Storage configuration (required)
+[storage]
+url = "s3://bucket/path"         # Storage backend URL
+encryption_password = "your-secure-password"  # Encryption password
+```
 
-# Usage
-zerofs s3://bucket/path
+## Storage Backends
+
+### AWS S3
+
+```toml
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "secure-password-here"
+
+[aws]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+region = "us-east-1"              # Optional, defaults to us-east-1
+endpoint = "https://s3.amazonaws.com"  # Optional for S3-compatible services
+allow_http = false                # Set to true for non-HTTPS endpoints
 ```
 
 <Note>
-For S3-compatible services like MinIO or Cloudflare R2 set `AWS_ENDPOINT` to the service endpoint.
+For S3-compatible services like MinIO or Cloudflare R2, set the `endpoint` field to the service endpoint.
 </Note>
 
-### Azure Storage Backend
+### Azure Blob Storage
 
-For Azure Blob Storage:
+```toml
+[storage]
+url = "azure://container/path"
+encryption_password = "secure-password-here"
 
-```bash
-# Required for Azure
-export AZURE_STORAGE_ACCOUNT_NAME='your-account-name'
-export AZURE_STORAGE_ACCOUNT_KEY='your-account-key'
-
-# Usage
-zerofs azure://container/path
+[azure]
+storage_account_name = "myaccount"
+storage_account_key = "your-account-key"
 ```
 
-### Local Filesystem Backend
+### Local Filesystem
 
-For local testing without cloud storage:
+```toml
+[storage]
+url = "file:///path/to/storage"
+encryption_password = "secure-password-here"
 
-```bash
-# No additional configuration required
-# Just use file:// URL
-
-# Usage
-zerofs file:///path/to/storage
+# No additional backend configuration needed
 ```
 
-## Optional Configuration
+## Network Services
 
-### Memory Cache
+### NFS Server
 
-```bash
-# Memory cache size in GB (improves performance)
-export ZEROFS_MEMORY_CACHE_SIZE_GB='8'
+```toml
+[servers.nfs]
+host = "0.0.0.0"     # Bind address (default: 127.0.0.1)
+port = 2049          # Port (default: 2049)
 ```
 
-### NBD Block Devices
+### 9P Server
 
-```bash
-# NBD TCP server configuration
-export ZEROFS_NBD_PORT='10809'      # Port (default: 10809)
-export ZEROFS_NBD_HOST='0.0.0.0'    # Bind address (default: 127.0.0.1)
-
-# NBD Unix socket (optional, can be used alongside TCP)
-export ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock'
-
-# Note: NBD devices are managed dynamically via the .nbd/ directory
-# Create devices: truncate -s <size> /mnt/zerofs/.nbd/<device-name>
+```toml
+[servers.ninep]
+host = "0.0.0.0"     # Bind address (default: 127.0.0.1)
+port = 5564          # Port (default: 5564)
+socket = "/tmp/zerofs.sock"  # Unix socket path (optional)
 ```
 
-### Network Services
+### NBD Server
+
+```toml
+[servers.nbd]
+host = "0.0.0.0"     # Bind address (default: 127.0.0.1)
+port = 10809         # Port (default: 10809)
+socket = "/tmp/zerofs-nbd.sock"  # Unix socket path (optional)
+```
+
+## Complete Examples
+
+### Basic S3 Configuration
+
+```toml
+# /etc/zerofs/zerofs.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[aws]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+[servers.nfs]
+host = "0.0.0.0"
+port = 2049
+```
+
+### High-Performance Configuration
+
+```toml
+# /etc/zerofs/zerofs-performance.toml
+[cache]
+dir = "/nvme/zerofs-cache"    # Use fast NVMe storage
+disk_size_gb = 100.0
+memory_size_gb = 16.0          # Large memory cache
+
+[storage]
+url = "s3://high-performance-bucket/data"
+encryption_password = "very-secure-password-here"
+
+[aws]
+access_key_id = "your-key"
+secret_access_key = "your-secret"
+region = "us-east-1"
+
+[servers.nfs]
+host = "0.0.0.0"
+port = 2049
+
+[servers.nbd]
+host = "0.0.0.0"
+port = 10809
+socket = "/tmp/zerofs-nbd.sock"  # Unix socket for better local performance
+```
+
+### S3-Compatible Services
+
+<CodeGroup>
+
+```toml {{ title: 'MinIO' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+
+[storage]
+url = "s3://my-bucket/path"
+encryption_password = "secure-password"
+
+[aws]
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+endpoint = "https://minio.example.com"
+allow_http = true  # Set to true if using HTTP
+```
+
+```toml {{ title: 'Wasabi' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+
+[storage]
+url = "s3://wasabi-bucket/path"
+encryption_password = "secure-password"
+
+[aws]
+access_key_id = "your-wasabi-key"
+secret_access_key = "your-wasabi-secret"
+endpoint = "https://s3.wasabisys.com"
+region = "us-east-1"
+```
+
+</CodeGroup>
+
+## Running ZeroFS
+
+### With Configuration File
 
 ```bash
-# NFS server configuration
-export ZEROFS_NFS_HOST='0.0.0.0'  # Bind address (default: 127.0.0.1)
-export ZEROFS_NFS_HOST_PORT='2049'  # Port (default: 2049)
+# Start ZeroFS with a config file
+zerofs run --config /etc/zerofs/zerofs.toml
 
-# 9P server configuration
-export ZEROFS_9P_HOST='0.0.0.0'  # Bind address (default: 127.0.0.1)
-export ZEROFS_9P_PORT='5564'  # Port (default: 5564)
-export ZEROFS_9P_SOCKET='/tmp/zerofs.sock'  # Unix socket path (optional, enables Unix socket server)
+# Or use the shorthand
+zerofs run -c zerofs.toml
 ```
 
 ### Password Management
@@ -113,114 +212,37 @@ export ZEROFS_9P_SOCKET='/tmp/zerofs.sock'  # Unix socket path (optional, enable
 To change the encryption password:
 
 ```bash
-# Set both current and new password
-export ZEROFS_ENCRYPTION_PASSWORD='current-password'
-export ZEROFS_NEW_PASSWORD='new-secure-password'
+# Change password interactively
+zerofs change-password --config zerofs.toml
 
-# Run ZeroFS - it will update the password and exit
-zerofs s3://bucket/path
-
-# Use the new password for future runs
-export ZEROFS_ENCRYPTION_PASSWORD='new-secure-password'
+# The command will:
+# 1. Prompt for the new password
+# 2. Update encrypted data with the new password
+# 3. You'll need to update the config file manually
 ```
 
-### Logging
+<Note>
+After changing the password, update the `encryption_password` field in your configuration file.
+</Note>
 
-```bash
-# Set log level (default: error,zerofs=info)
-export RUST_LOG='zerofs=debug'
+## Environment Variable Substitution
 
-# Common log levels:
-# - error: Only errors
-# - warn: Warnings and errors
-# - info: Informational messages (default for zerofs)
-# - debug: Detailed debugging
-# - trace: Very detailed tracing
+Configuration values can reference environment variables using `${VAR}` syntax:
+
+```toml
+[storage]
+url = "s3://my-bucket/data"
+encryption_password = "${ZEROFS_PASSWORD}"
+
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 ```
 
-## Complete Examples
-
-### Basic S3 Setup
-
-```bash
-#!/bin/bash
-# Required configuration
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-export SLATEDB_CACHE_SIZE_GB='10'
-export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'
-
-# S3 credentials
-export AWS_ACCESS_KEY_ID='AKIAIOSFODNN7EXAMPLE'
-export AWS_SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
-
-# Start ZeroFS
-zerofs s3://my-bucket/zerofs-data
-```
-
-### High-Performance Configuration
-
-```bash
-#!/bin/bash
-# Cache configuration
-export SLATEDB_CACHE_DIR='/nvme/zerofs-cache'  # Use fast NVMe storage
-export SLATEDB_CACHE_SIZE_GB='100'
-export ZEROFS_MEMORY_CACHE_SIZE_GB='16'
-
-# Security
-export ZEROFS_ENCRYPTION_PASSWORD='very-secure-password'
-
-# Network configuration
-export ZEROFS_NFS_HOST='0.0.0.0'
-export ZEROFS_NBD_HOST='0.0.0.0'
-export ZEROFS_NBD_PORT='10809'
-# Optional: Use Unix socket for better local performance
-# export ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock'
-
-# S3 configuration
-export AWS_ACCESS_KEY_ID='your-key'
-export AWS_SECRET_ACCESS_KEY='your-secret'
-export AWS_DEFAULT_REGION='us-east-1'
-
-# Enable debug logging
-export RUST_LOG='zerofs=info'
-
-# Start ZeroFS
-zerofs s3://high-performance-bucket/data
-```
-
-### S3-Compatible Services
-
-<CodeGroup>
-
-```bash {{ title: 'MinIO' }}
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-export SLATEDB_CACHE_SIZE_GB='10'
-export ZEROFS_ENCRYPTION_PASSWORD='secure-password'
-
-# MinIO configuration
-export AWS_ENDPOINT='https://minio.example.com'
-export AWS_ACCESS_KEY_ID='minioadmin'
-export AWS_SECRET_ACCESS_KEY='minioadmin'
-export AWS_ALLOW_HTTP='false'  # Use 'true' for HTTP
-
-zerofs s3://my-bucket/path
-```
-
-```bash {{ title: 'Wasabi' }}
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-export SLATEDB_CACHE_SIZE_GB='10'
-export ZEROFS_ENCRYPTION_PASSWORD='secure-password'
-
-# Wasabi configuration
-export AWS_ENDPOINT='https://s3.wasabisys.com'
-export AWS_ACCESS_KEY_ID='your-wasabi-key'
-export AWS_SECRET_ACCESS_KEY='your-wasabi-secret'
-export AWS_DEFAULT_REGION='us-east-1'
-
-zerofs s3://wasabi-bucket/path
-```
-
-</CodeGroup>
+This is useful for:
+- Keeping secrets out of configuration files
+- Using the same config across environments
+- Integration with secret management systems
 
 ## System Integration
 
@@ -236,21 +258,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/zerofs/zerofs.env
-ExecStart=/usr/local/bin/zerofs s3://bucket/path
+ExecStart=/usr/local/bin/zerofs run --config /etc/zerofs/zerofs.toml
 Restart=always
 RestartSec=5
+# Optional: Load environment variables for substitution
+EnvironmentFile=-/etc/zerofs/zerofs.env
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Create `/etc/zerofs/zerofs.env`:
+If using environment variable substitution, create `/etc/zerofs/zerofs.env`:
 
 ```bash
-SLATEDB_CACHE_DIR=/var/cache/zerofs
-SLATEDB_CACHE_SIZE_GB=50
-ZEROFS_ENCRYPTION_PASSWORD=your-secure-password
+ZEROFS_PASSWORD=your-secure-password
 AWS_ACCESS_KEY_ID=your-key
 AWS_SECRET_ACCESS_KEY=your-secret
 ```
@@ -258,41 +279,79 @@ AWS_SECRET_ACCESS_KEY=your-secret
 ### Docker
 
 ```bash
+# Create config file
+cat > zerofs.toml <<EOF
+[cache]
+dir = "/cache"
+disk_size_gb = 10.0
+
+[storage]
+url = "s3://bucket/path"
+encryption_password = "\${ZEROFS_PASSWORD}"
+
+[aws]
+access_key_id = "\${AWS_ACCESS_KEY_ID}"
+secret_access_key = "\${AWS_SECRET_ACCESS_KEY}"
+
+[servers.nfs]
+host = "0.0.0.0"
+port = 2049
+EOF
+
+# Run container
 docker run -d \
-  -e SLATEDB_CACHE_DIR=/cache \
-  -e SLATEDB_CACHE_SIZE_GB=10 \
-  -e ZEROFS_ENCRYPTION_PASSWORD='secure-password' \
+  -e ZEROFS_PASSWORD='secure-password' \
   -e AWS_ACCESS_KEY_ID='your-key' \
   -e AWS_SECRET_ACCESS_KEY='your-secret' \
+  -v $(pwd)/zerofs.toml:/config/zerofs.toml:ro \
   -v /tmp/cache:/cache \
   -p 2049:2049 \
-  ghcr.io/barre/zerofs:latest s3://bucket/path
+  ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
 ```
 
-### Environment File Best Practices
+### Configuration Best Practices
 
-1. **Restrict permissions**: `chmod 600 /etc/zerofs/zerofs.env`
-2. **Never commit to git**: Add `*.env` to `.gitignore`
-3. **Use strong passwords**: Generate with `openssl rand -base64 32`
-4. **Separate environments**: Use different passwords for dev/staging/prod
+1. **Restrict permissions**: `chmod 600 /etc/zerofs/zerofs.toml`
+2. **Use environment variables for secrets**: Keep passwords out of config files
+3. **Version control**: Track config files (without secrets) in git
+4. **Use strong passwords**: Generate with `openssl rand -base64 32`
+5. **Separate environments**: Use different config files for dev/staging/prod
+
+## Logging Configuration
+
+Set log levels using the `RUST_LOG` environment variable:
+
+```bash
+# Set log level (default: error,zerofs=info)
+export RUST_LOG='zerofs=debug'
+
+# Common log levels:
+# - error: Only errors
+# - warn: Warnings and errors
+# - info: Informational messages (default for zerofs)
+# - debug: Detailed debugging
+# - trace: Very detailed tracing
+
+# Run with custom logging
+RUST_LOG=zerofs=debug zerofs run -c zerofs.toml
+```
 
 ## Validation
 
-After configuration, verify your setup:
+After creating your configuration, verify it:
 
 ```bash
-# Check environment variables
-env | grep -E '(ZEROFS|SLATEDB|AWS|AZURE)'
+# Initialize a template config
+zerofs init --config test.toml
 
-# Test storage backend connectivity
-# For S3
+# Test the configuration
+zerofs run --config test.toml
+
+# Check connectivity (for S3)
 aws s3 ls s3://your-bucket/
 
-# Verify cache directory exists and has space
-df -h $SLATEDB_CACHE_DIR
-
-# Start ZeroFS and check logs
-RUST_LOG=zerofs=debug zerofs s3://bucket/path
+# Verify cache directory
+df -h /var/cache/zerofs
 ```
 
 ---

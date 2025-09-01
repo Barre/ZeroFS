@@ -107,12 +107,17 @@ The `_netdev` option ensures the mount waits for network availability during boo
 
 To allow access from multiple machines:
 
-```bash
-# Start ZeroFS listening on all interfaces
-ZEROFS_NFS_HOST=0.0.0.0 zerofs s3://bucket/path
+```toml
+# Configure ZeroFS to listen on all interfaces in zerofs.toml
+[servers.nfs]
+host = "0.0.0.0"  # Listen on all interfaces
+port = 2049
+
+# Start ZeroFS
+# zerofs run --config zerofs.toml
 
 # From client machines
-sudo mount -t nfs -o vers=3,nolock,tcp server-ip:/ /mnt/zerofs
+# sudo mount -t nfs -o vers=3,nolock,tcp server-ip:/ /mnt/zerofs
 ```
 
 ## Troubleshooting
@@ -169,12 +174,17 @@ nfsstat -c  # Client statistics
 
 ### Custom NFS Port
 
-```bash
-# Start ZeroFS on custom port
-ZEROFS_NFS_HOST_PORT=2050 zerofs s3://bucket/path
+```toml
+# Configure custom port in zerofs.toml
+[servers.nfs]
+host = "127.0.0.1"
+port = 2050  # Custom port
+
+# Start ZeroFS
+# zerofs run --config zerofs.toml
 
 # Mount using custom port
-sudo mount -t nfs -o vers=3,nolock,tcp,port=2050,mountport=2050 127.0.0.1:/ /mnt/zerofs
+# sudo mount -t nfs -o vers=3,nolock,tcp,port=2050,mountport=2050 127.0.0.1:/ /mnt/zerofs
 ```
 
 ### Read-Only Mount

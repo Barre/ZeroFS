@@ -18,27 +18,61 @@ Create globally distributed storage systems using ZeroFS instances across multip
 
 <CodeGroup>
 
-```bash {{ title: 'Multi-Region Setup' }}
-# Terminal 1 - US East
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=us-east-1 \
-ZEROFS_NBD_PORTS='10809' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs s3://my-bucket/us-east-db
+```toml {{ title: 'US East Config' }}
+# zerofs-us-east.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 50.0
 
-# Terminal 2 - EU West
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=eu-west-1 \
-ZEROFS_NBD_PORTS='10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs s3://my-bucket/eu-west-db
+[storage]
+url = "s3://my-bucket/us-east-db"
+encryption_password = "shared-key"
 
-# Terminal 3 - Asia Pacific
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=ap-southeast-1 \
-ZEROFS_NBD_PORTS='10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='100' \
-zerofs s3://my-bucket/asia-db
+[aws]
+region = "us-east-1"
+
+[servers.nbd]
+port = 10809
+
+# Start: zerofs run -c zerofs-us-east.toml
+```
+
+```toml {{ title: 'EU West Config' }}
+# zerofs-eu-west.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 50.0
+
+[storage]
+url = "s3://my-bucket/eu-west-db"
+encryption_password = "shared-key"
+
+[aws]
+region = "eu-west-1"
+
+[servers.nbd]
+port = 10810
+
+# Start: zerofs run -c zerofs-eu-west.toml
+```
+
+```toml {{ title: 'Asia Pacific Config' }}
+# zerofs-asia.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 50.0
+
+[storage]
+url = "s3://my-bucket/asia-db"
+encryption_password = "shared-key"
+
+[aws]
+region = "ap-southeast-1"
+
+[servers.nbd]
+port = 10811
+
+# Start: zerofs run -c zerofs-asia.toml
 ```
 
 ```bash {{ title: 'Create Global ZFS Pool' }}
@@ -107,14 +141,26 @@ graph TD
 
 <CodeGroup>
 
-```bash {{ title: 'Primary Database' }}
-# Primary PostgreSQL on ZeroFS
-ZEROFS_NBD_PORTS='10809' \
-ZEROFS_NBD_DEVICE_SIZES_GB='500' \
-zerofs s3://db-bucket/postgres-primary
+```toml {{ title: 'Primary Database Config' }}
+# zerofs-postgres-primary.toml
+[storage]
+url = "s3://db-bucket/postgres-primary"
+encryption_password = "db-secure-password"
+
+[servers.nbd]
+port = 10809
+
+# Start: zerofs run -c zerofs-postgres-primary.toml
+```
+
+```bash {{ title: 'Setup Primary' }}
+# Create NBD device
+mount -t nfs 127.0.0.1:/ /mnt/zerofs
+truncate -s 500G /mnt/zerofs/.nbd/pgdata
+umount /mnt/zerofs
 
 # Mount and initialize
-nbd-client 127.0.0.1 10809 /dev/nbd0
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N pgdata
 mkfs.xfs /dev/nbd0
 mount /dev/nbd0 /var/lib/postgresql
 
@@ -126,15 +172,29 @@ wal_keep_size = 1GB
 EOF
 ```
 
-```bash {{ title: 'Standby Replicas' }}
-# Standby 1 - Different region
-ZEROFS_NBD_PORTS='10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='500' \
-AWS_DEFAULT_REGION='us-west-2' \
-zerofs s3://db-bucket/postgres-standby1
+```toml {{ title: 'Standby Config' }}
+# zerofs-postgres-standby.toml
+[storage]
+url = "s3://db-bucket/postgres-standby1"
+encryption_password = "db-secure-password"
+
+[aws]
+region = "us-west-2"
+
+[servers.nbd]
+port = 10810
+
+# Start: zerofs run -c zerofs-postgres-standby.toml
+```
+
+```bash {{ title: 'Setup Standby' }}
+# Create NBD device
+mount -t nfs 127.0.0.1:/ /mnt/zerofs
+truncate -s 500G /mnt/zerofs/.nbd/pgdata
+umount /mnt/zerofs
 
 # Mount and setup streaming replication
-nbd-client 127.0.0.1 10810 /dev/nbd1
+nbd-client 127.0.0.1 10810 /dev/nbd1 -N pgdata
 mount /dev/nbd1 /var/lib/postgresql
 
 # Configure standby
@@ -149,21 +209,42 @@ systemctl start postgresql
 
 ### MySQL/MariaDB Galera Cluster
 
+```toml
+# Node 1: zerofs-galera-node1.toml
+[storage]
+url = "s3://db-bucket/galera-node1"
+encryption_password = "galera-secure-password"
+
+[servers.nbd]
+port = 10809
+
+# Node 2: zerofs-galera-node2.toml
+[storage]
+url = "s3://db-bucket/galera-node2"
+encryption_password = "galera-secure-password"
+
+[servers.nbd]
+port = 10810
+
+# Node 3: zerofs-galera-node3.toml
+[storage]
+url = "s3://db-bucket/galera-node3"
+encryption_password = "galera-secure-password"
+
+[servers.nbd]
+port = 10811
+
+# Start each node:
+# zerofs run -c zerofs-galera-node1.toml
+# zerofs run -c zerofs-galera-node2.toml
+# zerofs run -c zerofs-galera-node3.toml
+```
+
 ```bash
-# Node 1
-ZEROFS_NBD_PORTS='10809' \
-ZEROFS_NBD_DEVICE_SIZES_GB='200' \
-zerofs s3://db-bucket/galera-node1
-
-# Node 2 
-ZEROFS_NBD_PORTS='10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='200' \
-zerofs s3://db-bucket/galera-node2
-
-# Node 3
-ZEROFS_NBD_PORTS='10811' \
-ZEROFS_NBD_DEVICE_SIZES_GB='200' \
-zerofs s3://db-bucket/galera-node3
+# Create 200GB device on each node
+mount -t nfs 127.0.0.1:/ /mnt/zerofs
+truncate -s 200G /mnt/zerofs/.nbd/galera-data
+umount /mnt/zerofs
 
 # Each node has its own S3-backed storage
 # Galera handles synchronous replication
@@ -279,19 +360,16 @@ services:
   zerofs:
     image: ghcr.io/barre/zerofs:latest
     environment:
-      ZEROFS_ENCRYPTION_PASSWORD: ${ZEROFS_PASSWORD}
-      SLATEDB_CACHE_DIR: /cache
-      SLATEDB_CACHE_SIZE_GB: 50
+      ZEROFS_PASSWORD: ${ZEROFS_PASSWORD}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      ZEROFS_NBD_PORTS: "10809,10810"
-      ZEROFS_NBD_DEVICE_SIZES_GB: "10,20"
     volumes:
       - cache:/cache
+      - ./zerofs.toml:/config/zerofs.toml:ro
     ports:
       - "2049:2049"
       - "10809-10810:10809-10810"
-    command: s3://dev-bucket/docker-data
+    command: run --config /config/zerofs.toml
     
   postgres:
     image: postgres:16
@@ -317,10 +395,19 @@ volumes:
 
 ZeroFS can even host itself, creating a bootstrapping environment:
 
+```toml
+# zerofs-bootstrap.toml
+[storage]
+url = "s3://bucket/bootstrap"
+encryption_password = "bootstrap-password"
+
+[servers.nfs]
+port = 2049
+```
+
 ```bash
 # Start initial ZeroFS instance
-ZEROFS_ENCRYPTION_PASSWORD='bootstrap' \
-zerofs s3://bucket/bootstrap
+zerofs run -c zerofs-bootstrap.toml
 
 # Mount it
 mount -t nfs -o vers=3 127.0.0.1:/ /mnt/bootstrap

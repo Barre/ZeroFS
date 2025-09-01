@@ -42,10 +42,16 @@ sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs-9
 
 For improved performance when mounting locally, you can use Unix domain sockets:
 
-```bash
-# Start ZeroFS with Unix socket support
-ZEROFS_9P_SOCKET=/tmp/zerofs.sock zerofs s3://bucket/path
+```toml
+# Configure Unix socket in zerofs.toml
+[servers.ninep]
+socket = "/tmp/zerofs.sock"
 
+# Start ZeroFS
+# zerofs run --config zerofs.toml
+```
+
+```bash
 # Mount via Unix socket
 sudo mount -t 9p -o trans=unix,version=9p2000.L /tmp/zerofs.sock /mnt/zerofs-9p
 ```

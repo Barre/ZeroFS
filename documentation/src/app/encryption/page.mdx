@@ -32,19 +32,22 @@ ZeroFS encrypts all your data by default using ChaCha20-Poly1305. In this guide,
   </Col>
   <Col>
 
-    ```bash {{ title: 'First Run' }}
+    ```toml {{ title: 'Configuration' }}
     # ZeroFS generates a new DEK on first run
-    export ZEROFS_ENCRYPTION_PASSWORD='strong-password'
-    zerofs s3://bucket/path
+    [storage]
+    url = "s3://bucket/path"
+    encryption_password = "strong-password"
     ```
 
     ```bash {{ title: 'Password Change' }}
     # Change password without re-encrypting data
-    ZEROFS_ENCRYPTION_PASSWORD='old-password' \
-    ZEROFS_NEW_PASSWORD='new-strong-password' \
-    zerofs s3://bucket/path
+    zerofs change-password --config zerofs.toml
 
+    # Enter new password when prompted
     # ZeroFS re-encrypts only the DEK, not all data
+    
+    # Update config file afterwards:
+    # encryption_password = "new-strong-password"
     ```
 
   </Col>
@@ -133,12 +136,18 @@ aws secretsmanager create-secret \
   --name zerofs-prod-password \
   --secret-string "$(openssl rand -base64 32)"
 
-# Use in production
-export ZEROFS_ENCRYPTION_PASSWORD=$(
+# Use in production with environment variable substitution
+# In zerofs.toml:
+# [storage]
+# encryption_password = "${ZEROFS_PASSWORD}"
+
+export ZEROFS_PASSWORD=$(
   aws secretsmanager get-secret-value \
     --secret-id zerofs-prod-password \
     --query SecretString --output text
 )
+
+zerofs run --config zerofs.toml
 ```
 
 ### Lost Password Recovery
@@ -151,13 +160,18 @@ export ZEROFS_ENCRYPTION_PASSWORD=$(
 
 ### Network Security
 
-```bash
-# Bind to localhost only (default)
-export ZEROFS_NFS_HOST='127.0.0.1'
-export ZEROFS_NBD_HOST='127.0.0.1'
+```toml
+# Bind to localhost only (default) in zerofs.toml
+[servers.nfs]
+host = "127.0.0.1"
+port = 2049
+
+[servers.nbd]
+host = "127.0.0.1"
+port = 10809
 
 # For remote access, use VPN or SSH tunneling
-ssh -L 2049:localhost:2049 user@zerofs-server
+# ssh -L 2049:localhost:2049 user@zerofs-server
 ```
 
 

@@ -58,36 +58,99 @@ docker pull ghcr.io/barre/zerofs:latest
 
 ## Configuration
 
-Set up the required environment variables for ZeroFS:
+Create a configuration file for ZeroFS:
 
 ```bash
-# Required: Encryption password
-export ZEROFS_ENCRYPTION_PASSWORD='your-secure-password'
+# Initialize a config file
+zerofs init --config zerofs.toml
 
-# Required: SlateDB cache configuration
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-export SLATEDB_CACHE_SIZE_GB='10'
-
-# Recommended: Memory cache for better performance
-export ZEROFS_MEMORY_CACHE_SIZE_GB='8' # 8GB memory cache
-
-# S3 credentials (for AWS S3)
-export AWS_ACCESS_KEY_ID='your-access-key'
-export AWS_SECRET_ACCESS_KEY='your-secret-key'
-export AWS_DEFAULT_REGION='us-east-1'
-
-# For custom S3-compatible endpoints (e.g., MinIO, Ceph)
-export AWS_ENDPOINT='https://s3.example.com'
-export AWS_ALLOW_HTTP='true' # Only if using HTTP endpoints
-
-# Azure credentials (for Azure Blob Storage)
-export AZURE_STORAGE_ACCOUNT='your-account-name'
-export AZURE_STORAGE_KEY='your-account-key'
-
-# Optional: NBD block device configuration
-export ZEROFS_NBD_PORTS='10809,10810' # Comma-separated list
-export ZEROFS_NBD_DEVICE_SIZES_GB='10,20' # Comma-separated list of sizes in GB
+# This creates a template you can customize
 ```
+
+Edit the configuration file with your settings:
+
+<CodeGroup>
+
+```toml {{ title: 'S3 Configuration' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0    # Optional memory cache
+
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[aws]
+access_key_id = "your-access-key"
+secret_access_key = "your-secret-key"
+region = "us-east-1"
+
+[servers.nfs]
+host = "127.0.0.1"
+port = 2049
+```
+
+```toml {{ title: 'Azure Configuration' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0
+
+[storage]
+url = "azure://my-container/zerofs-data"
+encryption_password = "your-secure-password"
+
+[azure]
+storage_account_name = "your-account"
+storage_account_key = "your-key"
+
+[servers.nfs]
+host = "127.0.0.1"
+port = 2049
+```
+
+```toml {{ title: 'Local Testing' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0
+
+[storage]
+url = "file:///tmp/zerofs-test"
+encryption_password = "your-secure-password"
+
+[servers.nfs]
+host = "127.0.0.1"
+port = 2049
+
+[servers.ninep]
+host = "127.0.0.1"
+port = 5564
+```
+
+```toml {{ title: 'MinIO/S3-Compatible' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0
+
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[aws]
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+endpoint = "https://minio.example.com"
+allow_http = true    # For HTTP endpoints
+
+[servers.nfs]
+host = "127.0.0.1"
+port = 2049
+```
+
+</CodeGroup>
 
 <div className="not-prose">
   <Button href="/configuration" variant="text" arrow="right">
@@ -97,88 +160,76 @@ export ZEROFS_NBD_DEVICE_SIZES_GB='10,20' # Comma-separated list of sizes in GB
 
 ## Start ZeroFS
 
-Now start ZeroFS with your S3 bucket:
+Now start ZeroFS with your configuration:
 
 <CodeGroup>
 
 ```bash {{ title: 'Basic Start' }}
-# Start ZeroFS with an S3 bucket
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-SLATEDB_CACHE_DIR='/var/cache/zerofs' \
-SLATEDB_CACHE_SIZE_GB='10' \
-ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
-AWS_ACCESS_KEY_ID='your-key' \
-AWS_SECRET_ACCESS_KEY='your-secret' \
-AWS_DEFAULT_REGION='us-east-1' \
-zerofs s3://my-bucket/zerofs-data
+# Start ZeroFS with configuration file
+zerofs run --config zerofs.toml
 
-# Start ZeroFS with Azure Blob Storage
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-SLATEDB_CACHE_DIR='/var/cache/zerofs' \
-SLATEDB_CACHE_SIZE_GB='10' \
-ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
-AZURE_STORAGE_ACCOUNT='your-account' \
-AZURE_STORAGE_KEY='your-key' \
-zerofs azure://my-container/zerofs-data
-
-# Quick local testing without external storage
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-SLATEDB_CACHE_DIR='/var/cache/zerofs' \
-SLATEDB_CACHE_SIZE_GB='10' \
-ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
-zerofs file:///tmp/zerofs-test
-
-# Custom S3-compatible endpoint (MinIO, Ceph, etc.)
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-SLATEDB_CACHE_DIR='/var/cache/zerofs' \
-SLATEDB_CACHE_SIZE_GB='10' \
-ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
-AWS_ACCESS_KEY_ID='your-key' \
-AWS_SECRET_ACCESS_KEY='your-secret' \
-AWS_ENDPOINT='https://minio.example.com' \
-zerofs s3://my-bucket/zerofs-data
+# Or use the shorthand
+zerofs run -c zerofs.toml
 ```
 
-```bash {{ title: 'Export Variables First' }}
-# Export environment variables once
-export ZEROFS_ENCRYPTION_PASSWORD='your-password'
-export SLATEDB_CACHE_DIR='/var/cache/zerofs'
-export SLATEDB_CACHE_SIZE_GB='10'
-export ZEROFS_MEMORY_CACHE_SIZE_GB='8'
-export AWS_ACCESS_KEY_ID='your-key'
-export AWS_SECRET_ACCESS_KEY='your-secret'
-export AWS_DEFAULT_REGION='us-east-1'
+```bash {{ title: 'With Environment Variables' }}
+# You can override config values with environment variables
+export ZEROFS_PASSWORD='override-password'
+export AWS_ACCESS_KEY_ID='override-key'
+export AWS_SECRET_ACCESS_KEY='override-secret'
 
-# Then start ZeroFS
-zerofs s3://my-bucket/zerofs-data
+# Config file can reference environment variables
+# [storage]
+# encryption_password = "${ZEROFS_PASSWORD}"
+
+zerofs run -c zerofs.toml
 ```
 
 ```bash {{ title: 'With NBD Support' }}
-# Enable both NFS and NBD block devices
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-SLATEDB_CACHE_DIR='/var/cache/zerofs' \
-SLATEDB_CACHE_SIZE_GB='10' \
-ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
-AWS_ACCESS_KEY_ID='your-key' \
-AWS_SECRET_ACCESS_KEY='your-secret' \
-AWS_DEFAULT_REGION='us-east-1' \
-ZEROFS_NBD_PORTS='10809,10810' \
-ZEROFS_NBD_DEVICE_SIZES_GB='10,20' \
-zerofs s3://my-bucket/zerofs-data
+# Add NBD configuration to your TOML file
+cat >> zerofs.toml <<EOF
+[servers.nbd]
+host = "127.0.0.1"
+port = 10809
+EOF
+
+# Start ZeroFS
+zerofs run -c zerofs.toml
+
+# Create NBD devices via the filesystem
+mkdir -p /mnt/zerofs/.nbd
+truncate -s 10G /mnt/zerofs/.nbd/device1
 ```
 
 ```bash {{ title: 'Docker' }}
+# Create config file
+cat > zerofs.toml <<EOF
+[cache]
+dir = "/cache"
+disk_size_gb = 10.0
+
+[storage]
+url = "s3://bucket/path"
+encryption_password = "\${ZEROFS_PASSWORD}"
+
+[aws]
+access_key_id = "\${AWS_ACCESS_KEY_ID}"
+secret_access_key = "\${AWS_SECRET_ACCESS_KEY}"
+
+[servers.nfs]
+host = "0.0.0.0"
+port = 2049
+EOF
+
 # Run with Docker
 docker run -d \
-  -e ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-  -e SLATEDB_CACHE_DIR='/cache' \
-  -e SLATEDB_CACHE_SIZE_GB='10' \
-  -e ZEROFS_MEMORY_CACHE_SIZE_GB='8' \
+  -e ZEROFS_PASSWORD='your-password' \
   -e AWS_ACCESS_KEY_ID='your-key' \
   -e AWS_SECRET_ACCESS_KEY='your-secret' \
-  -p 2049:2049 \
+  -v $(pwd)/zerofs.toml:/config/zerofs.toml:ro \
   -v /tmp/cache:/cache \
-  ghcr.io/barre/zerofs:latest s3://bucket/path
+  -p 2049:2049 \
+  ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
 ```
 
 </CodeGroup>
@@ -206,6 +257,11 @@ sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:
 ```
 
 ```bash {{ title: 'Linux (9P)' }}
+# Make sure 9P is configured in your TOML file:
+# [servers.ninep]
+# host = "127.0.0.1"
+# port = 5564
+
 # Create mount point
 sudo mkdir -p /mnt/9p
 
@@ -227,17 +283,29 @@ echo "127.0.0.1 /mnt/9p 9p trans=tcp,port=5564,version=9p2000.L,msize=1048576,ca
 
 ## Using NBD Block Devices
 
-If you enabled NBD support, you can also access ZeroFS as block devices:
+If you enabled NBD support, you can create and access block devices dynamically:
 
 <CodeGroup>
 
-```bash {{ title: 'Connect NBD Device' }}
+```bash {{ title: 'Create & Connect NBD Device' }}
+# First, ensure NBD is configured in your TOML:
+# [servers.nbd]
+# host = "127.0.0.1"
+# port = 10809
+
+# Mount the filesystem (if not already mounted)
+sudo mount -t nfs -o vers=3,async,nolock 127.0.0.1:/ /mnt/zerofs
+
+# Create a block device file
+sudo mkdir -p /mnt/zerofs/.nbd
+sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
+
 # Install nbd-client if needed
 sudo apt-get install nbd-client  # Debian/Ubuntu
 sudo yum install nbd              # RHEL/CentOS
 
-# Connect to NBD device with optimal settings
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
+# Connect to the NBD device
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
 
 # Create filesystem
 sudo mkfs.ext4 /dev/nbd0
@@ -248,11 +316,15 @@ sudo mount /dev/nbd0 /mnt/nbd0
 ```
 
 ```bash {{ title: 'Multiple Devices' }}
-# If you configured multiple NBD ports
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
-sudo nbd-client 127.0.0.1 10810 /dev/nbd1 -N device_10810 -persist -timeout 60 -block-size 4096 -connections 4
+# Create multiple block devices
+sudo truncate -s 10G /mnt/zerofs/.nbd/device1
+sudo truncate -s 20G /mnt/zerofs/.nbd/device2
 
-# Format and mount each device
+# Connect each device
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1
+sudo nbd-client 127.0.0.1 10809 /dev/nbd1 -N device2
+
+# Format and mount
 sudo mkfs.ext4 /dev/nbd0
 sudo mkfs.ext4 /dev/nbd1
 

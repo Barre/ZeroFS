@@ -41,9 +41,11 @@ sudo mount -v -t nfs -o vers=3,tcp,port=2049 127.0.0.1:/ /mnt/zerofs
 # Check ZeroFS logs
 journalctl -u zerofs -f
 
-# Verify bind address
-export ZEROFS_NFS_HOST='0.0.0.0'  # Listen on all interfaces
-export ZEROFS_NFS_HOST_PORT='2049'
+# Verify bind address in config file
+# Edit zerofs.toml:
+# [servers.nfs]
+# host = "0.0.0.0"  # Listen on all interfaces
+# port = 2049
 
 # Test connectivity
 telnet 127.0.0.1 2049
@@ -70,19 +72,20 @@ mount -t nfs -o vers=3,tcp 127.0.0.1:/ /mnt/zerofs
 
 ```bash {{ title: 'Invalid Credentials' }}
 # Error: InvalidAccessKeyId or SignatureDoesNotMatch
-# Solution: Verify AWS credentials
+# Solution: Verify AWS credentials in config
 
 # Test credentials directly
 aws s3 ls s3://your-bucket/ --debug
 
-# Check environment variables
-echo $AWS_ACCESS_KEY_ID
-echo $AWS_SECRET_ACCESS_KEY
-echo $AWS_DEFAULT_REGION
+# Check configuration file
+cat zerofs.toml | grep -A 5 '\[aws\]'
 
-# For S3-compatible services
-export AWS_ENDPOINT='https://s3.wasabisys.com'
-export AWS_ALLOW_HTTP='false'
+# Verify values are correct:
+# [aws]
+# access_key_id = "your-key"
+# secret_access_key = "your-secret"
+# region = "us-east-1"
+# endpoint = "https://s3.wasabisys.com"  # For S3-compatible
 ```
 
 ```bash {{ title: 'Bucket Not Found' }}
@@ -95,8 +98,9 @@ aws s3 ls
 # Check bucket region
 aws s3api get-bucket-location --bucket your-bucket
 
-# Set correct region
-export AWS_DEFAULT_REGION='us-west-2'
+# Update config file with correct region:
+# [aws]
+# region = "us-west-2"
 ```
 
 ```bash {{ title: 'Network Timeouts' }}
@@ -124,11 +128,14 @@ export HTTPS_PROXY='http://proxy.company.com:8080'
 # Error: Failed to create cache directory
 # Solution: Check permissions and disk space
 
-# Verify cache directory exists
-ls -la $SLATEDB_CACHE_DIR
+# Verify cache directory from config
+grep -A 3 '\[cache\]' zerofs.toml
+
+# Check if directory exists
+ls -la /var/cache/zerofs
 
 # Check disk space
-df -h $SLATEDB_CACHE_DIR
+df -h /var/cache/zerofs
 
 # Fix permissions
 sudo mkdir -p /var/cache/zerofs
@@ -136,57 +143,90 @@ sudo chown $USER:$USER /var/cache/zerofs
 chmod 755 /var/cache/zerofs
 
 # Verify write access
-touch $SLATEDB_CACHE_DIR/test && rm $SLATEDB_CACHE_DIR/test
+touch /var/cache/zerofs/test && rm /var/cache/zerofs/test
 ```
 
 ```bash {{ title: 'Cache Size Errors' }}
 # Error: Invalid cache size
-# Solution: Use positive integer for GB
+# Solution: Use positive number for GB in config
 
-# Correct format (integer only)
-export SLATEDB_CACHE_SIZE_GB='50'
+# Correct format in zerofs.toml:
+# [cache]
+# dir = "/var/cache/zerofs"
+# disk_size_gb = 50.0           # Correct
+# memory_size_gb = 2.0          # Correct
 
 # Wrong formats:
-# export SLATEDB_CACHE_SIZE_GB='50GB'  # Don't include unit
-# export SLATEDB_CACHE_SIZE_GB='50.5'  # No decimals
-# export SLATEDB_CACHE_SIZE_GB=''      # Must be set
+# disk_size_gb = "50GB"         # Don't include unit
+# disk_size_gb = 50             # Should be float
 ```
 
 </CodeGroup>
+
+## Configuration Issues
+
+### Missing Configuration File
+
+```bash
+# Error: Failed to load config
+# Solution: Create or specify config file
+
+# Initialize a new config
+zerofs init --config zerofs.toml
+
+# Run with specific config file
+zerofs run --config /path/to/zerofs.toml
+
+# Or use short form
+zerofs run -c zerofs.toml
+```
+
+### Invalid TOML Syntax
+
+```bash
+# Error: Failed to parse config file
+# Solution: Check TOML syntax
+
+# Validate TOML syntax
+cat zerofs.toml | python -m toml
+
+# Common issues:
+# - Missing quotes around strings
+# - Invalid indentation
+# - Missing section headers [section]
+# - Duplicate keys
+```
 
 ## Encryption Issues
 
 ### Password Problems
 
-```bash
+```toml
 # Error: Failed to decrypt
 # Wrong password or corrupted data
 
-# Verify password is correct
-export ZEROFS_ENCRYPTION_PASSWORD='correct-password'
+# Verify password in config file:
+[storage]
+url = "s3://bucket/path"
+encryption_password = "correct-password"
 
-# Check for special characters that need escaping
-# Use single quotes to avoid shell interpretation
-export ZEROFS_ENCRYPTION_PASSWORD='p@$$w0rd!'
+# For special characters, use single quotes in TOML:
+encryption_password = 'p@$$w0rd!'
 
-# If password was changed, use new password
-export ZEROFS_ENCRYPTION_PASSWORD='new-password'
+# Or use environment variable substitution:
+encryption_password = "${ZEROFS_PASSWORD}"
 ```
 
 ### Changing Passwords
 
 ```bash
-# Error: Password change failed
-# Solution: Ensure both passwords are set correctly
+# Change password using the CLI
+zerofs change-password --config zerofs.toml
 
-export ZEROFS_ENCRYPTION_PASSWORD='current-password'
-export ZEROFS_NEW_PASSWORD='new-password'
-zerofs s3://bucket/path
-
-# Verify change worked by running with new password
-unset ZEROFS_NEW_PASSWORD
-export ZEROFS_ENCRYPTION_PASSWORD='new-password'
-zerofs s3://bucket/path
+# You'll be prompted for the new password
+# After changing, update your config file:
+# [storage]
+# encryption_password = "new-password"
 ```
 
 ## NBD Issues
@@ -195,35 +235,43 @@ zerofs s3://bucket/path
 
 ```bash
 # Error: nbd-client connection failed
-# Solution: Check ports and device availability
+# Solution: Check NBD configuration and availability
 
-# Verify NBD ports are configured
-echo $ZEROFS_NBD_PORTS
-echo $ZEROFS_NBD_DEVICE_SIZES_GB
+# Verify NBD is configured in zerofs.toml:
+# [servers.nbd]
+# host = "127.0.0.1"
+# port = 10809
 
-# Check if ports are listening
+# Check if port is listening
 ss -tlnp | grep 10809
 
 # Ensure NBD module is loaded (Linux)
 sudo modprobe nbd
 lsmod | grep nbd
 
-# Connect with explicit device name
-nbd-client -N device_10809 127.0.0.1 10809 /dev/nbd0
+# Create NBD device file
+sudo mkdir -p /mnt/zerofs/.nbd
+sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
+
+# Connect to the device
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
 ```
 
-### Device Size Mismatches
+### Device Size Changes
 
 ```bash
 # Error: Device size cannot be changed
 # Solution: Delete and recreate device
 
 # Remove existing device file
-rm /mnt/zerofs/.nbd/device_10809
+sudo rm /mnt/zerofs/.nbd/my-device
 
-# Restart ZeroFS with new size
-export ZEROFS_NBD_DEVICE_SIZES_GB='100'
-zerofs s3://bucket/path
+# Create new device with different size
+sudo truncate -s 100G /mnt/zerofs/.nbd/my-device
+
+# Reconnect NBD client
+sudo nbd-client -d /dev/nbd0
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
 ```
 
 ## Debugging Techniques
@@ -236,7 +284,7 @@ export RUST_LOG='zerofs=trace,slatedb=debug'
 
 # Log to file for analysis
 export RUST_LOG='zerofs=debug'
-zerofs s3://bucket/path 2>&1 | tee zerofs.log
+zerofs run -c zerofs.toml 2>&1 | tee zerofs.log
 
 # Filter specific components
 export RUST_LOG='zerofs::nfs=trace,zerofs::cache=debug'
@@ -294,16 +342,38 @@ perf script | FlameGraph/stackcollapse-perf.pl | FlameGraph/flamegraph.pl > zero
 # Stop ZeroFS
 systemctl stop zerofs
 
+# Find cache directory from config
+CACHE_DIR=$(grep -A 1 '\[cache\]' zerofs.toml | grep dir | cut -d'"' -f2)
+
 # Backup cache (optional)
-mv $SLATEDB_CACHE_DIR $SLATEDB_CACHE_DIR.backup
+mv $CACHE_DIR $CACHE_DIR.backup
 
 # Clear cache
-rm -rf $SLATEDB_CACHE_DIR/*
+rm -rf $CACHE_DIR/*
 
 # Restart ZeroFS
 systemctl start zerofs
 
 # Cache will rebuild automatically
+```
+
+### Configuration Recovery
+
+```bash
+# Lost configuration file
+# Solution: Recreate from template
+
+# Generate new config template
+zerofs init --config zerofs-new.toml
+
+# Edit with your settings
+vim zerofs-new.toml
+
+# Test with dry run
+zerofs run -c zerofs-new.toml --dry-run
+
+# Replace old config
+mv zerofs-new.toml zerofs.toml
 ```
 
 <div className="not-prose">
