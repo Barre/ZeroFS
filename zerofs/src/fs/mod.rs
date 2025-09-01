@@ -126,7 +126,7 @@ impl ZeroFS {
         cache_config: CacheConfig,
         db_path: String,
         encryption_key: [u8; 32],
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<Self> {
         let total_disk_cache_gb = cache_config.max_cache_size_gb;
         let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -483,16 +483,14 @@ impl ZeroFS {
     }
 
     #[cfg(test)]
-    pub async fn new_in_memory() -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new_in_memory() -> anyhow::Result<Self> {
         // Use a fixed test key for in-memory tests
         let test_key = [0u8; 32];
         Self::new_in_memory_with_encryption(test_key).await
     }
 
     #[cfg(test)]
-    pub async fn new_in_memory_with_encryption(
-        encryption_key: [u8; 32],
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new_in_memory_with_encryption(encryption_key: [u8; 32]) -> anyhow::Result<Self> {
         let object_store = slatedb::object_store::memory::InMemory::new();
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
 
@@ -608,7 +606,7 @@ impl ZeroFS {
     pub async fn dangerous_new_with_object_store_unencrypted_for_key_management_only(
         object_store: Arc<dyn ObjectStore>,
         db_path: String,
-    ) -> Result<DangerousUnencryptedZeroFS, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<DangerousUnencryptedZeroFS> {
         let settings = slatedb::config::Settings {
             wal_enabled: false,
             ..Default::default()

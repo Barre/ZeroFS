@@ -466,15 +466,13 @@ pub async fn start_nfs_server_with_config(
     filesystem: ZeroFS,
     host: &str,
     port: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> anyhow::Result<()> {
     let listener = NFSTcpListener::bind(&format!("{host}:{port}"), filesystem).await?;
 
     info!("NFS server listening on {}:{}", host, port);
 
-    listener
-        .handle_forever()
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    listener.handle_forever().await?;
+    Ok(())
 }
 
 #[cfg(test)]

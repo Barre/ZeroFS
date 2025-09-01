@@ -46,7 +46,7 @@ impl UnifiedCache {
         _cache_dir: &str,
         _disk_capacity_gb: f64,
         memory_capacity_gb: Option<f64>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<Self> {
         let memory_capacity_bytes =
             (memory_capacity_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
 
