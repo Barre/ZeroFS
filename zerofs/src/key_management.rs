@@ -219,7 +219,7 @@ pub async fn change_encryption_password(
         &serialized,
         &slatedb::config::PutOptions::default(),
         &slatedb::config::WriteOptions {
-            await_durable: true,
+            await_durable: false,
         },
     )
     .await?;
