@@ -685,7 +685,7 @@ Key-Value Store:
 ZeroFS is available as a GitHub Action for easy integration into your CI/CD workflows:
 
 ```yaml
-- uses: Barre/zerofs@v1
+- uses: Barre/zerofs@main
   with:
     object-store-url: 's3://bucket/path'
     encryption-password: ${{ secrets.ZEROFS_PASSWORD }}

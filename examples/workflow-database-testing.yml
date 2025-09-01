@@ -23,7 +23,7 @@ jobs:
       
       # Setup persistent database storage
       - name: Setup ZeroFS for PostgreSQL
-        uses: Barre/ZeroFS@v1
+        uses: Barre/ZeroFS@main
         with:
           object-store-url: 's3://my-bucket/test-databases/pr-${{ github.event.pull_request.number }}'
           mount-path: '/mnt/pgdata'

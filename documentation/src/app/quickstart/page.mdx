@@ -54,7 +54,7 @@ docker pull ghcr.io/barre/zerofs:latest
 
 ```yaml {{ title: 'GitHub Action' }}
 # Use in your workflow
-- uses: Barre/zerofs@v1
+- uses: Barre/zerofs@main
   with:
     object-store-url: 's3://bucket/path'
     encryption-password: ${{ secrets.ZEROFS_PASSWORD }}

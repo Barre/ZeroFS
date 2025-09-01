@@ -5,7 +5,7 @@ This GitHub Action provides persistent volumes backed by S3-compatible storage f
 ## Usage
 
 ```yaml
-- uses: Barre/ZeroFS@v1
+- uses: Barre/ZeroFS@main
   with:
     object-store-url: 's3://bucket/path'
     encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
