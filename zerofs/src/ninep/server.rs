@@ -96,7 +96,7 @@ async fn handle_client_stream<S>(
     stream: S,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -129,7 +129,7 @@ async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     read_stream: &mut R,
     tx: mpsc::Sender<(u16, Vec<u8>)>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -149,7 +149,7 @@ where
         let size = u32::from_le_bytes(size_buf);
         if !(7..=DEFAULT_MSIZE).contains(&size) {
             error!("Invalid message size: {}", size);
-            return Err("Invalid message size".into());
+            return Err(anyhow::anyhow!("Invalid message size"));
         }
 
         let mut full_buf = BytesMut::with_capacity(size as usize);
@@ -199,9 +199,9 @@ where
                         &full_buf[0..std::cmp::min(40, full_buf.len())]
                     );
                     let error_msg = P9Message::error(tag, libc::ENOSYS as u32);
-                    let response_bytes = error_msg
-                        .to_bytes()
-                        .map_err(|e| format!("Failed to serialize error response: {e:?}"))?;
+                    let response_bytes = error_msg.to_bytes().map_err(|e| {
+                        anyhow::anyhow!("Failed to serialize error response: {e:?}")
+                    })?;
 
                     if let Err(e) = tx.send((tag, response_bytes)).await {
                         error!("Failed to send error response: {}", e);
@@ -209,7 +209,7 @@ where
                     }
                 } else {
                     debug!("Message too short to parse: {:?}", e);
-                    return Err(format!("Failed to parse message: {e:?}").into());
+                    return Err(anyhow::anyhow!("Failed to parse message: {e:?}"));
                 }
             }
         };
