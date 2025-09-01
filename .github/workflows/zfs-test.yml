@@ -271,9 +271,8 @@ jobs:
           fi
 
           echo "Stopping ZeroFS..."
-          # Find and kill the actual zerofs process (not cargo)
-          # First try to find the process
-          ZEROFS_PID=$(pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" || true)
+          # Find and kill the zerofs process
+          ZEROFS_PID=$(pgrep -f "zerofs.*run.*zerofs-ci.toml" || true)
           if [ -n "$ZEROFS_PID" ]; then
             echo "Found ZeroFS process: $ZEROFS_PID"
             kill -TERM $ZEROFS_PID || true
@@ -283,7 +282,7 @@ jobs:
 
           # Wait for ZeroFS to stop
           for i in {1..10}; do
-            if ! pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" > /dev/null; then
+            if ! pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
               echo "ZeroFS stopped"
               break
             fi
@@ -292,9 +291,9 @@ jobs:
           done
 
           # Final check if ZeroFS stopped
-          if pgrep -f "zerofs.*s3://zerofs-zfs-test/zfs-test" > /dev/null; then
+          if pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
             echo "WARNING: ZeroFS may still be running, forcing kill..."
-            pkill -KILL -f "zerofs.*s3://zerofs-zfs-test/zfs-test" || true
+            pkill -KILL -f "zerofs.*run.*zerofs-ci.toml" || true
             sleep 1
           fi
 
