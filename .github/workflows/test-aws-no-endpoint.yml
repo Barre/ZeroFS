@@ -1,0 +1,30 @@
+name: Test AWS S3 Without Endpoint
+
+on:
+  push:
+    branches: ["test-aws-endpoint-fix"]
+
+jobs:
+  test-aws-no-endpoint:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup ZeroFS Volume (No Endpoint Specified)
+        id: setup-zerofs
+        uses: ./
+        with:
+          object-store-url: 's3://test-bucket/github-actions-test'
+          encryption-password: 'test-password-123'
+          aws-access-key-id: 'dummy-access-key'
+          aws-secret-access-key: 'dummy-secret-key'
+          aws-region: 'us-east-1'
+          # Intentionally NOT specifying aws-endpoint to test the fix
+          cache-size-gb: '1'
+          mount-path: '/mnt/zerofs-test'
+      
+      - name: Check if we got past initialization
+        run: |
+          echo "Successfully got past the RelativeUrlWithoutBase error!"
+          echo "The fix is working - ZeroFS started without an explicit endpoint"
