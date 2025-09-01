@@ -21,30 +21,34 @@ ZeroFS provides Network Block Device (NBD) servers that expose S3 storage as raw
 
 ## Configuration
 
-Start ZeroFS with NBD support using either TCP or Unix socket (or both):
+Configure NBD support in your ZeroFS configuration file:
 
-```bash
+```toml
 # TCP mode (default port 10809)
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_PORT='10809' \
-zerofs s3://bucket/path
+[servers.nbd]
+host = "127.0.0.1"
+port = 10809
 
 # Unix socket mode (better performance for local access)
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock' \
-zerofs s3://bucket/path
+[servers.nbd]
+socket = "/tmp/zerofs-nbd.sock"
 
 # Both TCP and Unix socket
-ZEROFS_ENCRYPTION_PASSWORD='your-password' \
-ZEROFS_NBD_PORT='10809' \
-ZEROFS_NBD_SOCKET='/tmp/zerofs-nbd.sock' \
-zerofs s3://bucket/path
+[servers.nbd]
+host = "127.0.0.1"
+port = 10809
+socket = "/tmp/zerofs-nbd.sock"
 ```
 
-Environment variables:
-- `ZEROFS_NBD_HOST` - Bind address for NBD TCP server (default: 127.0.0.1)
-- `ZEROFS_NBD_PORT` - Port for NBD server (default: 10809)
-- `ZEROFS_NBD_SOCKET` - Unix socket path for NBD (optional)
+Then start ZeroFS:
+```bash
+zerofs run --config zerofs.toml
+```
+
+Configuration options:
+- `host` - Bind address for NBD TCP server (default: 127.0.0.1)
+- `port` - Port for NBD server (default: 10809)
+- `socket` - Unix socket path for NBD (optional)
 
 ## Device Management
 
@@ -183,25 +187,47 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N database -persist -timeout 600 -connecti
 
 Create globally distributed ZFS pools across regions:
 
-```bash
+```toml
 # Machine 1 - US East (10.0.1.5)
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=us-east-1 \
-ZEROFS_NBD_HOST='0.0.0.0' \
-zerofs s3://my-bucket/us-east-db
+# zerofs-us-east.toml
+[storage]
+url = "s3://my-bucket/us-east-db"
+encryption_password = "shared-key"
 
-# Create device
+[aws]
+region = "us-east-1"
+
+[servers.nbd]
+host = "0.0.0.0"
+port = 10809
+
+# Start: zerofs run -c zerofs-us-east.toml
+```
+
+```toml
+# Machine 2 - EU West (10.0.2.5)
+# zerofs-eu-west.toml
+[storage]
+url = "s3://my-bucket/eu-west-db"
+encryption_password = "shared-key"
+
+[aws]
+region = "eu-west-1"
+
+[servers.nbd]
+host = "0.0.0.0"
+port = 10809
+
+# Start: zerofs run -c zerofs-eu-west.toml
+```
+
+```bash
+
+# Create devices on both machines
 mount -t nfs 10.0.1.5:/ /mnt/zerofs
 truncate -s 100G /mnt/zerofs/.nbd/storage
 umount /mnt/zerofs
 
-# Machine 2 - EU West (10.0.2.5)
-ZEROFS_ENCRYPTION_PASSWORD='shared-key' \
-AWS_DEFAULT_REGION=eu-west-1 \
-ZEROFS_NBD_HOST='0.0.0.0' \
-zerofs s3://my-bucket/eu-west-db
-
-# Create device
 mount -t nfs 10.0.2.5:/ /mnt/zerofs
 truncate -s 100G /mnt/zerofs/.nbd/storage
 umount /mnt/zerofs
