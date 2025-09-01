@@ -55,16 +55,34 @@ jobs:
           # Create cache directory
           mkdir -p /tmp/zerofs-cache
 
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 2.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-zfs-test/zfs-test"
+          encryption_password = "secret"
+
+          [servers.ninep]
+          host = "127.0.0.1"
+          port = 5564
+
+          [servers.nbd]
+          host = "127.0.0.1"
+          port = 10809
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
           # Start ZeroFS with NBD support in the background
-          AWS_ENDPOINT=http://localhost:9000 \
-          AWS_ACCESS_KEY_ID=minioadmin \
-          AWS_SECRET_ACCESS_KEY=minioadmin \
-          AWS_ALLOW_HTTP=true \
-          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
-          SLATEDB_CACHE_SIZE_GB=2 \
-          ZEROFS_ENCRYPTION_PASSWORD=secret \
-          ZEROFS_NBD_PORT=10809 \
-          cargo run --profile ci s3://zerofs-zfs-test/zfs-test &
+          cargo run --profile ci -- run -c zerofs-ci.toml &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to start..."
@@ -301,15 +319,8 @@ jobs:
         working-directory: zerofs
         run: |
           echo "Starting ZeroFS again..."
-          AWS_ENDPOINT=http://localhost:9000 \
-          AWS_ACCESS_KEY_ID=minioadmin \
-          AWS_SECRET_ACCESS_KEY=minioadmin \
-          AWS_ALLOW_HTTP=true \
-          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
-          SLATEDB_CACHE_SIZE_GB=2 \
-          ZEROFS_ENCRYPTION_PASSWORD=secret \
-          ZEROFS_NBD_PORT=10809 \
-          cargo run --profile ci s3://zerofs-zfs-test/zfs-test &
+          # Config file should still exist from earlier
+          cargo run --profile ci -- run -c zerofs-ci.toml &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to restart..."
@@ -393,7 +404,7 @@ jobs:
           sudo nbd-client -d /dev/nbd0 || true
 
           # Kill ZeroFS
-          pkill -f "cargo run --profile ci s3://zerofs-zfs-test/zfs-test" || true
+          pkill -f "cargo run --profile ci -- run -c zerofs-ci.toml" || true
 
           # Stop MinIO
           docker stop minio || true

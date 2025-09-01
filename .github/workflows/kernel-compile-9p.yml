@@ -63,16 +63,30 @@ jobs:
           # Create cache directory
           mkdir -p /tmp/zerofs-cache
 
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 10.0
+
+          [storage]
+          url = "s3://zerofs-test/test"
+          encryption_password = "secret"
+
+          [servers.ninep]
+          host = "127.0.0.1"
+          port = 5564
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
           # Start ZeroFS in the background with 9P enabled
-          AWS_ENDPOINT=http://localhost:9000 \
-          AWS_ACCESS_KEY_ID=minioadmin \
-          AWS_SECRET_ACCESS_KEY=minioadmin \
-          AWS_ALLOW_HTTP=true \
-          SLATEDB_CACHE_DIR=/tmp/zerofs-cache \
-          SLATEDB_CACHE_SIZE_GB=5 \
-          ZEROFS_MEMORY_CACHE_SIZE_GB=10 \
-          ZEROFS_ENCRYPTION_PASSWORD=secret \
-          cargo run --profile ci s3://zerofs-test/test &
+          cargo run --profile ci -- run -c zerofs-ci.toml &
 
           # Save PID for stats collection
           echo $! > /tmp/zerofs.pid
@@ -150,4 +164,4 @@ jobs:
           if [ -f /tmp/zerofs.pid ]; then
             kill $(cat /tmp/zerofs.pid) || true
           fi
-          pkill -f "cargo run --profile ci s3://zerofs-test/test" || true
+          pkill -f "cargo run --profile ci -- run -c zerofs-ci.toml" || true

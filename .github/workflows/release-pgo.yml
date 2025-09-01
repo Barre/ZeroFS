@@ -82,17 +82,30 @@ jobs:
       - name: Run profiling workloads
         run: |
           mkdir -p /tmp/zerofs-cache
-          export AWS_ENDPOINT=http://localhost:9000
-          export AWS_ACCESS_KEY_ID=minioadmin
-          export AWS_SECRET_ACCESS_KEY=minioadmin
-          export AWS_ALLOW_HTTP=true
-          export SLATEDB_CACHE_DIR=/tmp/zerofs-cache
-          export SLATEDB_CACHE_SIZE_GB=5
-          export ZEROFS_MEMORY_CACHE_SIZE_GB=10
-          export ZEROFS_ENCRYPTION_PASSWORD=secret
-
+          
+          # Create ZeroFS configuration based on test type
           if [ "${{ matrix.test }}" = "9p" ]; then
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-profile/test &
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 10.0
+
+          [storage]
+          url = "s3://pgo-profile/test"
+          encryption_password = "secret"
+
+          [servers.ninep]
+          host = "127.0.0.1"
+          port = 5564
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS 9P server to start..."
             for i in {1..30}; do
@@ -121,8 +134,31 @@ jobs:
             wait $ZEROFS_PID || true
 
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            export ZEROFS_NBD_PORT=10809
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-zfs-test/zfs-test &
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 10.0
+
+          [storage]
+          url = "s3://pgo-zfs-test/zfs-test"
+          encryption_password = "secret"
+
+          [servers.ninep]
+          host = "127.0.0.1"
+          port = 5564
+          
+          [servers.nbd]
+          host = "127.0.0.1"
+          port = 10809
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NBD server to start..."
             for i in {1..30}; do
@@ -150,7 +186,27 @@ jobs:
             wait $ZEROFS_PID || true
 
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs s3://pgo-nfs-test/test &
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 10.0
+
+          [storage]
+          url = "s3://pgo-nfs-test/test"
+          encryption_password = "secret"
+
+          [servers.nfs]
+          host = "127.0.0.1"
+          port = 2049
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NFS server to start..."
             for i in {1..30}; do
