@@ -18,8 +18,9 @@ ZeroFS is distributed as a single static binary. Choose your installation method
 
 <CodeGroup>
 
-```bash {{ title: 'Download Binary' }}
+```bash {{ title: 'Download Binary (Recommended)' }}
 # Download the latest release for your platform
+# These binaries are optimized with Profile-Guided Optimization (PGO) for best performance
 curl -LO https://github.com/Barre/ZeroFS/releases/latest/download/zerofs-pgo-multiplatform.tar.gz
 
 # Extract the archive
@@ -31,6 +32,11 @@ sudo mv zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m) /usr/local/b
 
 # Clean up the archive
 rm zerofs-multiplatform.tar.gz
+```
+
+```bash {{ title: 'Via Cargo' }}
+# Install from crates.io
+cargo install zerofs
 ```
 
 ```bash {{ title: 'Build from Source' }}

@@ -105,10 +105,24 @@ graph TB
 
 ## Quick Start
 
-```bash
-# Install ZeroFS
-cargo install zerofs
+### Installation
 
+#### Download Binary (Recommended)
+Download pre-built binaries from the [releases page](https://github.com/Barre/ZeroFS/releases). These binaries are optimized with Profile-Guided Optimization (PGO) for best performance.
+
+#### Via Cargo
+```bash
+cargo install zerofs
+```
+
+#### Via Docker
+```bash
+docker pull ghcr.io/barre/zerofs:latest
+```
+
+### Getting Started
+
+```bash
 # Generate a configuration file
 zerofs init
 
