@@ -172,7 +172,7 @@ touch /var/cache/zerofs/test && rm /var/cache/zerofs/test
 # Solution: Create or specify config file
 
 # Initialize a new config
-zerofs init --config zerofs.toml
+zerofs init
 
 # Run with specific config file
 zerofs run --config /path/to/zerofs.toml
@@ -257,23 +257,6 @@ sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
 sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
 ```
 
-### Device Size Changes
-
-```bash
-# Error: Device size cannot be changed
-# Solution: Delete and recreate device
-
-# Remove existing device file
-sudo rm /mnt/zerofs/.nbd/my-device
-
-# Create new device with different size
-sudo truncate -s 100G /mnt/zerofs/.nbd/my-device
-
-# Reconnect NBD client
-sudo nbd-client -d /dev/nbd0
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
-```
-
 ## Debugging Techniques
 
 ### Enable Detailed Logging
@@ -290,91 +273,6 @@ zerofs run -c zerofs.toml 2>&1 | tee zerofs.log
 export RUST_LOG='zerofs::nfs=trace,zerofs::cache=debug'
 ```
 
-### System Monitoring
-
-<CodeGroup>
-
-```bash {{ title: 'Resource Usage' }}
-# Monitor CPU and memory
-htop
-# or
-top -p $(pgrep zerofs)
-
-# I/O statistics
-iotop -p $(pgrep zerofs)
-
-# Network traffic
-iftop -i eth0  # Watch for S3 traffic
-```
-
-```bash {{ title: 'Trace System Calls' }}
-# Trace ZeroFS system calls
-strace -f -p $(pgrep zerofs) -o zerofs-strace.log
-
-# Trace specific operations
-strace -f -e open,read,write -p $(pgrep zerofs)
-
-# Trace network calls
-strace -f -e network -p $(pgrep zerofs)
-```
-
-```bash {{ title: 'Performance Profiling' }}
-# CPU profiling
-perf record -p $(pgrep zerofs) -g -- sleep 60
-perf report
-
-# Flame graphs
-git clone https://github.com/brendangregg/FlameGraph
-perf record -F 99 -p $(pgrep zerofs) -g -- sleep 30
-perf script | FlameGraph/stackcollapse-perf.pl | FlameGraph/flamegraph.pl > zerofs-flame.svg
-```
-
-</CodeGroup>
-
-## Recovery Procedures
-
-### Corrupted Cache
-
-```bash
-# Symptoms: Crashes, data inconsistency
-# Solution: Clear and rebuild cache
-
-# Stop ZeroFS
-systemctl stop zerofs
-
-# Find cache directory from config
-CACHE_DIR=$(grep -A 1 '\[cache\]' zerofs.toml | grep dir | cut -d'"' -f2)
-
-# Backup cache (optional)
-mv $CACHE_DIR $CACHE_DIR.backup
-
-# Clear cache
-rm -rf $CACHE_DIR/*
-
-# Restart ZeroFS
-systemctl start zerofs
-
-# Cache will rebuild automatically
-```
-
-### Configuration Recovery
-
-```bash
-# Lost configuration file
-# Solution: Recreate from template
-
-# Generate new config template
-zerofs init --config zerofs-new.toml
-
-# Edit with your settings
-vim zerofs-new.toml
-
-# Test with dry run
-zerofs run -c zerofs-new.toml --dry-run
-
-# Replace old config
-mv zerofs-new.toml zerofs.toml
-```
 
 <div className="not-prose">
   <Button href="/advanced-use-cases" variant="text" arrow="right">
