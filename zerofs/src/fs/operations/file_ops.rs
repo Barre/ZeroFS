@@ -8,8 +8,7 @@ use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
-use bytes::{Bytes, BytesMut};
-use futures::TryStreamExt;
+use bytes::BytesMut;
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::collections::HashMap;
@@ -58,42 +57,43 @@ impl ZeroFS {
                 let new_size = std::cmp::max(file.size, end_offset);
 
                 let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
-                let end_chunk = ((end_offset - 1) / CHUNK_SIZE as u64) as usize;
+                let end_chunk = (end_offset.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
 
                 let mut batch = self.db.new_write_batch();
 
                 let chunk_processing_start = std::time::Instant::now();
 
-                let partial_chunks = (start_chunk..=end_chunk).filter(|&chunk_idx| {
-                    let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-                    let write_start = if offset > chunk_start {
-                        (offset - chunk_start) as usize
-                    } else {
-                        0
-                    };
-                    let write_end = if end_offset < chunk_start + CHUNK_SIZE as u64 {
-                        (end_offset - chunk_start) as usize
-                    } else {
-                        CHUNK_SIZE
-                    };
+                // Optimization: skip loading chunks that will be completely overwritten
+                let existing_chunks: HashMap<usize, Vec<u8>> =
+                    stream::iter(start_chunk..=end_chunk)
+                        .map(|chunk_idx| {
+                            let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
+                            let chunk_end = chunk_start + CHUNK_SIZE as u64;
 
-                    write_start > 0 || write_end < CHUNK_SIZE
-                });
+                            let will_overwrite_fully =
+                                offset <= chunk_start && end_offset >= chunk_end;
 
-                let existing_chunks: HashMap<usize, Bytes> = stream::iter(partial_chunks)
-                    .map(|chunk_idx| {
-                        let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
-                        let db = self.db.clone();
-                        async move {
-                            let data = db.get_bytes(&chunk_key).await.ok().flatten();
-                            (chunk_idx, data)
-                        }
-                    })
-                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
-                    .filter_map(|(idx, data)| async move { data.map(|d| (idx, d)) })
-                    .collect()
-                    .await;
+                            let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
+                            let db = self.db.clone();
+                            async move {
+                                let data = if will_overwrite_fully {
+                                    vec![0u8; CHUNK_SIZE]
+                                } else {
+                                    db.get_bytes(&chunk_key)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .map(|bytes| bytes.to_vec())
+                                        .unwrap_or_else(|| vec![0u8; CHUNK_SIZE])
+                                };
+                                (chunk_idx, data)
+                            }
+                        })
+                        .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
+                        .collect()
+                        .await;
 
+                let mut data_offset = 0;
                 for chunk_idx in start_chunk..=end_chunk {
                     let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
                     let chunk_end = chunk_start + CHUNK_SIZE as u64;
@@ -112,46 +112,14 @@ impl ZeroFS {
                         CHUNK_SIZE
                     };
 
-                    let data_offset = (chunk_idx - start_chunk) * CHUNK_SIZE + write_start
-                        - (offset % CHUNK_SIZE as u64) as usize;
                     let data_len = write_end - write_start;
 
-                    let chunk_data = if write_start == 0 && write_end == CHUNK_SIZE {
-                        // Full chunk write - no need to read existing data
-                        BytesMut::from(&data[data_offset..data_offset + data_len])
-                    } else {
-                        // Partial chunk write - need to merge with existing data
-                        let mut chunk_buf = BytesMut::with_capacity(CHUNK_SIZE);
+                    let mut chunk = existing_chunks[&chunk_idx].clone();
+                    chunk[write_start..write_end]
+                        .copy_from_slice(&data[data_offset..data_offset + data_len]);
+                    data_offset += data_len;
 
-                        if let Some(existing_data) = existing_chunks.get(&chunk_idx) {
-                            // Copy existing data before the write region
-                            if write_start > 0 {
-                                chunk_buf.extend_from_slice(
-                                    &existing_data[..write_start.min(existing_data.len())],
-                                );
-                            }
-
-                            // Add the new data
-                            chunk_buf.extend_from_slice(&data[data_offset..data_offset + data_len]);
-
-                            // Copy existing data after the write region
-                            if write_end < CHUNK_SIZE && write_end < existing_data.len() {
-                                chunk_buf.extend_from_slice(&existing_data[write_end..]);
-                            } else if write_end < CHUNK_SIZE {
-                                // Pad with zeros if needed
-                                chunk_buf.resize(CHUNK_SIZE, 0);
-                            }
-                        } else {
-                            // No existing data - create new chunk with zeros
-                            chunk_buf.resize(write_start, 0);
-                            chunk_buf.extend_from_slice(&data[data_offset..data_offset + data_len]);
-                            chunk_buf.resize(CHUNK_SIZE, 0);
-                        }
-
-                        chunk_buf
-                    };
-
-                    batch.put_bytes(&chunk_key, &chunk_data);
+                    batch.put_bytes(&chunk_key, &chunk);
                 }
 
                 debug!(
@@ -402,75 +370,42 @@ impl ZeroFS {
 
                 let end = std::cmp::min(offset + count as u64, file.size);
                 let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
-                let end_chunk = ((end - 1) / CHUNK_SIZE as u64) as usize;
+                let end_chunk = (end.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
                 let start_offset = (offset % CHUNK_SIZE as u64) as usize;
 
-                let chunk_futures = stream::iter(start_chunk..=end_chunk).map(|chunk_idx| {
-                    let db = self.db.clone();
-                    let key = KeyCodec::chunk_key(id, chunk_idx as u64);
-                    async move {
-                        let chunk_data_opt =
-                            db.get_bytes(&key).await.map_err(|_| FsError::IoError)?;
-
-                        Ok::<(usize, Option<Bytes>), FsError>((chunk_idx, chunk_data_opt))
-                    }
-                });
-
-                let mut chunks: Vec<(usize, Option<Bytes>)> = chunk_futures
-                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
-                    .try_collect::<Vec<_>>()
-                    .await?;
-
-                chunks.sort_by_key(|(idx, _)| *idx);
+                let chunks: Vec<Vec<u8>> = stream::iter(start_chunk..=end_chunk)
+                    .map(|chunk_idx| {
+                        let db = self.db.clone();
+                        let key = KeyCodec::chunk_key(id, chunk_idx as u64);
+                        async move {
+                            db.get_bytes(&key)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|bytes| bytes.to_vec())
+                                .unwrap_or_else(|| vec![0u8; CHUNK_SIZE])
+                        }
+                    })
+                    .buffered(READ_CHUNK_BUFFER_SIZE)
+                    .collect()
+                    .await;
 
                 let mut result = BytesMut::with_capacity((end - offset) as usize);
 
-                for (chunk_idx, chunk_data_opt) in chunks {
-                    if let Some(chunk_data) = chunk_data_opt {
-                        if chunk_idx == start_chunk && chunk_idx == end_chunk {
-                            let end_offset = start_offset + (end - offset) as usize;
-                            let safe_end = std::cmp::min(end_offset, chunk_data.len());
-                            let safe_start = std::cmp::min(start_offset, chunk_data.len());
-                            if safe_start < safe_end {
-                                result.extend_from_slice(&chunk_data[safe_start..safe_end]);
-                            }
-                            if end_offset > chunk_data.len() && safe_start < chunk_data.len() {
-                                let zeros_needed = end_offset - chunk_data.len();
-                                result.resize(result.len() + zeros_needed, 0);
-                            }
-                        } else if chunk_idx == start_chunk {
-                            let safe_start = std::cmp::min(start_offset, chunk_data.len());
-                            if safe_start < chunk_data.len() {
-                                result.extend_from_slice(&chunk_data[safe_start..]);
-                            }
-                        } else if chunk_idx == end_chunk {
-                            let bytes_in_last = ((end - 1) % CHUNK_SIZE as u64 + 1) as usize;
-                            let safe_bytes = std::cmp::min(bytes_in_last, chunk_data.len());
-                            result.extend_from_slice(&chunk_data[..safe_bytes]);
-                            if bytes_in_last > chunk_data.len() {
-                                let zeros_needed = bytes_in_last - chunk_data.len();
-                                result.resize(result.len() + zeros_needed, 0);
-                            }
-                        } else {
-                            result.extend_from_slice(&chunk_data);
-                        }
+                for (chunk_idx, chunk_data) in (start_chunk..=end_chunk).zip(chunks) {
+                    let chunk_start = if chunk_idx == start_chunk {
+                        start_offset
                     } else {
-                        let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-                        let chunk_end = std::cmp::min(chunk_start + CHUNK_SIZE as u64, file.size);
-                        let chunk_size = (chunk_end - chunk_start) as usize;
+                        0
+                    };
 
-                        if chunk_idx == start_chunk && chunk_idx == end_chunk {
-                            let end_offset = start_offset + (end - offset) as usize;
-                            result.resize(result.len() + (end_offset - start_offset), 0);
-                        } else if chunk_idx == start_chunk {
-                            result.resize(result.len() + (chunk_size - start_offset), 0);
-                        } else if chunk_idx == end_chunk {
-                            let bytes_in_last = ((end - 1) % CHUNK_SIZE as u64 + 1) as usize;
-                            result.resize(result.len() + bytes_in_last, 0);
-                        } else {
-                            result.resize(result.len() + chunk_size, 0);
-                        }
-                    }
+                    let chunk_end = if chunk_idx == end_chunk {
+                        ((end - 1) % CHUNK_SIZE as u64 + 1) as usize
+                    } else {
+                        CHUNK_SIZE
+                    };
+
+                    result.extend_from_slice(&chunk_data[chunk_start..chunk_end]);
                 }
 
                 let result_bytes = result.freeze();
@@ -523,7 +458,6 @@ impl ZeroFS {
         let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
 
         let mut batch = self.db.new_write_batch();
-        let cache_keys_to_remove = Vec::new();
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
@@ -538,6 +472,7 @@ impl ZeroFS {
             if offset <= chunk_start && end_offset >= chunk_end {
                 batch.delete_bytes(&chunk_key);
             } else {
+                // Partial trim - load chunk, clear trimmed region, save or delete
                 let trim_start = if offset > chunk_start {
                     (offset - chunk_start) as usize
                 } else {
@@ -550,36 +485,23 @@ impl ZeroFS {
                     CHUNK_SIZE
                 };
 
-                let mut chunk_data = vec![0u8; CHUNK_SIZE];
-                let mut has_data = false;
-
                 if let Some(existing_data) = self
                     .db
                     .get_bytes(&chunk_key)
                     .await
                     .map_err(|_| FsError::IoError)?
                 {
-                    let copy_len = existing_data.len().min(CHUNK_SIZE);
-                    chunk_data[..copy_len].copy_from_slice(&existing_data[..copy_len]);
-                    has_data = true;
-                }
-
-                if has_data {
+                    let mut chunk_data = existing_data.to_vec();
                     chunk_data[trim_start..trim_end].fill(0);
 
                     if chunk_data.iter().all(|&b| b == 0) {
                         batch.delete_bytes(&chunk_key);
                     } else {
-                        let chunk_size_in_file =
-                            std::cmp::min(CHUNK_SIZE, (file.size - chunk_start) as usize);
-                        batch.put_bytes(&chunk_key, &chunk_data[..chunk_size_in_file]);
+                        batch.put_bytes(&chunk_key, &chunk_data);
                     }
                 }
+                // If chunk doesn't exist, nothing to trim
             }
-        }
-
-        if !cache_keys_to_remove.is_empty() {
-            self.cache.remove_batch(cache_keys_to_remove);
         }
 
         self.db

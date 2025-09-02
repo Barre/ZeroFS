@@ -90,7 +90,6 @@ impl ZeroFS {
                         let mut batch = self.db.new_write_batch();
 
                         if new_size < old_size {
-                            // Truncation logic - delete chunks beyond new size
                             let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
                             let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
 
@@ -99,51 +98,23 @@ impl ZeroFS {
                                 batch.delete_bytes(&key);
                             }
 
-                            if new_size > 0 && new_size % CHUNK_SIZE as u64 != 0 {
+                            if new_size > 0 {
                                 let last_chunk_idx = new_chunks - 1;
-                                let last_chunk_size = (new_size % CHUNK_SIZE as u64) as usize;
+                                let clear_from = (new_size % CHUNK_SIZE as u64) as usize;
 
-                                let key = KeyCodec::chunk_key(id, last_chunk_idx as u64);
-                                if let Some(old_chunk_data) = self
-                                    .db
-                                    .get_bytes(&key)
-                                    .await
-                                    .map_err(|_| FsError::IoError)?
-                                {
-                                    let mut new_chunk_data = vec![0u8; last_chunk_size];
-                                    let copy_len = last_chunk_size.min(old_chunk_data.len());
-                                    new_chunk_data[..copy_len]
-                                        .copy_from_slice(&old_chunk_data[..copy_len]);
+                                if clear_from > 0 {
+                                    let key = KeyCodec::chunk_key(id, last_chunk_idx as u64);
+                                    let old_chunk_data = self
+                                        .db
+                                        .get_bytes(&key)
+                                        .await
+                                        .map_err(|_| FsError::IoError)?
+                                        .map(|bytes| bytes.to_vec())
+                                        .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
+
+                                    let mut new_chunk_data = old_chunk_data;
+                                    new_chunk_data[clear_from..].fill(0);
                                     batch.put_bytes(&key, &new_chunk_data);
-                                }
-                            }
-                        } else if new_size > old_size && old_size > 0 {
-                            // Extension logic - extend the last chunk if needed
-                            let last_old_chunk_idx = ((old_size - 1) / CHUNK_SIZE as u64) as usize;
-                            let last_old_chunk_end = (old_size % CHUNK_SIZE as u64) as usize;
-
-                            if last_old_chunk_end > 0 {
-                                let key = KeyCodec::chunk_key(id, last_old_chunk_idx as u64);
-                                if let Some(old_chunk_data) = self
-                                    .db
-                                    .get_bytes(&key)
-                                    .await
-                                    .map_err(|_| FsError::IoError)?
-                                {
-                                    let new_chunk_size = if (last_old_chunk_idx + 1) * CHUNK_SIZE
-                                        <= new_size as usize
-                                    {
-                                        CHUNK_SIZE
-                                    } else {
-                                        (new_size % CHUNK_SIZE as u64) as usize
-                                    };
-
-                                    if new_chunk_size > old_chunk_data.len() {
-                                        let mut extended_chunk = vec![0u8; new_chunk_size];
-                                        extended_chunk[..old_chunk_data.len()]
-                                            .copy_from_slice(&old_chunk_data);
-                                        batch.put_bytes(&key, &extended_chunk);
-                                    }
                                 }
                             }
                         }

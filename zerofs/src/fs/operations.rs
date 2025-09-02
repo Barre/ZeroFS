@@ -513,6 +513,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_beyond_truncated_chunk() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let data = vec![b'A'; 300 * 1024];
+        fs.process_write(&(&test_auth()).into(), file_id, 0, &data)
+            .await
+            .unwrap();
+
+        let setattr = SetAttributes {
+            size: SetSize::Set(100 * 1024),
+            ..Default::default()
+        };
+        fs.process_setattr(&test_creds(), file_id, &setattr)
+            .await
+            .unwrap();
+
+        let (read_data, _) = fs
+            .process_read_file(&(&test_auth()).into(), file_id, 200 * 1024, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(read_data.len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_process_symlink() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
