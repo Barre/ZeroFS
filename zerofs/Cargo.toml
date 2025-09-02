@@ -23,13 +23,15 @@ lto = false
 codegen-units = 16
 
 [dependencies]
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "0bf591030aa4cf07b421d2368c2d08ebd38d43f3", features = [
+    "wal_disable",
+] }
 mimalloc = "0.1"
 zerofs_nfsserve = "0.14"
 tokio = { version = "1.46", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-slatedb = { version = "0.8.0", features = ["wal_disable"] }
 object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
 bytes = "1.5"
 serde = { version = "1.0", features = ["derive"] }
