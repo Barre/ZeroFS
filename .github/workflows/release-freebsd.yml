@@ -1,0 +1,126 @@
+name: Release FreeBSD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build FreeBSD ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-freebsd
+            artifact_name: freebsd-amd64
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          arch: ${{ matrix.arch }}
+          prepare: |
+            # Install dependencies
+            pkg install -y gmake curl
+
+            # Install Rust via rustup for latest stable version
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+          run: |
+            # Source cargo environment (using . for POSIX compatibility)
+            . $HOME/.cargo/env
+
+            echo "Building ZeroFS for FreeBSD ${{ matrix.arch }}..."
+            echo "Rust version: $(rustc --version)"
+
+            cd zerofs
+
+            # Build release binary (native target in VM)
+            cargo build --release
+
+            # Verify binary
+            file target/release/zerofs
+            ls -lh target/release/zerofs
+
+            # Copy binary to artifacts location
+            cp target/release/zerofs ../zerofs-${{ matrix.artifact_name }}
+
+            # Clean up build artifacts to minimize rsync back to host
+            rm -rf target/
+
+      - name: Prepare binary
+        run: |
+          mkdir -p artifacts
+          mv zerofs-${{ matrix.artifact_name }} artifacts/
+          chmod +x artifacts/zerofs-${{ matrix.artifact_name }}
+
+      - name: Generate attestation for binary
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: artifacts/zerofs-${{ matrix.artifact_name }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-${{ matrix.artifact_name }}
+          path: artifacts/
+          retention-days: 30
+
+  create-release-bundle:
+    name: Create FreeBSD release bundle
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zerofs-freebsd-*
+          path: artifacts
+
+      - name: Create tarball
+        run: |
+          mkdir -p release
+          for arch_dir in artifacts/*/; do
+            if [ -d "$arch_dir" ]; then
+              cp "$arch_dir"* release/
+            fi
+          done
+          cd release
+          tar czf ../zerofs-freebsd-multiarch.tar.gz zerofs-freebsd-*
+          cd ..
+          sha256sum zerofs-freebsd-multiarch.tar.gz > zerofs-freebsd-multiarch.tar.gz.sha256
+
+      - name: Upload combined release
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-freebsd-release
+          path: |
+            zerofs-freebsd-multiarch.tar.gz
+            zerofs-freebsd-multiarch.tar.gz.sha256
+          retention-days: 90
+
+      - name: Generate attestations
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            zerofs-freebsd-multiarch.tar.gz
+            release/zerofs-freebsd-*
