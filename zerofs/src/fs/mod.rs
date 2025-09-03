@@ -7,7 +7,6 @@ pub mod lock_manager;
 pub mod metrics;
 pub mod operations;
 pub mod permissions;
-pub mod recovery;
 pub mod stats;
 pub mod types;
 
@@ -154,7 +153,6 @@ impl ZeroFS {
         let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
 
         let settings = slatedb::config::Settings {
-            wal_enabled: false,
             l0_max_ssts: 16,
             object_store_cache_options: ObjectStoreCacheOptions {
                 root_folder: Some(slatedb_cache_dir.clone().into()),
@@ -269,7 +267,7 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
 
-        let mut fs = Self {
+        let fs = Self {
             db: db.clone(),
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
@@ -278,8 +276,6 @@ impl ZeroFS {
             global_stats,
             flush_coordinator,
         };
-
-        fs.run_recovery_if_needed().await?;
 
         Ok(fs)
     }
@@ -495,7 +491,6 @@ impl ZeroFS {
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
 
         let settings = slatedb::config::Settings {
-            wal_enabled: false,
             compression_codec: None, // Disable compression - we handle it in encryption layer
             compactor_options: Some(slatedb::config::CompactorOptions {
                 ..Default::default()
@@ -608,7 +603,6 @@ impl ZeroFS {
         db_path: String,
     ) -> anyhow::Result<DangerousUnencryptedZeroFS> {
         let settings = slatedb::config::Settings {
-            wal_enabled: false,
             ..Default::default()
         };
 
