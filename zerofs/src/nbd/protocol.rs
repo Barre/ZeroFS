@@ -23,6 +23,7 @@ pub const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
 pub const NBD_FLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
 pub const NBD_FLAG_CAN_MULTI_CONN: u16 = 1 << 8;
 pub const NBD_FLAG_SEND_CACHE: u16 = 1 << 10;
+pub const NBD_FLAG_CAN_FAST_ZERO: u16 = 1 << 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u16", endian = "big")]
@@ -209,4 +210,5 @@ pub fn get_transmission_flags() -> u16 {
         | NBD_FLAG_SEND_WRITE_ZEROES
         | NBD_FLAG_CAN_MULTI_CONN
         | NBD_FLAG_SEND_CACHE
+        | NBD_FLAG_CAN_FAST_ZERO
 }
