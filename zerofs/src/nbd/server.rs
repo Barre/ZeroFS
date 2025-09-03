@@ -2,9 +2,10 @@ use super::error::{NBDError, Result};
 use super::protocol::{
     NBD_CMD_FLAG_FUA, NBD_EINVAL, NBD_EIO, NBD_ENOSPC, NBD_FLAG_C_FIXED_NEWSTYLE,
     NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_NO_ZEROES, NBD_INFO_EXPORT,
-    NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_ERR_UNSUP, NBD_REP_INFO,
-    NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand, NBDInfoExport, NBDOption,
-    NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
+    NBD_OPT_ABORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO, NBD_OPT_INFO, NBD_OPT_LIST,
+    NBD_OPT_STRUCTURED_REPLY, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
+    NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand,
+    NBDInfoExport, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     get_transmission_flags,
 };
 use crate::fs::errors::FsError;
@@ -291,27 +292,21 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 "Received option: {} (length: {})",
                 header.option, header.length
             );
-            debug!(
-                "NBDOption values - List: {}, Info: {}, Go: {}",
-                NBDOption::List as u32,
-                NBDOption::Info as u32,
-                NBDOption::Go as u32
-            );
 
             match header.option {
-                3 => {
+                NBD_OPT_LIST => {
                     debug!("Handling LIST option");
                     self.handle_list_option(header.length).await?;
                 }
-                1 => {
+                NBD_OPT_EXPORT_NAME => {
                     debug!("Handling EXPORT_NAME option");
                     return self.handle_export_name_option(header.length).await;
                 }
-                6 => {
+                NBD_OPT_INFO => {
                     debug!("Handling INFO option");
                     self.handle_info_option(header.length).await?;
                 }
-                7 => {
+                NBD_OPT_GO => {
                     match self.handle_go_option(header.length).await {
                         Ok(device) => return Ok(device),
                         Err(NBDError::DeviceNotFound(_)) => {
@@ -321,11 +316,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                         Err(e) => return Err(e),
                     }
                 }
-                8 => {
+                NBD_OPT_STRUCTURED_REPLY => {
                     debug!("Handling STRUCTURED_REPLY option");
                     self.handle_structured_reply_option(header.length).await?;
                 }
-                2 => {
+                NBD_OPT_ABORT => {
                     debug!("Handling ABORT option");
                     self.send_option_reply(header.option, NBD_REP_ACK, &[])
                         .await?;
@@ -359,11 +354,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             reply_data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
             reply_data.extend_from_slice(name_bytes);
 
-            self.send_option_reply(NBDOption::List as u32, NBD_REP_SERVER, &reply_data)
+            self.send_option_reply(NBD_OPT_LIST, NBD_REP_SERVER, &reply_data)
                 .await?;
         }
 
-        self.send_option_reply(NBDOption::List as u32, NBD_REP_ACK, &[])
+        self.send_option_reply(NBD_OPT_LIST, NBD_REP_ACK, &[])
             .await?;
         self.writer.flush().await?;
         Ok(())
@@ -404,7 +399,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_info_option(&mut self, length: u32) -> Result<()> {
         if length < 4 {
-            self.send_option_reply(NBDOption::Info as u32, NBD_REP_ERR_INVALID, &[])
+            self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_INVALID, &[])
                 .await?;
             self.writer.flush().await?;
             return Ok(());
@@ -415,7 +410,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if data.len() < 4 + name_len + 2 {
-            self.send_option_reply(NBDOption::Info as u32, NBD_REP_ERR_INVALID, &[])
+            self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_INVALID, &[])
                 .await?;
             self.writer.flush().await?;
             return Err(NBDError::Protocol("Invalid INFO option length".to_string()));
@@ -435,15 +430,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     transmission_flags: get_transmission_flags(),
                 };
                 let info_bytes = info.to_bytes()?;
-                self.send_option_reply(NBDOption::Info as u32, NBD_REP_INFO, &info_bytes)
+                self.send_option_reply(NBD_OPT_INFO, NBD_REP_INFO, &info_bytes)
                     .await?;
-                self.send_option_reply(NBDOption::Info as u32, NBD_REP_ACK, &[])
+                self.send_option_reply(NBD_OPT_INFO, NBD_REP_ACK, &[])
                     .await?;
                 self.writer.flush().await?;
                 Ok(())
             }
             Err(_) => {
-                self.send_option_reply(NBDOption::Info as u32, NBD_REP_ERR_UNKNOWN, &[])
+                self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_UNKNOWN, &[])
                     .await?;
                 self.writer.flush().await?;
                 Ok(())
@@ -456,7 +451,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         self.reader.read_exact(&mut data).await?;
 
         if data.len() < 4 {
-            self.send_option_reply(NBDOption::Go as u32, NBD_REP_ERR_INVALID, &[])
+            self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_INVALID, &[])
                 .await?;
             self.writer.flush().await?;
             return Err(NBDError::Protocol("Invalid GO option".to_string()));
@@ -464,7 +459,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if data.len() < 4 + name_len + 2 {
-            self.send_option_reply(NBDOption::Go as u32, NBD_REP_ERR_INVALID, &[])
+            self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_INVALID, &[])
                 .await?;
             self.writer.flush().await?;
             return Err(NBDError::Protocol("Invalid GO option length".to_string()));
@@ -489,15 +484,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     transmission_flags: get_transmission_flags(),
                 };
                 let info_bytes = info.to_bytes()?;
-                self.send_option_reply(NBDOption::Go as u32, NBD_REP_INFO, &info_bytes)
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_INFO, &info_bytes)
                     .await?;
-                self.send_option_reply(NBDOption::Go as u32, NBD_REP_ACK, &[])
-                    .await?;
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_ACK, &[]).await?;
                 self.writer.flush().await?;
                 Ok(device)
             }
             Err(_) => {
-                self.send_option_reply(NBDOption::Go as u32, NBD_REP_ERR_UNKNOWN, &[])
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
                     .await?;
                 self.writer.flush().await?;
                 Err(NBDError::DeviceNotFound(name.to_string()))
@@ -512,7 +506,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
 
         // We don't support structured replies for now
-        self.send_option_reply(NBDOption::StructuredReply as u32, NBD_REP_ERR_UNSUP, &[])
+        self.send_option_reply(NBD_OPT_STRUCTURED_REPLY, NBD_REP_ERR_UNSUP, &[])
             .await?;
         self.writer.flush().await?;
         Ok(())
