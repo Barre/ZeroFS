@@ -45,20 +45,27 @@ pub enum NBDCommand {
     Unknown(u16),
 }
 
+pub const NBD_OPT_EXPORT_NAME: u32 = 1;
+pub const NBD_OPT_ABORT: u32 = 2;
+pub const NBD_OPT_LIST: u32 = 3;
+pub const NBD_OPT_INFO: u32 = 6;
+pub const NBD_OPT_GO: u32 = 7;
+pub const NBD_OPT_STRUCTURED_REPLY: u32 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u32")]
 pub enum NBDOption {
-    #[deku(id = "1")]
+    #[deku(id = "NBD_OPT_EXPORT_NAME")]
     ExportName,
-    #[deku(id = "2")]
+    #[deku(id = "NBD_OPT_ABORT")]
     Abort,
-    #[deku(id = "3")]
+    #[deku(id = "NBD_OPT_LIST")]
     List,
-    #[deku(id = "6")]
+    #[deku(id = "NBD_OPT_INFO")]
     Info,
-    #[deku(id = "7")]
+    #[deku(id = "NBD_OPT_GO")]
     Go,
-    #[deku(id = "8")]
+    #[deku(id = "NBD_OPT_STRUCTURED_REPLY")]
     StructuredReply,
 }
 
