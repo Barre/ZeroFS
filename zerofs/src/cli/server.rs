@@ -292,11 +292,13 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");
-            fs.mark_clean_shutdown().await?;
+            fs.flush().await?;
+            fs.db.close().await?;
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, shutting down gracefully...");
-            fs.mark_clean_shutdown().await?;
+            fs.flush().await?;
+            fs.db.close().await?;
         }
     }
 

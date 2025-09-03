@@ -9,7 +9,6 @@ pub const PREFIX_DIR_SCAN: u8 = 0x04;
 pub const PREFIX_TOMBSTONE: u8 = 0x05;
 pub const PREFIX_STATS: u8 = 0x06;
 pub const PREFIX_SYSTEM: u8 = 0x07;
-pub const PREFIX_RECOVERY: u8 = 0x08;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
@@ -94,10 +93,6 @@ impl KeyCodec {
 
     pub fn system_counter_key() -> Bytes {
         Bytes::from(vec![PREFIX_SYSTEM, SYSTEM_COUNTER_SUBTYPE])
-    }
-
-    pub fn recovery_key() -> Bytes {
-        Bytes::from(vec![PREFIX_RECOVERY])
     }
 
     pub fn parse_key(key: &[u8]) -> ParsedKey {
