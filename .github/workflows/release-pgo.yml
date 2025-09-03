@@ -343,6 +343,11 @@ jobs:
             os: macos-latest
             platform: darwin
             use_cross: false
+          - target: x86_64-unknown-freebsd
+            arch: amd64
+            os: ubuntu-latest
+            platform: freebsd
+            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -354,6 +359,7 @@ jobs:
           path: pgo-data/
 
       - name: Install Rust
+        if: matrix.platform != 'freebsd'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -364,6 +370,7 @@ jobs:
           cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Setup PGO profile
+        if: matrix.platform != 'freebsd'
         run: |
           cp pgo-data/merged.profdata zerofs/
           cp pgo-data/Cargo.lock zerofs/
@@ -374,14 +381,44 @@ jobs:
           cd zerofs && RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
 
       - name: Build with PGO (cargo)
-        if: matrix.use_cross == false
+        if: matrix.use_cross == false && matrix.platform != 'freebsd'
         run: |
           cd zerofs && RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
+
+      - name: Build on FreeBSD with PGO
+        if: matrix.platform == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y gmake curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          run: |
+            . $HOME/.cargo/env
+            echo "Building ZeroFS for FreeBSD with PGO..."
+            echo "Rust version: $(rustc --version)"
+            
+            # Copy PGO data into VM
+            cp pgo-data/merged.profdata zerofs/
+            cp pgo-data/Cargo.lock zerofs/
+            
+            cd zerofs
+            RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cargo build --release
+            
+            file target/release/zerofs
+            ls -lh target/release/zerofs
+            
+            cp target/release/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+            rm -rf target/
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          if [ "${{ matrix.platform }}" = "freebsd" ]; then
+            mv zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo artifacts/
+          else
+            cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          fi
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
 
       - name: Generate attestation for binary
