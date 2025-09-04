@@ -23,7 +23,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "0bf591030aa4cf07b421d2368c2d08ebd38d43f3" }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "b6f57c74eb0caf814fc70fafae889096b7696a30" }
 mimalloc = "0.1"
 zerofs_nfsserve = "0.14"
 tokio = { version = "1.46", features = ["full"] }
