@@ -39,7 +39,8 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           # Download MinIO binary
-          wget https://dl.min.io/server/minio/release/darwin-amd64/minio
+          wget https://dl.min.io/server/minio/release/darwin-amd64/archive/minio.RELEASE.2025-07-23T15-54-02Z
+          mv minio.RELEASE.2025-07-23T15-54-02Z minio
           chmod +x minio
 
           # Start MinIO in background
