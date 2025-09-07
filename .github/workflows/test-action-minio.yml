@@ -12,10 +12,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Start MinIO (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -25,7 +25,7 @@ jobs:
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             minio/minio server /data
-          
+
           # Wait for MinIO to be ready
           for i in {1..30}; do
             if curl -f http://localhost:9000/minio/health/live; then
@@ -34,19 +34,20 @@ jobs:
             fi
             sleep 1
           done
-      
+
       - name: Start MinIO (macOS)
         if: runner.os == 'macOS'
         run: |
           # Download MinIO binary
           wget https://dl.min.io/server/minio/release/darwin-amd64/minio
           chmod +x minio
-          
+
           # Start MinIO in background
           export MINIO_ROOT_USER=minioadmin
           export MINIO_ROOT_PASSWORD=minioadmin
-          ./minio server /tmp/minio-data &
-          
+          mkdir -p ${{ github.workspace }}/minio-data
+          ./minio server ${{ github.workspace }}/minio-data &
+
           # Wait for MinIO to be ready
           for i in {1..30}; do
             if curl -f http://localhost:9000/minio/health/live; then
@@ -55,7 +56,7 @@ jobs:
             fi
             sleep 1
           done
-      
+
       - name: Setup MinIO bucket
         run: |
           # Install mc (MinIO client)
@@ -67,31 +68,31 @@ jobs:
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/test-bucket || true
-      
+
       - name: Setup ZeroFS Volume
         id: setup-zerofs
         uses: ./
         with:
-          object-store-url: 's3://test-bucket/github-actions-test'
-          encryption-password: 'test-password-123'
-          aws-access-key-id: 'minioadmin'
-          aws-secret-access-key: 'minioadmin'
-          aws-endpoint: 'http://localhost:9000'
-          aws-allow-http: 'true'
-          aws-region: 'us-east-1'
-          cache-size-gb: '1'
-          mount-path: '/mnt/zerofs-test'
-      
+          object-store-url: "s3://test-bucket/github-actions-test"
+          encryption-password: "test-password-123"
+          aws-access-key-id: "minioadmin"
+          aws-secret-access-key: "minioadmin"
+          aws-endpoint: "http://localhost:9000"
+          aws-allow-http: "true"
+          aws-region: "us-east-1"
+          cache-size-gb: "1"
+          mount-path: "/mnt/zerofs-test"
+
       - name: Test Volume Operations
         run: |
           echo "Testing ZeroFS volume on ${{ matrix.os }}..."
-          
+
           # Use the mount path from the action output
           MOUNT_PATH="${{ steps.setup-zerofs.outputs.mount-path }}"
           if [ -z "$MOUNT_PATH" ]; then
             MOUNT_PATH="/mnt/zerofs-test"
           fi
-          
+
           sudo mkdir -p "$MOUNT_PATH/test-dir"
           echo "Hello from GitHub Actions on ${{ matrix.os }}!" | sudo tee "$MOUNT_PATH/test-dir/test.txt"
           sudo cat "$MOUNT_PATH/test-dir/test.txt"
