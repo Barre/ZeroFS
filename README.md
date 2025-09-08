@@ -402,8 +402,6 @@ rm /mnt/zerofs/.nbd/my-device
 
 Devices are discovered dynamically by the NBD server - no restart needed! You can read/write these files directly through NFS/9P, or access them as block devices through NBD.
 
-**Important**: Once an NBD device is created with a specific size, the size cannot be changed. To resize, delete and recreate the device.
-
 ## Geo-Distributed Storage with ZFS
 
 Since ZeroFS makes S3 regions look like local block devices, you can create globally distributed ZFS pools by running multiple ZeroFS instances across different regions:
