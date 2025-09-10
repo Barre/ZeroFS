@@ -472,6 +472,43 @@ pub struct Rreaddir {
     pub data: Vec<u8>,
 }
 
+impl Rreaddir {
+    pub fn from_entries(entries: Vec<DirEntry>) -> Result<Self, DekuError> {
+        use deku::DekuContainerWrite;
+
+        let mut data = Vec::new();
+        for entry in entries {
+            let bytes = entry.to_bytes()?;
+            data.extend_from_slice(&bytes);
+        }
+
+        Ok(Rreaddir {
+            count: data.len() as u32,
+            data,
+        })
+    }
+
+    pub fn to_entries(&self) -> Result<Vec<DirEntry>, DekuError> {
+        use deku::DekuContainerRead;
+
+        let mut entries = Vec::new();
+        let mut offset = 0;
+
+        while offset < self.data.len() {
+            let remaining = &self.data[offset..];
+            let (_, entry) = DirEntry::from_bytes((remaining, 0))?;
+
+            // Calculate how many bytes were consumed
+            let entry_bytes = entry.to_bytes()?;
+            offset += entry_bytes.len();
+
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rgetattr {
     #[deku(endian = "little")]
@@ -672,17 +709,7 @@ pub struct P9Message {
 
 impl P9Message {
     pub fn to_bytes(&self) -> Result<Vec<u8>, DekuError> {
-        use deku::prelude::*;
-        use std::io::Cursor;
-
-        // First serialize without the size field
-        let mut temp = self.clone();
-        temp.size = 0;
-        let mut bytes = Vec::new();
-        let mut cursor = Cursor::new(&mut bytes);
-        let mut writer = Writer::new(&mut cursor);
-        temp.to_writer(&mut writer, ())?;
-        drop(writer);
+        let mut bytes = DekuContainerWrite::to_bytes(self)?;
 
         // Update the size field with the actual size
         let size = bytes.len() as u32;

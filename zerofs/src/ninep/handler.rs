@@ -487,7 +487,8 @@ impl NinePHandler {
             fid.dir_last_cookie = cookie;
         }
 
-        let mut data = Vec::new();
+        let mut dir_entries = Vec::new();
+        let mut total_size = 0usize;
 
         for (offset, name, _) in &entries_to_return {
             let (child_id, child_inode) = if name == "." {
@@ -551,24 +552,23 @@ impl NinePHandler {
                 name: P9String::new(name),
             };
 
-            let encoded = dirent
-                .to_bytes()
-                .map_err(|_| libc::EIO as u32)
-                .unwrap_or_default();
+            // Check if adding this entry would exceed the count limit
+            let entry_size = dirent.to_bytes().map(|b| b.len()).unwrap_or(0);
 
-            if data.len() + encoded.len() > tr.count as usize {
+            if total_size + entry_size > tr.count as usize {
                 break;
             }
 
-            data.extend_from_slice(&encoded);
+            total_size += entry_size;
+            dir_entries.push(dirent);
         }
 
         P9Message::new(
             tag,
-            Message::Rreaddir(Rreaddir {
-                count: data.len() as u32,
-                data,
-            }),
+            Message::Rreaddir(Rreaddir::from_entries(dir_entries).unwrap_or(Rreaddir {
+                count: 0,
+                data: Vec::new(),
+            })),
         )
     }
 
@@ -1721,22 +1721,9 @@ mod tests {
 
         let entries_count = match &resp.body {
             Message::Rreaddir(rreaddir) => {
-                assert!(!rreaddir.data.is_empty());
-                let mut count = 0;
-                let mut offset = 0;
-                while offset < rreaddir.data.len() {
-                    // Each entry: qid(13) + offset(8) + type(1) + name_len(2) + name
-                    if offset + 24 > rreaddir.data.len() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes([
-                        rreaddir.data[offset + 22],
-                        rreaddir.data[offset + 23],
-                    ]) as usize;
-                    offset += 24 + name_len;
-                    count += 1;
-                }
-                count
+                let entries = rreaddir.to_entries().unwrap();
+                assert!(!entries.is_empty());
+                entries.len()
             }
             _ => panic!("Expected Rreaddir"),
         };
@@ -1758,20 +1745,8 @@ mod tests {
         match &resp.body {
             Message::Rreaddir(rreaddir) => {
                 // Should have fewer entries when starting from offset 5
-                let mut count = 0;
-                let mut offset = 0;
-                while offset < rreaddir.data.len() {
-                    if offset + 24 > rreaddir.data.len() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes([
-                        rreaddir.data[offset + 22],
-                        rreaddir.data[offset + 23],
-                    ]) as usize;
-                    offset += 24 + name_len;
-                    count += 1;
-                }
-                assert_eq!(count, entries_count - 5);
+                let entries = rreaddir.to_entries().unwrap();
+                assert_eq!(entries.len(), entries_count - 5);
             }
             _ => panic!("Expected Rreaddir"),
         };
@@ -1843,24 +1818,11 @@ mod tests {
         match &resp.body {
             Message::Rreaddir(rreaddir) => {
                 // Should successfully read from offset 1
-                assert!(!rreaddir.data.is_empty());
+                let entries = rreaddir.to_entries().unwrap();
+                assert!(!entries.is_empty());
 
-                // Count entries
-                let mut count = 0;
-                let mut offset = 0;
-                while offset < rreaddir.data.len() {
-                    if offset + 24 > rreaddir.data.len() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes([
-                        rreaddir.data[offset + 22],
-                        rreaddir.data[offset + 23],
-                    ]) as usize;
-                    offset += 24 + name_len;
-                    count += 1;
-                }
                 // Should have 6 entries from offset 1 (skipping only ".")
-                assert_eq!(count, 6, "Expected 6 entries from offset 1");
+                assert_eq!(entries.len(), 6, "Expected 6 entries from offset 1");
             }
             _ => panic!("Expected Rreaddir"),
         };
@@ -1938,44 +1900,18 @@ mod tests {
 
             match &resp.body {
                 Message::Rreaddir(rreaddir) => {
-                    if rreaddir.data.is_empty() {
+                    let entries = rreaddir.to_entries().unwrap();
+                    if entries.is_empty() {
                         println!("Got empty response, ending");
                         break;
                     }
 
                     // Parse entries
-                    let mut pos = 0;
                     let mut batch_count = 0;
 
-                    while pos < rreaddir.data.len() {
-                        if pos + 24 > rreaddir.data.len() {
-                            break;
-                        }
-
-                        // Skip qid (13 bytes), read offset (8 bytes)
-                        let entry_offset = u64::from_le_bytes([
-                            rreaddir.data[pos + 13],
-                            rreaddir.data[pos + 14],
-                            rreaddir.data[pos + 15],
-                            rreaddir.data[pos + 16],
-                            rreaddir.data[pos + 17],
-                            rreaddir.data[pos + 18],
-                            rreaddir.data[pos + 19],
-                            rreaddir.data[pos + 20],
-                        ]);
-
-                        // Skip type (1 byte), read name length (2 bytes)
-                        let name_len =
-                            u16::from_le_bytes([rreaddir.data[pos + 22], rreaddir.data[pos + 23]])
-                                as usize;
-
-                        if pos + 24 + name_len > rreaddir.data.len() {
-                            break;
-                        }
-
-                        let name =
-                            String::from_utf8_lossy(&rreaddir.data[pos + 24..pos + 24 + name_len])
-                                .to_string();
+                    for entry in &entries {
+                        let entry_offset = entry.offset;
+                        let name = entry.name.as_str().unwrap_or("").to_string();
 
                         // Check for duplicate offsets
                         if !seen_offsets.insert(entry_offset) {
@@ -1996,7 +1932,6 @@ mod tests {
                         }
 
                         current_offset = entry_offset;
-                        pos += 24 + name_len;
                     }
 
                     println!(
@@ -2109,20 +2044,8 @@ mod tests {
         match &resp.body {
             Message::Rreaddir(rreaddir) => {
                 // Should have . and .. entries
-                let mut count = 0;
-                let mut offset = 0;
-                while offset < rreaddir.data.len() {
-                    if offset + 24 > rreaddir.data.len() {
-                        break;
-                    }
-                    let name_len = u16::from_le_bytes([
-                        rreaddir.data[offset + 22],
-                        rreaddir.data[offset + 23],
-                    ]) as usize;
-                    offset += 24 + name_len;
-                    count += 1;
-                }
-                assert_eq!(count, 2, "Expected 2 entries (. and ..)");
+                let entries = rreaddir.to_entries().unwrap();
+                assert_eq!(entries.len(), 2, "Expected 2 entries (. and ..)");
             }
             _ => panic!("Expected Rreaddir"),
         };
@@ -2136,8 +2059,9 @@ mod tests {
 
         match &resp.body {
             Message::Rreaddir(rreaddir) => {
+                let entries = rreaddir.to_entries().unwrap();
                 assert_eq!(
-                    rreaddir.data.len(),
+                    entries.len(),
                     0,
                     "Expected empty response for offset past end"
                 );
@@ -2154,8 +2078,9 @@ mod tests {
 
         match &resp.body {
             Message::Rreaddir(rreaddir) => {
+                let entries = rreaddir.to_entries().unwrap();
                 assert_eq!(
-                    rreaddir.data.len(),
+                    entries.len(),
                     0,
                     "Expected empty response for sequential read past end"
                 );
