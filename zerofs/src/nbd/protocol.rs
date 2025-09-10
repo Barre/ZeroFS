@@ -25,6 +25,18 @@ pub const NBD_FLAG_CAN_MULTI_CONN: u16 = 1 << 8;
 pub const NBD_FLAG_SEND_CACHE: u16 = 1 << 10;
 pub const NBD_FLAG_CAN_FAST_ZERO: u16 = 1 << 11;
 
+// Command flags
+pub const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
+
+pub const TRANSMISSION_FLAGS: u16 = NBD_FLAG_HAS_FLAGS
+    | NBD_FLAG_SEND_FLUSH
+    | NBD_FLAG_SEND_FUA
+    | NBD_FLAG_SEND_TRIM
+    | NBD_FLAG_SEND_WRITE_ZEROES
+    | NBD_FLAG_CAN_MULTI_CONN
+    | NBD_FLAG_SEND_CACHE
+    | NBD_FLAG_CAN_FAST_ZERO;
+
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u16", endian = "big")]
 pub enum NBDCommand {
@@ -197,18 +209,4 @@ impl NBDExportInfo {
             transmission_flags: flags,
         }
     }
-}
-
-// Command flags
-pub const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
-
-pub fn get_transmission_flags() -> u16 {
-    NBD_FLAG_HAS_FLAGS
-        | NBD_FLAG_SEND_FLUSH
-        | NBD_FLAG_SEND_FUA
-        | NBD_FLAG_SEND_TRIM
-        | NBD_FLAG_SEND_WRITE_ZEROES
-        | NBD_FLAG_CAN_MULTI_CONN
-        | NBD_FLAG_SEND_CACHE
-        | NBD_FLAG_CAN_FAST_ZERO
 }

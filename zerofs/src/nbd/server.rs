@@ -6,7 +6,7 @@ use super::protocol::{
     NBD_OPT_STRUCTURED_REPLY, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
     NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand,
     NBDInfoExport, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
-    get_transmission_flags,
+    TRANSMISSION_FLAGS,
 };
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
@@ -383,7 +383,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         self.writer.write_all(&device.size.to_be_bytes()).await?;
         self.writer
-            .write_all(&get_transmission_flags().to_be_bytes())
+            .write_all(&TRANSMISSION_FLAGS.to_be_bytes())
             .await?;
 
         // Only send 124 bytes of zeroes if client didn't set NBD_FLAG_C_NO_ZEROES
@@ -427,7 +427,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 let info = NBDInfoExport {
                     info_type: NBD_INFO_EXPORT,
                     size: device.size,
-                    transmission_flags: get_transmission_flags(),
+                    transmission_flags: TRANSMISSION_FLAGS,
                 };
                 let info_bytes = info.to_bytes()?;
                 self.send_option_reply(NBD_OPT_INFO, NBD_REP_INFO, &info_bytes)
@@ -481,7 +481,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 let info = NBDInfoExport {
                     info_type: NBD_INFO_EXPORT,
                     size: device.size,
-                    transmission_flags: get_transmission_flags(),
+                    transmission_flags: TRANSMISSION_FLAGS,
                 };
                 let info_bytes = info.to_bytes()?;
                 self.send_option_reply(NBD_OPT_GO, NBD_REP_INFO, &info_bytes)
