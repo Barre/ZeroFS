@@ -1,8 +1,8 @@
 use deku::prelude::*;
 
 // NBD Magic numbers
-pub const NBD_MAGIC: u64 = 0x4e42444d41474943; // "NBDMAGIC"
-pub const NBD_IHAVEOPT: u64 = 0x49484156454F5054; // "IHAVEOPT"
+pub const NBD_MAGIC: u64 = 0x4e42444d41474943;
+pub const NBD_IHAVEOPT: u64 = 0x49484156454F5054;
 pub const NBD_REQUEST_MAGIC: u32 = 0x25609513;
 pub const NBD_SIMPLE_REPLY_MAGIC: u32 = 0x67446698;
 pub const NBD_REPLY_MAGIC: u64 = 0x3e889045565a9;
@@ -37,6 +37,30 @@ pub const TRANSMISSION_FLAGS: u16 = NBD_FLAG_HAS_FLAGS
     | NBD_FLAG_SEND_CACHE
     | NBD_FLAG_CAN_FAST_ZERO;
 
+pub const NBD_OPT_EXPORT_NAME: u32 = 1;
+pub const NBD_OPT_ABORT: u32 = 2;
+pub const NBD_OPT_LIST: u32 = 3;
+pub const NBD_OPT_INFO: u32 = 6;
+pub const NBD_OPT_GO: u32 = 7;
+pub const NBD_OPT_STRUCTURED_REPLY: u32 = 8;
+
+// Option reply types
+pub const NBD_REP_ACK: u32 = 1;
+pub const NBD_REP_SERVER: u32 = 2;
+pub const NBD_REP_INFO: u32 = 3;
+pub const NBD_REP_ERR_UNSUP: u32 = 0x80000001;
+pub const NBD_REP_ERR_INVALID: u32 = 0x80000003;
+pub const NBD_REP_ERR_UNKNOWN: u32 = 0x80000006;
+
+// Info types
+pub const NBD_INFO_EXPORT: u16 = 0;
+
+// Error codes
+pub const NBD_SUCCESS: u32 = 0;
+pub const NBD_EIO: u32 = 5;
+pub const NBD_EINVAL: u32 = 22;
+pub const NBD_ENOSPC: u32 = 28;
+
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u16", endian = "big")]
 pub enum NBDCommand {
@@ -58,13 +82,6 @@ pub enum NBDCommand {
     Unknown(u16),
 }
 
-pub const NBD_OPT_EXPORT_NAME: u32 = 1;
-pub const NBD_OPT_ABORT: u32 = 2;
-pub const NBD_OPT_LIST: u32 = 3;
-pub const NBD_OPT_INFO: u32 = 6;
-pub const NBD_OPT_GO: u32 = 7;
-pub const NBD_OPT_STRUCTURED_REPLY: u32 = 8;
-
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u32")]
 pub enum NBDOption {
@@ -81,23 +98,6 @@ pub enum NBDOption {
     #[deku(id = "NBD_OPT_STRUCTURED_REPLY")]
     StructuredReply,
 }
-
-// Option reply types
-pub const NBD_REP_ACK: u32 = 1;
-pub const NBD_REP_SERVER: u32 = 2;
-pub const NBD_REP_INFO: u32 = 3;
-pub const NBD_REP_ERR_UNSUP: u32 = 0x80000001;
-pub const NBD_REP_ERR_INVALID: u32 = 0x80000003;
-pub const NBD_REP_ERR_UNKNOWN: u32 = 0x80000006;
-
-// Info types
-pub const NBD_INFO_EXPORT: u16 = 0;
-
-// Error codes
-pub const NBD_SUCCESS: u32 = 0;
-pub const NBD_EIO: u32 = 5;
-pub const NBD_EINVAL: u32 = 22;
-pub const NBD_ENOSPC: u32 = 28;
 
 #[derive(Debug, DekuRead, DekuWrite)]
 #[deku(endian = "big")]
