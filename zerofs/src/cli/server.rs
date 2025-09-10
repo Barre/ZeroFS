@@ -152,11 +152,11 @@ fn start_garbage_collection(fs: Arc<ZeroFS>) -> JoinHandle<()> {
 
 fn start_stats_reporting(fs: Arc<ZeroFS>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        info!("Starting stats reporting task (reports every 5 seconds)");
+        info!("Starting stats reporting task (reports to debug every 5 seconds)");
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            info!("\n{}", fs.stats.report());
+            fs.stats.output_report_debug();
         }
     })
 }

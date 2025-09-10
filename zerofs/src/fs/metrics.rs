@@ -294,4 +294,8 @@ impl FileSystemStats {
 
         table.to_string()
     }
+
+    pub fn output_report_debug(&self) {
+        tracing::debug!("\n{}", self.report());
+    }
 }
