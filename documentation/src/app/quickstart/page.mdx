@@ -24,7 +24,7 @@ ZeroFS is distributed as a single static binary. Choose your installation method
 curl -LO https://github.com/Barre/ZeroFS/releases/latest/download/zerofs-pgo-multiplatform.tar.gz
 
 # Extract the archive
-tar -xzf zerofs-pgo-multiplatform.tar.gz
+tar -xzf zerofs-pgo-multiplatform.tar.gz zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)-pgo
 
 # Make the binary executable and move it to PATH
 chmod +x zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)-pgo
@@ -32,6 +32,7 @@ sudo mv zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)-pgo /usr/loc
 
 # Clean up the archive
 rm zerofs-pgo-multiplatform.tar.gz
+rm zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)-pgo
 ```
 
 ```bash {{ title: 'Via Cargo' }}
