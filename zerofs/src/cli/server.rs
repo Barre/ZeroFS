@@ -3,6 +3,7 @@ use crate::config::{NbdConfig, NfsConfig, NinePConfig, Settings};
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
+use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -182,8 +183,7 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
         }
     }
 
-    let (object_store, path_from_url) =
-        object_store::parse_url_opts(&url.parse()?, env_vars.into_iter())?;
+    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.into_iter())?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
 
     let actual_db_path = path_from_url.to_string();

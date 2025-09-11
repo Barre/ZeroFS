@@ -11,6 +11,7 @@ mod key_management;
 mod nbd;
 mod nfs;
 mod ninep;
+mod parse_object_store;
 mod storage_compatibility;
 
 #[cfg(test)]
