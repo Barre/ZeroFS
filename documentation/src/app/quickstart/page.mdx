@@ -27,8 +27,8 @@ curl -LO https://github.com/Barre/ZeroFS/releases/latest/download/zerofs-pgo-mul
 tar -xzf zerofs-pgo-multiplatform.tar.gz
 
 # Make the binary executable and move it to PATH
-chmod +x zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)
-sudo mv zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m) /usr/local/bin/zerofs
+chmod +x zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)-pgo
+sudo mv zerofs-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)-pgo /usr/local/bin/zerofs
 
 # Clean up the archive
 rm zerofs-pgo-multiplatform.tar.gz
