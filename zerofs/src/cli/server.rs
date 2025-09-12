@@ -209,7 +209,16 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
         cache_config.root_folder
     );
 
-    crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path).await?;
+    if !settings.storage.skip_compatibility_check {
+        crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
+            .await?;
+    } else {
+        tracing::warn!(
+            "Compatibility check skipped per configuration. \
+            WARNING: Running multiple ZeroFS instances on the same storage \
+            backend may cause data corruption!"
+        );
+    }
 
     let password = settings.storage.encryption_password.clone();
 
