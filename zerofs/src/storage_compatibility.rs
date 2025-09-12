@@ -24,7 +24,7 @@ pub async fn check_if_match_support(
     object_store
         .put(&test_path, "initial".into())
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to write test file: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to write test file: {e:#?}"))?;
 
     let result = object_store
         .put_opts(
