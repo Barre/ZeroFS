@@ -2,3 +2,4 @@ target
 /mnt
 /cache
 bench/bench_workspace
+zerofs.toml
