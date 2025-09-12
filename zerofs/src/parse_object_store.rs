@@ -1,4 +1,4 @@
-// Vendored and slightly modified from: https://github.com/apache/arrow-rs-object-store/blob/c0e241eb95a61d52964f3d7741673b91f86db58b/src/client/mod.rs
+// Vendored and slightly modified from: https://github.com/apache/arrow-rs-object-store/blob/c0e241eb95a61d52964f3d7741673b91f86db58b/src/parse.rs
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
