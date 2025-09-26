@@ -51,11 +51,15 @@ impl ZeroFS {
 
     /// Check execute permission on all parent directories leading to a file
     ///
+    /// For files with multiple hardlinks (nlink > 1), this check is skipped because:
+    /// - We cannot determine which parent directory was actually used for access
+    /// - The stored parent field only reflects the original creation directory
+    ///
     /// NOTE: This function has a known race condition - parent directory permissions
     /// could change after we check them but before the operation completes. This is
     /// accepted because:
     /// - The race window is extremely small
-    /// - Fixing it would require complex multi-directory locking  
+    /// - Fixing it would require complex multi-directory locking
     /// - NFS traditionally has relaxed consistency semantics
     pub async fn check_parent_execute_permissions(
         &self,
@@ -67,6 +71,17 @@ impl ZeroFS {
         }
 
         let inode = self.load_inode(id).await?;
+
+        match &inode {
+            Inode::File(f) if f.nlink > 1 => return Ok(()),
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s)
+                if s.nlink > 1 =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let parent_id = match &inode {
             Inode::File(f) => f.parent,
             Inode::Directory(d) => d.parent,
