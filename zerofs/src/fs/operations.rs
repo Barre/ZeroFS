@@ -885,30 +885,6 @@ mod tests {
             ..Default::default()
         };
 
-        let result = fs
-            .process_setattr(&test_creds(), file_id, &chmod_attrs)
-            .await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs
-            .process_read_file(&(&test_auth()).into(), file_id, 0, 100)
-            .await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs
-            .process_write(&(&test_auth()).into(), file_id, 0, b"new data")
-            .await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let exec_attrs = SetAttributes {
-            mode: SetMode::Set(0o755),
-            ..Default::default()
-        };
-
-        fs.process_setattr(&test_creds(), dir_id, &exec_attrs)
-            .await
-            .unwrap();
-
         fs.process_setattr(&test_creds(), file_id, &chmod_attrs)
             .await
             .unwrap();
@@ -922,5 +898,15 @@ mod tests {
         fs.process_write(&(&test_auth()).into(), file_id, 0, b"updated data")
             .await
             .unwrap();
+
+        let result = fs
+            .process_create(
+                &test_creds(),
+                dir_id,
+                b"new_file.txt",
+                &SetAttributes::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
     }
 }

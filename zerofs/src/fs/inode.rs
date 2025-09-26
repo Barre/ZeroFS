@@ -14,7 +14,7 @@ pub struct FileInode {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    pub parent: InodeId,
+    pub parent: InodeId, // Directory where file was originally created. For hardlinks, this is not updated.
     pub nlink: u32,
 }
 

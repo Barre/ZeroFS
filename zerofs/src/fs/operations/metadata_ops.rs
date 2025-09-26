@@ -24,8 +24,6 @@ impl ZeroFS {
         let _guard = self.lock_manager.acquire_write(id).await;
         let mut inode = self.load_inode(id).await?;
 
-        self.check_parent_execute_permissions(id, creds).await?;
-
         // For chmod (mode change), must be owner
         if matches!(setattr.mode, SetMode::Set(_)) {
             check_ownership(&inode, creds)?;

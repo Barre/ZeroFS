@@ -171,9 +171,6 @@ impl ZeroFS {
         check_access(&link_dir_inode, &creds, AccessMode::Write)?;
         check_access(&link_dir_inode, &creds, AccessMode::Execute)?;
 
-        self.check_parent_execute_permissions(fileid, &creds)
-            .await?;
-
         let mut link_dir = match link_dir_inode {
             Inode::Directory(d) => d,
             _ => return Err(FsError::NotDirectory),

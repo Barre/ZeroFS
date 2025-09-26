@@ -35,9 +35,8 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        // Optimistically load inode and check parent permissions before lock
+        // Optimistically load inode before lock
         let _ = self.load_inode(id).await?;
-        self.check_parent_execute_permissions(id, &creds).await?;
 
         let _guard = self.lock_manager.acquire_write(id).await;
         let mut inode = self.load_inode(id).await?;
@@ -357,8 +356,6 @@ impl ZeroFS {
         let inode = self.load_inode(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
-
-        self.check_parent_execute_permissions(id, &creds).await?;
 
         check_access(&inode, &creds, AccessMode::Read)?;
 
