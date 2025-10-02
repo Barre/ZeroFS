@@ -30,6 +30,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: "clippy"
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
