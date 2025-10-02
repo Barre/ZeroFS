@@ -192,17 +192,19 @@ impl ZeroFS {
         &self,
         creds: &Credentials,
         dirid: InodeId,
-        filename: &[u8],
+        name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        validate_filename(filename)?;
+        validate_filename(name)?;
 
-        let filename_str = String::from_utf8_lossy(filename);
-        debug!("process_create: dirid={}, filename={}", dirid, filename_str);
-        let name = filename_str.to_string();
+        debug!(
+            "process_create: dirid={}, filename={}",
+            dirid,
+            String::from_utf8_lossy(name)
+        );
 
         // Optimistic existence check without holding lock
-        let entry_key = KeyCodec::dir_entry_key(dirid, &name);
+        let entry_key = KeyCodec::dir_entry_key(dirid, name);
         if self
             .db
             .get_bytes(&entry_key)
@@ -233,7 +235,11 @@ impl ZeroFS {
                 }
 
                 let file_id = self.allocate_inode().await?;
-                debug!("Allocated inode {} for file {}", file_id, name);
+                debug!(
+                    "Allocated inode {} for file {}",
+                    file_id,
+                    String::from_utf8_lossy(name)
+                );
 
                 let (now_sec, now_nsec) = get_current_time();
 
@@ -271,7 +277,7 @@ impl ZeroFS {
 
                 batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(file_id));
 
-                let scan_key = KeyCodec::dir_scan_key(dirid, file_id, &name);
+                let scan_key = KeyCodec::dir_scan_key(dirid, file_id, name);
                 batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(file_id));
 
                 dir.entry_count += 1;

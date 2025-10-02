@@ -14,14 +14,13 @@ impl ZeroFS {
         &self,
         auth: &AuthContext,
         dirid: InodeId,
-        filename: &[u8],
+        name: &[u8],
     ) -> Result<(), FsError> {
-        validate_filename(filename)?;
+        validate_filename(name)?;
 
-        let name = String::from_utf8_lossy(filename).to_string();
         let creds = Credentials::from_auth_context(auth);
 
-        let entry_key = KeyCodec::dir_entry_key(dirid, &name);
+        let entry_key = KeyCodec::dir_entry_key(dirid, name);
         let entry_data = self
             .db
             .get_bytes(&entry_key)
@@ -152,7 +151,7 @@ impl ZeroFS {
 
                 batch.delete_bytes(&entry_key);
 
-                let scan_key = KeyCodec::dir_scan_key(dirid, file_id, &name);
+                let scan_key = KeyCodec::dir_scan_key(dirid, file_id, name);
                 batch.delete_bytes(&scan_key);
 
                 dir.entry_count = dir.entry_count.saturating_sub(1);
@@ -207,7 +206,7 @@ impl ZeroFS {
                     .remove(crate::fs::cache::CacheKey::Metadata(dirid));
                 self.cache.remove(crate::fs::cache::CacheKey::DirEntry {
                     dir_id: dirid,
-                    name: name.clone(),
+                    name: name.to_vec(),
                 });
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
