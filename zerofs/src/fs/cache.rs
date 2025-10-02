@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum CacheKey {
     Metadata(InodeId),
-    DirEntry { dir_id: InodeId, name: String },
+    DirEntry { dir_id: InodeId, name: Vec<u8> },
 }
 
 #[derive(Clone, Serialize, Deserialize)]

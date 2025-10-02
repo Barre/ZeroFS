@@ -150,7 +150,7 @@ impl NinePHandler {
                 tag,
                 Message::Rversion(Rversion {
                     msize: tv.msize,
-                    version: P9String::new("unknown"),
+                    version: P9String::new(b"unknown".to_vec()),
                 }),
             );
         }
@@ -162,7 +162,7 @@ impl NinePHandler {
             tag,
             Message::Rversion(Rversion {
                 msize,
-                version: P9String::new(VERSION_9P2000L),
+                version: P9String::new(VERSION_9P2000L.to_vec()),
             }),
         )
     }
@@ -379,7 +379,7 @@ impl NinePHandler {
 
         let is_sequential = tr.offset == fid_entry.dir_last_offset;
 
-        let mut entries_to_return = Vec::new();
+        let mut entries_to_return: Vec<(u64, Vec<u8>, u64)> = Vec::new();
 
         let parent_id = match self.filesystem.load_inode(fid_entry.inode_id).await {
             Ok(Inode::Directory(dir)) => {
@@ -405,12 +405,12 @@ impl NinePHandler {
             // For non-sequential reads or starting fresh
             if tr.offset == 0 {
                 // Add both . and ..
-                entries_to_return.push((0, ".".to_string(), fid_entry.inode_id));
-                entries_to_return.push((1, "..".to_string(), parent_id));
+                entries_to_return.push((0, b".".to_vec(), fid_entry.inode_id));
+                entries_to_return.push((1, b"..".to_vec(), parent_id));
                 current_offset = 2;
             } else if tr.offset == 1 {
                 // Add only ..
-                entries_to_return.push((1, "..".to_string(), parent_id));
+                entries_to_return.push((1, b"..".to_vec(), parent_id));
                 current_offset = 2;
             } else {
                 // Start from offset 2 (after special entries)
@@ -443,10 +443,10 @@ impl NinePHandler {
                     let was_end = result.end;
 
                     for entry in result.entries {
-                        let name = String::from_utf8_lossy(&entry.name).to_string();
+                        let name = &entry.name;
 
                         // Skip special entries - we handle them manually
-                        if name == "." || name == ".." {
+                        if name == b"." || name == b".." {
                             cookie = entry.fileid;
                             continue;
                         }
@@ -455,7 +455,7 @@ impl NinePHandler {
                             current_offset += 1;
                         } else {
                             // We've reached the target offset, start collecting
-                            entries_to_return.push((current_offset, name, entry.fileid));
+                            entries_to_return.push((current_offset, name.clone(), entry.fileid));
                             current_offset += 1;
                         }
 
@@ -491,13 +491,13 @@ impl NinePHandler {
         let mut total_size = 0usize;
 
         for (offset, name, _) in &entries_to_return {
-            let (child_id, child_inode) = if name == "." {
+            let (child_id, child_inode) = if name.as_slice() == b"." {
                 let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
                 (fid_entry.inode_id, inode)
-            } else if name == ".." {
+            } else if name.as_slice() == b".." {
                 let current_inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
                     Ok(i) => i,
                     Err(_) => continue,
@@ -520,9 +520,10 @@ impl NinePHandler {
             } else {
                 // NFS lookup expects encoded IDs
                 let encoded_parent_id = EncodedFileId::from_inode(fid_entry.inode_id).into();
+                let filename = name.as_slice().into();
                 match self
                     .filesystem
-                    .lookup(&auth, encoded_parent_id, &name.as_bytes().into())
+                    .lookup(&auth, encoded_parent_id, &filename)
                     .await
                 {
                     Ok(encoded_id) => {
@@ -549,7 +550,7 @@ impl NinePHandler {
                     Inode::Fifo(_) => DT_FIFO,
                     Inode::Socket(_) => DT_SOCK,
                 },
-                name: P9String::new(name),
+                name: P9String::new(name.to_vec()),
             };
 
             // Check if adding this entry would exceed the count limit
@@ -592,13 +593,12 @@ impl NinePHandler {
         let mut temp_creds = parent_fid.creds;
         temp_creds.gid = tc.gid;
 
-        let filename = name.to_string();
         match self
             .filesystem
             .process_create(
                 &temp_creds,
                 parent_fid.inode_id,
-                filename.as_bytes(),
+                name.as_bytes(),
                 &SetAttributes {
                     mode: SetMode::Set(tc.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
@@ -965,7 +965,7 @@ impl NinePHandler {
             Inode::Symlink(s) => P9Message::new(
                 tag,
                 Message::Rreadlink(Rreadlink {
-                    target: P9String::new(&String::from_utf8_lossy(&s.target)),
+                    target: P9String::new(s.target.clone()),
                 }),
             ),
             _ => P9Message::error(tag, libc::EINVAL as u32),
@@ -1267,7 +1267,7 @@ impl NinePHandler {
             start: tl.start,
             length: tl.length,
             proc_id: tl.proc_id,
-            client_id: tl.client_id.as_str().unwrap_or("").to_string(),
+            client_id: tl.client_id.data.clone(),
             fid: tl.fid,
             inode_id: fid.inode_id,
         };
@@ -1314,7 +1314,7 @@ impl NinePHandler {
             start: tg.start,
             length: tg.length,
             proc_id: tg.proc_id,
-            client_id: tg.client_id.as_str().unwrap_or("").to_string(),
+            client_id: tg.client_id.data.clone(),
             fid: tg.fid,
             inode_id: fid.inode_id,
         };
@@ -1331,7 +1331,7 @@ impl NinePHandler {
                     start: conflicting_lock.start,
                     length: conflicting_lock.length,
                     proc_id: conflicting_lock.proc_id,
-                    client_id: P9String::new(&conflicting_lock.client_id),
+                    client_id: P9String::new(conflicting_lock.client_id.clone()),
                 }),
             )
         } else {
@@ -1342,7 +1342,7 @@ impl NinePHandler {
                     start: tg.start,
                     length: tg.length,
                     proc_id: 0,
-                    client_id: P9String::new(""),
+                    client_id: P9String::new(Vec::new()),
                 }),
             )
         }
@@ -1530,15 +1530,15 @@ mod tests {
 
         let version_msg = Message::Tversion(Tversion {
             msize: DEFAULT_MSIZE,
-            version: P9String::new(VERSION_9P2000L),
+            version: P9String::new(VERSION_9P2000L.to_vec()),
         });
         handler.handle_message(0, version_msg).await;
 
         let attach_msg = Message::Tattach(Tattach {
             fid: 1,
             afid: u32::MAX,
-            uname: P9String::new("test"),
-            aname: P9String::new(""),
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(Vec::new()),
             n_uname: 1000,
         });
         let attach_resp = handler.handle_message(1, attach_msg).await;
@@ -1594,7 +1594,7 @@ mod tests {
         // Set up a session
         let version_msg = Message::Tversion(Tversion {
             msize: DEFAULT_MSIZE,
-            version: P9String::new(VERSION_9P2000L),
+            version: P9String::new(VERSION_9P2000L.to_vec()),
         });
         handler.handle_message(0, version_msg).await;
 
@@ -1602,8 +1602,8 @@ mod tests {
         let attach_msg = Message::Tattach(Tattach {
             fid: 1,
             afid: u32::MAX,
-            uname: P9String::new("test"),
-            aname: P9String::new(""),
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(Vec::new()),
             n_uname: 1000,
         });
         handler.handle_message(1, attach_msg).await;
@@ -1629,7 +1629,7 @@ mod tests {
         // Create a file using the new fid
         let create_msg = Message::Tlcreate(Tlcreate {
             fid: 2,
-            name: P9String::new("test.txt"),
+            name: P9String::new(b"test.txt".to_vec()),
             flags: 0x8002, // O_RDWR | O_CREAT
             mode: 0o644,
             gid: 1000,
@@ -1693,15 +1693,15 @@ mod tests {
 
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,
-            version: P9String::new("9P2000.L"),
+            version: P9String::new(b"9P2000.L".to_vec()),
         });
         handler.handle_message(0, version_msg).await;
 
         let attach_msg = Message::Tattach(Tattach {
             fid: 1,
             afid: u32::MAX,
-            uname: P9String::new("test"),
-            aname: P9String::new("/"),
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(b"/".to_vec()),
             n_uname: 1000,
         });
         handler.handle_message(1, attach_msg).await;
@@ -1779,15 +1779,15 @@ mod tests {
         // Initialize
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,
-            version: P9String::new("9P2000.L"),
+            version: P9String::new(b"9P2000.L".to_vec()),
         });
         handler.handle_message(0, version_msg).await;
 
         let attach_msg = Message::Tattach(Tattach {
             fid: 1,
             afid: u32::MAX,
-            uname: P9String::new("test"),
-            aname: P9String::new("/"),
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(b"/".to_vec()),
             n_uname: 1000,
         });
         handler.handle_message(1, attach_msg).await;
@@ -1854,15 +1854,15 @@ mod tests {
 
         let version_msg = Message::Tversion(Tversion {
             msize: DEFAULT_MSIZE,
-            version: P9String::new(VERSION_9P2000L),
+            version: P9String::new(VERSION_9P2000L.to_vec()),
         });
         handler.handle_message(0, version_msg).await;
 
         let attach_msg = Message::Tattach(Tattach {
             fid: 1,
             afid: u32::MAX,
-            uname: P9String::new("test"),
-            aname: P9String::new(""),
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(Vec::new()),
             n_uname: 1000,
         });
         handler.handle_message(1, attach_msg).await;
@@ -2007,15 +2007,15 @@ mod tests {
 
         let version_msg = Message::Tversion(Tversion {
             msize: 8192,
-            version: P9String::new("9P2000.L"),
+            version: P9String::new(b"9P2000.L".to_vec()),
         });
         handler.handle_message(0, version_msg).await;
 
         let attach_msg = Message::Tattach(Tattach {
             fid: 1,
             afid: u32::MAX,
-            uname: P9String::new("test"),
-            aname: P9String::new("/"),
+            uname: P9String::new(b"test".to_vec()),
+            aname: P9String::new(b"/".to_vec()),
             n_uname: 1000,
         });
         handler.handle_message(1, attach_msg).await;
@@ -2024,7 +2024,7 @@ mod tests {
             fid: 1,
             newfid: 2,
             nwname: 1,
-            wnames: vec![P9String::new("emptydir")],
+            wnames: vec![P9String::new(b"emptydir".to_vec())],
         });
         handler.handle_message(2, walk_msg).await;
 

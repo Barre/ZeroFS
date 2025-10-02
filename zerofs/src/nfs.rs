@@ -33,10 +33,10 @@ impl NFSFileSystem for ZeroFS {
     ) -> Result<fileid3, nfsstat3> {
         let encoded_dirid = EncodedFileId::from(dirid);
         let real_dirid = encoded_dirid.inode_id();
-        let filename_str = String::from_utf8_lossy(filename);
         debug!(
             "lookup called: dirid={}, filename={}",
-            real_dirid, filename_str
+            real_dirid,
+            String::from_utf8_lossy(filename)
         );
 
         let dir_inode = self.load_inode(real_dirid).await?;
@@ -47,14 +47,18 @@ impl NFSFileSystem for ZeroFS {
                 let auth_ctx: crate::fs::types::AuthContext = auth.into();
                 let creds = Credentials::from_auth_context(&auth_ctx);
                 check_access(&dir_inode, &creds, AccessMode::Execute)?;
-                let name = filename_str.to_string();
+                let name = filename.to_vec();
 
                 let cache_key = CacheKey::DirEntry {
                     dir_id: real_dirid,
                     name: name.clone(),
                 };
                 if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key) {
-                    debug!("lookup cache hit: {} -> inode {}", name, inode_id);
+                    debug!(
+                        "lookup cache hit: {} -> inode {}",
+                        String::from_utf8_lossy(filename),
+                        inode_id
+                    );
                     return Ok(EncodedFileId::from_inode(inode_id).into());
                 }
 
@@ -70,7 +74,11 @@ impl NFSFileSystem for ZeroFS {
                         let mut bytes = [0u8; 8];
                         bytes.copy_from_slice(&entry_data[..8]);
                         let inode_id = u64::from_le_bytes(bytes);
-                        debug!("lookup found: {} -> inode {}", name, inode_id);
+                        debug!(
+                            "lookup found: {} -> inode {}",
+                            String::from_utf8_lossy(filename),
+                            inode_id
+                        );
 
                         let cache_key = crate::fs::cache::CacheKey::DirEntry {
                             dir_id: real_dirid,
@@ -82,7 +90,10 @@ impl NFSFileSystem for ZeroFS {
                         Ok(EncodedFileId::from_inode(inode_id).into())
                     }
                     None => {
-                        debug!("lookup not found: {} in directory", name);
+                        debug!(
+                            "lookup not found: {} in directory",
+                            String::from_utf8_lossy(filename)
+                        );
                         Err(nfsstat3::NFS3ERR_NOENT)
                     }
                 }

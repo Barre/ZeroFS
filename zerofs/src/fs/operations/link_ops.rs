@@ -25,10 +25,10 @@ impl ZeroFS {
 
         debug!(
             "process_symlink: dirid={}, linkname={:?}, target={:?}",
-            dirid, linkname, target
+            dirid,
+            String::from_utf8_lossy(linkname),
+            target
         );
-
-        let linkname_str = String::from_utf8_lossy(linkname);
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.load_inode(dirid).await?;
@@ -46,7 +46,7 @@ impl ZeroFS {
             _ => return Err(FsError::NotDirectory),
         };
 
-        let entry_key = KeyCodec::dir_entry_key(dirid, &linkname_str);
+        let entry_key = KeyCodec::dir_entry_key(dirid, linkname);
         if self
             .db
             .get_bytes(&entry_key)
@@ -98,7 +98,7 @@ impl ZeroFS {
 
         batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(new_id));
 
-        let scan_key = KeyCodec::dir_scan_key(dirid, new_id, &linkname_str);
+        let scan_key = KeyCodec::dir_scan_key(dirid, new_id, linkname);
         batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(new_id));
 
         dir.entry_count += 1;
@@ -189,8 +189,7 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        let name = linkname_str.to_string();
-        let entry_key = KeyCodec::dir_entry_key(linkdirid, &name);
+        let entry_key = KeyCodec::dir_entry_key(linkdirid, linkname);
 
         if self
             .db
@@ -205,7 +204,7 @@ impl ZeroFS {
         let mut batch = self.db.new_write_batch();
         batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(fileid));
 
-        let scan_key = KeyCodec::dir_scan_key(linkdirid, fileid, &name);
+        let scan_key = KeyCodec::dir_scan_key(linkdirid, fileid, linkname);
         batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(fileid));
 
         let (now_sec, now_nsec) = get_current_time();

@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
 pub struct NBDDevice {
-    pub name: String,
+    pub name: Vec<u8>,
     pub size: u64,
 }
 
@@ -114,7 +114,10 @@ where
 
     match session.negotiate_options().await {
         Ok(device) => {
-            info!("Client selected device: {}", device.name);
+            info!(
+                "Client selected device: {}",
+                String::from_utf8_lossy(&device.name)
+            );
             session.handle_transmission(device).await?;
         }
         Err(NBDError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -154,7 +157,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // Look up .nbd directory
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, ".nbd")
+            .lookup_by_name(0, b".nbd")
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -176,8 +179,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let mut devices = Vec::new();
         for entry in &entries.entries {
             // Skip . and ..
-            let name = String::from_utf8_lossy(&entry.name);
-            if name == "." || name == ".." {
+            let name = &entry.name;
+            if name == b"." || name == b".." {
                 continue;
             }
 
@@ -187,13 +190,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             let inode = self.filesystem.load_inode(real_id).await.map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
                     "Failed to load inode for {}: {e:?}",
-                    name
+                    String::from_utf8_lossy(name)
                 )))
             })?;
 
             if let Inode::File(file_inode) = inode {
                 devices.push(NBDDevice {
-                    name: name.to_string(),
+                    name: name.to_vec(),
                     size: file_inode.size,
                 });
             }
@@ -202,10 +205,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         Ok(devices)
     }
 
-    async fn get_device_by_name(&self, name: &str) -> Result<NBDDevice> {
+    async fn get_device_by_name(&self, name: &[u8]) -> Result<NBDDevice> {
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, ".nbd")
+            .lookup_by_name(0, b".nbd")
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -216,7 +219,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let device_inode = match self.filesystem.lookup_by_name(nbd_dir_inode, name).await {
             Ok(inode) => inode,
             Err(FsError::NotFound) => {
-                return Err(NBDError::DeviceNotFound(name.to_string()));
+                return Err(NBDError::DeviceNotFound(name.to_vec()));
             }
             Err(e) => {
                 return Err(NBDError::Io(std::io::Error::other(format!(
@@ -232,18 +235,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
                     "Failed to load inode for {}: {e:?}",
-                    name
+                    String::from_utf8_lossy(name)
                 )))
             })?;
 
         match inode {
             Inode::File(file_inode) => Ok(NBDDevice {
-                name: name.to_string(),
+                name: name.to_vec(),
                 size: file_inode.size,
             }),
             _ => Err(NBDError::Io(std::io::Error::other(format!(
                 "NBD device '{}' is not a regular file",
-                name
+                String::from_utf8_lossy(name)
             )))),
         }
     }
@@ -349,10 +352,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let devices = self.get_available_devices().await?;
         for device in devices {
-            let name_bytes = device.name.as_bytes();
+            let name_bytes = device.name;
             let mut reply_data = Vec::new();
             reply_data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
-            reply_data.extend_from_slice(name_bytes);
+            reply_data.extend_from_slice(&name_bytes);
 
             self.send_option_reply(NBD_OPT_LIST, NBD_REP_SERVER, &reply_data)
                 .await?;
@@ -367,17 +370,23 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_export_name_option(&mut self, length: u32) -> Result<NBDDevice> {
         let mut name_buf = vec![0u8; length as usize];
         self.reader.read_exact(&mut name_buf).await?;
-        let name = String::from_utf8_lossy(&name_buf);
 
-        debug!("Client requested export: '{}' (length: {})", name, length);
+        debug!(
+            "Client requested export: '{}' (length: {})",
+            String::from_utf8_lossy(&name_buf),
+            length
+        );
 
         // For NBD_OPT_EXPORT_NAME, we can't send an error reply
         // We must either send the export info or close the connection
-        let device = match self.get_device_by_name(&name).await {
+        let device = match self.get_device_by_name(&name_buf).await {
             Ok(device) => device,
             Err(_) => {
-                error!("Export '{}' not found, closing connection", name);
-                return Err(NBDError::DeviceNotFound(name.to_string()));
+                error!(
+                    "Export '{}' not found, closing connection",
+                    String::from_utf8_lossy(&name_buf)
+                );
+                return Err(NBDError::DeviceNotFound(name_buf));
             }
         };
 
@@ -416,13 +425,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return Err(NBDError::Protocol("Invalid INFO option length".to_string()));
         }
 
-        let name = String::from_utf8_lossy(&data[4..4 + name_len]);
+        let name = &data[4..4 + name_len];
         debug!(
             "INFO option: requested export name '{}' (name_len: {})",
-            name, name_len
+            String::from_utf8_lossy(name),
+            name_len
         );
 
-        match self.get_device_by_name(&name).await {
+        match self.get_device_by_name(name).await {
             Ok(device) => {
                 let info = NBDInfoExport {
                     info_type: NBD_INFO_EXPORT,
@@ -465,10 +475,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return Err(NBDError::Protocol("Invalid GO option length".to_string()));
         }
 
-        let name = String::from_utf8_lossy(&data[4..4 + name_len]);
+        let name = &data[4..4 + name_len];
         debug!(
             "GO option: requested export name '{}' (name_len: {})",
-            name, name_len
+            String::from_utf8_lossy(name),
+            name_len
         );
         debug!(
             "GO option data length: {}, expected minimum: {}",
@@ -476,7 +487,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             4 + name_len + 2
         );
 
-        match self.get_device_by_name(&name).await {
+        match self.get_device_by_name(name).await {
             Ok(device) => {
                 let info = NBDInfoExport {
                     info_type: NBD_INFO_EXPORT,
@@ -494,7 +505,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
                     .await?;
                 self.writer.flush().await?;
-                Err(NBDError::DeviceNotFound(name.to_string()))
+                Err(NBDError::DeviceNotFound(name.to_vec()))
             }
         }
     }
@@ -526,7 +537,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, ".nbd")
+            .lookup_by_name(0, b".nbd")
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup .nbd directory: {e:?}")))?;
 

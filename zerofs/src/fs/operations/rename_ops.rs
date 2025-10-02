@@ -16,24 +16,21 @@ impl ZeroFS {
         &self,
         auth: &AuthContext,
         from_dirid: u64,
-        from_filename: &[u8],
+        from_name: &[u8],
         to_dirid: u64,
-        to_filename: &[u8],
+        to_name: &[u8],
     ) -> Result<(), FsError> {
-        if from_filename.is_empty() || to_filename.is_empty() {
+        if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
 
-        validate_filename(from_filename)?;
-        validate_filename(to_filename)?;
+        validate_filename(from_name)?;
+        validate_filename(to_name)?;
 
-        let from_name = String::from_utf8_lossy(from_filename).to_string();
-        let to_name = String::from_utf8_lossy(to_filename).to_string();
-
-        if from_name == "." || from_name == ".." {
+        if from_name == b"." || from_name == b".." {
             return Err(FsError::InvalidArgument);
         }
-        if to_name == "." || to_name == ".." {
+        if to_name == b"." || to_name == b".." {
             return Err(FsError::Exists);
         }
 
@@ -43,13 +40,16 @@ impl ZeroFS {
 
         debug!(
             "process_rename: from_dir={}, from_name={}, to_dir={}, to_name={}",
-            from_dirid, from_name, to_dirid, to_name
+            from_dirid,
+            String::from_utf8_lossy(from_name),
+            to_dirid,
+            String::from_utf8_lossy(to_name)
         );
 
         let creds = Credentials::from_auth_context(auth);
 
         // Look up all inode IDs without holding any locks
-        let from_entry_key = KeyCodec::dir_entry_key(from_dirid, &from_name);
+        let from_entry_key = KeyCodec::dir_entry_key(from_dirid, from_name);
         let entry_data = self
             .db
             .get_bytes(&from_entry_key)
@@ -65,7 +65,7 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        let to_entry_key = KeyCodec::dir_entry_key(to_dirid, &to_name);
+        let to_entry_key = KeyCodec::dir_entry_key(to_dirid, to_name);
         let target_inode_id = if let Some(existing_entry) = self
             .db
             .get_bytes(&to_entry_key)
@@ -266,17 +266,17 @@ impl ZeroFS {
                 );
             }
 
-            let existing_scan_key = KeyCodec::dir_scan_key(to_dirid, target_id, &to_name);
+            let existing_scan_key = KeyCodec::dir_scan_key(to_dirid, target_id, to_name);
             batch.delete_bytes(&existing_scan_key);
         }
 
         batch.delete_bytes(&from_entry_key);
 
-        let from_scan_key = KeyCodec::dir_scan_key(from_dirid, source_inode_id, &from_name);
+        let from_scan_key = KeyCodec::dir_scan_key(from_dirid, source_inode_id, from_name);
         batch.delete_bytes(&from_scan_key);
         batch.put_bytes(&to_entry_key, &KeyCodec::encode_dir_entry(source_inode_id));
 
-        let to_scan_key = KeyCodec::dir_scan_key(to_dirid, source_inode_id, &to_name);
+        let to_scan_key = KeyCodec::dir_scan_key(to_dirid, source_inode_id, to_name);
         batch.put_bytes(&to_scan_key, &KeyCodec::encode_dir_entry(source_inode_id));
 
         if from_dirid != to_dirid {
@@ -382,11 +382,11 @@ impl ZeroFS {
         }
         self.cache.remove(CacheKey::DirEntry {
             dir_id: from_dirid,
-            name: from_name.clone(),
+            name: from_name.to_vec(),
         });
         self.cache.remove(CacheKey::DirEntry {
             dir_id: to_dirid,
-            name: to_name.clone(),
+            name: to_name.to_vec(),
         });
 
         match source_inode {

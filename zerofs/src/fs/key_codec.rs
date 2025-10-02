@@ -14,7 +14,7 @@ const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
 #[derive(Debug, Clone)]
 pub enum ParsedKey {
-    DirScan { entry_id: InodeId, name: String },
+    DirScan { entry_id: InodeId, name: Vec<u8> },
     Tombstone { inode_id: InodeId },
     Unknown,
 }
@@ -37,20 +37,20 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn dir_entry_key(dir_id: InodeId, name: &str) -> Bytes {
+    pub fn dir_entry_key(dir_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(9 + name.len());
         key.push(PREFIX_DIR_ENTRY);
         key.extend_from_slice(&dir_id.to_be_bytes());
-        key.extend_from_slice(name.as_bytes());
+        key.extend_from_slice(name);
         Bytes::from(key)
     }
 
-    pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &str) -> Bytes {
+    pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(17 + name.len());
         key.push(PREFIX_DIR_SCAN);
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(&entry_id.to_be_bytes());
-        key.extend_from_slice(name.as_bytes());
+        key.extend_from_slice(name);
         Bytes::from(key)
     }
 
@@ -104,8 +104,11 @@ impl KeyCodec {
             PREFIX_DIR_SCAN if key.len() > 17 => {
                 if let Ok(entry_bytes) = key[9..17].try_into() {
                     let entry_id = u64::from_be_bytes(entry_bytes);
-                    if let Ok(name) = String::from_utf8(key[17..].to_vec()) {
-                        ParsedKey::DirScan { entry_id, name }
+                    if let Some(name) = key.get(17..) {
+                        ParsedKey::DirScan {
+                            entry_id,
+                            name: name.to_vec(),
+                        }
                     } else {
                         ParsedKey::Unknown
                     }
@@ -177,7 +180,7 @@ mod tests {
     fn test_dir_scan_parsing() {
         let dir_id = 10u64;
         let entry_id = 20u64;
-        let name = "test_file.txt";
+        let name = b"test_file.txt";
         let key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
 
         match KeyCodec::parse_key(&key) {

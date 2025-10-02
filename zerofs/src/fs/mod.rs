@@ -585,7 +585,7 @@ impl ZeroFS {
 
 impl ZeroFS {
     /// Helper method to lookup an entry by name in a directory
-    pub async fn lookup_by_name(&self, dir_id: u64, name: &str) -> Result<u64, errors::FsError> {
+    pub async fn lookup_by_name(&self, dir_id: u64, name: &[u8]) -> Result<u64, errors::FsError> {
         let entry_key = KeyCodec::dir_entry_key(dir_id, name);
         let entry_data = self
             .db
