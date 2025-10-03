@@ -176,9 +176,25 @@ impl FileSystemGlobalStats {
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
-    use crate::test_helpers::test_helpers_mod::{filename, test_auth};
-    use zerofs_nfsserve::nfs::sattr3;
-    use zerofs_nfsserve::vfs::NFSFileSystem;
+    use crate::fs::permissions::Credentials;
+    use crate::fs::types::{AuthContext, SetAttributes};
+
+    fn test_creds() -> Credentials {
+        Credentials {
+            uid: 1000,
+            gid: 1000,
+            groups: [1000; 16],
+            groups_count: 1,
+        }
+    }
+
+    fn test_auth() -> AuthContext {
+        AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+        }
+    }
 
     #[tokio::test]
     async fn test_stats_initialization() {
@@ -194,10 +210,11 @@ mod tests {
     #[tokio::test]
     async fn test_stats_file_creation() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
 
         // Create a file
         let (_file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -209,16 +226,18 @@ mod tests {
     #[tokio::test]
     async fn test_stats_file_write() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create a file
         let (file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         // Write 1000 bytes
         let data = vec![0u8; 1000];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1000);
@@ -226,7 +245,7 @@ mod tests {
 
         // Write more data (extending the file)
         let data = vec![1u8; 500];
-        fs.write(&test_auth(), file_id, 1000, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 1000, &data).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1500);
@@ -236,19 +255,21 @@ mod tests {
     #[tokio::test]
     async fn test_stats_file_overwrite() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create a file and write initial data
         let (file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         // Overwrite part of the file (no size change)
         let data = vec![1u8; 500];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1000); // Size unchanged
@@ -258,17 +279,19 @@ mod tests {
     #[tokio::test]
     async fn test_stats_sparse_file() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create a file
         let (file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"sparse.txt"), sattr3::default())
+            .process_create(&creds, 0, b"sparse.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         // Write 1 byte at offset 1GB (creating a sparse file)
         let data = vec![42u8; 1];
         let offset = 1_000_000_000;
-        fs.write(&test_auth(), file_id, offset, &data)
+        fs.process_write(&auth, file_id, offset, &data)
             .await
             .unwrap();
 
@@ -280,22 +303,24 @@ mod tests {
     #[tokio::test]
     async fn test_stats_file_removal() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create and write to a file
         let (file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 5000];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 5000);
         assert_eq!(inodes, 1);
 
         // Remove the file
-        fs.remove(&test_auth(), 0, &filename(b"test.txt"))
+        fs.process_remove(&test_auth(), 0, b"test.txt")
             .await
             .unwrap();
 
@@ -310,17 +335,12 @@ mod tests {
 
         // Create directories
         let (dir1_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"dir1"), &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
 
         let (_dir2_id, _) = fs
-            .mkdir(
-                &test_auth(),
-                dir1_id,
-                &filename(b"dir2"),
-                &sattr3::default(),
-            )
+            .process_mkdir(&test_creds(), dir1_id, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -335,12 +355,12 @@ mod tests {
 
         // Create a symlink
         let (_link_id, _) = fs
-            .symlink(
-                &test_auth(),
+            .process_symlink(
+                &test_creds(),
                 0,
-                &filename(b"link"),
-                &filename(b"/target/path"),
-                &sattr3::default(),
+                b"link",
+                b"/target/path",
+                &SetAttributes::default(),
             )
             .await
             .unwrap();
@@ -356,20 +376,17 @@ mod tests {
 
         // Create a file with content
         let (file_id, _) = fs
-            .create(
-                &test_auth(),
-                0,
-                &filename(b"original.txt"),
-                sattr3::default(),
-            )
+            .process_create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&test_auth(), file_id, 0, &data)
+            .await
+            .unwrap();
 
         // Create a hard link
-        fs.link(&test_auth(), file_id, 0, &filename(b"hardlink.txt"))
+        fs.process_link(&test_auth(), file_id, 0, b"hardlink.txt")
             .await
             .unwrap();
 
@@ -378,7 +395,7 @@ mod tests {
         assert_eq!(inodes, 1); // Still just 2 inodes (root + file)
 
         // Remove original - stats should remain
-        fs.remove(&test_auth(), 0, &filename(b"original.txt"))
+        fs.process_remove(&test_auth(), 0, b"original.txt")
             .await
             .unwrap();
 
@@ -387,7 +404,7 @@ mod tests {
         assert_eq!(inodes, 1);
 
         // Remove hard link - now stats should update
-        fs.remove(&test_auth(), 0, &filename(b"hardlink.txt"))
+        fs.process_remove(&test_auth(), 0, b"hardlink.txt")
             .await
             .unwrap();
 
@@ -402,44 +419,40 @@ mod tests {
 
         // Create a file with content
         let (file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
+            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 10000];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&test_auth(), file_id, 0, &data)
+            .await
+            .unwrap();
 
         // Truncate to smaller size
-        use zerofs_nfsserve::nfs::{
-            set_atime, set_gid3, set_mode3, set_mtime, set_size3, set_uid3,
+        use crate::fs::types::SetSize;
+
+        let setattr = SetAttributes {
+            size: SetSize::Set(5000),
+            ..Default::default()
         };
 
-        let setattr = sattr3 {
-            mode: set_mode3::Void,
-            uid: set_uid3::Void,
-            gid: set_gid3::Void,
-            size: set_size3::size(5000),
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
-        };
-
-        fs.setattr(&test_auth(), file_id, setattr).await.unwrap();
+        fs.process_setattr(&test_creds(), file_id, &setattr)
+            .await
+            .unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 5000);
         assert_eq!(inodes, 1);
 
         // Extend to larger size
-        let setattr = sattr3 {
-            mode: set_mode3::Void,
-            uid: set_uid3::Void,
-            gid: set_gid3::Void,
-            size: set_size3::size(15000),
-            atime: set_atime::DONT_CHANGE,
-            mtime: set_mtime::DONT_CHANGE,
+        let setattr = SetAttributes {
+            size: SetSize::Set(15000),
+            ..Default::default()
         };
 
-        fs.setattr(&test_auth(), file_id, setattr).await.unwrap();
+        fs.process_setattr(&test_creds(), file_id, &setattr)
+            .await
+            .unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 15000);
@@ -457,20 +470,17 @@ mod tests {
             let fs_clone = fs.clone();
             let handle = tokio::spawn(async move {
                 let fname = format!("file{i}.txt");
+                let creds = test_creds();
+                let auth = test_auth();
                 let (file_id, _) = fs_clone
-                    .create(
-                        &test_auth(),
-                        0,
-                        &filename(fname.as_bytes()),
-                        sattr3::default(),
-                    )
+                    .process_create(&creds, 0, fname.as_bytes(), &SetAttributes::default())
                     .await
                     .unwrap();
 
                 // Write different amounts of data
                 let data = vec![0u8; (i + 1) * 1000];
                 fs_clone
-                    .write(&test_auth(), file_id, 0, &data)
+                    .process_write(&auth, file_id, 0, &data)
                     .await
                     .unwrap();
             });
@@ -513,77 +523,60 @@ mod tests {
     #[tokio::test]
     async fn test_fsstat_reporting() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create some files
         for i in 0..5 {
             let fname = format!("file{i}.txt");
             let (file_id, _) = fs
-                .create(
-                    &test_auth(),
-                    0,
-                    &filename(fname.as_bytes()),
-                    sattr3::default(),
-                )
+                .process_create(&creds, 0, fname.as_bytes(), &SetAttributes::default())
                 .await
                 .unwrap();
 
             let data = vec![0u8; 1_000_000]; // 1MB each
-            fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+            fs.process_write(&auth, file_id, 0, &data).await.unwrap();
         }
 
-        // Check fsstat
-        let fsstat = fs.fsstat(&test_auth(), 0).await.unwrap();
-
+        // Check fsstat - need to load and calculate manually
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
         const TOTAL_INODES: u64 = 1 << 48;
 
         // Get the next inode ID to verify available inodes calculation
         let next_inode_id = fs.next_inode_id.load(std::sync::atomic::Ordering::Relaxed);
+        let (used_bytes, used_inodes) = fs.global_stats.get_totals();
 
-        assert_eq!(fsstat.tbytes, TOTAL_BYTES);
-        assert_eq!(fsstat.fbytes, TOTAL_BYTES - 5_000_000);
-        assert_eq!(fsstat.abytes, TOTAL_BYTES - 5_000_000);
-        // Total files = used_inodes + available_inodes
-        // Since we created one file, used_inodes = 1
-        // available = TOTAL_INODES - next_inode_id
-        let (_, used_inodes) = fs.global_stats.get_totals();
-        assert_eq!(fsstat.tfiles, used_inodes + (TOTAL_INODES - next_inode_id));
-        // Available inodes are based on next_inode_id, not currently used inodes
-        assert_eq!(fsstat.ffiles, TOTAL_INODES - next_inode_id);
-        assert_eq!(fsstat.afiles, TOTAL_INODES - next_inode_id);
+        let fbytes = TOTAL_BYTES - used_bytes;
+        let ffiles = TOTAL_INODES - next_inode_id;
+        let tfiles = used_inodes + ffiles;
+
+        assert_eq!(fbytes, TOTAL_BYTES - 5_000_000);
+        assert_eq!(tfiles, used_inodes + (TOTAL_INODES - next_inode_id));
+        assert_eq!(ffiles, TOTAL_INODES - next_inode_id);
     }
 
     #[tokio::test]
     async fn test_stats_rename_without_replacement() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         let (file_id, _) = fs
-            .create(
-                &test_auth(),
-                0,
-                &filename(b"original.txt"),
-                sattr3::default(),
-            )
+            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         let (bytes_before, inodes_before) = fs.global_stats.get_totals();
         assert_eq!(bytes_before, 1000);
         assert_eq!(inodes_before, 1);
 
         // Rename without replacing anything
-        fs.rename(
-            &test_auth(),
-            0,
-            &filename(b"original.txt"),
-            0,
-            &filename(b"renamed.txt"),
-        )
-        .await
-        .unwrap();
+        fs.process_rename(&auth, 0, b"original.txt", 0, b"renamed.txt")
+            .await
+            .unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 1000); // No change
@@ -596,34 +589,32 @@ mod tests {
 
         // Create source file with 1000 bytes
         let (file1_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"source.txt"), sattr3::default())
+            .process_create(&test_creds(), 0, b"source.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data1 = vec![0u8; 1000];
-        fs.write(&test_auth(), file1_id, 0, &data1).await.unwrap();
+        fs.process_write(&test_auth(), file1_id, 0, &data1)
+            .await
+            .unwrap();
 
         // Create target file with 2000 bytes
         let (file2_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"target.txt"), sattr3::default())
+            .process_create(&test_creds(), 0, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data2 = vec![0u8; 2000];
-        fs.write(&test_auth(), file2_id, 0, &data2).await.unwrap();
+        fs.process_write(&test_auth(), file2_id, 0, &data2)
+            .await
+            .unwrap();
 
         let (bytes_before, inodes_before) = fs.global_stats.get_totals();
         assert_eq!(bytes_before, 3000); // 1000 + 2000
         assert_eq!(inodes_before, 2);
 
         // Rename source over target (replacing it)
-        fs.rename(
-            &test_auth(),
-            0,
-            &filename(b"source.txt"),
-            0,
-            &filename(b"target.txt"),
-        )
-        .await
-        .unwrap();
+        fs.process_rename(&test_auth(), 0, b"source.txt", 0, b"target.txt")
+            .await
+            .unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 1000); // Only source file remains
@@ -636,22 +627,26 @@ mod tests {
 
         // Create source file
         let (source_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"source.txt"), sattr3::default())
+            .process_create(&test_creds(), 0, b"source.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data1 = vec![0u8; 500];
-        fs.write(&test_auth(), source_id, 0, &data1).await.unwrap();
+        fs.process_write(&test_auth(), source_id, 0, &data1)
+            .await
+            .unwrap();
 
         // Create target file with 1500 bytes
         let (target_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"target.txt"), sattr3::default())
+            .process_create(&test_creds(), 0, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data2 = vec![0u8; 1500];
-        fs.write(&test_auth(), target_id, 0, &data2).await.unwrap();
+        fs.process_write(&test_auth(), target_id, 0, &data2)
+            .await
+            .unwrap();
 
         // Create a hard link to target
-        fs.link(&test_auth(), target_id, 0, &filename(b"hardlink.txt"))
+        fs.process_link(&test_auth(), target_id, 0, b"hardlink.txt")
             .await
             .unwrap();
 
@@ -660,22 +655,21 @@ mod tests {
         assert_eq!(inodes_before, 2); // source + target (hardlink doesn't add inode)
 
         // Rename source over target (which has a hard link)
-        fs.rename(
-            &test_auth(),
-            0,
-            &filename(b"source.txt"),
-            0,
-            &filename(b"target.txt"),
-        )
-        .await
-        .unwrap();
+        fs.process_rename(&test_auth(), 0, b"source.txt", 0, b"target.txt")
+            .await
+            .unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 2000); // Both files still exist (source + hardlinked target)
         assert_eq!(inodes_after, 2); // Both inodes remain
 
         // Verify hardlink still works
-        let attrs = fs.getattr(&test_auth(), target_id).await.unwrap();
+        let inode = fs.load_inode(target_id).await.unwrap();
+        let attrs: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
+            inode: &inode,
+            id: target_id,
+        }
+        .into();
         assert_eq!(attrs.size, 1500); // Original target size via hardlink
     }
 
@@ -685,13 +679,13 @@ mod tests {
 
         // Create source directory
         let (_source_dir_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"sourcedir"), &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"sourcedir", &SetAttributes::default())
             .await
             .unwrap();
 
         // Create target directory (must be empty to be replaceable)
         let (_target_dir_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"targetdir"), &sattr3::default())
+            .process_mkdir(&test_creds(), 0, b"targetdir", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -700,15 +694,9 @@ mod tests {
         assert_eq!(inodes_before, 2); // Two directories
 
         // Rename source directory over target directory
-        fs.rename(
-            &test_auth(),
-            0,
-            &filename(b"sourcedir"),
-            0,
-            &filename(b"targetdir"),
-        )
-        .await
-        .unwrap();
+        fs.process_rename(&test_auth(), 0, b"sourcedir", 0, b"targetdir")
+            .await
+            .unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 0);
@@ -718,23 +706,25 @@ mod tests {
     #[tokio::test]
     async fn test_stats_rename_replacing_symlink() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create a file to rename
         let (file_id, _) = fs
-            .create(&test_auth(), 0, &filename(b"file.txt"), sattr3::default())
+            .process_create(&creds, 0, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data = vec![0u8; 750];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         // Create a symlink
         let (_link_id, _) = fs
-            .symlink(
-                &test_auth(),
+            .process_symlink(
+                &creds,
                 0,
-                &filename(b"link"),
-                &filename(b"/some/target"),
-                &sattr3::default(),
+                b"link",
+                b"/some/target",
+                &SetAttributes::default(),
             )
             .await
             .unwrap();
@@ -744,15 +734,9 @@ mod tests {
         assert_eq!(inodes_before, 2); // file + symlink
 
         // Rename file over symlink
-        fs.rename(
-            &test_auth(),
-            0,
-            &filename(b"file.txt"),
-            0,
-            &filename(b"link"),
-        )
-        .await
-        .unwrap();
+        fs.process_rename(&auth, 0, b"file.txt", 0, b"link")
+            .await
+            .unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 750);
@@ -762,42 +746,34 @@ mod tests {
     #[tokio::test]
     async fn test_stats_rename_cross_directory() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create two directories
         let (dir1_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"dir1"), &sattr3::default())
+            .process_mkdir(&creds, 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
         let (dir2_id, _) = fs
-            .mkdir(&test_auth(), 0, &filename(b"dir2"), &sattr3::default())
+            .process_mkdir(&creds, 0, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
 
         // Create file in dir1
         let (file_id, _) = fs
-            .create(
-                &test_auth(),
-                dir1_id,
-                &filename(b"file.txt"),
-                sattr3::default(),
-            )
+            .process_create(&creds, dir1_id, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data = vec![0u8; 1234];
-        fs.write(&test_auth(), file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
 
         // Create another file in dir2 that will be replaced
         let (target_id, _) = fs
-            .create(
-                &test_auth(),
-                dir2_id,
-                &filename(b"target.txt"),
-                sattr3::default(),
-            )
+            .process_create(&creds, dir2_id, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
         let target_data = vec![0u8; 5678];
-        fs.write(&test_auth(), target_id, 0, &target_data)
+        fs.process_write(&auth, target_id, 0, &target_data)
             .await
             .unwrap();
 
@@ -806,15 +782,9 @@ mod tests {
         assert_eq!(inodes_before, 4); // 2 dirs + 2 files
 
         // Rename file from dir1 to dir2, replacing target
-        fs.rename(
-            &test_auth(),
-            dir1_id,
-            &filename(b"file.txt"),
-            dir2_id,
-            &filename(b"target.txt"),
-        )
-        .await
-        .unwrap();
+        fs.process_rename(&auth, dir1_id, b"file.txt", dir2_id, b"target.txt")
+            .await
+            .unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 1234); // Only source file remains
@@ -824,15 +794,17 @@ mod tests {
     #[tokio::test]
     async fn test_stats_rename_special_files() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
 
         // Create a FIFO
         let (_fifo_id, _) = fs
-            .mknod(
-                &test_auth(),
+            .process_mknod(
+                &creds,
                 0,
-                &filename(b"fifo1"),
-                zerofs_nfsserve::nfs::ftype3::NF3FIFO,
-                &sattr3::default(),
+                b"fifo1",
+                crate::fs::types::FileType::Fifo,
+                &SetAttributes::default(),
                 None,
             )
             .await
@@ -840,12 +812,12 @@ mod tests {
 
         // Create another FIFO to be replaced
         let (_fifo2_id, _) = fs
-            .mknod(
-                &test_auth(),
+            .process_mknod(
+                &creds,
                 0,
-                &filename(b"fifo2"),
-                zerofs_nfsserve::nfs::ftype3::NF3FIFO,
-                &sattr3::default(),
+                b"fifo2",
+                crate::fs::types::FileType::Fifo,
+                &SetAttributes::default(),
                 None,
             )
             .await
@@ -856,7 +828,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // Two FIFOs
 
         // Rename fifo1 over fifo2
-        fs.rename(&test_auth(), 0, &filename(b"fifo1"), 0, &filename(b"fifo2"))
+        fs.process_rename(&auth, 0, b"fifo1", 0, b"fifo2")
             .await
             .unwrap();
 

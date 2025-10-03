@@ -1508,9 +1508,10 @@ mod tests {
     use super::FileLockManager;
     use super::*;
     use crate::fs::ZeroFS;
+    use crate::fs::permissions::Credentials;
+    use crate::fs::types::SetAttributes;
     use libc::O_RDONLY;
     use std::sync::Arc;
-    use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
     #[tokio::test]
     async fn test_statfs() {
@@ -1662,17 +1663,18 @@ mod tests {
     async fn test_readdir_random_pagination() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
-        let auth = AuthContext {
+        let creds = Credentials {
             uid: 1000,
             gid: 1000,
-            gids: vec![1000],
+            groups: [1000; 16],
+            groups_count: 1,
         };
         for i in 0..10 {
-            fs.create(
-                &auth,
+            fs.process_create(
+                &creds,
                 0,
-                &format!("file{i:02}.txt").as_bytes().into(),
-                SetAttributes::default().into(),
+                format!("file{i:02}.txt").as_bytes(),
+                &SetAttributes::default(),
             )
             .await
             .unwrap();
@@ -1747,17 +1749,18 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
         // Create a few files
-        let auth = AuthContext {
+        let creds = Credentials {
             uid: 1000,
             gid: 1000,
-            gids: vec![1000],
+            groups: [1000; 16],
+            groups_count: 1,
         };
         for i in 0..5 {
-            fs.create(
-                &auth,
+            fs.process_create(
+                &creds,
                 0,
-                &format!("file{i}.txt").as_bytes().into(),
-                SetAttributes::default().into(),
+                format!("file{i}.txt").as_bytes(),
+                &SetAttributes::default(),
             )
             .await
             .unwrap();
@@ -1822,18 +1825,19 @@ mod tests {
     async fn test_readdir_pagination_duplicates_at_boundary() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
-        let auth = AuthContext {
+        let creds = Credentials {
             uid: 1000,
             gid: 1000,
-            gids: vec![1000],
+            groups: [1000; 16],
+            groups_count: 1,
         };
 
         for i in 0..1002 {
-            fs.create(
-                &auth,
+            fs.process_create(
+                &creds,
                 0,
-                &format!("file_{:06}.txt", i).as_bytes().into(),
-                SetAttributes::default().into(),
+                format!("file_{:06}.txt", i).as_bytes(),
+                &SetAttributes::default(),
             )
             .await
             .unwrap();
@@ -1977,18 +1981,14 @@ mod tests {
     async fn test_readdir_empty_directory() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
 
-        let auth = AuthContext {
+        let creds = Credentials {
             uid: 1000,
             gid: 1000,
-            gids: vec![1000],
+            groups: [1000; 16],
+            groups_count: 1,
         };
         let (_empty_dir_id, _) = fs
-            .mkdir(
-                &auth,
-                0,
-                &b"emptydir".to_vec().into(),
-                &SetAttributes::default().into(),
-            )
+            .process_mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
             .await
             .unwrap();
 
