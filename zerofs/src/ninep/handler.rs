@@ -6,6 +6,7 @@ use tracing::debug;
 
 use super::lock_manager::{FileLock, FileLockManager};
 use super::protocol::*;
+use super::protocol::{P9_MAX_GROUPS, P9_MAX_NAME_LEN, P9_NOBODY_UID, P9_READDIR_BATCH_SIZE};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::Credentials;
@@ -192,17 +193,17 @@ impl NinePHandler {
                 _ => {
                     // For other users, we could look them up, but for now just use nobody
                     debug!(
-                        "Unknown user '{}' with n_uname=-1, using nobody (65534)",
-                        username
+                        "Unknown user '{}' with n_uname=-1, using nobody ({})",
+                        username, P9_NOBODY_UID
                     );
-                    65534
+                    P9_NOBODY_UID
                 }
             }
         } else {
             ta.n_uname
         };
 
-        let mut groups = [0u32; 16];
+        let mut groups = [0u32; P9_MAX_GROUPS];
         groups[0] = uid; // User is always member of their own group
         let creds = Credentials {
             uid,
@@ -428,7 +429,7 @@ impl NinePHandler {
 
         // Read regular entries - continue until we hit the end
         loop {
-            const BATCH_SIZE: usize = 1000;
+            const BATCH_SIZE: usize = P9_READDIR_BATCH_SIZE;
 
             match self
                 .filesystem
@@ -1226,7 +1227,7 @@ impl NinePHandler {
             files: total_inodes,
             ffree: available_inodes,
             fsid: 0,
-            namelen: 255,
+            namelen: P9_MAX_NAME_LEN,
         };
 
         P9Message::new(tag, Message::Rstatfs(statfs))
