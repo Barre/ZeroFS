@@ -1,6 +1,8 @@
 use super::handler::NinePHandler;
 use super::lock_manager::FileLockManager;
-use super::protocol::P9Message;
+use super::protocol::{
+    P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN, P9Message,
+};
 use crate::fs::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
 use bytes::BytesMut;
@@ -105,7 +107,7 @@ where
 
     let (mut read_stream, mut write_stream) = tokio::io::split(stream);
 
-    let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(100);
+    let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
     let writer_task = tokio::spawn(async move {
         while let Some((tag, response_bytes)) = rx.recv().await {
@@ -134,7 +136,7 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        let mut size_buf = [0u8; 4];
+        let mut size_buf = [0u8; P9_SIZE_FIELD_LEN];
         match read_stream.read_exact(&mut size_buf).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -147,7 +149,7 @@ where
         }
 
         let size = u32::from_le_bytes(size_buf);
-        if !(7..=DEFAULT_MSIZE).contains(&size) {
+        if !(P9_MIN_MESSAGE_SIZE..=DEFAULT_MSIZE).contains(&size) {
             error!("Invalid message size: {}", size);
             return Err(anyhow::anyhow!("Invalid message size"));
         }
@@ -156,7 +158,9 @@ where
         full_buf.extend_from_slice(&size_buf);
         full_buf.resize(size as usize, 0);
 
-        read_stream.read_exact(&mut full_buf[4..]).await?;
+        read_stream
+            .read_exact(&mut full_buf[P9_SIZE_FIELD_LEN..])
+            .await?;
 
         match P9Message::from_bytes((&full_buf, 0)) {
             Ok((_, parsed)) => {
@@ -186,7 +190,7 @@ where
             }
             Err(e) => {
                 // Failed to parse message - check if we can at least get the tag
-                if full_buf.len() >= 7 {
+                if full_buf.len() >= P9_MIN_MESSAGE_SIZE as usize {
                     let tag = u16::from_le_bytes([full_buf[5], full_buf[6]]);
                     let msg_type = full_buf[4];
                     debug!(
@@ -194,9 +198,10 @@ where
                         msg_type, msg_type, tag, e
                     );
                     debug!(
-                        "Message size: {}, buffer (first 40 bytes): {:?}",
+                        "Message size: {}, buffer (first {} bytes): {:?}",
                         size,
-                        &full_buf[0..std::cmp::min(40, full_buf.len())]
+                        P9_DEBUG_BUFFER_SIZE,
+                        &full_buf[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, full_buf.len())]
                     );
                     let error_msg = P9Message::error(tag, libc::ENOSYS as u32);
                     let response_bytes = error_msg.to_bytes().map_err(|e| {

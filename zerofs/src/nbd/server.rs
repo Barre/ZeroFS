@@ -1,10 +1,11 @@
 use super::error::{NBDError, Result};
 use super::protocol::{
-    NBD_CMD_FLAG_FUA, NBD_EINVAL, NBD_EIO, NBD_ENOSPC, NBD_FLAG_C_FIXED_NEWSTYLE,
-    NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_NO_ZEROES, NBD_INFO_EXPORT,
-    NBD_OPT_ABORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO, NBD_OPT_INFO, NBD_OPT_LIST,
-    NBD_OPT_STRUCTURED_REPLY, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN,
-    NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_SERVER, NBD_SUCCESS, NBDClientFlags, NBDCommand,
+    NBD_CMD_FLAG_FUA, NBD_EINVAL, NBD_EIO, NBD_ENOSPC, NBD_EXPORT_NAME_PADDING,
+    NBD_FLAG_C_FIXED_NEWSTYLE, NBD_FLAG_C_NO_ZEROES, NBD_FLAG_FIXED_NEWSTYLE, NBD_FLAG_NO_ZEROES,
+    NBD_INFO_EXPORT, NBD_OPT_ABORT, NBD_OPT_EXPORT_NAME, NBD_OPT_GO, NBD_OPT_INFO, NBD_OPT_LIST,
+    NBD_OPT_STRUCTURED_REPLY, NBD_OPTION_HEADER_SIZE, NBD_READDIR_DEFAULT_LIMIT, NBD_REP_ACK,
+    NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_ERR_UNSUP, NBD_REP_INFO, NBD_REP_SERVER,
+    NBD_REQUEST_HEADER_SIZE, NBD_SUCCESS, NBD_ZERO_CHUNK_SIZE, NBDClientFlags, NBDCommand,
     NBDInfoExport, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     TRANSMISSION_FLAGS,
 };
@@ -165,10 +166,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 )))
             })?;
 
-        // List files in .nbd directory
         let entries = self
             .filesystem
-            .process_readdir(&auth, nbd_dir_inode, 0, 1000)
+            .process_readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -274,7 +274,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn negotiate_options(&mut self) -> Result<NBDDevice> {
         loop {
-            let mut header_buf = [0u8; 16];
+            let mut header_buf = [0u8; NBD_OPTION_HEADER_SIZE];
             match self.reader.read_exact(&mut header_buf).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -395,9 +395,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .write_all(&TRANSMISSION_FLAGS.to_be_bytes())
             .await?;
 
-        // Only send 124 bytes of zeroes if client didn't set NBD_FLAG_C_NO_ZEROES
+        // Only send padding bytes if client didn't set NBD_FLAG_C_NO_ZEROES
         if !self.client_no_zeroes {
-            let zeros = vec![0u8; 124];
+            let zeros = vec![0u8; NBD_EXPORT_NAME_PADDING];
             self.writer.write_all(&zeros).await?;
         }
 
@@ -548,7 +548,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup device file: {e:?}")))?;
 
         loop {
-            let mut request_buf = [0u8; 28];
+            let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
             self.reader.read_exact(&mut request_buf).await?;
             let request = NBDRequest::from_bytes((&request_buf, 0))
                 .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?
@@ -871,8 +871,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             gids: vec![],
         };
 
-        const ZERO_CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-        let zero_chunk = vec![0u8; ZERO_CHUNK_SIZE.min(length as usize)];
+        let zero_chunk = vec![0u8; NBD_ZERO_CHUNK_SIZE.min(length as usize)];
 
         // Write zeros in chunks to avoid huge allocations
         let mut remaining = length as usize;
@@ -880,7 +879,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let mut write_succeeded = true;
 
         while remaining > 0 && write_succeeded {
-            let chunk_size = remaining.min(ZERO_CHUNK_SIZE);
+            let chunk_size = remaining.min(NBD_ZERO_CHUNK_SIZE);
             let chunk_data = if chunk_size == zero_chunk.len() {
                 &zero_chunk
             } else {
