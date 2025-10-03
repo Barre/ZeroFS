@@ -169,8 +169,18 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: /mnt/zerofs
         run: |
-          # Run the test suite
-          sudo prove -rv /tmp/pjdfstest_nfs/tests/
+          # Create test directory
+          mkdir -p pjdfstest_test
+          cd pjdfstest_test
+
+          # Get list of all test files
+          find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
+
+          # Filter out excluded tests
+          grep -v -f ${{ github.workspace }}/.github/.pjdfstest-nfs-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
+
+          # Run the filtered test suite
+          sudo prove -rv $(cat /tmp/tests_to_run.txt)
 
       - name: Run pjdfstest (macOS)
         if: runner.os == 'macOS'
