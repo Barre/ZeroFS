@@ -42,7 +42,7 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn dir_entry_key(dir_id: InodeId, name: &str) -> Bytes {
+    pub fn dir_entry_key(dir_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE + name.len());
         key.push(PREFIX_DIR_ENTRY);
         key.extend_from_slice(&dir_id.to_be_bytes());
@@ -50,7 +50,7 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &str) -> Bytes {
+    pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(KEY_CHUNK_SIZE + name.len());
         key.push(PREFIX_DIR_SCAN);
         key.extend_from_slice(&dir_id.to_be_bytes());
@@ -109,11 +109,8 @@ impl KeyCodec {
             PREFIX_DIR_SCAN if key.len() > KEY_CHUNK_SIZE => {
                 if let Ok(entry_bytes) = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into() {
                     let entry_id = u64::from_be_bytes(entry_bytes);
-                    if let Ok(name) = String::from_utf8(key[KEY_CHUNK_SIZE..].to_vec()) {
-                        ParsedKey::DirScan { entry_id, name }
-                    } else {
-                        ParsedKey::Unknown
-                    }
+                    let name = key[KEY_CHUNK_SIZE..].to_vec();
+                    ParsedKey::DirScan { entry_id, name }
                 } else {
                     ParsedKey::Unknown
                 }
