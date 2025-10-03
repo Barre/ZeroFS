@@ -1,5 +1,5 @@
 use super::common::validate_filename;
-use crate::fs::cache::CacheKey;
+use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
@@ -17,6 +17,77 @@ use std::sync::atomic::Ordering;
 use tracing::debug;
 
 impl ZeroFS {
+    pub async fn process_lookup(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        filename: &[u8],
+    ) -> Result<InodeId, FsError> {
+        debug!(
+            "process_lookup: dirid={}, filename={}",
+            dirid,
+            String::from_utf8_lossy(filename)
+        );
+
+        let dir_inode = self.load_inode(dirid).await?;
+
+        match dir_inode {
+            Inode::Directory(_) => {
+                check_access(&dir_inode, creds, AccessMode::Execute)?;
+
+                let cache_key = CacheKey::DirEntry {
+                    dir_id: dirid,
+                    name: filename.to_vec(),
+                };
+                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key) {
+                    debug!(
+                        "process_lookup cache hit: {} -> inode {}",
+                        String::from_utf8_lossy(filename),
+                        inode_id
+                    );
+                    return Ok(inode_id);
+                }
+
+                let entry_key = KeyCodec::dir_entry_key(dirid, filename);
+
+                match self
+                    .db
+                    .get_bytes(&entry_key)
+                    .await
+                    .map_err(|_| FsError::IoError)?
+                {
+                    Some(entry_data) => {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&entry_data[..8]);
+                        let inode_id = u64::from_le_bytes(bytes);
+                        debug!(
+                            "process_lookup found: {} -> inode {}",
+                            String::from_utf8_lossy(filename),
+                            inode_id
+                        );
+
+                        let cache_key = CacheKey::DirEntry {
+                            dir_id: dirid,
+                            name: filename.to_vec(),
+                        };
+                        let cache_value = CacheValue::DirEntry(inode_id);
+                        self.cache.insert(cache_key, cache_value, false);
+
+                        Ok(inode_id)
+                    }
+                    None => {
+                        debug!(
+                            "process_lookup not found: {} in directory",
+                            String::from_utf8_lossy(filename)
+                        );
+                        Err(FsError::NotFound)
+                    }
+                }
+            }
+            _ => Err(FsError::NotDirectory),
+        }
+    }
+
     pub async fn process_mkdir(
         &self,
         creds: &Credentials,
