@@ -34,6 +34,8 @@ pub struct StorageConfig {
     pub url: String,
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub encryption_password: String,
+    #[serde(default)]
+    pub skip_compatibility_check: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -235,6 +237,7 @@ impl Settings {
             storage: StorageConfig {
                 url: "s3://your-bucket/zerofs-data".to_string(),
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
+                skip_compatibility_check: false,
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
