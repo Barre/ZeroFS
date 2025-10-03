@@ -1017,4 +1017,278 @@ mod tests {
             .unwrap();
         assert!(found_file > 0);
     }
+
+    #[tokio::test]
+    async fn test_hardlink_parent_becomes_none() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            crate::fs::inode::Inode::File(f) => {
+                assert_eq!(f.parent, Some(0));
+                assert_eq!(f.nlink, 1);
+            }
+            _ => panic!("Expected file inode"),
+        }
+
+        fs.process_link(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            file_id,
+            0,
+            b"hardlink.txt",
+        )
+        .await
+        .unwrap();
+
+        // Parent should become None when file is hardlinked
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            crate::fs::inode::Inode::File(f) => {
+                assert_eq!(f.parent, None);
+                assert_eq!(f.nlink, 2);
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hardlink_parent_stays_none_after_unlink() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.process_link(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            file_id,
+            0,
+            b"hardlink.txt",
+        )
+        .await
+        .unwrap();
+
+        fs.process_remove(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            0,
+            b"hardlink.txt",
+        )
+        .await
+        .unwrap();
+
+        // Parent should stay None even when nlink drops back to 1
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            crate::fs::inode::Inode::File(f) => {
+                assert_eq!(f.parent, None);
+                assert_eq!(f.nlink, 1);
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_parent_restoration_on_rename() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.process_link(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            file_id,
+            0,
+            b"hardlink.txt",
+        )
+        .await
+        .unwrap();
+
+        fs.process_remove(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            0,
+            b"hardlink.txt",
+        )
+        .await
+        .unwrap();
+
+        let (dir_id, _) = fs
+            .process_mkdir(&creds, 0, b"subdir", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.process_rename(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            0,
+            b"original.txt",
+            dir_id,
+            b"moved.txt",
+        )
+        .await
+        .unwrap();
+
+        // Parent should be lazily restored on rename when nlink=1
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            crate::fs::inode::Inode::File(f) => {
+                assert_eq!(f.parent, Some(dir_id));
+                assert_eq!(f.nlink, 1);
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_hardlinked_file_parent_stays_none() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.process_link(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            file_id,
+            0,
+            b"hardlink.txt",
+        )
+        .await
+        .unwrap();
+
+        let (dir_id, _) = fs
+            .process_mkdir(&creds, 0, b"subdir", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.process_rename(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            0,
+            b"original.txt",
+            dir_id,
+            b"moved.txt",
+        )
+        .await
+        .unwrap();
+
+        // Parent should stay None when renaming file with nlink > 1
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match inode {
+            crate::fs::inode::Inode::File(f) => {
+                assert_eq!(f.parent, None);
+                assert_eq!(f.nlink, 2);
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hardlink_permission_checks_skipped() {
+        let fs = create_test_fs().await;
+        let owner_creds = Credentials {
+            uid: 1000,
+            gid: 1000,
+            groups: [1000; 16],
+            groups_count: 1,
+        };
+
+        let (dir_id, _) = fs
+            .process_mkdir(
+                &owner_creds,
+                0,
+                b"private_dir",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (file_id, _) = fs
+            .process_create(&owner_creds, dir_id, b"file.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.process_link(
+            &AuthContext {
+                uid: 1000,
+                gid: 1000,
+                gids: vec![1000],
+            },
+            file_id,
+            0,
+            b"public_link.txt",
+        )
+        .await
+        .unwrap();
+
+        let inode = fs.load_inode(file_id).await.unwrap();
+        match &inode {
+            crate::fs::inode::Inode::File(f) => {
+                assert_eq!(f.parent, None);
+                assert_eq!(f.nlink, 2);
+            }
+            _ => panic!("Expected file inode"),
+        }
+
+        // Parent permission checks should be skipped when parent=None
+        let result = fs
+            .process_read_file(
+                &AuthContext {
+                    uid: 2000,
+                    gid: 2000,
+                    gids: vec![2000],
+                },
+                file_id,
+                0,
+                100,
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
 }

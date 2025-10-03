@@ -499,7 +499,7 @@ impl ZeroFS {
                         SetGid::Set(g) => g,
                         _ => creds.gid,
                     },
-                    parent: dirid,
+                    parent: Some(dirid),
                     nlink: 1,
                     rdev,
                 };

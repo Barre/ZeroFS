@@ -282,13 +282,28 @@ impl ZeroFS {
         if from_dirid != to_dirid {
             let mut moved_inode = self.load_inode(source_inode_id).await?;
             match &mut moved_inode {
-                Inode::File(f) => f.parent = to_dirid,
                 Inode::Directory(d) => d.parent = to_dirid,
-                Inode::Symlink(s) => s.parent = to_dirid,
-                Inode::Fifo(s) => s.parent = to_dirid,
-                Inode::Socket(s) => s.parent = to_dirid,
-                Inode::CharDevice(s) => s.parent = to_dirid,
-                Inode::BlockDevice(s) => s.parent = to_dirid,
+                Inode::File(f) => {
+                    // Lazy restoration: if nlink == 1, restore parent
+                    if f.nlink == 1 {
+                        f.parent = Some(to_dirid);
+                    }
+                }
+                Inode::Symlink(s) => {
+                    // Lazy restoration: if nlink == 1, restore parent
+                    if s.nlink == 1 {
+                        s.parent = Some(to_dirid);
+                    }
+                }
+                Inode::Fifo(s)
+                | Inode::Socket(s)
+                | Inode::CharDevice(s)
+                | Inode::BlockDevice(s) => {
+                    // Lazy restoration: if nlink == 1, restore parent
+                    if s.nlink == 1 {
+                        s.parent = Some(to_dirid);
+                    }
+                }
             }
             batch.put_bytes(
                 &KeyCodec::inode_key(source_inode_id),

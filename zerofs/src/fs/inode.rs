@@ -14,7 +14,9 @@ pub struct FileInode {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    pub parent: InodeId,
+    /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
+    /// Lazily restored to Some(parent) when file becomes singly-linked again.
+    pub parent: Option<InodeId>,
     pub nlink: u32,
 }
 
@@ -46,7 +48,9 @@ pub struct SymlinkInode {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    pub parent: InodeId,
+    /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
+    /// Lazily restored to Some(parent) when file becomes singly-linked again.
+    pub parent: Option<InodeId>,
     pub nlink: u32,
 }
 
@@ -61,7 +65,9 @@ pub struct SpecialInode {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    pub parent: InodeId,
+    /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
+    /// Lazily restored to Some(parent) when file becomes singly-linked again.
+    pub parent: Option<InodeId>,
     pub nlink: u32,
     pub rdev: Option<(u32, u32)>, // For character and block devices (major, minor)
 }
@@ -97,7 +103,7 @@ mod tests {
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            parent: 0,
+            parent: Some(0),
             nlink: 1,
         };
 
@@ -164,7 +170,7 @@ mod tests {
             mode: 0o777,
             uid: 1000,
             gid: 1000,
-            parent: 0,
+            parent: Some(0),
             nlink: 1,
         };
 
@@ -197,7 +203,7 @@ mod tests {
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            parent: 0,
+            parent: Some(0),
             nlink: 1,
         };
 
