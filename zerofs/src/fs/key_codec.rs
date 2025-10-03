@@ -12,6 +12,11 @@ pub const PREFIX_SYSTEM: u8 = 0x07;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
+const U64_SIZE: usize = 8;
+const KEY_INODE_SIZE: usize = 9;
+const KEY_CHUNK_SIZE: usize = 17;
+const KEY_TOMBSTONE_SIZE: usize = 17;
+
 #[derive(Debug, Clone)]
 pub enum ParsedKey {
     DirScan { entry_id: InodeId, name: String },
@@ -23,14 +28,14 @@ pub struct KeyCodec;
 
 impl KeyCodec {
     pub fn inode_key(inode_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(9);
+        let mut key = Vec::with_capacity(KEY_INODE_SIZE);
         key.push(PREFIX_INODE);
         key.extend_from_slice(&inode_id.to_be_bytes());
         Bytes::from(key)
     }
 
     pub fn chunk_key(inode_id: InodeId, chunk_index: u64) -> Bytes {
-        let mut key = Vec::with_capacity(17);
+        let mut key = Vec::with_capacity(KEY_CHUNK_SIZE);
         key.push(PREFIX_CHUNK);
         key.extend_from_slice(&inode_id.to_be_bytes());
         key.extend_from_slice(&chunk_index.to_be_bytes());
@@ -38,7 +43,7 @@ impl KeyCodec {
     }
 
     pub fn dir_entry_key(dir_id: InodeId, name: &str) -> Bytes {
-        let mut key = Vec::with_capacity(9 + name.len());
+        let mut key = Vec::with_capacity(KEY_INODE_SIZE + name.len());
         key.push(PREFIX_DIR_ENTRY);
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(name.as_bytes());
@@ -46,7 +51,7 @@ impl KeyCodec {
     }
 
     pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &str) -> Bytes {
-        let mut key = Vec::with_capacity(17 + name.len());
+        let mut key = Vec::with_capacity(KEY_CHUNK_SIZE + name.len());
         key.push(PREFIX_DIR_SCAN);
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(&entry_id.to_be_bytes());
@@ -55,7 +60,7 @@ impl KeyCodec {
     }
 
     pub fn dir_scan_prefix(dir_id: InodeId) -> Vec<u8> {
-        let mut prefix = Vec::with_capacity(9);
+        let mut prefix = Vec::with_capacity(KEY_INODE_SIZE);
         prefix.push(PREFIX_DIR_SCAN);
         prefix.extend_from_slice(&dir_id.to_be_bytes());
         prefix
@@ -70,14 +75,14 @@ impl KeyCodec {
 
     // Build the end key for a directory scan range (next directory)
     pub fn dir_scan_end_key(dir_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(9);
+        let mut key = Vec::with_capacity(KEY_INODE_SIZE);
         key.push(PREFIX_DIR_SCAN);
         key.extend_from_slice(&(dir_id + 1).to_be_bytes());
         Bytes::from(key)
     }
 
     pub fn tombstone_key(timestamp: u64, inode_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(17);
+        let mut key = Vec::with_capacity(KEY_TOMBSTONE_SIZE);
         key.push(PREFIX_TOMBSTONE);
         key.extend_from_slice(&timestamp.to_be_bytes());
         key.extend_from_slice(&inode_id.to_be_bytes());
@@ -85,7 +90,7 @@ impl KeyCodec {
     }
 
     pub fn stats_shard_key(shard_id: usize) -> Bytes {
-        let mut key = Vec::with_capacity(9);
+        let mut key = Vec::with_capacity(KEY_INODE_SIZE);
         key.push(PREFIX_STATS);
         key.extend_from_slice(&(shard_id as u64).to_be_bytes());
         Bytes::from(key)
@@ -101,10 +106,10 @@ impl KeyCodec {
         }
 
         match key[0] {
-            PREFIX_DIR_SCAN if key.len() > 17 => {
-                if let Ok(entry_bytes) = key[9..17].try_into() {
+            PREFIX_DIR_SCAN if key.len() > KEY_CHUNK_SIZE => {
+                if let Ok(entry_bytes) = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into() {
                     let entry_id = u64::from_be_bytes(entry_bytes);
-                    if let Ok(name) = String::from_utf8(key[17..].to_vec()) {
+                    if let Ok(name) = String::from_utf8(key[KEY_CHUNK_SIZE..].to_vec()) {
                         ParsedKey::DirScan { entry_id, name }
                     } else {
                         ParsedKey::Unknown
@@ -113,8 +118,8 @@ impl KeyCodec {
                     ParsedKey::Unknown
                 }
             }
-            PREFIX_TOMBSTONE if key.len() == 17 => {
-                if let Ok(id_bytes) = key[9..17].try_into() {
+            PREFIX_TOMBSTONE if key.len() == KEY_TOMBSTONE_SIZE => {
+                if let Ok(id_bytes) = key[KEY_INODE_SIZE..KEY_TOMBSTONE_SIZE].try_into() {
                     ParsedKey::Tombstone {
                         inode_id: u64::from_be_bytes(id_bytes),
                     }
@@ -131,10 +136,10 @@ impl KeyCodec {
     }
 
     pub fn decode_counter(data: &[u8]) -> Result<u64, FsError> {
-        if data.len() != 8 {
+        if data.len() != U64_SIZE {
             return Err(FsError::InvalidData);
         }
-        let bytes: [u8; 8] = data.try_into().map_err(|_| FsError::InvalidData)?;
+        let bytes: [u8; U64_SIZE] = data.try_into().map_err(|_| FsError::InvalidData)?;
         Ok(u64::from_le_bytes(bytes))
     }
 
@@ -143,10 +148,12 @@ impl KeyCodec {
     }
 
     pub fn decode_dir_entry(data: &[u8]) -> Result<InodeId, FsError> {
-        if data.len() < 8 {
+        if data.len() < U64_SIZE {
             return Err(FsError::InvalidData);
         }
-        let bytes: [u8; 8] = data[..8].try_into().map_err(|_| FsError::InvalidData)?;
+        let bytes: [u8; U64_SIZE] = data[..U64_SIZE]
+            .try_into()
+            .map_err(|_| FsError::InvalidData)?;
         Ok(u64::from_le_bytes(bytes))
     }
 
@@ -155,10 +162,10 @@ impl KeyCodec {
     }
 
     pub fn decode_tombstone_size(data: &[u8]) -> Result<u64, FsError> {
-        if data.len() != 8 {
+        if data.len() != U64_SIZE {
             return Err(FsError::InvalidData);
         }
-        let bytes: [u8; 8] = data.try_into().map_err(|_| FsError::InvalidData)?;
+        let bytes: [u8; U64_SIZE] = data.try_into().map_err(|_| FsError::InvalidData)?;
         Ok(u64::from_le_bytes(bytes))
     }
 
