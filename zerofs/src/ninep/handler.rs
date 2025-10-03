@@ -7,14 +7,12 @@ use tracing::debug;
 use super::lock_manager::{FileLock, FileLockManager};
 use super::protocol::*;
 use super::protocol::{P9_MAX_GROUPS, P9_MAX_NAME_LEN, P9_NOBODY_UID, P9_READDIR_BATCH_SIZE};
-use crate::fs::errors::FsError;
+use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{
     FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
 };
-use crate::fs::{EncodedFileId, ZeroFS};
-use zerofs_nfsserve::vfs::NFSFileSystem;
 
 pub const DEFAULT_MSIZE: u32 = 1_048_576; // 1MB
 pub const DEFAULT_IOUNIT: u32 = 1_048_576; // 1MB
@@ -267,15 +265,13 @@ impl NinePHandler {
 
             match inode {
                 Inode::Directory(ref _dir) => {
-                    let auth = self.make_auth_context(&src_fid.creds);
-                    let encoded_current_id = EncodedFileId::from_inode(current_id).into();
+                    let creds = src_fid.creds;
                     match self
                         .filesystem
-                        .lookup(&auth, encoded_current_id, &name.as_bytes().into())
+                        .process_lookup(&creds, current_id, name.as_bytes())
                         .await
                     {
-                        Ok(encoded_id) => {
-                            let child_id = EncodedFileId::from(encoded_id).inode_id();
+                        Ok(child_id) => {
                             let child_inode = match self.filesystem.load_inode(child_id).await {
                                 Ok(i) => i,
                                 Err(e) => {
@@ -286,7 +282,7 @@ impl NinePHandler {
                             wqids.push(inode_to_qid(&child_inode, child_id));
                             current_id = child_id;
                         }
-                        Err(e) => return P9Message::error(tag, FsError::from(e).to_errno()),
+                        Err(e) => return P9Message::error(tag, e.to_errno()),
                     }
                 }
                 _ => return P9Message::error(tag, libc::ENOTDIR as u32),
@@ -519,16 +515,14 @@ impl NinePHandler {
                 };
                 (parent_id, parent_inode)
             } else {
-                // NFS lookup expects encoded IDs
-                let encoded_parent_id = EncodedFileId::from_inode(fid_entry.inode_id).into();
-                let filename = name.as_slice().into();
+                let auth_ctx: crate::fs::types::AuthContext = (&auth).into();
+                let creds = Credentials::from_auth_context(&auth_ctx);
                 match self
                     .filesystem
-                    .lookup(&auth, encoded_parent_id, &filename)
+                    .process_lookup(&creds, fid_entry.inode_id, name.as_slice())
                     .await
                 {
-                    Ok(encoded_id) => {
-                        let real_id = EncodedFileId::from(encoded_id).inode_id();
+                    Ok(real_id) => {
                         let inode = match self.filesystem.load_inode(real_id).await {
                             Ok(i) => i,
                             Err(_) => continue,
@@ -1038,19 +1032,16 @@ impl NinePHandler {
         let creds = source_fid.creds;
 
         let mut source_parent_id = 0;
-        let auth = self.make_auth_context(&creds);
         for name in &source_parent_path {
-            let encoded_parent_id = EncodedFileId::from_inode(source_parent_id).into();
             match self
                 .filesystem
-                .lookup(&auth, encoded_parent_id, &name.as_bytes().into())
+                .process_lookup(&creds, source_parent_id, name.as_bytes())
                 .await
             {
-                Ok(encoded_id) => {
-                    let real_id = EncodedFileId::from(encoded_id).inode_id();
+                Ok(real_id) => {
                     source_parent_id = real_id;
                 }
-                Err(e) => return P9Message::error(tag, FsError::from(e).to_errno()),
+                Err(e) => return P9Message::error(tag, e.to_errno()),
             }
         }
 
@@ -1136,15 +1127,13 @@ impl NinePHandler {
             Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
         };
 
-        let auth = self.make_auth_context(&creds);
-        let encoded_parent_id = EncodedFileId::from_inode(parent_id).into();
         let child_id = match self
             .filesystem
-            .lookup(&auth, encoded_parent_id, &name.as_bytes().into())
+            .process_lookup(&creds, parent_id, name.as_bytes())
             .await
         {
-            Ok(encoded_id) => EncodedFileId::from(encoded_id).inode_id(),
-            Err(e) => return P9Message::error(tag, FsError::from(e).to_errno()),
+            Ok(id) => id,
+            Err(e) => return P9Message::error(tag, e.to_errno()),
         };
 
         let child_inode = match self.filesystem.load_inode(child_id).await {

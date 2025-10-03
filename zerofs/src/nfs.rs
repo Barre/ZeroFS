@@ -1,6 +1,4 @@
-use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::inode::Inode;
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use crate::fs::{EncodedFileId, ZeroFS};
@@ -39,67 +37,11 @@ impl NFSFileSystem for ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        let dir_inode = self.load_inode(real_dirid).await?;
+        let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let creds = Credentials::from_auth_context(&auth_ctx);
 
-        match dir_inode {
-            Inode::Directory(ref _dir) => {
-                use crate::fs::permissions::{AccessMode, Credentials, check_access};
-                let auth_ctx: crate::fs::types::AuthContext = auth.into();
-                let creds = Credentials::from_auth_context(&auth_ctx);
-                check_access(&dir_inode, &creds, AccessMode::Execute)?;
-                let name = filename.to_vec();
-
-                let cache_key = CacheKey::DirEntry {
-                    dir_id: real_dirid,
-                    name: name.clone(),
-                };
-                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key) {
-                    debug!(
-                        "lookup cache hit: {} -> inode {}",
-                        String::from_utf8_lossy(filename),
-                        inode_id
-                    );
-                    return Ok(EncodedFileId::from_inode(inode_id).into());
-                }
-
-                let entry_key = KeyCodec::dir_entry_key(real_dirid, &name);
-
-                match self
-                    .db
-                    .get_bytes(&entry_key)
-                    .await
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
-                {
-                    Some(entry_data) => {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&entry_data[..8]);
-                        let inode_id = u64::from_le_bytes(bytes);
-                        debug!(
-                            "lookup found: {} -> inode {}",
-                            String::from_utf8_lossy(filename),
-                            inode_id
-                        );
-
-                        let cache_key = crate::fs::cache::CacheKey::DirEntry {
-                            dir_id: real_dirid,
-                            name: name.clone(),
-                        };
-                        let cache_value = crate::fs::cache::CacheValue::DirEntry(inode_id);
-                        self.cache.insert(cache_key, cache_value, false);
-
-                        Ok(EncodedFileId::from_inode(inode_id).into())
-                    }
-                    None => {
-                        debug!(
-                            "lookup not found: {} in directory",
-                            String::from_utf8_lossy(filename)
-                        );
-                        Err(nfsstat3::NFS3ERR_NOENT)
-                    }
-                }
-            }
-            _ => Err(nfsstat3::NFS3ERR_NOTDIR),
-        }
+        let inode_id = self.process_lookup(&creds, real_dirid, filename).await?;
+        Ok(EncodedFileId::from_inode(inode_id).into())
     }
 
     async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
