@@ -400,8 +400,12 @@ impl ZeroFS {
 
     #[cfg(test)]
     pub async fn new_in_memory_with_encryption(encryption_key: [u8; 32]) -> anyhow::Result<Self> {
+        use slatedb::DbBuilder;
+        use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+        use slatedb::object_store::path::Path;
+
         let object_store = slatedb::object_store::memory::InMemory::new();
-        let object_store: Arc<dyn ObjectStore> = Arc::new(object_store);
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
 
         let settings = slatedb::config::Settings {
             compression_codec: None, // Disable compression - we handle it in encryption layer
@@ -425,74 +429,13 @@ impl ZeroFS {
                 .await?,
         );
 
-        let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
-        let db = Arc::new(EncryptedDb::new(slatedb.clone(), encryptor.clone()));
-
-        let next_inode_id = 1;
-
-        let root_inode_key = KeyCodec::inode_key(0);
-        if db.get_bytes(&root_inode_key).await?.is_none() {
-            let (uid, gid) = get_current_uid_gid();
-            let (now_sec, now_nsec) = get_current_time();
-            let root_dir = DirectoryInode {
-                mtime: now_sec,
-                mtime_nsec: now_nsec,
-                ctime: now_sec,
-                ctime_nsec: now_nsec,
-                atime: now_sec,
-                atime_nsec: now_nsec,
-                mode: 0o1777,
-                uid,
-                gid,
-                entry_count: 0,
-                parent: 0,
-                nlink: 2, // . and ..
-            };
-            let serialized = bincode::serialize(&Inode::Directory(root_dir))?;
-            db.put_with_options(
-                &root_inode_key,
-                &serialized,
-                &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await?;
-        }
-
-        let lock_manager = Arc::new(LockManager::new());
-
-        // For tests, use memory-only cache (no disk backing needed)
-        let unified_cache = Arc::new(UnifiedCache::new("", 0.0, Some(0.1))?);
-
-        let db = Arc::new(
-            EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
-        );
-
-        let global_stats = Arc::new(FileSystemGlobalStats::new());
-
-        for i in 0..STATS_SHARDS {
-            let shard_key = KeyCodec::stats_shard_key(i);
-            if let Some(data) = db.get_bytes(&shard_key).await?
-                && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
-            {
-                global_stats.load_shard(i, &shard_data);
-            }
-        }
-
-        let flush_coordinator = FlushCoordinator::new(db.clone());
-
-        let fs = Self {
-            db: db.clone(),
-            lock_manager,
-            next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
-            cache: unified_cache,
-            stats: Arc::new(FileSystemStats::new()),
-            global_stats,
-            flush_coordinator,
+        let cache_config = CacheConfig {
+            root_folder: "".to_string(),
+            max_cache_size_gb: 0.0,
+            memory_cache_size_gb: Some(0.1),
         };
 
-        Ok(fs)
+        Self::new_with_slatedb(slatedb, cache_config, encryption_key).await
     }
 }
 
