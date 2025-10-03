@@ -19,7 +19,7 @@ const KEY_TOMBSTONE_SIZE: usize = 17;
 
 #[derive(Debug, Clone)]
 pub enum ParsedKey {
-    DirScan { entry_id: InodeId, name: String },
+    DirScan { entry_id: InodeId, name: Vec<u8> },
     Tombstone { inode_id: InodeId },
     Unknown,
 }
@@ -46,7 +46,7 @@ impl KeyCodec {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE + name.len());
         key.push(PREFIX_DIR_ENTRY);
         key.extend_from_slice(&dir_id.to_be_bytes());
-        key.extend_from_slice(name.as_bytes());
+        key.extend_from_slice(name);
         Bytes::from(key)
     }
 
@@ -55,7 +55,7 @@ impl KeyCodec {
         key.push(PREFIX_DIR_SCAN);
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(&entry_id.to_be_bytes());
-        key.extend_from_slice(name.as_bytes());
+        key.extend_from_slice(name);
         Bytes::from(key)
     }
 
@@ -184,7 +184,7 @@ mod tests {
     fn test_dir_scan_parsing() {
         let dir_id = 10u64;
         let entry_id = 20u64;
-        let name = "test_file.txt";
+        let name = b"test_file.txt";
         let key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
 
         match KeyCodec::parse_key(&key) {

@@ -14,7 +14,7 @@ pub struct FileLock {
     pub start: u64,
     pub length: u64,
     pub proc_id: u32,
-    pub client_id: String,
+    pub client_id: Vec<u8>,
     pub fid: u32,
     pub inode_id: InodeId,
 }

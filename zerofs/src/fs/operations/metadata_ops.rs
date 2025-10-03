@@ -424,17 +424,18 @@ impl ZeroFS {
         &self,
         creds: &Credentials,
         dirid: InodeId,
-        filename: &[u8],
+        name: &[u8],
         ftype: FileType,
         attr: &SetAttributes,
         rdev: Option<(u32, u32)>, // For device files
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        validate_filename(filename)?;
+        validate_filename(name)?;
 
-        let filename_str = String::from_utf8_lossy(filename);
         debug!(
             "process_mknod: dirid={}, filename={}, ftype={:?}",
-            dirid, filename_str, ftype
+            dirid,
+            String::from_utf8_lossy(name),
+            ftype
         );
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
@@ -453,8 +454,7 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                let name = filename_str.to_string();
-                let entry_key = KeyCodec::dir_entry_key(dirid, &name);
+                let entry_key = KeyCodec::dir_entry_key(dirid, name);
 
                 if self
                     .db
@@ -520,7 +520,7 @@ impl ZeroFS {
 
                 batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(special_id));
 
-                let scan_key = KeyCodec::dir_scan_key(dirid, special_id, &name);
+                let scan_key = KeyCodec::dir_scan_key(dirid, special_id, name);
                 batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(special_id));
 
                 dir.entry_count += 1;

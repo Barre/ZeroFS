@@ -8,8 +8,8 @@ pub enum NBDError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
-    #[error("Device not found: {0}")]
-    DeviceNotFound(String),
+    #[error("Device not found: {}", String::from_utf8_lossy(.0))]
+    DeviceNotFound(Vec<u8>),
 
     #[error("Client does not support required features")]
     IncompatibleClient,

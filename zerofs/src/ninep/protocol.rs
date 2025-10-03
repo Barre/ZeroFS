@@ -1,6 +1,6 @@
 use deku::prelude::*;
 
-pub const VERSION_9P2000L: &str = "9P2000.L";
+pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -115,11 +115,10 @@ pub struct P9String {
 }
 
 impl P9String {
-    pub fn new(s: &str) -> Self {
-        let bytes = s.as_bytes();
+    pub fn new(data: Vec<u8>) -> Self {
         Self {
-            len: bytes.len() as u16,
-            data: bytes.to_vec(),
+            len: data.len() as u16,
+            data,
         }
     }
 

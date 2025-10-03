@@ -21,17 +21,19 @@ impl ZeroFS {
         &self,
         creds: &Credentials,
         dirid: InodeId,
-        dirname: &[u8],
+        name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        validate_filename(dirname)?;
+        validate_filename(name)?;
 
-        let dirname_str = String::from_utf8_lossy(dirname);
-        debug!("process_mkdir: dirid={}, dirname={}", dirid, dirname_str);
-        let name = dirname_str.to_string();
+        debug!(
+            "process_mkdir: dirid={}, dirname={}",
+            dirid,
+            String::from_utf8_lossy(name)
+        );
 
         // Optimistic existence check without holding lock
-        let entry_key = KeyCodec::dir_entry_key(dirid, &name);
+        let entry_key = KeyCodec::dir_entry_key(dirid, name);
         if self
             .db
             .get_bytes(&entry_key)
@@ -124,7 +126,7 @@ impl ZeroFS {
 
                 batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(new_dir_id));
 
-                let scan_key = KeyCodec::dir_scan_key(dirid, new_dir_id, &name);
+                let scan_key = KeyCodec::dir_scan_key(dirid, new_dir_id, name);
                 batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(new_dir_id));
 
                 dir.entry_count += 1;
@@ -296,8 +298,12 @@ impl ZeroFS {
                         resuming = false;
                     }
 
-                    debug!("readdir: found entry {} (inode {})", filename, inode_id);
-                    dir_entries.push((inode_id, filename.as_bytes().to_vec()));
+                    debug!(
+                        "readdir: found entry {} (inode {})",
+                        String::from_utf8_lossy(&filename),
+                        inode_id
+                    );
+                    dir_entries.push((inode_id, filename));
                 }
 
                 const BUFFER_SIZE: usize = 256;

@@ -67,7 +67,7 @@ pub const NBD_OPTION_HEADER_SIZE: usize = 16;
 pub const NBD_REQUEST_HEADER_SIZE: usize = 28;
 
 // Server configuration
-pub const NBD_READDIR_DEFAULT_LIMIT: u32 = 1000;
+pub const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
 pub const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
