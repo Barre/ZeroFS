@@ -507,7 +507,7 @@ mod tests {
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            parent: 0,
+            parent: Some(0),
             nlink: 1,
         };
 

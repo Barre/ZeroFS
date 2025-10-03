@@ -30,8 +30,8 @@ impl ZeroFS {
         while current_id != 0 {
             let inode = self.load_inode(current_id).await?;
             let parent_id = match inode {
+                Inode::Directory(d) => Some(d.parent),
                 Inode::File(f) => f.parent,
-                Inode::Directory(d) => d.parent,
                 Inode::Symlink(s) => s.parent,
                 Inode::Fifo(s) => s.parent,
                 Inode::Socket(s) => s.parent,
@@ -39,11 +39,16 @@ impl ZeroFS {
                 Inode::BlockDevice(s) => s.parent,
             };
 
-            if parent_id == ancestor_id {
+            // If parent is None (file is hardlinked), can't determine ancestry
+            let Some(pid) = parent_id else {
+                return Ok(false);
+            };
+
+            if pid == ancestor_id {
                 return Ok(true);
             }
 
-            current_id = parent_id;
+            current_id = pid;
         }
 
         Ok(false)
@@ -68,8 +73,8 @@ impl ZeroFS {
 
         let inode = self.load_inode(id).await?;
         let parent_id = match &inode {
+            Inode::Directory(d) => Some(d.parent),
             Inode::File(f) => f.parent,
-            Inode::Directory(d) => d.parent,
             Inode::Symlink(s) => s.parent,
             Inode::Fifo(s) => s.parent,
             Inode::Socket(s) => s.parent,
@@ -77,7 +82,10 @@ impl ZeroFS {
             Inode::BlockDevice(s) => s.parent,
         };
 
-        let mut current_id = parent_id;
+        // If parent is None (file is hardlinked), skip parent permission checks
+        let Some(mut current_id) = parent_id else {
+            return Ok(());
+        };
         while current_id != 0 {
             let parent_inode = self.load_inode(current_id).await?;
 

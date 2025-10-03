@@ -86,7 +86,7 @@ impl ZeroFS {
             mode,
             uid,
             gid,
-            parent: dirid,
+            parent: Some(dirid),
             nlink: 1,
         });
 
@@ -214,6 +214,10 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 file.nlink += 1;
+                // When transitioning from 1 to 2+ links, clear parent for hardlinked files
+                if file.nlink > 1 {
+                    file.parent = None;
+                }
                 file.ctime = now_sec;
                 file.ctime_nsec = now_nsec;
             }
@@ -225,6 +229,10 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 special.nlink += 1;
+                // When transitioning from 1 to 2+ links, clear parent for hardlinked files
+                if special.nlink > 1 {
+                    special.parent = None;
+                }
                 special.ctime = now_sec;
                 special.ctime_nsec = now_nsec;
             }
