@@ -1,5 +1,6 @@
+use crate::cli::server::build_slatedb;
 use crate::config::Settings;
-use crate::fs::ZeroFS;
+use crate::fs::CacheConfig;
 use crate::key_management;
 use std::sync::Arc;
 
@@ -68,24 +69,25 @@ pub async fn change_password(
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
     let actual_db_path = path_from_url.to_string();
 
-    let temp_fs = ZeroFS::dangerous_new_with_object_store_unencrypted_for_key_management_only(
-        object_store.clone(),
-        actual_db_path.clone(),
-    )
-    .await
-    .map_err(|e| PasswordError::Other(e.to_string()))?;
+    let cache_config = CacheConfig {
+        root_folder: settings.cache.dir.to_str().unwrap().to_string(),
+        max_cache_size_gb: settings.cache.disk_size_gb,
+        memory_cache_size_gb: settings.cache.memory_size_gb,
+    };
 
-    key_management::change_encryption_password(&temp_fs.db, current_password, &new_password)
+    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path)
+        .await
+        .map_err(|e| PasswordError::Other(e.to_string()))?;
+
+    key_management::change_encryption_password(&slatedb, current_password, &new_password)
         .await
         .map_err(|e| PasswordError::EncryptionError(e.to_string()))?;
 
-    temp_fs
-        .db
+    slatedb
         .flush()
         .await
         .map_err(|e| PasswordError::Other(e.to_string()))?;
-    temp_fs
-        .db
+    slatedb
         .close()
         .await
         .map_err(|e| PasswordError::Other(e.to_string()))?;

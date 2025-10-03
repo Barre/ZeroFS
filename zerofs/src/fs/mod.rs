@@ -17,16 +17,9 @@ use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use crate::encryption::{EncryptedDb, EncryptionManager};
-use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
-use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
-use slatedb::object_store::{ObjectStore, path::Path};
-use slatedb::{
-    DbBuilder,
-    config::{PutOptions, WriteOptions},
-};
+use slatedb::config::{PutOptions, WriteOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::runtime::Runtime;
 use zerofs_nfsserve::nfs::fileid3;
 
 use self::errors::FsError;
@@ -107,11 +100,6 @@ pub struct ZeroFS {
     flush_coordinator: FlushCoordinator,
 }
 
-// DANGEROUS: Temporary unencrypted access only for initial key setup and password changes
-pub struct DangerousUnencryptedZeroFS {
-    pub db: Arc<slatedb::Db>,
-}
-
 #[derive(Clone)]
 pub struct CacheConfig {
     pub root_folder: String,
@@ -120,90 +108,28 @@ pub struct CacheConfig {
 }
 
 impl ZeroFS {
-    pub async fn new_with_object_store(
-        object_store: Arc<dyn ObjectStore>,
+    pub async fn new_with_slatedb(
+        slatedb: Arc<slatedb::Db>,
         cache_config: CacheConfig,
-        db_path: String,
         encryption_key: [u8; 32],
     ) -> anyhow::Result<Self> {
-        let total_disk_cache_gb = cache_config.max_cache_size_gb;
         let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
-
-        let slatedb_object_cache_gb = total_disk_cache_gb;
-
-        // Split memory cache: 50% for ZeroFS, 50% for SlateDB block cache
         let zerofs_memory_cache_gb = total_memory_cache_gb * 0.5;
-        let slatedb_memory_cache_gb = total_memory_cache_gb * 0.5;
-
-        tracing::info!(
-            "Cache allocation - Total disk: {:.2}GB, SlateDB object store: {:.2}GB, Memory - SlateDB: {:.2}GB, ZeroFS: {:.2}GB",
-            total_disk_cache_gb,
-            slatedb_object_cache_gb,
-            slatedb_memory_cache_gb,
-            zerofs_memory_cache_gb
-        );
-
-        let slatedb_object_cache_bytes = (slatedb_object_cache_gb * 1_000_000_000.0) as usize;
-        let slatedb_memory_cache_bytes = (slatedb_memory_cache_gb * 1_000_000_000.0) as u64;
-
-        tracing::info!(
-            "SlateDB in-memory block cache: {} MB",
-            slatedb_memory_cache_bytes / 1_000_000
-        );
-        let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
-
-        let settings = slatedb::config::Settings {
-            l0_max_ssts: 16,
-            object_store_cache_options: ObjectStoreCacheOptions {
-                root_folder: Some(slatedb_cache_dir.clone().into()),
-                max_cache_size_bytes: Some(slatedb_object_cache_bytes),
-                ..Default::default()
-            },
-            flush_interval: Some(std::time::Duration::from_secs(30)),
-            max_unflushed_bytes: 1024 * 1024 * 1024,
-            compactor_options: Some(slatedb::config::CompactorOptions {
-                max_concurrent_compactions: 8,
-                max_sst_size: 256 * 1024 * 1024,
-                ..Default::default()
-            }),
-            compression_codec: None, // Disable compression - we handle it in encryption layer
-            garbage_collector_options: Some(GarbageCollectorOptions {
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: slatedb_memory_cache_bytes,
-        }));
-
-        let db_path = Path::from(db_path);
-
-        // This may look weird, but this is required to not drop the runtime handle from the async context
-        let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
-            let runtime = Runtime::new().unwrap();
-            let handle = runtime.handle().clone();
-
-            let runtime_keeper = std::thread::spawn(move || {
-                runtime.block_on(async { std::future::pending::<()>().await });
-            });
-
-            (handle, runtime_keeper)
-        })
-        .await?;
-
-        let slatedb = Arc::new(
-            DbBuilder::new(db_path, object_store)
-                .with_settings(settings)
-                .with_gc_runtime(runtime_handle.clone())
-                .with_compaction_runtime(runtime_handle.clone())
-                .with_memory_cache(cache)
-                .build()
-                .await?,
-        );
 
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
-        let db = Arc::new(EncryptedDb::new(slatedb.clone(), encryptor.clone()));
+
+        let lock_manager = Arc::new(LockManager::new());
+
+        let zerofs_cache_dir = format!("{}/zerofs", cache_config.root_folder);
+        let unified_cache = Arc::new(UnifiedCache::new(
+            &zerofs_cache_dir,
+            0.0,
+            Some(zerofs_memory_cache_gb),
+        )?);
+
+        let db = Arc::new(
+            EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
+        );
 
         let counter_key = KeyCodec::system_counter_key();
         let next_inode_id = match db.get_bytes(&counter_key).await? {
@@ -240,19 +166,6 @@ impl ZeroFS {
             )
             .await?;
         }
-
-        let lock_manager = Arc::new(LockManager::new());
-
-        let zerofs_cache_dir = format!("{}/zerofs", cache_config.root_folder);
-        let unified_cache = Arc::new(UnifiedCache::new(
-            &zerofs_cache_dir,
-            0.0,
-            Some(zerofs_memory_cache_gb),
-        )?);
-
-        let db = Arc::new(
-            EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
-        );
 
         let global_stats = Arc::new(FileSystemGlobalStats::new());
 
@@ -595,25 +508,6 @@ impl ZeroFS {
             .ok_or(errors::FsError::NotFound)?;
 
         KeyCodec::decode_dir_entry(&entry_data)
-    }
-
-    /// DANGEROUS: Creates an unencrypted database connection. Only use for key management!
-    pub async fn dangerous_new_with_object_store_unencrypted_for_key_management_only(
-        object_store: Arc<dyn ObjectStore>,
-        db_path: String,
-    ) -> anyhow::Result<DangerousUnencryptedZeroFS> {
-        let settings = slatedb::config::Settings {
-            ..Default::default()
-        };
-
-        let slatedb = Arc::new(
-            DbBuilder::new(Path::from(db_path), object_store)
-                .with_settings(settings)
-                .build()
-                .await?,
-        );
-
-        Ok(DangerousUnencryptedZeroFS { db: slatedb })
     }
 }
 
