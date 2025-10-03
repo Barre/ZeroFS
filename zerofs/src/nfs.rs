@@ -4,6 +4,7 @@ use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use crate::fs::{EncodedFileId, ZeroFS};
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
@@ -13,8 +14,21 @@ use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapa
 const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
 const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
 
+/// Adapter struct that implements the NFS trait for ZeroFS.
+/// This prevents accidental direct calls to NFS trait methods on ZeroFS.
+#[derive(Clone)]
+pub struct NFSAdapter {
+    fs: Arc<ZeroFS>,
+}
+
+impl NFSAdapter {
+    pub fn new(fs: Arc<ZeroFS>) -> Self {
+        Self { fs }
+    }
+}
+
 #[async_trait]
-impl NFSFileSystem for ZeroFS {
+impl NFSFileSystem for NFSAdapter {
     fn root_dir(&self) -> fileid3 {
         0
     }
@@ -40,7 +54,7 @@ impl NFSFileSystem for ZeroFS {
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
 
-        let inode_id = self.process_lookup(&creds, real_dirid, filename).await?;
+        let inode_id = self.fs.process_lookup(&creds, real_dirid, filename).await?;
         Ok(EncodedFileId::from_inode(inode_id).into())
     }
 
@@ -48,7 +62,7 @@ impl NFSFileSystem for ZeroFS {
         debug!("getattr called: id={}", id);
         let encoded_id = EncodedFileId::from(id);
         let real_id = encoded_id.inode_id();
-        let inode = self.load_inode(real_id).await?;
+        let inode = self.fs.load_inode(real_id).await?;
         Ok(InodeWithId {
             inode: &inode,
             id: real_id,
@@ -66,7 +80,8 @@ impl NFSFileSystem for ZeroFS {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
         let real_id = EncodedFileId::from(id).inode_id();
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
-        self.process_read_file(&auth_ctx, real_id, offset, count)
+        self.fs
+            .process_read_file(&auth_ctx, real_id, offset, count)
             .await
             .map_err(|e| e.into())
     }
@@ -87,8 +102,10 @@ impl NFSFileSystem for ZeroFS {
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
-        let file_attrs: crate::fs::types::FileAttributes =
-            self.process_write(&auth_ctx, real_id, offset, data).await?;
+        let file_attrs: crate::fs::types::FileAttributes = self
+            .fs
+            .process_write(&auth_ctx, real_id, offset, data)
+            .await?;
         Ok((&file_attrs).into())
     }
 
@@ -112,6 +129,7 @@ impl NFSFileSystem for ZeroFS {
         let fs_attr = SetAttributes::from(attr);
 
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
+            .fs
             .process_create(&creds, real_dirid, filename, &fs_attr)
             .await?;
 
@@ -133,6 +151,7 @@ impl NFSFileSystem for ZeroFS {
         );
 
         let id = self
+            .fs
             .process_create_exclusive(&auth.into(), real_dirid, filename)
             .await?;
 
@@ -158,6 +177,7 @@ impl NFSFileSystem for ZeroFS {
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
+            .fs
             .process_mkdir(&creds, real_dirid, dirname, &fs_attr)
             .await?;
         Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
@@ -177,7 +197,10 @@ impl NFSFileSystem for ZeroFS {
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
-        Ok(self.process_remove(&auth_ctx, real_dirid, filename).await?)
+        Ok(self
+            .fs
+            .process_remove(&auth_ctx, real_dirid, filename)
+            .await?)
     }
 
     async fn rename(
@@ -196,15 +219,16 @@ impl NFSFileSystem for ZeroFS {
             real_from_dirid, real_to_dirid
         );
 
-        self.process_rename(
-            &auth.into(),
-            real_from_dirid,
-            from_filename,
-            real_to_dirid,
-            to_filename,
-        )
-        .await
-        .map_err(|e| e.into())
+        self.fs
+            .process_rename(
+                &auth.into(),
+                real_from_dirid,
+                from_filename,
+                real_to_dirid,
+                to_filename,
+            )
+            .await
+            .map_err(|e| e.into())
     }
 
     async fn readdir(
@@ -222,6 +246,7 @@ impl NFSFileSystem for ZeroFS {
         );
 
         let result = self
+            .fs
             .process_readdir(&auth.into(), real_dirid, start_after, max_entries)
             .await?;
 
@@ -253,7 +278,7 @@ impl NFSFileSystem for ZeroFS {
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(setattr);
-        let file_attrs = self.process_setattr(&creds, real_id, &fs_attr).await?;
+        let file_attrs = self.fs.process_setattr(&creds, real_id, &fs_attr).await?;
         Ok((&file_attrs).into())
     }
 
@@ -276,6 +301,7 @@ impl NFSFileSystem for ZeroFS {
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs) = self
+            .fs
             .process_symlink(&creds, real_dirid, &linkname.0, &symlink.0, &fs_attr)
             .await
             .map_err(|e: crate::fs::errors::FsError| -> nfsstat3 { e.into() })?;
@@ -287,7 +313,7 @@ impl NFSFileSystem for ZeroFS {
         debug!("readlink called: id={}", id);
         let real_id = EncodedFileId::from(id).inode_id();
 
-        let inode = self.load_inode(real_id).await?;
+        let inode = self.fs.load_inode(real_id).await?;
 
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
@@ -310,12 +336,8 @@ impl NFSFileSystem for ZeroFS {
             real_dirid, filename, ftype
         );
 
-        // Extract device numbers if this is a device file
         let rdev = match ftype {
-            ftype3::NF3CHR | ftype3::NF3BLK => {
-                // Extract device numbers from specdata3
-                spec.map(|s| (s.specdata1, s.specdata2))
-            }
+            ftype3::NF3CHR | ftype3::NF3BLK => spec.map(|s| (s.specdata1, s.specdata2)),
             _ => None,
         };
 
@@ -324,6 +346,7 @@ impl NFSFileSystem for ZeroFS {
         let fs_attr = SetAttributes::from(*attr);
         let fs_type = FileType::from(ftype);
         let (id, file_attrs) = self
+            .fs
             .process_mknod(&creds, real_dirid, &filename.0, fs_type, &fs_attr, rdev)
             .await?;
 
@@ -345,6 +368,7 @@ impl NFSFileSystem for ZeroFS {
         );
 
         Ok(self
+            .fs
             .process_link(&auth.into(), real_fileid, real_linkdirid, &linkname.0)
             .await?)
     }
@@ -365,7 +389,7 @@ impl NFSFileSystem for ZeroFS {
             count
         );
 
-        match self.flush().await {
+        match self.fs.flush().await {
             Ok(_) => {
                 debug!("commit successful for file {}", real_fileid);
                 Ok(self.serverid())
@@ -388,10 +412,10 @@ impl NFSFileSystem for ZeroFS {
             Err(_) => post_op_attr::Void,
         };
 
-        let (used_bytes, used_inodes) = self.global_stats.get_totals();
+        let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
 
         // Get the next inode ID to determine how many more IDs can be allocated
-        let next_inode_id = self.next_inode_id.load(Ordering::Relaxed);
+        let next_inode_id = self.fs.next_inode_id.load(Ordering::Relaxed);
 
         // Available inodes = total possible inodes - allocated inode IDs
         // This represents how many more inodes can be created (never increases since IDs aren't reused)
@@ -417,10 +441,11 @@ impl NFSFileSystem for ZeroFS {
 }
 
 pub async fn start_nfs_server_with_config(
-    filesystem: ZeroFS,
+    filesystem: Arc<ZeroFS>,
     socket: SocketAddr,
 ) -> anyhow::Result<()> {
-    let listener = NFSTcpListener::bind(socket, filesystem).await?;
+    let adapter = NFSAdapter::new(filesystem);
+    let listener = NFSTcpListener::bind(socket, adapter).await?;
 
     info!("NFS server listening on {}", socket);
 
@@ -439,15 +464,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_nfs_filesystem_trait() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let adapter = NFSAdapter::new(fs);
 
-        assert_eq!(fs.root_dir(), 0);
-        assert!(matches!(fs.capabilities(), VFSCapabilities::ReadWrite));
+        assert_eq!(adapter.root_dir(), 0);
+        assert!(matches!(adapter.capabilities(), VFSCapabilities::ReadWrite));
     }
 
     #[tokio::test]
     async fn test_lookup() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (file_id, _) = fs
             .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
@@ -469,7 +496,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_getattr() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let fattr = fs.getattr(&test_auth(), 0).await.unwrap();
 
@@ -479,7 +507,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_write() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (file_id, _) = fs
             .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
@@ -502,7 +531,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_exclusive() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let file_id = fs
             .create_exclusive(&test_auth(), 0, &filename(b"exclusive.txt"))
@@ -519,7 +549,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_mkdir_and_readdir() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (dir_id, fattr) = fs
             .mkdir(&test_auth(), 0, &filename(b"mydir"), &sattr3::default())
@@ -549,7 +580,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_rename() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (file_id, _) = fs
             .create(
@@ -587,7 +619,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (file_id, _) = fs
             .create(
@@ -614,7 +647,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_setattr() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (file_id, initial_fattr) = fs
             .create(&test_auth(), 0, &filename(b"test.txt"), sattr3::default())
@@ -660,7 +694,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_symlink_and_readlink() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let target = nfspath3 {
             0: b"/path/to/target".to_vec(),
@@ -679,7 +714,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_complex_filesystem_operations() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         let (docs_dir, _) = fs
             .mkdir(&test_auth(), 0, &filename(b"documents"), &sattr3::default())
@@ -750,7 +786,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_directory_pagination() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         // Create a large number of files
         let num_files = 100;
@@ -817,7 +854,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_pagination_with_many_hardlinks() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         // Create original files
         let num_files = 5;
@@ -895,7 +933,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_pagination_edge_cases() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         // Test 1: Empty directory (only . and ..)
         let (empty_dir, _) = fs
@@ -972,7 +1011,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_readdir_operations() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let fs = NFSAdapter::new(fs);
 
         // Create some files
         for i in 0..20 {

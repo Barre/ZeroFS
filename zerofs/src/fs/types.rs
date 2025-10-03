@@ -43,7 +43,7 @@ impl From<ftype3> for FileType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp {
     pub seconds: u64,
     pub nanoseconds: u32,

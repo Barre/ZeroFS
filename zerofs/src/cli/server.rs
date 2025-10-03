@@ -1,5 +1,7 @@
 use crate::bucket_identity;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, Settings};
+use crate::fs::permissions::Credentials;
+use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
@@ -9,8 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
-use zerofs_nfsserve::nfs::{nfsstring, sattr3, set_mode3};
-use zerofs_nfsserve::vfs::{AuthContext, NFSFileSystem};
 
 async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
@@ -27,7 +27,7 @@ async fn start_nfs_servers(
         let fs_clone = Arc::clone(&fs);
         let addr = *addr;
         handles.push(tokio::spawn(async move {
-            match crate::nfs::start_nfs_server_with_config((*fs_clone).clone(), addr).await {
+            match crate::nfs::start_nfs_server_with_config(fs_clone, addr).await {
                 Ok(()) => Ok(()),
                 Err(e) => Err(std::io::Error::other(e.to_string())),
             }
@@ -68,25 +68,24 @@ async fn start_ninep_servers(
 }
 
 async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
-    let auth = AuthContext {
+    let creds = Credentials {
         uid: 0,
         gid: 0,
-        gids: vec![],
+        groups: [0; 16],
+        groups_count: 1,
     };
-    let nbd_name = nfsstring(b".nbd".to_vec());
+    let nbd_name = b".nbd";
 
-    match fs.lookup(&auth, 0, &nbd_name).await {
+    match fs.process_lookup(&creds, 0, nbd_name).await {
         Ok(_) => info!(".nbd directory already exists"),
         Err(_) => {
-            let attr = sattr3 {
-                mode: set_mode3::mode(0o755),
-                uid: zerofs_nfsserve::nfs::set_uid3::uid(0),
-                gid: zerofs_nfsserve::nfs::set_gid3::gid(0),
-                size: zerofs_nfsserve::nfs::set_size3::Void,
-                atime: zerofs_nfsserve::nfs::set_atime::DONT_CHANGE,
-                mtime: zerofs_nfsserve::nfs::set_mtime::DONT_CHANGE,
+            let attr = SetAttributes {
+                mode: crate::fs::types::SetMode::Set(0o755),
+                uid: crate::fs::types::SetUid::Set(0),
+                gid: crate::fs::types::SetGid::Set(0),
+                ..Default::default()
             };
-            fs.mkdir(&auth, 0, &nbd_name, &attr)
+            fs.process_mkdir(&creds, 0, nbd_name, &attr)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create .nbd directory: {e:?}"))?;
             info!("Created .nbd directory for NBD device management");
