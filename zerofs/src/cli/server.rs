@@ -175,16 +175,13 @@ pub async fn build_slatedb(
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
-    let slatedb_object_cache_gb = total_disk_cache_gb;
-    let slatedb_memory_cache_gb = total_memory_cache_gb * 0.5;
-
     info!(
-        "Cache allocation - Total disk: {:.2}GB, SlateDB object store: {:.2}GB, Memory - SlateDB: {:.2}GB",
-        total_disk_cache_gb, slatedb_object_cache_gb, slatedb_memory_cache_gb,
+        "Cache allocation - Disk: {:.2}GB, Memory: {:.2}GB",
+        total_disk_cache_gb, total_memory_cache_gb,
     );
 
-    let slatedb_object_cache_bytes = (slatedb_object_cache_gb * 1_000_000_000.0) as usize;
-    let slatedb_memory_cache_bytes = (slatedb_memory_cache_gb * 1_000_000_000.0) as u64;
+    let slatedb_object_cache_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
+    let slatedb_memory_cache_bytes = (total_memory_cache_gb * 1_000_000_000.0) as u64;
 
     info!(
         "SlateDB in-memory block cache: {} MB",
@@ -305,7 +302,7 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
-    let fs = ZeroFS::new_with_slatedb(slatedb, cache_config, encryption_key).await?;
+    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key).await?;
 
     Ok(Arc::new(fs))
 }

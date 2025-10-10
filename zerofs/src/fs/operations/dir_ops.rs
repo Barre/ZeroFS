@@ -71,7 +71,7 @@ impl ZeroFS {
                             name: filename.to_vec(),
                         };
                         let cache_value = CacheValue::DirEntry(inode_id);
-                        self.cache.insert(cache_key, cache_value, false);
+                        self.cache.insert(cache_key, cache_value);
 
                         Ok(inode_id)
                     }
