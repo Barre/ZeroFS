@@ -24,7 +24,7 @@ codegen-units = 16
 
 [dependencies]
 slatedb = "0.8.2"
-mimalloc = "0.1"
+tikv-jemallocator = "0.6.0"
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.46", features = ["full"] }
 async-trait = "0.1"
