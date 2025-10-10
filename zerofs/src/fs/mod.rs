@@ -110,22 +110,13 @@ pub struct CacheConfig {
 impl ZeroFS {
     pub async fn new_with_slatedb(
         slatedb: Arc<slatedb::Db>,
-        cache_config: CacheConfig,
         encryption_key: [u8; 32],
     ) -> anyhow::Result<Self> {
-        let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
-        let zerofs_memory_cache_gb = total_memory_cache_gb * 0.5;
-
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
 
         let lock_manager = Arc::new(LockManager::new());
 
-        let zerofs_cache_dir = format!("{}/zerofs", cache_config.root_folder);
-        let unified_cache = Arc::new(UnifiedCache::new(
-            &zerofs_cache_dir,
-            0.0,
-            Some(zerofs_memory_cache_gb),
-        )?);
+        let unified_cache = Arc::new(UnifiedCache::new()?);
 
         let db = Arc::new(
             EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
@@ -231,7 +222,7 @@ impl ZeroFS {
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
-        self.cache.insert(cache_key, cache_value, false);
+        self.cache.insert(cache_key, cache_value);
 
         Ok(inode)
     }
@@ -429,13 +420,7 @@ impl ZeroFS {
                 .await?,
         );
 
-        let cache_config = CacheConfig {
-            root_folder: "".to_string(),
-            max_cache_size_gb: 0.0,
-            memory_cache_size_gb: Some(0.1),
-        };
-
-        Self::new_with_slatedb(slatedb, cache_config, encryption_key).await
+        Self::new_with_slatedb(slatedb, encryption_key).await
     }
 }
 
