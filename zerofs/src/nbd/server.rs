@@ -667,7 +667,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         {
             Ok((data, _)) => {
                 if self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &data)
+                    .send_simple_reply(cookie, NBD_SUCCESS, data.as_ref())
                     .await
                     .is_err()
                 {
@@ -724,6 +724,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_EIO;
         }
 
+        let data = data.freeze();
         match self
             .filesystem
             .process_write(&auth, inode, offset, &data)
@@ -871,7 +872,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             gids: vec![],
         };
 
-        let zero_chunk = vec![0u8; NBD_ZERO_CHUNK_SIZE.min(length as usize)];
+        let zero_chunk = bytes::Bytes::from(vec![0u8; NBD_ZERO_CHUNK_SIZE.min(length as usize)]);
 
         // Write zeros in chunks to avoid huge allocations
         let mut remaining = length as usize;
@@ -883,7 +884,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             let chunk_data = if chunk_size == zero_chunk.len() {
                 &zero_chunk
             } else {
-                &zero_chunk[..chunk_size]
+                &zero_chunk.slice(..chunk_size)
             };
 
             if self

@@ -6,6 +6,7 @@ use crate::fs::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::types::{AuthContext, InodeId};
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
+use bytes::Bytes;
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 
@@ -88,7 +89,7 @@ impl ZeroFS {
 
                             let inode_key = KeyCodec::inode_key(file_id);
                             let inode_data = bincode::serialize(&file_inode)?;
-                            batch.put_bytes(&inode_key, &inode_data);
+                            batch.put_bytes(&inode_key, Bytes::from(inode_data));
                         } else {
                             let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
 
@@ -102,7 +103,7 @@ impl ZeroFS {
                                 let tombstone_key = KeyCodec::tombstone_key(timestamp, file_id);
                                 batch.put_bytes(
                                     &tombstone_key,
-                                    &KeyCodec::encode_tombstone_size(file.size),
+                                    KeyCodec::encode_tombstone_size(file.size),
                                 );
                                 self.stats
                                     .tombstones_created
@@ -141,7 +142,7 @@ impl ZeroFS {
 
                             let inode_key = KeyCodec::inode_key(file_id);
                             let inode_data = bincode::serialize(&file_inode)?;
-                            batch.put_bytes(&inode_key, &inode_data);
+                            batch.put_bytes(&inode_key, Bytes::from(inode_data));
                         } else {
                             let inode_key = KeyCodec::inode_key(file_id);
                             batch.delete_bytes(&inode_key);
@@ -162,7 +163,7 @@ impl ZeroFS {
 
                 let dir_key = KeyCodec::inode_key(dirid);
                 let dir_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&dir_key, &dir_data);
+                batch.put_bytes(&dir_key, Bytes::from(dir_data));
 
                 // For directories and symlinks: always remove from stats
                 // For files and special files: only remove if this is the last link

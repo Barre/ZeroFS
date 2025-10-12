@@ -193,12 +193,12 @@ impl ZeroFS {
 
                 let new_dir_key = KeyCodec::inode_key(new_dir_id);
                 let new_dir_data = bincode::serialize(&Inode::Directory(new_dir_inode.clone()))?;
-                batch.put_bytes(&new_dir_key, &new_dir_data);
+                batch.put_bytes(&new_dir_key, Bytes::from(new_dir_data));
 
-                batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(new_dir_id));
+                batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(new_dir_id));
 
                 let scan_key = KeyCodec::dir_scan_key(dirid, new_dir_id, name);
-                batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(new_dir_id));
+                batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(new_dir_id));
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -212,11 +212,11 @@ impl ZeroFS {
 
                 let counter_key = KeyCodec::system_counter_key();
                 let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch.put_bytes(&counter_key, &KeyCodec::encode_counter(next_id));
+                batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
 
                 let parent_dir_key = KeyCodec::inode_key(dirid);
                 let parent_dir_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&parent_dir_key, &parent_dir_data);
+                batch.put_bytes(&parent_dir_key, Bytes::from(parent_dir_data));
 
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;

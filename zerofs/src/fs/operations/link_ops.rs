@@ -8,6 +8,7 @@ use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
 use crate::fs::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
+use bytes::Bytes;
 use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
@@ -94,12 +95,12 @@ impl ZeroFS {
 
         let inode_key = KeyCodec::inode_key(new_id);
         let inode_data = bincode::serialize(&symlink_inode)?;
-        batch.put_bytes(&inode_key, &inode_data);
+        batch.put_bytes(&inode_key, Bytes::from(inode_data));
 
-        batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(new_id));
+        batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(new_id));
 
         let scan_key = KeyCodec::dir_scan_key(dirid, new_id, linkname);
-        batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(new_id));
+        batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(new_id));
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -109,11 +110,11 @@ impl ZeroFS {
 
         let counter_key = KeyCodec::system_counter_key();
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        batch.put_bytes(&counter_key, &KeyCodec::encode_counter(next_id));
+        batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
 
         let dir_key = KeyCodec::inode_key(dirid);
         let dir_data = bincode::serialize(&dir_inode)?;
-        batch.put_bytes(&dir_key, &dir_data);
+        batch.put_bytes(&dir_key, Bytes::from(dir_data));
 
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
         self.global_stats.add_to_batch(&stats_update, &mut batch)?;
@@ -202,10 +203,10 @@ impl ZeroFS {
         }
 
         let mut batch = self.db.new_write_batch();
-        batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(fileid));
+        batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(fileid));
 
         let scan_key = KeyCodec::dir_scan_key(linkdirid, fileid, linkname);
-        batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(fileid));
+        batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(fileid));
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
@@ -241,7 +242,7 @@ impl ZeroFS {
 
         let file_inode_key = KeyCodec::inode_key(fileid);
         let file_inode_data = bincode::serialize(&file_inode)?;
-        batch.put_bytes(&file_inode_key, &file_inode_data);
+        batch.put_bytes(&file_inode_key, Bytes::from(file_inode_data));
 
         link_dir.entry_count += 1;
         link_dir.mtime = now_sec;
@@ -251,7 +252,7 @@ impl ZeroFS {
 
         let dir_inode_key = KeyCodec::inode_key(linkdirid);
         let dir_inode_data = bincode::serialize(&Inode::Directory(link_dir))?;
-        batch.put_bytes(&dir_inode_key, &dir_inode_data);
+        batch.put_bytes(&dir_inode_key, Bytes::from(dir_inode_data));
 
         self.db
             .write_with_options(

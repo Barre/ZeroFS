@@ -143,7 +143,7 @@ impl FileSystemGlobalStats {
         batch: &mut crate::encryption::EncryptedWriteBatch,
     ) -> Result<(), FsError> {
         let shard_bytes = bincode::serialize(&update.shard_data)?;
-        batch.put_bytes(&update.shard_key, &shard_bytes);
+        batch.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
 
         Ok(())
     }
@@ -237,7 +237,9 @@ mod tests {
 
         // Write 1000 bytes
         let data = vec![0u8; 1000];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1000);
@@ -245,7 +247,9 @@ mod tests {
 
         // Write more data (extending the file)
         let data = vec![1u8; 500];
-        fs.process_write(&auth, file_id, 1000, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 1000, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1500);
@@ -265,11 +269,15 @@ mod tests {
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         // Overwrite part of the file (no size change)
         let data = vec![1u8; 500];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1000); // Size unchanged
@@ -291,7 +299,7 @@ mod tests {
         // Write 1 byte at offset 1GB (creating a sparse file)
         let data = vec![42u8; 1];
         let offset = 1_000_000_000;
-        fs.process_write(&auth, file_id, offset, &data)
+        fs.process_write(&auth, file_id, offset, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -313,7 +321,9 @@ mod tests {
             .unwrap();
 
         let data = vec![0u8; 5000];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 5000);
@@ -381,7 +391,7 @@ mod tests {
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.process_write(&test_auth(), file_id, 0, &data)
+        fs.process_write(&test_auth(), file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -424,7 +434,7 @@ mod tests {
             .unwrap();
 
         let data = vec![0u8; 10000];
-        fs.process_write(&test_auth(), file_id, 0, &data)
+        fs.process_write(&test_auth(), file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -480,7 +490,7 @@ mod tests {
                 // Write different amounts of data
                 let data = vec![0u8; (i + 1) * 1000];
                 fs_clone
-                    .process_write(&auth, file_id, 0, &data)
+                    .process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
                     .await
                     .unwrap();
             });
@@ -535,7 +545,9 @@ mod tests {
                 .unwrap();
 
             let data = vec![0u8; 1_000_000]; // 1MB each
-            fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+            fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+                .await
+                .unwrap();
         }
 
         // Check fsstat - need to load and calculate manually
@@ -567,7 +579,9 @@ mod tests {
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         let (bytes_before, inodes_before) = fs.global_stats.get_totals();
         assert_eq!(bytes_before, 1000);
@@ -593,7 +607,7 @@ mod tests {
             .await
             .unwrap();
         let data1 = vec![0u8; 1000];
-        fs.process_write(&test_auth(), file1_id, 0, &data1)
+        fs.process_write(&test_auth(), file1_id, 0, &Bytes::copy_from_slice(&data1))
             .await
             .unwrap();
 
@@ -603,7 +617,7 @@ mod tests {
             .await
             .unwrap();
         let data2 = vec![0u8; 2000];
-        fs.process_write(&test_auth(), file2_id, 0, &data2)
+        fs.process_write(&test_auth(), file2_id, 0, &Bytes::copy_from_slice(&data2))
             .await
             .unwrap();
 
@@ -631,7 +645,7 @@ mod tests {
             .await
             .unwrap();
         let data1 = vec![0u8; 500];
-        fs.process_write(&test_auth(), source_id, 0, &data1)
+        fs.process_write(&test_auth(), source_id, 0, &Bytes::copy_from_slice(&data1))
             .await
             .unwrap();
 
@@ -641,7 +655,7 @@ mod tests {
             .await
             .unwrap();
         let data2 = vec![0u8; 1500];
-        fs.process_write(&test_auth(), target_id, 0, &data2)
+        fs.process_write(&test_auth(), target_id, 0, &Bytes::copy_from_slice(&data2))
             .await
             .unwrap();
 
@@ -715,7 +729,9 @@ mod tests {
             .await
             .unwrap();
         let data = vec![0u8; 750];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         // Create a symlink
         let (_link_id, _) = fs
@@ -765,7 +781,9 @@ mod tests {
             .await
             .unwrap();
         let data = vec![0u8; 1234];
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            .await
+            .unwrap();
 
         // Create another file in dir2 that will be replaced
         let (target_id, _) = fs
@@ -773,7 +791,7 @@ mod tests {
             .await
             .unwrap();
         let target_data = vec![0u8; 5678];
-        fs.process_write(&auth, target_id, 0, &target_data)
+        fs.process_write(&auth, target_id, 0, &Bytes::copy_from_slice(&target_data))
             .await
             .unwrap();
 

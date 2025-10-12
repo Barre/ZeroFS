@@ -651,7 +651,7 @@ impl NinePHandler {
                 tag,
                 Message::Rread(Rread {
                     count: data.len() as u32,
-                    data,
+                    data: data.to_vec(),
                 }),
             ),
             Err(e) => P9Message::error(tag, e.to_errno()),
@@ -679,10 +679,12 @@ impl NinePHandler {
         );
 
         let auth = self.make_auth_context(&fid_entry.creds);
+        let data_len = tw.data.len();
+        let data = bytes::Bytes::from(tw.data);
 
         match self
             .filesystem
-            .process_write(&(&auth).into(), fid_entry.inode_id, tw.offset, &tw.data)
+            .process_write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
             .await
         {
             Ok(_post_attr) => {
@@ -690,7 +692,7 @@ impl NinePHandler {
                 P9Message::new(
                     tag,
                     Message::Rwrite(Rwrite {
-                        count: tw.data.len() as u32,
+                        count: data_len as u32,
                     }),
                 )
             }
