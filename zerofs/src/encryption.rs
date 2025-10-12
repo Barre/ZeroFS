@@ -92,8 +92,8 @@ pub struct EncryptedWriteBatch {
     inner: WriteBatch,
     encryptor: Arc<EncryptionManager>,
     // Queue of cache operations to apply after successful write
-    cache_ops: Vec<(Bytes, Option<Vec<u8>>)>, // (key, Some(value) for put, None for delete)
-    pending_operations: Vec<(Bytes, Vec<u8>)>,
+    cache_ops: Vec<(Bytes, Option<Bytes>)>, // (key, Some(value) for put, None for delete)
+    pending_operations: Vec<(Bytes, Bytes)>,
 }
 
 impl EncryptedWriteBatch {
@@ -106,13 +106,13 @@ impl EncryptedWriteBatch {
         }
     }
 
-    pub fn put_bytes(&mut self, key: &bytes::Bytes, value: &[u8]) {
+    pub fn put_bytes(&mut self, key: &bytes::Bytes, value: Bytes) {
         // Queue cache operation if this is a chunk
         if !key.is_empty() && key[0] == PREFIX_CHUNK {
-            self.cache_ops.push((key.clone(), Some(value.to_vec())));
+            self.cache_ops.push((key.clone(), Some(value.clone())));
         }
 
-        self.pending_operations.push((key.clone(), value.to_vec()));
+        self.pending_operations.push((key.clone(), value));
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {
@@ -124,7 +124,7 @@ impl EncryptedWriteBatch {
     }
 
     #[allow(clippy::type_complexity)]
-    pub async fn into_inner(self) -> Result<(WriteBatch, Vec<(Bytes, Option<Vec<u8>>)>)> {
+    pub async fn into_inner(self) -> Result<(WriteBatch, Vec<(Bytes, Option<Bytes>)>)> {
         let mut inner = self.inner;
 
         if !self.pending_operations.is_empty() {

@@ -10,6 +10,7 @@ use crate::fs::types::{
     FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
 };
 use crate::fs::{CHUNK_SIZE, InodeId, ZeroFS, get_current_time};
+use bytes::Bytes;
 use slatedb::config::WriteOptions;
 use tracing::debug;
 
@@ -114,14 +115,14 @@ impl ZeroFS {
 
                                     let mut new_chunk_data = old_chunk_data;
                                     new_chunk_data[clear_from..].fill(0);
-                                    batch.put_bytes(&key, &new_chunk_data);
+                                    batch.put_bytes(&key, Bytes::from(new_chunk_data));
                                 }
                             }
                         }
 
                         let inode_key = KeyCodec::inode_key(id);
                         let inode_data = bincode::serialize(&inode)?;
-                        batch.put_bytes(&inode_key, &inode_data);
+                        batch.put_bytes(&inode_key, Bytes::from(inode_data));
 
                         let stats_update = if let Some(update) = self
                             .global_stats
@@ -516,12 +517,12 @@ impl ZeroFS {
 
                 let special_inode_key = KeyCodec::inode_key(special_id);
                 let special_inode_data = bincode::serialize(&inode)?;
-                batch.put_bytes(&special_inode_key, &special_inode_data);
+                batch.put_bytes(&special_inode_key, Bytes::from(special_inode_data));
 
-                batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(special_id));
+                batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(special_id));
 
                 let scan_key = KeyCodec::dir_scan_key(dirid, special_id, name);
-                batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(special_id));
+                batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(special_id));
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -531,7 +532,7 @@ impl ZeroFS {
 
                 let dir_inode_key = KeyCodec::inode_key(dirid);
                 let dir_inode_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&dir_inode_key, &dir_inode_data);
+                batch.put_bytes(&dir_inode_key, Bytes::from(dir_inode_data));
 
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;

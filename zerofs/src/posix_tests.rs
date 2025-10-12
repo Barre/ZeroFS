@@ -154,12 +154,22 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, file1_id, 0, b"content1")
-            .await
-            .unwrap();
-        fs.process_write(&auth, file2_id, 0, b"content2")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            file1_id,
+            0,
+            &bytes::Bytes::from(b"content1".to_vec()),
+        )
+        .await
+        .unwrap();
+        fs.process_write(
+            &auth,
+            file2_id,
+            0,
+            &bytes::Bytes::from(b"content2".to_vec()),
+        )
+        .await
+        .unwrap();
 
         fs.process_rename(&auth, 0, b"file1", 0, b"file2")
             .await
@@ -172,7 +182,7 @@ mod tests {
         assert_eq!(found_id, file1_id);
 
         let (data, _) = fs.process_read_file(&auth, found_id, 0, 100).await.unwrap();
-        assert_eq!(&data, b"content1");
+        assert_eq!(data.as_ref(), b"content1");
 
         let result = fs.load_inode(file2_id).await;
         assert!(result.is_err());
@@ -278,9 +288,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, file_id, 0, b"Hello, World!")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            file_id,
+            0,
+            &bytes::Bytes::from(b"Hello, World!".to_vec()),
+        )
+        .await
+        .unwrap();
 
         let inode = fs.load_inode(file_id).await.unwrap();
         let fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
@@ -299,7 +314,7 @@ mod tests {
         assert_eq!(fattr.size, 5);
 
         let (data, _) = fs.process_read_file(&auth, file_id, 0, 10).await.unwrap();
-        assert_eq!(&data, b"Hello");
+        assert_eq!(data.as_ref(), b"Hello");
 
         let setattr = SetAttributes {
             size: SetSize::Set(10),
@@ -310,7 +325,7 @@ mod tests {
         assert_eq!(fattr.size, 10);
 
         let (data, _) = fs.process_read_file(&auth, file_id, 0, 10).await.unwrap();
-        assert_eq!(&data, b"Hello\0\0\0\0\0");
+        assert_eq!(data.as_ref(), b"Hello\0\0\0\0\0");
     }
 
     #[tokio::test]
@@ -485,9 +500,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, file_id, 0, b"test content")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            file_id,
+            0,
+            &bytes::Bytes::from(b"test content".to_vec()),
+        )
+        .await
+        .unwrap();
 
         fs.process_rename(&auth, dir1_id, b"file.txt", dir2_id, b"file.txt")
             .await
@@ -503,7 +523,7 @@ mod tests {
         assert_eq!(found_id, file_id);
 
         let (data, _) = fs.process_read_file(&auth, found_id, 0, 100).await.unwrap();
-        assert_eq!(&data, b"test content");
+        assert_eq!(data.as_ref(), b"test content");
 
         let _dir1_inode = fs.load_inode(dir1_id).await.unwrap();
         let _dir2_inode = fs.load_inode(dir2_id).await.unwrap();
@@ -527,7 +547,7 @@ mod tests {
         let chunk_size = 128 * 1024;
         let test_data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
 
-        fs.process_write(&auth, file_id, 0, &test_data)
+        fs.process_write(&auth, file_id, 0, &bytes::Bytes::from(test_data.clone()))
             .await
             .unwrap();
 
@@ -590,9 +610,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, file_id, 0, b"Hello, World!")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            file_id,
+            0,
+            &bytes::Bytes::from(b"Hello, World!".to_vec()),
+        )
+        .await
+        .unwrap();
 
         let initial_inode = fs.load_inode(file_id).await.unwrap();
         let initial_attr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
@@ -674,7 +699,7 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, file_id, 100, b"Hello")
+        fs.process_write(&auth, file_id, 100, &bytes::Bytes::from(b"Hello".to_vec()))
             .await
             .unwrap();
 
@@ -691,7 +716,7 @@ mod tests {
         assert!(data.iter().all(|&b| b == 0));
 
         let (data, _) = fs.process_read_file(&auth, file_id, 100, 5).await.unwrap();
-        assert_eq!(&data, b"Hello");
+        assert_eq!(data.as_ref(), b"Hello");
     }
 
     #[tokio::test]
@@ -709,18 +734,28 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, src_id, 0, b"source content")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            src_id,
+            0,
+            &bytes::Bytes::from(b"source content".to_vec()),
+        )
+        .await
+        .unwrap();
 
         let (_target_id, _) = fs
             .process_create(&creds, 0, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(&auth, _target_id, 0, b"target content")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            _target_id,
+            0,
+            &bytes::Bytes::from(b"target content".to_vec()),
+        )
+        .await
+        .unwrap();
 
         fs.process_rename(&auth, 0, b"source.txt", 0, b"target.txt")
             .await
@@ -733,7 +768,7 @@ mod tests {
         assert_eq!(new_id, src_id);
 
         let (data, _) = fs.process_read_file(&auth, new_id, 0, 100).await.unwrap();
-        assert_eq!(&data, b"source content");
+        assert_eq!(data.as_ref(), b"source content");
     }
 
     #[tokio::test]
@@ -774,9 +809,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&auth, file_id, 0, b"Hello, World!")
-            .await
-            .unwrap();
+        fs.process_write(
+            &auth,
+            file_id,
+            0,
+            &bytes::Bytes::from(b"Hello, World!".to_vec()),
+        )
+        .await
+        .unwrap();
 
         let setattr = SetAttributes {
             size: SetSize::Set(100),
@@ -787,14 +827,14 @@ mod tests {
         assert_eq!(attr_after.size, 100);
 
         let (data, _) = fs.process_read_file(&auth, file_id, 0, 13).await.unwrap();
-        assert_eq!(&data, b"Hello, World!");
+        assert_eq!(data.as_ref(), b"Hello, World!");
 
         let (data, _) = fs.process_read_file(&auth, file_id, 13, 87).await.unwrap();
         assert_eq!(data.len(), 87);
         assert!(data.iter().all(|&b| b == 0));
 
         let (data, _) = fs.process_read_file(&auth, file_id, 0, 13).await.unwrap();
-        assert_eq!(&data, b"Hello, World!");
+        assert_eq!(data.as_ref(), b"Hello, World!");
     }
 
     #[tokio::test]

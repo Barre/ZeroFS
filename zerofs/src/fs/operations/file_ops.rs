@@ -8,7 +8,7 @@ use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ impl ZeroFS {
         auth: &AuthContext,
         id: InodeId,
         offset: u64,
-        data: &[u8],
+        data: &Bytes,
     ) -> Result<FileAttributes, FsError> {
         let start_time = std::time::Instant::now();
         debug!(
@@ -64,34 +64,31 @@ impl ZeroFS {
                 let chunk_processing_start = std::time::Instant::now();
 
                 // Optimization: skip loading chunks that will be completely overwritten
-                let existing_chunks: HashMap<usize, Vec<u8>> =
-                    stream::iter(start_chunk..=end_chunk)
-                        .map(|chunk_idx| {
-                            let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-                            let chunk_end = chunk_start + CHUNK_SIZE as u64;
+                let existing_chunks: HashMap<usize, Bytes> = stream::iter(start_chunk..=end_chunk)
+                    .map(|chunk_idx| {
+                        let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
+                        let chunk_end = chunk_start + CHUNK_SIZE as u64;
 
-                            let will_overwrite_fully =
-                                offset <= chunk_start && end_offset >= chunk_end;
+                        let will_overwrite_fully = offset <= chunk_start && end_offset >= chunk_end;
 
-                            let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
-                            let db = self.db.clone();
-                            async move {
-                                let data = if will_overwrite_fully {
-                                    vec![0u8; CHUNK_SIZE]
-                                } else {
-                                    db.get_bytes(&chunk_key)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .map(|bytes| bytes.to_vec())
-                                        .unwrap_or_else(|| vec![0u8; CHUNK_SIZE])
-                                };
-                                (chunk_idx, data)
-                            }
-                        })
-                        .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
-                        .collect()
-                        .await;
+                        let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
+                        let db = self.db.clone();
+                        async move {
+                            let data = if will_overwrite_fully {
+                                Bytes::from(vec![0u8; CHUNK_SIZE])
+                            } else {
+                                db.get_bytes(&chunk_key)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                            };
+                            (chunk_idx, data)
+                        }
+                    })
+                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
+                    .collect()
+                    .await;
 
                 let mut data_offset = 0;
                 for chunk_idx in start_chunk..=end_chunk {
@@ -114,12 +111,12 @@ impl ZeroFS {
 
                     let data_len = write_end - write_start;
 
-                    let mut chunk = existing_chunks[&chunk_idx].clone();
+                    let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
                     chunk[write_start..write_end]
                         .copy_from_slice(&data[data_offset..data_offset + data_len]);
                     data_offset += data_len;
 
-                    batch.put_bytes(&chunk_key, &chunk);
+                    batch.put_bytes(&chunk_key, chunk.freeze());
                 }
 
                 debug!(
@@ -139,7 +136,7 @@ impl ZeroFS {
 
                 let inode_key = KeyCodec::inode_key(id);
                 let inode_data = bincode::serialize(&inode)?;
-                batch.put_bytes(&inode_key, &inode_data);
+                batch.put_bytes(&inode_key, Bytes::from(inode_data));
 
                 let stats_update = if let Some(update) = self
                     .global_stats
@@ -273,12 +270,12 @@ impl ZeroFS {
 
                 let file_inode_key = KeyCodec::inode_key(file_id);
                 let file_inode_data = bincode::serialize(&Inode::File(file_inode.clone()))?;
-                batch.put_bytes(&file_inode_key, &file_inode_data);
+                batch.put_bytes(&file_inode_key, Bytes::from(file_inode_data));
 
-                batch.put_bytes(&entry_key, &KeyCodec::encode_dir_entry(file_id));
+                batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(file_id));
 
                 let scan_key = KeyCodec::dir_scan_key(dirid, file_id, name);
-                batch.put_bytes(&scan_key, &KeyCodec::encode_dir_entry(file_id));
+                batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(file_id));
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -289,11 +286,11 @@ impl ZeroFS {
                 // Persist the counter
                 let counter_key = KeyCodec::system_counter_key();
                 let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch.put_bytes(&counter_key, &KeyCodec::encode_counter(next_id));
+                batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
 
                 let dir_key = KeyCodec::inode_key(dirid);
                 let dir_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&dir_key, &dir_data);
+                batch.put_bytes(&dir_key, Bytes::from(dir_data));
 
                 // Update statistics
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
@@ -354,7 +351,7 @@ impl ZeroFS {
         id: InodeId,
         offset: u64,
         count: u32,
-    ) -> Result<(Vec<u8>, bool), FsError> {
+    ) -> Result<(Bytes, bool), FsError> {
         debug!(
             "process_read_file: id={}, offset={}, count={}",
             id, offset, count
@@ -371,7 +368,7 @@ impl ZeroFS {
         match &inode {
             Inode::File(file) => {
                 if offset >= file.size {
-                    return Ok((vec![], true));
+                    return Ok((Bytes::new(), true));
                 }
 
                 let end = std::cmp::min(offset + count as u64, file.size);
@@ -379,7 +376,7 @@ impl ZeroFS {
                 let end_chunk = (end.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
                 let start_offset = (offset % CHUNK_SIZE as u64) as usize;
 
-                let chunks: Vec<Vec<u8>> = stream::iter(start_chunk..=end_chunk)
+                let chunks: Vec<Bytes> = stream::iter(start_chunk..=end_chunk)
                     .map(|chunk_idx| {
                         let db = self.db.clone();
                         let key = KeyCodec::chunk_key(id, chunk_idx as u64);
@@ -388,8 +385,7 @@ impl ZeroFS {
                                 .await
                                 .ok()
                                 .flatten()
-                                .map(|bytes| bytes.to_vec())
-                                .unwrap_or_else(|| vec![0u8; CHUNK_SIZE])
+                                .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
                         }
                     })
                     .buffered(READ_CHUNK_BUFFER_SIZE)
@@ -423,7 +419,7 @@ impl ZeroFS {
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                Ok((result_bytes.to_vec(), eof))
+                Ok((result_bytes, eof))
             }
             _ => Err(FsError::IsDirectory),
         }
@@ -497,13 +493,13 @@ impl ZeroFS {
                     .await
                     .map_err(|_| FsError::IoError)?
                 {
-                    let mut chunk_data = existing_data.to_vec();
+                    let mut chunk_data = BytesMut::from(existing_data.as_ref());
                     chunk_data[trim_start..trim_end].fill(0);
 
                     if chunk_data.iter().all(|&b| b == 0) {
                         batch.delete_bytes(&chunk_key);
                     } else {
-                        batch.put_bytes(&chunk_key, &chunk_data);
+                        batch.put_bytes(&chunk_key, chunk_data.freeze());
                     }
                 }
                 // If chunk doesn't exist, nothing to trim

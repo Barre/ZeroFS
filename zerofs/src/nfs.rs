@@ -83,6 +83,7 @@ impl NFSFileSystem for NFSAdapter {
         self.fs
             .process_read_file(&auth_ctx, real_id, offset, count)
             .await
+            .map(|(data, eof)| (data.to_vec(), eof))
             .map_err(|e| e.into())
     }
 
@@ -102,9 +103,10 @@ impl NFSFileSystem for NFSAdapter {
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
+        let data_bytes = bytes::Bytes::copy_from_slice(data);
         let file_attrs: crate::fs::types::FileAttributes = self
             .fs
-            .process_write(&auth_ctx, real_id, offset, data)
+            .process_write(&auth_ctx, real_id, offset, &data_bytes)
             .await?;
         Ok((&file_attrs).into())
     }

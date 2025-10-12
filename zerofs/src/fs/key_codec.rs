@@ -128,8 +128,8 @@ impl KeyCodec {
         }
     }
 
-    pub fn encode_counter(value: u64) -> Vec<u8> {
-        value.to_le_bytes().to_vec()
+    pub fn encode_counter(value: u64) -> Bytes {
+        Bytes::copy_from_slice(&value.to_le_bytes())
     }
 
     pub fn decode_counter(data: &[u8]) -> Result<u64, FsError> {
@@ -140,8 +140,8 @@ impl KeyCodec {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    pub fn encode_dir_entry(inode_id: InodeId) -> Vec<u8> {
-        inode_id.to_le_bytes().to_vec()
+    pub fn encode_dir_entry(inode_id: InodeId) -> Bytes {
+        Bytes::copy_from_slice(&inode_id.to_le_bytes())
     }
 
     pub fn decode_dir_entry(data: &[u8]) -> Result<InodeId, FsError> {
@@ -154,8 +154,8 @@ impl KeyCodec {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    pub fn encode_tombstone_size(size: u64) -> Vec<u8> {
-        size.to_le_bytes().to_vec()
+    pub fn encode_tombstone_size(size: u64) -> Bytes {
+        Bytes::copy_from_slice(&size.to_le_bytes())
     }
 
     pub fn decode_tombstone_size(data: &[u8]) -> Result<u64, FsError> {

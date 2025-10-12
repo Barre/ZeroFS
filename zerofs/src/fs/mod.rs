@@ -341,7 +341,7 @@ impl ZeroFS {
                         let remaining_chunks = start_chunk;
                         let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
-                        batch.put_bytes(&key, &KeyCodec::encode_tombstone_size(actual_remaining));
+                        batch.put_bytes(&key, KeyCodec::encode_tombstone_size(actual_remaining));
                     }
                 }
 

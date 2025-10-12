@@ -8,6 +8,8 @@ pub mod rename_ops;
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use crate::fs::ZeroFS;
     use crate::fs::errors::FsError;
     use crate::fs::inode::Inode;
@@ -139,7 +141,12 @@ mod tests {
 
         let data = b"Hello, World!";
         let fattr = fs
-            .process_write(&(&test_auth()).into(), file_id, 0, data)
+            .process_write(
+                &(&test_auth()).into(),
+                file_id,
+                0,
+                &Bytes::copy_from_slice(data),
+            )
             .await
             .unwrap();
 
@@ -150,7 +157,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(read_data, data);
+        assert_eq!(read_data.as_ref(), data);
         assert!(eof);
     }
 
@@ -164,14 +171,24 @@ mod tests {
             .unwrap();
 
         let data1 = vec![b'A'; 100];
-        fs.process_write(&(&test_auth()).into(), file_id, 0, &data1)
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::copy_from_slice(&data1),
+        )
+        .await
+        .unwrap();
 
         let data2 = vec![b'B'; 50];
-        fs.process_write(&(&test_auth()).into(), file_id, 50, &data2)
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            50,
+            &Bytes::copy_from_slice(&data2),
+        )
+        .await
+        .unwrap();
 
         let (read_data, _) = fs
             .process_read_file(&(&test_auth()).into(), file_id, 0, 100)
@@ -196,7 +213,12 @@ mod tests {
         let data = vec![b'X'; chunk_size * 2 + 1024];
 
         let fattr = fs
-            .process_write(&(&test_auth()).into(), file_id, 0, &data)
+            .process_write(
+                &(&test_auth()).into(),
+                file_id,
+                0,
+                &Bytes::copy_from_slice(&data),
+            )
             .await
             .unwrap();
         assert_eq!(fattr.size, data.len() as u64);
@@ -206,7 +228,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(read_data, data);
+        assert_eq!(read_data.as_ref(), &data[..]);
         assert!(eof);
     }
 
@@ -219,9 +241,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&(&test_auth()).into(), file_id, 0, b"some data")
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"some data".to_vec()),
+        )
+        .await
+        .unwrap();
 
         fs.process_remove(&(&test_auth()).into(), 0, b"test.txt")
             .await
@@ -311,17 +338,27 @@ mod tests {
             .process_create(&test_creds(), 0, b"file1.txt", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_write(&(&test_auth()).into(), file1_id, 0, b"content1")
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file1_id,
+            0,
+            &Bytes::from(b"content1".to_vec()),
+        )
+        .await
+        .unwrap();
 
         let (file2_id, _) = fs
             .process_create(&test_creds(), 0, b"file2.txt", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_write(&(&test_auth()).into(), file2_id, 0, b"content2")
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file2_id,
+            0,
+            &Bytes::from(b"content2".to_vec()),
+        )
+        .await
+        .unwrap();
 
         fs.process_rename(&(&test_auth()).into(), 0, b"file1.txt", 0, b"file2.txt")
             .await
@@ -344,7 +381,7 @@ mod tests {
             .process_read_file(&(&test_auth()).into(), file1_id, 0, 100)
             .await
             .unwrap();
-        assert_eq!(read_data, b"content1");
+        assert_eq!(read_data.as_ref(), b"content1");
 
         // Check that the original file2 inode is gone
         let result = fs.load_inode(file2_id).await;
@@ -490,9 +527,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&(&test_auth()).into(), file_id, 0, &vec![b'A'; 1000])
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(vec![b'A'; 1000]),
+        )
+        .await
+        .unwrap();
 
         let setattr = SetAttributes {
             size: SetSize::Set(500),
@@ -522,9 +564,14 @@ mod tests {
             .unwrap();
 
         let data = vec![b'A'; 300 * 1024];
-        fs.process_write(&(&test_auth()).into(), file_id, 0, &data)
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::copy_from_slice(&data),
+        )
+        .await
+        .unwrap();
 
         let setattr = SetAttributes {
             size: SetSize::Set(100 * 1024),
@@ -867,9 +914,14 @@ mod tests {
             .await
             .unwrap();
 
-        fs.process_write(&(&test_auth()).into(), file_id, 0, b"initial data")
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"initial data".to_vec()),
+        )
+        .await
+        .unwrap();
 
         let no_exec_attrs = SetAttributes {
             mode: SetMode::Set(0o644),
@@ -896,7 +948,12 @@ mod tests {
         assert!(matches!(result, Err(FsError::PermissionDenied)));
 
         let result = fs
-            .process_write(&(&test_auth()).into(), file_id, 0, b"new data")
+            .process_write(
+                &(&test_auth()).into(),
+                file_id,
+                0,
+                &Bytes::from(b"new data".to_vec()),
+            )
             .await;
         assert!(matches!(result, Err(FsError::PermissionDenied)));
 
@@ -917,10 +974,15 @@ mod tests {
             .process_read_file(&(&test_auth()).into(), file_id, 0, 100)
             .await
             .unwrap();
-        assert_eq!(data, b"initial data");
+        assert_eq!(data.as_ref(), b"initial data");
 
-        fs.process_write(&(&test_auth()).into(), file_id, 0, b"updated data")
-            .await
-            .unwrap();
+        fs.process_write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"updated data".to_vec()),
+        )
+        .await
+        .unwrap();
     }
 }
