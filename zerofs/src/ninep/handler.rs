@@ -611,7 +611,10 @@ impl NinePHandler {
 
                 let qid = inode_to_qid(&child_inode, child_id);
 
-                let mut fid_entry = self.session.fids.get_mut(&tc.fid).unwrap();
+                let mut fid_entry = match self.session.fids.get_mut(&tc.fid) {
+                    Some(entry) => entry,
+                    None => return P9Message::error(tag, libc::EBADF as u32),
+                };
                 fid_entry.path.push(name.to_string());
                 fid_entry.inode_id = child_id;
                 fid_entry.qid = qid.clone();
