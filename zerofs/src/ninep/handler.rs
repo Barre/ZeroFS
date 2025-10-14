@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use dashmap::DashMap;
 use deku::DekuContainerWrite;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ pub const BLOCK_SIZE: u64 = 512;
 // Represents an open file handle
 #[derive(Debug, Clone)]
 pub struct Fid {
-    pub path: Vec<String>,
+    pub path: Vec<bytes::Bytes>,
     pub inode_id: InodeId,
     pub qid: Qid,
     pub iounit: u32,
@@ -217,7 +218,6 @@ impl NinePHandler {
 
         let qid = inode_to_qid(&root_inode, 0);
 
-        // Check if fid is already in use
         if self.session.fids.contains_key(&ta.fid) {
             return P9Message::error(tag, libc::EINVAL as u32);
         }
@@ -251,12 +251,8 @@ impl NinePHandler {
         let mut wqids = Vec::new();
 
         for wname in &tw.wnames {
-            let name = match wname.as_str() {
-                Ok(s) => s,
-                Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-            };
-
-            current_path.push(name.to_string());
+            let name_bytes = Bytes::copy_from_slice(&wname.data);
+            current_path.push(name_bytes.clone());
 
             let inode = match self.filesystem.load_inode(current_id).await {
                 Ok(i) => i,
@@ -268,7 +264,7 @@ impl NinePHandler {
                     let creds = src_fid.creds;
                     match self
                         .filesystem
-                        .process_lookup(&creds, current_id, name.as_bytes())
+                        .process_lookup(&creds, current_id, &name_bytes)
                         .await
                     {
                         Ok(child_id) => {
@@ -580,11 +576,6 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBUSY as u32);
         }
 
-        let name = match tc.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
         let mut temp_creds = parent_fid.creds;
         temp_creds.gid = tc.gid;
 
@@ -593,7 +584,7 @@ impl NinePHandler {
             .process_create(
                 &temp_creds,
                 parent_fid.inode_id,
-                name.as_bytes(),
+                &tc.name.data,
                 &SetAttributes {
                     mode: SetMode::Set(tc.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
@@ -615,7 +606,7 @@ impl NinePHandler {
                     Some(entry) => entry,
                     None => return P9Message::error(tag, libc::EBADF as u32),
                 };
-                fid_entry.path.push(name.to_string());
+                fid_entry.path.push(Bytes::from(tc.name.data));
                 fid_entry.inode_id = child_id;
                 fid_entry.qid = qid.clone();
                 fid_entry.opened = true;
@@ -683,7 +674,7 @@ impl NinePHandler {
 
         let auth = self.make_auth_context(&fid_entry.creds);
         let data_len = tw.data.len();
-        let data = bytes::Bytes::from(tw.data);
+        let data = Bytes::from(tw.data);
 
         match self
             .filesystem
@@ -793,17 +784,11 @@ impl NinePHandler {
         };
 
         let parent_id = parent_fid.inode_id;
-
         let creds = parent_fid.creds;
 
-        let name = match tm.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
         debug!(
-            "handle_mkdir: parent_id={}, name={}, dfid={}, mode={:o}, gid={}, fid uid={}, fid gid={}",
-            parent_id, name, tm.dfid, tm.mode, tm.gid, creds.uid, creds.gid
+            "handle_mkdir: parent_id={}, name={:?}, dfid={}, mode={:o}, gid={}, fid uid={}, fid gid={}",
+            parent_id, &tm.name.data, tm.dfid, tm.mode, tm.gid, creds.uid, creds.gid
         );
 
         let mut temp_creds = creds;
@@ -814,7 +799,7 @@ impl NinePHandler {
             .process_mkdir(
                 &temp_creds,
                 parent_id,
-                name.as_bytes(),
+                &tm.name.data,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode),
                     uid: SetUid::Set(creds.uid),
@@ -846,16 +831,6 @@ impl NinePHandler {
         let parent_id = parent_fid.inode_id;
         let creds = parent_fid.creds;
 
-        let name = match ts.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
-        let target = match ts.symtgt.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
         let mut temp_creds = creds;
         temp_creds.gid = ts.gid;
 
@@ -864,8 +839,8 @@ impl NinePHandler {
             .process_symlink(
                 &temp_creds,
                 parent_id,
-                name.as_bytes(),
-                target.as_bytes(),
+                &ts.name.data,
+                &ts.symtgt.data,
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(creds.uid),
@@ -897,11 +872,6 @@ impl NinePHandler {
         let mut temp_creds = parent_fid.creds;
         temp_creds.gid = tm.gid;
 
-        let name = match tm.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
         let file_type = tm.mode & 0o170000; // S_IFMT
         let device_type = match file_type {
             S_IFCHR => FileType::CharDevice,
@@ -916,7 +886,7 @@ impl NinePHandler {
             .process_mknod(
                 &temp_creds,
                 parent_fid.inode_id,
-                name.as_bytes(),
+                &tm.name.data,
                 device_type,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode & 0o7777),
@@ -954,9 +924,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        let inode_id = fid_entry.inode_id;
-
-        let inode = match self.filesystem.load_inode(inode_id).await {
+        let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -988,25 +956,19 @@ impl NinePHandler {
 
         let dir_id = dir_fid.inode_id;
         let file_id = file_fid.inode_id;
-
         let creds = dir_fid.creds;
-
-        let name = match tl.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
+        let name_bytes = &tl.name.data;
 
         debug!(
-            "handle_link: file_id={}, dir_id={}, name={}, uid={}, gid={}",
-            file_id, dir_id, name, creds.uid, creds.gid
+            "handle_link: file_id={}, dir_id={}, name={:?}, uid={}, gid={}",
+            file_id, dir_id, name_bytes, creds.uid, creds.gid
         );
 
-        // Create hard link
         let auth = self.make_auth_context(&creds);
 
         match self
             .filesystem
-            .process_link(&(&auth).into(), file_id, dir_id, name.as_bytes())
+            .process_link(&(&auth).into(), file_id, dir_id, name_bytes)
             .await
         {
             Ok(_post_attr) => P9Message::new(tag, Message::Rlink(Rlink)),
@@ -1040,7 +1002,7 @@ impl NinePHandler {
         for name in &source_parent_path {
             match self
                 .filesystem
-                .process_lookup(&creds, source_parent_id, name.as_bytes())
+                .process_lookup(&creds, source_parent_id, name)
                 .await
             {
                 Ok(real_id) => {
@@ -1050,10 +1012,7 @@ impl NinePHandler {
             }
         }
 
-        let new_name = match tr.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
+        let new_name_bytes = Bytes::copy_from_slice(&tr.name.data);
 
         let auth = self.make_auth_context(&creds);
 
@@ -1062,9 +1021,9 @@ impl NinePHandler {
             .process_rename(
                 &(&auth).into(),
                 source_parent_id,
-                source_name.as_bytes(),
+                source_name,
                 dest_parent_id,
-                new_name.as_bytes(),
+                &new_name_bytes,
             )
             .await
         {
@@ -1086,30 +1045,16 @@ impl NinePHandler {
             (old_dir_fid, new_dir_fid)
         };
 
-        let old_parent_id = old_dir_fid.inode_id;
-        let new_parent_id = new_dir_fid.inode_id;
-        let creds = old_dir_fid.creds;
-
-        let old_name = match tr.oldname.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
-        let new_name = match tr.newname.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
-        let auth = self.make_auth_context(&creds);
+        let auth = self.make_auth_context(&old_dir_fid.creds);
 
         match self
             .filesystem
             .process_rename(
                 &(&auth).into(),
-                old_parent_id,
-                old_name.as_bytes(),
-                new_parent_id,
-                new_name.as_bytes(),
+                old_dir_fid.inode_id,
+                &tr.oldname.data,
+                new_dir_fid.inode_id,
+                &tr.newname.data,
             )
             .await
         {
@@ -1127,14 +1072,9 @@ impl NinePHandler {
         let parent_id = dir_fid.inode_id;
         let creds = dir_fid.creds;
 
-        let name = match tu.name.as_str() {
-            Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
-        };
-
         let child_id = match self
             .filesystem
-            .process_lookup(&creds, parent_id, name.as_bytes())
+            .process_lookup(&creds, parent_id, &tu.name.data)
             .await
         {
             Ok(id) => id,
@@ -1162,7 +1102,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_remove(&(&auth).into(), parent_id, name.as_bytes())
+            .process_remove(&(&auth).into(), parent_id, &tu.name.data)
             .await
         {
             Ok(_) => P9Message::new(tag, Message::Runlinkat(Runlinkat)),
@@ -1234,7 +1174,6 @@ impl NinePHandler {
 
     async fn handle_tflush(&self, tag: u16, _tf: Tflush) -> P9Message {
         // We don't support canceling operations
-        // Return ENOTSUP error
         P9Message::error(tag, libc::ENOTSUP as u32)
     }
 
