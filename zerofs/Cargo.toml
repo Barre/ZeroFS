@@ -24,14 +24,14 @@ codegen-units = 16
 
 [dependencies]
 slatedb = "0.8.2"
-tikv-jemallocator = { version = "0.6.0", features = ["background_threads"] }
+tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
-tokio = { version = "1.46", features = ["full"] }
+tokio = { version = "1.48", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-object_store = { version = "0.12.3", features = ["aws", "azure", "gcp"] }
-bytes = "1.5"
+object_store = { version = "0.12.4", features = ["aws", "azure", "gcp"] }
+bytes = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 rand = "0.8"
@@ -39,6 +39,7 @@ futures = "0.3"
 foyer = "0.17"
 foyer-common = "0.17"
 chacha20poly1305 = "0.10"
+generic-array = "=0.14.7"
 hkdf = "0.12"
 sha2 = "0.10"
 lz4_flex = "0.11"
