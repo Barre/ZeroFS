@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "0.16.3"
+version = "0.16.4"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
@@ -23,7 +23,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = "0.8.2"
+slatedb = "0.9.0"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.48", features = ["full"] }
