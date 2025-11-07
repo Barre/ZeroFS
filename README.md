@@ -107,8 +107,10 @@ graph TB
 
 ### Installation
 
-#### Download Binary (Recommended)
-Download pre-built binaries from the [releases page](https://github.com/Barre/ZeroFS/releases). These binaries are optimized with Profile-Guided Optimization (PGO) for best performance.
+#### Install script (Recommended)
+```bash
+curl -sSf https://github.com/Barre/ZeroFS/blob/main/install.sh | sh
+```
 
 #### Via Cargo
 ```bash
