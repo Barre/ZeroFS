@@ -7,8 +7,10 @@ use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use slatedb::config::GarbageCollectorDirectoryOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -205,7 +207,18 @@ pub async fn build_slatedb(
         }),
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
-            ..Default::default()
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                interval: Some(Duration::from_secs(60)),
+                min_age: Duration::from_secs(60),
+            }),
+            manifest_options: Some(GarbageCollectorDirectoryOptions {
+                interval: Some(Duration::from_secs(60)),
+                min_age: Duration::from_secs(60),
+            }),
+            compacted_options: Some(GarbageCollectorDirectoryOptions {
+                interval: Some(Duration::from_secs(60)),
+                min_age: Duration::from_secs(60),
+            }),
         }),
         ..Default::default()
     };
