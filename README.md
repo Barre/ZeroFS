@@ -109,7 +109,7 @@ graph TB
 
 #### Install script (Recommended)
 ```bash
-curl -sSf https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/install.sh | sh
+curl -sSfL https://sh.zerofs.net | sh
 ```
 
 #### Via Cargo
