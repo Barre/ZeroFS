@@ -39,12 +39,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool git perl
-          
+
           # Check if 9p kernel module is available
           sudo modprobe 9p
           sudo modprobe 9pnet
           sudo modprobe 9pnet_virtio
-          
+
           # List loaded 9p modules
           lsmod | grep 9p || echo "No 9p modules loaded yet"
 
@@ -123,7 +123,7 @@ jobs:
           sudo mkdir -p /mnt/zerofs-9p
 
           # Mount ZeroFS via 9P using v9fs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=65536,access=user 127.0.0.1 /mnt/zerofs-9p
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,access=user 127.0.0.1 /mnt/zerofs-9p
 
           # Verify mount
           mount | grep zerofs-9p
@@ -137,10 +137,10 @@ jobs:
 
           # Get list of all test files
           find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
-          
+
           # Filter out excluded tests
           grep -v -f ${{ github.workspace }}/.github/.pjdfstest-9p-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
-          
+
           # Run the filtered test suite
           sudo prove -rv $(cat /tmp/tests_to_run.txt)
 

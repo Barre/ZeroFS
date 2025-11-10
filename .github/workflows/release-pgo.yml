@@ -82,7 +82,7 @@ jobs:
       - name: Run profiling workloads
         run: |
           mkdir -p /tmp/zerofs-cache
-          
+
           # Create ZeroFS configuration based on test type
           if [ "${{ matrix.test }}" = "9p" ]; then
             cat > zerofs-pgo.toml << EOF
@@ -115,7 +115,7 @@ jobs:
               sleep 1
             done
             sudo mkdir -p /mnt/zerofs
-            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
             cd /mnt/zerofs
             wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
             tar -xf linux-6.11.tar.xz
@@ -145,7 +145,7 @@ jobs:
 
           [servers.ninep]
           addresses = ["127.0.0.1:5564"]
-          
+
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
 
@@ -397,17 +397,17 @@ jobs:
             . $HOME/.cargo/env
             echo "Building ZeroFS for FreeBSD with PGO..."
             echo "Rust version: $(rustc --version)"
-            
+
             # Copy PGO data into VM
             cp pgo-data/merged.profdata zerofs/
             cp pgo-data/Cargo.lock zerofs/
-            
+
             cd zerofs
             RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cargo build --release
-            
+
             file target/release/zerofs
             ls -lh target/release/zerofs
-            
+
             cp target/release/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
             rm -rf target/
 

@@ -300,7 +300,7 @@ This should be fine for most use-cases but if you need to hide directory structu
 
 #### TCP Mount (default)
 ```bash
-mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/9p
+mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
 
 #### Unix Socket Mount (lower latency for local access)
@@ -312,7 +312,7 @@ For improved performance when mounting locally, you can use Unix domain sockets 
 # unix_socket = "/tmp/zerofs.9p.sock"
 
 # Mount using Unix socket
-mount -t 9p -o trans=unix,version=9p2000.L,msize=1048576,cache=mmap,access=user /tmp/zerofs.9p.sock /mnt/9p
+mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs.9p.sock /mnt/9p
 ```
 
 Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.

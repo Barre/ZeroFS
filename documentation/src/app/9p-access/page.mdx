@@ -79,7 +79,7 @@ sudo umount /mnt/zerofs-9p
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `msize=N` | Maximum message size in bytes | 8192 |
+| `msize=N` | Maximum message size in bytes | 128K |
 | `cache=mode` | Caching mode (see below) | none |
 | `access=mode` | Access check mode | user |
 
@@ -107,7 +107,7 @@ Add to `/etc/fstab`:
 127.0.0.1 /mnt/zerofs-9p 9p trans=tcp,port=5564,version=9p2000.L,_netdev 0 0
 
 # With performance options
-127.0.0.1 /mnt/zerofs-9p 9p trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=loose,_netdev 0 0
+127.0.0.1 /mnt/zerofs-9p 9p trans=tcp,port=5564,version=9p2000.L,cache=loose,_netdev 0 0
 ```
 
 ### Systemd Mount Unit
@@ -123,7 +123,7 @@ After=network.target
 What=127.0.0.1
 Where=/mnt/zerofs-9p
 Type=9p
-Options=trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=loose,_netdev
+Options=trans=tcp,port=5564,version=9p2000.L,cache=loose,_netdev
 
 [Install]
 WantedBy=multi-user.target
@@ -137,18 +137,6 @@ sudo systemctl start mnt-zerofs-9p.mount
 ```
 
 ## Performance Tuning
-
-### Message Size
-
-Larger message sizes improve throughput for sequential I/O:
-
-```bash
-# Low (8KB)
--o msize=8192
-
-# Recommended (1MB)
--o msize=1048576
-```
 
 ### Cache Mode Selection
 
@@ -193,7 +181,7 @@ mount | grep 9p
 for mode in none mmap loose; do
     echo "Testing cache=$mode"
     sudo umount /mnt/zerofs-9p
-    sudo mount -t 9p -o cache=$mode,msize=1048576,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-9p
+    sudo mount -t 9p -o cache=$mode,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-9p
     # Run your benchmark
 done
 ```

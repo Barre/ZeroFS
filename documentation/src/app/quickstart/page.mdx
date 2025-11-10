@@ -252,7 +252,7 @@ sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:
 sudo mkdir -p /mnt/9p
 
 # Mount ZeroFS via 9P (better performance on Linux)
-sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/9p
+sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
 
 ```bash {{ title: 'Persistent Mount (NFS)' }}
@@ -262,7 +262,7 @@ echo "127.0.0.1:/ /mnt/zerofs nfs vers=3,async,nolock,tcp,port=2049,mountport=20
 
 ```bash {{ title: 'Persistent Mount (9P)' }}
 # Add to /etc/fstab for automatic mounting (Linux only)
-echo "127.0.0.1 /mnt/9p 9p trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user,_netdev 0 0" | sudo tee -a /etc/fstab
+echo "127.0.0.1 /mnt/9p 9p trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user,_netdev 0 0" | sudo tee -a /etc/fstab
 ```
 
 </CodeGroup>

@@ -112,7 +112,7 @@ jobs:
           sudo mkdir -p /mnt/zerofs
 
           # Mount ZeroFS via 9P
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=1048576,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
 
           # Verify mount
           mount | grep zerofs

@@ -233,7 +233,7 @@ jobs:
           sudo mkdir -p /mnt/zerofs-9p
 
           # Mount ZeroFS via 9P using v9fs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,msize=65536,access=user 127.0.0.1 /mnt/zerofs-9p
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,access=user 127.0.0.1 /mnt/zerofs-9p
 
           # Verify mount
           mount | grep zerofs-9p
