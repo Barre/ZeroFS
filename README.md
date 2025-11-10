@@ -223,6 +223,33 @@ storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
 storage_account_key = "${AZURE_STORAGE_ACCOUNT_KEY}"
 ```
 
+#### Google Cloud Storage (GCS)
+
+**Option 1: Application Default Credentials (recommended for GCP VMs/GKE)**
+
+If running on a GCP VM or GKE pod with an attached service account, no configuration is needed:
+```toml
+[storage]
+url = "gs://my-bucket/path"
+# No [gcp] section needed - uses VM/pod service account automatically
+```
+
+**Option 2: Service Account Key File**
+
+```toml
+[storage]
+url = "gs://my-bucket/path"
+
+[gcp]
+service_account = "${GCS_SERVICE_ACCOUNT}"  # Path to service account JSON file
+```
+
+Or set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable:
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+zerofs server -c zerofs.toml
+```
+
 #### Local Filesystem
 ```toml
 [storage]

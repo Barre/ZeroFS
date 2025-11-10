@@ -68,6 +68,37 @@ storage_account_name = "myaccount"
 storage_account_key = "your-account-key"
 ```
 
+### Google Cloud Storage (GCS)
+
+**Using Application Default Credentials (GCP VMs/GKE):**
+
+```toml
+[storage]
+url = "gs://my-bucket/zerofs-data"
+encryption_password = "secure-password-here"
+
+# No [gcp] section needed when running on GCP with attached service account
+```
+
+**Using Service Account Key File:**
+
+```toml
+[storage]
+url = "gs://my-bucket/zerofs-data"
+encryption_password = "secure-password-here"
+
+[gcp]
+service_account = "/path/to/service-account-key.json"
+# Or use application_credentials = "${GOOGLE_APPLICATION_CREDENTIALS}"
+```
+
+<Note>
+GCS authentication follows Google's Application Default Credentials (ADC) chain:
+1. If running on a GCP VM or GKE pod with an attached service account, credentials are automatically discovered via the metadata service
+2. Otherwise, uses `GOOGLE_APPLICATION_CREDENTIALS` environment variable or `[gcp]` config section
+3. Falls back to gcloud CLI credentials if available
+</Note>
+
 ### Local Filesystem
 
 ```toml
@@ -123,6 +154,52 @@ secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 [servers.nfs]
 addresses = ["0.0.0.0:2049"]
+```
+
+### Basic GCS Configuration
+
+**On GCP VM/GKE (recommended):**
+
+```toml
+# /etc/zerofs/zerofs.toml - Minimal config for GCP VMs
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+
+[storage]
+url = "gs://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
+
+# No [gcp] section needed - uses VM's attached service account automatically
+```
+
+**With Service Account Key File:**
+
+```toml
+# /etc/zerofs/zerofs.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+
+[storage]
+url = "gs://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[gcp]
+service_account = "/path/to/service-account-key.json"
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
+```
+
+Or using `GOOGLE_APPLICATION_CREDENTIALS`:
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+zerofs run -c zerofs.toml
 ```
 
 ### High-Performance Configuration
