@@ -1,5 +1,6 @@
 use crate::bucket_identity;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, Settings};
+use crate::coordinator::{DistributedCoordinator, MetadataCoordinator};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, ZeroFS};
@@ -277,7 +278,7 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
         }
     }
 
-    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.into_iter())?;
+    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.clone().into_iter())?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
 
     let actual_db_path = path_from_url.to_string();
@@ -316,7 +317,34 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
-    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key).await?;
+    // Build coordinator if configured for concurrent writers
+    let coordinator: Option<Arc<dyn MetadataCoordinator>> = 
+        if settings.storage.allow_concurrent_writers.unwrap_or(false) {
+            info!("Concurrent writers: ENABLED - safe for multiple ZeroFS instances");
+            
+            // Get initial inode counter from main DB
+            let counter_key = crate::fs::key_codec::KeyCodec::system_counter_key();
+            let initial_inode = match slatedb.get(&counter_key).await? {
+                Some(data) => crate::fs::key_codec::KeyCodec::decode_counter(&data)?,
+                None => 1,
+            };
+            
+            Some(Arc::new(DistributedCoordinator::new(
+                slatedb.clone(),  // Use the SAME SlateDB instance
+                initial_inode,
+                crate::fs::MAX_INODE_ID,
+                100, // Batch size: allocate 100 inodes at a time
+            )))
+        } else {
+            info!("Concurrent writers: DISABLED - single writer mode");
+            None
+        };
+
+    let fs = ZeroFS::new_with_slatedb_and_coordinator(
+        slatedb,
+        encryption_key,
+        coordinator,
+    ).await?;
 
     Ok(Arc::new(fs))
 }

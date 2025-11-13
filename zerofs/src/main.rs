@@ -4,6 +4,7 @@ use std::io::BufRead;
 mod bucket_identity;
 mod cli;
 mod config;
+mod coordinator;
 mod encryption;
 mod fs;
 mod key_management;

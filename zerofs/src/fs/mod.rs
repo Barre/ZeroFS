@@ -98,6 +98,7 @@ pub struct ZeroFS {
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     flush_coordinator: FlushCoordinator,
+    coordinator: Arc<dyn crate::coordinator::MetadataCoordinator>,
 }
 
 #[derive(Clone)]
@@ -108,9 +109,21 @@ pub struct CacheConfig {
 }
 
 impl ZeroFS {
+    /// Create a new ZeroFS instance with the default (local) coordinator
+    /// Used primarily by tests
+    #[allow(dead_code)]
     pub async fn new_with_slatedb(
         slatedb: Arc<slatedb::Db>,
         encryption_key: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        Self::new_with_slatedb_and_coordinator(slatedb, encryption_key, None).await
+    }
+
+    /// Create a new ZeroFS instance with an optional custom coordinator
+    pub async fn new_with_slatedb_and_coordinator(
+        slatedb: Arc<slatedb::Db>,
+        encryption_key: [u8; 32],
+        coordinator: Option<Arc<dyn crate::coordinator::MetadataCoordinator>>,
     ) -> anyhow::Result<Self> {
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
 
@@ -171,6 +184,16 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
 
+        // Create coordinator: use provided one or fall back to local
+        let coord: Arc<dyn crate::coordinator::MetadataCoordinator> = 
+            coordinator.unwrap_or_else(|| {
+                tracing::info!("Using local coordinator (single-writer mode)");
+                Arc::new(crate::coordinator::LocalCoordinator::new(
+                    next_inode_id,
+                    MAX_INODE_ID,
+                ))
+            });
+
         let fs = Self {
             db: db.clone(),
             lock_manager,
@@ -179,18 +202,24 @@ impl ZeroFS {
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             flush_coordinator,
+            coordinator: coord,
         };
 
         Ok(fs)
     }
 
     pub async fn allocate_inode(&self) -> Result<InodeId, FsError> {
-        let id = self.next_inode_id.fetch_add(1, Ordering::SeqCst);
-
-        if id > MAX_INODE_ID {
-            self.next_inode_id.store(MAX_INODE_ID + 2, Ordering::SeqCst);
-            return Err(FsError::NoSpace);
-        }
+        // Use coordinator for allocation
+        let id = self.coordinator
+            .allocate_inode()
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to allocate inode: {:?}", e);
+                FsError::NoSpace
+            })?;
+        
+        // Also update local counter for consistency (used when coordinator is local)
+        self.next_inode_id.store(id + 1, Ordering::Release);
 
         Ok(id)
     }
