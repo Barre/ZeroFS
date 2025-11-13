@@ -1,20 +1,3 @@
-//! Metadata coordination for multi-writer scenarios
-//!
-//! This module provides distributed coordination for metadata operations
-//! when multiple ZeroFS instances write to the same storage backend.
-//!
-//! ## Architecture
-//!
-//! - **Local mode**: No coordination, suitable for single-writer setups
-//! - **Distributed mode**: Uses the same SlateDB instance with a dedicated key prefix
-//!   for coordinating inode allocation using CAS operations
-//!
-//! ## Use Cases
-//!
-//! Enable metadata coordination when:
-//! - Multiple ZeroFS writers access the same backend
-//! - Your storage backend supports If-Match (S3, GCS, Azure)
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb::config::{PutOptions, WriteOptions};
@@ -34,15 +17,11 @@ pub enum CoordinatorError {
     InodeIdExhausted,
 }
 
-/// Metadata coordinator trait for inode allocation and coordination
 #[async_trait]
 pub trait MetadataCoordinator: Send + Sync {
-    /// Allocate a new unique inode ID
     async fn allocate_inode(&self) -> Result<u64, CoordinatorError>;
 }
 
-/// Local coordinator - no cross-process coordination
-/// Suitable for single-writer scenarios
 pub struct LocalCoordinator {
     next_inode: Arc<AtomicU64>,
     max_inode_id: u64,
@@ -71,8 +50,6 @@ impl MetadataCoordinator for LocalCoordinator {
     }
 }
 
-/// Distributed coordinator using SlateDB with CAS operations
-/// Provides safe multi-writer coordination using the same DB instance
 pub struct DistributedCoordinator {
     db: Arc<slatedb::Db>,
     cache: Arc<AtomicU64>,
@@ -81,13 +58,6 @@ pub struct DistributedCoordinator {
 }
 
 impl DistributedCoordinator {
-    /// Create a new distributed coordinator
-    ///
-    /// # Arguments
-    /// * `db` - SlateDB instance with CAS support enabled
-    /// * `initial_inode` - Starting inode ID
-    /// * `max_inode_id` - Maximum allowed inode ID
-    /// * `cache_batch_size` - Number of inodes to pre-allocate in each batch
     pub fn new(
         db: Arc<slatedb::Db>,
         initial_inode: u64,
@@ -102,14 +72,11 @@ impl DistributedCoordinator {
         }
     }
     
-    /// Allocate a batch of inodes from the distributed counter
-    /// Uses optimistic locking: read version, increment, write with condition
     async fn allocate_batch(&self) -> Result<u64, CoordinatorError> {
         const MAX_RETRIES: u32 = 10;
         const COUNTER_KEY: &[u8] = b"__metadata_coord_inode_counter";
         
         for attempt in 0..MAX_RETRIES {
-            // Read current counter value
             let current = match self.db.get(COUNTER_KEY).await {
                 Ok(Some(data)) => {
                     u64::from_be_bytes(
@@ -119,30 +86,24 @@ impl DistributedCoordinator {
                     )
                 }
                 Ok(None) => {
-                    // First allocation - initialize the counter
                     let initial = 1u64;
                     let initial_bytes = initial.to_be_bytes();
                     
-                    // Try to create initial counter (PutMode::Create for CAS)
                     match self.db.put_with_options(
                         &Bytes::from_static(COUNTER_KEY),
                         &initial_bytes,
-                        &PutOptions::default(), // Uses default which should be Create mode when CAS is enabled
+                        &PutOptions::default(),
                         &WriteOptions {
                             await_durable: true,
                         },
                     ).await {
                         Ok(_) => initial,
-                        Err(_) => {
-                            // Another writer created it, retry read
-                            continue;
-                        }
+                        Err(_) => continue,
                     }
                 }
                 Err(e) => return Err(CoordinatorError::BackendError(e.to_string())),
             };
             
-            // Check for overflow
             if current > self.max_inode_id {
                 return Err(CoordinatorError::InodeIdExhausted);
             }
@@ -150,8 +111,6 @@ impl DistributedCoordinator {
             let next = current.saturating_add(self.cache_batch_size);
             let next_bytes = next.to_be_bytes();
             
-            // Write updated counter
-            // Note: SlateDB's manifest versioning provides coordination when CAS is enabled
             match self.db.put_with_options(
                 &Bytes::from_static(COUNTER_KEY),
                 &next_bytes,
@@ -172,9 +131,8 @@ impl DistributedCoordinator {
                 Err(e) => {
                     tracing::debug!("Batch allocation conflict on attempt {}: {}", attempt + 1, e);
                     
-                    // Retry with exponential backoff
                     if attempt < MAX_RETRIES - 1 {
-                        let backoff_ms = 10u64 << attempt.min(5); // Max 320ms
+                        let backoff_ms = 10u64 << attempt.min(5);
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     }
                 }
@@ -190,24 +148,16 @@ impl DistributedCoordinator {
 #[async_trait]
 impl MetadataCoordinator for DistributedCoordinator {
     async fn allocate_inode(&self) -> Result<u64, CoordinatorError> {
-        // Try to allocate from local cache first
         loop {
             let current = self.cache.load(Ordering::Acquire);
             let next = current + 1;
             
-            // Check if we need to allocate a new batch
             if next % self.cache_batch_size == 0 {
-                // Allocate new batch from distributed counter
                 let batch_start = self.allocate_batch().await?;
-                
-                // Update cache to the new batch
                 self.cache.store(batch_start, Ordering::Release);
-                
-                // Return first ID from the new batch
                 return Ok(batch_start);
             }
             
-            // Try to increment within current batch
             if self.cache.compare_exchange(
                 current,
                 next,
@@ -219,8 +169,6 @@ impl MetadataCoordinator for DistributedCoordinator {
                 }
                 return Ok(current);
             }
-            
-            // Another thread updated the cache, retry
         }
     }
 }

@@ -317,12 +317,10 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
-    // Build coordinator if configured for concurrent writers
     let coordinator: Option<Arc<dyn MetadataCoordinator>> = 
         if settings.storage.allow_concurrent_writers.unwrap_or(false) {
             info!("Concurrent writers: ENABLED - safe for multiple ZeroFS instances");
             
-            // Get initial inode counter from main DB
             let counter_key = crate::fs::key_codec::KeyCodec::system_counter_key();
             let initial_inode = match slatedb.get(&counter_key).await? {
                 Some(data) => crate::fs::key_codec::KeyCodec::decode_counter(&data)?,
@@ -330,10 +328,10 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
             };
             
             Some(Arc::new(DistributedCoordinator::new(
-                slatedb.clone(),  // Use the SAME SlateDB instance
+                slatedb.clone(),
                 initial_inode,
                 crate::fs::MAX_INODE_ID,
-                100, // Batch size: allocate 100 inodes at a time
+                100,
             )))
         } else {
             info!("Concurrent writers: DISABLED - single writer mode");

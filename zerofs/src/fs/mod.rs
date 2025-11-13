@@ -109,8 +109,6 @@ pub struct CacheConfig {
 }
 
 impl ZeroFS {
-    /// Create a new ZeroFS instance with the default (local) coordinator
-    /// Used primarily by tests
     #[allow(dead_code)]
     pub async fn new_with_slatedb(
         slatedb: Arc<slatedb::Db>,
@@ -119,7 +117,6 @@ impl ZeroFS {
         Self::new_with_slatedb_and_coordinator(slatedb, encryption_key, None).await
     }
 
-    /// Create a new ZeroFS instance with an optional custom coordinator
     pub async fn new_with_slatedb_and_coordinator(
         slatedb: Arc<slatedb::Db>,
         encryption_key: [u8; 32],
@@ -184,7 +181,6 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
 
-        // Create coordinator: use provided one or fall back to local
         let coord: Arc<dyn crate::coordinator::MetadataCoordinator> = 
             coordinator.unwrap_or_else(|| {
                 tracing::info!("Using local coordinator (single-writer mode)");
@@ -209,7 +205,6 @@ impl ZeroFS {
     }
 
     pub async fn allocate_inode(&self) -> Result<InodeId, FsError> {
-        // Use coordinator for allocation
         let id = self.coordinator
             .allocate_inode()
             .await
@@ -218,9 +213,7 @@ impl ZeroFS {
                 FsError::NoSpace
             })?;
         
-        // Also update local counter for consistency (used when coordinator is local)
         self.next_inode_id.store(id + 1, Ordering::Release);
-
         Ok(id)
     }
 
