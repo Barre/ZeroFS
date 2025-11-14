@@ -3971,7 +3971,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "anyhow",
  "argon2",
