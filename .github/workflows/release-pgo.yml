@@ -88,7 +88,7 @@ jobs:
             cat > zerofs-pgo.toml << EOF
           [cache]
           dir = "/tmp/zerofs-cache"
-          disk_size_gb = 5.0
+          disk_size_gb = 0.5
           memory_size_gb = 2.0
 
           [storage]
@@ -123,10 +123,8 @@ jobs:
             make tinyconfig
             make -j$(nproc)
             cd /mnt/zerofs
-            dd if=/dev/urandom of=1gb.bin bs=1M count=1024
             dd if=/dev/urandom of=500mb.bin bs=1M count=500
-            dd if=1gb.bin of=/dev/null bs=1M
-            cp 1gb.bin 1gb-copy.bin
+            dd if=500mb.bin of=/dev/null bs=1M
             cd /
             sudo umount /mnt/zerofs || true
             kill -TERM $ZEROFS_PID || true
@@ -177,7 +175,6 @@ jobs:
             cd /mnt/zfsdata
             sudo wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
             sudo tar -xf linux-6.11.tar.xz
-            sudo dd if=/dev/urandom of=random.dat bs=1M count=100
             sudo zfs snapshot testpool/data@snapshot1
             kill -TERM $ZEROFS_PID || true
             wait $ZEROFS_PID || true
