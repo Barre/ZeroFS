@@ -109,9 +109,18 @@ impl Default for FileAttributes {
             rdev: None,
             fsid: 0,
             fileid: 0,
-            atime: Timestamp { seconds: 0, nanoseconds: 0 },
-            mtime: Timestamp { seconds: 0, nanoseconds: 0 },
-            ctime: Timestamp { seconds: 0, nanoseconds: 0 },
+            atime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            mtime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            ctime: Timestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
         }
     }
 }
@@ -464,7 +473,6 @@ pub struct ReadDirResult {
     pub entries: Vec<DirEntry>,
     pub end: bool,
 }
-
 
 /// Protocol-agnostic authentication context
 #[derive(Debug, Clone)]

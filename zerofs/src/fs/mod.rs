@@ -208,17 +208,32 @@ impl ZeroFS {
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let key = KeyCodec::inode_key(inode_id);
-        let data = self
-            .db
-            .get_bytes(&key)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to get inode {}: {:?}", inode_id, e);
-                FsError::IoError
-            })?
-            .ok_or(FsError::NotFound)?;
+        let data = self.db.get_bytes(&key).await.map_err(|e| {
+            tracing::error!(
+                "load_inode({}): database get_bytes failed: {:?}",
+                inode_id,
+                e
+            );
+            FsError::IoError
+        })?;
 
-        let inode: Inode = bincode::deserialize(&data)?;
+        let data = match data {
+            Some(d) => d,
+            None => {
+                tracing::error!(
+                    "load_inode({}): CRITICAL - inode key not found in database (key={:?}). This indicates database corruption or a bug.",
+                    inode_id,
+                    key
+                );
+                return Err(FsError::NotFound);
+            }
+        };
+
+        let inode: Inode = bincode::deserialize(&data).map_err(|e| {
+            tracing::error!("load_inode({}): failed to deserialize inode data (len={}): {:?}. This may indicate corruption or encryption/serialization bug.",
+                inode_id, data.len(), e);
+            FsError::InvalidData
+        })?;
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
