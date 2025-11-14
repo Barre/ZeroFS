@@ -23,7 +23,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = "0.9.0"
+slatedb = "0.9.1"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.48", features = ["full"] }
