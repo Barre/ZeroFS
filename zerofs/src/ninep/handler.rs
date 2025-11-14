@@ -425,7 +425,7 @@ impl NinePHandler {
 
             match self
                 .filesystem
-                .process_readdir(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
+                .process_readdir_lite(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
                 .await
             {
                 Ok(result) => {
