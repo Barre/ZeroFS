@@ -220,8 +220,8 @@ impl ZeroFS {
         let data = match data {
             Some(d) => d,
             None => {
-                tracing::error!(
-                    "load_inode({}): CRITICAL - inode key not found in database (key={:?}). This indicates database corruption or a bug.",
+                tracing::warn!(
+                    "load_inode({}): inode key not found in database (key={:?}).",
                     inode_id,
                     key
                 );
@@ -230,8 +230,12 @@ impl ZeroFS {
         };
 
         let inode: Inode = bincode::deserialize(&data).map_err(|e| {
-            tracing::error!("load_inode({}): failed to deserialize inode data (len={}): {:?}. This may indicate corruption or encryption/serialization bug.",
-                inode_id, data.len(), e);
+            tracing::warn!(
+                "load_inode({}): failed to deserialize inode data (len={}): {:?}.",
+                inode_id,
+                data.len(),
+                e
+            );
             FsError::InvalidData
         })?;
 
