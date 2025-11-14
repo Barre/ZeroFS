@@ -252,12 +252,13 @@ impl ZeroFS {
         }
     }
 
-    pub async fn process_readdir(
+    async fn process_readdir_internal(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         start_after: InodeId,
         max_entries: usize,
+        load_attrs: bool,
     ) -> Result<ReadDirResult, FsError> {
         debug!(
             "process_readdir: dirid={}, start_after={}, max_entries={}",
@@ -284,37 +285,46 @@ impl ZeroFS {
 
                 if !skip_special {
                     debug!("readdir: adding . entry for current directory");
-                    entries.push(DirEntry {
-                        fileid: dirid,
-                        name: b".".to_vec(),
-                        attr: InodeWithId {
-                            inode: &dir_inode,
-                            id: dirid,
-                        }
-                        .into(),
-                    });
-
-                    debug!("readdir: adding .. entry for parent directory");
-                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
-                    let parent_attr = if parent_id == dirid {
+                    let dot_attr = if load_attrs {
                         InodeWithId {
                             inode: &dir_inode,
                             id: dirid,
                         }
                         .into()
                     } else {
-                        match self.load_inode(parent_id).await {
-                            Ok(parent_inode) => InodeWithId {
-                                inode: &parent_inode,
-                                id: parent_id,
-                            }
-                            .into(),
-                            Err(_) => InodeWithId {
+                        FileAttributes::default()
+                    };
+                    entries.push(DirEntry {
+                        fileid: dirid,
+                        name: b".".to_vec(),
+                        attr: dot_attr,
+                    });
+
+                    debug!("readdir: adding .. entry for parent directory");
+                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
+                    let parent_attr = if load_attrs {
+                        if parent_id == dirid {
+                            InodeWithId {
                                 inode: &dir_inode,
                                 id: dirid,
                             }
-                            .into(),
+                            .into()
+                        } else {
+                            match self.load_inode(parent_id).await {
+                                Ok(parent_inode) => InodeWithId {
+                                    inode: &parent_inode,
+                                    id: parent_id,
+                                }
+                                .into(),
+                                Err(_) => InodeWithId {
+                                    inode: &dir_inode,
+                                    id: dirid,
+                                }
+                                .into(),
+                            }
                         }
+                    } else {
+                        FileAttributes::default()
                     };
                     entries.push(DirEntry {
                         fileid: parent_id,
@@ -377,38 +387,56 @@ impl ZeroFS {
                     dir_entries.push((inode_id, filename));
                 }
 
-                const BUFFER_SIZE: usize = 256;
+                if load_attrs {
+                    const BUFFER_SIZE: usize = 256;
 
-                let inode_futures =
-                    stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
-                        debug!("readdir: loading inode {} for entry", inode_id);
-                        let inode = self.load_inode(inode_id).await?;
-                        debug!("readdir: loaded inode {} successfully", inode_id);
-                        Ok::<(u64, Vec<u8>, Inode), FsError>((inode_id, name, inode))
-                    });
+                    let inode_futures =
+                        stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
+                            debug!("readdir: loading inode {} for entry", inode_id);
+                            let inode = self.load_inode(inode_id).await?;
+                            debug!("readdir: loaded inode {} successfully", inode_id);
+                            Ok::<(u64, Vec<u8>, Inode), FsError>((inode_id, name, inode))
+                        });
 
-                let loaded_entries: Vec<_> = inode_futures
-                    .buffered(BUFFER_SIZE)
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?;
+                    let loaded_entries: Vec<_> = inode_futures
+                        .buffered(BUFFER_SIZE)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
 
-                for (inode_id, name, inode) in loaded_entries {
-                    let position = inode_positions.entry(inode_id).or_insert(0);
-                    let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
-                    *position += 1;
+                    for (inode_id, name, inode) in loaded_entries {
+                        let position = inode_positions.entry(inode_id).or_insert(0);
+                        let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
+                        *position += 1;
 
-                    entries.push(DirEntry {
-                        fileid: encoded_id,
-                        name,
-                        attr: InodeWithId {
-                            inode: &inode,
-                            id: inode_id,
-                        }
-                        .into(),
-                    });
-                    debug!("readdir: added entry with encoded id {}", encoded_id);
+                        entries.push(DirEntry {
+                            fileid: encoded_id,
+                            name,
+                            attr: InodeWithId {
+                                inode: &inode,
+                                id: inode_id,
+                            }
+                            .into(),
+                        });
+                        debug!("readdir: added entry with encoded id {}", encoded_id);
+                    }
+                } else {
+                    for (inode_id, name) in dir_entries {
+                        let position = inode_positions.entry(inode_id).or_insert(0);
+                        let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
+                        *position += 1;
+
+                        entries.push(DirEntry {
+                            fileid: encoded_id,
+                            name,
+                            attr: FileAttributes::default(),
+                        });
+                        debug!(
+                            "readdir: added entry with encoded id {} (no attrs)",
+                            encoded_id
+                        );
+                    }
                 }
 
                 let end = !has_more;
@@ -427,5 +455,30 @@ impl ZeroFS {
             }
             _ => Err(FsError::NotDirectory),
         }
+    }
+
+    pub async fn process_readdir(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        start_after: InodeId,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, FsError> {
+        self.process_readdir_internal(auth, dirid, start_after, max_entries, true)
+            .await
+    }
+
+    /// Public API: process_readdir without loading attributes (used by 9P)
+    /// Returns entries with default/empty attributes. Callers should load inodes separately
+    /// only for entries they actually need to return to the client.
+    pub async fn process_readdir_lite(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        start_after: InodeId,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, FsError> {
+        self.process_readdir_internal(auth, dirid, start_after, max_entries, false)
+            .await
     }
 }

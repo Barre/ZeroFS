@@ -96,6 +96,26 @@ pub struct FileAttributes {
     pub ctime: Timestamp,
 }
 
+impl Default for FileAttributes {
+    fn default() -> Self {
+        Self {
+            file_type: FileType::Regular,
+            mode: 0,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            used: 0,
+            rdev: None,
+            fsid: 0,
+            fileid: 0,
+            atime: Timestamp { seconds: 0, nanoseconds: 0 },
+            mtime: Timestamp { seconds: 0, nanoseconds: 0 },
+            ctime: Timestamp { seconds: 0, nanoseconds: 0 },
+        }
+    }
+}
+
 impl From<&FileAttributes> for fattr3 {
     fn from(attrs: &FileAttributes) -> Self {
         fattr3 {
@@ -444,6 +464,7 @@ pub struct ReadDirResult {
     pub entries: Vec<DirEntry>,
     pub end: bool,
 }
+
 
 /// Protocol-agnostic authentication context
 #[derive(Debug, Clone)]
