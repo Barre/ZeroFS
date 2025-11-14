@@ -381,10 +381,20 @@ impl ZeroFS {
 
                 let inode_futures =
                     stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
-                        debug!("readdir: loading inode {} for entry", inode_id);
-                        let inode = self.load_inode(inode_id).await?;
-                        debug!("readdir: loaded inode {} successfully", inode_id);
-                        Ok::<(u64, Vec<u8>, Inode), FsError>((inode_id, name, inode))
+                        debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
+                        match self.load_inode(inode_id).await {
+                            Ok(inode) => {
+                                debug!("readdir: loaded inode {} successfully", inode_id);
+                                Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "readdir: skipping entry '{}' (inode {}) due to error: {:?}. Database may be corrupted.",
+                                    String::from_utf8_lossy(&name), inode_id, e
+                                );
+                                Ok(None)
+                            }
+                        }
                     });
 
                 let loaded_entries: Vec<_> = inode_futures
@@ -392,7 +402,10 @@ impl ZeroFS {
                     .collect::<Vec<_>>()
                     .await
                     .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
 
                 for (inode_id, name, inode) in loaded_entries {
                     let position = inode_positions.entry(inode_id).or_insert(0);
