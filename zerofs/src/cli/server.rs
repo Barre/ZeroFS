@@ -209,16 +209,16 @@ pub async fn build_slatedb(
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_secs(60)),
-                min_age: Duration::from_secs(60),
+                interval: Some(Duration::from_mins(60)),
+                min_age: Duration::from_mins(60),
             }),
             manifest_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_secs(60)),
-                min_age: Duration::from_secs(60),
+                interval: Some(Duration::from_mins(60)),
+                min_age: Duration::from_mins(60),
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_secs(60)),
-                min_age: Duration::from_secs(60),
+                interval: Some(Duration::from_mins(60)),
+                min_age: Duration::from_mins(60),
             }),
         }),
         ..Default::default()
