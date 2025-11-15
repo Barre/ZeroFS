@@ -7,10 +7,15 @@ use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use slatedb::DbBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
+use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
+use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use slatedb::object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -168,12 +173,6 @@ pub async fn build_slatedb(
     cache_config: &CacheConfig,
     db_path: String,
 ) -> Result<Arc<slatedb::Db>> {
-    use slatedb::DbBuilder;
-    use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
-    use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
-    use slatedb::object_store::path::Path;
-    use tokio::runtime::Runtime;
-
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
