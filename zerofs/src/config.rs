@@ -230,22 +230,6 @@ impl Settings {
             "${AWS_SECRET_ACCESS_KEY}".to_string(),
         );
 
-        let mut azure_config = std::collections::HashMap::new();
-        azure_config.insert(
-            "storage_account_name".to_string(),
-            "${AZURE_STORAGE_ACCOUNT_NAME}".to_string(),
-        );
-        azure_config.insert(
-            "storage_account_key".to_string(),
-            "${AZURE_STORAGE_ACCOUNT_KEY}".to_string(),
-        );
-
-        let mut gcs_config = std::collections::HashMap::new();
-        gcs_config.insert(
-            "service_account".to_string(),
-            "${GCS_SERVICE_ACCOUNT}".to_string(),
-        );
-
         Settings {
             cache: CacheConfig {
                 dir: PathBuf::from("${HOME}/.cache/zerofs"),
