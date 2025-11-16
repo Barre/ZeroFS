@@ -23,7 +23,7 @@ pub enum Commands {
     Run {
         #[arg(short, long)]
         config: PathBuf,
-        /// Open the database in read-only mode
+        /// Open the filesystem in read-only mode
         #[arg(long)]
         read_only: bool,
     },
