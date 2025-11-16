@@ -1,4 +1,5 @@
 use crate::fs::cache::UnifiedCache;
+use crate::fs::errors::FsError;
 use crate::fs::key_codec::PREFIX_CHUNK;
 use anyhow::Result;
 use bytes::Bytes;
@@ -11,7 +12,7 @@ use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
 use slatedb::{
-    WriteBatch,
+    DbReader, WriteBatch,
     config::{DurabilityLevel, ReadOptions, ScanOptions, WriteOptions},
 };
 use std::ops::RangeBounds;
@@ -148,9 +149,21 @@ impl EncryptedWriteBatch {
     }
 }
 
+// Wrapper for SlateDB handle that can be either read-write or read-only
+pub enum SlateDbHandle {
+    ReadWrite(Arc<slatedb::Db>),
+    ReadOnly(Arc<DbReader>),
+}
+
+impl SlateDbHandle {
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, SlateDbHandle::ReadOnly(_))
+    }
+}
+
 // Encrypted DB wrapper
 pub struct EncryptedDb {
-    inner: Arc<slatedb::Db>,
+    inner: SlateDbHandle,
     encryptor: Arc<EncryptionManager>,
     cache: Option<Arc<UnifiedCache>>,
 }
@@ -158,7 +171,15 @@ pub struct EncryptedDb {
 impl EncryptedDb {
     pub fn new(db: Arc<slatedb::Db>, encryptor: Arc<EncryptionManager>) -> Self {
         Self {
-            inner: db,
+            inner: SlateDbHandle::ReadWrite(db),
+            encryptor,
+            cache: None,
+        }
+    }
+
+    pub fn new_read_only(db_reader: Arc<DbReader>, encryptor: Arc<EncryptionManager>) -> Self {
+        Self {
+            inner: SlateDbHandle::ReadOnly(db_reader),
             encryptor,
             cache: None,
         }
@@ -169,13 +190,22 @@ impl EncryptedDb {
         self
     }
 
+    pub fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
             ..Default::default()
         };
 
-        match self.inner.get_with_options(key, &read_options).await? {
+        let encrypted = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.get_with_options(key, &read_options).await?,
+            SlateDbHandle::ReadOnly(reader) => reader.get_with_options(key, &read_options).await?,
+        };
+
+        match encrypted {
             Some(encrypted) => {
                 let decrypted = self.encryptor.decrypt(key, &encrypted)?;
                 Ok(Some(bytes::Bytes::from(decrypted)))
@@ -195,7 +225,12 @@ impl EncryptedDb {
             max_fetch_tasks: 8,
             ..Default::default()
         };
-        let iter = self.inner.scan_with_options(range, &scan_options).await?;
+        let iter = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.scan_with_options(range, &scan_options).await?,
+            SlateDbHandle::ReadOnly(reader) => {
+                reader.scan_with_options(range, &scan_options).await?
+            }
+        };
 
         Ok(Box::pin(futures::stream::unfold(
             (iter, encryptor),
@@ -233,15 +268,25 @@ impl EncryptedDb {
         batch: EncryptedWriteBatch,
         options: &WriteOptions,
     ) -> Result<()> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+
         let (inner_batch, _cache_ops) = batch.into_inner().await?;
 
-        self.inner.write_with_options(inner_batch, options).await?;
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
+            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+        }
 
         Ok(())
     }
 
-    pub fn new_write_batch(&self) -> EncryptedWriteBatch {
-        EncryptedWriteBatch::new(self.encryptor.clone())
+    pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+        Ok(EncryptedWriteBatch::new(self.encryptor.clone()))
     }
 
     pub async fn put_with_options(
@@ -251,20 +296,38 @@ impl EncryptedDb {
         put_options: &slatedb::config::PutOptions,
         write_options: &WriteOptions,
     ) -> Result<()> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+
         let encrypted = self.encryptor.encrypt(key, value)?;
-        self.inner
-            .put_with_options(key, &encrypted, put_options, write_options)
-            .await?;
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                db.put_with_options(key, &encrypted, put_options, write_options)
+                    .await?
+            }
+            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+        }
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        self.inner.flush().await?;
+        if self.is_read_only() {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.flush().await?,
+            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+        }
         Ok(())
     }
 
     pub async fn close(&self) -> Result<()> {
-        self.inner.close().await?;
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.close().await?,
+            SlateDbHandle::ReadOnly(reader) => reader.close().await?,
+        }
         Ok(())
     }
 }

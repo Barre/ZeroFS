@@ -88,7 +88,10 @@ impl ZeroFS {
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
 
-                        let mut batch = self.db.new_write_batch();
+                        let mut batch = self
+                            .db
+                            .new_write_batch()
+                            .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                         if new_size < old_size {
                             let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
@@ -513,7 +516,10 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let mut batch = self.db.new_write_batch();
+                let mut batch = self
+                    .db
+                    .new_write_batch()
+                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 let special_inode_key = KeyCodec::inode_key(special_id);
                 let special_inode_data = bincode::serialize(&inode)?;

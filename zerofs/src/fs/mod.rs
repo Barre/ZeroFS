@@ -109,7 +109,7 @@ pub struct CacheConfig {
 
 impl ZeroFS {
     pub async fn new_with_slatedb(
-        slatedb: Arc<slatedb::Db>,
+        slatedb: crate::encryption::SlateDbHandle,
         encryption_key: [u8; 32],
     ) -> anyhow::Result<Self> {
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
@@ -118,9 +118,14 @@ impl ZeroFS {
 
         let unified_cache = Arc::new(UnifiedCache::new()?);
 
-        let db = Arc::new(
-            EncryptedDb::new(slatedb.clone(), encryptor).with_cache(unified_cache.clone()),
-        );
+        let db = Arc::new(match slatedb {
+            crate::encryption::SlateDbHandle::ReadWrite(db) => {
+                EncryptedDb::new(db, encryptor).with_cache(unified_cache.clone())
+            }
+            crate::encryption::SlateDbHandle::ReadOnly(reader) => {
+                EncryptedDb::new_read_only(reader, encryptor).with_cache(unified_cache.clone())
+            }
+        });
 
         let counter_key = KeyCodec::system_counter_key();
         let next_inode_id = match db.get_bytes(&counter_key).await? {
@@ -130,6 +135,12 @@ impl ZeroFS {
 
         let root_inode_key = KeyCodec::inode_key(0);
         if db.get_bytes(&root_inode_key).await?.is_none() {
+            if db.is_read_only() {
+                return Err(anyhow::anyhow!(
+                    "Cannot initialize filesystem in read-only mode. Root inode does not exist."
+                ));
+            }
+
             let (uid, gid) = get_current_uid_gid();
             let (now_sec, now_nsec) = get_current_time();
             let root_dir = DirectoryInode {
@@ -318,7 +329,10 @@ impl ZeroFS {
                 }
                 tombstones_to_update.push((key, inode_id, size, start_chunk, is_final_batch));
 
-                let mut batch = self.db.new_write_batch();
+                let mut batch = self
+                    .db
+                    .new_write_batch()
+                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
                 for chunk_idx in start_chunk..total_chunks {
                     let chunk_key = KeyCodec::chunk_key(inode_id, chunk_idx as u64);
                     batch.delete_bytes(&chunk_key);
@@ -349,7 +363,10 @@ impl ZeroFS {
             }
 
             if !tombstones_to_update.is_empty() {
-                let mut batch = self.db.new_write_batch();
+                let mut batch = self
+                    .db
+                    .new_write_batch()
+                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 for (key, _inode_id, old_size, start_chunk, delete_tombstone) in
                     tombstones_to_update
