@@ -134,6 +134,24 @@ addresses = ["0.0.0.0:10809"]  # Bind addresses (default: ["127.0.0.1:10809"])
 socket = "/tmp/zerofs-nbd.sock"  # Unix socket path (optional)
 ```
 
+## Multiple Instances
+
+ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
+
+```bash
+# Read-write instance (default)
+zerofs run -c zerofs.toml
+
+# Read-only instances
+zerofs run -c zerofs.toml --read-only
+```
+
+Read-only instances automatically see updates from the writer and return `EROFS` errors for write operations.
+
+<Note>
+Only one read-write instance can run at a time. Multiple read-only instances can run safely alongside the writer for load balancing.
+</Note>
+
 ## Complete Examples
 
 ### Basic S3 Configuration
