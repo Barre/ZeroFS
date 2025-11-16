@@ -582,12 +582,12 @@ dependencies = [
 
 [[package]]
 name = "darling"
-version = "0.20.11"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
+checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
 dependencies = [
- "darling_core 0.20.11",
- "darling_macro 0.20.11",
+ "darling_core 0.21.3",
+ "darling_macro 0.21.3",
 ]
 
 [[package]]
@@ -606,9 +606,9 @@ dependencies = [
 
 [[package]]
 name = "darling_core"
-version = "0.20.11"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
+checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
 dependencies = [
  "fnv",
  "ident_case",
@@ -631,11 +631,11 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.20.11"
+version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
 dependencies = [
- "darling_core 0.20.11",
+ "darling_core 0.21.3",
  "quote",
  "syn 2.0.110",
 ]
@@ -656,9 +656,9 @@ dependencies = [
 
 [[package]]
 name = "deku"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f476a022dcfbb013d1365734a42e05b6aca967ebe0d3bb38170086abd9ea3324"
+checksum = "8bdbd42cb0450604984c8135ced826886d7e146994ad265b52eefcbf717c7be5"
 dependencies = [
  "bitvec",
  "deku_derive",
@@ -668,11 +668,11 @@ dependencies = [
 
 [[package]]
 name = "deku_derive"
-version = "0.19.1"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb216d425bdf810c165a8ae1649523033e88b5f795480ccec63926295541b084"
+checksum = "2a27e999281c31ca063da429182b6055a07745564912c925036e2b7e67170646"
 dependencies = [
- "darling 0.20.11",
+ "darling 0.21.3",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
