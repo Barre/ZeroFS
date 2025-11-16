@@ -456,7 +456,11 @@ impl ZeroFS {
                 .await?,
         );
 
-        Self::new_with_slatedb(slatedb, encryption_key).await
+        Self::new_with_slatedb(
+            crate::encryption::SlateDbHandle::ReadWrite(slatedb),
+            encryption_key,
+        )
+        .await
     }
 }
 
