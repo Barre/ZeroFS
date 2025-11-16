@@ -131,7 +131,7 @@ impl ZeroFS {
 
         self.global_stats.commit_update(&stats_update);
 
-        self.cache.remove(CacheKey::Metadata(dirid));
+        self.cache.remove(CacheKey::Metadata(dirid)).await;
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -264,10 +264,12 @@ impl ZeroFS {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        self.cache.remove_batch(vec![
-            CacheKey::Metadata(fileid),
-            CacheKey::Metadata(linkdirid),
-        ]);
+        self.cache
+            .remove_batch(vec![
+                CacheKey::Metadata(fileid),
+                CacheKey::Metadata(linkdirid),
+            ])
+            .await;
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);

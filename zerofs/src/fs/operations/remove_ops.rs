@@ -1,4 +1,5 @@
 use super::common::validate_filename;
+use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
 use crate::fs::key_codec::KeyCodec;
@@ -201,14 +202,16 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.cache
-                    .remove(crate::fs::cache::CacheKey::Metadata(file_id));
-                self.cache
-                    .remove(crate::fs::cache::CacheKey::Metadata(dirid));
-                self.cache.remove(crate::fs::cache::CacheKey::DirEntry {
-                    dir_id: dirid,
-                    name: name.to_vec(),
-                });
+                let futures = vec![
+                    CacheKey::Metadata(file_id),
+                    CacheKey::Metadata(dirid),
+                    CacheKey::DirEntry {
+                        dir_id: dirid,
+                        name: name.to_vec(),
+                    },
+                ];
+
+                self.cache.remove_batch(futures).await;
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 

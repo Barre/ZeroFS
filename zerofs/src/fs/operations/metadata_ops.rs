@@ -150,7 +150,7 @@ impl ZeroFS {
                             self.global_stats.commit_update(&update);
                         }
 
-                        self.cache.remove(CacheKey::Metadata(id));
+                        self.cache.remove(CacheKey::Metadata(id)).await;
 
                         return Ok(InodeWithId { inode: &inode, id }.into());
                     }
@@ -549,7 +549,7 @@ impl ZeroFS {
 
                 self.global_stats.commit_update(&stats_update);
 
-                self.cache.remove(CacheKey::Metadata(dirid));
+                self.cache.remove(CacheKey::Metadata(dirid)).await;
 
                 Ok((
                     special_id,
