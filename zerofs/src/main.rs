@@ -69,8 +69,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        cli::Commands::Run { config } => {
-            cli::server::run_server(config).await?;
+        cli::Commands::Run { config, read_only } => {
+            cli::server::run_server(config, read_only).await?;
         }
     }
 

@@ -91,7 +91,10 @@ impl ZeroFS {
             nlink: 1,
         });
 
-        let mut batch = self.db.new_write_batch();
+        let mut batch = self
+            .db
+            .new_write_batch()
+            .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
         let inode_key = KeyCodec::inode_key(new_id);
         let inode_data = bincode::serialize(&symlink_inode)?;
@@ -202,7 +205,10 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        let mut batch = self.db.new_write_batch();
+        let mut batch = self
+            .db
+            .new_write_batch()
+            .map_err(|_| FsError::ReadOnlyFilesystem)?;
         batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(fileid));
 
         let scan_key = KeyCodec::dir_scan_key(linkdirid, fileid, linkname);

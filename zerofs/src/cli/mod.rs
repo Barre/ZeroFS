@@ -23,6 +23,9 @@ pub enum Commands {
     Run {
         #[arg(short, long)]
         config: PathBuf,
+        /// Open the database in read-only mode
+        #[arg(long)]
+        read_only: bool,
     },
     /// Change the encryption password
     ///

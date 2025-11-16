@@ -1,3 +1,4 @@
+use crate::encryption::SlateDbHandle;
 use anyhow::Result;
 use argon2::{
     Algorithm, Argon2, Params, Version,
@@ -155,11 +156,19 @@ impl KeyManager {
 }
 
 /// Load or initialize encryption key from database
-pub async fn load_or_init_encryption_key(db: &slatedb::Db, password: &str) -> Result<[u8; 32]> {
+pub async fn load_or_init_encryption_key(
+    db_handle: &SlateDbHandle,
+    password: &str,
+) -> Result<[u8; 32]> {
     let key_manager = KeyManager::new();
 
     // Check if wrapped key exists in database
-    match db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await? {
+    let existing_key = match db_handle {
+        SlateDbHandle::ReadWrite(db) => db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+        SlateDbHandle::ReadOnly(reader) => reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+    };
+
+    match existing_key {
         Some(data) => {
             // Key exists, unwrap it
             let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
@@ -169,21 +178,32 @@ pub async fn load_or_init_encryption_key(db: &slatedb::Db, password: &str) -> Re
         }
         None => {
             // First time setup - generate new key
+            if db_handle.is_read_only() {
+                return Err(anyhow::anyhow!(
+                    "Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first."
+                ));
+            }
+
             let (wrapped_key, dek) = key_manager.generate_and_wrap_key(password)?;
 
             // Store wrapped key in database
             let serialized = bincode::serialize(&wrapped_key)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
 
-            db.put_with_options(
-                WRAPPED_KEY_DB_KEY.as_bytes(),
-                &serialized,
-                &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await?;
+            match db_handle {
+                SlateDbHandle::ReadWrite(db) => {
+                    db.put_with_options(
+                        WRAPPED_KEY_DB_KEY.as_bytes(),
+                        &serialized,
+                        &slatedb::config::PutOptions::default(),
+                        &slatedb::config::WriteOptions {
+                            await_durable: false,
+                        },
+                    )
+                    .await?;
+                }
+                SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+            }
 
             Ok(dek)
         }
@@ -192,17 +212,22 @@ pub async fn load_or_init_encryption_key(db: &slatedb::Db, password: &str) -> Re
 
 /// Change the password used to encrypt the DEK
 pub async fn change_encryption_password(
-    db: &slatedb::Db,
+    db_handle: &SlateDbHandle,
     old_password: &str,
     new_password: &str,
 ) -> Result<()> {
+    if db_handle.is_read_only() {
+        return Err(anyhow::anyhow!("Cannot change password in read-only mode"));
+    }
+
     let key_manager = KeyManager::new();
 
     // Load current wrapped key
-    let data = db
-        .get(WRAPPED_KEY_DB_KEY.as_bytes())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("No encryption key found in database"))?;
+    let data = match db_handle {
+        SlateDbHandle::ReadWrite(db) => db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+        SlateDbHandle::ReadOnly(reader) => reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+    }
+    .ok_or_else(|| anyhow::anyhow!("No encryption key found in database"))?;
 
     let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
         .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
@@ -214,15 +239,20 @@ pub async fn change_encryption_password(
     let serialized = bincode::serialize(&new_wrapped_key)
         .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
 
-    db.put_with_options(
-        WRAPPED_KEY_DB_KEY.as_bytes(),
-        &serialized,
-        &slatedb::config::PutOptions::default(),
-        &slatedb::config::WriteOptions {
-            await_durable: false,
-        },
-    )
-    .await?;
+    match db_handle {
+        SlateDbHandle::ReadWrite(db) => {
+            db.put_with_options(
+                WRAPPED_KEY_DB_KEY.as_bytes(),
+                &serialized,
+                &slatedb::config::PutOptions::default(),
+                &slatedb::config::WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await?;
+        }
+        SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+    }
 
     Ok(())
 }

@@ -160,7 +160,10 @@ impl ZeroFS {
             check_sticky_bit_delete(target_dir, &target_inode, &creds)?;
         }
 
-        let mut batch = self.db.new_write_batch();
+        let mut batch = self
+            .db
+            .new_write_batch()
+            .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
         let mut target_was_directory = false;
         let mut target_stats_update = None;

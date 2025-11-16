@@ -75,7 +75,7 @@ pub async fn change_password(
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path)
+    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path, false)
         .await
         .map_err(|e| PasswordError::Other(e.to_string()))?;
 
@@ -83,14 +83,21 @@ pub async fn change_password(
         .await
         .map_err(|e| PasswordError::EncryptionError(e.to_string()))?;
 
-    slatedb
-        .flush()
-        .await
-        .map_err(|e| PasswordError::Other(e.to_string()))?;
-    slatedb
-        .close()
-        .await
-        .map_err(|e| PasswordError::Other(e.to_string()))?;
+    match &slatedb {
+        crate::encryption::SlateDbHandle::ReadWrite(db) => {
+            db.flush()
+                .await
+                .map_err(|e| PasswordError::Other(e.to_string()))?;
+            db.close()
+                .await
+                .map_err(|e| PasswordError::Other(e.to_string()))?;
+        }
+        crate::encryption::SlateDbHandle::ReadOnly(_) => {
+            return Err(PasswordError::Other(
+                "Cannot change password in read-only mode".to_string(),
+            ));
+        }
+    }
 
     Ok(())
 }

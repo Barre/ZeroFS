@@ -33,6 +33,8 @@ pub enum FsError {
     StaleHandle,
     #[error("Invalid data")]
     InvalidData,
+    #[error("Read-only file system")]
+    ReadOnlyFilesystem,
 }
 
 impl From<bincode::Error> for FsError {
@@ -59,6 +61,7 @@ impl From<FsError> for nfsstat3 {
             FsError::NotSupported => nfsstat3::NFS3ERR_NOTSUPP,
             FsError::StaleHandle => nfsstat3::NFS3ERR_STALE,
             FsError::InvalidData => nfsstat3::NFS3ERR_IO,
+            FsError::ReadOnlyFilesystem => nfsstat3::NFS3ERR_ROFS,
         }
     }
 }
@@ -70,7 +73,8 @@ impl From<nfsstat3> for FsError {
             nfsstat3::NFS3ERR_NOENT => FsError::NotFound,
             nfsstat3::NFS3ERR_EXIST => FsError::Exists,
             nfsstat3::NFS3ERR_INVAL | nfsstat3::NFS3ERR_BADTYPE => FsError::InvalidArgument,
-            nfsstat3::NFS3ERR_IO | nfsstat3::NFS3ERR_ROFS => FsError::IoError,
+            nfsstat3::NFS3ERR_IO => FsError::IoError,
+            nfsstat3::NFS3ERR_ROFS => FsError::ReadOnlyFilesystem,
             nfsstat3::NFS3ERR_NOTEMPTY => FsError::NotEmpty,
             nfsstat3::NFS3ERR_MLINK => FsError::TooManyLinks,
             nfsstat3::NFS3ERR_NOSPC | nfsstat3::NFS3ERR_DQUOT => FsError::NoSpace,
@@ -102,6 +106,7 @@ impl FsError {
             FsError::NotSupported => libc::ENOSYS as u32,
             FsError::StaleHandle => libc::ESTALE as u32,
             FsError::InvalidData => libc::EIO as u32,
+            FsError::ReadOnlyFilesystem => libc::EROFS as u32,
         }
     }
 }

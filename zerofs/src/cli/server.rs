@@ -1,5 +1,6 @@
 use crate::bucket_identity;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, Settings};
+use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, ZeroFS};
@@ -7,11 +8,11 @@ use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
-use slatedb::DbBuilder;
-use slatedb::config::GarbageCollectorDirectoryOptions;
+use slatedb::config::{DbReaderOptions, GarbageCollectorDirectoryOptions};
 use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
+use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -172,7 +173,8 @@ pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
     cache_config: &CacheConfig,
     db_path: String,
-) -> Result<Arc<slatedb::Db>> {
+    read_only: bool,
+) -> Result<SlateDbHandle> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -231,33 +233,47 @@ pub async fn build_slatedb(
 
     let db_path = Path::from(db_path);
 
-    // This may look weird, but this is required to not drop the runtime handle from the async context
-    let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
-        let runtime = Runtime::new().unwrap();
-        let handle = runtime.handle().clone();
-
-        let runtime_keeper = std::thread::spawn(move || {
-            runtime.block_on(async { std::future::pending::<()>().await });
-        });
-
-        (handle, runtime_keeper)
-    })
-    .await?;
-
-    let slatedb = Arc::new(
-        DbBuilder::new(db_path, object_store)
-            .with_settings(settings)
-            .with_gc_runtime(runtime_handle.clone())
-            .with_compaction_runtime(runtime_handle.clone())
-            .with_memory_cache(cache)
-            .build()
+    if read_only {
+        info!("Opening database in read-only mode");
+        let reader = Arc::new(
+            DbReader::open(
+                db_path,
+                object_store,
+                None, // Use auto-updating checkpoint
+                DbReaderOptions::default(),
+            )
             .await?,
-    );
+        );
+        Ok(SlateDbHandle::ReadOnly(reader))
+    } else {
+        // This may look weird, but this is required to not drop the runtime handle from the async context
+        let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
+            let runtime = Runtime::new().unwrap();
+            let handle = runtime.handle().clone();
 
-    Ok(slatedb)
+            let runtime_keeper = std::thread::spawn(move || {
+                runtime.block_on(async { std::future::pending::<()>().await });
+            });
+
+            (handle, runtime_keeper)
+        })
+        .await?;
+
+        let slatedb = Arc::new(
+            DbBuilder::new(db_path, object_store)
+                .with_settings(settings)
+                .with_gc_runtime(runtime_handle.clone())
+                .with_compaction_runtime(runtime_handle.clone())
+                .with_memory_cache(cache)
+                .build()
+                .await?,
+        );
+
+        Ok(SlateDbHandle::ReadWrite(slatedb))
+    }
 }
 
-async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
+async fn initialize_filesystem(settings: &Settings, read_only: bool) -> Result<Arc<ZeroFS>> {
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
@@ -318,7 +334,7 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
 
     info!("Loading or initializing encryption key");
 
-    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path).await?;
+    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path, read_only).await?;
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
@@ -327,7 +343,7 @@ async fn initialize_filesystem(settings: &Settings) -> Result<Arc<ZeroFS>> {
     Ok(Arc::new(fs))
 }
 
-pub async fn run_server(config_path: PathBuf) -> Result<()> {
+pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info"));
@@ -339,9 +355,9 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     let settings = Settings::from_file(config_path.to_str().unwrap())
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    let fs = initialize_filesystem(&settings).await?;
+    let fs = initialize_filesystem(&settings, read_only).await?;
 
-    if settings.servers.nbd.is_some() {
+    if !read_only && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
     }
 
@@ -373,7 +389,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             let (result, _, _) = result;
             result??;
         }
-        _ = gc_handle => {
+        _ = gc_handle, if !read_only => {
             unreachable!("GC task should never complete");
         }
         _ = stats_handle => {
@@ -381,12 +397,16 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");
-            fs.flush().await?;
+            if !read_only {
+                fs.flush().await?;
+            }
             fs.db.close().await?;
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, shutting down gracefully...");
-            fs.flush().await?;
+            if !read_only {
+                fs.flush().await?;
+            }
             fs.db.close().await?;
         }
     }

@@ -78,7 +78,10 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                let mut batch = self.db.new_write_batch();
+                let mut batch = self
+                    .db
+                    .new_write_batch()
+                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
                 let (now_sec, now_nsec) = get_current_time();
 
                 match &mut file_inode {
