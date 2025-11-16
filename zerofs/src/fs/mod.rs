@@ -462,6 +462,27 @@ impl ZeroFS {
         )
         .await
     }
+
+    #[cfg(test)]
+    pub async fn new_in_memory_read_only(
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        encryption_key: [u8; 32],
+    ) -> anyhow::Result<Self> {
+        use slatedb::DbReader;
+        use slatedb::config::DbReaderOptions;
+        use slatedb::object_store::path::Path;
+
+        let db_path = Path::from("test_slatedb");
+        let reader = Arc::new(
+            DbReader::open(db_path, object_store, None, DbReaderOptions::default()).await?,
+        );
+
+        Self::new_with_slatedb(
+            crate::encryption::SlateDbHandle::ReadOnly(reader),
+            encryption_key,
+        )
+        .await
+    }
 }
 
 impl ZeroFS {
@@ -665,5 +686,114 @@ mod tests {
         assert_eq!(from_raw.inode_id(), 42);
         assert_eq!(from_raw.position(), 5);
         assert_eq!(from_raw.as_raw(), raw_value);
+    }
+
+    #[tokio::test]
+    async fn test_read_only_mode_operations() {
+        use slatedb::DbBuilder;
+        use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+        use slatedb::object_store::path::Path;
+
+        let object_store = slatedb::object_store::memory::InMemory::new();
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
+
+        let test_key = [0u8; 32];
+        let settings = slatedb::config::Settings {
+            compression_codec: None,
+            compactor_options: Some(slatedb::config::CompactorOptions {
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let test_cache_bytes = 50_000_000u64;
+        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+            max_capacity: test_cache_bytes,
+        }));
+
+        let db_path = Path::from("test_slatedb");
+        let slatedb = Arc::new(
+            DbBuilder::new(db_path.clone(), object_store.clone())
+                .with_settings(settings)
+                .with_memory_cache(cache)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let fs_rw = ZeroFS::new_with_slatedb(
+            crate::encryption::SlateDbHandle::ReadWrite(slatedb),
+            test_key,
+        )
+        .await
+        .unwrap();
+
+        let test_inode_id = fs_rw.allocate_inode().await.unwrap();
+        let file_inode = FileInode {
+            size: 2048,
+            mtime: 1234567890,
+            mtime_nsec: 123456789,
+            ctime: 1234567891,
+            ctime_nsec: 234567890,
+            atime: 1234567892,
+            atime_nsec: 345678901,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            parent: Some(0),
+            nlink: 1,
+        };
+        fs_rw
+            .save_inode(test_inode_id, &Inode::File(file_inode.clone()))
+            .await
+            .unwrap();
+
+        fs_rw.flush().await.unwrap();
+        drop(fs_rw);
+
+        let fs_ro = ZeroFS::new_in_memory_read_only(object_store, test_key)
+            .await
+            .unwrap();
+
+        let root_inode = fs_ro.load_inode(0).await.unwrap();
+        assert!(matches!(root_inode, Inode::Directory(_)));
+
+        let loaded_inode = fs_ro.load_inode(test_inode_id).await.unwrap();
+        match loaded_inode {
+            Inode::File(f) => {
+                assert_eq!(f.size, file_inode.size);
+                assert_eq!(f.mode, file_inode.mode);
+            }
+            _ => panic!("Expected File inode"),
+        }
+
+        let new_file = FileInode {
+            size: 100,
+            mtime: 1234567890,
+            mtime_nsec: 123456789,
+            ctime: 1234567891,
+            ctime_nsec: 234567890,
+            atime: 1234567892,
+            atime_nsec: 345678901,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            parent: Some(0),
+            nlink: 1,
+        };
+        let result = fs_ro
+            .save_inode(test_inode_id, &Inode::File(new_file))
+            .await;
+        assert!(result.is_err(), "save_inode should fail in read-only mode");
+
+        let mut modified_file = file_inode.clone();
+        modified_file.size = 4096;
+        let result = fs_ro
+            .save_inode(test_inode_id, &Inode::File(modified_file))
+            .await;
+        assert!(
+            result.is_err(),
+            "modifying inode should fail in read-only mode"
+        );
     }
 }
