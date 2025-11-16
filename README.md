@@ -277,6 +277,20 @@ addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
 ```
 
+### Multiple Instances
+
+ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
+
+```bash
+# Read-write instance (default)
+zerofs run -c zerofs.toml
+
+# Read-only instances
+zerofs run -c zerofs.toml --read-only
+```
+
+Read-only instances automatically see updates from the writer and return `EROFS` errors for write operations.
+
 ### Encryption
 
 Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
