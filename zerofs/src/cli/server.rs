@@ -233,6 +233,19 @@ pub async fn build_slatedb(
 
     let db_path = Path::from(db_path);
 
+    // This may look weird, but this is required to not drop the runtime handle from the async context
+    let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
+        let runtime = Runtime::new().unwrap();
+        let handle = runtime.handle().clone();
+
+        let runtime_keeper = std::thread::spawn(move || {
+            runtime.block_on(async { std::future::pending::<()>().await });
+        });
+
+        (handle, runtime_keeper)
+    })
+    .await?;
+
     if read_only {
         info!("Opening database in read-only mode");
         let reader = Arc::new(
@@ -246,19 +259,6 @@ pub async fn build_slatedb(
         );
         Ok(SlateDbHandle::ReadOnly(reader))
     } else {
-        // This may look weird, but this is required to not drop the runtime handle from the async context
-        let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
-            let runtime = Runtime::new().unwrap();
-            let handle = runtime.handle().clone();
-
-            let runtime_keeper = std::thread::spawn(move || {
-                runtime.block_on(async { std::future::pending::<()>().await });
-            });
-
-            (handle, runtime_keeper)
-        })
-        .await?;
-
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
