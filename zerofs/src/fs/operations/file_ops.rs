@@ -165,7 +165,7 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.cache.remove(CacheKey::Metadata(id));
+                self.cache.remove(CacheKey::Metadata(id)).await;
 
                 let elapsed = start_time.elapsed();
                 debug!(
@@ -311,7 +311,7 @@ impl ZeroFS {
 
                 self.global_stats.commit_update(&stats_update);
 
-                self.cache.remove(CacheKey::Metadata(dirid));
+                self.cache.remove(CacheKey::Metadata(dirid)).await;
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use slatedb::DbBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
 use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
-use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -223,8 +223,10 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+    let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
         max_capacity: slatedb_memory_cache_bytes,
+        time_to_idle: None,
+        time_to_live: None,
     }));
 
     let db_path = Path::from(db_path);

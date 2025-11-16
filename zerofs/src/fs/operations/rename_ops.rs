@@ -388,22 +388,28 @@ impl ZeroFS {
             self.global_stats.commit_update(&update);
         }
 
-        self.cache.remove(CacheKey::Metadata(source_inode_id));
+        let mut futures = vec![CacheKey::Metadata(source_inode_id)];
+
         if let Some(target_id) = target_inode_id {
-            self.cache.remove(CacheKey::Metadata(target_id));
+            futures.push(CacheKey::Metadata(target_id));
         }
-        self.cache.remove(CacheKey::Metadata(from_dirid));
+
+        futures.push(CacheKey::Metadata(from_dirid));
+
         if from_dirid != to_dirid {
-            self.cache.remove(CacheKey::Metadata(to_dirid));
+            futures.push(CacheKey::Metadata(to_dirid));
         }
-        self.cache.remove(CacheKey::DirEntry {
-            dir_id: from_dirid,
-            name: from_name.to_vec(),
-        });
-        self.cache.remove(CacheKey::DirEntry {
+
+        futures.push(CacheKey::DirEntry {
             dir_id: to_dirid,
             name: to_name.to_vec(),
         });
+        futures.push(CacheKey::DirEntry {
+            dir_id: from_dirid,
+            name: from_name.to_vec(),
+        });
+
+        self.cache.remove_batch(futures).await;
 
         match source_inode {
             Inode::File(_) => {
