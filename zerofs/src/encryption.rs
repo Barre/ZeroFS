@@ -1,4 +1,3 @@
-use crate::fs::cache::UnifiedCache;
 use crate::fs::errors::FsError;
 use crate::fs::key_codec::PREFIX_CHUNK;
 use anyhow::Result;
@@ -166,7 +165,6 @@ impl SlateDbHandle {
 pub struct EncryptedDb {
     inner: SlateDbHandle,
     encryptor: Arc<EncryptionManager>,
-    cache: Option<Arc<UnifiedCache>>,
 }
 
 impl EncryptedDb {
@@ -174,7 +172,6 @@ impl EncryptedDb {
         Self {
             inner: SlateDbHandle::ReadWrite(db),
             encryptor,
-            cache: None,
         }
     }
 
@@ -182,13 +179,7 @@ impl EncryptedDb {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
             encryptor,
-            cache: None,
         }
-    }
-
-    pub fn with_cache(mut self, cache: Arc<UnifiedCache>) -> Self {
-        self.cache = Some(cache);
-        self
     }
 
     pub fn is_read_only(&self) -> bool {
