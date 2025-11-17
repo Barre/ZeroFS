@@ -75,7 +75,7 @@ pub async fn change_password(
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path, false)
+    let (slatedb, _) = build_slatedb(object_store, &cache_config, actual_db_path, false)
         .await
         .map_err(|e| PasswordError::Other(e.to_string()))?;
 

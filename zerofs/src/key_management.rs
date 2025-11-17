@@ -165,7 +165,10 @@ pub async fn load_or_init_encryption_key(
     // Check if wrapped key exists in database
     let existing_key = match db_handle {
         SlateDbHandle::ReadWrite(db) => db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
-        SlateDbHandle::ReadOnly(reader) => reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+        SlateDbHandle::ReadOnly(reader_swap) => {
+            let reader = reader_swap.load();
+            reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?
+        }
     };
 
     match existing_key {
@@ -225,7 +228,10 @@ pub async fn change_encryption_password(
     // Load current wrapped key
     let data = match db_handle {
         SlateDbHandle::ReadWrite(db) => db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
-        SlateDbHandle::ReadOnly(reader) => reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+        SlateDbHandle::ReadOnly(reader_swap) => {
+            let reader = reader_swap.load();
+            reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?
+        }
     }
     .ok_or_else(|| anyhow::anyhow!("No encryption key found in database"))?;
 
