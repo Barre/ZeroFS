@@ -145,6 +145,38 @@ max_size_gb = 100.0  # Limit filesystem to 100 GB
 
 When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
 
+## LSM Tree Performance Tuning
+
+ZeroFS uses an LSM (Log-Structured Merge) tree as its underlying storage engine. For advanced performance tuning, you can configure LSM parameters:
+
+```toml
+[lsm]
+l0_max_ssts = 16                 # Max SST files in L0 before compaction
+max_unflushed_gb = 1.0           # Max unflushed data before forcing flush (in GB)
+max_concurrent_compactions = 8   # Max concurrent compaction operations
+```
+
+### Parameters
+
+- **`l0_max_ssts`** (default: 16, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
+
+- **`max_unflushed_gb`** (default: 1.0, min: 0.1): Maximum amount of unflushed data (in gigabytes) before forcing a flush to storage. Supports fractional values like `0.5` for 500 MB. Larger values improve write batching but increase memory usage and potential data loss on crash.
+
+- **`max_concurrent_compactions`** (default: 8, min: 1): Maximum number of compaction operations that can run concurrently. Higher values can improve throughput on systems with many CPU cores and high network throughput but increase memory usage.
+
+<Note>
+These are advanced settings. The defaults are optimized for most workloads. Only modify these if you understand LSM tree behavior and are experiencing specific performance issues.
+</Note>
+
+### When to Tune LSM Parameters
+
+Consider tuning these parameters if you're experiencing:
+
+- **High write latency**: Increase `max_unflushed_gb` to batch more writes
+- **High read latency**: Decrease `l0_max_ssts` to reduce read amplification
+- **CPU / Network underutilization**: Increase `max_concurrent_compactions` on high-core systems
+- **Memory pressure**: Decrease `max_unflushed_gb` to reduce memory usage
+
 ## Multiple Instances
 
 ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
@@ -246,6 +278,11 @@ encryption_password = "very-secure-password-here"
 
 [filesystem]
 max_size_gb = 500.0            # Optional: limit filesystem size
+
+[lsm]
+l0_max_ssts = 16               # Trigger compaction with fewer SST files
+max_unflushed_gb = 2.0         # Allow more data batching for better write throughput
+max_concurrent_compactions = 16  # Use more CPU cores for compaction
 
 [aws]
 access_key_id = "your-key"

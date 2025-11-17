@@ -75,9 +75,15 @@ pub async fn change_password(
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let (slatedb, _) = build_slatedb(object_store, &cache_config, actual_db_path, false)
-        .await
-        .map_err(|e| PasswordError::Other(e.to_string()))?;
+    let (slatedb, _) = build_slatedb(
+        object_store,
+        &cache_config,
+        actual_db_path,
+        false,
+        settings.lsm,
+    )
+    .await
+    .map_err(|e| PasswordError::Other(e.to_string()))?;
 
     key_management::change_encryption_password(&slatedb, current_password, &new_password)
         .await
