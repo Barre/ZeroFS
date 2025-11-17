@@ -448,7 +448,13 @@ async fn initialize_filesystem(
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
-    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key).await?;
+    let max_bytes = settings
+        .filesystem
+        .as_ref()
+        .map(|fs_config| fs_config.max_bytes())
+        .unwrap_or(crate::config::FilesystemConfig::DEFAULT_MAX_BYTES);
+
+    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key, max_bytes).await?;
 
     Ok((Arc::new(fs), checkpoint_params))
 }

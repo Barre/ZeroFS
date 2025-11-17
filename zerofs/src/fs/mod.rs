@@ -98,6 +98,7 @@ pub struct ZeroFS {
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     flush_coordinator: FlushCoordinator,
+    pub max_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -111,6 +112,7 @@ impl ZeroFS {
     pub async fn new_with_slatedb(
         slatedb: crate::encryption::SlateDbHandle,
         encryption_key: [u8; 32],
+        max_bytes: u64,
     ) -> anyhow::Result<Self> {
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
 
@@ -190,6 +192,7 @@ impl ZeroFS {
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             flush_coordinator,
+            max_bytes,
         };
 
         Ok(fs)
@@ -459,6 +462,7 @@ impl ZeroFS {
         Self::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             encryption_key,
+            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
         )
         .await
     }
@@ -481,6 +485,7 @@ impl ZeroFS {
         Self::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             encryption_key,
+            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
         )
         .await
     }
@@ -725,6 +730,7 @@ mod tests {
         let fs_rw = ZeroFS::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             test_key,
+            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
         )
         .await
         .unwrap();

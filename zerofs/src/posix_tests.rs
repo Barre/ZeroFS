@@ -1331,4 +1331,177 @@ mod tests {
 
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_quota_write_enforcement() {
+        let fs = Arc::new(
+            ZeroFS::new_with_slatedb(
+                crate::encryption::SlateDbHandle::ReadWrite(Arc::new(
+                    slatedb::DbBuilder::new(
+                        slatedb::object_store::path::Path::from("test_quota"),
+                        Arc::new(slatedb::object_store::memory::InMemory::new()),
+                    )
+                    .build()
+                    .await
+                    .unwrap(),
+                )),
+                [0u8; 32],
+                1_000_000,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let creds = test_creds();
+        let auth = AuthContext {
+            uid: creds.uid,
+            gid: creds.gid,
+            gids: vec![],
+        };
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let data = bytes::Bytes::from(vec![0u8; 500_000]);
+        let result = fs.process_write(&auth, file_id, 0, &data).await;
+        assert!(result.is_ok());
+
+        let data = bytes::Bytes::from(vec![0u8; 600_000]);
+        let result = fs.process_write(&auth, file_id, 500_000, &data).await;
+        assert!(matches!(result, Err(crate::fs::errors::FsError::NoSpace)));
+
+        fs.process_remove(&auth, 0, b"test.txt").await.unwrap();
+
+        let (file_id2, _) = fs
+            .process_create(&creds, 0, b"test2.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let data = bytes::Bytes::from(vec![0u8; 500_000]);
+        let result = fs.process_write(&auth, file_id2, 0, &data).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_quota_setattr_enforcement() {
+        let fs = Arc::new(
+            ZeroFS::new_with_slatedb(
+                crate::encryption::SlateDbHandle::ReadWrite(Arc::new(
+                    slatedb::DbBuilder::new(
+                        slatedb::object_store::path::Path::from("test_quota_setattr"),
+                        Arc::new(slatedb::object_store::memory::InMemory::new()),
+                    )
+                    .build()
+                    .await
+                    .unwrap(),
+                )),
+                [0u8; 32],
+                1_000_000,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let creds = test_creds();
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let setattr = SetAttributes {
+            size: SetSize::Set(500_000),
+            ..Default::default()
+        };
+        let result = fs.process_setattr(&creds, file_id, &setattr).await;
+        assert!(result.is_ok());
+
+        let setattr = SetAttributes {
+            size: SetSize::Set(1_500_000),
+            ..Default::default()
+        };
+        let result = fs.process_setattr(&creds, file_id, &setattr).await;
+        assert!(matches!(result, Err(crate::fs::errors::FsError::NoSpace)));
+
+        let setattr = SetAttributes {
+            size: SetSize::Set(100_000),
+            ..Default::default()
+        };
+        let result = fs.process_setattr(&creds, file_id, &setattr).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_quota_allows_deletes_when_over_limit() {
+        let fs = Arc::new(
+            ZeroFS::new_with_slatedb(
+                crate::encryption::SlateDbHandle::ReadWrite(Arc::new(
+                    slatedb::DbBuilder::new(
+                        slatedb::object_store::path::Path::from("test_quota_over"),
+                        Arc::new(slatedb::object_store::memory::InMemory::new()),
+                    )
+                    .build()
+                    .await
+                    .unwrap(),
+                )),
+                [0u8; 32],
+                1_000_000,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let creds = test_creds();
+        let auth = AuthContext {
+            uid: creds.uid,
+            gid: creds.gid,
+            gids: vec![],
+        };
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"big.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let data = bytes::Bytes::from(vec![0u8; 900_000]);
+        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+
+        let (file_id2, _) = fs
+            .process_create(&creds, 0, b"new.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let data = bytes::Bytes::from(vec![0u8; 200_000]);
+        let result = fs.process_write(&auth, file_id2, 0, &data).await;
+        assert!(matches!(result, Err(crate::fs::errors::FsError::NoSpace)));
+
+        let result = fs.process_remove(&auth, 0, b"big.txt").await;
+        assert!(result.is_ok());
+
+        let data = bytes::Bytes::from(vec![0u8; 500_000]);
+        let result = fs.process_write(&auth, file_id2, 0, &data).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_quota_default_unlimited() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+        let auth = AuthContext {
+            uid: creds.uid,
+            gid: creds.gid,
+            gids: vec![],
+        };
+
+        let (file_id, _) = fs
+            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let data = bytes::Bytes::from(vec![0u8; 10_000_000]);
+        let result = fs.process_write(&auth, file_id, 0, &data).await;
+        assert!(result.is_ok());
+    }
 }

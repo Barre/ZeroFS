@@ -56,6 +56,19 @@ impl ZeroFS {
                 let end_offset = offset + data.len() as u64;
                 let new_size = std::cmp::max(file.size, end_offset);
 
+                if new_size > old_size {
+                    let size_increase = new_size - old_size;
+                    let (used_bytes, _) = self.global_stats.get_totals();
+
+                    if used_bytes.saturating_add(size_increase) > self.max_bytes {
+                        debug!(
+                            "Write would exceed quota: used={}, increase={}, max={}",
+                            used_bytes, size_increase, self.max_bytes
+                        );
+                        return Err(FsError::NoSpace);
+                    }
+                }
+
                 let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
                 let end_chunk = (end_offset.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
 

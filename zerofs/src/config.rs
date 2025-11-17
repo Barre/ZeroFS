@@ -11,6 +11,8 @@ pub struct Settings {
     pub cache: CacheConfig,
     pub storage: StorageConfig,
     pub servers: ServerConfig,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,6 +38,27 @@ pub struct StorageConfig {
     pub url: String,
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub encryption_password: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemConfig {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_size_gb: Option<f64>,
+}
+
+impl FilesystemConfig {
+    /// Default maximum bytes: 8 EiB
+    pub const DEFAULT_MAX_BYTES: u64 = 8 << 60;
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_size_gb
+            .and_then(|gb| {
+                let gb_int = gb as u64;
+                gb_int.checked_mul(1_000_000_000)
+            })
+            .unwrap_or(Self::DEFAULT_MAX_BYTES)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -253,6 +276,7 @@ impl Settings {
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
                 }),
             },
+            filesystem: None,
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
@@ -269,6 +293,13 @@ impl Settings {
         );
         toml_string.push_str("# default_region = \"us-east-1\"\n");
         toml_string.push_str("# allow_http = \"true\"  # For non-HTTPS endpoints\n");
+
+        toml_string.push_str("\n# Optional filesystem quota configuration\n");
+        toml_string
+            .push_str("# Limit the maximum size of the filesystem to prevent unlimited growth\n");
+        toml_string.push_str("# If not specified, defaults to 8 EiB (effectively unlimited)\n");
+        toml_string.push_str("\n# [filesystem]\n");
+        toml_string.push_str("# max_size_gb = 100.0  # Limit filesystem to 100 GB\n");
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 
