@@ -134,6 +134,17 @@ addresses = ["0.0.0.0:10809"]  # Bind addresses (default: ["127.0.0.1:10809"])
 socket = "/tmp/zerofs-nbd.sock"  # Unix socket path (optional)
 ```
 
+## Filesystem Quotas
+
+ZeroFS supports configurable filesystem size limits:
+
+```toml
+[filesystem]
+max_size_gb = 100.0  # Limit filesystem to 100 GB
+```
+
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
+
 ## Multiple Instances
 
 ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
@@ -232,6 +243,9 @@ memory_size_gb = 16.0          # Large memory cache
 [storage]
 url = "s3://high-performance-bucket/data"
 encryption_password = "very-secure-password-here"
+
+[filesystem]
+max_size_gb = 500.0            # Optional: limit filesystem size
 
 [aws]
 access_key_id = "your-key"
