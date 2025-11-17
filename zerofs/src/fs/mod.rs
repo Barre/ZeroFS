@@ -118,14 +118,15 @@ impl ZeroFS {
 
         let lock_manager = Arc::new(LockManager::new());
 
-        let unified_cache = Arc::new(UnifiedCache::new()?);
+        // Cache is only active in read-write mode. In read-only mode, DbReader reads from WAL
+        // between checkpoints but we have no way to invalidate the cache when WAL entries appear.
+        let is_read_write = matches!(slatedb, crate::encryption::SlateDbHandle::ReadWrite(_));
+        let unified_cache = Arc::new(UnifiedCache::new(is_read_write)?);
 
         let db = Arc::new(match slatedb {
-            crate::encryption::SlateDbHandle::ReadWrite(db) => {
-                EncryptedDb::new(db, encryptor).with_cache(unified_cache.clone())
-            }
+            crate::encryption::SlateDbHandle::ReadWrite(db) => EncryptedDb::new(db, encryptor),
             crate::encryption::SlateDbHandle::ReadOnly(reader) => {
-                EncryptedDb::new_read_only(reader, encryptor).with_cache(unified_cache.clone())
+                EncryptedDb::new_read_only(reader, encryptor)
             }
         });
 

@@ -184,7 +184,6 @@ pub struct CheckpointRefreshParams {
 fn start_checkpoint_refresh(
     params: CheckpointRefreshParams,
     encrypted_db: Arc<crate::encryption::EncryptedDb>,
-    cache: Arc<crate::fs::cache::UnifiedCache>,
 ) -> JoinHandle<()> {
     let db_path = params.db_path;
     let object_store = params.object_store;
@@ -212,8 +211,6 @@ fn start_checkpoint_refresh(
                 Ok(checkpoint_result) => {
                     info!("Created new checkpoint with ID: {}", checkpoint_result.id);
 
-                    cache.invalidate_all();
-
                     match DbReader::open(
                         db_path.clone(),
                         object_store.clone(),
@@ -228,7 +225,7 @@ fn start_checkpoint_refresh(
                                 continue;
                             }
 
-                            info!("Successfully refreshed reader and invalidated cache");
+                            info!("Successfully refreshed reader");
                         }
                         Err(e) => {
                             tracing::error!(
@@ -506,8 +503,8 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     let gc_handle = start_garbage_collection(Arc::clone(&fs));
     let stats_handle = start_stats_reporting(Arc::clone(&fs));
 
-    let checkpoint_handle = checkpoint_params
-        .map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db), Arc::clone(&fs.cache)));
+    let checkpoint_handle =
+        checkpoint_params.map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db)));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
