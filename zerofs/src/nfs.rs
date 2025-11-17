@@ -11,7 +11,6 @@ use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
 
-const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
 const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
 
 /// Adapter struct that implements the NFS trait for ZeroFS.
@@ -427,11 +426,14 @@ impl NFSFileSystem for NFSAdapter {
         // This will be less than TOTAL_INODES if some allocated IDs have been freed
         let total_inodes = used_inodes + available_inodes;
 
+        // Use configured max_bytes from filesystem config
+        let total_bytes = self.fs.max_bytes;
+
         let res = fsstat3 {
             obj_attributes: obj_attr,
-            tbytes: TOTAL_BYTES,
-            fbytes: TOTAL_BYTES.saturating_sub(used_bytes),
-            abytes: TOTAL_BYTES.saturating_sub(used_bytes),
+            tbytes: total_bytes,
+            fbytes: total_bytes.saturating_sub(used_bytes),
+            abytes: total_bytes.saturating_sub(used_bytes),
             tfiles: total_inodes,
             ffiles: available_inodes,
             afiles: available_inodes,

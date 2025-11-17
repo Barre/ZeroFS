@@ -81,6 +81,18 @@ impl ZeroFS {
                 if let SetSize::Set(new_size) = setattr.size {
                     let old_size = file.size;
                     if new_size != old_size {
+                        if new_size > old_size {
+                            let size_increase = new_size - old_size;
+                            let (used_bytes, _) = self.global_stats.get_totals();
+                            if used_bytes.saturating_add(size_increase) > self.max_bytes {
+                                debug!(
+                                    "Setattr size change would exceed quota: used={}, increase={}, max={}",
+                                    used_bytes, size_increase, self.max_bytes
+                                );
+                                return Err(FsError::NoSpace);
+                            }
+                        }
+
                         file.size = new_size;
                         let (now_sec, now_nsec) = get_current_time();
                         file.mtime = now_sec;

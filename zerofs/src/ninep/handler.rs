@@ -1128,28 +1128,22 @@ impl NinePHandler {
 
         let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
 
-        // Constants matching NFS implementation
-        const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
         const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
         const BLOCK_SIZE: u32 = 4096; // 4KB blocks
 
-        // Calculate block counts (round up for used blocks)
-        let total_blocks = TOTAL_BYTES / BLOCK_SIZE as u64;
+        let total_bytes = self.filesystem.max_bytes;
+
+        let total_blocks = total_bytes.div_ceil(BLOCK_SIZE as u64);
         let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
-        // Get the next inode ID to determine how many more IDs can be allocated
         let next_inode_id = self
             .filesystem
             .next_inode_id
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        // Available inodes = total possible inodes - allocated inode IDs
-        // This represents how many more inodes can be created (never increases since IDs aren't reused)
         let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
 
-        // Total inodes for df = currently used + available to allocate
-        // This will be less than TOTAL_INODES if some allocated IDs have been freed
         let total_inodes = used_inodes + available_inodes;
 
         let statfs = Rstatfs {
