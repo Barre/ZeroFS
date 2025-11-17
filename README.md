@@ -164,6 +164,9 @@ memory_size_gb = 1.0  # Optional, defaults to 0.25
 url = "s3://my-bucket/zerofs-data"
 encryption_password = "${ZEROFS_PASSWORD}"
 
+[filesystem]
+max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 8 EiB)
+
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
 
@@ -276,6 +279,17 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional: adds Unix socket support
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
 ```
+
+### Filesystem Quotas
+
+ZeroFS supports configurable filesystem size limits:
+
+```toml
+[filesystem]
+max_size_gb = 100.0  # Limit filesystem to 100 GB
+```
+
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
 
 ### Multiple Instances
 
