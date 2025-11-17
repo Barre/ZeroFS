@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{debug, info};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
 
@@ -209,7 +209,7 @@ fn start_checkpoint_refresh(
                 .await
             {
                 Ok(checkpoint_result) => {
-                    info!("Created new checkpoint with ID: {}", checkpoint_result.id);
+                    debug!("Created new checkpoint with ID: {}", checkpoint_result.id);
 
                     match DbReader::open(
                         db_path.clone(),
@@ -225,7 +225,7 @@ fn start_checkpoint_refresh(
                                 continue;
                             }
 
-                            info!("Successfully refreshed reader");
+                            debug!("Successfully refreshed reader");
                         }
                         Err(e) => {
                             tracing::error!(
