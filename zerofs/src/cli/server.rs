@@ -251,6 +251,7 @@ pub async fn build_slatedb(
     cache_config: &CacheConfig,
     db_path: String,
     read_only: bool,
+    lsm_config: Option<crate::config::LsmConfig>,
 ) -> Result<(SlateDbHandle, Option<CheckpointRefreshParams>)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
@@ -269,8 +270,20 @@ pub async fn build_slatedb(
     );
     let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
 
+    let l0_max_ssts = lsm_config
+        .map(|c| c.l0_max_ssts())
+        .unwrap_or(crate::config::LsmConfig::DEFAULT_L0_MAX_SSTS);
+    let max_unflushed_bytes = lsm_config
+        .map(|c| c.max_unflushed_bytes())
+        .unwrap_or_else(|| {
+            (crate::config::LsmConfig::DEFAULT_MAX_UNFLUSHED_GB * 1_000_000_000.0) as usize
+        });
+    let max_concurrent_compactions = lsm_config
+        .map(|c| c.max_concurrent_compactions())
+        .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
+
     let settings = slatedb::config::Settings {
-        l0_max_ssts: 16,
+        l0_max_ssts,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(slatedb_cache_dir.clone().into()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
@@ -278,9 +291,9 @@ pub async fn build_slatedb(
             ..Default::default()
         },
         flush_interval: Some(std::time::Duration::from_secs(30)),
-        max_unflushed_bytes: 1024 * 1024 * 1024,
+        max_unflushed_bytes,
         compactor_options: Some(slatedb::config::CompactorOptions {
-            max_concurrent_compactions: 8,
+            max_concurrent_compactions,
             max_sst_size: 256 * 1024 * 1024,
             ..Default::default()
         }),
@@ -443,8 +456,14 @@ async fn initialize_filesystem(
 
     info!("Loading or initializing encryption key");
 
-    let (slatedb, checkpoint_params) =
-        build_slatedb(object_store, &cache_config, actual_db_path, read_only).await?;
+    let (slatedb, checkpoint_params) = build_slatedb(
+        object_store,
+        &cache_config,
+        actual_db_path,
+        read_only,
+        settings.lsm,
+    )
+    .await?;
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 

@@ -13,6 +13,8 @@ pub struct Settings {
     pub servers: ServerConfig,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub filesystem: Option<FilesystemConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lsm: Option<LsmConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +60,56 @@ impl FilesystemConfig {
                 gb_int.checked_mul(1_000_000_000)
             })
             .unwrap_or(Self::DEFAULT_MAX_BYTES)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct LsmConfig {
+    /// Maximum number of SST files in level 0 before triggering compaction
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub l0_max_ssts: Option<usize>,
+    /// Maximum unflushed data before forcing a flush (in gigabytes)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_unflushed_gb: Option<f64>,
+    /// Maximum number of concurrent compactions
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_concurrent_compactions: Option<usize>,
+}
+
+impl LsmConfig {
+    /// Default l0_max_ssts: 16
+    pub const DEFAULT_L0_MAX_SSTS: usize = 16;
+    /// Default max_unflushed_gb: 1.0 GiB
+    pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;
+    /// Default max_concurrent_compactions: 8
+    pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 8;
+
+    /// Minimum l0_max_ssts to maintain reasonable performance
+    pub const MIN_L0_MAX_SSTS: usize = 4;
+    /// Minimum max_unflushed_gb: 0.1 GB (100 MB)
+    pub const MIN_MAX_UNFLUSHED_GB: f64 = 0.1;
+    /// Minimum max_concurrent_compactions: 1
+    pub const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
+
+    pub fn l0_max_ssts(&self) -> usize {
+        self.l0_max_ssts
+            .unwrap_or(Self::DEFAULT_L0_MAX_SSTS)
+            .max(Self::MIN_L0_MAX_SSTS)
+    }
+
+    pub fn max_unflushed_bytes(&self) -> usize {
+        let gb = self
+            .max_unflushed_gb
+            .unwrap_or(Self::DEFAULT_MAX_UNFLUSHED_GB)
+            .max(Self::MIN_MAX_UNFLUSHED_GB);
+        (gb * 1_000_000_000.0) as usize
+    }
+
+    pub fn max_concurrent_compactions(&self) -> usize {
+        self.max_concurrent_compactions
+            .unwrap_or(Self::DEFAULT_MAX_CONCURRENT_COMPACTIONS)
+            .max(Self::MIN_MAX_CONCURRENT_COMPACTIONS)
     }
 }
 
@@ -277,6 +329,7 @@ impl Settings {
                 }),
             },
             filesystem: None,
+            lsm: None,
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
@@ -300,6 +353,15 @@ impl Settings {
         toml_string.push_str("# If not specified, defaults to 8 EiB (effectively unlimited)\n");
         toml_string.push_str("\n# [filesystem]\n");
         toml_string.push_str("# max_size_gb = 100.0  # Limit filesystem to 100 GB\n");
+
+        toml_string.push_str("\n# Optional LSM tree tuning parameters\n");
+        toml_string
+            .push_str("# Advanced performance tuning for the underlying LSM tree storage engine\n");
+        toml_string.push_str("# Only modify these if you understand LSM tree behavior\n");
+        toml_string.push_str("\n# [lsm]\n");
+        toml_string.push_str("# l0_max_ssts = 16                 # Max SST files in L0 before compaction (default: 16, min: 4)\n");
+        toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
+        toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 
