@@ -2,6 +2,7 @@ use crate::fs::cache::UnifiedCache;
 use crate::fs::errors::FsError;
 use crate::fs::key_codec::PREFIX_CHUNK;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
@@ -152,7 +153,7 @@ impl EncryptedWriteBatch {
 // Wrapper for SlateDB handle that can be either read-write or read-only
 pub enum SlateDbHandle {
     ReadWrite(Arc<slatedb::Db>),
-    ReadOnly(Arc<DbReader>),
+    ReadOnly(ArcSwap<DbReader>),
 }
 
 impl SlateDbHandle {
@@ -177,7 +178,7 @@ impl EncryptedDb {
         }
     }
 
-    pub fn new_read_only(db_reader: Arc<DbReader>, encryptor: Arc<EncryptionManager>) -> Self {
+    pub fn new_read_only(db_reader: ArcSwap<DbReader>, encryptor: Arc<EncryptionManager>) -> Self {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
             encryptor,
@@ -194,6 +195,18 @@ impl EncryptedDb {
         self.inner.is_read_only()
     }
 
+    pub fn swap_reader(&self, new_reader: Arc<DbReader>) -> Result<()> {
+        match &self.inner {
+            SlateDbHandle::ReadOnly(reader_swap) => {
+                reader_swap.store(new_reader);
+                Ok(())
+            }
+            SlateDbHandle::ReadWrite(_) => Err(anyhow::anyhow!(
+                "Cannot swap reader on a read-write database"
+            )),
+        }
+    }
+
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
@@ -202,7 +215,10 @@ impl EncryptedDb {
 
         let encrypted = match &self.inner {
             SlateDbHandle::ReadWrite(db) => db.get_with_options(key, &read_options).await?,
-            SlateDbHandle::ReadOnly(reader) => reader.get_with_options(key, &read_options).await?,
+            SlateDbHandle::ReadOnly(reader_swap) => {
+                let reader = reader_swap.load();
+                reader.get_with_options(key, &read_options).await?
+            }
         };
 
         match encrypted {
@@ -227,7 +243,8 @@ impl EncryptedDb {
         };
         let iter = match &self.inner {
             SlateDbHandle::ReadWrite(db) => db.scan_with_options(range, &scan_options).await?,
-            SlateDbHandle::ReadOnly(reader) => {
+            SlateDbHandle::ReadOnly(reader_swap) => {
+                let reader = reader_swap.load();
                 reader.scan_with_options(range, &scan_options).await?
             }
         };
@@ -326,7 +343,10 @@ impl EncryptedDb {
     pub async fn close(&self) -> Result<()> {
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => db.close().await?,
-            SlateDbHandle::ReadOnly(reader) => reader.close().await?,
+            SlateDbHandle::ReadOnly(reader_swap) => {
+                let reader = reader_swap.load();
+                reader.close().await?
+            }
         }
         Ok(())
     }

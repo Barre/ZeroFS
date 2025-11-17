@@ -8,17 +8,24 @@ use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
-use slatedb::config::{DbReaderOptions, GarbageCollectorDirectoryOptions};
+use arc_swap::ArcSwap;
+use slatedb::DbBuilder;
+use slatedb::DbReader;
+use slatedb::admin::AdminBuilder;
+use slatedb::config::CheckpointOptions;
+use slatedb::config::DbReaderOptions;
+use slatedb::config::GarbageCollectorDirectoryOptions;
 use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
-use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::info;
+
+const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
 
 async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
@@ -169,12 +176,82 @@ fn start_stats_reporting(fs: Arc<ZeroFS>) -> JoinHandle<()> {
     })
 }
 
+pub struct CheckpointRefreshParams {
+    pub db_path: String,
+    pub object_store: Arc<dyn object_store::ObjectStore>,
+}
+
+fn start_checkpoint_refresh(
+    params: CheckpointRefreshParams,
+    encrypted_db: Arc<crate::encryption::EncryptedDb>,
+    cache: Arc<crate::fs::cache::UnifiedCache>,
+) -> JoinHandle<()> {
+    let db_path = params.db_path;
+    let object_store = params.object_store;
+    tokio::spawn(async move {
+        info!("Starting checkpoint refresh task",);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            CHECKPOINT_REFRESH_INTERVAL_SECS,
+        ));
+
+        let db_path = Path::from(db_path);
+        let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
+
+        loop {
+            interval.tick().await;
+
+            match admin
+                .create_detached_checkpoint(&CheckpointOptions {
+                    lifetime: Some(std::time::Duration::from_secs(
+                        CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
+                    )),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(checkpoint_result) => {
+                    info!("Created new checkpoint with ID: {}", checkpoint_result.id);
+
+                    cache.invalidate_all();
+
+                    match DbReader::open(
+                        db_path.clone(),
+                        object_store.clone(),
+                        Some(checkpoint_result.id),
+                        DbReaderOptions::default(),
+                    )
+                    .await
+                    {
+                        Ok(new_reader) => {
+                            if let Err(e) = encrypted_db.swap_reader(Arc::new(new_reader)) {
+                                tracing::error!("Failed to swap reader: {:?}", e);
+                                continue;
+                            }
+
+                            info!("Successfully refreshed reader and invalidated cache");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to create new DbReader with checkpoint: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create checkpoint: {:?}", e);
+                }
+            }
+        }
+    })
+}
+
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
     cache_config: &CacheConfig,
     db_path: String,
     read_only: bool,
-) -> Result<SlateDbHandle> {
+) -> Result<(SlateDbHandle, Option<CheckpointRefreshParams>)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -248,16 +325,42 @@ pub async fn build_slatedb(
 
     if read_only {
         info!("Opening database in read-only mode");
+
+        let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
+        let checkpoint_result = admin
+            .create_detached_checkpoint(&CheckpointOptions {
+                lifetime: Some(std::time::Duration::from_secs(
+                    CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
+                )),
+                ..Default::default()
+            })
+            .await?;
+
+        info!(
+            "Created initial checkpoint with ID: {}",
+            checkpoint_result.id
+        );
+
+        let db_path_str = db_path.to_string();
         let reader = Arc::new(
             DbReader::open(
                 db_path,
-                object_store,
-                None, // Use auto-updating checkpoint
+                object_store.clone(),
+                Some(checkpoint_result.id),
                 DbReaderOptions::default(),
             )
             .await?,
         );
-        Ok(SlateDbHandle::ReadOnly(reader))
+
+        let checkpoint_params = CheckpointRefreshParams {
+            db_path: db_path_str,
+            object_store,
+        };
+
+        Ok((
+            SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+            Some(checkpoint_params),
+        ))
     } else {
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
@@ -269,11 +372,14 @@ pub async fn build_slatedb(
                 .await?,
         );
 
-        Ok(SlateDbHandle::ReadWrite(slatedb))
+        Ok((SlateDbHandle::ReadWrite(slatedb), None))
     }
 }
 
-async fn initialize_filesystem(settings: &Settings, read_only: bool) -> Result<Arc<ZeroFS>> {
+async fn initialize_filesystem(
+    settings: &Settings,
+    read_only: bool,
+) -> Result<(Arc<ZeroFS>, Option<CheckpointRefreshParams>)> {
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
@@ -337,13 +443,14 @@ async fn initialize_filesystem(settings: &Settings, read_only: bool) -> Result<A
 
     info!("Loading or initializing encryption key");
 
-    let slatedb = build_slatedb(object_store, &cache_config, actual_db_path, read_only).await?;
+    let (slatedb, checkpoint_params) =
+        build_slatedb(object_store, &cache_config, actual_db_path, read_only).await?;
 
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
     let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key).await?;
 
-    Ok(Arc::new(fs))
+    Ok((Arc::new(fs), checkpoint_params))
 }
 
 pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
@@ -358,7 +465,7 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     let settings = Settings::from_file(config_path.to_str().unwrap())
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    let fs = initialize_filesystem(&settings, read_only).await?;
+    let (fs, checkpoint_params) = initialize_filesystem(&settings, read_only).await?;
 
     if !read_only && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
@@ -373,6 +480,9 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
 
     let gc_handle = start_garbage_collection(Arc::clone(&fs));
     let stats_handle = start_stats_reporting(Arc::clone(&fs));
+
+    let checkpoint_handle = checkpoint_params
+        .map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db), Arc::clone(&fs.cache)));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -397,6 +507,9 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
         }
         _ = stats_handle => {
             unreachable!("Stats task should never complete");
+        }
+        _ = async { checkpoint_handle.unwrap().await }, if checkpoint_handle.is_some() => {
+            unreachable!("Checkpoint refresh task should never complete");
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");

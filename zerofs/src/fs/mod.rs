@@ -468,6 +468,7 @@ impl ZeroFS {
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         encryption_key: [u8; 32],
     ) -> anyhow::Result<Self> {
+        use arc_swap::ArcSwap;
         use slatedb::DbReader;
         use slatedb::config::DbReaderOptions;
         use slatedb::object_store::path::Path;
@@ -478,7 +479,7 @@ impl ZeroFS {
         );
 
         Self::new_with_slatedb(
-            crate::encryption::SlateDbHandle::ReadOnly(reader),
+            crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             encryption_key,
         )
         .await

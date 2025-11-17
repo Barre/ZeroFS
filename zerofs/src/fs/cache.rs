@@ -47,4 +47,8 @@ impl UnifiedCache {
         let futures = keys.iter().map(|key| self.cache.remove(key));
         futures::future::join_all(futures).await;
     }
+
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
 }
