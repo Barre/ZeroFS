@@ -4,7 +4,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
+    Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
 use futures::stream::Stream;
@@ -19,10 +19,10 @@ use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
 
-const NONCE_SIZE: usize = 12;
+const NONCE_SIZE: usize = 24;
 
 pub struct EncryptionManager {
-    cipher: ChaCha20Poly1305,
+    cipher: XChaCha20Poly1305,
 }
 
 impl EncryptionManager {
@@ -35,14 +35,14 @@ impl EncryptionManager {
             .expect("valid length");
 
         Self {
-            cipher: ChaCha20Poly1305::new(Key::from_slice(&encryption_key)),
+            cipher: XChaCha20Poly1305::new(Key::from_slice(&encryption_key)),
         }
     }
 
     pub fn encrypt(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Check if this is a chunk key to decide on compression
         let data = if !key.is_empty() && key[0] == PREFIX_CHUNK {
@@ -70,7 +70,7 @@ impl EncryptionManager {
 
         // Extract nonce and ciphertext
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = XNonce::from_slice(nonce_bytes);
 
         // Decrypt
         let decrypted = self
