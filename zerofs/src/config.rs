@@ -134,8 +134,8 @@ pub struct NfsConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NinePConfig {
-    #[serde(default = "default_9p_addresses")]
-    pub addresses: HashSet<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
@@ -147,8 +147,8 @@ pub struct NinePConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NbdConfig {
-    #[serde(default = "default_nbd_addresses")]
-    pub addresses: HashSet<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
@@ -320,11 +320,11 @@ impl Settings {
                     addresses: default_nfs_addresses(),
                 }),
                 ninep: Some(NinePConfig {
-                    addresses: default_9p_addresses(),
+                    addresses: Some(default_9p_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
                 }),
                 nbd: Some(NbdConfig {
-                    addresses: default_nbd_addresses(),
+                    addresses: Some(default_nbd_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
                 }),
             },
