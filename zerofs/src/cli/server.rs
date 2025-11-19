@@ -4,6 +4,7 @@ use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, ZeroFS};
+use crate::ha::{start_health_server, LeaseCoordinator, HAState};
 use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
@@ -297,16 +298,16 @@ pub async fn build_slatedb(
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(60)),
-                min_age: Duration::from_mins(60),
+                interval: Some(Duration::from_secs(60 * 60)),
+                min_age: Duration::from_secs(60 * 60),
             }),
             manifest_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(60)),
-                min_age: Duration::from_mins(60),
+                interval: Some(Duration::from_secs(60 * 60)),
+                min_age: Duration::from_secs(60 * 60),
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(60)),
-                min_age: Duration::from_mins(60),
+                interval: Some(Duration::from_secs(60 * 60)),
+                min_age: Duration::from_secs(60 * 60),
             }),
         }),
         ..Default::default()
@@ -442,8 +443,12 @@ async fn initialize_filesystem(
     );
 
     if !read_only {
-        crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
-            .await?;
+        // TEMPORARILY DISABLED: Wasabi doesn't support conditional writes
+        // In production, you MUST use a storage provider that supports conditional writes
+        // (AWS S3, MinIO, Cloudflare R2, etc.) for safe HA operation
+        tracing::warn!("⚠️  Storage compatibility check DISABLED - HA may not be safe without conditional write support!");
+        // crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
+        //     .await?;
     }
 
     let password = settings.storage.encryption_password.clone();
@@ -506,6 +511,75 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     let checkpoint_handle =
         checkpoint_params.map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db)));
 
+    // Start HA health server if configured
+    let ha_health_handle = if let Some(ha_config) = &settings.servers.ha {
+        if ha_config.enabled {
+            let ha_state = Arc::new(HAState::new());
+            
+            // Start health server
+            let health_port = ha_config.health_port;
+            let ha_state_for_health = Arc::clone(&ha_state);
+            let health_handle = tokio::spawn(async move {
+                if let Err(e) = start_health_server(ha_state_for_health, health_port).await {
+                    tracing::error!("Health server error: {}", e);
+                }
+            });
+
+            // Start lease coordinator if using lease strategy
+            if ha_config.strategy == "lease" {
+                let mut env_vars = Vec::new();
+                if let Some(aws) = &settings.aws {
+                    for (k, v) in &aws.0 {
+                        env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
+                    }
+                }
+                if let Some(azure) = &settings.azure {
+                    for (k, v) in &azure.0 {
+                        env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
+                    }
+                }
+                if let Some(gcp) = &settings.gcp {
+                    for (k, v) in &gcp.0 {
+                        env_vars.push((format!("google_{}", k.to_lowercase()), v.clone()));
+                    }
+                }
+                let (object_store, path_from_url) = parse_url_opts(
+                    &settings.storage.url.parse()?,
+                    env_vars.into_iter(),
+                )?;
+                let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+                let db_path = path_from_url.to_string();
+
+                let lease_config = crate::ha::lease_coordinator::LeaseCoordinatorConfig {
+                    node_id: ha_config.node_id.clone(),
+                    lease_ttl_secs: ha_config.lease_ttl_secs,
+                    renew_interval_secs: ha_config.renew_interval_secs,
+                };
+
+                let lease_coordinator = Arc::new(LeaseCoordinator::new(
+                    lease_config,
+                    object_store,
+                    db_path,
+                    (*ha_state).clone(),
+                ));
+
+                // Start lease coordinator in background
+                let coordinator = Arc::clone(&lease_coordinator);
+                tokio::spawn(async move {
+                    if let Err(e) = coordinator.start().await {
+                        tracing::error!("Lease coordinator error: {}", e);
+                    }
+                });
+            }
+
+            Some(health_handle)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut server_handles = Vec::new();
@@ -532,6 +606,9 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
         }
         _ = async { checkpoint_handle.unwrap().await }, if checkpoint_handle.is_some() => {
             unreachable!("Checkpoint refresh task should never complete");
+        }
+        _ = async { ha_health_handle.unwrap().await }, if ha_health_handle.is_some() => {
+            unreachable!("Health server should never complete");
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");

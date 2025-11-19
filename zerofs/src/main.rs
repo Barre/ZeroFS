@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod encryption;
 mod fs;
+mod ha;
 mod key_management;
 mod nbd;
 mod nfs;

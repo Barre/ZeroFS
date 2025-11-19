@@ -1,0 +1,40 @@
+# ZeroFS HA Configuration - S3 Lease-Based Coordination
+# This example shows how to configure ZeroFS for High Availability
+# using S3-based lease coordination (no external dependencies)
+
+[storage]
+url = "s3://sb-zerofile-ha/zerofs-data"
+encryption_password = "${ZEROFS_PASSWORD}"
+
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 0.5
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
+
+[servers.ninep]
+addresses = ["0.0.0.0:5564"]
+
+# HA Configuration
+[servers.ha]
+enabled = true
+# IMPORTANT: Each node must have a unique node_id
+node_id = "${NODE_ID}"  # e.g., "node-1", "node-2", "node-3"
+strategy = "lease"      # Use S3-based coordination
+lease_ttl_secs = 30     # Lease valid for 30 seconds
+renew_interval_secs = 10 # Renew every 10 seconds
+health_port = 8080      # Health check endpoint for load balancer
+
+# Optional: Filesystem quota
+[filesystem]
+max_size_gb = 100.0
+
+# AWS credentials (for Wasabi S3-compatible storage)
+[aws]
+default_region = "us-east-1"
+endpoint = "https://s3.wasabisys.com"
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+

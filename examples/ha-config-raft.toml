@@ -1,0 +1,43 @@
+# ZeroFS HA Configuration - Raft Consensus
+# This example shows how to configure ZeroFS for High Availability
+# using embedded Raft consensus (peer-to-peer coordination)
+
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "${ZEROFS_PASSWORD}"
+
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 0.5
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
+
+[servers.ninep]
+addresses = ["0.0.0.0:5564"]
+
+# HA Configuration
+[servers.ha]
+enabled = true
+node_id = "${NODE_ID}"  # Must be unique: "node-1", "node-2", "node-3"
+strategy = "raft"       # Use Raft consensus
+health_port = 8080      # Health check endpoint
+
+# This node's Raft listen address
+raft_listen = "${RAFT_LISTEN}"  # e.g., "10.0.1.1:7000"
+
+# All Raft peer addresses (including self)
+raft_peers = [
+    "10.0.1.1:7000",  # node-1
+    "10.0.1.2:7000",  # node-2
+    "10.0.1.3:7000",  # node-3
+]
+
+[filesystem]
+max_size_gb = 100.0
+
+[aws]
+default_region = "us-east-1"
+
+

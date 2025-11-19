@@ -122,6 +122,53 @@ pub struct ServerConfig {
     pub ninep: Option<NinePConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbd: Option<NbdConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ha: Option<HAConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HAConfig {
+    /// Enable HA mode
+    #[serde(default)]
+    pub enabled: bool,
+    /// Unique node identifier
+    #[serde(deserialize_with = "deserialize_expandable_string")]
+    pub node_id: String,
+    /// Coordination strategy: "lease" (S3-based) or "raft" (embedded)
+    #[serde(default = "default_ha_strategy")]
+    pub strategy: String,
+    /// Lease TTL in seconds (for lease strategy)
+    #[serde(default = "default_lease_ttl")]
+    pub lease_ttl_secs: u64,
+    /// Lease renewal interval in seconds (for lease strategy)
+    #[serde(default = "default_lease_renew_interval")]
+    pub renew_interval_secs: u64,
+    /// Health check HTTP port (for load balancer health checks)
+    #[serde(default = "default_health_port")]
+    pub health_port: u16,
+    /// Raft peer addresses (for raft strategy)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raft_peers: Option<Vec<SocketAddr>>,
+    /// This node's Raft listen address (for raft strategy)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raft_listen: Option<SocketAddr>,
+}
+
+fn default_ha_strategy() -> String {
+    "lease".to_string()
+}
+
+fn default_lease_ttl() -> u64 {
+    30
+}
+
+fn default_lease_renew_interval() -> u64 {
+    10
+}
+
+fn default_health_port() -> u16 {
+    8080
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -327,6 +374,7 @@ impl Settings {
                     addresses: default_nbd_addresses(),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
                 }),
+                ha: None,
             },
             filesystem: None,
             lsm: None,

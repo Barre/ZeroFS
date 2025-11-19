@@ -57,6 +57,8 @@ uuid = { version = "1.17", features = ["v4"] }
 toml = "0.9"
 shellexpand = "3.1"
 clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 tempfile = "3.21"
