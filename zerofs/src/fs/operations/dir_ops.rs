@@ -192,6 +192,7 @@ impl ZeroFS {
                 let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 let new_dir_key = KeyCodec::inode_key(new_dir_id);

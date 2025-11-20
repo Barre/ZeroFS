@@ -94,6 +94,7 @@ impl ZeroFS {
         let mut batch = self
             .db
             .new_write_batch()
+            .await
             .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
         let inode_key = KeyCodec::inode_key(new_id);
@@ -208,6 +209,7 @@ impl ZeroFS {
         let mut batch = self
             .db
             .new_write_batch()
+            .await
             .map_err(|_| FsError::ReadOnlyFilesystem)?;
         batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(fileid));
 

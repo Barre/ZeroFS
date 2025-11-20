@@ -153,6 +153,62 @@ pub struct HAConfig {
     /// This node's Raft listen address (for raft strategy)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raft_listen: Option<SocketAddr>,
+    /// WAL replication configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wal_replication: Option<WALReplicationConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WALReplicationConfig {
+    /// Enable WAL replication
+    #[serde(default)]
+    pub enabled: bool,
+    /// Listen address for WAL receiver (standby nodes)
+    #[serde(default = "default_wal_listen")]
+    pub listen: String,
+    /// Standby nodes to replicate to (active node only)
+    #[serde(default)]
+    pub standby_nodes: Vec<String>,
+    /// Default replication protocol: "async" (Protocol A) or "sync" (Protocol C)
+    #[serde(default = "default_wal_protocol")]
+    pub default_protocol: String,
+    /// ACK policy for Protocol C: "one", "majority", "all"
+    #[serde(default = "default_wal_ack_policy")]
+    pub sync_ack_policy: String,
+    /// Timeout for Protocol C acknowledgments (milliseconds)
+    #[serde(default = "default_wal_sync_timeout")]
+    pub sync_timeout_ms: u64,
+    /// Enable TCP_NODELAY for low latency
+    #[serde(default = "default_tcp_nodelay")]
+    pub tcp_nodelay: bool,
+    /// Reconnection interval (seconds)
+    #[serde(default = "default_reconnect_interval")]
+    pub reconnect_interval_secs: u64,
+}
+
+fn default_wal_listen() -> String {
+    "0.0.0.0:8090".to_string()
+}
+
+fn default_wal_protocol() -> String {
+    "async".to_string()
+}
+
+fn default_wal_ack_policy() -> String {
+    "one".to_string()
+}
+
+fn default_wal_sync_timeout() -> u64 {
+    100
+}
+
+fn default_tcp_nodelay() -> bool {
+    true
+}
+
+fn default_reconnect_interval() -> u64 {
+    5
 }
 
 fn default_ha_strategy() -> String {

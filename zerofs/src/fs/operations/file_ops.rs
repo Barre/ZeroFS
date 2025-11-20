@@ -75,6 +75,7 @@ impl ZeroFS {
                 let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 let chunk_processing_start = std::time::Instant::now();
@@ -285,6 +286,7 @@ impl ZeroFS {
                 let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 let file_inode_key = KeyCodec::inode_key(file_id);
@@ -478,10 +480,11 @@ impl ZeroFS {
         let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
         let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
 
-        let mut batch = self
-            .db
-            .new_write_batch()
-            .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut batch = self
+                    .db
+                    .new_write_batch()
+                    .await
+                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;

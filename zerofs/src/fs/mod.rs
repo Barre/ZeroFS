@@ -138,7 +138,7 @@ impl ZeroFS {
 
         let root_inode_key = KeyCodec::inode_key(0);
         if db.get_bytes(&root_inode_key).await?.is_none() {
-            if db.is_read_only() {
+            if db.is_read_only().await {
                 return Err(anyhow::anyhow!(
                     "Cannot initialize filesystem in read-only mode. Root inode does not exist."
                 ));
@@ -336,6 +336,7 @@ impl ZeroFS {
                 let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
                 for chunk_idx in start_chunk..total_chunks {
                     let chunk_key = KeyCodec::chunk_key(inode_id, chunk_idx as u64);
@@ -370,6 +371,7 @@ impl ZeroFS {
                 let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 for (key, _inode_id, old_size, start_chunk, delete_tombstone) in
@@ -504,6 +506,130 @@ impl ZeroFS {
             .ok_or(errors::FsError::NotFound)?;
 
         KeyCodec::decode_dir_entry(&entry_data)
+    }
+
+    /// Promote from read-only to read-write mode (Standby → Active)
+    /// This is called when the node acquires the lease
+    pub async fn promote_to_active(
+        &self,
+        object_store: Arc<dyn object_store::ObjectStore>,
+        db_path: String,
+        settings: &slatedb::config::Settings,
+        cache: Arc<slatedb::db_cache::moka::MokaCache>,
+        runtime_handle: tokio::runtime::Handle,
+        wal_streamer: Option<Arc<crate::ha::WALStreamer>>,
+    ) -> anyhow::Result<()> {
+        use arc_swap::ArcSwap;
+        use slatedb::{DbBuilder, DbReader};
+        use slatedb::admin::AdminBuilder;
+        use slatedb::config::{CheckpointOptions, DbReaderOptions};
+        use slatedb::object_store::path::Path;
+        use tracing::info;
+
+        if !self.db.is_read_only().await {
+            info!("Already in read-write mode");
+            return Ok(());
+        }
+
+        info!("🔄 Promoting to ACTIVE mode");
+
+        // 1. Replay any pending WAL entries (if WAL replay is implemented)
+        // TODO: Implement WAL replay here
+        // self.replay_wal_entries().await?;
+
+        // 2. Open new ReadWrite DB handle
+        let db_path_obj = Path::from(db_path.clone());
+        let rw_db = Arc::new(
+            DbBuilder::new(db_path_obj, object_store.clone())
+                .with_settings(settings.clone())
+                .with_gc_runtime(runtime_handle.clone())
+                .with_compaction_runtime(runtime_handle.clone())
+                .with_memory_cache(cache)
+                .build()
+                .await?,
+        );
+
+        // 3. Hot-swap the DB handle
+        self.db.swap_to_readwrite(rw_db).await?;
+
+        // 4. Clear caches (data might be stale)
+        self.cache.clear().await;
+
+        // 5. Attach WAL streamer if provided
+        if let Some(streamer) = wal_streamer {
+            self.db.attach_wal_streamer(streamer).await;
+        }
+
+        // 6. Enable cache for read-write mode
+        // Cache is already created, just need to ensure it's enabled
+        // (UnifiedCache handles this internally based on is_read_write flag)
+
+        info!("✓ Promotion to ACTIVE complete");
+        Ok(())
+    }
+
+    /// Demote from read-write to read-only mode (Active → Standby)
+    /// This is called when the node loses the lease
+    pub async fn demote_to_standby(
+        &self,
+        object_store: Arc<dyn object_store::ObjectStore>,
+        db_path: String,
+    ) -> anyhow::Result<()> {
+        use arc_swap::ArcSwap;
+        use slatedb::DbReader;
+        use slatedb::admin::AdminBuilder;
+        use slatedb::config::{CheckpointOptions, DbReaderOptions};
+        use slatedb::object_store::path::Path;
+        use tracing::warn;
+
+        if self.db.is_read_only().await {
+            warn!("Already in read-only mode");
+            return Ok(());
+        }
+
+        warn!("🔄 Demoting to STANDBY mode");
+
+        // 1. Detach WAL streamer
+        self.db.detach_wal_streamer().await;
+
+        // 2. Flush any pending writes
+        if let Err(e) = self.db.flush().await {
+            warn!("Error flushing during demotion: {}", e);
+        }
+
+        // 3. Close ReadWrite handle (handled by swap_to_readonly)
+
+        // 4. Create checkpoint
+        let db_path_obj = Path::from(db_path.clone());
+        let admin = AdminBuilder::new(db_path_obj.clone(), object_store.clone()).build();
+        let checkpoint_result = admin
+            .create_detached_checkpoint(&CheckpointOptions {
+                lifetime: Some(std::time::Duration::from_secs(3600)), // 1 hour
+                ..Default::default()
+            })
+            .await?;
+
+        warn!("Created checkpoint {} for demotion", checkpoint_result.id);
+
+        // 5. Open ReadOnly handle
+        let reader = Arc::new(
+            DbReader::open(
+                db_path_obj,
+                object_store,
+                Some(checkpoint_result.id),
+                DbReaderOptions::default(),
+            )
+            .await?,
+        );
+
+        // 6. Hot-swap to read-only
+        self.db.swap_to_readonly(ArcSwap::new(reader)).await?;
+
+        // 7. Clear caches
+        self.cache.clear().await;
+
+        warn!("✓ Demotion to STANDBY complete");
+        Ok(())
     }
 }
 

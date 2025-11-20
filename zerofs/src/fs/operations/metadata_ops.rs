@@ -103,6 +103,7 @@ impl ZeroFS {
                         let mut batch = self
                             .db
                             .new_write_batch()
+                            .await
                             .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                         if new_size < old_size {
@@ -528,9 +529,10 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let mut batch = self
+                  let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 let special_inode_key = KeyCodec::inode_key(special_id);

@@ -81,6 +81,7 @@ impl ZeroFS {
                 let mut batch = self
                     .db
                     .new_write_batch()
+                    .await
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
                 let (now_sec, now_nsec) = get_current_time();
 

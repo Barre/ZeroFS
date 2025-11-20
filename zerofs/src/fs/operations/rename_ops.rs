@@ -163,6 +163,7 @@ impl ZeroFS {
         let mut batch = self
             .db
             .new_write_batch()
+            .await
             .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
         let mut target_was_directory = false;

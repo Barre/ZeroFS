@@ -1,0 +1,76 @@
+# ZeroFS HA Configuration with WAL Replication
+# This example shows both active and standby node configs
+
+# ====================
+# ACTIVE NODE CONFIG
+# ====================
+# Use this config for the active (read-write) node
+
+[storage]
+# S3-compatible storage
+url = "s3://your-bucket/zerofs-data"
+
+[encryption]
+# Encryption password (can use env var: $ZEROFS_PASSWORD)
+password = "$ZEROFS_PASSWORD"
+
+[servers]
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
+
+[servers.ninep]
+addresses = ["0.0.0.0:5564"]
+
+[servers.ha]
+enabled = true
+node_id = "$HOSTNAME"
+strategy = "lease"
+lease_ttl_secs = 30
+renew_interval_secs = 10
+health_port = 8080
+
+# WAL Replication configuration
+[servers.ha.wal_replication]
+enabled = true
+# Active node: list standby nodes to replicate to
+standby_nodes = [
+    "standby1:8090",
+    "standby2:8090",
+    "standby3:8090"
+]
+# Protocol A (async) - default, best performance
+# Protocol C (sync) - optional, zero data loss
+default_protocol = "async"
+# For Protocol C: how many ACKs required
+sync_ack_policy = "one"  # one|majority|all
+sync_timeout_ms = 100
+tcp_nodelay = true
+reconnect_interval_secs = 5
+
+[aws]
+# AWS credentials (can use env vars)
+ACCESS_KEY_ID = "$AWS_ACCESS_KEY_ID"
+SECRET_ACCESS_KEY = "$AWS_SECRET_ACCESS_KEY"
+DEFAULT_REGION = "$AWS_DEFAULT_REGION"
+# Wasabi endpoint
+ENDPOINT = "https://s3.wasabisys.com"
+
+# ====================
+# STANDBY NODE CONFIG
+# ====================
+# For standby nodes, change:
+# 1. node_id to unique value (e.g., "standby-1", "standby-2")
+# 2. Remove standby_nodes list
+# 3. Set listen address for WAL receiver
+# 4. Use different NFS/9P ports or bind to different IPs
+
+# Example standby node differences:
+# [servers.ha]
+# node_id = "standby-1"  # Unique per standby
+#
+# [servers.ha.wal_replication]
+# enabled = true
+# listen = "0.0.0.0:8090"  # Listen for WAL entries
+# # No standby_nodes list on standby
+
