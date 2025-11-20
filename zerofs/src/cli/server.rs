@@ -139,10 +139,12 @@ async fn start_ninep_servers(
     };
     let mut handles = Vec::new();
 
-    for addr in &config.addresses {
-        info!("Starting 9P server on {}", addr);
-        let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
-        handles.push(tokio::spawn(async move { ninep_tcp_server.start().await }));
+    if let Some(addresses) = &config.addresses {
+        for addr in addresses {
+            info!("Starting 9P server on {}", addr);
+            let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
+            handles.push(tokio::spawn(async move { ninep_tcp_server.start().await }));
+        }
     }
 
     if let Some(socket_path) = config.unix_socket.as_ref() {
@@ -196,19 +198,21 @@ async fn start_nbd_servers(
     };
     let mut handles = Vec::new();
 
-    for addr in &config.addresses {
-        info!(
-            "Starting NBD server on {} (devices dynamically discovered from .nbd/)",
-            addr
-        );
-        let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = nbd_tcp_server.start().await {
-                Err(e)
-            } else {
-                Ok(())
-            }
-        }));
+    if let Some(addresses) = &config.addresses {
+        for addr in addresses {
+            info!(
+                "Starting NBD server on {} (devices dynamically discovered from .nbd/)",
+                addr
+            );
+            let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
+            handles.push(tokio::spawn(async move {
+                if let Err(e) = nbd_tcp_server.start().await {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            }));
+        }
     }
 
     if let Some(socket_path) = config.unix_socket.as_ref() {
