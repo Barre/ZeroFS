@@ -27,14 +27,36 @@ lease_ttl_secs = 30     # Lease valid for 30 seconds
 renew_interval_secs = 10 # Renew every 10 seconds
 health_port = 8080      # Health check endpoint for load balancer
 
+# WAL Replication Configuration
+[servers.ha.wal_replication]
+enabled = true
+# Active node: list standby nodes to replicate to
+# Standby node: leave empty or remove this section
+standby_nodes = [
+    "zerofs-node2:8090",
+    "zerofs-node3:8090"
+]
+# Protocol A (async) - default, best performance, ~5-10ms data loss window
+# Protocol C (sync) - optional, zero data loss, ~5-10ms latency overhead
+default_protocol = "async"
+# For Protocol C: how many ACKs required
+sync_ack_policy = "one"  # one|majority|all
+sync_timeout_ms = 100
+tcp_nodelay = true
+reconnect_interval_secs = 5
+# Standby nodes: set listen address (active nodes ignore this)
+listen = "0.0.0.0:8090"
+
 # Optional: Filesystem quota
 [filesystem]
 max_size_gb = 100.0
 
-# AWS credentials (for Wasabi S3-compatible storage)
+# AWS credentials (for Wasabi S3-compatible storage via s3-proxy)
+# The s3-proxy provides conditional write support that Wasabi lacks
 [aws]
 default_region = "us-east-1"
-endpoint = "https://s3.wasabisys.com"
+endpoint = "http://s3-proxy:8080"  # Use s3-proxy instead of direct Wasabi
 access_key_id = "${AWS_ACCESS_KEY_ID}"
 secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+allow_http = "true"  # Required for HTTP proxy endpoint
 

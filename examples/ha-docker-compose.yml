@@ -4,16 +4,40 @@ version: '3.8'
 # This demonstrates a 3-node cluster with S3 lease-based coordination
 
 services:
+  # S3 Proxy - Required for Wasabi conditional writes support
+  s3-proxy:
+    build:
+      context: https://github.com/stackblaze/s3-proxy.git#main
+      dockerfile: Dockerfile
+    environment:
+      - S3PROXY_AWS_KEY=${AWS_ACCESS_KEY_ID}
+      - S3PROXY_AWS_SECRET=${AWS_SECRET_ACCESS_KEY}
+      - S3PROXY_AWS_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - S3PROXY_AWS_BUCKET=sb-zerofile-ha
+      - S3PROXY_AWS_ENDPOINT=https://s3.wasabisys.com
+    # No port mapping needed - nodes access via Docker network (s3-proxy:8080)
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --spider http://localhost:8080/ || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   # Node 1
   zerofs-node1:
     image: zerofs:latest
     command: ["run", "-c", "/etc/zerofs/config.toml"]
+    depends_on:
+      s3-proxy:
+        condition: service_started
     environment:
       - NODE_ID=node-1
       - ZEROFS_PASSWORD=${ZEROFS_PASSWORD}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - HOSTNAME=node-1
     volumes:
       - ./ha-config-lease.toml:/etc/zerofs/config.toml:ro
       - node1-cache:/var/cache/zerofs
@@ -21,6 +45,7 @@ services:
       - "12049:2049"  # NFS (different host port to avoid conflict with HAProxy)
       - "15564:5564"  # 9P
       - "8081:8080"   # Health check
+      - "8091:8090"   # WAL replication
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
@@ -32,12 +57,16 @@ services:
   zerofs-node2:
     image: zerofs:latest
     command: ["run", "-c", "/etc/zerofs/config.toml"]
+    depends_on:
+      s3-proxy:
+        condition: service_started
     environment:
       - NODE_ID=node-2
       - ZEROFS_PASSWORD=${ZEROFS_PASSWORD}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - HOSTNAME=node-2
     volumes:
       - ./ha-config-lease.toml:/etc/zerofs/config.toml:ro
       - node2-cache:/var/cache/zerofs
@@ -45,6 +74,7 @@ services:
       - "12050:2049"  # NFS (different host port)
       - "15565:5564"  # 9P
       - "8082:8080"   # Health check
+      - "8092:8090"   # WAL replication
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
@@ -56,12 +86,16 @@ services:
   zerofs-node3:
     image: zerofs:latest
     command: ["run", "-c", "/etc/zerofs/config.toml"]
+    depends_on:
+      s3-proxy:
+        condition: service_started
     environment:
       - NODE_ID=node-3
       - ZEROFS_PASSWORD=${ZEROFS_PASSWORD}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - HOSTNAME=node-3
     volumes:
       - ./ha-config-lease.toml:/etc/zerofs/config.toml:ro
       - node3-cache:/var/cache/zerofs
@@ -69,26 +103,12 @@ services:
       - "12051:2049"  # NFS (different host port)
       - "15566:5564"  # 9P
       - "8083:8080"   # Health check
+      - "8093:8090"   # WAL replication
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
       timeout: 3s
       retries: 3
-    restart: unless-stopped
-
-  # HAProxy load balancer (optional)
-  haproxy:
-    image: haproxy:2.8
-    volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-    ports:
-      - "2049:2049"   # NFS frontend
-      - "5564:5564"   # 9P frontend
-      - "9000:9000"   # Stats page
-    depends_on:
-      - zerofs-node1
-      - zerofs-node2
-      - zerofs-node3
     restart: unless-stopped
 
 volumes:

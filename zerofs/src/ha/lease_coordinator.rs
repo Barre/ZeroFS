@@ -19,9 +19,13 @@ use object_store::{path::Path, ObjectStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::server_mode::{HAState, ServerMode};
+
+/// Callback for handling promotion/demotion events
+pub type PromotionCallback = Arc<dyn Fn(ServerMode) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>;
 
 const LEASE_FILE_NAME: &str = ".zerofs_ha_lease";
 const DEFAULT_LEASE_TTL_SECS: u64 = 30;
@@ -65,6 +69,7 @@ pub struct LeaseCoordinator {
     db_path: String,
     ha_state: HAState,
     current_lease: Arc<tokio::sync::RwLock<Option<LeaseData>>>,
+    promotion_callback: RwLock<Option<PromotionCallback>>,
 }
 
 impl LeaseCoordinator {
@@ -85,38 +90,75 @@ impl LeaseCoordinator {
             db_path,
             ha_state,
             current_lease: Arc::new(tokio::sync::RwLock::new(None)),
+            promotion_callback: RwLock::new(None),
         }
+    }
+    
+    /// Set a callback to be invoked when the node is promoted or demoted
+    pub async fn set_promotion_callback(&self, callback: PromotionCallback) {
+        *self.promotion_callback.write().await = Some(callback);
     }
 
     /// Start the lease coordination loop
     pub async fn start(self: Arc<Self>) -> Result<()> {
         info!("Starting lease coordinator for node '{}'", self.config.node_id);
+        info!("Lease coordinator will tick every {} seconds", self.config.renew_interval_secs);
 
         let mut renew_interval = tokio::time::interval(Duration::from_secs(
             self.config.renew_interval_secs,
         ));
         renew_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        // Skip the first immediate tick
+        renew_interval.tick().await;
+        info!("Lease coordinator loop started, waiting for first interval...");
 
         loop {
             renew_interval.tick().await;
+            info!("Lease coordinator tick - attempting to acquire/renew lease");
 
             match self.try_acquire_or_renew_lease().await {
                 Ok(true) => {
                     // We hold the lease
                     if !self.ha_state.is_active().await {
                         info!("✓ Acquired lease - promoting to ACTIVE");
-                        // TODO: In full implementation, this would signal a separate
-                        // HA coordinator to handle DB promotion. For now, go directly active.
-                        self.ha_state.set_mode(ServerMode::Active).await;
-                        self.ha_state
-                            .set_leader(Some(self.config.node_id.clone()))
-                            .await;
+                        
+                        // Invoke promotion callback
+                        if let Some(callback) = self.promotion_callback.read().await.as_ref() {
+                            match callback(ServerMode::Active).await {
+                                Ok(()) => {
+                                    self.ha_state.set_mode(ServerMode::Active).await;
+                                    self.ha_state
+                                        .set_leader(Some(self.config.node_id.clone()))
+                                        .await;
+                                    info!("✓ Promotion to ACTIVE completed");
+                                }
+                                Err(e) => {
+                                    error!("Promotion callback failed: {}. Staying in standby.", e);
+                                    // Don't promote if callback fails
+                                }
+                            }
+                        } else {
+                            // No callback - direct promotion (backward compatibility)
+                            self.ha_state.set_mode(ServerMode::Active).await;
+                            self.ha_state
+                                .set_leader(Some(self.config.node_id.clone()))
+                                .await;
+                        }
                     }
                 }
                 Ok(false) => {
                     // Someone else holds the lease
                     if self.ha_state.is_active().await {
-                        warn!("Lost lease - should demote to standby");
+                        warn!("Lost lease - demoting to STANDBY");
+                        
+                        // Invoke demotion callback
+                        if let Some(callback) = self.promotion_callback.read().await.as_ref() {
+                            if let Err(e) = callback(ServerMode::Standby).await {
+                                error!("Demotion callback failed: {}", e);
+                            }
+                        }
+                        
                         self.ha_state.set_mode(ServerMode::Fenced).await;
                     } else if !self.ha_state.is_standby().await {
                         self.ha_state.set_mode(ServerMode::Standby).await;
@@ -127,6 +169,14 @@ impl LeaseCoordinator {
                     // On error, be conservative - go to standby
                     if self.ha_state.is_active().await {
                         warn!("Lease error while active - demoting to standby");
+                        
+                        // Invoke demotion callback
+                        if let Some(callback) = self.promotion_callback.read().await.as_ref() {
+                            if let Err(e) = callback(ServerMode::Standby).await {
+                                error!("Demotion callback failed: {}", e);
+                            }
+                        }
+                        
                         self.ha_state.set_mode(ServerMode::Fenced).await;
                     }
                 }
@@ -138,6 +188,7 @@ impl LeaseCoordinator {
     /// Returns Ok(true) if we hold the lease, Ok(false) if someone else does
     async fn try_acquire_or_renew_lease(&self) -> Result<bool> {
         let lease_path = Path::from(format!("{}/{}", self.db_path, LEASE_FILE_NAME));
+        info!("Checking lease at path: {}", lease_path);
 
         // First, try to read the existing lease
         let existing_lease = self.read_lease(&lease_path).await?;
@@ -148,16 +199,19 @@ impl LeaseCoordinator {
             Some((lease_data, etag)) => {
                 // Check if lease is expired
                 if lease_data.expires_at < now {
-                    debug!("Lease expired, attempting to acquire");
-                    self.try_acquire_lease(&lease_path, Some(lease_data.version))
+                    info!("Lease expired (expired at {}), attempting to acquire for node '{}'", 
+                          lease_data.expires_at, self.config.node_id);
+                    self.try_acquire_lease(&lease_path, Some(lease_data.version), Some(etag))
                         .await
                 } else if lease_data.node_id == self.config.node_id {
                     // We hold the lease, try to renew it
-                    debug!("Renewing lease");
+                    info!("Renewing lease (version {}, expires in {}s)", 
+                           lease_data.version,
+                           (lease_data.expires_at - now).num_seconds());
                     self.try_renew_lease(&lease_path, lease_data, etag).await
                 } else {
                     // Someone else holds a valid lease
-                    debug!(
+                    info!(
                         "Node '{}' holds the lease (expires in {} seconds)",
                         lease_data.node_id,
                         (lease_data.expires_at - now).num_seconds()
@@ -170,8 +224,8 @@ impl LeaseCoordinator {
             }
             None => {
                 // No lease exists, try to create one
-                debug!("No lease exists, attempting to acquire");
-                self.try_acquire_lease(&lease_path, None).await
+                info!("No lease exists, attempting to acquire for node '{}'", self.config.node_id);
+                self.try_acquire_lease(&lease_path, None, None).await
             }
         }
     }
@@ -188,15 +242,26 @@ impl LeaseCoordinator {
                     .unwrap_or_else(|| "unknown".to_string());
                 let bytes = result.bytes().await?;
                 let lease_data: LeaseData = serde_json::from_slice(&bytes)?;
+                info!("Read lease from S3: node_id={}, version={}, expires_at={}", 
+                       lease_data.node_id, lease_data.version, lease_data.expires_at);
                 Ok(Some((lease_data, etag)))
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow!("Failed to read lease: {}", e)),
+            Err(object_store::Error::NotFound { .. }) => {
+                info!("No lease file found at {} - will attempt to create one", path);
+                Ok(None)
+            }
+            Err(e) => {
+                error!("Failed to read lease from {}: {} (this will prevent lease acquisition)", path, e);
+                Err(anyhow!("Failed to read lease: {}", e))
+            }
         }
     }
 
     /// Try to acquire a new lease
-    async fn try_acquire_lease(&self, path: &Path, last_version: Option<u64>) -> Result<bool> {
+    /// 
+    /// If etag is provided, uses conditional update (for acquiring expired leases).
+    /// If etag is None, uses Create mode (for initial lease creation).
+    async fn try_acquire_lease(&self, path: &Path, last_version: Option<u64>, etag: Option<String>) -> Result<bool> {
         let now = Utc::now();
         let new_lease = LeaseData {
             node_id: self.config.node_id.clone(),
@@ -207,30 +272,45 @@ impl LeaseCoordinator {
 
         let data = serde_json::to_vec(&new_lease)?;
 
-        // Use put_opts with if-match to ensure atomic acquisition
-        let put_opts = object_store::PutOptions {
-            mode: object_store::PutMode::Create, // Only succeed if file doesn't exist
-            ..Default::default()
+        // Use put_opts with appropriate mode
+        let put_opts = if let Some(etag_value) = etag {
+            // Acquiring expired lease - use conditional update
+            object_store::PutOptions {
+                mode: object_store::PutMode::Update(object_store::UpdateVersion {
+                    e_tag: Some(etag_value),
+                    version: None,
+                }),
+                ..Default::default()
+            }
+        } else {
+            // Creating new lease - use Create mode
+            object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            }
         };
 
         match self.object_store.put_opts(path, data.into(), put_opts).await {
             Ok(_) => {
                 info!(
-                    "Successfully acquired lease (version {})",
-                    new_lease.version
+                    "Successfully acquired lease (version {}) for node '{}'",
+                    new_lease.version, self.config.node_id
                 );
                 *self.current_lease.write().await = Some(new_lease);
                 Ok(true)
             }
             Err(object_store::Error::AlreadyExists { .. }) => {
-                debug!("Failed to acquire lease - already exists");
+                info!("Failed to acquire lease - already exists (another node may have acquired it)");
                 Ok(false)
             }
             Err(object_store::Error::Precondition { .. }) => {
-                debug!("Failed to acquire lease - precondition failed");
+                info!("Failed to acquire lease - precondition failed (another node acquired it first)");
                 Ok(false)
             }
-            Err(e) => Err(anyhow!("Failed to acquire lease: {}", e)),
+            Err(e) => {
+                error!("Failed to acquire lease for node '{}': {} (check S3 connectivity and permissions)", self.config.node_id, e);
+                Err(anyhow!("Failed to acquire lease: {}", e))
+            }
         }
     }
 
