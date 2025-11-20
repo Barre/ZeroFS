@@ -18,6 +18,7 @@ use slatedb::{
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 const NONCE_SIZE: usize = 12;
 
@@ -94,7 +95,7 @@ pub struct EncryptedWriteBatch {
     encryptor: Arc<EncryptionManager>,
     // Queue of cache operations to apply after successful write
     cache_ops: Vec<(Bytes, Option<Bytes>)>, // (key, Some(value) for put, None for delete)
-    pending_operations: Vec<(Bytes, Bytes)>,
+    pub(crate) pending_operations: Vec<(Bytes, Bytes)>,
 }
 
 impl EncryptedWriteBatch {
@@ -163,31 +164,93 @@ impl SlateDbHandle {
 
 // Encrypted DB wrapper
 pub struct EncryptedDb {
-    inner: SlateDbHandle,
+    inner: Arc<RwLock<SlateDbHandle>>,  // Use Arc<RwLock> for hot-swapping
     encryptor: Arc<EncryptionManager>,
+    wal_streamer: Arc<RwLock<Option<Arc<crate::ha::WALStreamer>>>>,
 }
 
 impl EncryptedDb {
     pub fn new(db: Arc<slatedb::Db>, encryptor: Arc<EncryptionManager>) -> Self {
         Self {
-            inner: SlateDbHandle::ReadWrite(db),
+            inner: Arc::new(RwLock::new(SlateDbHandle::ReadWrite(db))),
             encryptor,
+            wal_streamer: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn new_read_only(db_reader: ArcSwap<DbReader>, encryptor: Arc<EncryptionManager>) -> Self {
         Self {
-            inner: SlateDbHandle::ReadOnly(db_reader),
+            inner: Arc::new(RwLock::new(SlateDbHandle::ReadOnly(db_reader))),
             encryptor,
+            wal_streamer: Arc::new(RwLock::new(None)),
         }
     }
 
-    pub fn is_read_only(&self) -> bool {
-        self.inner.is_read_only()
+    /// Hot-swap from read-only to read-write handle (promotion)
+    pub async fn swap_to_readwrite(&self, db: Arc<slatedb::Db>) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        
+        // Close old read-only handle if present
+        if let SlateDbHandle::ReadOnly(reader_swap) = &*inner {
+            let reader = reader_swap.load();
+            if let Err(e) = reader.close().await {
+                tracing::warn!("Error closing read-only handle during promotion: {}", e);
+            }
+        }
+        
+        *inner = SlateDbHandle::ReadWrite(db);
+        tracing::info!("✓ Swapped to read-write handle");
+        Ok(())
     }
 
-    pub fn swap_reader(&self, new_reader: Arc<DbReader>) -> Result<()> {
-        match &self.inner {
+    /// Hot-swap from read-write to read-only handle (demotion)
+    pub async fn swap_to_readonly(&self, reader: ArcSwap<DbReader>) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        
+        // Close old read-write handle if present
+        if let SlateDbHandle::ReadWrite(db) = &*inner {
+            // Flush before closing
+            if let Err(e) = db.flush().await {
+                tracing::warn!("Error flushing during demotion: {}", e);
+            }
+            if let Err(e) = db.close().await {
+                tracing::warn!("Error closing read-write handle during demotion: {}", e);
+            }
+        }
+        
+        *inner = SlateDbHandle::ReadOnly(reader);
+        tracing::info!("✓ Swapped to read-only handle");
+        Ok(())
+    }
+    
+    /// Attach WAL streamer for replication (active node only)
+    /// NOTE: This method is deprecated - use attach_wal_streamer() instead
+    pub fn with_wal_replication(self, streamer: Arc<crate::ha::WALStreamer>) -> Self {
+        // This is only used during initialization, so we can use blocking_write
+        // but it should be called from a non-async context
+        *self.wal_streamer.blocking_write() = Some(streamer);
+        self
+    }
+
+    /// Attach WAL streamer after construction (for HA mode switching)
+    pub async fn attach_wal_streamer(&self, streamer: Arc<crate::ha::WALStreamer>) {
+        *self.wal_streamer.write().await = Some(streamer);
+        tracing::info!("✓ WAL streamer attached to write path");
+    }
+
+    /// Detach WAL streamer (for demotion from active to standby)
+    pub async fn detach_wal_streamer(&self) {
+        *self.wal_streamer.write().await = None;
+        tracing::info!("✓ WAL streamer detached from write path");
+    }
+
+    pub async fn is_read_only(&self) -> bool {
+        self.inner.read().await.is_read_only()
+    }
+
+    pub async fn swap_reader(&self, new_reader: Arc<DbReader>) -> Result<()> {
+        let inner = self.inner.read().await;
+        match &*inner {
             SlateDbHandle::ReadOnly(reader_swap) => {
                 reader_swap.store(new_reader);
                 Ok(())
@@ -204,11 +267,14 @@ impl EncryptedDb {
             ..Default::default()
         };
 
-        let encrypted = match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.get_with_options(key, &read_options).await?,
-            SlateDbHandle::ReadOnly(reader_swap) => {
-                let reader = reader_swap.load();
-                reader.get_with_options(key, &read_options).await?
+        let encrypted = {
+            let inner = self.inner.read().await;
+            match &*inner {
+                SlateDbHandle::ReadWrite(db) => db.get_with_options(key, &read_options).await?,
+                SlateDbHandle::ReadOnly(reader_swap) => {
+                    let reader = reader_swap.load();
+                    reader.get_with_options(key, &read_options).await?
+                }
             }
         };
 
@@ -232,11 +298,14 @@ impl EncryptedDb {
             max_fetch_tasks: 8,
             ..Default::default()
         };
-        let iter = match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.scan_with_options(range, &scan_options).await?,
-            SlateDbHandle::ReadOnly(reader_swap) => {
-                let reader = reader_swap.load();
-                reader.scan_with_options(range, &scan_options).await?
+        let iter = {
+            let inner = self.inner.read().await;
+            match &*inner {
+                SlateDbHandle::ReadWrite(db) => db.scan_with_options(range, &scan_options).await?,
+                SlateDbHandle::ReadOnly(reader_swap) => {
+                    let reader = reader_swap.load();
+                    reader.scan_with_options(range, &scan_options).await?
+                }
             }
         };
 
@@ -276,22 +345,96 @@ impl EncryptedDb {
         batch: EncryptedWriteBatch,
         options: &WriteOptions,
     ) -> Result<()> {
-        if self.is_read_only() {
-            return Err(FsError::ReadOnlyFilesystem.into());
-        }
+        let is_read_only = self.is_read_only().await;
+        
+        // Check if we have a streamer (quick read lock check)
+        let has_streamer = self.wal_streamer.read().await.is_some();
+
+        // Capture batch data for replication BEFORE consuming the batch
+        let batch_data_for_replication = if has_streamer {
+            // Serialize the pending operations before they're consumed
+            Some(bincode::serialize(&batch.pending_operations)?)
+        } else {
+            None
+        };
 
         let (inner_batch, _cache_ops) = batch.into_inner().await?;
 
-        match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
-            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+        // STEP 1: Write to local disk (only if NOT read-only)
+        if !is_read_only {
+            let inner = self.inner.read().await;
+            match &*inner {
+                SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
+                SlateDbHandle::ReadOnly(_) => unreachable!("is_read_only() returned false but handle is ReadOnly"),
+            }
+        } else {
+            // In read-only mode, we skip local write but still allow replication
+            // This allows standby nodes that haven't been promoted yet to still replicate
+            tracing::debug!("Skipping local write in read-only mode, replication will still occur if streamer attached");
+        }
+
+        // STEP 2: Replicate to standbys (works regardless of local read-only state)
+        // This is critical: even if THIS node is read-only, if it has a streamer attached,
+        // it means it's about to be promoted or is in transition, and replication should work
+        if let Some(batch_data) = batch_data_for_replication {
+            let streamer_guard = self.wal_streamer.read().await;
+            if let Some(streamer) = streamer_guard.as_ref() {
+                // Fire-and-forget replication (Protocol A default)
+                // This doesn't block the return
+                if let Err(e) = streamer.replicate(bytes::Bytes::from(batch_data)).await {
+                    tracing::warn!("WAL replication warning: {}", e);
+                    // Continue - local write succeeded (if not read-only)
+                }
+            }
+        }
+
+        // Return error only if we're read-only AND no replication happened
+        // (i.e., this was a genuine write attempt on a standby without promotion)
+        if is_read_only && !has_streamer {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+
+        Ok(())
+    }
+    
+    /// Write with explicit replication protocol
+    pub async fn write_with_protocol(
+        &self,
+        batch: EncryptedWriteBatch,
+        options: &WriteOptions,
+        protocol: crate::ha::ReplicationProtocol,
+    ) -> Result<()> {
+        if self.is_read_only().await {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+
+        // Capture batch data for replication
+        let batch_data = bincode::serialize(&batch.pending_operations)?;
+
+        let (inner_batch, _cache_ops) = batch.into_inner().await?;
+
+        // Write to local disk
+        {
+            let inner = self.inner.read().await;
+            match &*inner {
+                SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
+                SlateDbHandle::ReadOnly(_) => unreachable!(),
+            }
+        }
+
+        // Replicate with specific protocol
+        let streamer_guard = self.wal_streamer.read().await;
+        if let Some(streamer) = streamer_guard.as_ref() {
+            streamer
+                .replicate_with_protocol(bytes::Bytes::from(batch_data), protocol)
+                .await?;
         }
 
         Ok(())
     }
 
-    pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch> {
-        if self.is_read_only() {
+    pub async fn new_write_batch(&self) -> Result<EncryptedWriteBatch> {
+        if self.is_read_only().await {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
         Ok(EncryptedWriteBatch::new(self.encryptor.clone()))
@@ -304,27 +447,31 @@ impl EncryptedDb {
         put_options: &slatedb::config::PutOptions,
         write_options: &WriteOptions,
     ) -> Result<()> {
-        if self.is_read_only() {
+        if self.is_read_only().await {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
         let encrypted = self.encryptor.encrypt(key, value)?;
-        match &self.inner {
-            SlateDbHandle::ReadWrite(db) => {
-                db.put_with_options(key, &encrypted, put_options, write_options)
-                    .await?
+        {
+            let inner = self.inner.read().await;
+            match &*inner {
+                SlateDbHandle::ReadWrite(db) => {
+                    db.put_with_options(key, &encrypted, put_options, write_options)
+                        .await?
+                }
+                SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
             }
-            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        if self.is_read_only() {
+        if self.is_read_only().await {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        match &self.inner {
+        let inner = self.inner.read().await;
+        match &*inner {
             SlateDbHandle::ReadWrite(db) => db.flush().await?,
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
@@ -332,7 +479,8 @@ impl EncryptedDb {
     }
 
     pub async fn close(&self) -> Result<()> {
-        match &self.inner {
+        let inner = self.inner.read().await;
+        match &*inner {
             SlateDbHandle::ReadWrite(db) => db.close().await?,
             SlateDbHandle::ReadOnly(reader_swap) => {
                 let reader = reader_swap.load();

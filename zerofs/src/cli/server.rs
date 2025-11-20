@@ -24,9 +24,85 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
+
+async fn start_wal_replication(
+    _settings: &Settings,
+    ha_config: &crate::config::HAConfig,
+    wal_config: &crate::config::WALReplicationConfig,
+    _fs: Arc<ZeroFS>,
+    _read_only: bool,
+) -> Result<(Option<JoinHandle<Result<(), std::io::Error>>>, Option<Arc<crate::ha::WALStreamer>>)> {
+    use crate::ha::{
+        ReplicationProtocol, WALReceiver, WALReceiverConfig, WALStreamer, WALStreamerConfig,
+    };
+    use std::time::Duration;
+
+    // ALWAYS start WAL receiver on all nodes (they all need to listen for incoming WAL entries)
+    info!("🔄 Starting WAL receiver on {}", wal_config.listen);
+
+    let receiver_config = WALReceiverConfig {
+        node_id: ha_config.node_id.clone(),
+        listen_address: wal_config.listen.clone(),
+        wal_dir: PathBuf::from(format!("/tmp/zerofs-wal-{}", ha_config.node_id)),
+    };
+
+    let receiver = WALReceiver::new(receiver_config).await?;
+    let receiver_handle = tokio::spawn(async move {
+        if let Err(e) = receiver.start().await {
+            tracing::error!("WAL receiver error: {}", e);
+            return Err(std::io::Error::other(e.to_string()));
+        }
+        Ok(())
+    });
+
+    // Create WAL streamer ONLY if standby_nodes are configured (this node might become active)
+    // NOTE: We create it but DON'T attach it yet - attachment happens during promotion to active
+    let wal_streamer = if !wal_config.standby_nodes.is_empty() {
+        info!(
+            "🔄 Creating WAL streamer for {} standby node(s)",
+            wal_config.standby_nodes.len()
+        );
+
+        let protocol = match wal_config.default_protocol.as_str() {
+            "sync" => ReplicationProtocol::Sync,
+            _ => ReplicationProtocol::Async,
+        };
+
+        let ack_policy = match wal_config.sync_ack_policy.as_str() {
+            "majority" => crate::ha::AckPolicy::Majority,
+            "all" => crate::ha::AckPolicy::All,
+            _ => crate::ha::AckPolicy::One,
+        };
+
+        let streamer_config = WALStreamerConfig {
+            node_id: ha_config.node_id.clone(),
+            standby_addresses: wal_config.standby_nodes.clone(),
+            default_protocol: protocol,
+            sync_ack_policy: ack_policy,
+            sync_timeout: Duration::from_millis(wal_config.sync_timeout_ms),
+            tcp_nodelay: wal_config.tcp_nodelay,
+            reconnect_interval: Duration::from_secs(wal_config.reconnect_interval_secs),
+        };
+
+        let streamer = WALStreamer::new(streamer_config).await?;
+
+        info!(
+            "✓ WAL streamer ready (protocol: {}, standbys: {})",
+            protocol,
+            streamer.connected_standbys().await
+        );
+        info!("⏸️  WAL streamer will be attached during promotion to ACTIVE");
+
+        Some(streamer)
+    } else {
+        None
+    };
+
+    Ok((Some(receiver_handle), wal_streamer))
+}
 
 async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
@@ -221,7 +297,7 @@ fn start_checkpoint_refresh(
                     .await
                     {
                         Ok(new_reader) => {
-                            if let Err(e) = encrypted_db.swap_reader(Arc::new(new_reader)) {
+                            if let Err(e) = encrypted_db.swap_reader(Arc::new(new_reader)).await {
                                 tracing::error!("Failed to swap reader: {:?}", e);
                                 continue;
                             }
@@ -492,7 +568,45 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     let settings = Settings::from_file(config_path.to_str().unwrap())
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    let (fs, checkpoint_params) = initialize_filesystem(&settings, read_only).await?;
+    // If HA is enabled, start in read-only mode initially to prevent write conflicts
+    // The lease coordinator will promote to read-write when this node acquires the lease
+    let effective_read_only = if let Some(ha_config) = &settings.servers.ha {
+        if ha_config.enabled {
+            info!("🔒 HA enabled - starting in read-only mode (will promote when lease acquired)");
+            true // Force read-only for HA nodes initially
+        } else {
+            read_only
+        }
+    } else {
+        read_only
+    };
+
+    let (fs, checkpoint_params) = initialize_filesystem(&settings, effective_read_only).await?;
+
+    // Start WAL replication if configured and HA is enabled
+    let (wal_receiver_handle, wal_streamer) = if let Some(ha_config) = &settings.servers.ha {
+        if ha_config.enabled {
+            if let Some(wal_config) = &ha_config.wal_replication {
+                if wal_config.enabled {
+                    start_wal_replication(
+                        &settings,
+                        ha_config,
+                        wal_config,
+                        Arc::clone(&fs),
+                        read_only,
+                    ).await?
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
 
     if !read_only && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
@@ -558,16 +672,145 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
 
                 let lease_coordinator = Arc::new(LeaseCoordinator::new(
                     lease_config,
-                    object_store,
-                    db_path,
+                    object_store.clone(),
+                    db_path.clone(),
                     (*ha_state).clone(),
                 ));
+
+                // Set up promotion/demotion callbacks
+                let fs_clone = Arc::clone(&fs);
+                let object_store_for_promotion = object_store.clone();
+                let db_path_for_promotion = db_path.clone();
+                let settings_for_promotion = settings.clone();
+                let wal_streamer_for_promotion = wal_streamer.clone();
+                
+                // Get cache and runtime handle for promotion
+                // We need to recreate these from settings since they're not stored
+                let cache_config = CacheConfig {
+                    root_folder: settings.cache.dir.to_str().unwrap().to_string(),
+                    max_cache_size_gb: settings.cache.disk_size_gb,
+                    memory_cache_size_gb: settings.cache.memory_size_gb,
+                };
+                
+                // Create callback for promotion/demotion
+                let promotion_callback: crate::ha::lease_coordinator::PromotionCallback = Arc::new(move |mode| {
+                    let fs = Arc::clone(&fs_clone);
+                    let object_store = Arc::clone(&object_store_for_promotion);
+                    let db_path = db_path_for_promotion.clone();
+                    let settings = settings_for_promotion.clone();
+                    let cache_config = cache_config.clone();
+                    let wal_streamer = wal_streamer_for_promotion.clone();
+                    
+                    Box::pin(async move {
+                        match mode {
+                            crate::ha::ServerMode::Active => {
+                                info!("🔄 Promotion callback: Promoting to ACTIVE");
+                                
+                                // Build Settings from LsmConfig (similar to build_slatedb)
+                                let l0_max_ssts = settings.lsm
+                                    .as_ref()
+                                    .map(|c| c.l0_max_ssts())
+                                    .unwrap_or(crate::config::LsmConfig::DEFAULT_L0_MAX_SSTS);
+                                let max_unflushed_bytes = settings.lsm
+                                    .as_ref()
+                                    .map(|c| c.max_unflushed_bytes())
+                                    .unwrap_or_else(|| {
+                                        (crate::config::LsmConfig::DEFAULT_MAX_UNFLUSHED_GB * 1_000_000_000.0) as usize
+                                    });
+                                let max_concurrent_compactions = settings.lsm
+                                    .as_ref()
+                                    .map(|c| c.max_concurrent_compactions())
+                                    .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
+                                
+                                let slatedb_settings = slatedb::config::Settings {
+                                    l0_max_ssts,
+                                    object_store_cache_options: ObjectStoreCacheOptions {
+                                        root_folder: Some(format!("{}/slatedb", cache_config.root_folder).into()),
+                                        max_cache_size_bytes: Some((cache_config.max_cache_size_gb * 1_000_000_000.0) as usize),
+                                        cache_puts: true,
+                                        ..Default::default()
+                                    },
+                                    flush_interval: Some(std::time::Duration::from_secs(30)),
+                                    max_unflushed_bytes,
+                                    compactor_options: Some(slatedb::config::CompactorOptions {
+                                        max_concurrent_compactions,
+                                        max_sst_size: 256 * 1024 * 1024,
+                                        ..Default::default()
+                                    }),
+                                    compression_codec: None,
+                                    garbage_collector_options: Some(GarbageCollectorOptions {
+                                        wal_options: Some(GarbageCollectorDirectoryOptions {
+                                            interval: Some(Duration::from_secs(60 * 60)),
+                                            min_age: Duration::from_secs(60 * 60),
+                                        }),
+                                        manifest_options: Some(GarbageCollectorDirectoryOptions {
+                                            interval: Some(Duration::from_secs(60 * 60)),
+                                            min_age: Duration::from_secs(60 * 60),
+                                        }),
+                                        compacted_options: Some(GarbageCollectorDirectoryOptions {
+                                            interval: Some(Duration::from_secs(60 * 60)),
+                                            min_age: Duration::from_secs(60 * 60),
+                                        }),
+                                    }),
+                                    ..Default::default()
+                                };
+                                
+                                // Recreate cache and runtime for read-write mode
+                                let memory_cache_bytes = (cache_config.memory_cache_size_gb.unwrap_or(0.25) * 1_000_000_000.0) as u64;
+                                let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
+                                    max_capacity: memory_cache_bytes,
+                                    time_to_idle: None,
+                                    time_to_live: None,
+                                }));
+                                
+                                let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
+                                    let runtime = Runtime::new().unwrap();
+                                    let handle = runtime.handle().clone();
+                                    let runtime_keeper = std::thread::spawn(move || {
+                                        runtime.block_on(async { std::future::pending::<()>().await });
+                                    });
+                                    (handle, runtime_keeper)
+                                })
+                                .await?;
+                                
+                                // Pass WAL streamer if available (from WAL replication setup)
+                                fs.promote_to_active(
+                                    object_store,
+                                    db_path,
+                                    &slatedb_settings,
+                                    cache,
+                                    runtime_handle,
+                                    wal_streamer.clone(),
+                                ).await?;
+                                
+                                Ok(())
+                            }
+                            crate::ha::ServerMode::Standby => {
+                                warn!("🔄 Demotion callback: Demoting to STANDBY");
+                                fs.demote_to_standby(object_store, db_path).await?;
+                                Ok(())
+                            }
+                            _ => {
+                                // For other modes (Fenced, Initializing), don't change DB mode
+                                Ok(())
+                            }
+                        }
+                    })
+                });
+                
+                lease_coordinator.set_promotion_callback(promotion_callback).await;
 
                 // Start lease coordinator in background
                 let coordinator = Arc::clone(&lease_coordinator);
                 tokio::spawn(async move {
-                    if let Err(e) = coordinator.start().await {
-                        tracing::error!("Lease coordinator error: {}", e);
+                    tracing::info!("Spawning lease coordinator task...");
+                    match coordinator.start().await {
+                        Ok(()) => {
+                            tracing::error!("Lease coordinator task completed unexpectedly (should run forever)");
+                        }
+                        Err(e) => {
+                            tracing::error!("Lease coordinator error: {} (this will prevent HA from working)", e);
+                        }
                     }
                 });
             }
@@ -609,6 +852,9 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
         }
         _ = async { ha_health_handle.unwrap().await }, if ha_health_handle.is_some() => {
             unreachable!("Health server should never complete");
+        }
+        _ = async { wal_receiver_handle.unwrap().await }, if wal_receiver_handle.is_some() => {
+            unreachable!("WAL receiver should never complete");
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");
