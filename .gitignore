@@ -4,3 +4,12 @@ target
 bench/bench_workspace
 zerofs.toml
 TODO.md
+
+# HA testing and documentation files
+HA_*.md
+WAL-*.md
+examples/test-*.sh
+examples/.env
+examples/env.template
+examples/*-SUCCESS.md
+examples/S3-PROXY-SETUP.md
