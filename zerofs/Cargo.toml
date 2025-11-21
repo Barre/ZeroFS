@@ -23,7 +23,9 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { version = "0.9", features = ["moka"] }
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "853b218ef7732aeeb564a7c6c79df42e1e0deaab", features = [
+    "moka",
+] }
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.48", features = ["full"] }
