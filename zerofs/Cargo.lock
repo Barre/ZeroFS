@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.17.2"
+version = "0.17.3"
 dependencies = [
  "anyhow",
  "arc-swap",
