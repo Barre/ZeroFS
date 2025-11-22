@@ -2782,6 +2782,7 @@ dependencies = [
  "foyer",
  "futures",
  "log",
+ "moka",
  "object_store",
  "once_cell",
  "ouroboros",
