@@ -2,7 +2,6 @@ use crate::fs::inode::Inode;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use crate::fs::{EncodedFileId, ZeroFS};
-use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -26,7 +25,6 @@ impl NFSAdapter {
     }
 }
 
-#[async_trait]
 impl NFSFileSystem for NFSAdapter {
     fn root_dir(&self) -> fileid3 {
         0

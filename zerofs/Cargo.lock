@@ -3915,7 +3915,6 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "argon2",
- "async-trait",
  "bincode",
  "bytes",
  "chacha20poly1305",
