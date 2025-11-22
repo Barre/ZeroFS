@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "0.17.1"
+version = "0.17.2"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
@@ -23,9 +23,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "853b218ef7732aeeb564a7c6c79df42e1e0deaab", features = [
-    "moka",
-] }
+slatedb = "0.9.2"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.48", features = ["full"] }

@@ -2760,8 +2760,9 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.9.0"
-source = "git+https://github.com/slatedb/slatedb.git?rev=853b218ef7732aeeb564a7c6c79df42e1e0deaab#853b218ef7732aeeb564a7c6c79df42e1e0deaab"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16c3a10e8975744fddd018b3f442e6309f2a24713c4f1d65341ca0c472bc9c07"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2781,7 +2782,6 @@ dependencies = [
  "foyer",
  "futures",
  "log",
- "moka",
  "object_store",
  "once_cell",
  "ouroboros",
@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "anyhow",
  "arc-swap",
