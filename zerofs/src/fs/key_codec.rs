@@ -12,6 +12,8 @@ const PREFIX_SYSTEM: u8 = 0x07;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
+pub const SYSTEM_WRAPPED_ENCRYPTION_KEY: &[u8] = b"system:wrapped_encryption_key";
+
 const U64_SIZE: usize = 8;
 const KEY_INODE_SIZE: usize = 9;
 const KEY_CHUNK_SIZE: usize = 17;

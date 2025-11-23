@@ -1,4 +1,5 @@
 use crate::encryption::SlateDbHandle;
+use crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY;
 use anyhow::Result;
 use argon2::{
     Algorithm, Argon2, Params, Version,
@@ -10,8 +11,6 @@ use chacha20poly1305::{
 };
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
-
-const WRAPPED_KEY_DB_KEY: &str = "system:wrapped_encryption_key";
 const ARGON2_MEM_COST: u32 = 65536;
 const ARGON2_TIME_COST: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
@@ -164,10 +163,10 @@ pub async fn load_or_init_encryption_key(
 
     // Check if wrapped key exists in database
     let existing_key = match db_handle {
-        SlateDbHandle::ReadWrite(db) => db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+        SlateDbHandle::ReadWrite(db) => db.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?,
         SlateDbHandle::ReadOnly(reader_swap) => {
             let reader = reader_swap.load();
-            reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?
+            reader.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?
         }
     };
 
@@ -196,7 +195,7 @@ pub async fn load_or_init_encryption_key(
             match db_handle {
                 SlateDbHandle::ReadWrite(db) => {
                     db.put_with_options(
-                        WRAPPED_KEY_DB_KEY.as_bytes(),
+                        SYSTEM_WRAPPED_ENCRYPTION_KEY,
                         &serialized,
                         &slatedb::config::PutOptions::default(),
                         &slatedb::config::WriteOptions {
@@ -227,10 +226,10 @@ pub async fn change_encryption_password(
 
     // Load current wrapped key
     let data = match db_handle {
-        SlateDbHandle::ReadWrite(db) => db.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?,
+        SlateDbHandle::ReadWrite(db) => db.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?,
         SlateDbHandle::ReadOnly(reader_swap) => {
             let reader = reader_swap.load();
-            reader.get(WRAPPED_KEY_DB_KEY.as_bytes()).await?
+            reader.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?
         }
     }
     .ok_or_else(|| anyhow::anyhow!("No encryption key found in database"))?;
@@ -248,7 +247,7 @@ pub async fn change_encryption_password(
     match db_handle {
         SlateDbHandle::ReadWrite(db) => {
             db.put_with_options(
-                WRAPPED_KEY_DB_KEY.as_bytes(),
+                SYSTEM_WRAPPED_ENCRYPTION_KEY,
                 &serialized,
                 &slatedb::config::PutOptions::default(),
                 &slatedb::config::WriteOptions {

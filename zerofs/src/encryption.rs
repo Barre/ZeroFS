@@ -45,14 +45,12 @@ impl EncryptionManager {
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Check if this is a chunk key to decide on compression
-        let data = if key.first()
-            .and_then(|&b| KeyPrefix::try_from(b).ok())
-            .map_or(false, |p| p == KeyPrefix::Chunk)
-        {
-            lz4_flex::compress_prepend_size(plaintext)
-        } else {
-            plaintext.to_vec()
-        };
+        let data =
+            if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
+                lz4_flex::compress_prepend_size(plaintext)
+            } else {
+                plaintext.to_vec()
+            };
 
         let ciphertext = self
             .cipher
@@ -82,10 +80,7 @@ impl EncryptionManager {
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         // Decompress chunks
-        if key.first()
-            .and_then(|&b| KeyPrefix::try_from(b).ok())
-            .map_or(false, |p| p == KeyPrefix::Chunk)
-        {
+        if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             lz4_flex::decompress_size_prepended(&decrypted)
                 .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
         } else {
@@ -115,10 +110,7 @@ impl EncryptedWriteBatch {
 
     pub fn put_bytes(&mut self, key: &bytes::Bytes, value: Bytes) {
         // Queue cache operation if this is a chunk
-        if key.first()
-            .and_then(|&b| KeyPrefix::try_from(b).ok())
-            .map_or(false, |p| p == KeyPrefix::Chunk)
-        {
+        if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             self.cache_ops.push((key.clone(), Some(value.clone())));
         }
 
@@ -126,10 +118,7 @@ impl EncryptedWriteBatch {
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {
-        if key.first()
-            .and_then(|&b| KeyPrefix::try_from(b).ok())
-            .map_or(false, |p| p == KeyPrefix::Chunk)
-        {
+        if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             self.cache_ops.push((key.clone(), None));
         }
 
@@ -259,6 +248,13 @@ impl EncryptedDb {
                     Ok(Some(kv)) => {
                         let key = kv.key;
                         let encrypted_value = kv.value;
+
+                        // Skip decryption for system keys that use different encryption
+                        // (wrapped_encryption_key uses password-derived encryption)
+                        if key.as_ref() == crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY {
+                            return Some((Ok((key, encrypted_value)), (iter, encryptor)));
+                        }
+
                         match encryptor.decrypt(&key, &encrypted_value) {
                             Ok(decrypted) => {
                                 Some((Ok((key, Bytes::from(decrypted))), (iter, encryptor)))
