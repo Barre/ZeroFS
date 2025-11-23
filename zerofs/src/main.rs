@@ -72,6 +72,11 @@ async fn main() -> Result<()> {
         cli::Commands::Run { config, read_only } => {
             cli::server::run_server(config, read_only).await?;
         }
+        cli::Commands::Debug { subcommand } => match subcommand {
+            cli::DebugCommands::ListKeys { config } => {
+                cli::debug::list_keys(config).await?;
+            }
+        },
     }
 
     Ok(())

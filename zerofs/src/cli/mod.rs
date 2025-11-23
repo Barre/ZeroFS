@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod debug;
 pub mod password;
 pub mod server;
 
@@ -35,6 +36,20 @@ pub enum Commands {
     ///
     /// zerofs change-password -c config.toml < password.txt
     ChangePassword {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Debug commands for inspecting the database
+    Debug {
+        #[command(subcommand)]
+        subcommand: DebugCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DebugCommands {
+    /// List all keys in the database
+    ListKeys {
         #[arg(short, long)]
         config: PathBuf,
     },
