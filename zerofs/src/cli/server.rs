@@ -403,22 +403,7 @@ async fn initialize_filesystem(
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let mut env_vars = Vec::new();
-    if let Some(aws) = &settings.aws {
-        for (k, v) in &aws.0 {
-            env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
-        }
-    }
-    if let Some(azure) = &settings.azure {
-        for (k, v) in &azure.0 {
-            env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
-        }
-    }
-    if let Some(gcp) = &settings.gcp {
-        for (k, v) in &gcp.0 {
-            env_vars.push((format!("google_{}", k.to_lowercase()), v.clone()));
-        }
-    }
+    let env_vars = settings.cloud_provider_env_vars();
 
     let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.into_iter())?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
