@@ -1,5 +1,5 @@
 use crate::fs::errors::FsError;
-use crate::fs::key_codec::PREFIX_CHUNK;
+use crate::fs::key_codec::KeyPrefix;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -45,7 +45,10 @@ impl EncryptionManager {
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Check if this is a chunk key to decide on compression
-        let data = if !key.is_empty() && key[0] == PREFIX_CHUNK {
+        let data = if key.first()
+            .and_then(|&b| KeyPrefix::try_from(b).ok())
+            .map_or(false, |p| p == KeyPrefix::Chunk)
+        {
             lz4_flex::compress_prepend_size(plaintext)
         } else {
             plaintext.to_vec()
@@ -79,7 +82,10 @@ impl EncryptionManager {
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         // Decompress chunks
-        if !key.is_empty() && key[0] == PREFIX_CHUNK {
+        if key.first()
+            .and_then(|&b| KeyPrefix::try_from(b).ok())
+            .map_or(false, |p| p == KeyPrefix::Chunk)
+        {
             lz4_flex::decompress_size_prepended(&decrypted)
                 .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
         } else {
@@ -109,7 +115,10 @@ impl EncryptedWriteBatch {
 
     pub fn put_bytes(&mut self, key: &bytes::Bytes, value: Bytes) {
         // Queue cache operation if this is a chunk
-        if !key.is_empty() && key[0] == PREFIX_CHUNK {
+        if key.first()
+            .and_then(|&b| KeyPrefix::try_from(b).ok())
+            .map_or(false, |p| p == KeyPrefix::Chunk)
+        {
             self.cache_ops.push((key.clone(), Some(value.clone())));
         }
 
@@ -117,7 +126,10 @@ impl EncryptedWriteBatch {
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {
-        if !key.is_empty() && key[0] == PREFIX_CHUNK {
+        if key.first()
+            .and_then(|&b| KeyPrefix::try_from(b).ok())
+            .map_or(false, |p| p == KeyPrefix::Chunk)
+        {
             self.cache_ops.push((key.clone(), None));
         }
 
