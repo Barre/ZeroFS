@@ -294,6 +294,26 @@ impl Settings {
         Ok(settings)
     }
 
+    pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
+        let mut env_vars = Vec::new();
+        if let Some(aws) = &self.aws {
+            for (k, v) in &aws.0 {
+                env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
+            }
+        }
+        if let Some(azure) = &self.azure {
+            for (k, v) in &azure.0 {
+                env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
+            }
+        }
+        if let Some(gcp) = &self.gcp {
+            for (k, v) in &gcp.0 {
+                env_vars.push((format!("google_{}", k.to_lowercase()), v.clone()));
+            }
+        }
+        env_vars
+    }
+
     pub fn generate_default() -> Self {
         let mut aws_config = std::collections::HashMap::new();
         aws_config.insert(

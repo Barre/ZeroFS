@@ -44,17 +44,7 @@ pub async fn change_password(
     }
     validate_password(&new_password)?;
 
-    let mut env_vars = Vec::new();
-    if let Some(aws) = &settings.aws {
-        for (k, v) in &aws.0 {
-            env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
-        }
-    }
-    if let Some(azure) = &settings.azure {
-        for (k, v) in &azure.0 {
-            env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
-        }
-    }
+    let env_vars = settings.cloud_provider_env_vars();
 
     let (object_store, path_from_url) = object_store::parse_url_opts(
         &settings
