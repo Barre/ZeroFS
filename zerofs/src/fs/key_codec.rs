@@ -2,13 +2,13 @@ use super::errors::FsError;
 use super::inode::InodeId;
 use bytes::Bytes;
 
-pub const PREFIX_INODE: u8 = 0x01;
-pub const PREFIX_CHUNK: u8 = 0x02;
-pub const PREFIX_DIR_ENTRY: u8 = 0x03;
-pub const PREFIX_DIR_SCAN: u8 = 0x04;
-pub const PREFIX_TOMBSTONE: u8 = 0x05;
-pub const PREFIX_STATS: u8 = 0x06;
-pub const PREFIX_SYSTEM: u8 = 0x07;
+const PREFIX_INODE: u8 = 0x01;
+const PREFIX_CHUNK: u8 = 0x02;
+const PREFIX_DIR_ENTRY: u8 = 0x03;
+const PREFIX_DIR_SCAN: u8 = 0x04;
+const PREFIX_TOMBSTONE: u8 = 0x05;
+const PREFIX_STATS: u8 = 0x06;
+const PREFIX_SYSTEM: u8 = 0x07;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
@@ -16,6 +16,62 @@ const U64_SIZE: usize = 8;
 const KEY_INODE_SIZE: usize = 9;
 const KEY_CHUNK_SIZE: usize = 17;
 const KEY_TOMBSTONE_SIZE: usize = 17;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyPrefix {
+    Inode,
+    Chunk,
+    DirEntry,
+    DirScan,
+    Tombstone,
+    Stats,
+    System,
+}
+
+impl TryFrom<u8> for KeyPrefix {
+    type Error = ();
+
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        match byte {
+            PREFIX_INODE => Ok(Self::Inode),
+            PREFIX_CHUNK => Ok(Self::Chunk),
+            PREFIX_DIR_ENTRY => Ok(Self::DirEntry),
+            PREFIX_DIR_SCAN => Ok(Self::DirScan),
+            PREFIX_TOMBSTONE => Ok(Self::Tombstone),
+            PREFIX_STATS => Ok(Self::Stats),
+            PREFIX_SYSTEM => Ok(Self::System),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<KeyPrefix> for u8 {
+    fn from(prefix: KeyPrefix) -> Self {
+        match prefix {
+            KeyPrefix::Inode => PREFIX_INODE,
+            KeyPrefix::Chunk => PREFIX_CHUNK,
+            KeyPrefix::DirEntry => PREFIX_DIR_ENTRY,
+            KeyPrefix::DirScan => PREFIX_DIR_SCAN,
+            KeyPrefix::Tombstone => PREFIX_TOMBSTONE,
+            KeyPrefix::Stats => PREFIX_STATS,
+            KeyPrefix::System => PREFIX_SYSTEM,
+        }
+    }
+}
+
+impl KeyPrefix {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inode => "INODE",
+            Self::Chunk => "CHUNK",
+            Self::DirEntry => "DIR_ENTRY",
+            Self::DirScan => "DIR_SCAN",
+            Self::Tombstone => "TOMBSTONE",
+            Self::Stats => "STATS",
+            Self::System => "SYSTEM",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ParsedKey {
@@ -29,14 +85,14 @@ pub struct KeyCodec;
 impl KeyCodec {
     pub fn inode_key(inode_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE);
-        key.push(PREFIX_INODE);
+        key.push(u8::from(KeyPrefix::Inode));
         key.extend_from_slice(&inode_id.to_be_bytes());
         Bytes::from(key)
     }
 
     pub fn chunk_key(inode_id: InodeId, chunk_index: u64) -> Bytes {
         let mut key = Vec::with_capacity(KEY_CHUNK_SIZE);
-        key.push(PREFIX_CHUNK);
+        key.push(u8::from(KeyPrefix::Chunk));
         key.extend_from_slice(&inode_id.to_be_bytes());
         key.extend_from_slice(&chunk_index.to_be_bytes());
         Bytes::from(key)
@@ -44,7 +100,7 @@ impl KeyCodec {
 
     pub fn dir_entry_key(dir_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE + name.len());
-        key.push(PREFIX_DIR_ENTRY);
+        key.push(u8::from(KeyPrefix::DirEntry));
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(name);
         Bytes::from(key)
@@ -52,7 +108,7 @@ impl KeyCodec {
 
     pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(KEY_CHUNK_SIZE + name.len());
-        key.push(PREFIX_DIR_SCAN);
+        key.push(u8::from(KeyPrefix::DirScan));
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(&entry_id.to_be_bytes());
         key.extend_from_slice(name);
@@ -61,7 +117,7 @@ impl KeyCodec {
 
     pub fn dir_scan_prefix(dir_id: InodeId) -> Vec<u8> {
         let mut prefix = Vec::with_capacity(KEY_INODE_SIZE);
-        prefix.push(PREFIX_DIR_SCAN);
+        prefix.push(u8::from(KeyPrefix::DirScan));
         prefix.extend_from_slice(&dir_id.to_be_bytes());
         prefix
     }
@@ -76,14 +132,14 @@ impl KeyCodec {
     // Build the end key for a directory scan range (next directory)
     pub fn dir_scan_end_key(dir_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE);
-        key.push(PREFIX_DIR_SCAN);
+        key.push(u8::from(KeyPrefix::DirScan));
         key.extend_from_slice(&(dir_id + 1).to_be_bytes());
         Bytes::from(key)
     }
 
     pub fn tombstone_key(timestamp: u64, inode_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(KEY_TOMBSTONE_SIZE);
-        key.push(PREFIX_TOMBSTONE);
+        key.push(u8::from(KeyPrefix::Tombstone));
         key.extend_from_slice(&timestamp.to_be_bytes());
         key.extend_from_slice(&inode_id.to_be_bytes());
         Bytes::from(key)
@@ -91,22 +147,23 @@ impl KeyCodec {
 
     pub fn stats_shard_key(shard_id: usize) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE);
-        key.push(PREFIX_STATS);
+        key.push(u8::from(KeyPrefix::Stats));
         key.extend_from_slice(&(shard_id as u64).to_be_bytes());
         Bytes::from(key)
     }
 
     pub fn system_counter_key() -> Bytes {
-        Bytes::from(vec![PREFIX_SYSTEM, SYSTEM_COUNTER_SUBTYPE])
+        Bytes::from(vec![u8::from(KeyPrefix::System), SYSTEM_COUNTER_SUBTYPE])
     }
 
     pub fn parse_key(key: &[u8]) -> ParsedKey {
-        if key.is_empty() {
-            return ParsedKey::Unknown;
-        }
+        let prefix = match key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) {
+            Some(p) => p,
+            None => return ParsedKey::Unknown,
+        };
 
-        match key[0] {
-            PREFIX_DIR_SCAN if key.len() > KEY_CHUNK_SIZE => {
+        match prefix {
+            KeyPrefix::DirScan if key.len() > KEY_CHUNK_SIZE => {
                 if let Ok(entry_bytes) = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into() {
                     let entry_id = u64::from_be_bytes(entry_bytes);
                     let name = key[KEY_CHUNK_SIZE..].to_vec();
@@ -115,7 +172,7 @@ impl KeyCodec {
                     ParsedKey::Unknown
                 }
             }
-            PREFIX_TOMBSTONE if key.len() == KEY_TOMBSTONE_SIZE => {
+            KeyPrefix::Tombstone if key.len() == KEY_TOMBSTONE_SIZE => {
                 if let Ok(id_bytes) = key[KEY_INODE_SIZE..KEY_TOMBSTONE_SIZE].try_into() {
                     ParsedKey::Tombstone {
                         inode_id: u64::from_be_bytes(id_bytes),
@@ -166,9 +223,10 @@ impl KeyCodec {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    pub fn prefix_range(prefix: u8) -> (Bytes, Bytes) {
-        let start = Bytes::from(vec![prefix]);
-        let end = Bytes::from(vec![prefix + 1]);
+    pub fn prefix_range(prefix: KeyPrefix) -> (Bytes, Bytes) {
+        let prefix_byte = u8::from(prefix);
+        let start = Bytes::from(vec![prefix_byte]);
+        let end = Bytes::from(vec![prefix_byte + 1]);
         (start, end)
     }
 }
@@ -238,7 +296,7 @@ mod tests {
         assert!(matches!(KeyCodec::parse_key(&[]), ParsedKey::Unknown));
         assert!(matches!(KeyCodec::parse_key(&[0xFF]), ParsedKey::Unknown));
         assert!(matches!(
-            KeyCodec::parse_key(&[PREFIX_INODE]),
+            KeyCodec::parse_key(&[u8::from(KeyPrefix::Inode)]),
             ParsedKey::Unknown
         ));
         let inode_key = KeyCodec::inode_key(1);

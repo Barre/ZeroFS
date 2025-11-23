@@ -288,7 +288,7 @@ impl ZeroFS {
         self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
 
         loop {
-            let (start, end) = KeyCodec::prefix_range(key_codec::PREFIX_TOMBSTONE);
+            let (start, end) = KeyCodec::prefix_range(key_codec::KeyPrefix::Tombstone);
             let range = start..end;
 
             let mut tombstones_to_update = Vec::new();
@@ -585,37 +585,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_inode_key_generation() {
-        use crate::fs::key_codec::{KeyCodec, PREFIX_INODE};
+        use crate::fs::key_codec::{KeyCodec, KeyPrefix};
         // Test binary key format: [PREFIX_INODE | inode_id(8 bytes BE)]
         let key0 = KeyCodec::inode_key(0);
-        assert_eq!(key0[0], PREFIX_INODE);
+        assert_eq!(key0[0], u8::from(KeyPrefix::Inode));
         assert_eq!(&key0[1..9], &0u64.to_be_bytes());
 
         let key42 = KeyCodec::inode_key(42);
-        assert_eq!(key42[0], PREFIX_INODE);
+        assert_eq!(key42[0], u8::from(KeyPrefix::Inode));
         assert_eq!(&key42[1..9], &42u64.to_be_bytes());
 
         let key999 = KeyCodec::inode_key(999);
-        assert_eq!(key999[0], PREFIX_INODE);
+        assert_eq!(key999[0], u8::from(KeyPrefix::Inode));
         assert_eq!(&key999[1..9], &999u64.to_be_bytes());
     }
 
     #[tokio::test]
     async fn test_chunk_key_generation() {
-        use crate::fs::key_codec::{KeyCodec, PREFIX_CHUNK};
+        use crate::fs::key_codec::{KeyCodec, KeyPrefix};
         // Test binary key format: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
         let key = KeyCodec::chunk_key(1, 0);
-        assert_eq!(key[0], PREFIX_CHUNK);
+        assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
         assert_eq!(&key[1..9], &1u64.to_be_bytes());
         assert_eq!(&key[9..17], &0u64.to_be_bytes());
 
         let key = KeyCodec::chunk_key(42, 10);
-        assert_eq!(key[0], PREFIX_CHUNK);
+        assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
         assert_eq!(&key[1..9], &42u64.to_be_bytes());
         assert_eq!(&key[9..17], &10u64.to_be_bytes());
 
         let key = KeyCodec::chunk_key(999, 999);
-        assert_eq!(key[0], PREFIX_CHUNK);
+        assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
         assert_eq!(&key[1..9], &999u64.to_be_bytes());
         assert_eq!(&key[9..17], &999u64.to_be_bytes());
     }
