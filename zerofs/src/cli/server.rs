@@ -269,7 +269,6 @@ pub async fn build_slatedb(
         "SlateDB in-memory block cache: {} MB",
         slatedb_memory_cache_bytes / 1_000_000
     );
-    let slatedb_cache_dir = format!("{}/slatedb", cache_config.root_folder);
 
     let l0_max_ssts = lsm_config
         .map(|c| c.l0_max_ssts())
@@ -286,7 +285,7 @@ pub async fn build_slatedb(
     let settings = slatedb::config::Settings {
         l0_max_ssts,
         object_store_cache_options: ObjectStoreCacheOptions {
-            root_folder: Some(slatedb_cache_dir.clone().into()),
+            root_folder: Some(PathBuf::from(cache_config.root_folder.clone())),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
             part_size_bytes: 16 * 1024 * 1024,
             cache_puts: false,
