@@ -6,6 +6,11 @@
 
 <div align="center">
 
+![GitHub Release](https://img.shields.io/github/v/release/barre/zerofs)
+![GitHub License](https://img.shields.io/github/license/barre/zerofs)
+<a href="https://discord.gg/5PxcuUeaaT">![Discord](https://img.shields.io/discord/1310528344730632292)</a>
+
+
 **[Documentation](https://www.zerofs.net)** | **[QuickStart](https://www.zerofs.net/quickstart)** | **[ZeroFS vs AWS EFS](https://www.zerofs.net/zerofs-vs-aws-efs)**
 
 </div>
