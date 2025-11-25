@@ -216,7 +216,7 @@ impl ZeroFS {
 
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, FsError> {
         let cache_key = CacheKey::Metadata(inode_id);
-        if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key).await {
+        if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key) {
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok((*cached_inode).clone());
         }
@@ -256,7 +256,7 @@ impl ZeroFS {
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
-        self.cache.insert(cache_key, cache_value).await;
+        self.cache.insert(cache_key, cache_value);
 
         Ok(inode)
     }
@@ -277,7 +277,7 @@ impl ZeroFS {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        self.cache.remove(CacheKey::Metadata(inode_id)).await;
+        self.cache.remove(CacheKey::Metadata(inode_id));
 
         Ok(())
     }

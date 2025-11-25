@@ -148,17 +148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-lock"
-version = "3.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd03604047cee9b6ce9de9f70c6cd540a0520c813cbd49bae61f33ab80ed1dc"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "pin-project-lite",
-]
-
-[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -511,15 +500,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -880,6 +860,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastant"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e825441bfb2d831c47c97d05821552db8832479f44c571b97fededbf0099c07"
+dependencies = [
+ "small_ctor",
+ "web-time",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -969,8 +959,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "642093b1a72c4a0ef89862484d669a353e732974781bb9c49a979526d1e30edc"
 dependencies = [
  "equivalent",
- "foyer-common",
- "foyer-memory",
+ "foyer-common 0.18.1",
+ "foyer-memory 0.18.1",
  "foyer-storage",
  "madsim-tokio",
  "mixtrics",
@@ -1002,6 +992,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "foyer-common"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a72f40b0c110e4233f46df0589bf1b2b3b5ed04e4cf504a582374d7548c9c05"
+dependencies = [
+ "bytes",
+ "cfg-if",
+ "itertools",
+ "madsim-tokio",
+ "mixtrics",
+ "parking_lot",
+ "pin-project",
+ "thiserror 2.0.17",
+ "tokio",
+ "twox-hash",
+]
+
+[[package]]
 name = "foyer-intrusive-collections"
 version = "0.10.0-dev"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,7 +1028,31 @@ dependencies = [
  "bitflags",
  "cmsketch",
  "equivalent",
- "foyer-common",
+ "foyer-common 0.18.1",
+ "foyer-intrusive-collections",
+ "hashbrown 0.15.5",
+ "itertools",
+ "madsim-tokio",
+ "mixtrics",
+ "parking_lot",
+ "pin-project",
+ "serde",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "foyer-memory"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1b23cefdcd78b4d729679d75bb6fb96a57f7dd94f141dcc373a2db1c04fbaa"
+dependencies = [
+ "arc-swap",
+ "bitflags",
+ "cmsketch",
+ "equivalent",
+ "foyer-common 0.20.1",
  "foyer-intrusive-collections",
  "hashbrown 0.15.5",
  "itertools",
@@ -1046,8 +1078,8 @@ dependencies = [
  "bytes",
  "equivalent",
  "flume",
- "foyer-common",
- "foyer-memory",
+ "foyer-common 0.18.1",
+ "foyer-memory 0.18.1",
  "fs4",
  "futures-core",
  "futures-util",
@@ -1833,27 +1865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moka"
-version = "0.12.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8261cd88c312e0004c1d51baad2980c66528dfdb2bee62003e643a4d8f86b077"
-dependencies = [
- "async-lock",
- "crossbeam-channel",
- "crossbeam-epoch",
- "crossbeam-utils",
- "equivalent",
- "event-listener",
- "futures-util",
- "parking_lot",
- "portable-atomic",
- "rustc_version",
- "smallvec",
- "tagptr",
- "uuid",
-]
-
-[[package]]
 name = "naive-timer"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2196,12 +2207,6 @@ dependencies = [
  "opaque-debug",
  "universal-hash",
 ]
-
-[[package]]
-name = "portable-atomic"
-version = "1.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
 name = "potential_utf"
@@ -2849,7 +2854,6 @@ dependencies = [
  "foyer",
  "futures",
  "log",
- "moka",
  "object_store",
  "once_cell",
  "ouroboros",
@@ -2870,6 +2874,12 @@ dependencies = [
  "uuid",
  "walkdir",
 ]
+
+[[package]]
+name = "small_ctor"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88414a5ca1f85d82cc34471e975f0f74f6aa54c40f062efa42c0080e7f763f81"
 
 [[package]]
 name = "smallvec"
@@ -2967,12 +2977,6 @@ dependencies = [
  "quote",
  "syn 2.0.110",
 ]
-
-[[package]]
-name = "tagptr"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tap"
@@ -4059,13 +4063,14 @@ dependencies = [
  "comfy-table",
  "dashmap",
  "deku",
+ "fastant",
+ "foyer-memory 0.20.1",
  "futures",
  "generic-array",
  "hex",
  "hkdf",
  "libc",
  "lz4_flex",
- "moka",
  "num-format",
  "object_store",
  "rand 0.8.5",

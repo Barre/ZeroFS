@@ -412,7 +412,7 @@ impl ZeroFS {
             name: from_name.to_vec(),
         });
 
-        self.cache.remove_batch(futures).await;
+        self.cache.remove_batch(futures);
 
         match source_inode {
             Inode::File(_) => {

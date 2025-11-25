@@ -214,7 +214,7 @@ impl ZeroFS {
                     },
                 ];
 
-                self.cache.remove_batch(futures).await;
+                self.cache.remove_batch(futures);
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
