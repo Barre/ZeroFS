@@ -156,6 +156,17 @@ pub enum SlateDbHandle {
     ReadOnly(ArcSwap<DbReader>),
 }
 
+impl Clone for SlateDbHandle {
+    fn clone(&self) -> Self {
+        match self {
+            SlateDbHandle::ReadWrite(db) => SlateDbHandle::ReadWrite(db.clone()),
+            SlateDbHandle::ReadOnly(reader) => {
+                SlateDbHandle::ReadOnly(ArcSwap::new(reader.load_full()))
+            }
+        }
+    }
+}
+
 impl SlateDbHandle {
     pub fn is_read_only(&self) -> bool {
         matches!(self, SlateDbHandle::ReadOnly(_))
