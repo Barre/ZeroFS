@@ -69,7 +69,7 @@ pub async fn change_password(
         object_store,
         &cache_config,
         actual_db_path,
-        false,
+        crate::cli::server::DatabaseMode::ReadWrite,
         settings.lsm,
     )
     .await
