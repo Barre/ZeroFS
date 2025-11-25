@@ -1,0 +1,141 @@
+export const metadata = {
+  title: 'Checkpoints',
+  description:
+    'Learn how to create point-in-time snapshots of your ZeroFS database for backup and recovery.',
+}
+
+# Checkpoints
+
+ZeroFS supports creating named checkpoints for point-in-time snapshots. Checkpoints capture the database state at a specific moment, enabling you to open historical views of your data. {{ className: 'lead' }}
+
+## Overview
+
+Checkpoints are named snapshots of your database state. They're useful for:
+
+- **Point-in-time recovery**: Access data as it was at a specific moment
+- **Consistent backups**: Create snapshots before risky operations
+- **Historical analysis**: Run read-only queries against past states
+
+### Creating Checkpoints
+
+<Row>
+  <Col>
+
+    Checkpoints are created via RPC commands while ZeroFS is running. This ensures data consistency by coordinating with the active database.
+
+    Each checkpoint has:
+    - **Name**: A unique identifier you choose
+    - **ID**: An internal UUID
+    - **Timestamp**: When the checkpoint was created
+
+  </Col>
+  <Col>
+
+    ```bash {{ title: 'Create a Checkpoint' }}
+    # Create a named checkpoint
+    zerofs checkpoint create -c zerofs.toml my-snapshot
+
+    # Output:
+    # Checkpoint created successfully!
+    #   Name: my-snapshot
+    #   ID: 01234567-89ab-cdef-0123-456789abcdef
+    #   Created at: 2025-01-15 10:30:00
+    ```
+
+  </Col>
+</Row>
+
+### Managing Checkpoints
+
+<Row>
+  <Col>
+
+    ```bash {{ title: 'List Checkpoints' }}
+    zerofs checkpoint list -c zerofs.toml
+    ```
+
+  </Col>
+  <Col>
+
+    ```bash {{ title: 'Checkpoint Info & Deletion' }}
+    # Get details about a specific checkpoint
+    zerofs checkpoint info -c zerofs.toml my-snapshot
+
+    # Delete a checkpoint
+    zerofs checkpoint delete -c zerofs.toml old-snapshot
+    ```
+
+  </Col>
+</Row>
+
+### Opening from a Checkpoint
+
+You can start ZeroFS in read-only mode from a specific checkpoint. This is useful for:
+
+- Inspecting historical data
+- Running read-only analytics on a consistent snapshot
+- Verifying data integrity
+
+```bash
+# Start ZeroFS from a checkpoint (read-only)
+zerofs run -c zerofs.toml --checkpoint my-snapshot
+
+# Mount and access historical data
+mount -t nfs 127.0.0.1:/ /mnt/snapshot
+ls /mnt/snapshot  # See data as it was at checkpoint time
+```
+
+<Note>
+  Opening from a checkpoint is always read-only. The checkpoint data is preserved and cannot be modified.
+</Note>
+
+## Use Cases
+
+### Pre-Migration Snapshots
+
+Create checkpoints before major changes:
+
+```bash
+# Checkpoint before migration
+zerofs checkpoint create -c zerofs.toml pre-migration
+
+# Run migration...
+
+# If something goes wrong, you can inspect the pre-migration state
+zerofs run -c zerofs.toml --checkpoint pre-migration
+```
+
+### Regular Backups
+
+Maintain periodic checkpoints:
+
+```bash
+# Create daily checkpoints
+zerofs checkpoint create -c zerofs.toml daily-2025-01-15
+
+# List available checkpoints
+zerofs checkpoint list -c zerofs.toml
+
+# Clean up old checkpoints
+zerofs checkpoint delete -c zerofs.toml daily-2025-01-01
+```
+
+## Configuration
+
+Checkpoint commands require the RPC server to be enabled:
+
+```toml {{ title: 'zerofs.toml' }}
+[servers.rpc]
+addresses = ["127.0.0.1:7000"]
+unix_socket = "/tmp/zerofs.rpc.sock"
+```
+
+<Note>
+  The RPC server must be running (via `zerofs run`) for checkpoint create, list, delete, and info commands to work.
+</Note>
+
+<div className="not-prose">
+  <Button href="/configuration" variant="text" arrow="right">
+    Learn more about configuration options
+  </Button>
+</div>

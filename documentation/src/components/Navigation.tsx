@@ -241,6 +241,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'Architecture', href: '/architecture' },
       { title: 'Encryption & Security', href: '/encryption' },
       { title: 'Configuration', href: '/configuration' },
+      { title: 'Checkpoints', href: '/checkpoints' },
       { title: 'Troubleshooting', href: '/troubleshooting' },
       { title: 'Advanced Use Cases', href: '/advanced-use-cases' },
     ],
