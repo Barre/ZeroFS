@@ -1,9 +1,9 @@
-use moka::future::{Cache, CacheBuilder};
+use foyer_memory::{Cache, CacheBuilder};
 
 use super::inode::{Inode, InodeId};
 use std::sync::Arc;
 
-const MAX_ENTRIES: u64 = 50_000;
+const MAX_ENTRIES: usize = 50_000;
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
 pub enum CacheKey {
@@ -25,7 +25,7 @@ pub struct UnifiedCache {
 
 impl UnifiedCache {
     pub fn new(is_active: bool) -> anyhow::Result<Self> {
-        let cache = CacheBuilder::new(MAX_ENTRIES).build();
+        let cache = CacheBuilder::new(MAX_ENTRIES).with_shards(64).build();
 
         Ok(Self {
             cache: Arc::new(cache),
@@ -33,32 +33,33 @@ impl UnifiedCache {
         })
     }
 
-    pub async fn get(&self, key: CacheKey) -> Option<CacheValue> {
+    pub fn get(&self, key: CacheKey) -> Option<CacheValue> {
         if !self.is_active {
             return None;
         }
-        self.cache.get(&key).await
+        self.cache.get(&key).map(|entry| entry.value().clone())
     }
 
-    pub async fn insert(&self, key: CacheKey, value: CacheValue) {
+    pub fn insert(&self, key: CacheKey, value: CacheValue) {
         if !self.is_active {
             return;
         }
-        self.cache.insert(key, value).await;
+        self.cache.insert(key, value);
     }
 
-    pub async fn remove(&self, key: CacheKey) {
+    pub fn remove(&self, key: CacheKey) {
         if !self.is_active {
             return;
         }
-        self.cache.remove(&key).await;
+        self.cache.remove(&key);
     }
 
-    pub async fn remove_batch(&self, keys: Vec<CacheKey>) {
+    pub fn remove_batch(&self, keys: Vec<CacheKey>) {
         if !self.is_active {
             return;
         }
-        let futures = keys.iter().map(|key| self.cache.remove(key));
-        futures::future::join_all(futures).await;
+        for key in keys {
+            self.cache.remove(&key);
+        }
     }
 }

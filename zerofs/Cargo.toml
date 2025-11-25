@@ -23,7 +23,9 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { version = "0.9.2", features = ["moka"] }
+slatedb = "0.9.2"
+foyer-memory = "0.20.1"
+fastant = "0.1.11"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.48", features = ["full"] }
@@ -53,7 +55,6 @@ comfy-table = "7.1"
 num-format = "0.4"
 libc = "0.2"
 dashmap = "6.1"
-moka = { version = "0.12", features = ["future"] }
 uuid = { version = "1.17", features = ["v4"] }
 toml = "0.9"
 shellexpand = "3.1"

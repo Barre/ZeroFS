@@ -39,7 +39,7 @@ impl ZeroFS {
                     dir_id: dirid,
                     name: filename.to_vec(),
                 };
-                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key).await {
+                if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key) {
                     debug!(
                         "process_lookup cache hit: {} -> inode {}",
                         String::from_utf8_lossy(filename),
@@ -71,7 +71,7 @@ impl ZeroFS {
                             name: filename.to_vec(),
                         };
                         let cache_value = CacheValue::DirEntry(inode_id);
-                        self.cache.insert(cache_key, cache_value).await;
+                        self.cache.insert(cache_key, cache_value);
 
                         Ok(inode_id)
                     }
@@ -236,7 +236,7 @@ impl ZeroFS {
 
                 self.global_stats.commit_update(&stats_update);
 
-                self.cache.remove(CacheKey::Metadata(dirid)).await;
+                self.cache.remove(CacheKey::Metadata(dirid));
 
                 self.stats
                     .directories_created
