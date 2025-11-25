@@ -310,6 +310,41 @@ zerofs run -c zerofs.toml --read-only
 
 Read-only instances automatically see updates from the writer and return `EROFS` errors for write operations.
 
+### Checkpoints
+
+ZeroFS supports creating named checkpoints for point-in-time snapshots.
+
+**Creating and managing checkpoints:**
+
+```bash
+# Create a named checkpoint (requires RPC server and running ZeroFS instance)
+zerofs checkpoint create -c zerofs.toml my-snapshot
+
+# List all checkpoints
+zerofs checkpoint list -c zerofs.toml
+
+# Get checkpoint info
+zerofs checkpoint info -c zerofs.toml my-snapshot
+
+# Delete a checkpoint
+zerofs checkpoint delete -c zerofs.toml my-snapshot
+```
+
+**Opening from a checkpoint (read-only):**
+
+```bash
+# Start ZeroFS from a specific checkpoint
+zerofs run -c zerofs.toml --checkpoint my-snapshot
+```
+
+**RPC server configuration** (required for checkpoint commands):
+
+```toml
+[servers.rpc]
+addresses = ["127.0.0.1:7000"]
+unix_socket = "/tmp/zerofs.rpc.sock"
+```
+
 ### Encryption
 
 Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
