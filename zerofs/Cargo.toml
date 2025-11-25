@@ -27,6 +27,7 @@ slatedb = { version = "0.9.2", features = ["moka"] }
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.15"
 tokio = { version = "1.48", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -57,6 +58,9 @@ uuid = { version = "1.17", features = ["v4"] }
 toml = "0.9"
 shellexpand = "3.1"
 clap = { version = "4.5", features = ["derive"] }
+tarpc = { version = "0.37", features = ["tokio1", "serde-transport"] }
+tokio-serde = { version = "0.9", features = ["bincode"] }
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3.21"
