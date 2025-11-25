@@ -1,5 +1,6 @@
 use crate::bucket_identity;
-use crate::config::{NbdConfig, NfsConfig, NinePConfig, Settings};
+use crate::checkpoint_manager::CheckpointManager;
+use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
@@ -9,15 +10,14 @@ use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use slatedb::DbBuilder;
-use slatedb::DbReader;
 use slatedb::admin::AdminBuilder;
-use slatedb::config::CheckpointOptions;
-use slatedb::config::DbReaderOptions;
-use slatedb::config::GarbageCollectorDirectoryOptions;
-use slatedb::config::{GarbageCollectorOptions, ObjectStoreCacheOptions};
+use slatedb::config::{
+    CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
+    ObjectStoreCacheOptions,
+};
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
+use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +26,40 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
+
+#[derive(Debug, Clone, Copy)]
+pub enum DatabaseMode {
+    ReadWrite,
+    ReadOnly,
+    Checkpoint(uuid::Uuid),
+}
+
+impl DatabaseMode {
+    pub fn is_read_only(&self) -> bool {
+        !matches!(self, DatabaseMode::ReadWrite)
+    }
+}
+
+async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
+    let env_vars = settings.cloud_provider_env_vars();
+    let (object_store, path_from_url) =
+        parse_url_opts(&settings.storage.url.parse()?, env_vars.into_iter())?;
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let db_path = Path::from(path_from_url.to_string());
+
+    let admin = AdminBuilder::new(db_path, object_store).build();
+
+    let checkpoints = admin
+        .list_checkpoints(Some(name))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list checkpoints: {}", e))?;
+
+    checkpoints
+        .into_iter()
+        .find(|cp| cp.name.as_deref() == Some(name))
+        .map(|cp| cp.id)
+        .ok_or_else(|| anyhow::anyhow!("Checkpoint '{}' not found", name))
+}
 
 async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
@@ -157,6 +191,47 @@ async fn start_nbd_servers(
     handles
 }
 
+async fn start_rpc_servers(
+    config: Option<&RpcConfig>,
+    checkpoint_manager: Arc<CheckpointManager>,
+) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
+    let config = match config {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    let service = crate::rpc::server::ZeroFsServiceImpl::new(checkpoint_manager);
+    let mut handles = Vec::new();
+
+    if let Some(addresses) = &config.addresses {
+        for &addr in addresses {
+            info!("Starting RPC server on {}", addr);
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                crate::rpc::server::serve_tcp(addr, service)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }));
+        }
+    }
+
+    if let Some(socket_path) = &config.unix_socket {
+        info!(
+            "Starting RPC server on Unix socket: {}",
+            socket_path.display()
+        );
+        let socket_path = socket_path.clone();
+        let service = service.clone();
+        handles.push(tokio::spawn(async move {
+            crate::rpc::server::serve_unix(socket_path, service)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }));
+    }
+
+    handles
+}
+
 fn start_garbage_collection(fs: Arc<ZeroFS>) -> JoinHandle<()> {
     tokio::spawn(async move {
         info!("Starting garbage collection task (runs continuously)");
@@ -251,7 +326,7 @@ pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
     cache_config: &CacheConfig,
     db_path: String,
-    read_only: bool,
+    db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
 ) -> Result<(SlateDbHandle, Option<CheckpointRefreshParams>)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
@@ -337,63 +412,87 @@ pub async fn build_slatedb(
     })
     .await?;
 
-    if read_only {
-        info!("Opening database in read-only mode");
+    match db_mode {
+        DatabaseMode::ReadWrite => {
+            info!("Opening database in read-write mode");
+            let slatedb = Arc::new(
+                DbBuilder::new(db_path, object_store)
+                    .with_settings(settings)
+                    .with_gc_runtime(runtime_handle.clone())
+                    .with_compaction_runtime(runtime_handle.clone())
+                    .with_memory_cache(cache)
+                    .build()
+                    .await?,
+            );
 
-        let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
-        let checkpoint_result = admin
-            .create_detached_checkpoint(&CheckpointOptions {
-                lifetime: Some(std::time::Duration::from_secs(
-                    CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
-                )),
-                ..Default::default()
-            })
-            .await?;
+            Ok((SlateDbHandle::ReadWrite(slatedb), None))
+        }
+        DatabaseMode::ReadOnly => {
+            info!("Opening database in read-only mode");
 
-        info!(
-            "Created initial checkpoint with ID: {}",
-            checkpoint_result.id
-        );
+            let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
+            let checkpoint_result = admin
+                .create_detached_checkpoint(&CheckpointOptions {
+                    lifetime: Some(std::time::Duration::from_secs(
+                        CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
+                    )),
+                    ..Default::default()
+                })
+                .await?;
 
-        let db_path_str = db_path.to_string();
-        let reader = Arc::new(
-            DbReader::open(
-                db_path,
-                object_store.clone(),
-                Some(checkpoint_result.id),
-                DbReaderOptions::default(),
-            )
-            .await?,
-        );
+            info!(
+                "Created initial checkpoint with ID: {}",
+                checkpoint_result.id
+            );
 
-        let checkpoint_params = CheckpointRefreshParams {
-            db_path: db_path_str,
-            object_store,
-        };
-
-        Ok((
-            SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
-            Some(checkpoint_params),
-        ))
-    } else {
-        let slatedb = Arc::new(
-            DbBuilder::new(db_path, object_store)
-                .with_settings(settings)
-                .with_gc_runtime(runtime_handle.clone())
-                .with_compaction_runtime(runtime_handle.clone())
-                .with_memory_cache(cache)
-                .build()
+            let db_path_str = db_path.to_string();
+            let reader = Arc::new(
+                DbReader::open(
+                    db_path,
+                    object_store.clone(),
+                    Some(checkpoint_result.id),
+                    DbReaderOptions::default(),
+                )
                 .await?,
-        );
+            );
 
-        Ok((SlateDbHandle::ReadWrite(slatedb), None))
+            let checkpoint_params = CheckpointRefreshParams {
+                db_path: db_path_str,
+                object_store,
+            };
+
+            Ok((
+                SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+                Some(checkpoint_params),
+            ))
+        }
+        DatabaseMode::Checkpoint(checkpoint_id) => {
+            info!("Opening database from checkpoint ID: {}", checkpoint_id);
+
+            let reader = Arc::new(
+                DbReader::open(
+                    db_path,
+                    object_store,
+                    Some(checkpoint_id),
+                    DbReaderOptions::default(),
+                )
+                .await?,
+            );
+
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+        }
     }
 }
 
-async fn initialize_filesystem(
-    settings: &Settings,
-    read_only: bool,
-) -> Result<(Arc<ZeroFS>, Option<CheckpointRefreshParams>)> {
+pub struct InitResult {
+    pub fs: Arc<ZeroFS>,
+    pub checkpoint_params: Option<CheckpointRefreshParams>,
+    pub object_store: Arc<dyn object_store::ObjectStore>,
+    pub db_path: String,
+    pub db_handle: SlateDbHandle,
+}
+
+async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Result<InitResult> {
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
@@ -430,7 +529,7 @@ async fn initialize_filesystem(
         cache_config.root_folder
     );
 
-    if !read_only {
+    if !db_mode.is_read_only() {
         crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
             .await?;
     }
@@ -443,10 +542,10 @@ async fn initialize_filesystem(
     info!("Loading or initializing encryption key");
 
     let (slatedb, checkpoint_params) = build_slatedb(
-        object_store,
+        object_store.clone(),
         &cache_config,
-        actual_db_path,
-        read_only,
+        actual_db_path.clone(),
+        db_mode,
         settings.lsm,
     )
     .await?;
@@ -459,12 +558,23 @@ async fn initialize_filesystem(
         .map(|fs_config| fs_config.max_bytes())
         .unwrap_or(crate::config::FilesystemConfig::DEFAULT_MAX_BYTES);
 
+    let db_handle = slatedb.clone();
     let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key, max_bytes).await?;
 
-    Ok((Arc::new(fs), checkpoint_params))
+    Ok(InitResult {
+        fs: Arc::new(fs),
+        checkpoint_params,
+        object_store,
+        db_path: actual_db_path,
+        db_handle,
+    })
 }
 
-pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
+pub async fn run_server(
+    config_path: PathBuf,
+    read_only: bool,
+    checkpoint_name: Option<String>,
+) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info"));
@@ -476,9 +586,27 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     let settings = Settings::from_file(config_path.to_str().unwrap())
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-    let (fs, checkpoint_params) = initialize_filesystem(&settings, read_only).await?;
+    let db_mode = match (read_only, &checkpoint_name) {
+        (false, None) => DatabaseMode::ReadWrite,
+        (true, None) => DatabaseMode::ReadOnly,
+        (false, Some(name)) => {
+            let uuid = resolve_checkpoint_name(&settings, name)
+                .await
+                .with_context(|| format!("Failed to resolve checkpoint '{}'", name))?;
+            DatabaseMode::Checkpoint(uuid)
+        }
+        (true, Some(_)) => {
+            return Err(anyhow::anyhow!(
+                "Cannot specify both --read-only and --checkpoint flags"
+            ));
+        }
+    };
 
-    if !read_only && settings.servers.nbd.is_some() {
+    let init_result = initialize_filesystem(&settings, db_mode).await?;
+    let fs = init_result.fs;
+    let checkpoint_params = init_result.checkpoint_params;
+
+    if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
     }
 
@@ -488,6 +616,13 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
         start_ninep_servers(Arc::clone(&fs), settings.servers.ninep.as_ref()).await?;
 
     let nbd_handles = start_nbd_servers(Arc::clone(&fs), settings.servers.nbd.as_ref()).await;
+
+    let checkpoint_manager = Arc::new(CheckpointManager::new(
+        init_result.db_handle,
+        slatedb::object_store::path::Path::from(init_result.db_path),
+        init_result.object_store,
+    ));
+    let rpc_handles = start_rpc_servers(settings.servers.rpc.as_ref(), checkpoint_manager).await;
 
     let gc_handle = start_garbage_collection(Arc::clone(&fs));
     let stats_handle = start_stats_reporting(Arc::clone(&fs));
@@ -501,10 +636,11 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
     server_handles.extend(nfs_handles);
     server_handles.extend(ninep_handles);
     server_handles.extend(nbd_handles);
+    server_handles.extend(rpc_handles);
 
     if server_handles.is_empty() {
         return Err(anyhow::anyhow!(
-            "No servers configured. At least one server (NFS, 9P, or NBD) must be enabled."
+            "No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled."
         ));
     }
 
@@ -513,7 +649,7 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
             let (result, _, _) = result;
             result??;
         }
-        _ = gc_handle, if !read_only => {
+        _ = gc_handle, if !db_mode.is_read_only() => {
             unreachable!("GC task should never complete");
         }
         _ = stats_handle => {
@@ -524,14 +660,14 @@ pub async fn run_server(config_path: PathBuf, read_only: bool) -> Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");
-            if !read_only {
+            if !db_mode.is_read_only() {
                 fs.flush().await?;
             }
             fs.db.close().await?;
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, shutting down gracefully...");
-            if !read_only {
+            if !db_mode.is_read_only() {
                 fs.flush().await?;
             }
             fs.db.close().await?;
