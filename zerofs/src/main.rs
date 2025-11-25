@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::io::BufRead;
 
 mod bucket_identity;
+mod checkpoint_manager;
 mod cli;
 mod config;
 mod encryption;
@@ -11,6 +12,7 @@ mod nbd;
 mod nfs;
 mod ninep;
 mod parse_object_store;
+mod rpc;
 mod storage_compatibility;
 
 #[cfg(test)]
@@ -69,12 +71,30 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        cli::Commands::Run { config, read_only } => {
-            cli::server::run_server(config, read_only).await?;
+        cli::Commands::Run {
+            config,
+            read_only,
+            checkpoint,
+        } => {
+            cli::server::run_server(config, read_only, checkpoint).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
                 cli::debug::list_keys(config).await?;
+            }
+        },
+        cli::Commands::Checkpoint { subcommand } => match subcommand {
+            cli::CheckpointCommands::Create { config, name } => {
+                cli::checkpoint::create_checkpoint(&config, &name).await?;
+            }
+            cli::CheckpointCommands::List { config } => {
+                cli::checkpoint::list_checkpoints(&config).await?;
+            }
+            cli::CheckpointCommands::Delete { config, name } => {
+                cli::checkpoint::delete_checkpoint(&config, &name).await?;
+            }
+            cli::CheckpointCommands::Info { config, name } => {
+                cli::checkpoint::get_checkpoint_info(&config, &name).await?;
             }
         },
     }
