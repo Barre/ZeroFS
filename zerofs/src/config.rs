@@ -122,6 +122,8 @@ pub struct ServerConfig {
     pub ninep: Option<NinePConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbd: Option<NbdConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc: Option<RpcConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -147,6 +149,19 @@ pub struct NinePConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NbdConfig {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addresses: Option<HashSet<SocketAddr>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_path",
+        default
+    )]
+    pub unix_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RpcConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub addresses: Option<HashSet<SocketAddr>>,
     #[serde(
@@ -216,6 +231,15 @@ fn default_nbd_addresses() -> HashSet<SocketAddr> {
     set.insert(SocketAddr::new(
         IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         10809,
+    ));
+    set
+}
+
+fn default_rpc_addresses() -> HashSet<SocketAddr> {
+    let mut set = HashSet::new();
+    set.insert(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        7000,
     ));
     set
 }
@@ -346,6 +370,10 @@ impl Settings {
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
+                }),
+                rpc: Some(RpcConfig {
+                    addresses: Some(default_rpc_addresses()),
+                    unix_socket: Some(PathBuf::from("/tmp/zerofs.rpc.sock")),
                 }),
             },
             filesystem: None,
