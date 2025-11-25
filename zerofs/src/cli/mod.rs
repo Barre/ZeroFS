@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod checkpoint;
 pub mod debug;
 pub mod password;
 pub mod server;
@@ -25,8 +26,11 @@ pub enum Commands {
         #[arg(short, long)]
         config: PathBuf,
         /// Open the filesystem in read-only mode
-        #[arg(long)]
+        #[arg(long, conflicts_with = "checkpoint")]
         read_only: bool,
+        /// Open from a specific checkpoint by name (read-only mode)
+        #[arg(long, conflicts_with = "read_only")]
+        checkpoint: Option<String>,
     },
     /// Change the encryption password
     ///
@@ -44,6 +48,11 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: DebugCommands,
     },
+    /// Checkpoint management commands
+    Checkpoint {
+        #[command(subcommand)]
+        subcommand: CheckpointCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -52,6 +61,36 @@ pub enum DebugCommands {
     ListKeys {
         #[arg(short, long)]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CheckpointCommands {
+    /// Create a new checkpoint
+    Create {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Name for the checkpoint (must be unique)
+        name: String,
+    },
+    /// List all checkpoints
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Delete a checkpoint by name
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Checkpoint name to delete
+        name: String,
+    },
+    /// Get checkpoint information
+    Info {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Checkpoint name to query
+        name: String,
     },
 }
 
