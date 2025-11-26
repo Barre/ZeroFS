@@ -358,6 +358,7 @@ pub async fn build_slatedb(
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
 
     let settings = slatedb::config::Settings {
+        wal_enabled: false,
         l0_max_ssts,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(PathBuf::from(cache_config.root_folder.clone())),
