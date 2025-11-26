@@ -9,7 +9,6 @@ pub mod operations;
 pub mod permissions;
 pub mod stats;
 pub mod types;
-pub mod write_coordinator;
 
 use self::cache::{CacheKey, CacheValue, UnifiedCache};
 use self::flush_coordinator::FlushCoordinator;
@@ -17,14 +16,11 @@ use self::key_codec::{KeyCodec, ParsedKey};
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedWriteBatch, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zerofs_nfsserve::nfs::fileid3;
-
-pub use self::write_coordinator::SequenceGuard;
 
 use self::errors::FsError;
 use self::inode::{DirectoryInode, Inode, InodeId};
@@ -102,7 +98,6 @@ pub struct ZeroFS {
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     flush_coordinator: FlushCoordinator,
-    pub write_coordinator: Arc<WriteCoordinator>,
     pub max_bytes: u64,
 }
 
@@ -189,7 +184,6 @@ impl ZeroFS {
         }
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
-        let write_coordinator = Arc::new(WriteCoordinator::new());
 
         let fs = Self {
             db: db.clone(),
@@ -199,7 +193,6 @@ impl ZeroFS {
             stats: Arc::new(FileSystemStats::new()),
             global_stats,
             flush_coordinator,
-            write_coordinator,
             max_bytes,
         };
 
@@ -221,29 +214,13 @@ impl ZeroFS {
         self.flush_coordinator.flush().await
     }
 
-    /// Allocate a sequence number for ordered commits.
-    /// Must be called FIRST before any operation-specific work.
-    pub fn allocate_sequence(&self) -> SequenceGuard {
-        self.write_coordinator.allocate_sequence()
-    }
-
     pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch, FsError> {
         self.db
             .new_write_batch()
             .map_err(|_| FsError::ReadOnlyFilesystem)
     }
 
-    pub async fn commit_batch_ordered(
-        &self,
-        mut batch: EncryptedWriteBatch,
-        seq_guard: &mut SequenceGuard,
-    ) -> Result<(), FsError> {
-        seq_guard.wait_for_predecessors().await;
-
-        let counter_key = KeyCodec::system_counter_key();
-        let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
-
+    pub async fn commit_batch(&self, batch: EncryptedWriteBatch) -> Result<(), FsError> {
         self.db
             .write_with_options(
                 batch,
@@ -252,10 +229,7 @@ impl ZeroFS {
                 },
             )
             .await
-            .map_err(|_| FsError::IoError)?;
-
-        seq_guard.mark_committed();
-        Ok(())
+            .map_err(|_| FsError::IoError)
     }
 
     pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, FsError> {

@@ -24,7 +24,6 @@ impl ZeroFS {
         offset: u64,
         data: &Bytes,
     ) -> Result<FileAttributes, FsError> {
-        let mut seq_guard = self.allocate_sequence();
         let start_time = std::time::Instant::now();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
@@ -163,7 +162,7 @@ impl ZeroFS {
                 };
 
                 let db_write_start = std::time::Instant::now();
-                self.commit_batch_ordered(batch, &mut seq_guard).await?;
+                self.commit_batch(batch).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
                 if let Some(update) = stats_update {
@@ -197,7 +196,6 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         debug!(
@@ -296,11 +294,9 @@ impl ZeroFS {
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
-                self.commit_batch_ordered(batch, &mut seq_guard)
-                    .await
-                    .inspect_err(|e| {
-                        error!("Failed to write batch: {:?}", e);
-                    })?;
+                self.commit_batch(batch).await.inspect_err(|e| {
+                    error!("Failed to write batch: {:?}", e);
+                })?;
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -425,7 +421,6 @@ impl ZeroFS {
         offset: u64,
         length: u64,
     ) -> Result<(), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         debug!(
             "Processing trim on inode {} at offset {} length {}",
             id, offset, length
@@ -500,11 +495,9 @@ impl ZeroFS {
             }
         }
 
-        self.commit_batch_ordered(batch, &mut seq_guard)
-            .await
-            .inspect_err(|e| {
-                error!("Failed to commit trim batch: {}", e);
-            })?;
+        self.commit_batch(batch).await.inspect_err(|e| {
+            error!("Failed to commit trim batch: {}", e);
+        })?;
 
         debug!("Trim completed successfully for inode {}", id);
         Ok(())

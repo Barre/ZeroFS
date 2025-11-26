@@ -20,7 +20,6 @@ impl ZeroFS {
         to_dirid: u64,
         to_name: &[u8],
     ) -> Result<(), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
@@ -374,7 +373,7 @@ impl ZeroFS {
             self.global_stats.add_to_batch(update, &mut batch)?;
         }
 
-        self.commit_batch_ordered(batch, &mut seq_guard).await?;
+        self.commit_batch(batch).await?;
 
         if let Some(update) = target_stats_update {
             self.global_stats.commit_update(&update);
