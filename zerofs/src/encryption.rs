@@ -309,6 +309,21 @@ impl EncryptedDb {
         Ok(())
     }
 
+    pub(crate) async fn write_raw_batch(
+        &self,
+        batch: WriteBatch,
+        options: &WriteOptions,
+    ) -> Result<()> {
+        if self.is_read_only() {
+            return Err(FsError::ReadOnlyFilesystem.into());
+        }
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.write_with_options(batch, options).await?,
+            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+        }
+        Ok(())
+    }
+
     pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
