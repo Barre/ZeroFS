@@ -255,6 +255,22 @@ fn start_stats_reporting(fs: Arc<ZeroFS>) -> JoinHandle<()> {
     })
 }
 
+fn start_periodic_flush(fs: Arc<ZeroFS>, interval_secs: u64) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        info!(
+            "Starting periodic flush task (flushes every {} seconds)",
+            interval_secs
+        );
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+            if let Err(e) = fs.flush().await {
+                tracing::error!("Periodic flush failed: {:?}", e);
+            }
+        }
+    })
+}
+
 pub struct CheckpointRefreshParams {
     pub db_path: String,
     pub object_store: Arc<dyn object_store::ObjectStore>,
@@ -626,6 +642,11 @@ pub async fn run_server(
 
     let gc_handle = start_garbage_collection(Arc::clone(&fs));
     let stats_handle = start_stats_reporting(Arc::clone(&fs));
+    let flush_interval_secs = settings
+        .lsm
+        .map(|c| c.flush_interval_secs())
+        .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
+    let flush_handle = start_periodic_flush(Arc::clone(&fs), flush_interval_secs);
 
     let checkpoint_handle =
         checkpoint_params.map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db)));
@@ -651,6 +672,9 @@ pub async fn run_server(
         }
         _ = gc_handle, if !db_mode.is_read_only() => {
             unreachable!("GC task should never complete");
+        }
+        _ = flush_handle, if !db_mode.is_read_only() => {
+            unreachable!("Periodic flush task should never complete");
         }
         _ = stats_handle => {
             unreachable!("Stats task should never complete");

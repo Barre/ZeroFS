@@ -75,6 +75,9 @@ pub struct LsmConfig {
     /// Maximum number of concurrent compactions
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_concurrent_compactions: Option<usize>,
+    /// Interval in seconds between periodic flushes
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub flush_interval_secs: Option<u64>,
 }
 
 impl LsmConfig {
@@ -84,6 +87,8 @@ impl LsmConfig {
     pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;
     /// Default max_concurrent_compactions: 8
     pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 8;
+    /// Default flush_interval_secs: 30 seconds
+    pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 
     /// Minimum l0_max_ssts to maintain reasonable performance
     pub const MIN_L0_MAX_SSTS: usize = 4;
@@ -91,6 +96,8 @@ impl LsmConfig {
     pub const MIN_MAX_UNFLUSHED_GB: f64 = 0.1;
     /// Minimum max_concurrent_compactions: 1
     pub const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
+    /// Minimum flush_interval_secs: 5 seconds
+    pub const MIN_FLUSH_INTERVAL_SECS: u64 = 5;
 
     pub fn l0_max_ssts(&self) -> usize {
         self.l0_max_ssts
@@ -110,6 +117,12 @@ impl LsmConfig {
         self.max_concurrent_compactions
             .unwrap_or(Self::DEFAULT_MAX_CONCURRENT_COMPACTIONS)
             .max(Self::MIN_MAX_CONCURRENT_COMPACTIONS)
+    }
+
+    pub fn flush_interval_secs(&self) -> u64 {
+        self.flush_interval_secs
+            .unwrap_or(Self::DEFAULT_FLUSH_INTERVAL_SECS)
+            .max(Self::MIN_FLUSH_INTERVAL_SECS)
     }
 }
 
@@ -410,6 +423,7 @@ impl Settings {
         toml_string.push_str("# l0_max_ssts = 16                 # Max SST files in L0 before compaction (default: 16, min: 4)\n");
         toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
+        toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 
