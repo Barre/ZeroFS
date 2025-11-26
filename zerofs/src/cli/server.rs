@@ -640,13 +640,21 @@ pub async fn run_server(
     ));
     let rpc_handles = start_rpc_servers(settings.servers.rpc.as_ref(), checkpoint_manager).await;
 
-    let gc_handle = start_garbage_collection(Arc::clone(&fs));
+    let gc_handle = if !db_mode.is_read_only() {
+        Some(start_garbage_collection(Arc::clone(&fs)))
+    } else {
+        None
+    };
     let stats_handle = start_stats_reporting(Arc::clone(&fs));
-    let flush_interval_secs = settings
-        .lsm
-        .map(|c| c.flush_interval_secs())
-        .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
-    let flush_handle = start_periodic_flush(Arc::clone(&fs), flush_interval_secs);
+    let flush_handle = if !db_mode.is_read_only() {
+        let flush_interval_secs = settings
+            .lsm
+            .map(|c| c.flush_interval_secs())
+            .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
+        Some(start_periodic_flush(Arc::clone(&fs), flush_interval_secs))
+    } else {
+        None
+    };
 
     let checkpoint_handle =
         checkpoint_params.map(|params| start_checkpoint_refresh(params, Arc::clone(&fs.db)));
@@ -670,10 +678,10 @@ pub async fn run_server(
             let (result, _, _) = result;
             result??;
         }
-        _ = gc_handle, if !db_mode.is_read_only() => {
+        _ = async { gc_handle.unwrap().await }, if gc_handle.is_some() => {
             unreachable!("GC task should never complete");
         }
-        _ = flush_handle, if !db_mode.is_read_only() => {
+        _ = async { flush_handle.unwrap().await }, if flush_handle.is_some() => {
             unreachable!("Periodic flush task should never complete");
         }
         _ = stats_handle => {
