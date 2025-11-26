@@ -94,7 +94,6 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         debug!(
@@ -217,6 +216,7 @@ impl ZeroFS {
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
+                let mut seq_guard = self.allocate_sequence();
                 self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
                 self.global_stats.commit_update(&stats_update);

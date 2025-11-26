@@ -17,7 +17,6 @@ impl ZeroFS {
         dirid: InodeId,
         name: &[u8],
     ) -> Result<(), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         let creds = Credentials::from_auth_context(auth);
@@ -188,6 +187,7 @@ impl ZeroFS {
                     self.global_stats.add_to_batch(update, &mut batch)?;
                 }
 
+                let mut seq_guard = self.allocate_sequence();
                 self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
                 if let Some(update) = stats_update {

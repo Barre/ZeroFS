@@ -24,7 +24,6 @@ impl ZeroFS {
         offset: u64,
         data: &Bytes,
     ) -> Result<FileAttributes, FsError> {
-        let mut seq_guard = self.allocate_sequence();
         let start_time = std::time::Instant::now();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
@@ -163,6 +162,7 @@ impl ZeroFS {
                 };
 
                 let db_write_start = std::time::Instant::now();
+                let mut seq_guard = self.allocate_sequence();
                 self.commit_batch_ordered(batch, &mut seq_guard).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
@@ -197,7 +197,6 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         debug!(
@@ -296,6 +295,7 @@ impl ZeroFS {
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
+                let mut seq_guard = self.allocate_sequence();
                 self.commit_batch_ordered(batch, &mut seq_guard)
                     .await
                     .inspect_err(|e| {
@@ -425,7 +425,6 @@ impl ZeroFS {
         offset: u64,
         length: u64,
     ) -> Result<(), FsError> {
-        let mut seq_guard = self.allocate_sequence();
         debug!(
             "Processing trim on inode {} at offset {} length {}",
             id, offset, length
@@ -500,6 +499,7 @@ impl ZeroFS {
             }
         }
 
+        let mut seq_guard = self.allocate_sequence();
         self.commit_batch_ordered(batch, &mut seq_guard)
             .await
             .inspect_err(|e| {
