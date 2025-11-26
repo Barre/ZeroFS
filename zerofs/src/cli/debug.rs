@@ -48,7 +48,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         object_store,
         &cache_config,
         actual_db_path,
-        super::server::DatabaseMode::ReadOnly,
+        super::server::DatabaseMode::ReadWrite,
         settings.lsm,
     )
     .await?;
