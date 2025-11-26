@@ -238,15 +238,19 @@ impl ZeroFS {
         mut batch: EncryptedWriteBatch,
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
-        seq_guard.wait_for_predecessors().await;
-
         let counter_key = KeyCodec::system_counter_key();
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
         batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
 
+        let (encrypt_result, _) = tokio::join!(
+            batch.into_inner(),
+            seq_guard.wait_for_predecessors()
+        );
+        let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
+
         self.db
-            .write_with_options(
-                batch,
+            .write_raw_batch(
+                inner_batch,
                 &WriteOptions {
                     await_durable: false,
                 },
