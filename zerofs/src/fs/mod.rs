@@ -242,10 +242,8 @@ impl ZeroFS {
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
         batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
 
-        let (encrypt_result, _) = tokio::join!(
-            batch.into_inner(),
-            seq_guard.wait_for_predecessors()
-        );
+        let (encrypt_result, _) =
+            tokio::join!(batch.into_inner(), seq_guard.wait_for_predecessors());
         let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
 
         self.db
