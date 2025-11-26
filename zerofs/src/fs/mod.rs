@@ -483,6 +483,7 @@ impl ZeroFS {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
 
         let settings = slatedb::config::Settings {
+            wal_enabled: false,
             compression_codec: None, // Disable compression - we handle it in encryption layer
             compactor_options: Some(slatedb::config::CompactorOptions {
                 ..Default::default()
@@ -750,6 +751,7 @@ mod tests {
 
         let test_key = [0u8; 32];
         let settings = slatedb::config::Settings {
+            wal_enabled: false,
             compression_codec: None,
             compactor_options: Some(slatedb::config::CompactorOptions {
                 ..Default::default()
