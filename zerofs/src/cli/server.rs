@@ -358,6 +358,7 @@ pub async fn build_slatedb(
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
 
     let settings = slatedb::config::Settings {
+        wal_enabled: false,
         l0_max_ssts,
         l0_sst_size_bytes: 256 * 1024 * 1024,
         object_store_cache_options: ObjectStoreCacheOptions {

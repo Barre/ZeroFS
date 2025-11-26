@@ -23,7 +23,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { version = "0.9.2" }
+slatedb = { version = "0.9.2", features = ["wal_disable"] }
 foyer-memory = "0.20.1"
 fastant = "0.1.11"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
