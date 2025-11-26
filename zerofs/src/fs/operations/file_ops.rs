@@ -10,7 +10,6 @@ use crate::fs::types::{
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
-use slatedb::config::WriteOptions;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
@@ -25,6 +24,7 @@ impl ZeroFS {
         offset: u64,
         data: &Bytes,
     ) -> Result<FileAttributes, FsError> {
+        let mut seq_guard = self.allocate_sequence();
         let start_time = std::time::Instant::now();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
@@ -72,10 +72,7 @@ impl ZeroFS {
                 let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
                 let end_chunk = (end_offset.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
 
-                let mut batch = self
-                    .db
-                    .new_write_batch()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut batch = self.new_write_batch()?;
 
                 let chunk_processing_start = std::time::Instant::now();
 
@@ -166,15 +163,7 @@ impl ZeroFS {
                 };
 
                 let db_write_start = std::time::Instant::now();
-                self.db
-                    .write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|_| FsError::IoError)?;
+                self.commit_batch_ordered(batch, &mut seq_guard).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
                 if let Some(update) = stats_update {
@@ -208,6 +197,7 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         debug!(
@@ -282,10 +272,7 @@ impl ZeroFS {
                     nlink: 1,
                 };
 
-                let mut batch = self
-                    .db
-                    .new_write_batch()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut batch = self.new_write_batch()?;
 
                 let file_inode_key = KeyCodec::inode_key(file_id);
                 let file_inode_data = bincode::serialize(&Inode::File(file_inode.clone()))?;
@@ -302,30 +289,17 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                // Persist the counter
-                let counter_key = KeyCodec::system_counter_key();
-                let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
-
                 let dir_key = KeyCodec::inode_key(dirid);
                 let dir_data = bincode::serialize(&dir_inode)?;
                 batch.put_bytes(&dir_key, Bytes::from(dir_data));
 
-                // Update statistics
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
-                self.db
-                    .write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
+                self.commit_batch_ordered(batch, &mut seq_guard)
                     .await
-                    .map_err(|e| {
+                    .inspect_err(|e| {
                         error!("Failed to write batch: {:?}", e);
-                        FsError::IoError
                     })?;
 
                 self.global_stats.commit_update(&stats_update);
@@ -451,6 +425,7 @@ impl ZeroFS {
         offset: u64,
         length: u64,
     ) -> Result<(), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         debug!(
             "Processing trim on inode {} at offset {} length {}",
             id, offset, length
@@ -478,10 +453,7 @@ impl ZeroFS {
         let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
         let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
 
-        let mut batch = self
-            .db
-            .new_write_batch()
-            .map_err(|_| FsError::ReadOnlyFilesystem)?;
+        let mut batch = self.new_write_batch()?;
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
@@ -528,17 +500,10 @@ impl ZeroFS {
             }
         }
 
-        self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
+        self.commit_batch_ordered(batch, &mut seq_guard)
             .await
-            .map_err(|e| {
+            .inspect_err(|e| {
                 error!("Failed to commit trim batch: {}", e);
-                FsError::IoError
             })?;
 
         debug!("Trim completed successfully for inode {}", id);

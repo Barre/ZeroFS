@@ -8,7 +8,6 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky
 use crate::fs::types::{AuthContext, InodeId};
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use bytes::Bytes;
-use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 
 impl ZeroFS {
@@ -18,6 +17,7 @@ impl ZeroFS {
         dirid: InodeId,
         name: &[u8],
     ) -> Result<(), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         let creds = Credentials::from_auth_context(auth);
@@ -78,10 +78,7 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                let mut batch = self
-                    .db
-                    .new_write_batch()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut batch = self.new_write_batch()?;
                 let (now_sec, now_nsec) = get_current_time();
 
                 match &mut file_inode {
@@ -191,15 +188,7 @@ impl ZeroFS {
                     self.global_stats.add_to_batch(update, &mut batch)?;
                 }
 
-                self.db
-                    .write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|_| FsError::IoError)?;
+                self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
                 if let Some(update) = stats_update {
                     self.global_stats.commit_update(&update);

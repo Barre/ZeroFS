@@ -12,7 +12,6 @@ use crate::fs::{EncodedFileId, ZeroFS, get_current_time};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
-use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -95,6 +94,7 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         debug!(
@@ -189,10 +189,7 @@ impl ZeroFS {
                     nlink: 2,
                 };
 
-                let mut batch = self
-                    .db
-                    .new_write_batch()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut batch = self.new_write_batch()?;
 
                 let new_dir_key = KeyCodec::inode_key(new_dir_id);
                 let new_dir_data = bincode::serialize(&Inode::Directory(new_dir_inode.clone()))?;
@@ -213,10 +210,6 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                let counter_key = KeyCodec::system_counter_key();
-                let next_id = self.next_inode_id.load(Ordering::SeqCst);
-                batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
-
                 let parent_dir_key = KeyCodec::inode_key(dirid);
                 let parent_dir_data = bincode::serialize(&dir_inode)?;
                 batch.put_bytes(&parent_dir_key, Bytes::from(parent_dir_data));
@@ -224,15 +217,7 @@ impl ZeroFS {
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
-                self.db
-                    .write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|_| FsError::IoError)?;
+                self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
                 self.global_stats.commit_update(&stats_update);
 

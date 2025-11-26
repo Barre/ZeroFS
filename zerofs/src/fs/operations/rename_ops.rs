@@ -8,7 +8,6 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky
 use crate::fs::types::AuthContext;
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use bytes::Bytes;
-use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -21,6 +20,7 @@ impl ZeroFS {
         to_dirid: u64,
         to_name: &[u8],
     ) -> Result<(), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
@@ -160,10 +160,7 @@ impl ZeroFS {
             check_sticky_bit_delete(target_dir, &target_inode, &creds)?;
         }
 
-        let mut batch = self
-            .db
-            .new_write_batch()
-            .map_err(|_| FsError::ReadOnlyFilesystem)?;
+        let mut batch = self.new_write_batch()?;
 
         let mut target_was_directory = false;
         let mut target_stats_update = None;
@@ -377,15 +374,7 @@ impl ZeroFS {
             self.global_stats.add_to_batch(update, &mut batch)?;
         }
 
-        self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
         if let Some(update) = target_stats_update {
             self.global_stats.commit_update(&update);
