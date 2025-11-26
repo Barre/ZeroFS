@@ -48,7 +48,7 @@ For improved performance when mounting locally, you can use Unix domain sockets:
 # Configure Unix socket in zerofs.toml
 [servers.ninep]
 addresses = ["127.0.0.1:5564"]
-socket = "/tmp/zerofs.sock"
+unix_socket = "/tmp/zerofs.sock"
 
 # Start ZeroFS
 # zerofs run --config zerofs.toml

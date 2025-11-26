@@ -30,12 +30,12 @@ addresses = ["127.0.0.1:10809"]
 
 # Unix socket mode (better performance for local access)
 [servers.nbd]
-socket = "/tmp/zerofs-nbd.sock"
+unix_socket = "/tmp/zerofs-nbd.sock"
 
 # Both TCP and Unix socket
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
-socket = "/tmp/zerofs-nbd.sock"
+unix_socket = "/tmp/zerofs-nbd.sock"
 ```
 
 Then start ZeroFS:

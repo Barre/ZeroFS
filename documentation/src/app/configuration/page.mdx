@@ -123,7 +123,7 @@ addresses = ["0.0.0.0:2049"]  # Bind addresses (default: ["127.0.0.1:2049"])
 ```toml
 [servers.ninep]
 addresses = ["0.0.0.0:5564"]  # Bind addresses (default: ["127.0.0.1:5564"])
-socket = "/tmp/zerofs.sock"  # Unix socket path (optional)
+unix_socket = "/tmp/zerofs.sock"
 ```
 
 ### NBD Server
@@ -131,7 +131,7 @@ socket = "/tmp/zerofs.sock"  # Unix socket path (optional)
 ```toml
 [servers.nbd]
 addresses = ["0.0.0.0:10809"]  # Bind addresses (default: ["127.0.0.1:10809"])
-socket = "/tmp/zerofs-nbd.sock"  # Unix socket path (optional)
+unix_socket = "/tmp/zerofs-nbd.sock"
 ```
 
 ## Filesystem Quotas
@@ -294,7 +294,7 @@ addresses = ["0.0.0.0:2049"]
 
 [servers.nbd]
 addresses = ["0.0.0.0:10809"]
-socket = "/tmp/zerofs-nbd.sock"  # Unix socket for better local performance
+unix_socket = "/tmp/zerofs-nbd.sock"  # Unix socket for better local performance
 ```
 
 ### S3-Compatible Services
