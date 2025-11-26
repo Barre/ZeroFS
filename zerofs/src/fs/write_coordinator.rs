@@ -236,4 +236,62 @@ mod tests {
             num_sequences as u64
         );
     }
+
+    /// sequences allocated AFTER locks prevents deadlock.
+    /// Task A holds lock, Task B waits for lock (no sequence), Task C is independent.
+    /// C should complete without waiting for B.
+    #[tokio::test]
+    async fn test_sequence_allocation_after_lock_prevents_deadlock() {
+        use tokio::sync::Mutex;
+
+        let coordinator = Arc::new(WriteCoordinator::new());
+        let lock_a = Arc::new(Mutex::new(()));
+        let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let coord_a = Arc::clone(&coordinator);
+        let lock_a_clone = Arc::clone(&lock_a);
+        let completed_a = Arc::clone(&completed);
+        let task_a = tokio::spawn(async move {
+            let _guard = lock_a_clone.lock().await;
+            let mut seq = coord_a.allocate_sequence();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            seq.wait_for_predecessors().await;
+            seq.mark_committed();
+            completed_a.fetch_add(1, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let coord_b = Arc::clone(&coordinator);
+        let lock_a_clone2 = Arc::clone(&lock_a);
+        let completed_b = Arc::clone(&completed);
+        let task_b = tokio::spawn(async move {
+            let _guard = lock_a_clone2.lock().await;
+            let mut seq = coord_b.allocate_sequence();
+            seq.wait_for_predecessors().await;
+            seq.mark_committed();
+            completed_b.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let coord_c = Arc::clone(&coordinator);
+        let completed_c = Arc::clone(&completed);
+        let task_c = tokio::spawn(async move {
+            let mut seq = coord_c.allocate_sequence();
+            seq.wait_for_predecessors().await;
+            seq.mark_committed();
+            completed_c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let result = tokio::time::timeout(Duration::from_millis(100), task_c).await;
+        assert!(
+            result.is_ok(),
+            "Task C should complete without waiting for Task B"
+        );
+
+        task_a.await.unwrap();
+        task_b.await.unwrap();
+
+        assert_eq!(completed.load(Ordering::SeqCst), 3);
+        assert_eq!(coordinator.committed_watermark.load(Ordering::SeqCst), 3);
+    }
 }
