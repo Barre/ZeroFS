@@ -11,7 +11,6 @@ use crate::fs::types::{
 };
 use crate::fs::{CHUNK_SIZE, InodeId, ZeroFS, get_current_time};
 use bytes::Bytes;
-use slatedb::config::WriteOptions;
 use tracing::debug;
 
 impl ZeroFS {
@@ -21,6 +20,7 @@ impl ZeroFS {
         id: InodeId,
         setattr: &SetAttributes,
     ) -> Result<FileAttributes, FsError> {
+        let mut seq_guard = self.allocate_sequence();
         debug!("process_setattr: id={}, setattr={:?}", id, setattr);
         let _guard = self.lock_manager.acquire_write(id).await;
         let mut inode = self.load_inode(id).await?;
@@ -100,10 +100,7 @@ impl ZeroFS {
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
 
-                        let mut batch = self
-                            .db
-                            .new_write_batch()
-                            .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                        let mut batch = self.new_write_batch()?;
 
                         if new_size < old_size {
                             let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
@@ -150,17 +147,8 @@ impl ZeroFS {
                             None
                         };
 
-                        self.db
-                            .write_with_options(
-                                batch,
-                                &WriteOptions {
-                                    await_durable: false,
-                                },
-                            )
-                            .await
-                            .map_err(|_| FsError::IoError)?;
+                        self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
-                        // Update in-memory statistics after successful commit
                         if let Some(update) = stats_update {
                             self.global_stats.commit_update(&update);
                         }
@@ -443,8 +431,9 @@ impl ZeroFS {
         name: &[u8],
         ftype: FileType,
         attr: &SetAttributes,
-        rdev: Option<(u32, u32)>, // For device files
+        rdev: Option<(u32, u32)>,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         validate_filename(name)?;
 
         debug!(
@@ -528,10 +517,7 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let mut batch = self
-                    .db
-                    .new_write_batch()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut batch = self.new_write_batch()?;
 
                 let special_inode_key = KeyCodec::inode_key(special_id);
                 let special_inode_data = bincode::serialize(&inode)?;
@@ -555,15 +541,7 @@ impl ZeroFS {
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
                 self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
-                self.db
-                    .write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await
-                    .map_err(|_| FsError::IoError)?;
+                self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
                 self.global_stats.commit_update(&stats_update);
 

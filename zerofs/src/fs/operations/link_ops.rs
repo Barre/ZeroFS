@@ -9,7 +9,6 @@ use crate::fs::types::{
 };
 use crate::fs::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
 use bytes::Bytes;
-use slatedb::config::WriteOptions;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -22,6 +21,7 @@ impl ZeroFS {
         target: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         validate_filename(linkname)?;
 
         debug!(
@@ -91,10 +91,7 @@ impl ZeroFS {
             nlink: 1,
         });
 
-        let mut batch = self
-            .db
-            .new_write_batch()
-            .map_err(|_| FsError::ReadOnlyFilesystem)?;
+        let mut batch = self.new_write_batch()?;
 
         let inode_key = KeyCodec::inode_key(new_id);
         let inode_data = bincode::serialize(&symlink_inode)?;
@@ -111,10 +108,6 @@ impl ZeroFS {
         dir.ctime = now_sec;
         dir.ctime_nsec = now_nsec;
 
-        let counter_key = KeyCodec::system_counter_key();
-        let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
-
         let dir_key = KeyCodec::inode_key(dirid);
         let dir_data = bincode::serialize(&dir_inode)?;
         batch.put_bytes(&dir_key, Bytes::from(dir_data));
@@ -122,15 +115,7 @@ impl ZeroFS {
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
         self.global_stats.add_to_batch(&stats_update, &mut batch)?;
 
-        self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
         self.global_stats.commit_update(&stats_update);
 
@@ -156,6 +141,7 @@ impl ZeroFS {
         linkdirid: InodeId,
         linkname: &[u8],
     ) -> Result<(), FsError> {
+        let mut seq_guard = self.allocate_sequence();
         validate_filename(linkname)?;
 
         let linkname_str = String::from_utf8_lossy(linkname);
@@ -205,10 +191,7 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        let mut batch = self
-            .db
-            .new_write_batch()
-            .map_err(|_| FsError::ReadOnlyFilesystem)?;
+        let mut batch = self.new_write_batch()?;
         batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(fileid));
 
         let scan_key = KeyCodec::dir_scan_key(linkdirid, fileid, linkname);
@@ -260,15 +243,7 @@ impl ZeroFS {
         let dir_inode_data = bincode::serialize(&Inode::Directory(link_dir))?;
         batch.put_bytes(&dir_inode_key, Bytes::from(dir_inode_data));
 
-        self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
+        self.commit_batch_ordered(batch, &mut seq_guard).await?;
 
         self.cache.remove_batch(vec![
             CacheKey::Metadata(fileid),
