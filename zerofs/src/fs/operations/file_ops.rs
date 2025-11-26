@@ -1,5 +1,5 @@
 use super::common::validate_filename;
-use crate::fs::cache::CacheKey;
+use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{FileInode, Inode};
 use crate::fs::key_codec::KeyCodec;
@@ -11,6 +11,7 @@ use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
 
@@ -170,7 +171,10 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
-                self.cache.remove(CacheKey::Metadata(id));
+                self.cache.insert(
+                    CacheKey::Metadata(id),
+                    CacheValue::Metadata(Arc::new(inode.clone())),
+                );
 
                 let elapsed = start_time.elapsed();
                 debug!(
