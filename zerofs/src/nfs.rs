@@ -61,7 +61,7 @@ impl NFSFileSystem for NFSAdapter {
         debug!("getattr called: id={}", id);
         let encoded_id = EncodedFileId::from(id);
         let real_id = encoded_id.inode_id();
-        let inode = self.fs.inode_store.get(real_id).await?;
+        let inode = self.fs.get_inode_cached(real_id).await?;
         Ok(InodeWithId {
             inode: &inode,
             id: real_id,
@@ -309,7 +309,7 @@ impl NFSFileSystem for NFSAdapter {
         debug!("readlink called: id={}", id);
         let real_id = EncodedFileId::from(id).inode_id();
 
-        let inode = self.fs.inode_store.get(real_id).await?;
+        let inode = self.fs.get_inode_cached(real_id).await?;
 
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
