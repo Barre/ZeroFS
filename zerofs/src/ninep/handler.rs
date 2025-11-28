@@ -1117,7 +1117,7 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
-        match self.filesystem.flush().await {
+        match self.filesystem.flush_coordinator.flush().await {
             Ok(_) => P9Message::new(tag, Message::Rfsync(Rfsync)),
             Err(e) => P9Message::error(tag, e.to_errno()),
         }

@@ -390,7 +390,7 @@ impl NFSFileSystem for NFSAdapter {
             count
         );
 
-        match self.fs.flush().await {
+        match self.fs.flush_coordinator.flush().await {
             Ok(_) => {
                 debug!("commit successful for file {}", real_fileid);
                 Ok(self.serverid())
