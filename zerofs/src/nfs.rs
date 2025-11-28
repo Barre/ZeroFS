@@ -54,7 +54,7 @@ impl NFSFileSystem for NFSAdapter {
         let creds = Credentials::from_auth_context(&auth_ctx);
 
         let inode_id = self.fs.process_lookup(&creds, real_dirid, filename).await?;
-        Ok(EncodedFileId::from_inode(inode_id).into())
+        Ok(EncodedFileId::from_inode(inode_id)?.into())
     }
 
     async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -135,7 +135,7 @@ impl NFSFileSystem for NFSAdapter {
             .await?;
 
         let fattr: fattr3 = (&file_attrs).into();
-        Ok((EncodedFileId::from_inode(id).into(), fattr))
+        Ok((EncodedFileId::from_inode(id)?.into(), fattr))
     }
 
     async fn create_exclusive(
@@ -156,7 +156,7 @@ impl NFSFileSystem for NFSAdapter {
             .process_create_exclusive(&auth.into(), real_dirid, filename)
             .await?;
 
-        Ok(EncodedFileId::from_inode(id).into())
+        Ok(EncodedFileId::from_inode(id)?.into())
     }
 
     async fn mkdir(
@@ -181,7 +181,7 @@ impl NFSFileSystem for NFSAdapter {
             .fs
             .process_mkdir(&creds, real_dirid, dirname, &fs_attr)
             .await?;
-        Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
+        Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
     }
 
     async fn remove(
@@ -307,7 +307,7 @@ impl NFSFileSystem for NFSAdapter {
             .await
             .map_err(|e: crate::fs::errors::FsError| -> nfsstat3 { e.into() })?;
 
-        Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
+        Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
     }
 
     async fn readlink(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
@@ -351,7 +351,7 @@ impl NFSFileSystem for NFSAdapter {
             .process_mknod(&creds, real_dirid, &filename.0, fs_type, &fs_attr, rdev)
             .await?;
 
-        Ok((EncodedFileId::from_inode(id).into(), (&file_attrs).into()))
+        Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
     }
 
     async fn link(
@@ -1007,7 +1007,7 @@ mod tests {
         assert!(result2.end);
 
         // Test 4: Resume from non-existent cookie (should fail)
-        let fake_cookie = EncodedFileId::new(999999, 0).as_raw();
+        let fake_cookie = EncodedFileId::new(999999, 0).unwrap().as_raw();
         let _result = fs.readdir(&test_auth(), 0, fake_cookie, 10).await;
         // This should work but return no entries (or few entries if the inode exists)
         // The implementation continues scanning from the encoded position
