@@ -862,9 +862,9 @@ mod tests {
             }
             _ => panic!("Expected file inode"),
         }
-        let mut txn = fs.new_transaction().unwrap();
+        let mut txn = fs.db.new_transaction().unwrap();
         fs.inode_store.save(&mut txn, file_id, &inode).unwrap();
-        let mut seq_guard = fs.allocate_sequence();
+        let mut seq_guard = fs.write_coordinator.allocate_sequence();
         fs.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
         // Create one more hardlink - should succeed

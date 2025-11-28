@@ -330,9 +330,9 @@ impl EncryptedDb {
         Ok(())
     }
 
-    pub fn new_transaction(&self) -> Result<EncryptedTransaction> {
+    pub fn new_transaction(&self) -> Result<EncryptedTransaction, FsError> {
         if self.is_read_only() {
-            return Err(FsError::ReadOnlyFilesystem.into());
+            return Err(FsError::ReadOnlyFilesystem);
         }
         Ok(EncryptedTransaction::new(self.encryptor.clone()))
     }

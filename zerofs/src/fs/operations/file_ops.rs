@@ -64,7 +64,7 @@ impl ZeroFS {
                     }
                 }
 
-                let mut txn = self.new_transaction()?;
+                let mut txn = self.db.new_transaction()?;
 
                 self.chunk_store.write(&mut txn, id, offset, data).await;
 
@@ -92,7 +92,7 @@ impl ZeroFS {
                 };
 
                 let db_write_start = std::time::Instant::now();
-                let mut seq_guard = self.allocate_sequence();
+                let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
@@ -191,7 +191,7 @@ impl ZeroFS {
                     nlink: 1,
                 };
 
-                let mut txn = self.new_transaction()?;
+                let mut txn = self.db.new_transaction()?;
 
                 self.inode_store
                     .save(&mut txn, file_id, &Inode::File(file_inode.clone()))?;
@@ -209,7 +209,7 @@ impl ZeroFS {
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
-                let mut seq_guard = self.allocate_sequence();
+                let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard)
                     .await
                     .inspect_err(|e| {
@@ -324,13 +324,13 @@ impl ZeroFS {
             _ => return Err(FsError::IsDirectory),
         };
 
-        let mut txn = self.new_transaction()?;
+        let mut txn = self.db.new_transaction()?;
 
         self.chunk_store
             .zero_range(&mut txn, id, offset, length, file.size)
             .await;
 
-        let mut seq_guard = self.allocate_sequence();
+        let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard)
             .await
             .inspect_err(|e| {

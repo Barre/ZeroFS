@@ -81,7 +81,7 @@ impl ZeroFS {
             nlink: 1,
         });
 
-        let mut txn = self.new_transaction()?;
+        let mut txn = self.db.new_transaction()?;
 
         self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
         self.directory_store.add(&mut txn, dirid, linkname, new_id);
@@ -98,7 +98,7 @@ impl ZeroFS {
         self.global_stats
             .add_to_transaction(&stats_update, &mut txn)?;
 
-        let mut seq_guard = self.allocate_sequence();
+        let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
 
         self.global_stats.commit_update(&stats_update);
@@ -166,7 +166,7 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        let mut txn = self.new_transaction()?;
+        let mut txn = self.db.new_transaction()?;
         self.directory_store
             .add(&mut txn, linkdirid, linkname, fileid);
 
@@ -213,7 +213,7 @@ impl ZeroFS {
         self.inode_store
             .save(&mut txn, linkdirid, &Inode::Directory(link_dir))?;
 
-        let mut seq_guard = self.allocate_sequence();
+        let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
 
         self.cache.remove_batch(vec![
