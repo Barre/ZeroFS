@@ -97,7 +97,7 @@ impl ZeroFS {
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
 
-                        let mut txn = self.new_transaction()?;
+                        let mut txn = self.db.new_transaction()?;
 
                         self.chunk_store
                             .truncate(&mut txn, id, old_size, new_size)
@@ -116,7 +116,7 @@ impl ZeroFS {
                             None
                         };
 
-                        let mut seq_guard = self.allocate_sequence();
+                        let mut seq_guard = self.write_coordinator.allocate_sequence();
                         self.commit_transaction(txn, &mut seq_guard).await?;
 
                         if let Some(update) = stats_update {
@@ -390,9 +390,9 @@ impl ZeroFS {
             }
         }
 
-        let mut txn = self.new_transaction()?;
+        let mut txn = self.db.new_transaction()?;
         self.inode_store.save(&mut txn, id, &inode)?;
-        let mut seq_guard = self.allocate_sequence();
+        let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
 
         Ok(InodeWithId { inode: &inode, id }.into())
@@ -482,7 +482,7 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let mut txn = self.new_transaction()?;
+                let mut txn = self.db.new_transaction()?;
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
                 self.directory_store.add(&mut txn, dirid, name, special_id);
@@ -499,7 +499,7 @@ impl ZeroFS {
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
-                let mut seq_guard = self.allocate_sequence();
+                let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
 
                 self.global_stats.commit_update(&stats_update);

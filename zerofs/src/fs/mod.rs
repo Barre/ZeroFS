@@ -233,18 +233,6 @@ impl ZeroFS {
         self.flush_coordinator.flush().await
     }
 
-    /// Allocate a sequence number for ordered commits.
-    /// Must be called FIRST before any operation-specific work.
-    pub fn allocate_sequence(&self) -> SequenceGuard {
-        self.write_coordinator.allocate_sequence()
-    }
-
-    pub fn new_transaction(&self) -> Result<EncryptedTransaction, FsError> {
-        self.db
-            .new_transaction()
-            .map_err(|_| FsError::ReadOnlyFilesystem)
-    }
-
     pub async fn commit_transaction(
         &self,
         mut txn: EncryptedTransaction,
@@ -542,9 +530,9 @@ mod tests {
         let inode = Inode::File(file_inode.clone());
         let inode_id = fs.allocate_inode().await.unwrap();
 
-        let mut txn = fs.new_transaction().unwrap();
+        let mut txn = fs.db.new_transaction().unwrap();
         fs.inode_store.save(&mut txn, inode_id, &inode).unwrap();
-        let mut seq_guard = fs.allocate_sequence();
+        let mut seq_guard = fs.write_coordinator.allocate_sequence();
         fs.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
         let loaded_inode = fs.inode_store.get(inode_id).await.unwrap();
@@ -729,12 +717,12 @@ mod tests {
             parent: Some(0),
             nlink: 1,
         };
-        let mut txn = fs_rw.new_transaction().unwrap();
+        let mut txn = fs_rw.db.new_transaction().unwrap();
         fs_rw
             .inode_store
             .save(&mut txn, test_inode_id, &Inode::File(file_inode.clone()))
             .unwrap();
-        let mut seq_guard = fs_rw.allocate_sequence();
+        let mut seq_guard = fs_rw.write_coordinator.allocate_sequence();
         fs_rw.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
         fs_rw.flush().await.unwrap();
@@ -757,7 +745,7 @@ mod tests {
         }
 
         // Verify that creating transactions fails in read-only mode
-        let result = fs_ro.new_transaction();
+        let result = fs_ro.db.new_transaction();
         assert!(
             result.is_err(),
             "new_transaction should fail in read-only mode"

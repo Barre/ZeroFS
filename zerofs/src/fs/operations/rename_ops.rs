@@ -132,7 +132,7 @@ impl ZeroFS {
             check_sticky_bit_delete(target_dir, &target_inode, &creds)?;
         }
 
-        let mut txn = self.new_transaction()?;
+        let mut txn = self.db.new_transaction()?;
 
         let mut target_was_directory = false;
         let mut target_stats_update = None;
@@ -319,7 +319,7 @@ impl ZeroFS {
             self.global_stats.add_to_transaction(update, &mut txn)?;
         }
 
-        let mut seq_guard = self.allocate_sequence();
+        let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
 
         if let Some(update) = target_stats_update {

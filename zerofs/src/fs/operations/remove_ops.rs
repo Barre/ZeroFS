@@ -57,7 +57,7 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                let mut txn = self.new_transaction()?;
+                let mut txn = self.db.new_transaction()?;
                 let (now_sec, now_nsec) = get_current_time();
 
                 match &mut file_inode {
@@ -147,7 +147,7 @@ impl ZeroFS {
                     self.global_stats.add_to_transaction(update, &mut txn)?;
                 }
 
-                let mut seq_guard = self.allocate_sequence();
+                let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
 
                 if let Some(update) = stats_update {
