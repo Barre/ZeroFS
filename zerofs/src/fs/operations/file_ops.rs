@@ -2,20 +2,15 @@ use super::common::validate_filename;
 use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{FileInode, Inode};
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
 use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
-use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
-use bytes::{Bytes, BytesMut};
-use futures::stream::{self, StreamExt};
-use std::collections::HashMap;
+use crate::fs::{ZeroFS, get_current_time};
+use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error};
-
-const READ_CHUNK_BUFFER_SIZE: usize = 1024;
 
 impl ZeroFS {
     pub async fn process_write(
@@ -69,73 +64,9 @@ impl ZeroFS {
                     }
                 }
 
-                let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
-                let end_chunk = (end_offset.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
-
                 let mut txn = self.new_transaction()?;
 
-                let chunk_processing_start = std::time::Instant::now();
-
-                // Optimization: skip loading chunks that will be completely overwritten
-                let existing_chunks: HashMap<usize, Bytes> = stream::iter(start_chunk..=end_chunk)
-                    .map(|chunk_idx| {
-                        let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-                        let chunk_end = chunk_start + CHUNK_SIZE as u64;
-
-                        let will_overwrite_fully = offset <= chunk_start && end_offset >= chunk_end;
-
-                        let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
-                        let db = self.db.clone();
-                        async move {
-                            let data = if will_overwrite_fully {
-                                Bytes::from(vec![0u8; CHUNK_SIZE])
-                            } else {
-                                db.get_bytes(&chunk_key)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
-                            };
-                            (chunk_idx, data)
-                        }
-                    })
-                    .buffer_unordered(READ_CHUNK_BUFFER_SIZE)
-                    .collect()
-                    .await;
-
-                let mut data_offset = 0;
-                for chunk_idx in start_chunk..=end_chunk {
-                    let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-                    let chunk_end = chunk_start + CHUNK_SIZE as u64;
-
-                    let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
-
-                    let write_start = if offset > chunk_start {
-                        (offset - chunk_start) as usize
-                    } else {
-                        0
-                    };
-
-                    let write_end = if end_offset < chunk_end {
-                        (end_offset - chunk_start) as usize
-                    } else {
-                        CHUNK_SIZE
-                    };
-
-                    let data_len = write_end - write_start;
-
-                    let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
-                    chunk[write_start..write_end]
-                        .copy_from_slice(&data[data_offset..data_offset + data_len]);
-                    data_offset += data_len;
-
-                    txn.put_bytes(&chunk_key, chunk.freeze());
-                }
-
-                debug!(
-                    "Chunk processing took: {:?}",
-                    chunk_processing_start.elapsed()
-                );
+                self.chunk_store.write(&mut txn, id, offset, data).await;
 
                 file.size = new_size;
                 let (now_sec, now_nsec) = get_current_time();
@@ -347,47 +278,9 @@ impl ZeroFS {
                     return Ok((Bytes::new(), true));
                 }
 
-                let end = std::cmp::min(offset + count as u64, file.size);
-                let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
-                let end_chunk = (end.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
-                let start_offset = (offset % CHUNK_SIZE as u64) as usize;
-
-                let chunks: Vec<Bytes> = stream::iter(start_chunk..=end_chunk)
-                    .map(|chunk_idx| {
-                        let db = self.db.clone();
-                        let key = KeyCodec::chunk_key(id, chunk_idx as u64);
-                        async move {
-                            db.get_bytes(&key)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
-                        }
-                    })
-                    .buffered(READ_CHUNK_BUFFER_SIZE)
-                    .collect()
-                    .await;
-
-                let mut result = BytesMut::with_capacity((end - offset) as usize);
-
-                for (chunk_idx, chunk_data) in (start_chunk..=end_chunk).zip(chunks) {
-                    let chunk_start = if chunk_idx == start_chunk {
-                        start_offset
-                    } else {
-                        0
-                    };
-
-                    let chunk_end = if chunk_idx == end_chunk {
-                        ((end - 1) % CHUNK_SIZE as u64 + 1) as usize
-                    } else {
-                        CHUNK_SIZE
-                    };
-
-                    result.extend_from_slice(&chunk_data[chunk_start..chunk_end]);
-                }
-
-                let result_bytes = result.freeze();
-                let eof = end >= file.size;
+                let read_len = std::cmp::min(count as u64, file.size - offset);
+                let result_bytes = self.chunk_store.read(id, offset, read_len).await;
+                let eof = offset + read_len >= file.size;
 
                 self.stats
                     .bytes_read
@@ -431,56 +324,11 @@ impl ZeroFS {
             _ => return Err(FsError::IsDirectory),
         };
 
-        let end_offset = offset + length;
-        let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
-        let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
-
         let mut txn = self.new_transaction()?;
 
-        for chunk_idx in start_chunk..=end_chunk {
-            let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
-            let chunk_end = chunk_start + CHUNK_SIZE as u64;
-
-            if chunk_start >= file.size {
-                continue;
-            }
-
-            let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
-
-            if offset <= chunk_start && end_offset >= chunk_end {
-                txn.delete_bytes(&chunk_key);
-            } else {
-                // Partial trim - load chunk, clear trimmed region, save or delete
-                let trim_start = if offset > chunk_start {
-                    (offset - chunk_start) as usize
-                } else {
-                    0
-                };
-
-                let trim_end = if end_offset < chunk_end {
-                    (end_offset - chunk_start) as usize
-                } else {
-                    CHUNK_SIZE
-                };
-
-                if let Some(existing_data) = self
-                    .db
-                    .get_bytes(&chunk_key)
-                    .await
-                    .map_err(|_| FsError::IoError)?
-                {
-                    let mut chunk_data = BytesMut::from(existing_data.as_ref());
-                    chunk_data[trim_start..trim_end].fill(0);
-
-                    if chunk_data.iter().all(|&b| b == 0) {
-                        txn.delete_bytes(&chunk_key);
-                    } else {
-                        txn.put_bytes(&chunk_key, chunk_data.freeze());
-                    }
-                }
-                // If chunk doesn't exist, nothing to trim
-            }
-        }
+        self.chunk_store
+            .zero_range(&mut txn, id, offset, length, file.size)
+            .await;
 
         let mut seq_guard = self.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard)

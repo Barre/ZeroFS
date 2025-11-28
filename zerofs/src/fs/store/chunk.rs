@@ -1,0 +1,234 @@
+use crate::encryption::{EncryptedDb, EncryptedTransaction};
+use crate::fs::CHUNK_SIZE;
+use crate::fs::inode::InodeId;
+use crate::fs::key_codec::KeyCodec;
+use bytes::{Bytes, BytesMut};
+use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const PARALLEL_CHUNK_OPS: usize = 1024;
+
+#[derive(Clone)]
+pub struct ChunkStore {
+    db: Arc<EncryptedDb>,
+}
+
+impl ChunkStore {
+    pub fn new(db: Arc<EncryptedDb>) -> Self {
+        Self { db }
+    }
+
+    pub async fn get(&self, id: InodeId, chunk_idx: u64) -> Option<Bytes> {
+        let key = KeyCodec::chunk_key(id, chunk_idx);
+        self.db.get_bytes(&key).await.ok().flatten()
+    }
+
+    fn save(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64, data: Bytes) {
+        let key = KeyCodec::chunk_key(id, chunk_idx);
+        txn.put_bytes(&key, data);
+    }
+
+    pub fn delete(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64) {
+        let key = KeyCodec::chunk_key(id, chunk_idx);
+        txn.delete_bytes(&key);
+    }
+
+    pub fn delete_range(&self, txn: &mut EncryptedTransaction, id: InodeId, start: u64, end: u64) {
+        for chunk_idx in start..end {
+            self.delete(txn, id, chunk_idx);
+        }
+    }
+
+    pub async fn read(&self, id: InodeId, offset: u64, length: u64) -> Bytes {
+        if length == 0 {
+            return Bytes::new();
+        }
+
+        let end = offset + length;
+        let start_chunk = offset / CHUNK_SIZE as u64;
+        let end_chunk = (end - 1) / CHUNK_SIZE as u64;
+        let start_offset = (offset % CHUNK_SIZE as u64) as usize;
+
+        let chunks: Vec<Bytes> = stream::iter(start_chunk..=end_chunk)
+            .map(|chunk_idx| {
+                let store = self.clone();
+                async move {
+                    store
+                        .get(id, chunk_idx)
+                        .await
+                        .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                }
+            })
+            .buffered(PARALLEL_CHUNK_OPS)
+            .collect()
+            .await;
+
+        let mut result = BytesMut::with_capacity(length as usize);
+
+        for (i, chunk_data) in chunks.into_iter().enumerate() {
+            let chunk_idx = start_chunk + i as u64;
+            let chunk_start = if chunk_idx == start_chunk {
+                start_offset
+            } else {
+                0
+            };
+            let chunk_end = if chunk_idx == end_chunk {
+                ((end - 1) % CHUNK_SIZE as u64 + 1) as usize
+            } else {
+                CHUNK_SIZE
+            };
+            result.extend_from_slice(&chunk_data[chunk_start..chunk_end]);
+        }
+
+        result.freeze()
+    }
+
+    pub async fn write(
+        &self,
+        txn: &mut EncryptedTransaction,
+        id: InodeId,
+        offset: u64,
+        data: &[u8],
+    ) {
+        if data.is_empty() {
+            return;
+        }
+
+        let end_offset = offset + data.len() as u64;
+        let start_chunk = offset / CHUNK_SIZE as u64;
+        let end_chunk = (end_offset - 1) / CHUNK_SIZE as u64;
+
+        let existing_chunks: HashMap<u64, Bytes> = stream::iter(start_chunk..=end_chunk)
+            .map(|chunk_idx| {
+                let chunk_start = chunk_idx * CHUNK_SIZE as u64;
+                let chunk_end = chunk_start + CHUNK_SIZE as u64;
+                let will_overwrite_fully = offset <= chunk_start && end_offset >= chunk_end;
+
+                let store = self.clone();
+                async move {
+                    let data = if will_overwrite_fully {
+                        Bytes::from(vec![0u8; CHUNK_SIZE])
+                    } else {
+                        store
+                            .get(id, chunk_idx)
+                            .await
+                            .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                    };
+                    (chunk_idx, data)
+                }
+            })
+            .buffer_unordered(PARALLEL_CHUNK_OPS)
+            .collect()
+            .await;
+
+        let mut data_offset = 0usize;
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_start = chunk_idx * CHUNK_SIZE as u64;
+            let chunk_end = chunk_start + CHUNK_SIZE as u64;
+
+            let write_start = if offset > chunk_start {
+                (offset - chunk_start) as usize
+            } else {
+                0
+            };
+            let write_end = if end_offset < chunk_end {
+                (end_offset - chunk_start) as usize
+            } else {
+                CHUNK_SIZE
+            };
+
+            let write_len = write_end - write_start;
+            let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
+            chunk[write_start..write_end]
+                .copy_from_slice(&data[data_offset..data_offset + write_len]);
+            data_offset += write_len;
+
+            self.save(txn, id, chunk_idx, chunk.freeze());
+        }
+    }
+
+    pub async fn truncate(
+        &self,
+        txn: &mut EncryptedTransaction,
+        id: InodeId,
+        old_size: u64,
+        new_size: u64,
+    ) {
+        if new_size >= old_size {
+            return;
+        }
+
+        let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64);
+        let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64);
+
+        self.delete_range(txn, id, new_chunks, old_chunks);
+
+        if new_size > 0 {
+            let last_chunk_idx = new_chunks - 1;
+            let clear_from = (new_size % CHUNK_SIZE as u64) as usize;
+
+            if clear_from > 0 {
+                let chunk_data = self
+                    .get(id, last_chunk_idx)
+                    .await
+                    .map(|b| b.to_vec())
+                    .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
+
+                let mut new_chunk_data = chunk_data;
+                new_chunk_data[clear_from..].fill(0);
+                self.save(txn, id, last_chunk_idx, Bytes::from(new_chunk_data));
+            }
+        }
+    }
+
+    pub async fn zero_range(
+        &self,
+        txn: &mut EncryptedTransaction,
+        id: InodeId,
+        offset: u64,
+        length: u64,
+        file_size: u64,
+    ) {
+        if length == 0 {
+            return;
+        }
+
+        let end_offset = offset + length;
+        let start_chunk = offset / CHUNK_SIZE as u64;
+        let end_chunk = (end_offset - 1) / CHUNK_SIZE as u64;
+
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_start = chunk_idx * CHUNK_SIZE as u64;
+            let chunk_end = chunk_start + CHUNK_SIZE as u64;
+
+            if chunk_start >= file_size {
+                continue;
+            }
+
+            if offset <= chunk_start && end_offset >= chunk_end {
+                self.delete(txn, id, chunk_idx);
+            } else if let Some(existing_data) = self.get(id, chunk_idx).await {
+                let zero_start = if offset > chunk_start {
+                    (offset - chunk_start) as usize
+                } else {
+                    0
+                };
+                let zero_end = if end_offset < chunk_end {
+                    (end_offset - chunk_start) as usize
+                } else {
+                    CHUNK_SIZE
+                };
+
+                let mut chunk_data = BytesMut::from(existing_data.as_ref());
+                chunk_data[zero_start..zero_end].fill(0);
+
+                if chunk_data.iter().all(|&b| b == 0) {
+                    self.delete(txn, id, chunk_idx);
+                } else {
+                    self.save(txn, id, chunk_idx, chunk_data.freeze());
+                }
+            }
+        }
+    }
+}

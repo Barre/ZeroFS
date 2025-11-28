@@ -18,7 +18,7 @@ use self::key_codec::{KeyCodec, ParsedKey};
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{DirectoryStore, InodeStore};
+use self::store::{ChunkStore, DirectoryStore, InodeStore};
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -98,6 +98,7 @@ impl From<EncodedFileId> for fileid3 {
 #[derive(Clone)]
 pub struct ZeroFS {
     pub db: Arc<EncryptedDb>,
+    pub chunk_store: ChunkStore,
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub lock_manager: Arc<LockManager>,
@@ -194,11 +195,13 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let write_coordinator = Arc::new(WriteCoordinator::new());
+        let chunk_store = ChunkStore::new(db.clone());
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone());
 
         let fs = Self {
             db: db.clone(),
+            chunk_store,
             directory_store,
             inode_store,
             lock_manager,
@@ -359,9 +362,12 @@ impl ZeroFS {
                     .db
                     .new_transaction()
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
-                for chunk_idx in start_chunk..total_chunks {
-                    txn.delete_chunk(inode_id, chunk_idx as u64);
-                }
+                self.chunk_store.delete_range(
+                    &mut txn,
+                    inode_id,
+                    start_chunk as u64,
+                    total_chunks as u64,
+                );
 
                 if chunks_to_delete > 0 {
                     self.db
