@@ -2,7 +2,6 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::types::AuthContext;
@@ -48,34 +47,16 @@ impl ZeroFS {
         let creds = Credentials::from_auth_context(auth);
 
         // Look up all inode IDs without holding any locks
-        let from_entry_key = KeyCodec::dir_entry_key(from_dirid, from_name);
-        let entry_data = self
-            .db
-            .get_bytes(&from_entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .ok_or(FsError::NotFound)?;
-
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&entry_data[..8]);
-        let source_inode_id = u64::from_le_bytes(bytes);
+        let source_inode_id = self.directory_store.get(from_dirid, from_name).await?;
 
         if to_dirid == source_inode_id {
             return Err(FsError::InvalidArgument);
         }
 
-        let to_entry_key = KeyCodec::dir_entry_key(to_dirid, to_name);
-        let target_inode_id = if let Some(existing_entry) = self
-            .db
-            .get_bytes(&to_entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-        {
-            let mut existing_bytes = [0u8; 8];
-            existing_bytes.copy_from_slice(&existing_entry[..8]);
-            Some(u64::from_le_bytes(existing_bytes))
-        } else {
-            None
+        let target_inode_id = match self.directory_store.get(to_dirid, to_name).await {
+            Ok(id) => Some(id),
+            Err(FsError::NotFound) => None,
+            Err(e) => return Err(e),
         };
 
         let mut all_inodes_to_lock = vec![from_dirid, source_inode_id];
@@ -91,16 +72,9 @@ impl ZeroFS {
             .acquire_multiple_write(all_inodes_to_lock)
             .await;
 
-        let entry_data = self
-            .db
-            .get_bytes(&from_entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .ok_or(FsError::NotFound)?;
-
-        let mut verify_bytes = [0u8; 8];
-        verify_bytes.copy_from_slice(&entry_data[..8]);
-        if u64::from_le_bytes(verify_bytes) != source_inode_id {
+        // Re-check inside lock to verify entry still points to same inode
+        let verified_id = self.directory_store.get(from_dirid, from_name).await?;
+        if verified_id != source_inode_id {
             return Err(FsError::NotFound);
         }
 
@@ -248,11 +222,14 @@ impl ZeroFS {
                 );
             }
 
-            txn.remove_dir_entry(to_dirid, to_name, target_id);
+            self.directory_store
+                .remove(&mut txn, to_dirid, to_name, target_id);
         }
 
-        txn.remove_dir_entry(from_dirid, from_name, source_inode_id);
-        txn.add_dir_entry(to_dirid, to_name, source_inode_id);
+        self.directory_store
+            .remove(&mut txn, from_dirid, from_name, source_inode_id);
+        self.directory_store
+            .add(&mut txn, to_dirid, to_name, source_inode_id);
 
         if from_dirid != to_dirid {
             let mut moved_inode = self.load_inode(source_inode_id).await?;

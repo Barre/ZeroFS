@@ -138,22 +138,6 @@ impl EncryptedTransaction {
         self.delete_bytes(&key);
     }
 
-    pub fn add_dir_entry(&mut self, dir_id: InodeId, name: &[u8], entry_id: InodeId) {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
-        self.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id));
-
-        let scan_key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
-        self.put_bytes(&scan_key, KeyCodec::encode_dir_entry(entry_id));
-    }
-
-    pub fn remove_dir_entry(&mut self, dir_id: InodeId, name: &[u8], entry_id: InodeId) {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
-        self.delete_bytes(&entry_key);
-
-        let scan_key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
-        self.delete_bytes(&scan_key);
-    }
-
     pub fn delete_chunk(&mut self, inode_id: InodeId, chunk_idx: u64) {
         let key = KeyCodec::chunk_key(inode_id, chunk_idx);
         self.delete_bytes(&key);

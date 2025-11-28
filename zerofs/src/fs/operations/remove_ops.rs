@@ -2,7 +2,6 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::types::{AuthContext, InodeId};
@@ -20,17 +19,7 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        let entry_key = KeyCodec::dir_entry_key(dirid, name);
-        let entry_data = self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .ok_or(FsError::NotFound)?;
-
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&entry_data[..8]);
-        let file_id = u64::from_le_bytes(bytes);
+        let file_id = self.directory_store.get(dirid, name).await?;
 
         let _guards = self
             .lock_manager
@@ -46,17 +35,9 @@ impl ZeroFS {
             return Err(FsError::NotDirectory);
         }
 
-        let entry_data = self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .ok_or(FsError::NotFound)?;
-
-        let mut verify_bytes = [0u8; 8];
-        verify_bytes.copy_from_slice(&entry_data[..8]);
-
-        if u64::from_le_bytes(verify_bytes) != file_id {
+        // Re-check inside lock to verify entry still points to same inode
+        let verified_id = self.directory_store.get(dirid, name).await?;
+        if verified_id != file_id {
             return Err(FsError::NotFound);
         }
 
@@ -135,7 +116,7 @@ impl ZeroFS {
                     }
                 }
 
-                txn.remove_dir_entry(dirid, name, file_id);
+                self.directory_store.remove(&mut txn, dirid, name, file_id);
 
                 dir.entry_count = dir.entry_count.saturating_sub(1);
                 dir.mtime = now_sec;

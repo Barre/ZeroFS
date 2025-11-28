@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod operations;
 pub mod permissions;
 pub mod stats;
+pub mod store;
 pub mod types;
 pub mod write_coordinator;
 
@@ -17,6 +18,7 @@ use self::key_codec::{KeyCodec, ParsedKey};
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
+use self::store::DirectoryStore;
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -96,6 +98,7 @@ impl From<EncodedFileId> for fileid3 {
 #[derive(Clone)]
 pub struct ZeroFS {
     pub db: Arc<EncryptedDb>,
+    pub directory_store: DirectoryStore,
     pub lock_manager: Arc<LockManager>,
     pub next_inode_id: Arc<AtomicU64>,
     pub cache: Arc<UnifiedCache>,
@@ -190,9 +193,11 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let write_coordinator = Arc::new(WriteCoordinator::new());
+        let directory_store = DirectoryStore::new(db.clone());
 
         let fs = Self {
             db: db.clone(),
+            directory_store,
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
             cache: unified_cache,
@@ -532,21 +537,6 @@ impl ZeroFS {
             crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
         )
         .await
-    }
-}
-
-impl ZeroFS {
-    /// Helper method to lookup an entry by name in a directory
-    pub async fn lookup_by_name(&self, dir_id: u64, name: &[u8]) -> Result<u64, errors::FsError> {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
-        let entry_data = self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| errors::FsError::IoError)?
-            .ok_or(errors::FsError::NotFound)?;
-
-        KeyCodec::decode_dir_entry(&entry_data)
     }
 }
 

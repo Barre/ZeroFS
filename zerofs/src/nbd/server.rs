@@ -158,7 +158,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // Look up .nbd directory
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, b".nbd")
+            .directory_store
+            .get(0, b".nbd")
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -208,7 +209,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn get_device_by_name(&self, name: &[u8]) -> Result<NBDDevice> {
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, b".nbd")
+            .directory_store
+            .get(0, b".nbd")
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -216,7 +218,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 )))
             })?;
 
-        let device_inode = match self.filesystem.lookup_by_name(nbd_dir_inode, name).await {
+        let device_inode = match self
+            .filesystem
+            .directory_store
+            .get(nbd_dir_inode, name)
+            .await
+        {
             Ok(inode) => inode,
             Err(FsError::NotFound) => {
                 return Err(NBDError::DeviceNotFound(name.to_vec()));
@@ -537,13 +544,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, b".nbd")
+            .directory_store
+            .get(0, b".nbd")
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup .nbd directory: {e:?}")))?;
 
         let device_inode = self
             .filesystem
-            .lookup_by_name(nbd_dir_inode, &device.name)
+            .directory_store
+            .get(nbd_dir_inode, &device.name)
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup device file: {e:?}")))?;
 
