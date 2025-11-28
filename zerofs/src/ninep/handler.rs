@@ -769,11 +769,7 @@ impl NinePHandler {
             },
         };
 
-        match self
-            .filesystem
-            .setattr(&creds, inode_id, &attr)
-            .await
-        {
+        match self.filesystem.setattr(&creds, inode_id, &attr).await {
             Ok(_post_attr) => P9Message::new(tag, Message::Rsetattr(Rsetattr)),
             Err(e) => P9Message::error(tag, e.to_errno()),
         }
@@ -1002,11 +998,7 @@ impl NinePHandler {
 
         let mut source_parent_id = 0;
         for name in &source_parent_path {
-            match self
-                .filesystem
-                .lookup(&creds, source_parent_id, name)
-                .await
-            {
+            match self.filesystem.lookup(&creds, source_parent_id, name).await {
                 Ok(real_id) => {
                     source_parent_id = real_id;
                 }

@@ -329,9 +329,7 @@ mod tests {
         assert_eq!(inodes, 1);
 
         // Remove the file
-        fs.remove(&test_auth(), 0, b"test.txt")
-            .await
-            .unwrap();
+        fs.remove(&test_auth(), 0, b"test.txt").await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 0);
@@ -404,18 +402,14 @@ mod tests {
         assert_eq!(inodes, 1); // Still just 2 inodes (root + file)
 
         // Remove original - stats should remain
-        fs.remove(&test_auth(), 0, b"original.txt")
-            .await
-            .unwrap();
+        fs.remove(&test_auth(), 0, b"original.txt").await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1000); // Data still exists via hard link
         assert_eq!(inodes, 1);
 
         // Remove hard link - now stats should update
-        fs.remove(&test_auth(), 0, b"hardlink.txt")
-            .await
-            .unwrap();
+        fs.remove(&test_auth(), 0, b"hardlink.txt").await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 0);
@@ -445,9 +439,7 @@ mod tests {
             ..Default::default()
         };
 
-        fs.setattr(&test_creds(), file_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 5000);
@@ -459,9 +451,7 @@ mod tests {
             ..Default::default()
         };
 
-        fs.setattr(&test_creds(), file_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 15000);
@@ -747,9 +737,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // file + symlink
 
         // Rename file over symlink
-        fs.rename(&auth, 0, b"file.txt", 0, b"link")
-            .await
-            .unwrap();
+        fs.rename(&auth, 0, b"file.txt", 0, b"link").await.unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 750);
@@ -843,9 +831,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // Two FIFOs
 
         // Rename fifo1 over fifo2
-        fs.rename(&auth, 0, b"fifo1", 0, b"fifo2")
-            .await
-            .unwrap();
+        fs.rename(&auth, 0, b"fifo1", 0, b"fifo2").await.unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 0);
