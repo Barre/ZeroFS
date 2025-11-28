@@ -12,7 +12,7 @@ pub mod store;
 pub mod types;
 pub mod write_coordinator;
 
-use self::cache::{CacheKey, CacheValue, UnifiedCache};
+use self::cache::UnifiedCache;
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::{KeyCodec, ParsedKey};
 use self::lock_manager::LockManager;
@@ -195,9 +195,10 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let write_coordinator = Arc::new(WriteCoordinator::new());
+        let stats = Arc::new(FileSystemStats::new());
         let chunk_store = ChunkStore::new(db.clone());
         let directory_store = DirectoryStore::new(db.clone());
-        let inode_store = InodeStore::new(db.clone());
+        let inode_store = InodeStore::new(db.clone(), unified_cache.clone(), stats.clone());
 
         let fs = Self {
             db: db.clone(),
@@ -207,7 +208,7 @@ impl ZeroFS {
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
             cache: unified_cache,
-            stats: Arc::new(FileSystemStats::new()),
+            stats,
             global_stats,
             flush_coordinator,
             write_coordinator,
@@ -266,44 +267,6 @@ impl ZeroFS {
             .map_err(|_| FsError::IoError)?;
 
         seq_guard.mark_committed();
-        Ok(())
-    }
-
-    pub async fn load_inode(&self, inode_id: InodeId) -> Result<Inode, FsError> {
-        let cache_key = CacheKey::Metadata(inode_id);
-        if let Some(CacheValue::Metadata(cached_inode)) = self.cache.get(cache_key) {
-            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok((*cached_inode).clone());
-        }
-        self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-
-        let inode = self.inode_store.load(inode_id).await?;
-
-        let cache_key = CacheKey::Metadata(inode_id);
-        let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));
-        self.cache.insert(cache_key, cache_value);
-
-        Ok(inode)
-    }
-
-    pub async fn save_inode(&self, inode_id: InodeId, inode: &Inode) -> Result<(), FsError> {
-        let key = KeyCodec::inode_key(inode_id);
-        let data = bincode::serialize(inode)?;
-
-        self.db
-            .put_with_options(
-                &key,
-                &data,
-                &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
-
-        self.cache.remove(CacheKey::Metadata(inode_id));
-
         Ok(())
     }
 
@@ -528,7 +491,7 @@ mod tests {
     async fn test_create_filesystem() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let root_inode = fs.load_inode(0).await.unwrap();
+        let root_inode = fs.inode_store.get(0).await.unwrap();
         match root_inode {
             Inode::Directory(dir) => {
                 assert_eq!(dir.mode, 0o1777);
@@ -579,9 +542,12 @@ mod tests {
         let inode = Inode::File(file_inode.clone());
         let inode_id = fs.allocate_inode().await.unwrap();
 
-        fs.save_inode(inode_id, &inode).await.unwrap();
+        let mut txn = fs.new_transaction().unwrap();
+        fs.inode_store.save(&mut txn, inode_id, &inode).unwrap();
+        let mut seq_guard = fs.allocate_sequence();
+        fs.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
-        let loaded_inode = fs.load_inode(inode_id).await.unwrap();
+        let loaded_inode = fs.inode_store.get(inode_id).await.unwrap();
         match loaded_inode {
             Inode::File(f) => {
                 assert_eq!(f.size, file_inode.size);
@@ -636,7 +602,7 @@ mod tests {
     async fn test_load_nonexistent_inode() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let result = fs.load_inode(999).await;
+        let result = fs.inode_store.get(999).await;
         match result {
             Err(FsError::NotFound) => {} // Expected
             other => panic!("Expected NFS3ERR_NOENT, got {other:?}"),
@@ -763,10 +729,13 @@ mod tests {
             parent: Some(0),
             nlink: 1,
         };
+        let mut txn = fs_rw.new_transaction().unwrap();
         fs_rw
-            .save_inode(test_inode_id, &Inode::File(file_inode.clone()))
-            .await
+            .inode_store
+            .save(&mut txn, test_inode_id, &Inode::File(file_inode.clone()))
             .unwrap();
+        let mut seq_guard = fs_rw.allocate_sequence();
+        fs_rw.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
         fs_rw.flush().await.unwrap();
         drop(fs_rw);
@@ -775,10 +744,10 @@ mod tests {
             .await
             .unwrap();
 
-        let root_inode = fs_ro.load_inode(0).await.unwrap();
+        let root_inode = fs_ro.inode_store.get(0).await.unwrap();
         assert!(matches!(root_inode, Inode::Directory(_)));
 
-        let loaded_inode = fs_ro.load_inode(test_inode_id).await.unwrap();
+        let loaded_inode = fs_ro.inode_store.get(test_inode_id).await.unwrap();
         match loaded_inode {
             Inode::File(f) => {
                 assert_eq!(f.size, file_inode.size);
@@ -787,33 +756,11 @@ mod tests {
             _ => panic!("Expected File inode"),
         }
 
-        let new_file = FileInode {
-            size: 100,
-            mtime: 1234567890,
-            mtime_nsec: 123456789,
-            ctime: 1234567891,
-            ctime_nsec: 234567890,
-            atime: 1234567892,
-            atime_nsec: 345678901,
-            mode: 0o644,
-            uid: 1000,
-            gid: 1000,
-            parent: Some(0),
-            nlink: 1,
-        };
-        let result = fs_ro
-            .save_inode(test_inode_id, &Inode::File(new_file))
-            .await;
-        assert!(result.is_err(), "save_inode should fail in read-only mode");
-
-        let mut modified_file = file_inode.clone();
-        modified_file.size = 4096;
-        let result = fs_ro
-            .save_inode(test_inode_id, &Inode::File(modified_file))
-            .await;
+        // Verify that creating transactions fails in read-only mode
+        let result = fs_ro.new_transaction();
         assert!(
             result.is_err(),
-            "modifying inode should fail in read-only mode"
+            "new_transaction should fail in read-only mode"
         );
     }
 }

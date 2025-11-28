@@ -80,7 +80,7 @@ mod tests {
         };
         fs.process_setattr(&creds, dir_id, &setattr).await.unwrap();
 
-        let parent_inode = fs.load_inode(dir_id).await.unwrap();
+        let parent_inode = fs.inode_store.get(dir_id).await.unwrap();
         let parent_fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode,
             id: dir_id,
@@ -184,7 +184,7 @@ mod tests {
         let (data, _) = fs.process_read_file(&auth, found_id, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"content1");
 
-        let result = fs.load_inode(file2_id).await;
+        let result = fs.inode_store.get(file2_id).await;
         assert!(result.is_err());
     }
 
@@ -265,7 +265,7 @@ mod tests {
         assert!(matches!(fattr.file_type, FileType::Symlink));
         assert_eq!(fattr.size, target.len() as u64);
 
-        let inode = fs.load_inode(link_id).await.unwrap();
+        let inode = fs.inode_store.get(link_id).await.unwrap();
         if let crate::fs::inode::Inode::Symlink(symlink) = inode {
             assert_eq!(&symlink.target, target);
         } else {
@@ -297,7 +297,7 @@ mod tests {
         .await
         .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         let fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: file_id,
@@ -525,8 +525,8 @@ mod tests {
         let (data, _) = fs.process_read_file(&auth, found_id, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"test content");
 
-        let _dir1_inode = fs.load_inode(dir1_id).await.unwrap();
-        let _dir2_inode = fs.load_inode(dir2_id).await.unwrap();
+        let _dir1_inode = fs.inode_store.get(dir1_id).await.unwrap();
+        let _dir2_inode = fs.inode_store.get(dir2_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -619,7 +619,7 @@ mod tests {
         .await
         .unwrap();
 
-        let initial_inode = fs.load_inode(file_id).await.unwrap();
+        let initial_inode = fs.inode_store.get(file_id).await.unwrap();
         let initial_attr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &initial_inode,
             id: file_id,
@@ -676,7 +676,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inode = fs.load_inode(link_id).await.unwrap();
+        let inode = fs.inode_store.get(link_id).await.unwrap();
         if let crate::fs::inode::Inode::Symlink(symlink) = inode {
             assert_eq!(&symlink.target, b"/nonexistent/path");
         } else {
@@ -703,7 +703,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         let attr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: file_id,
@@ -887,7 +887,7 @@ mod tests {
         let fs = create_test_fs().await;
         let creds = test_creds();
 
-        let parent_inode_before = fs.load_inode(0).await.unwrap();
+        let parent_inode_before = fs.inode_store.get(0).await.unwrap();
         let parent_attr_before: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode_before,
             id: 0,
@@ -901,7 +901,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parent_inode_after = fs.load_inode(0).await.unwrap();
+        let parent_inode_after = fs.inode_store.get(0).await.unwrap();
         let parent_attr_after: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode_after,
             id: 0,
@@ -919,7 +919,7 @@ mod tests {
             .await
             .unwrap();
 
-        let parent_inode_final = fs.load_inode(0).await.unwrap();
+        let parent_inode_final = fs.inode_store.get(0).await.unwrap();
         let parent_attr_final: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode_final,
             id: 0,
@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(a_id, b_id, "Both names should point to the same inode");
 
         // Check link count
-        let inode = fs.load_inode(a_id).await.unwrap();
+        let inode = fs.inode_store.get(a_id).await.unwrap();
         let fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: a_id,
@@ -1068,7 +1068,7 @@ mod tests {
             .await
             .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, Some(0));
@@ -1091,7 +1091,7 @@ mod tests {
         .unwrap();
 
         // Parent should become None when file is hardlinked
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1137,7 +1137,7 @@ mod tests {
         .unwrap();
 
         // Parent should stay None even when nlink drops back to 1
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1202,7 +1202,7 @@ mod tests {
         .unwrap();
 
         // Parent should be lazily restored on rename when nlink=1
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, Some(dir_id));
@@ -1255,7 +1255,7 @@ mod tests {
         .unwrap();
 
         // Parent should stay None when renaming file with nlink > 1
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1306,7 +1306,7 @@ mod tests {
         .await
         .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match &inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);

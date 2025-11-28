@@ -29,7 +29,7 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
-        let mut dir_inode = self.load_inode(dirid).await?;
+        let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -138,7 +138,7 @@ impl ZeroFS {
             .acquire_multiple_write(vec![fileid, linkdirid])
             .await;
 
-        let link_dir_inode = self.load_inode(linkdirid).await?;
+        let link_dir_inode = self.inode_store.get(linkdirid).await?;
         let creds = Credentials::from_auth_context(auth);
 
         check_access(&link_dir_inode, &creds, AccessMode::Write)?;
@@ -152,7 +152,7 @@ impl ZeroFS {
             _ => return Err(FsError::NotDirectory),
         };
 
-        let mut file_inode = self.load_inode(fileid).await?;
+        let mut file_inode = self.inode_store.get(fileid).await?;
 
         if matches!(file_inode, Inode::Directory(_)) {
             return Err(FsError::InvalidArgument);

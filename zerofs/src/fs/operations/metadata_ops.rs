@@ -20,7 +20,7 @@ impl ZeroFS {
     ) -> Result<FileAttributes, FsError> {
         debug!("process_setattr: id={}, setattr={:?}", id, setattr);
         let _guard = self.lock_manager.acquire_write(id).await;
-        let mut inode = self.load_inode(id).await?;
+        let mut inode = self.inode_store.get(id).await?;
 
         self.check_parent_execute_permissions(id, creds).await?;
 
@@ -390,7 +390,11 @@ impl ZeroFS {
             }
         }
 
-        self.save_inode(id, &inode).await?;
+        let mut txn = self.new_transaction()?;
+        self.inode_store.save(&mut txn, id, &inode)?;
+        let mut seq_guard = self.allocate_sequence();
+        self.commit_transaction(txn, &mut seq_guard).await?;
+
         Ok(InodeWithId { inode: &inode, id }.into())
     }
 
@@ -413,7 +417,7 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
-        let mut dir_inode = self.load_inode(dirid).await?;
+        let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;

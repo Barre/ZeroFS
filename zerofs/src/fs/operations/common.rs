@@ -28,7 +28,7 @@ impl ZeroFS {
         let mut current_id = descendant_id;
 
         while current_id != 0 {
-            let inode = self.load_inode(current_id).await?;
+            let inode = self.inode_store.get(current_id).await?;
             let parent_id = match inode {
                 Inode::Directory(d) => Some(d.parent),
                 Inode::File(f) => f.parent,
@@ -71,7 +71,7 @@ impl ZeroFS {
             return Ok(());
         }
 
-        let inode = self.load_inode(id).await?;
+        let inode = self.inode_store.get(id).await?;
         let parent_id = match &inode {
             Inode::Directory(d) => Some(d.parent),
             Inode::File(f) => f.parent,
@@ -87,7 +87,7 @@ impl ZeroFS {
             return Ok(());
         };
         while current_id != 0 {
-            let parent_inode = self.load_inode(current_id).await?;
+            let parent_inode = self.inode_store.get(current_id).await?;
 
             check_access(&parent_inode, creds, AccessMode::Execute)?;
 

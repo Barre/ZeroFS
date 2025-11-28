@@ -188,12 +188,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             let encoded_id = EncodedFileId::from(entry.fileid);
             let real_id = encoded_id.inode_id();
 
-            let inode = self.filesystem.load_inode(real_id).await.map_err(|e| {
-                NBDError::Io(std::io::Error::other(format!(
-                    "Failed to load inode for {}: {e:?}",
-                    String::from_utf8_lossy(name)
-                )))
-            })?;
+            let inode = self
+                .filesystem
+                .inode_store
+                .get(real_id)
+                .await
+                .map_err(|e| {
+                    NBDError::Io(std::io::Error::other(format!(
+                        "Failed to load inode for {}: {e:?}",
+                        String::from_utf8_lossy(name)
+                    )))
+                })?;
 
             if let Inode::File(file_inode) = inode {
                 devices.push(NBDDevice {
@@ -237,7 +242,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let inode = self
             .filesystem
-            .load_inode(device_inode)
+            .inode_store
+            .get(device_inode)
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
