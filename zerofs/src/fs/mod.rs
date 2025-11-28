@@ -18,7 +18,7 @@ use self::key_codec::{KeyCodec, ParsedKey};
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::DirectoryStore;
+use self::store::{DirectoryStore, InodeStore};
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -99,6 +99,7 @@ impl From<EncodedFileId> for fileid3 {
 pub struct ZeroFS {
     pub db: Arc<EncryptedDb>,
     pub directory_store: DirectoryStore,
+    pub inode_store: InodeStore,
     pub lock_manager: Arc<LockManager>,
     pub next_inode_id: Arc<AtomicU64>,
     pub cache: Arc<UnifiedCache>,
@@ -194,10 +195,12 @@ impl ZeroFS {
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let write_coordinator = Arc::new(WriteCoordinator::new());
         let directory_store = DirectoryStore::new(db.clone());
+        let inode_store = InodeStore::new(db.clone());
 
         let fs = Self {
             db: db.clone(),
             directory_store,
+            inode_store,
             lock_manager,
             next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
             cache: unified_cache,
@@ -244,7 +247,7 @@ impl ZeroFS {
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        txn.save_inode_counter(next_id);
+        self.inode_store.save_counter(&mut txn, next_id);
 
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
         let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
@@ -271,37 +274,7 @@ impl ZeroFS {
         }
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        let key = KeyCodec::inode_key(inode_id);
-        let data = self.db.get_bytes(&key).await.map_err(|e| {
-            tracing::error!(
-                "load_inode({}): database get_bytes failed: {:?}",
-                inode_id,
-                e
-            );
-            FsError::IoError
-        })?;
-
-        let data = match data {
-            Some(d) => d,
-            None => {
-                tracing::warn!(
-                    "load_inode({}): inode key not found in database (key={:?}).",
-                    inode_id,
-                    key
-                );
-                return Err(FsError::NotFound);
-            }
-        };
-
-        let inode: Inode = bincode::deserialize(&data).map_err(|e| {
-            tracing::warn!(
-                "load_inode({}): failed to deserialize inode data (len={}): {:?}.",
-                inode_id,
-                data.len(),
-                e
-            );
-            FsError::InvalidData
-        })?;
+        let inode = self.inode_store.load(inode_id).await?;
 
         let cache_key = CacheKey::Metadata(inode_id);
         let cache_value = CacheValue::Metadata(Arc::new(inode.clone()));

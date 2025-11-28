@@ -83,7 +83,7 @@ impl ZeroFS {
 
         let mut txn = self.new_transaction()?;
 
-        txn.save_inode(new_id, &symlink_inode)?;
+        self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
         self.directory_store.add(&mut txn, dirid, linkname, new_id);
 
         dir.entry_count += 1;
@@ -92,7 +92,7 @@ impl ZeroFS {
         dir.ctime = now_sec;
         dir.ctime_nsec = now_nsec;
 
-        txn.save_inode(dirid, &dir_inode)?;
+        self.inode_store.save(&mut txn, dirid, &dir_inode)?;
 
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
         self.global_stats
@@ -202,7 +202,7 @@ impl ZeroFS {
             _ => unreachable!(),
         }
 
-        txn.save_inode(fileid, &file_inode)?;
+        self.inode_store.save(&mut txn, fileid, &file_inode)?;
 
         link_dir.entry_count += 1;
         link_dir.mtime = now_sec;
@@ -210,7 +210,8 @@ impl ZeroFS {
         link_dir.ctime = now_sec;
         link_dir.ctime_nsec = now_nsec;
 
-        txn.save_inode(linkdirid, &Inode::Directory(link_dir))?;
+        self.inode_store
+            .save(&mut txn, linkdirid, &Inode::Directory(link_dir))?;
 
         let mut seq_guard = self.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;

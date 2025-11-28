@@ -67,7 +67,7 @@ impl ZeroFS {
                             file.ctime = now_sec;
                             file.ctime_nsec = now_nsec;
 
-                            txn.save_inode(file_id, &file_inode)?;
+                            self.inode_store.save(&mut txn, file_id, &file_inode)?;
                         } else {
                             let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
 
@@ -82,7 +82,7 @@ impl ZeroFS {
                                     .fetch_add(1, Ordering::Relaxed);
                             }
 
-                            txn.delete_inode(file_id);
+                            self.inode_store.delete(&mut txn, file_id);
                             self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -90,14 +90,14 @@ impl ZeroFS {
                         if subdir.entry_count > 0 {
                             return Err(FsError::NotEmpty);
                         }
-                        txn.delete_inode(file_id);
+                        self.inode_store.delete(&mut txn, file_id);
                         dir.nlink = dir.nlink.saturating_sub(1);
                         self.stats
                             .directories_deleted
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     Inode::Symlink(_) => {
-                        txn.delete_inode(file_id);
+                        self.inode_store.delete(&mut txn, file_id);
                         self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                     }
                     Inode::Fifo(special)
@@ -109,9 +109,9 @@ impl ZeroFS {
                             special.ctime = now_sec;
                             special.ctime_nsec = now_nsec;
 
-                            txn.save_inode(file_id, &file_inode)?;
+                            self.inode_store.save(&mut txn, file_id, &file_inode)?;
                         } else {
-                            txn.delete_inode(file_id);
+                            self.inode_store.delete(&mut txn, file_id);
                         }
                     }
                 }
@@ -124,7 +124,7 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                txn.save_inode(dirid, &dir_inode)?;
+                self.inode_store.save(&mut txn, dirid, &dir_inode)?;
 
                 // For directories and symlinks: always remove from stats
                 // For files and special files: only remove if this is the last link

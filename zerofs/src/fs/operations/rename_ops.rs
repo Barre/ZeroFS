@@ -159,9 +159,13 @@ impl ZeroFS {
                         $special.ctime = now_sec;
                         $special.ctime_nsec = now_nsec;
 
-                        txn.save_inode(target_id, &Inode::$inode_variant($special))?;
+                        self.inode_store.save(
+                            &mut txn,
+                            target_id,
+                            &Inode::$inode_variant($special),
+                        )?;
                     } else {
-                        txn.delete_inode(target_id);
+                        self.inode_store.delete(&mut txn, target_id);
                     }
                 };
             }
@@ -174,7 +178,8 @@ impl ZeroFS {
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
 
-                        txn.save_inode(target_id, &Inode::File(file))?;
+                        self.inode_store
+                            .save(&mut txn, target_id, &Inode::File(file))?;
                     } else {
                         let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
 
@@ -189,14 +194,14 @@ impl ZeroFS {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
 
-                        txn.delete_inode(target_id);
+                        self.inode_store.delete(&mut txn, target_id);
                     }
                 }
                 Inode::Directory(_) => {
-                    txn.delete_inode(target_id);
+                    self.inode_store.delete(&mut txn, target_id);
                 }
                 Inode::Symlink(_) => {
-                    txn.delete_inode(target_id);
+                    self.inode_store.delete(&mut txn, target_id);
                 }
                 Inode::Fifo(mut special) => {
                     handle_special_file!(special, Fifo);
@@ -257,7 +262,8 @@ impl ZeroFS {
                     }
                 }
             }
-            txn.save_inode(source_inode_id, &moved_inode)?;
+            self.inode_store
+                .save(&mut txn, source_inode_id, &moved_inode)?;
         }
 
         let (now_sec, now_nsec) = get_current_time();
@@ -275,7 +281,8 @@ impl ZeroFS {
             d.ctime = now_sec;
             d.ctime_nsec = now_nsec;
         }
-        txn.save_inode(from_dirid, &from_dir_inode)?;
+        self.inode_store
+            .save(&mut txn, from_dirid, &from_dir_inode)?;
 
         if from_dirid != to_dirid {
             let mut to_dir_inode = self.load_inode(to_dirid).await?;
@@ -294,7 +301,7 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
-            txn.save_inode(to_dirid, &to_dir_inode)?;
+            self.inode_store.save(&mut txn, to_dirid, &to_dir_inode)?;
         } else {
             let mut dir_inode = self.load_inode(from_dirid).await?;
             if let Inode::Directory(d) = &mut dir_inode {
@@ -306,7 +313,7 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
-            txn.save_inode(from_dirid, &dir_inode)?;
+            self.inode_store.save(&mut txn, from_dirid, &dir_inode)?;
         }
 
         if let Some(ref update) = target_stats_update {

@@ -130,7 +130,7 @@ impl ZeroFS {
                             }
                         }
 
-                        txn.save_inode(id, &inode)?;
+                        self.inode_store.save(&mut txn, id, &inode)?;
 
                         let stats_update = if let Some(update) = self
                             .global_stats
@@ -507,7 +507,7 @@ impl ZeroFS {
 
                 let mut txn = self.new_transaction()?;
 
-                txn.save_inode(special_id, &inode)?;
+                self.inode_store.save(&mut txn, special_id, &inode)?;
                 self.directory_store.add(&mut txn, dirid, name, special_id);
 
                 dir.entry_count += 1;
@@ -516,7 +516,7 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                txn.save_inode(dirid, &dir_inode)?;
+                self.inode_store.save(&mut txn, dirid, &dir_inode)?;
 
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
                 self.global_stats

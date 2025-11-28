@@ -166,7 +166,11 @@ impl ZeroFS {
 
                 let mut txn = self.new_transaction()?;
 
-                txn.save_inode(new_dir_id, &Inode::Directory(new_dir_inode.clone()))?;
+                self.inode_store.save(
+                    &mut txn,
+                    new_dir_id,
+                    &Inode::Directory(new_dir_inode.clone()),
+                )?;
                 self.directory_store.add(&mut txn, dirid, name, new_dir_id);
 
                 dir.entry_count += 1;
@@ -179,7 +183,7 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                txn.save_inode(dirid, &dir_inode)?;
+                self.inode_store.save(&mut txn, dirid, &dir_inode)?;
 
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats
