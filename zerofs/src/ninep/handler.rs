@@ -211,7 +211,7 @@ impl NinePHandler {
             groups_count: 1,
         };
 
-        let root_inode = match self.filesystem.load_inode(0).await {
+        let root_inode = match self.filesystem.inode_store.get(0).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -254,7 +254,7 @@ impl NinePHandler {
             let name_bytes = Bytes::copy_from_slice(&wname.data);
             current_path.push(name_bytes.clone());
 
-            let inode = match self.filesystem.load_inode(current_id).await {
+            let inode = match self.filesystem.inode_store.get(current_id).await {
                 Ok(i) => i,
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             };
@@ -268,7 +268,8 @@ impl NinePHandler {
                         .await
                     {
                         Ok(child_id) => {
-                            let child_inode = match self.filesystem.load_inode(child_id).await {
+                            let child_inode = match self.filesystem.inode_store.get(child_id).await
+                            {
                                 Ok(i) => i,
                                 Err(e) => {
                                     return P9Message::error(tag, e.to_errno());
@@ -333,7 +334,7 @@ impl NinePHandler {
             tl.fid, inode_id, creds.uid, creds.gid, tl.flags
         );
 
-        let inode = match self.filesystem.load_inode(inode_id).await {
+        let inode = match self.filesystem.inode_store.get(inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -374,7 +375,7 @@ impl NinePHandler {
 
         let mut entries_to_return: Vec<(u64, Vec<u8>, u64)> = Vec::new();
 
-        let parent_id = match self.filesystem.load_inode(fid_entry.inode_id).await {
+        let parent_id = match self.filesystem.inode_store.get(fid_entry.inode_id).await {
             Ok(Inode::Directory(dir)) => {
                 if fid_entry.inode_id == 0 {
                     0
@@ -485,13 +486,14 @@ impl NinePHandler {
 
         for (offset, name, _) in &entries_to_return {
             let (child_id, child_inode) = if name.as_slice() == b"." {
-                let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+                let inode = match self.filesystem.inode_store.get(fid_entry.inode_id).await {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
                 (fid_entry.inode_id, inode)
             } else if name.as_slice() == b".." {
-                let current_inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+                let current_inode = match self.filesystem.inode_store.get(fid_entry.inode_id).await
+                {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
@@ -505,7 +507,7 @@ impl NinePHandler {
                     }
                     _ => unreachable!("readdir called on non-directory"),
                 };
-                let parent_inode = match self.filesystem.load_inode(parent_id).await {
+                let parent_inode = match self.filesystem.inode_store.get(parent_id).await {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
@@ -519,7 +521,7 @@ impl NinePHandler {
                     .await
                 {
                     Ok(real_id) => {
-                        let inode = match self.filesystem.load_inode(real_id).await {
+                        let inode = match self.filesystem.inode_store.get(real_id).await {
                             Ok(i) => i,
                             Err(_) => continue,
                         };
@@ -595,7 +597,7 @@ impl NinePHandler {
             .await
         {
             Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.load_inode(child_id).await {
+                let child_inode = match self.filesystem.inode_store.get(child_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -703,7 +705,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        match self.filesystem.load_inode(fid_entry.inode_id).await {
+        match self.filesystem.inode_store.get(fid_entry.inode_id).await {
             Ok(inode) => P9Message::new(
                 tag,
                 Message::Rgetattr(Rgetattr {
@@ -810,7 +812,7 @@ impl NinePHandler {
             .await
         {
             Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.load_inode(new_id).await {
+                let new_inode = match self.filesystem.inode_store.get(new_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -851,7 +853,7 @@ impl NinePHandler {
             .await
         {
             Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.load_inode(new_id).await {
+                let new_inode = match self.filesystem.inode_store.get(new_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -902,7 +904,7 @@ impl NinePHandler {
             .await
         {
             Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.load_inode(child_id).await {
+                let child_inode = match self.filesystem.inode_store.get(child_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -924,7 +926,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+        let inode = match self.filesystem.inode_store.get(fid_entry.inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -1081,7 +1083,7 @@ impl NinePHandler {
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
 
-        let child_inode = match self.filesystem.load_inode(child_id).await {
+        let child_inode = match self.filesystem.inode_store.get(child_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };

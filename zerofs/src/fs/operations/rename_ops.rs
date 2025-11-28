@@ -78,16 +78,16 @@ impl ZeroFS {
             return Err(FsError::NotFound);
         }
 
-        let source_inode = self.load_inode(source_inode_id).await?;
+        let source_inode = self.inode_store.get(source_inode_id).await?;
         if matches!(source_inode, Inode::Directory(_))
             && self.is_ancestor_of(source_inode_id, to_dirid).await?
         {
             return Err(FsError::InvalidArgument);
         }
 
-        let from_dir = self.load_inode(from_dirid).await?;
+        let from_dir = self.inode_store.get(from_dirid).await?;
         let to_dir = if from_dirid != to_dirid {
-            Some(self.load_inode(to_dirid).await?)
+            Some(self.inode_store.get(to_dirid).await?)
         } else {
             None
         };
@@ -117,7 +117,7 @@ impl ZeroFS {
         }
 
         if let Some(target_id) = target_inode_id {
-            let target_inode = self.load_inode(target_id).await?;
+            let target_inode = self.inode_store.get(target_id).await?;
             if let Inode::Directory(dir) = &target_inode
                 && dir.entry_count > 0
             {
@@ -137,7 +137,7 @@ impl ZeroFS {
         let mut target_was_directory = false;
         let mut target_stats_update = None;
         if let Some(target_id) = target_inode_id {
-            let existing_inode = self.load_inode(target_id).await?;
+            let existing_inode = self.inode_store.get(target_id).await?;
 
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
@@ -236,7 +236,7 @@ impl ZeroFS {
             .add(&mut txn, to_dirid, to_name, source_inode_id);
 
         if from_dirid != to_dirid {
-            let mut moved_inode = self.load_inode(source_inode_id).await?;
+            let mut moved_inode = self.inode_store.get(source_inode_id).await?;
             match &mut moved_inode {
                 Inode::Directory(d) => d.parent = to_dirid,
                 Inode::File(f) => {
@@ -269,7 +269,7 @@ impl ZeroFS {
 
         let is_moved_dir = matches!(source_inode, Inode::Directory(_));
 
-        let mut from_dir_inode = self.load_inode(from_dirid).await?;
+        let mut from_dir_inode = self.inode_store.get(from_dirid).await?;
         if let Inode::Directory(d) = &mut from_dir_inode {
             d.entry_count = d.entry_count.saturating_sub(1);
             if is_moved_dir && from_dirid != to_dirid {
@@ -284,7 +284,7 @@ impl ZeroFS {
             .save(&mut txn, from_dirid, &from_dir_inode)?;
 
         if from_dirid != to_dirid {
-            let mut to_dir_inode = self.load_inode(to_dirid).await?;
+            let mut to_dir_inode = self.inode_store.get(to_dirid).await?;
             if let Inode::Directory(d) = &mut to_dir_inode {
                 if target_inode_id.is_none() {
                     d.entry_count += 1;
@@ -302,7 +302,7 @@ impl ZeroFS {
             }
             self.inode_store.save(&mut txn, to_dirid, &to_dir_inode)?;
         } else {
-            let mut dir_inode = self.load_inode(from_dirid).await?;
+            let mut dir_inode = self.inode_store.get(from_dirid).await?;
             if let Inode::Directory(d) = &mut dir_inode {
                 if target_inode_id.is_some() {
                     d.entry_count = d.entry_count.saturating_sub(1);

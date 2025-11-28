@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(inodes_after, 2); // Both inodes remain
 
         // Verify hardlink still works
-        let inode = fs.load_inode(target_id).await.unwrap();
+        let inode = fs.inode_store.get(target_id).await.unwrap();
         let attrs: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: target_id,

@@ -82,7 +82,7 @@ mod tests {
         assert_eq!(fattr.mode, 0o777);
         assert_eq!(fattr.file_type, FileType::Directory);
 
-        let new_dir_inode = fs.load_inode(dir_id).await.unwrap();
+        let new_dir_inode = fs.inode_store.get(dir_id).await.unwrap();
         match new_dir_inode {
             Inode::Directory(dir) => {
                 assert_eq!(dir.entry_count, 0);
@@ -259,7 +259,7 @@ mod tests {
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap();
         assert!(entry_data.is_none());
 
-        let result = fs.load_inode(file_id).await;
+        let result = fs.inode_store.get(file_id).await;
         assert!(matches!(result, Err(FsError::NotFound)));
     }
 
@@ -276,7 +276,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = fs.load_inode(dir_id).await;
+        let result = fs.inode_store.get(dir_id).await;
         assert!(matches!(result, Err(FsError::NotFound)));
     }
 
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(read_data.as_ref(), b"content1");
 
         // Check that the original file2 inode is gone
-        let result = fs.load_inode(file2_id).await;
+        let result = fs.inode_store.get(file2_id).await;
         assert!(matches!(result, Err(FsError::NotFound)));
     }
 
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(stored_id, file_id);
 
         // Check entry counts
-        let dir1_inode = fs.load_inode(dir1_id).await.unwrap();
+        let dir1_inode = fs.inode_store.get(dir1_id).await.unwrap();
         match dir1_inode {
             Inode::Directory(dir) => {
                 assert_eq!(dir.entry_count, 0);
@@ -442,7 +442,7 @@ mod tests {
             _ => panic!("Should be a directory"),
         }
 
-        let dir2_inode = fs.load_inode(dir2_id).await.unwrap();
+        let dir2_inode = fs.inode_store.get(dir2_id).await.unwrap();
         match dir2_inode {
             Inode::Directory(dir) => {
                 assert_eq!(dir.entry_count, 1);
@@ -478,7 +478,7 @@ mod tests {
         .unwrap();
 
         // Check initial entry count
-        let dir_inode = fs.load_inode(dir_id).await.unwrap();
+        let dir_inode = fs.inode_store.get(dir_id).await.unwrap();
         match &dir_inode {
             Inode::Directory(dir) => assert_eq!(dir.entry_count, 2),
             _ => panic!("Should be a directory"),
@@ -495,7 +495,7 @@ mod tests {
         .unwrap();
 
         // Check that entry count decreased by 1
-        let dir_inode = fs.load_inode(dir_id).await.unwrap();
+        let dir_inode = fs.inode_store.get(dir_id).await.unwrap();
         match &dir_inode {
             Inode::Directory(dir) => assert_eq!(dir.entry_count, 1),
             _ => panic!("Should be a directory"),
@@ -506,7 +506,7 @@ mod tests {
             .unwrap();
 
         // Directory should now be empty and removable
-        let dir_inode = fs.load_inode(dir_id).await.unwrap();
+        let dir_inode = fs.inode_store.get(dir_id).await.unwrap();
         match &dir_inode {
             Inode::Directory(dir) => assert_eq!(dir.entry_count, 0),
             _ => panic!("Should be a directory"),
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(fattr.file_type, FileType::Symlink);
         assert_eq!(fattr.size, target.len() as u64);
 
-        let link_inode = fs.load_inode(link_id).await.unwrap();
+        let link_inode = fs.inode_store.get(link_id).await.unwrap();
         match link_inode {
             Inode::Symlink(symlink) => {
                 assert_eq!(symlink.target, target);
@@ -855,14 +855,17 @@ mod tests {
             .unwrap();
 
         // Manually set nlink to just below the limit to avoid creating 65k files
-        let mut inode = fs.load_inode(file_id).await.unwrap();
+        let mut inode = fs.inode_store.get(file_id).await.unwrap();
         match &mut inode {
             Inode::File(file) => {
                 file.nlink = crate::fs::MAX_HARDLINKS_PER_INODE - 1;
             }
             _ => panic!("Expected file inode"),
         }
-        fs.save_inode(file_id, &inode).await.unwrap();
+        let mut txn = fs.new_transaction().unwrap();
+        fs.inode_store.save(&mut txn, file_id, &inode).unwrap();
+        let mut seq_guard = fs.allocate_sequence();
+        fs.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
         // Create one more hardlink - should succeed
         let result = fs
@@ -871,7 +874,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the file now has exactly MAX_HARDLINKS_PER_INODE links
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             Inode::File(file) => {
                 assert_eq!(file.nlink, crate::fs::MAX_HARDLINKS_PER_INODE);
@@ -886,7 +889,7 @@ mod tests {
         assert!(matches!(result, Err(FsError::TooManyLinks)));
 
         // Verify the file still has MAX_HARDLINKS_PER_INODE links
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             Inode::File(file) => {
                 assert_eq!(file.nlink, crate::fs::MAX_HARDLINKS_PER_INODE);

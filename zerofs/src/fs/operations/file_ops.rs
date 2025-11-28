@@ -31,11 +31,11 @@ impl ZeroFS {
         let creds = Credentials::from_auth_context(auth);
 
         // Optimistically load inode and check parent permissions before lock
-        let _ = self.load_inode(id).await?;
+        let _ = self.inode_store.get(id).await?;
         self.check_parent_execute_permissions(id, &creds).await?;
 
         let _guard = self.lock_manager.acquire_write(id).await;
-        let mut inode = self.load_inode(id).await?;
+        let mut inode = self.inode_store.get(id).await?;
 
         // NFS RFC 1813 section 4.4: Allow owners to write to their files regardless of permission bits
         match &inode {
@@ -144,7 +144,7 @@ impl ZeroFS {
         }
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
-        let mut dir_inode = self.load_inode(dirid).await?;
+        let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -264,7 +264,7 @@ impl ZeroFS {
             id, offset, count
         );
 
-        let inode = self.load_inode(id).await?;
+        let inode = self.inode_store.get(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
 
@@ -307,7 +307,7 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire_write(id).await;
-        let inode = self.load_inode(id).await?;
+        let inode = self.inode_store.get(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
 

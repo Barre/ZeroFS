@@ -26,7 +26,7 @@ impl ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        let dir_inode = self.load_inode(dirid).await?;
+        let dir_inode = self.inode_store.get(dirid).await?;
 
         match dir_inode {
             Inode::Directory(_) => {
@@ -97,7 +97,7 @@ impl ZeroFS {
         }
 
         let _guard = self.lock_manager.acquire_write(dirid).await;
-        let mut dir_inode = self.load_inode(dirid).await?;
+        let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -226,7 +226,7 @@ impl ZeroFS {
             dirid, start_after, max_entries
         );
 
-        let dir_inode = self.load_inode(dirid).await?;
+        let dir_inode = self.inode_store.get(dirid).await?;
 
         let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Read)?;
@@ -271,7 +271,7 @@ impl ZeroFS {
                             }
                             .into()
                         } else {
-                            match self.load_inode(parent_id).await {
+                            match self.inode_store.get(parent_id).await {
                                 Ok(parent_inode) => InodeWithId {
                                     inode: &parent_inode,
                                     id: parent_id,
@@ -343,7 +343,7 @@ impl ZeroFS {
                     let inode_futures =
                         stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
                             debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
-                            match self.load_inode(inode_id).await {
+                            match self.inode_store.get(inode_id).await {
                                 Ok(inode) => {
                                     debug!("readdir: loaded inode {} successfully", inode_id);
                                     Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))

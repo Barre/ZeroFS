@@ -26,7 +26,7 @@ impl ZeroFS {
             .acquire_multiple_write(vec![dirid, file_id])
             .await;
 
-        let dir_inode = self.load_inode(dirid).await?;
+        let dir_inode = self.inode_store.get(dirid).await?;
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
@@ -41,7 +41,7 @@ impl ZeroFS {
             return Err(FsError::NotFound);
         }
 
-        let mut file_inode = self.load_inode(file_id).await?;
+        let mut file_inode = self.inode_store.get(file_id).await?;
 
         let original_nlink = match &file_inode {
             Inode::File(f) => f.nlink,
@@ -53,7 +53,7 @@ impl ZeroFS {
 
         check_sticky_bit_delete(&dir_inode, &file_inode, &creds)?;
 
-        let mut dir_inode = self.load_inode(dirid).await?;
+        let mut dir_inode = self.inode_store.get(dirid).await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
