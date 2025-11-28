@@ -3,10 +3,11 @@ use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, SymlinkInode};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
 use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
-use crate::fs::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
+use crate::fs::{ZeroFS, get_current_time};
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -48,7 +49,7 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        let new_id = self.allocate_inode().await?;
+        let new_id = self.inode_store.allocate()?;
 
         let mode = match &attr.mode {
             SetMode::Set(m) => *m | 0o120000,
