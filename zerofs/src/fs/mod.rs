@@ -23,8 +23,7 @@ use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use zerofs_nfsserve::nfs::fileid3;
+use std::sync::atomic::Ordering;
 
 pub use self::write_coordinator::SequenceGuard;
 
@@ -46,55 +45,6 @@ pub fn get_current_time() -> (u64, u32) {
 pub const CHUNK_SIZE: usize = 256 * 1024;
 pub const STATS_SHARDS: usize = 100;
 
-// Maximum hardlinks per inode - limited by our encoding scheme (16 bits for position)
-pub const MAX_HARDLINKS_PER_INODE: u32 = u16::MAX as u32;
-// Maximum inode ID - limited by our encoding scheme (48 bits for inode ID)
-pub const MAX_INODE_ID: u64 = (1u64 << 48) - 1;
-
-// Encoded file ID for NFS operations: High 48 bits = inode ID, Low 16 bits = position for hardlinks
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EncodedFileId(u64);
-
-impl EncodedFileId {
-    pub fn new(inode_id: u64, position: u16) -> Self {
-        Self((inode_id << 16) | (position as u64))
-    }
-
-    pub fn from_inode(inode_id: u64) -> Self {
-        Self::new(inode_id, 0)
-    }
-
-    pub fn decode(self) -> (u64, u16) {
-        let inode = self.0 >> 16;
-        let position = (self.0 & 0xFFFF) as u16;
-        (inode, position)
-    }
-
-    pub fn as_raw(self) -> u64 {
-        self.0
-    }
-
-    pub fn inode_id(self) -> u64 {
-        self.0 >> 16
-    }
-
-    pub fn position(self) -> u16 {
-        (self.0 & 0xFFFF) as u16
-    }
-}
-
-impl From<fileid3> for EncodedFileId {
-    fn from(id: fileid3) -> Self {
-        Self(id)
-    }
-}
-
-impl From<EncodedFileId> for fileid3 {
-    fn from(id: EncodedFileId) -> Self {
-        id.0
-    }
-}
-
 #[derive(Clone)]
 pub struct ZeroFS {
     pub db: Arc<EncryptedDb>,
@@ -102,7 +52,6 @@ pub struct ZeroFS {
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub lock_manager: Arc<LockManager>,
-    pub next_inode_id: Arc<AtomicU64>,
     pub cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
@@ -198,7 +147,12 @@ impl ZeroFS {
         let stats = Arc::new(FileSystemStats::new());
         let chunk_store = ChunkStore::new(db.clone());
         let directory_store = DirectoryStore::new(db.clone());
-        let inode_store = InodeStore::new(db.clone(), unified_cache.clone(), stats.clone());
+        let inode_store = InodeStore::new(
+            db.clone(),
+            unified_cache.clone(),
+            stats.clone(),
+            next_inode_id,
+        );
 
         let fs = Self {
             db: db.clone(),
@@ -206,7 +160,6 @@ impl ZeroFS {
             directory_store,
             inode_store,
             lock_manager,
-            next_inode_id: Arc::new(AtomicU64::new(next_inode_id)),
             cache: unified_cache,
             stats,
             global_stats,
@@ -218,17 +171,6 @@ impl ZeroFS {
         Ok(fs)
     }
 
-    pub async fn allocate_inode(&self) -> Result<InodeId, FsError> {
-        let id = self.next_inode_id.fetch_add(1, Ordering::SeqCst);
-
-        if id > MAX_INODE_ID {
-            self.next_inode_id.store(MAX_INODE_ID + 2, Ordering::SeqCst);
-            return Err(FsError::NoSpace);
-        }
-
-        Ok(id)
-    }
-
     pub async fn flush(&self) -> Result<(), FsError> {
         self.flush_coordinator.flush().await
     }
@@ -238,8 +180,7 @@ impl ZeroFS {
         mut txn: EncryptedTransaction,
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
-        let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        self.inode_store.save_counter(&mut txn, next_id);
+        self.inode_store.save_counter(&mut txn);
 
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
         let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
@@ -474,6 +415,7 @@ impl ZeroFS {
 mod tests {
     use super::*;
     use crate::fs::inode::FileInode;
+    use crate::fs::store::inode::MAX_INODE_ID;
 
     #[tokio::test]
     async fn test_create_filesystem() {
@@ -496,9 +438,9 @@ mod tests {
     async fn test_allocate_inode() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let inode1 = fs.allocate_inode().await.unwrap();
-        let inode2 = fs.allocate_inode().await.unwrap();
-        let inode3 = fs.allocate_inode().await.unwrap();
+        let inode1 = fs.inode_store.allocate().unwrap();
+        let inode2 = fs.inode_store.allocate().unwrap();
+        let inode3 = fs.inode_store.allocate().unwrap();
 
         assert_ne!(inode1, 0);
         assert_ne!(inode2, 0);
@@ -528,7 +470,7 @@ mod tests {
         };
 
         let inode = Inode::File(file_inode.clone());
-        let inode_id = fs.allocate_inode().await.unwrap();
+        let inode_id = fs.inode_store.allocate().unwrap();
 
         let mut txn = fs.db.new_transaction().unwrap();
         fs.inode_store.save(&mut txn, inode_id, &inode).unwrap();
@@ -601,64 +543,15 @@ mod tests {
     async fn test_max_inode_id_limit() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        // Set the counter to MAX_INODE_ID (next allocation will get this value)
-        fs.next_inode_id.store(MAX_INODE_ID, Ordering::SeqCst);
+        fs.inode_store.set_next_id_for_testing(MAX_INODE_ID);
 
-        // Should be able to allocate one more inode
-        let id = fs.allocate_inode().await.unwrap();
+        let id = fs.inode_store.allocate().unwrap();
         assert_eq!(id, MAX_INODE_ID);
 
-        // Next allocation should fail
-        let result = fs.allocate_inode().await;
+        let result = fs.inode_store.allocate();
         assert!(matches!(result, Err(FsError::NoSpace)));
 
-        // Verify the counter is set to indicate we're full
-        assert!(fs.next_inode_id.load(Ordering::SeqCst) > MAX_INODE_ID);
-    }
-
-    #[test]
-    fn test_dir_entry_encoding() {
-        // Test case 1: Root directory (0)
-        let encoded = EncodedFileId::from(0u64);
-        let (inode, pos) = encoded.decode();
-        assert_eq!(inode, 0);
-        assert_eq!(pos, 0);
-
-        // Test case 2: Regular inode with position 0
-        let encoded = EncodedFileId::new(42, 0);
-        assert_eq!(encoded.inode_id(), 42);
-        assert_eq!(encoded.position(), 0);
-        let (inode, pos) = encoded.decode();
-        assert_eq!(inode, 42);
-        assert_eq!(pos, 0);
-
-        // Test case 3: Hardlink with position
-        let encoded = EncodedFileId::new(100, 5);
-        assert_eq!(encoded.inode_id(), 100);
-        assert_eq!(encoded.position(), 5);
-        let (inode, pos) = encoded.decode();
-        assert_eq!(inode, 100);
-        assert_eq!(pos, 5);
-
-        // Test case 4: Maximum position
-        let encoded = EncodedFileId::new(1000, 65535);
-        let (inode, pos) = encoded.decode();
-        assert_eq!(inode, 1000);
-        assert_eq!(pos, 65535);
-
-        // Test case 5: Large inode ID (near max)
-        let large_id = MAX_INODE_ID;
-        let encoded = EncodedFileId::new(large_id, 0);
-        let (inode, pos) = encoded.decode();
-        assert_eq!(inode, large_id);
-        assert_eq!(pos, 0);
-
-        // Test case 6: Converting from raw u64
-        let raw_value = (42u64 << 16) | 5; // Should be 2752517
-        let from_raw = EncodedFileId::from(raw_value);
-        assert_eq!(from_raw.inode_id(), 42);
-        assert_eq!(from_raw.position(), 5);
-        assert_eq!(from_raw.as_raw(), raw_value);
+        assert!(fs.inode_store.next_id() > MAX_INODE_ID);
     }
 
     #[tokio::test]
@@ -702,7 +595,7 @@ mod tests {
         .await
         .unwrap();
 
-        let test_inode_id = fs_rw.allocate_inode().await.unwrap();
+        let test_inode_id = fs_rw.inode_store.allocate().unwrap();
         let file_inode = FileInode {
             size: 2048,
             mtime: 1234567890,

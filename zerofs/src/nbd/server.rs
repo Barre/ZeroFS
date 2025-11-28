@@ -9,10 +9,11 @@ use super::protocol::{
     NBDInfoExport, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     TRANSMISSION_FLAGS,
 };
+use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
+use crate::fs::store::inode::EncodedFileId;
 use crate::fs::types::AuthContext;
-use crate::fs::{EncodedFileId, ZeroFS};
 use bytes::BytesMut;
 use deku::prelude::*;
 use std::net::SocketAddr;

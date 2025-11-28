@@ -549,12 +549,10 @@ mod tests {
                 .unwrap();
         }
 
-        // Check fsstat - need to load and calculate manually
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
         const TOTAL_INODES: u64 = 1 << 48;
 
-        // Get the next inode ID to verify available inodes calculation
-        let next_inode_id = fs.next_inode_id.load(std::sync::atomic::Ordering::Relaxed);
+        let next_inode_id = fs.inode_store.next_id();
         let (used_bytes, used_inodes) = fs.global_stats.get_totals();
 
         let fbytes = TOTAL_BYTES - used_bytes;

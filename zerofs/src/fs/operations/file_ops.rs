@@ -156,7 +156,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
-                let file_id = self.allocate_inode().await?;
+                let file_id = self.inode_store.allocate()?;
                 debug!(
                     "Allocated inode {} for file {}",
                     file_id,

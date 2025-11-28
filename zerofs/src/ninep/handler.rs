@@ -1139,10 +1139,7 @@ impl NinePHandler {
         let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
-        let next_inode_id = self
-            .filesystem
-            .next_inode_id
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let next_inode_id = self.filesystem.inode_store.next_id();
 
         let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
 
@@ -1585,10 +1582,7 @@ mod tests {
                 // Should have fewer available inodes since we allocated one for the file
                 // Note: Available inodes are based on next_inode_id, not currently used inodes
                 const TOTAL_INODES: u64 = 1 << 48;
-                let next_inode_id = handler
-                    .filesystem
-                    .next_inode_id
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let next_inode_id = handler.filesystem.inode_store.next_id();
                 assert_eq!(rstatfs.ffree, TOTAL_INODES - next_inode_id);
 
                 // Should have fewer free blocks (10KB written = 3 blocks of 4KB)

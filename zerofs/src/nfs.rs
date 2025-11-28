@@ -1,11 +1,11 @@
+use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
 use crate::fs::permissions::Credentials;
+use crate::fs::store::inode::EncodedFileId;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
-use crate::fs::{EncodedFileId, ZeroFS};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -416,7 +416,7 @@ impl NFSFileSystem for NFSAdapter {
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
 
         // Get the next inode ID to determine how many more IDs can be allocated
-        let next_inode_id = self.fs.next_inode_id.load(Ordering::Relaxed);
+        let next_inode_id = self.fs.inode_store.next_id();
 
         // Available inodes = total possible inodes - allocated inode IDs
         // This represents how many more inodes can be created (never increases since IDs aren't reused)

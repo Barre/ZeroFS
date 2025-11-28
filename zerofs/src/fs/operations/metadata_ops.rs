@@ -437,7 +437,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
-                let special_id = self.allocate_inode().await?;
+                let special_id = self.inode_store.allocate()?;
                 let (now_sec, now_nsec) = get_current_time();
 
                 let base_mode = match ftype {

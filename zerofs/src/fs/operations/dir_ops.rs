@@ -3,11 +3,12 @@ use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
+use crate::fs::store::inode::EncodedFileId;
 use crate::fs::types::{
     AuthContext, DirEntry, FileAttributes, InodeId, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetTime, SetUid,
 };
-use crate::fs::{EncodedFileId, ZeroFS, get_current_time};
+use crate::fs::{ZeroFS, get_current_time};
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use std::sync::atomic::Ordering;
@@ -109,7 +110,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
-                let new_dir_id = self.allocate_inode().await?;
+                let new_dir_id = self.inode_store.allocate()?;
 
                 let (now_sec, now_nsec) = get_current_time();
 

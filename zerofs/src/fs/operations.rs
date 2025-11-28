@@ -10,13 +10,13 @@ pub mod rename_ops;
 mod tests {
     use bytes::Bytes;
 
-    use crate::fs::ZeroFS;
     use crate::fs::errors::FsError;
     use crate::fs::inode::Inode;
     use crate::fs::key_codec::KeyCodec;
     use crate::fs::permissions::Credentials;
+    use crate::fs::store::inode::{EncodedFileId, MAX_HARDLINKS_PER_INODE};
     use crate::fs::types::{FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
-    use crate::fs::{CHUNK_SIZE, EncodedFileId};
+    use crate::fs::{CHUNK_SIZE, ZeroFS};
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     fn test_creds() -> Credentials {
@@ -858,7 +858,7 @@ mod tests {
         let mut inode = fs.inode_store.get(file_id).await.unwrap();
         match &mut inode {
             Inode::File(file) => {
-                file.nlink = crate::fs::MAX_HARDLINKS_PER_INODE - 1;
+                file.nlink = MAX_HARDLINKS_PER_INODE - 1;
             }
             _ => panic!("Expected file inode"),
         }
@@ -877,7 +877,7 @@ mod tests {
         let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             Inode::File(file) => {
-                assert_eq!(file.nlink, crate::fs::MAX_HARDLINKS_PER_INODE);
+                assert_eq!(file.nlink, MAX_HARDLINKS_PER_INODE);
             }
             _ => panic!("Expected file inode"),
         }
@@ -892,7 +892,7 @@ mod tests {
         let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             Inode::File(file) => {
-                assert_eq!(file.nlink, crate::fs::MAX_HARDLINKS_PER_INODE);
+                assert_eq!(file.nlink, MAX_HARDLINKS_PER_INODE);
             }
             _ => panic!("Expected file inode"),
         }
