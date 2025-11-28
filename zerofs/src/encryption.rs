@@ -1,4 +1,6 @@
 use crate::fs::errors::FsError;
+use crate::fs::inode::{Inode, InodeId};
+use crate::fs::key_codec::KeyCodec;
 use crate::fs::key_codec::KeyPrefix;
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -89,16 +91,14 @@ impl EncryptionManager {
     }
 }
 
-// Encrypted WriteBatch wrapper
-pub struct EncryptedWriteBatch {
+pub struct EncryptedTransaction {
     inner: WriteBatch,
     encryptor: Arc<EncryptionManager>,
-    // Queue of cache operations to apply after successful write
-    cache_ops: Vec<(Bytes, Option<Bytes>)>, // (key, Some(value) for put, None for delete)
+    cache_ops: Vec<(Bytes, Option<Bytes>)>,
     pending_operations: Vec<(Bytes, Bytes)>,
 }
 
-impl EncryptedWriteBatch {
+impl EncryptedTransaction {
     pub fn new(encryptor: Arc<EncryptionManager>) -> Self {
         Self {
             inner: WriteBatch::new(),
@@ -109,11 +109,9 @@ impl EncryptedWriteBatch {
     }
 
     pub fn put_bytes(&mut self, key: &bytes::Bytes, value: Bytes) {
-        // Queue cache operation if this is a chunk
         if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             self.cache_ops.push((key.clone(), Some(value.clone())));
         }
-
         self.pending_operations.push((key.clone(), value));
     }
 
@@ -121,8 +119,58 @@ impl EncryptedWriteBatch {
         if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             self.cache_ops.push((key.clone(), None));
         }
-
         self.inner.delete(key);
+    }
+
+    pub fn save_inode(
+        &mut self,
+        id: InodeId,
+        inode: &Inode,
+    ) -> Result<(), Box<bincode::ErrorKind>> {
+        let key = KeyCodec::inode_key(id);
+        let data = bincode::serialize(inode)?;
+        self.put_bytes(&key, Bytes::from(data));
+        Ok(())
+    }
+
+    pub fn delete_inode(&mut self, id: InodeId) {
+        let key = KeyCodec::inode_key(id);
+        self.delete_bytes(&key);
+    }
+
+    pub fn add_dir_entry(&mut self, dir_id: InodeId, name: &[u8], entry_id: InodeId) {
+        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        self.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id));
+
+        let scan_key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
+        self.put_bytes(&scan_key, KeyCodec::encode_dir_entry(entry_id));
+    }
+
+    pub fn remove_dir_entry(&mut self, dir_id: InodeId, name: &[u8], entry_id: InodeId) {
+        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        self.delete_bytes(&entry_key);
+
+        let scan_key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
+        self.delete_bytes(&scan_key);
+    }
+
+    pub fn delete_chunk(&mut self, inode_id: InodeId, chunk_idx: u64) {
+        let key = KeyCodec::chunk_key(inode_id, chunk_idx);
+        self.delete_bytes(&key);
+    }
+
+    pub fn save_inode_counter(&mut self, next_id: u64) {
+        let key = KeyCodec::system_counter_key();
+        self.put_bytes(&key, KeyCodec::encode_counter(next_id));
+    }
+
+    pub fn add_tombstone(&mut self, inode_id: InodeId, size: u64) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key = KeyCodec::tombstone_key(timestamp, inode_id);
+        self.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }
 
     #[allow(clippy::type_complexity)]
@@ -292,14 +340,14 @@ impl EncryptedDb {
 
     pub async fn write_with_options(
         &self,
-        batch: EncryptedWriteBatch,
+        txn: EncryptedTransaction,
         options: &WriteOptions,
     ) -> Result<()> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let (inner_batch, _cache_ops) = batch.into_inner().await?;
+        let (inner_batch, _cache_ops) = txn.into_inner().await?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
@@ -324,11 +372,11 @@ impl EncryptedDb {
         Ok(())
     }
 
-    pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch> {
+    pub fn new_transaction(&self) -> Result<EncryptedTransaction> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
-        Ok(EncryptedWriteBatch::new(self.encryptor.clone()))
+        Ok(EncryptedTransaction::new(self.encryptor.clone()))
     }
 
     pub async fn put_with_options(

@@ -83,6 +83,80 @@ pub enum Inode {
     BlockDevice(SpecialInode),
 }
 
+impl Inode {
+    /// Get the parent directory ID if available.
+    pub fn parent(&self) -> Option<InodeId> {
+        match self {
+            Inode::Directory(d) => Some(d.parent),
+            Inode::File(f) => f.parent,
+            Inode::Symlink(s) => s.parent,
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                s.parent
+            }
+        }
+    }
+
+    /// Get the link count (nlink) for this inode.
+    pub fn nlink(&self) -> u32 {
+        match self {
+            Inode::Directory(d) => d.nlink,
+            Inode::File(f) => f.nlink,
+            Inode::Symlink(s) => s.nlink,
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                s.nlink
+            }
+        }
+    }
+
+    /// Get the file size (0 for directories/special files).
+    pub fn size(&self) -> u64 {
+        match self {
+            Inode::File(f) => f.size,
+            Inode::Symlink(s) => s.target.len() as u64,
+            _ => 0,
+        }
+    }
+
+    /// Check if this is a directory.
+    pub fn is_directory(&self) -> bool {
+        matches!(self, Inode::Directory(_))
+    }
+
+    /// Check if this is a regular file.
+    pub fn is_file(&self) -> bool {
+        matches!(self, Inode::File(_))
+    }
+
+    /// Check if this is a symlink.
+    pub fn is_symlink(&self) -> bool {
+        matches!(self, Inode::Symlink(_))
+    }
+
+    /// Get uid/gid tuple for ownership checks.
+    pub fn ownership(&self) -> (u32, u32) {
+        match self {
+            Inode::Directory(d) => (d.uid, d.gid),
+            Inode::File(f) => (f.uid, f.gid),
+            Inode::Symlink(s) => (s.uid, s.gid),
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                (s.uid, s.gid)
+            }
+        }
+    }
+
+    /// Get mode bits.
+    pub fn mode(&self) -> u32 {
+        match self {
+            Inode::Directory(d) => d.mode,
+            Inode::File(f) => f.mode,
+            Inode::Symlink(s) => s.mode,
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                s.mode
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

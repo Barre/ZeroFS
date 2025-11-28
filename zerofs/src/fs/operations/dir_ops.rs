@@ -188,16 +188,10 @@ impl ZeroFS {
                     nlink: 2,
                 };
 
-                let mut batch = self.new_write_batch()?;
+                let mut txn = self.new_transaction()?;
 
-                let new_dir_key = KeyCodec::inode_key(new_dir_id);
-                let new_dir_data = bincode::serialize(&Inode::Directory(new_dir_inode.clone()))?;
-                batch.put_bytes(&new_dir_key, Bytes::from(new_dir_data));
-
-                batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(new_dir_id));
-
-                let scan_key = KeyCodec::dir_scan_key(dirid, new_dir_id, name);
-                batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(new_dir_id));
+                txn.save_inode(new_dir_id, &Inode::Directory(new_dir_inode.clone()))?;
+                txn.add_dir_entry(dirid, name, new_dir_id);
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -209,15 +203,14 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                let parent_dir_key = KeyCodec::inode_key(dirid);
-                let parent_dir_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&parent_dir_key, Bytes::from(parent_dir_data));
+                txn.save_inode(dirid, &dir_inode)?;
 
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
-                self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+                self.global_stats
+                    .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.allocate_sequence();
-                self.commit_batch_ordered(batch, &mut seq_guard).await?;
+                self.commit_transaction(txn, &mut seq_guard).await?;
 
                 self.global_stats.commit_update(&stats_update);
 

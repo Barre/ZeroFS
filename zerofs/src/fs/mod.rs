@@ -18,7 +18,7 @@ use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::write_coordinator::WriteCoordinator;
-use crate::encryption::{EncryptedDb, EncryptedWriteBatch, EncryptionManager};
+use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -227,23 +227,21 @@ impl ZeroFS {
         self.write_coordinator.allocate_sequence()
     }
 
-    pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch, FsError> {
+    pub fn new_transaction(&self) -> Result<EncryptedTransaction, FsError> {
         self.db
-            .new_write_batch()
+            .new_transaction()
             .map_err(|_| FsError::ReadOnlyFilesystem)
     }
 
-    pub async fn commit_batch_ordered(
+    pub async fn commit_transaction(
         &self,
-        mut batch: EncryptedWriteBatch,
+        mut txn: EncryptedTransaction,
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
-        let counter_key = KeyCodec::system_counter_key();
         let next_id = self.next_inode_id.load(Ordering::SeqCst);
-        batch.put_bytes(&counter_key, KeyCodec::encode_counter(next_id));
+        txn.save_inode_counter(next_id);
 
-        let (encrypt_result, _) =
-            tokio::join!(batch.into_inner(), seq_guard.wait_for_predecessors());
+        let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
         let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
 
         self.db
@@ -379,19 +377,18 @@ impl ZeroFS {
                 }
                 tombstones_to_update.push((key, inode_id, size, start_chunk, is_final_batch));
 
-                let mut batch = self
+                let mut txn = self
                     .db
-                    .new_write_batch()
+                    .new_transaction()
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
                 for chunk_idx in start_chunk..total_chunks {
-                    let chunk_key = KeyCodec::chunk_key(inode_id, chunk_idx as u64);
-                    batch.delete_bytes(&chunk_key);
+                    txn.delete_chunk(inode_id, chunk_idx as u64);
                 }
 
                 if chunks_to_delete > 0 {
                     self.db
                         .write_with_options(
-                            batch,
+                            txn,
                             &WriteOptions {
                                 await_durable: false,
                             },
@@ -413,27 +410,27 @@ impl ZeroFS {
             }
 
             if !tombstones_to_update.is_empty() {
-                let mut batch = self
+                let mut txn = self
                     .db
-                    .new_write_batch()
+                    .new_transaction()
                     .map_err(|_| FsError::ReadOnlyFilesystem)?;
 
                 for (key, _inode_id, old_size, start_chunk, delete_tombstone) in
                     tombstones_to_update
                 {
                     if delete_tombstone {
-                        batch.delete_bytes(&key);
+                        txn.delete_bytes(&key);
                     } else {
                         let remaining_chunks = start_chunk;
                         let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
-                        batch.put_bytes(&key, KeyCodec::encode_tombstone_size(actual_remaining));
+                        txn.put_bytes(&key, KeyCodec::encode_tombstone_size(actual_remaining));
                     }
                 }
 
                 self.db
                     .write_with_options(
-                        batch,
+                        txn,
                         &WriteOptions {
                             await_durable: false,
                         },

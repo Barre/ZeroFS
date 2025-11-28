@@ -72,7 +72,7 @@ impl ZeroFS {
                 let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
                 let end_chunk = (end_offset.saturating_sub(1) / CHUNK_SIZE as u64) as usize;
 
-                let mut batch = self.new_write_batch()?;
+                let mut txn = self.new_transaction()?;
 
                 let chunk_processing_start = std::time::Instant::now();
 
@@ -129,7 +129,7 @@ impl ZeroFS {
                         .copy_from_slice(&data[data_offset..data_offset + data_len]);
                     data_offset += data_len;
 
-                    batch.put_bytes(&chunk_key, chunk.freeze());
+                    txn.put_bytes(&chunk_key, chunk.freeze());
                 }
 
                 debug!(
@@ -147,16 +147,14 @@ impl ZeroFS {
                     file.mode &= !0o6000;
                 }
 
-                let inode_key = KeyCodec::inode_key(id);
-                let inode_data = bincode::serialize(&inode)?;
-                batch.put_bytes(&inode_key, Bytes::from(inode_data));
+                txn.save_inode(id, &inode)?;
 
                 let stats_update = if let Some(update) = self
                     .global_stats
                     .prepare_size_change(id, old_size, new_size)
                     .await
                 {
-                    self.global_stats.add_to_batch(&update, &mut batch)?;
+                    self.global_stats.add_to_transaction(&update, &mut txn)?;
                     Some(update)
                 } else {
                     None
@@ -164,7 +162,7 @@ impl ZeroFS {
 
                 let db_write_start = std::time::Instant::now();
                 let mut seq_guard = self.allocate_sequence();
-                self.commit_batch_ordered(batch, &mut seq_guard).await?;
+                self.commit_transaction(txn, &mut seq_guard).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
                 if let Some(update) = stats_update {
@@ -275,16 +273,10 @@ impl ZeroFS {
                     nlink: 1,
                 };
 
-                let mut batch = self.new_write_batch()?;
+                let mut txn = self.new_transaction()?;
 
-                let file_inode_key = KeyCodec::inode_key(file_id);
-                let file_inode_data = bincode::serialize(&Inode::File(file_inode.clone()))?;
-                batch.put_bytes(&file_inode_key, Bytes::from(file_inode_data));
-
-                batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(file_id));
-
-                let scan_key = KeyCodec::dir_scan_key(dirid, file_id, name);
-                batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(file_id));
+                txn.save_inode(file_id, &Inode::File(file_inode.clone()))?;
+                txn.add_dir_entry(dirid, name, file_id);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -292,15 +284,14 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                let dir_key = KeyCodec::inode_key(dirid);
-                let dir_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&dir_key, Bytes::from(dir_data));
+                txn.save_inode(dirid, &dir_inode)?;
 
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
-                self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+                self.global_stats
+                    .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.allocate_sequence();
-                self.commit_batch_ordered(batch, &mut seq_guard)
+                self.commit_transaction(txn, &mut seq_guard)
                     .await
                     .inspect_err(|e| {
                         error!("Failed to write batch: {:?}", e);
@@ -456,7 +447,7 @@ impl ZeroFS {
         let start_chunk = (offset / CHUNK_SIZE as u64) as usize;
         let end_chunk = ((end_offset.saturating_sub(1)) / CHUNK_SIZE as u64) as usize;
 
-        let mut batch = self.new_write_batch()?;
+        let mut txn = self.new_transaction()?;
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx as u64 * CHUNK_SIZE as u64;
@@ -469,7 +460,7 @@ impl ZeroFS {
             let chunk_key = KeyCodec::chunk_key(id, chunk_idx as u64);
 
             if offset <= chunk_start && end_offset >= chunk_end {
-                batch.delete_bytes(&chunk_key);
+                txn.delete_bytes(&chunk_key);
             } else {
                 // Partial trim - load chunk, clear trimmed region, save or delete
                 let trim_start = if offset > chunk_start {
@@ -494,9 +485,9 @@ impl ZeroFS {
                     chunk_data[trim_start..trim_end].fill(0);
 
                     if chunk_data.iter().all(|&b| b == 0) {
-                        batch.delete_bytes(&chunk_key);
+                        txn.delete_bytes(&chunk_key);
                     } else {
-                        batch.put_bytes(&chunk_key, chunk_data.freeze());
+                        txn.put_bytes(&chunk_key, chunk_data.freeze());
                     }
                 }
                 // If chunk doesn't exist, nothing to trim
@@ -504,7 +495,7 @@ impl ZeroFS {
         }
 
         let mut seq_guard = self.allocate_sequence();
-        self.commit_batch_ordered(batch, &mut seq_guard)
+        self.commit_transaction(txn, &mut seq_guard)
             .await
             .inspect_err(|e| {
                 error!("Failed to commit trim batch: {}", e);

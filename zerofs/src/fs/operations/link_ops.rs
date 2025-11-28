@@ -8,7 +8,6 @@ use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
 };
 use crate::fs::{MAX_HARDLINKS_PER_INODE, ZeroFS, get_current_time};
-use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -90,16 +89,10 @@ impl ZeroFS {
             nlink: 1,
         });
 
-        let mut batch = self.new_write_batch()?;
+        let mut txn = self.new_transaction()?;
 
-        let inode_key = KeyCodec::inode_key(new_id);
-        let inode_data = bincode::serialize(&symlink_inode)?;
-        batch.put_bytes(&inode_key, Bytes::from(inode_data));
-
-        batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(new_id));
-
-        let scan_key = KeyCodec::dir_scan_key(dirid, new_id, linkname);
-        batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(new_id));
+        txn.save_inode(new_id, &symlink_inode)?;
+        txn.add_dir_entry(dirid, linkname, new_id);
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -107,15 +100,14 @@ impl ZeroFS {
         dir.ctime = now_sec;
         dir.ctime_nsec = now_nsec;
 
-        let dir_key = KeyCodec::inode_key(dirid);
-        let dir_data = bincode::serialize(&dir_inode)?;
-        batch.put_bytes(&dir_key, Bytes::from(dir_data));
+        txn.save_inode(dirid, &dir_inode)?;
 
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
-        self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+        self.global_stats
+            .add_to_transaction(&stats_update, &mut txn)?;
 
         let mut seq_guard = self.allocate_sequence();
-        self.commit_batch_ordered(batch, &mut seq_guard).await?;
+        self.commit_transaction(txn, &mut seq_guard).await?;
 
         self.global_stats.commit_update(&stats_update);
 
@@ -190,11 +182,8 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        let mut batch = self.new_write_batch()?;
-        batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(fileid));
-
-        let scan_key = KeyCodec::dir_scan_key(linkdirid, fileid, linkname);
-        batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(fileid));
+        let mut txn = self.new_transaction()?;
+        txn.add_dir_entry(linkdirid, linkname, fileid);
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
@@ -228,9 +217,7 @@ impl ZeroFS {
             _ => unreachable!(),
         }
 
-        let file_inode_key = KeyCodec::inode_key(fileid);
-        let file_inode_data = bincode::serialize(&file_inode)?;
-        batch.put_bytes(&file_inode_key, Bytes::from(file_inode_data));
+        txn.save_inode(fileid, &file_inode)?;
 
         link_dir.entry_count += 1;
         link_dir.mtime = now_sec;
@@ -238,12 +225,10 @@ impl ZeroFS {
         link_dir.ctime = now_sec;
         link_dir.ctime_nsec = now_nsec;
 
-        let dir_inode_key = KeyCodec::inode_key(linkdirid);
-        let dir_inode_data = bincode::serialize(&Inode::Directory(link_dir))?;
-        batch.put_bytes(&dir_inode_key, Bytes::from(dir_inode_data));
+        txn.save_inode(linkdirid, &Inode::Directory(link_dir))?;
 
         let mut seq_guard = self.allocate_sequence();
-        self.commit_batch_ordered(batch, &mut seq_guard).await?;
+        self.commit_transaction(txn, &mut seq_guard).await?;
 
         self.cache.remove_batch(vec![
             CacheKey::Metadata(fileid),
