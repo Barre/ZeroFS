@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use tracing::debug;
 
 impl ZeroFS {
-    pub async fn process_symlink(
+    pub async fn symlink(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -23,7 +23,7 @@ impl ZeroFS {
         validate_filename(linkname)?;
 
         debug!(
-            "process_symlink: dirid={}, linkname={:?}, target={:?}",
+            "symlink: dirid={}, linkname={:?}, target={:?}",
             dirid,
             String::from_utf8_lossy(linkname),
             target
@@ -119,7 +119,7 @@ impl ZeroFS {
         ))
     }
 
-    pub async fn process_link(
+    pub async fn link(
         &self,
         auth: &AuthContext,
         fileid: InodeId,
@@ -130,7 +130,7 @@ impl ZeroFS {
 
         let linkname_str = String::from_utf8_lossy(linkname);
         debug!(
-            "process_link: fileid={}, linkdirid={}, linkname={}",
+            "link: fileid={}, linkdirid={}, linkname={}",
             fileid, linkdirid, linkname_str
         );
 

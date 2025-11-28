@@ -170,7 +170,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let entries = self
             .filesystem
-            .process_readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
+            .readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -678,7 +678,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         match self
             .filesystem
-            .process_read_file(&auth, inode, offset, length)
+            .read_file(&auth, inode, offset, length)
             .await
         {
             Ok((data, _)) => {
@@ -743,7 +743,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let data = data.freeze();
         match self
             .filesystem
-            .process_write(&auth, inode, offset, &data)
+            .write(&auth, inode, offset, &data)
             .await
         {
             Ok(_) => {
@@ -905,7 +905,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
             if self
                 .filesystem
-                .process_write(&auth, inode, current_offset, chunk_data)
+                .write(&auth, inode, current_offset, chunk_data)
                 .await
                 .is_err()
             {

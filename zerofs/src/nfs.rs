@@ -53,7 +53,7 @@ impl NFSFileSystem for NFSAdapter {
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
 
-        let inode_id = self.fs.process_lookup(&creds, real_dirid, filename).await?;
+        let inode_id = self.fs.lookup(&creds, real_dirid, filename).await?;
         Ok(EncodedFileId::from_inode(inode_id)?.into())
     }
 
@@ -80,7 +80,7 @@ impl NFSFileSystem for NFSAdapter {
         let real_id = EncodedFileId::from(id).inode_id();
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         self.fs
-            .process_read_file(&auth_ctx, real_id, offset, count)
+            .read_file(&auth_ctx, real_id, offset, count)
             .await
             .map(|(data, eof)| (data.to_vec(), eof))
             .map_err(|e| e.into())
@@ -105,7 +105,7 @@ impl NFSFileSystem for NFSAdapter {
         let data_bytes = bytes::Bytes::copy_from_slice(data);
         let file_attrs: crate::fs::types::FileAttributes = self
             .fs
-            .process_write(&auth_ctx, real_id, offset, &data_bytes)
+            .write(&auth_ctx, real_id, offset, &data_bytes)
             .await?;
         Ok((&file_attrs).into())
     }
@@ -131,7 +131,7 @@ impl NFSFileSystem for NFSAdapter {
 
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
             .fs
-            .process_create(&creds, real_dirid, filename, &fs_attr)
+            .create(&creds, real_dirid, filename, &fs_attr)
             .await?;
 
         let fattr: fattr3 = (&file_attrs).into();
@@ -153,7 +153,7 @@ impl NFSFileSystem for NFSAdapter {
 
         let id = self
             .fs
-            .process_create_exclusive(&auth.into(), real_dirid, filename)
+            .create_exclusive(&auth.into(), real_dirid, filename)
             .await?;
 
         Ok(EncodedFileId::from_inode(id)?.into())
@@ -179,7 +179,7 @@ impl NFSFileSystem for NFSAdapter {
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
             .fs
-            .process_mkdir(&creds, real_dirid, dirname, &fs_attr)
+            .mkdir(&creds, real_dirid, dirname, &fs_attr)
             .await?;
         Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
     }
@@ -200,7 +200,7 @@ impl NFSFileSystem for NFSAdapter {
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         Ok(self
             .fs
-            .process_remove(&auth_ctx, real_dirid, filename)
+            .remove(&auth_ctx, real_dirid, filename)
             .await?)
     }
 
@@ -221,7 +221,7 @@ impl NFSFileSystem for NFSAdapter {
         );
 
         self.fs
-            .process_rename(
+            .rename(
                 &auth.into(),
                 real_from_dirid,
                 from_filename,
@@ -248,7 +248,7 @@ impl NFSFileSystem for NFSAdapter {
 
         let result = self
             .fs
-            .process_readdir(&auth.into(), real_dirid, start_after, max_entries)
+            .readdir(&auth.into(), real_dirid, start_after, max_entries)
             .await?;
 
         // Convert our ReadDirResult to NFS ReadDirResult
@@ -279,7 +279,7 @@ impl NFSFileSystem for NFSAdapter {
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(setattr);
-        let file_attrs = self.fs.process_setattr(&creds, real_id, &fs_attr).await?;
+        let file_attrs = self.fs.setattr(&creds, real_id, &fs_attr).await?;
         Ok((&file_attrs).into())
     }
 
@@ -303,7 +303,7 @@ impl NFSFileSystem for NFSAdapter {
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs) = self
             .fs
-            .process_symlink(&creds, real_dirid, &linkname.0, &symlink.0, &fs_attr)
+            .symlink(&creds, real_dirid, &linkname.0, &symlink.0, &fs_attr)
             .await
             .map_err(|e: crate::fs::errors::FsError| -> nfsstat3 { e.into() })?;
 
@@ -348,7 +348,7 @@ impl NFSFileSystem for NFSAdapter {
         let fs_type = FileType::from(ftype);
         let (id, file_attrs) = self
             .fs
-            .process_mknod(&creds, real_dirid, &filename.0, fs_type, &fs_attr, rdev)
+            .mknod(&creds, real_dirid, &filename.0, fs_type, &fs_attr, rdev)
             .await?;
 
         Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
@@ -370,7 +370,7 @@ impl NFSFileSystem for NFSAdapter {
 
         Ok(self
             .fs
-            .process_link(&auth.into(), real_fileid, real_linkdirid, &linkname.0)
+            .link(&auth.into(), real_fileid, real_linkdirid, &linkname.0)
             .await?)
     }
 

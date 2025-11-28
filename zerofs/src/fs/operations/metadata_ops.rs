@@ -12,13 +12,13 @@ use crate::fs::{InodeId, ZeroFS, get_current_time};
 use tracing::debug;
 
 impl ZeroFS {
-    pub async fn process_setattr(
+    pub async fn setattr(
         &self,
         creds: &Credentials,
         id: InodeId,
         setattr: &SetAttributes,
     ) -> Result<FileAttributes, FsError> {
-        debug!("process_setattr: id={}, setattr={:?}", id, setattr);
+        debug!("setattr: id={}, setattr={:?}", id, setattr);
         let _guard = self.lock_manager.acquire_write(id).await;
         let mut inode = self.inode_store.get(id).await?;
 
@@ -398,7 +398,7 @@ impl ZeroFS {
         Ok(InodeWithId { inode: &inode, id }.into())
     }
 
-    pub async fn process_mknod(
+    pub async fn mknod(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -410,7 +410,7 @@ impl ZeroFS {
         validate_filename(name)?;
 
         debug!(
-            "process_mknod: dirid={}, filename={}, ftype={:?}",
+            "mknod: dirid={}, filename={}, ftype={:?}",
             dirid,
             String::from_utf8_lossy(name),
             ftype

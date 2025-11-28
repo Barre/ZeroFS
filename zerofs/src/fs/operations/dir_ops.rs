@@ -15,14 +15,14 @@ use std::sync::atomic::Ordering;
 use tracing::debug;
 
 impl ZeroFS {
-    pub async fn process_lookup(
+    pub async fn lookup(
         &self,
         creds: &Credentials,
         dirid: InodeId,
         filename: &[u8],
     ) -> Result<InodeId, FsError> {
         debug!(
-            "process_lookup: dirid={}, filename={}",
+            "lookup: dirid={}, filename={}",
             dirid,
             String::from_utf8_lossy(filename)
         );
@@ -39,7 +39,7 @@ impl ZeroFS {
                 };
                 if let Some(CacheValue::DirEntry(inode_id)) = self.cache.get(cache_key) {
                     debug!(
-                        "process_lookup cache hit: {} -> inode {}",
+                        "lookup cache hit: {} -> inode {}",
                         String::from_utf8_lossy(filename),
                         inode_id
                     );
@@ -49,7 +49,7 @@ impl ZeroFS {
                 match self.directory_store.get(dirid, filename).await {
                     Ok(inode_id) => {
                         debug!(
-                            "process_lookup found: {} -> inode {}",
+                            "lookup found: {} -> inode {}",
                             String::from_utf8_lossy(filename),
                             inode_id
                         );
@@ -65,7 +65,7 @@ impl ZeroFS {
                     }
                     Err(FsError::NotFound) => {
                         debug!(
-                            "process_lookup not found: {} in directory",
+                            "lookup not found: {} in directory",
                             String::from_utf8_lossy(filename)
                         );
                         Err(FsError::NotFound)
@@ -77,7 +77,7 @@ impl ZeroFS {
         }
     }
 
-    pub async fn process_mkdir(
+    pub async fn mkdir(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -87,7 +87,7 @@ impl ZeroFS {
         validate_filename(name)?;
 
         debug!(
-            "process_mkdir: dirid={}, dirname={}",
+            "mkdir: dirid={}, dirname={}",
             dirid,
             String::from_utf8_lossy(name)
         );
@@ -214,7 +214,7 @@ impl ZeroFS {
         }
     }
 
-    async fn process_readdir_internal(
+    async fn readdir_internal(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
@@ -223,7 +223,7 @@ impl ZeroFS {
         load_attrs: bool,
     ) -> Result<ReadDirResult, FsError> {
         debug!(
-            "process_readdir: dirid={}, start_after={}, max_entries={}",
+            "readdir: dirid={}, start_after={}, max_entries={}",
             dirid, start_after, max_entries
         );
 
@@ -421,28 +421,28 @@ impl ZeroFS {
         }
     }
 
-    pub async fn process_readdir(
+    pub async fn readdir(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
-        self.process_readdir_internal(auth, dirid, start_after, max_entries, true)
+        self.readdir_internal(auth, dirid, start_after, max_entries, true)
             .await
     }
 
-    /// Public API: process_readdir without loading attributes (used by 9P)
+    /// Public API: readdir without loading attributes (used by 9P)
     /// Returns entries with default/empty attributes. Callers should load inodes separately
     /// only for entries they actually need to return to the client.
-    pub async fn process_readdir_lite(
+    pub async fn readdir_lite(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
-        self.process_readdir_internal(auth, dirid, start_after, max_entries, false)
+        self.readdir_internal(auth, dirid, start_after, max_entries, false)
             .await
     }
 }
