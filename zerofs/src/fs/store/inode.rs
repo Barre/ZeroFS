@@ -20,11 +20,14 @@ pub const MAX_HARDLINKS_PER_INODE: u32 = u16::MAX as u32;
 pub struct EncodedFileId(u64);
 
 impl EncodedFileId {
-    pub fn new(inode_id: u64, position: u16) -> Self {
-        Self((inode_id << 16) | (position as u64))
+    pub fn new(inode_id: u64, position: u16) -> Result<Self, FsError> {
+        if inode_id > MAX_INODE_ID {
+            return Err(FsError::InvalidData);
+        }
+        Ok(Self((inode_id << 16) | (position as u64)))
     }
 
-    pub fn from_inode(inode_id: u64) -> Self {
+    pub fn from_inode(inode_id: u64) -> Result<Self, FsError> {
         Self::new(inode_id, 0)
     }
 
@@ -187,26 +190,26 @@ mod tests {
         assert_eq!(inode, 0);
         assert_eq!(pos, 0);
 
-        let encoded = EncodedFileId::new(42, 0);
+        let encoded = EncodedFileId::new(42, 0).unwrap();
         assert_eq!(encoded.inode_id(), 42);
         assert_eq!(encoded.position(), 0);
         let (inode, pos) = encoded.decode();
         assert_eq!(inode, 42);
         assert_eq!(pos, 0);
 
-        let encoded = EncodedFileId::new(100, 5);
+        let encoded = EncodedFileId::new(100, 5).unwrap();
         assert_eq!(encoded.inode_id(), 100);
         assert_eq!(encoded.position(), 5);
         let (inode, pos) = encoded.decode();
         assert_eq!(inode, 100);
         assert_eq!(pos, 5);
 
-        let encoded = EncodedFileId::new(1000, 65535);
+        let encoded = EncodedFileId::new(1000, 65535).unwrap();
         let (inode, pos) = encoded.decode();
         assert_eq!(inode, 1000);
         assert_eq!(pos, 65535);
 
-        let encoded = EncodedFileId::new(MAX_INODE_ID, 0);
+        let encoded = EncodedFileId::new(MAX_INODE_ID, 0).unwrap();
         let (inode, pos) = encoded.decode();
         assert_eq!(inode, MAX_INODE_ID);
         assert_eq!(pos, 0);
@@ -216,5 +219,19 @@ mod tests {
         assert_eq!(from_raw.inode_id(), 42);
         assert_eq!(from_raw.position(), 5);
         assert_eq!(from_raw.as_raw(), raw_value);
+    }
+
+    #[test]
+    fn test_encoded_file_id_max_values() {
+        let encoded = EncodedFileId::new(MAX_INODE_ID, u16::MAX).unwrap();
+        assert_eq!(encoded.inode_id(), MAX_INODE_ID);
+        assert_eq!(encoded.position(), u16::MAX);
+    }
+
+    #[test]
+    fn test_encoded_file_id_inode_overflow() {
+        let overflow_id = MAX_INODE_ID + 1;
+        let result = EncodedFileId::new(overflow_id, 0);
+        assert!(result.is_err());
     }
 }

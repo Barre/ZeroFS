@@ -371,7 +371,7 @@ impl ZeroFS {
 
                     for (inode_id, name, inode) in loaded_entries {
                         let position = inode_positions.entry(inode_id).or_insert(0);
-                        let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
+                        let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
                         *position += 1;
 
                         entries.push(DirEntry {
@@ -388,7 +388,7 @@ impl ZeroFS {
                 } else {
                     for (inode_id, name) in dir_entries {
                         let position = inode_positions.entry(inode_id).or_insert(0);
-                        let encoded_id = EncodedFileId::new(inode_id, *position).as_raw();
+                        let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
                         *position += 1;
 
                         entries.push(DirEntry {
