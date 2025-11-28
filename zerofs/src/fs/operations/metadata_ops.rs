@@ -2,15 +2,13 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, SpecialInode};
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, validate_mode,
 };
 use crate::fs::types::{
     FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
 };
-use crate::fs::{CHUNK_SIZE, InodeId, ZeroFS, get_current_time};
-use bytes::Bytes;
+use crate::fs::{InodeId, ZeroFS, get_current_time};
 use tracing::debug;
 
 impl ZeroFS {
@@ -101,34 +99,9 @@ impl ZeroFS {
 
                         let mut txn = self.new_transaction()?;
 
-                        if new_size < old_size {
-                            let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
-                            let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
-
-                            for chunk_idx in new_chunks..old_chunks {
-                                txn.delete_chunk(id, chunk_idx as u64);
-                            }
-
-                            if new_size > 0 {
-                                let last_chunk_idx = new_chunks - 1;
-                                let clear_from = (new_size % CHUNK_SIZE as u64) as usize;
-
-                                if clear_from > 0 {
-                                    let key = KeyCodec::chunk_key(id, last_chunk_idx as u64);
-                                    let old_chunk_data = self
-                                        .db
-                                        .get_bytes(&key)
-                                        .await
-                                        .map_err(|_| FsError::IoError)?
-                                        .map(|bytes| bytes.to_vec())
-                                        .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
-
-                                    let mut new_chunk_data = old_chunk_data;
-                                    new_chunk_data[clear_from..].fill(0);
-                                    txn.put_bytes(&key, Bytes::from(new_chunk_data));
-                                }
-                            }
-                        }
+                        self.chunk_store
+                            .truncate(&mut txn, id, old_size, new_size)
+                            .await;
 
                         self.inode_store.save(&mut txn, id, &inode)?;
 

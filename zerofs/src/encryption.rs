@@ -122,11 +122,6 @@ impl EncryptedTransaction {
         self.inner.delete(key);
     }
 
-    pub fn delete_chunk(&mut self, inode_id: InodeId, chunk_idx: u64) {
-        let key = KeyCodec::chunk_key(inode_id, chunk_idx);
-        self.delete_bytes(&key);
-    }
-
     pub fn add_tombstone(&mut self, inode_id: InodeId, size: u64) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -69,12 +69,11 @@ impl ZeroFS {
 
                             self.inode_store.save(&mut txn, file_id, &file_inode)?;
                         } else {
-                            let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
+                            let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
 
-                            if total_chunks <= SMALL_FILE_TOMBSTONE_THRESHOLD {
-                                for chunk_idx in 0..total_chunks {
-                                    txn.delete_chunk(file_id, chunk_idx as u64);
-                                }
+                            if total_chunks as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
+                                self.chunk_store
+                                    .delete_range(&mut txn, file_id, 0, total_chunks);
                             } else {
                                 txn.add_tombstone(file_id, file.size);
                                 self.stats
