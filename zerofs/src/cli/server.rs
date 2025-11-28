@@ -127,7 +127,7 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
     };
     let nbd_name = b".nbd";
 
-    match fs.process_lookup(&creds, 0, nbd_name).await {
+    match fs.lookup(&creds, 0, nbd_name).await {
         Ok(_) => info!(".nbd directory already exists"),
         Err(_) => {
             let attr = SetAttributes {
@@ -136,7 +136,7 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
                 gid: crate::fs::types::SetGid::Set(0),
                 ..Default::default()
             };
-            fs.process_mkdir(&creds, 0, nbd_name, &attr)
+            fs.mkdir(&creds, 0, nbd_name, &attr)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create .nbd directory: {e:?}"))?;
             info!("Created .nbd directory for NBD device management");

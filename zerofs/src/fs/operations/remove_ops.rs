@@ -9,7 +9,7 @@ use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
 use std::sync::atomic::Ordering;
 
 impl ZeroFS {
-    pub async fn process_remove(
+    pub async fn remove(
         &self,
         auth: &AuthContext,
         dirid: InodeId,

@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use tracing::{debug, error};
 
 impl ZeroFS {
-    pub async fn process_write(
+    pub async fn write(
         &self,
         auth: &AuthContext,
         id: InodeId,
@@ -123,7 +123,7 @@ impl ZeroFS {
         }
     }
 
-    pub async fn process_create(
+    pub async fn create(
         &self,
         creds: &Credentials,
         dirid: InodeId,
@@ -133,7 +133,7 @@ impl ZeroFS {
         validate_filename(name)?;
 
         debug!(
-            "process_create: dirid={}, filename={}",
+            "create: dirid={}, filename={}",
             dirid,
             String::from_utf8_lossy(name)
         );
@@ -235,14 +235,14 @@ impl ZeroFS {
         }
     }
 
-    pub async fn process_create_exclusive(
+    pub async fn create_exclusive(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         filename: &[u8],
     ) -> Result<InodeId, FsError> {
         let (id, _) = self
-            .process_create(
+            .create(
                 &Credentials::from_auth_context(auth),
                 dirid,
                 filename,
@@ -252,7 +252,7 @@ impl ZeroFS {
         Ok(id)
     }
 
-    pub async fn process_read_file(
+    pub async fn read_file(
         &self,
         auth: &AuthContext,
         id: InodeId,
@@ -260,7 +260,7 @@ impl ZeroFS {
         count: u32,
     ) -> Result<(Bytes, bool), FsError> {
         debug!(
-            "process_read_file: id={}, offset={}, count={}",
+            "read_file: id={}, offset={}, count={}",
             id, offset, count
         );
 

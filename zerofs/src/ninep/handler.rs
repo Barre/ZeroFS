@@ -58,7 +58,7 @@ pub struct Fid {
     pub creds: Credentials, // Store credentials per fid/session
     // For directory reads: track position for sequential reads
     pub dir_last_offset: u64, // Last offset we returned entries for
-    pub dir_last_cookie: u64, // Last cookie from process_readdir for continuation
+    pub dir_last_cookie: u64, // Last cookie from readdir for continuation
 }
 
 #[derive(Debug)]
@@ -264,7 +264,7 @@ impl NinePHandler {
                     let creds = src_fid.creds;
                     match self
                         .filesystem
-                        .process_lookup(&creds, current_id, &name_bytes)
+                        .lookup(&creds, current_id, &name_bytes)
                         .await
                     {
                         Ok(child_id) => {
@@ -426,7 +426,7 @@ impl NinePHandler {
 
             match self
                 .filesystem
-                .process_readdir_lite(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
+                .readdir_lite(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
                 .await
             {
                 Ok(result) => {
@@ -517,7 +517,7 @@ impl NinePHandler {
                 let creds = Credentials::from_auth_context(&auth_ctx);
                 match self
                     .filesystem
-                    .process_lookup(&creds, fid_entry.inode_id, name.as_slice())
+                    .lookup(&creds, fid_entry.inode_id, name.as_slice())
                     .await
                 {
                     Ok(real_id) => {
@@ -583,7 +583,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_create(
+            .create(
                 &temp_creds,
                 parent_fid.inode_id,
                 &tc.name.data,
@@ -640,7 +640,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, tr.count)
+            .read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, tr.count)
             .await
         {
             Ok((data, _eof)) => P9Message::new(
@@ -680,7 +680,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
+            .write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
             .await
         {
             Ok(_post_attr) => {
@@ -771,7 +771,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_setattr(&creds, inode_id, &attr)
+            .setattr(&creds, inode_id, &attr)
             .await
         {
             Ok(_post_attr) => P9Message::new(tag, Message::Rsetattr(Rsetattr)),
@@ -798,7 +798,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_mkdir(
+            .mkdir(
                 &temp_creds,
                 parent_id,
                 &tm.name.data,
@@ -838,7 +838,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_symlink(
+            .symlink(
                 &temp_creds,
                 parent_id,
                 &ts.name.data,
@@ -885,7 +885,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_mknod(
+            .mknod(
                 &temp_creds,
                 parent_fid.inode_id,
                 &tm.name.data,
@@ -970,7 +970,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_link(&(&auth).into(), file_id, dir_id, name_bytes)
+            .link(&(&auth).into(), file_id, dir_id, name_bytes)
             .await
         {
             Ok(_post_attr) => P9Message::new(tag, Message::Rlink(Rlink)),
@@ -1004,7 +1004,7 @@ impl NinePHandler {
         for name in &source_parent_path {
             match self
                 .filesystem
-                .process_lookup(&creds, source_parent_id, name)
+                .lookup(&creds, source_parent_id, name)
                 .await
             {
                 Ok(real_id) => {
@@ -1020,7 +1020,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_rename(
+            .rename(
                 &(&auth).into(),
                 source_parent_id,
                 source_name,
@@ -1051,7 +1051,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_rename(
+            .rename(
                 &(&auth).into(),
                 old_dir_fid.inode_id,
                 &tr.oldname.data,
@@ -1076,7 +1076,7 @@ impl NinePHandler {
 
         let child_id = match self
             .filesystem
-            .process_lookup(&creds, parent_id, &tu.name.data)
+            .lookup(&creds, parent_id, &tu.name.data)
             .await
         {
             Ok(id) => id,
@@ -1104,7 +1104,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_remove(&(&auth).into(), parent_id, &tu.name.data)
+            .remove(&(&auth).into(), parent_id, &tu.name.data)
             .await
         {
             Ok(_) => P9Message::new(tag, Message::Runlinkat(Runlinkat)),
@@ -1604,7 +1604,7 @@ mod tests {
             groups_count: 1,
         };
         for i in 0..10 {
-            fs.process_create(
+            fs.create(
                 &creds,
                 0,
                 format!("file{i:02}.txt").as_bytes(),
@@ -1690,7 +1690,7 @@ mod tests {
             groups_count: 1,
         };
         for i in 0..5 {
-            fs.process_create(
+            fs.create(
                 &creds,
                 0,
                 format!("file{i}.txt").as_bytes(),
@@ -1767,7 +1767,7 @@ mod tests {
         };
 
         for i in 0..1002 {
-            fs.process_create(
+            fs.create(
                 &creds,
                 0,
                 format!("file_{:06}.txt", i).as_bytes(),
@@ -1922,7 +1922,7 @@ mod tests {
             groups_count: 1,
         };
         let (_empty_dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
             .await
             .unwrap();
 

@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use tracing::debug;
 
 impl ZeroFS {
-    pub async fn process_rename(
+    pub async fn rename(
         &self,
         auth: &AuthContext,
         from_dirid: u64,
@@ -37,7 +37,7 @@ impl ZeroFS {
         }
 
         debug!(
-            "process_rename: from_dir={}, from_name={}, to_dir={}, to_name={}",
+            "rename: from_dir={}, from_name={}, to_dir={}, to_name={}",
             from_dirid,
             String::from_utf8_lossy(from_name),
             to_dirid,
