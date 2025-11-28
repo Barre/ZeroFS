@@ -14,11 +14,11 @@ pub mod write_coordinator;
 
 use self::cache::UnifiedCache;
 use self::flush_coordinator::FlushCoordinator;
-use self::key_codec::{KeyCodec, ParsedKey};
+use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore};
+use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -51,6 +51,7 @@ pub struct ZeroFS {
     pub chunk_store: ChunkStore,
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
+    pub tombstone_store: TombstoneStore,
     pub lock_manager: Arc<LockManager>,
     pub cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
@@ -153,12 +154,14 @@ impl ZeroFS {
             stats.clone(),
             next_inode_id,
         );
+        let tombstone_store = TombstoneStore::new(db.clone());
 
         let fs = Self {
             db: db.clone(),
             chunk_store,
             directory_store,
             inode_store,
+            tombstone_store,
             lock_manager,
             cache: unified_cache,
             stats,
@@ -200,47 +203,37 @@ impl ZeroFS {
     }
 
     pub async fn run_garbage_collection(&self) -> Result<(), FsError> {
+        use bytes::Bytes;
+
         const MAX_CHUNKS_PER_ROUND: usize = 10_000;
 
         self.stats.gc_runs.fetch_add(1, Ordering::Relaxed);
 
         loop {
-            let (start, end) = KeyCodec::prefix_range(key_codec::KeyPrefix::Tombstone);
-            let range = start..end;
-
-            let mut tombstones_to_update = Vec::new();
+            let mut tombstones_to_update: Vec<(Bytes, u64, usize, bool)> = Vec::new();
             let mut chunks_deleted_this_round = 0;
             let mut tombstones_completed_this_round = 0;
             let mut found_incomplete_tombstones = false;
 
-            let iter = self.db.scan(range).await.map_err(|_| FsError::IoError)?;
+            let iter = self.tombstone_store.list().await?;
             futures::pin_mut!(iter);
 
             let mut chunks_remaining_in_round = MAX_CHUNKS_PER_ROUND;
 
-            while let Some(Ok((key, value))) = futures::StreamExt::next(&mut iter).await {
+            while let Some(result) = futures::StreamExt::next(&mut iter).await {
                 if chunks_remaining_in_round == 0 {
                     found_incomplete_tombstones = true;
                     break;
                 }
 
-                // Parse tombstone key
-                let inode_id = match KeyCodec::parse_key(&key) {
-                    ParsedKey::Tombstone { inode_id } => inode_id,
-                    _ => continue,
-                };
+                let entry = result?;
 
-                // Safe to unwrap: tombstone values are always 8 bytes written by encode_tombstone_size
-                let size = KeyCodec::decode_tombstone_size(&value)
-                    .expect("tombstone size should always be valid 8-byte value");
-
-                if size == 0 {
-                    // No chunks left, just delete the tombstone
-                    tombstones_to_update.push((key, inode_id, 0, 0, true));
+                if entry.remaining_size == 0 {
+                    tombstones_to_update.push((entry.key, 0, 0, true));
                     continue;
                 }
 
-                let total_chunks = size.div_ceil(CHUNK_SIZE as u64) as usize;
+                let total_chunks = entry.remaining_size.div_ceil(CHUNK_SIZE as u64) as usize;
                 let chunks_to_delete = total_chunks.min(chunks_remaining_in_round);
                 let start_chunk = total_chunks.saturating_sub(chunks_to_delete);
 
@@ -248,15 +241,17 @@ impl ZeroFS {
                 if !is_final_batch {
                     found_incomplete_tombstones = true;
                 }
-                tombstones_to_update.push((key, inode_id, size, start_chunk, is_final_batch));
+                tombstones_to_update.push((
+                    entry.key,
+                    entry.remaining_size,
+                    start_chunk,
+                    is_final_batch,
+                ));
 
-                let mut txn = self
-                    .db
-                    .new_transaction()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut txn = self.db.new_transaction()?;
                 self.chunk_store.delete_range(
                     &mut txn,
-                    inode_id,
+                    entry.inode_id,
                     start_chunk as u64,
                     total_chunks as u64,
                 );
@@ -286,21 +281,17 @@ impl ZeroFS {
             }
 
             if !tombstones_to_update.is_empty() {
-                let mut txn = self
-                    .db
-                    .new_transaction()
-                    .map_err(|_| FsError::ReadOnlyFilesystem)?;
+                let mut txn = self.db.new_transaction()?;
 
-                for (key, _inode_id, old_size, start_chunk, delete_tombstone) in
-                    tombstones_to_update
-                {
+                for (key, old_size, start_chunk, delete_tombstone) in tombstones_to_update {
                     if delete_tombstone {
-                        txn.delete_bytes(&key);
+                        self.tombstone_store.remove(&mut txn, &key);
                     } else {
                         let remaining_chunks = start_chunk;
                         let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
-                        txn.put_bytes(&key, KeyCodec::encode_tombstone_size(actual_remaining));
+                        self.tombstone_store
+                            .update(&mut txn, &key, actual_remaining);
                     }
                 }
 
