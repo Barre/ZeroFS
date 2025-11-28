@@ -7,7 +7,6 @@ use crate::fs::operations::common::SMALL_FILE_TOMBSTONE_THRESHOLD;
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
 use crate::fs::types::AuthContext;
 use crate::fs::{CHUNK_SIZE, ZeroFS, get_current_time};
-use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use tracing::debug;
 
@@ -159,7 +158,7 @@ impl ZeroFS {
             check_sticky_bit_delete(target_dir, &target_inode, &creds)?;
         }
 
-        let mut batch = self.new_write_batch()?;
+        let mut txn = self.new_transaction()?;
 
         let mut target_was_directory = false;
         let mut target_stats_update = None;
@@ -186,61 +185,44 @@ impl ZeroFS {
                         $special.ctime = now_sec;
                         $special.ctime_nsec = now_nsec;
 
-                        let inode_key = KeyCodec::inode_key(target_id);
-                        let inode_data = bincode::serialize(&Inode::$inode_variant($special))?;
-                        batch.put_bytes(&inode_key, Bytes::from(inode_data));
+                        txn.save_inode(target_id, &Inode::$inode_variant($special))?;
                     } else {
-                        let inode_key = KeyCodec::inode_key(target_id);
-                        batch.delete_bytes(&inode_key);
+                        txn.delete_inode(target_id);
                     }
                 };
             }
 
             match existing_inode {
                 Inode::File(mut file) => {
-                    // For regular files, check if it has multiple hard links
                     if file.nlink > 1 {
-                        // Just decrement the link count
                         file.nlink -= 1;
                         let (now_sec, now_nsec) = get_current_time();
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
 
-                        let inode_key = KeyCodec::inode_key(target_id);
-                        let inode_data = bincode::serialize(&Inode::File(file))?;
-                        batch.put_bytes(&inode_key, Bytes::from(inode_data));
+                        txn.save_inode(target_id, &Inode::File(file))?;
                     } else {
                         let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64) as usize;
 
                         if total_chunks <= SMALL_FILE_TOMBSTONE_THRESHOLD {
                             for chunk_idx in 0..total_chunks {
-                                let chunk_key = KeyCodec::chunk_key(target_id, chunk_idx as u64);
-                                batch.delete_bytes(&chunk_key);
+                                txn.delete_chunk(target_id, chunk_idx as u64);
                             }
                         } else {
-                            let (timestamp, _) = get_current_time();
-                            let tombstone_key = KeyCodec::tombstone_key(timestamp, target_id);
-                            batch.put_bytes(
-                                &tombstone_key,
-                                KeyCodec::encode_tombstone_size(file.size),
-                            );
-
+                            txn.add_tombstone(target_id, file.size);
                             self.stats
                                 .tombstones_created
                                 .fetch_add(1, Ordering::Relaxed);
                         }
 
-                        let inode_key = KeyCodec::inode_key(target_id);
-                        batch.delete_bytes(&inode_key);
+                        txn.delete_inode(target_id);
                     }
                 }
                 Inode::Directory(_) => {
-                    let inode_key = KeyCodec::inode_key(target_id);
-                    batch.delete_bytes(&inode_key);
+                    txn.delete_inode(target_id);
                 }
                 Inode::Symlink(_) => {
-                    let inode_key = KeyCodec::inode_key(target_id);
-                    batch.delete_bytes(&inode_key);
+                    txn.delete_inode(target_id);
                 }
                 Inode::Fifo(mut special) => {
                     handle_special_file!(special, Fifo);
@@ -266,18 +248,11 @@ impl ZeroFS {
                 );
             }
 
-            let existing_scan_key = KeyCodec::dir_scan_key(to_dirid, target_id, to_name);
-            batch.delete_bytes(&existing_scan_key);
+            txn.remove_dir_entry(to_dirid, to_name, target_id);
         }
 
-        batch.delete_bytes(&from_entry_key);
-
-        let from_scan_key = KeyCodec::dir_scan_key(from_dirid, source_inode_id, from_name);
-        batch.delete_bytes(&from_scan_key);
-        batch.put_bytes(&to_entry_key, KeyCodec::encode_dir_entry(source_inode_id));
-
-        let to_scan_key = KeyCodec::dir_scan_key(to_dirid, source_inode_id, to_name);
-        batch.put_bytes(&to_scan_key, KeyCodec::encode_dir_entry(source_inode_id));
+        txn.remove_dir_entry(from_dirid, from_name, source_inode_id);
+        txn.add_dir_entry(to_dirid, to_name, source_inode_id);
 
         if from_dirid != to_dirid {
             let mut moved_inode = self.load_inode(source_inode_id).await?;
@@ -305,10 +280,7 @@ impl ZeroFS {
                     }
                 }
             }
-            batch.put_bytes(
-                &KeyCodec::inode_key(source_inode_id),
-                Bytes::from(bincode::serialize(&moved_inode)?),
-            );
+            txn.save_inode(source_inode_id, &moved_inode)?;
         }
 
         let (now_sec, now_nsec) = get_current_time();
@@ -326,10 +298,7 @@ impl ZeroFS {
             d.ctime = now_sec;
             d.ctime_nsec = now_nsec;
         }
-        batch.put_bytes(
-            &KeyCodec::inode_key(from_dirid),
-            Bytes::from(bincode::serialize(&from_dir_inode)?),
-        );
+        txn.save_inode(from_dirid, &from_dir_inode)?;
 
         if from_dirid != to_dirid {
             let mut to_dir_inode = self.load_inode(to_dirid).await?;
@@ -348,10 +317,7 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
-            batch.put_bytes(
-                &KeyCodec::inode_key(to_dirid),
-                Bytes::from(bincode::serialize(&to_dir_inode)?),
-            );
+            txn.save_inode(to_dirid, &to_dir_inode)?;
         } else {
             let mut dir_inode = self.load_inode(from_dirid).await?;
             if let Inode::Directory(d) = &mut dir_inode {
@@ -363,18 +329,15 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
-            batch.put_bytes(
-                &KeyCodec::inode_key(from_dirid),
-                Bytes::from(bincode::serialize(&dir_inode)?),
-            );
+            txn.save_inode(from_dirid, &dir_inode)?;
         }
 
         if let Some(ref update) = target_stats_update {
-            self.global_stats.add_to_batch(update, &mut batch)?;
+            self.global_stats.add_to_transaction(update, &mut txn)?;
         }
 
         let mut seq_guard = self.allocate_sequence();
-        self.commit_batch_ordered(batch, &mut seq_guard).await?;
+        self.commit_transaction(txn, &mut seq_guard).await?;
 
         if let Some(update) = target_stats_update {
             self.global_stats.commit_update(&update);

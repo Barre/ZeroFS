@@ -99,15 +99,14 @@ impl ZeroFS {
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
 
-                        let mut batch = self.new_write_batch()?;
+                        let mut txn = self.new_transaction()?;
 
                         if new_size < old_size {
                             let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64) as usize;
                             let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64) as usize;
 
                             for chunk_idx in new_chunks..old_chunks {
-                                let key = KeyCodec::chunk_key(id, chunk_idx as u64);
-                                batch.delete_bytes(&key);
+                                txn.delete_chunk(id, chunk_idx as u64);
                             }
 
                             if new_size > 0 {
@@ -126,28 +125,26 @@ impl ZeroFS {
 
                                     let mut new_chunk_data = old_chunk_data;
                                     new_chunk_data[clear_from..].fill(0);
-                                    batch.put_bytes(&key, Bytes::from(new_chunk_data));
+                                    txn.put_bytes(&key, Bytes::from(new_chunk_data));
                                 }
                             }
                         }
 
-                        let inode_key = KeyCodec::inode_key(id);
-                        let inode_data = bincode::serialize(&inode)?;
-                        batch.put_bytes(&inode_key, Bytes::from(inode_data));
+                        txn.save_inode(id, &inode)?;
 
                         let stats_update = if let Some(update) = self
                             .global_stats
                             .prepare_size_change(id, old_size, new_size)
                             .await
                         {
-                            self.global_stats.add_to_batch(&update, &mut batch)?;
+                            self.global_stats.add_to_transaction(&update, &mut txn)?;
                             Some(update)
                         } else {
                             None
                         };
 
                         let mut seq_guard = self.allocate_sequence();
-                        self.commit_batch_ordered(batch, &mut seq_guard).await?;
+                        self.commit_transaction(txn, &mut seq_guard).await?;
 
                         if let Some(update) = stats_update {
                             self.global_stats.commit_update(&update);
@@ -516,16 +513,10 @@ impl ZeroFS {
                     _ => return Err(FsError::InvalidArgument),
                 };
 
-                let mut batch = self.new_write_batch()?;
+                let mut txn = self.new_transaction()?;
 
-                let special_inode_key = KeyCodec::inode_key(special_id);
-                let special_inode_data = bincode::serialize(&inode)?;
-                batch.put_bytes(&special_inode_key, Bytes::from(special_inode_data));
-
-                batch.put_bytes(&entry_key, KeyCodec::encode_dir_entry(special_id));
-
-                let scan_key = KeyCodec::dir_scan_key(dirid, special_id, name);
-                batch.put_bytes(&scan_key, KeyCodec::encode_dir_entry(special_id));
+                txn.save_inode(special_id, &inode)?;
+                txn.add_dir_entry(dirid, name, special_id);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -533,15 +524,14 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
-                let dir_inode_key = KeyCodec::inode_key(dirid);
-                let dir_inode_data = bincode::serialize(&dir_inode)?;
-                batch.put_bytes(&dir_inode_key, Bytes::from(dir_inode_data));
+                txn.save_inode(dirid, &dir_inode)?;
 
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
-                self.global_stats.add_to_batch(&stats_update, &mut batch)?;
+                self.global_stats
+                    .add_to_transaction(&stats_update, &mut txn)?;
 
                 let mut seq_guard = self.allocate_sequence();
-                self.commit_batch_ordered(batch, &mut seq_guard).await?;
+                self.commit_transaction(txn, &mut seq_guard).await?;
 
                 self.global_stats.commit_update(&stats_update);
 

@@ -136,14 +136,13 @@ impl FileSystemGlobalStats {
         })
     }
 
-    /// Add the statistics update to a write batch
-    pub fn add_to_batch(
+    pub fn add_to_transaction(
         &self,
         update: &StatsUpdate,
-        batch: &mut crate::encryption::EncryptedWriteBatch,
+        txn: &mut crate::encryption::EncryptedTransaction,
     ) -> Result<(), FsError> {
         let shard_bytes = bincode::serialize(&update.shard_data)?;
-        batch.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
+        txn.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
 
         Ok(())
     }
