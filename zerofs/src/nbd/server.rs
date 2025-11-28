@@ -741,11 +741,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
 
         let data = data.freeze();
-        match self
-            .filesystem
-            .write(&auth, inode, offset, &data)
-            .await
-        {
+        match self.filesystem.write(&auth, inode, offset, &data).await {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0
                     && let Err(e) = self.filesystem.flush_coordinator.flush().await

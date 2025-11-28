@@ -91,7 +91,6 @@ pub struct CacheConfig {
     pub memory_cache_size_gb: Option<f64>,
 }
 
-
 impl ZeroFS {
     pub async fn new_with_slatedb(
         slatedb: crate::encryption::SlateDbHandle,
@@ -623,10 +622,7 @@ impl ZeroFS {
         offset: u64,
         count: u32,
     ) -> Result<(Bytes, bool), FsError> {
-        debug!(
-            "read_file: id={}, offset={}, count={}",
-            id, offset, count
-        );
+        debug!("read_file: id={}, offset={}, count={}", id, offset, count);
 
         let inode = self.inode_store.get(id).await?;
 
@@ -2903,9 +2899,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = fs
-            .remove(&(&test_auth()).into(), 0, b"testdir")
-            .await;
+        let result = fs.remove(&(&test_auth()).into(), 0, b"testdir").await;
         assert!(matches!(result, Err(FsError::NotEmpty)));
     }
 
@@ -3146,10 +3140,7 @@ mod tests {
             ..Default::default()
         };
 
-        let fattr = fs
-            .setattr(&test_creds(), file_id, &setattr)
-            .await
-            .unwrap();
+        let fattr = fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
         assert_eq!(fattr.size, 500);
 
         let (read_data, _) = fs
@@ -3182,9 +3173,7 @@ mod tests {
             size: SetSize::Set(100 * 1024),
             ..Default::default()
         };
-        fs.setattr(&test_creds(), file_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
 
         let (read_data, _) = fs
             .read_file(&(&test_auth()).into(), file_id, 200 * 1024, 100)
@@ -3233,10 +3222,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = fs
-            .readdir(&(&test_auth()).into(), 0, 0, 10)
-            .await
-            .unwrap();
+        let result = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
 
         assert!(result.end);
         assert_eq!(result.entries.len(), 5);
@@ -3268,10 +3254,7 @@ mod tests {
             .unwrap();
         }
 
-        let result1 = fs
-            .readdir(&(&test_auth()).into(), 0, 0, 5)
-            .await
-            .unwrap();
+        let result1 = fs.readdir(&(&test_auth()).into(), 0, 0, 5).await.unwrap();
         assert!(!result1.end);
         assert_eq!(result1.entries.len(), 5);
 
@@ -3417,10 +3400,7 @@ mod tests {
             .unwrap();
 
         // First readdir - get all entries
-        let result1 = fs
-            .readdir(&(&test_auth()).into(), 0, 0, 10)
-            .await
-            .unwrap();
+        let result1 = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
         assert_eq!(result1.entries.len(), 6); // . .. file1.txt hardlink1.txt hardlink2.txt file2.txt
 
         // Check that hardlinks have different encoded fileids
@@ -3545,14 +3525,10 @@ mod tests {
             ..Default::default()
         };
 
-        let result = fs
-            .setattr(&test_creds(), file_id, &chmod_attrs)
-            .await;
+        let result = fs.setattr(&test_creds(), file_id, &chmod_attrs).await;
         assert!(matches!(result, Err(FsError::PermissionDenied)));
 
-        let result = fs
-            .read_file(&(&test_auth()).into(), file_id, 0, 100)
-            .await;
+        let result = fs.read_file(&(&test_auth()).into(), file_id, 0, 100).await;
         assert!(matches!(result, Err(FsError::PermissionDenied)));
 
         let result = fs

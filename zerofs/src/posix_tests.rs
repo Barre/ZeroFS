@@ -171,9 +171,7 @@ mod tests {
         .await
         .unwrap();
 
-        fs.rename(&auth, 0, b"file1", 0, b"file2")
-            .await
-            .unwrap();
+        fs.rename(&auth, 0, b"file1", 0, b"file2").await.unwrap();
 
         let result = fs.lookup(&creds, 0, b"file1").await;
         assert!(result.is_err());
@@ -207,18 +205,14 @@ mod tests {
             mode: SetMode::Set(0o1777),
             ..Default::default()
         };
-        fs.setattr(&creds, parent_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&creds, parent_id, &setattr).await.unwrap();
 
         let (_subdir_id, _) = fs
             .mkdir(&creds, parent_id, b"subdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.remove(&auth, parent_id, b"subdir")
-            .await
-            .unwrap();
+        fs.remove(&auth, parent_id, b"subdir").await.unwrap();
 
         let result = fs.lookup(&creds, parent_id, b"subdir").await;
         assert!(result.is_err());
@@ -419,9 +413,7 @@ mod tests {
 
         assert!(file_id > 0);
 
-        let result = fs
-            .create_exclusive(&auth, 0, b"exclusive.txt")
-            .await;
+        let result = fs.create_exclusive(&auth, 0, b"exclusive.txt").await;
         assert!(result.is_err());
     }
 
@@ -450,10 +442,7 @@ mod tests {
         let mut entries = Vec::new();
         let mut start_after = 0;
         loop {
-            let result = fs
-                .readdir(&auth, dir_id, start_after, 5)
-                .await
-                .unwrap();
+            let result = fs.readdir(&auth, dir_id, start_after, 5).await.unwrap();
             let _count = result.entries.len();
             entries.extend(result.entries);
 
@@ -516,10 +505,7 @@ mod tests {
         let result = fs.lookup(&creds, dir1_id, b"file.txt").await;
         assert!(result.is_err());
 
-        let found_id = fs
-            .lookup(&creds, dir2_id, b"file.txt")
-            .await
-            .unwrap();
+        let found_id = fs.lookup(&creds, dir2_id, b"file.txt").await.unwrap();
         assert_eq!(found_id, file_id);
 
         let (data, _) = fs.read_file(&auth, found_id, 0, 100).await.unwrap();
@@ -558,10 +544,7 @@ mod tests {
         assert_eq!(data1, test_data);
 
         let offset = chunk_size as u64 - 100;
-        let (data2, _) = fs
-            .read_file(&auth, file_id, offset, 200)
-            .await
-            .unwrap();
+        let (data2, _) = fs.read_file(&auth, file_id, offset, 200).await.unwrap();
         assert_eq!(data2.len(), 100);
         assert_eq!(&data2[..], &test_data[offset as usize..]);
 
@@ -655,10 +638,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (_, fattr) = fs
-            .create(&creds, 0, b"test.txt", &attr)
-            .await
-            .unwrap();
+        let (_, fattr) = fs.create(&creds, 0, b"test.txt", &attr).await.unwrap();
 
         assert_eq!(fattr.mode & 0o777, 0o640);
         assert_eq!(fattr.uid, 1001);
@@ -1051,10 +1031,7 @@ mod tests {
         let found_id = fs.lookup(&creds, 0, b"moved_dir3").await.unwrap();
         assert_eq!(found_id, dir3_id);
 
-        let found_file = fs
-            .lookup(&creds, dir3_id, b"file.txt")
-            .await
-            .unwrap();
+        let found_file = fs.lookup(&creds, dir3_id, b"file.txt").await.unwrap();
         assert!(found_file > 0);
     }
 

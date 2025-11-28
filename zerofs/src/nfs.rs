@@ -177,10 +177,8 @@ impl NFSFileSystem for NFSAdapter {
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
-        let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
-            .fs
-            .mkdir(&creds, real_dirid, dirname, &fs_attr)
-            .await?;
+        let (id, file_attrs): (u64, crate::fs::types::FileAttributes) =
+            self.fs.mkdir(&creds, real_dirid, dirname, &fs_attr).await?;
         Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
     }
 
@@ -198,10 +196,7 @@ impl NFSFileSystem for NFSAdapter {
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
-        Ok(self
-            .fs
-            .remove(&auth_ctx, real_dirid, filename)
-            .await?)
+        Ok(self.fs.remove(&auth_ctx, real_dirid, filename).await?)
     }
 
     async fn rename(
