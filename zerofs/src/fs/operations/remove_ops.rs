@@ -75,7 +75,7 @@ impl ZeroFS {
                                 self.chunk_store
                                     .delete_range(&mut txn, file_id, 0, total_chunks);
                             } else {
-                                txn.add_tombstone(file_id, file.size);
+                                self.tombstone_store.add(&mut txn, file_id, file.size);
                                 self.stats
                                     .tombstones_created
                                     .fetch_add(1, Ordering::Relaxed);

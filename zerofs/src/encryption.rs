@@ -1,6 +1,4 @@
 use crate::fs::errors::FsError;
-use crate::fs::inode::InodeId;
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::key_codec::KeyPrefix;
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -120,15 +118,6 @@ impl EncryptedTransaction {
             self.cache_ops.push((key.clone(), None));
         }
         self.inner.delete(key);
-    }
-
-    pub fn add_tombstone(&mut self, inode_id: InodeId, size: u64) {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let key = KeyCodec::tombstone_key(timestamp, inode_id);
-        self.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }
 
     #[allow(clippy::type_complexity)]
