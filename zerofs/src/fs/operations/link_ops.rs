@@ -2,7 +2,6 @@ use super::common::validate_filename;
 use crate::fs::cache::CacheKey;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, SymlinkInode};
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::types::{
     AuthContext, FileAttributes, InodeId, InodeWithId, SetAttributes, SetGid, SetMode, SetUid,
@@ -45,14 +44,7 @@ impl ZeroFS {
             _ => return Err(FsError::NotDirectory),
         };
 
-        let entry_key = KeyCodec::dir_entry_key(dirid, linkname);
-        if self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .is_some()
-        {
+        if self.directory_store.exists(dirid, linkname).await? {
             return Err(FsError::Exists);
         }
 
@@ -92,7 +84,7 @@ impl ZeroFS {
         let mut txn = self.new_transaction()?;
 
         txn.save_inode(new_id, &symlink_inode)?;
-        txn.add_dir_entry(dirid, linkname, new_id);
+        self.directory_store.add(&mut txn, dirid, linkname, new_id);
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -170,20 +162,13 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        let entry_key = KeyCodec::dir_entry_key(linkdirid, linkname);
-
-        if self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .is_some()
-        {
+        if self.directory_store.exists(linkdirid, linkname).await? {
             return Err(FsError::Exists);
         }
 
         let mut txn = self.new_transaction()?;
-        txn.add_dir_entry(linkdirid, linkname, fileid);
+        self.directory_store
+            .add(&mut txn, linkdirid, linkname, fileid);
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {

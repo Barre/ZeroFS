@@ -455,15 +455,7 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                let entry_key = KeyCodec::dir_entry_key(dirid, name);
-
-                if self
-                    .db
-                    .get_bytes(&entry_key)
-                    .await
-                    .map_err(|_| FsError::IoError)?
-                    .is_some()
-                {
+                if self.directory_store.exists(dirid, name).await? {
                     debug!("File already exists");
                     return Err(FsError::Exists);
                 }
@@ -516,7 +508,7 @@ impl ZeroFS {
                 let mut txn = self.new_transaction()?;
 
                 txn.save_inode(special_id, &inode)?;
-                txn.add_dir_entry(dirid, name, special_id);
+                self.directory_store.add(&mut txn, dirid, name, special_id);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;

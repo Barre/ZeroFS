@@ -208,14 +208,7 @@ impl ZeroFS {
         );
 
         // Optimistic existence check without holding lock
-        let entry_key = KeyCodec::dir_entry_key(dirid, name);
-        if self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .is_some()
-        {
+        if self.directory_store.exists(dirid, name).await? {
             return Err(FsError::Exists);
         }
 
@@ -228,13 +221,7 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 // Re-check existence inside lock (should hit cache and be fast)
-                if self
-                    .db
-                    .get_bytes(&entry_key)
-                    .await
-                    .map_err(|_| FsError::IoError)?
-                    .is_some()
-                {
+                if self.directory_store.exists(dirid, name).await? {
                     return Err(FsError::Exists);
                 }
 
@@ -276,7 +263,7 @@ impl ZeroFS {
                 let mut txn = self.new_transaction()?;
 
                 txn.save_inode(file_id, &Inode::File(file_inode.clone()))?;
-                txn.add_dir_entry(dirid, name, file_id);
+                self.directory_store.add(&mut txn, dirid, name, file_id);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;

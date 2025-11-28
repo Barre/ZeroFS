@@ -2,14 +2,12 @@ use super::common::validate_filename;
 use crate::fs::cache::{CacheKey, CacheValue};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, Inode};
-use crate::fs::key_codec::{KeyCodec, ParsedKey};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::types::{
     AuthContext, DirEntry, FileAttributes, InodeId, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetTime, SetUid,
 };
 use crate::fs::{EncodedFileId, ZeroFS, get_current_time};
-use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use std::sync::atomic::Ordering;
@@ -47,18 +45,8 @@ impl ZeroFS {
                     return Ok(inode_id);
                 }
 
-                let entry_key = KeyCodec::dir_entry_key(dirid, filename);
-
-                match self
-                    .db
-                    .get_bytes(&entry_key)
-                    .await
-                    .map_err(|_| FsError::IoError)?
-                {
-                    Some(entry_data) => {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&entry_data[..8]);
-                        let inode_id = u64::from_le_bytes(bytes);
+                match self.directory_store.get(dirid, filename).await {
+                    Ok(inode_id) => {
                         debug!(
                             "process_lookup found: {} -> inode {}",
                             String::from_utf8_lossy(filename),
@@ -74,13 +62,14 @@ impl ZeroFS {
 
                         Ok(inode_id)
                     }
-                    None => {
+                    Err(FsError::NotFound) => {
                         debug!(
                             "process_lookup not found: {} in directory",
                             String::from_utf8_lossy(filename)
                         );
                         Err(FsError::NotFound)
                     }
+                    Err(e) => Err(e),
                 }
             }
             _ => Err(FsError::NotDirectory),
@@ -103,14 +92,7 @@ impl ZeroFS {
         );
 
         // Optimistic existence check without holding lock
-        let entry_key = KeyCodec::dir_entry_key(dirid, name);
-        if self
-            .db
-            .get_bytes(&entry_key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .is_some()
-        {
+        if self.directory_store.exists(dirid, name).await? {
             return Err(FsError::Exists);
         }
 
@@ -123,13 +105,7 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 // Re-check existence inside lock (should hit cache and be fast)
-                if self
-                    .db
-                    .get_bytes(&entry_key)
-                    .await
-                    .map_err(|_| FsError::IoError)?
-                    .is_some()
-                {
+                if self.directory_store.exists(dirid, name).await? {
                     return Err(FsError::Exists);
                 }
 
@@ -191,7 +167,7 @@ impl ZeroFS {
                 let mut txn = self.new_transaction()?;
 
                 txn.save_inode(new_dir_id, &Inode::Directory(new_dir_inode.clone()))?;
-                txn.add_dir_entry(dirid, name, new_dir_id);
+                self.directory_store.add(&mut txn, dirid, name, new_dir_id);
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -314,19 +290,11 @@ impl ZeroFS {
                     });
                 }
 
-                let start_key = if start_after == 0 {
-                    Bytes::from(KeyCodec::dir_scan_prefix(dirid))
+                let iter = if start_after == 0 {
+                    self.directory_store.list(dirid).await?
                 } else {
-                    KeyCodec::dir_scan_resume_key(dirid, start_inode)
+                    self.directory_store.list_from(dirid, start_inode).await?
                 };
-
-                let end_key = KeyCodec::dir_scan_end_key(dirid);
-
-                let iter = self
-                    .db
-                    .scan(start_key..end_key)
-                    .await
-                    .map_err(|_| FsError::IoError)?;
                 pin_mut!(iter);
 
                 let mut dir_entries = Vec::new();
@@ -340,12 +308,9 @@ impl ZeroFS {
                         break;
                     }
 
-                    let (key, _value) = result.map_err(|_| FsError::IoError)?;
-
-                    let (inode_id, filename) = match KeyCodec::parse_key(&key) {
-                        ParsedKey::DirScan { entry_id, name } => (entry_id, name),
-                        _ => continue,
-                    };
+                    let entry = result?;
+                    let inode_id = entry.inode_id;
+                    let filename = entry.name;
 
                     if resuming {
                         if inode_id == start_inode {
