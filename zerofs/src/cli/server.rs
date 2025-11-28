@@ -4,7 +4,7 @@ use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
-use crate::fs::{CacheConfig, ZeroFS};
+use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
@@ -230,18 +230,6 @@ async fn start_rpc_servers(
     }
 
     handles
-}
-
-fn start_garbage_collection(fs: Arc<ZeroFS>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        info!("Starting garbage collection task (runs continuously)");
-        loop {
-            if let Err(e) = fs.run_garbage_collection().await {
-                tracing::error!("Garbage collection failed: {:?}", e);
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        }
-    })
 }
 
 fn start_stats_reporting(fs: Arc<ZeroFS>) -> JoinHandle<()> {
@@ -641,7 +629,13 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(settings.servers.rpc.as_ref(), checkpoint_manager).await;
 
     let gc_handle = if !db_mode.is_read_only() {
-        Some(start_garbage_collection(Arc::clone(&fs)))
+        let gc = Arc::new(GarbageCollector::new(
+            Arc::clone(&fs.db),
+            fs.tombstone_store.clone(),
+            fs.chunk_store.clone(),
+            Arc::clone(&fs.stats),
+        ));
+        Some(gc.start())
     } else {
         None
     };
