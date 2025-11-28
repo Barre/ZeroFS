@@ -252,7 +252,7 @@ fn start_periodic_flush(fs: Arc<ZeroFS>, interval_secs: u64) -> JoinHandle<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
-            if let Err(e) = fs.flush().await {
+            if let Err(e) = fs.flush_coordinator.flush().await {
                 tracing::error!("Periodic flush failed: {:?}", e);
             }
         }
@@ -687,14 +687,14 @@ pub async fn run_server(
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");
             if !db_mode.is_read_only() {
-                fs.flush().await?;
+                fs.flush_coordinator.flush().await?;
             }
             fs.db.close().await?;
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, shutting down gracefully...");
             if !db_mode.is_read_only() {
-                fs.flush().await?;
+                fs.flush_coordinator.flush().await?;
             }
             fs.db.close().await?;
         }

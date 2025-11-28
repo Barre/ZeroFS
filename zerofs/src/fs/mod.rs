@@ -57,7 +57,7 @@ pub struct ZeroFS {
     pub cache: Arc<UnifiedCache>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
-    flush_coordinator: FlushCoordinator,
+    pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: Arc<WriteCoordinator>,
     pub max_bytes: u64,
 }
@@ -173,10 +173,6 @@ impl ZeroFS {
         };
 
         Ok(fs)
-    }
-
-    pub async fn flush(&self) -> Result<(), FsError> {
-        self.flush_coordinator.flush().await
     }
 
     pub async fn commit_transaction(
@@ -480,7 +476,7 @@ mod tests {
         let mut seq_guard = fs_rw.write_coordinator.allocate_sequence();
         fs_rw.commit_transaction(txn, &mut seq_guard).await.unwrap();
 
-        fs_rw.flush().await.unwrap();
+        fs_rw.flush_coordinator.flush().await.unwrap();
         drop(fs_rw);
 
         let fs_ro = ZeroFS::new_in_memory_read_only(object_store, test_key)
