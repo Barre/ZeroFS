@@ -15,8 +15,8 @@ use crate::fs::types::{
     FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
 };
 
-pub const DEFAULT_MSIZE: u32 = 128 * 1024; // 1MB
-pub const DEFAULT_IOUNIT: u32 = 128 * 1024; // 1MB
+pub const DEFAULT_MSIZE: u32 = 256 * 1024;
+pub const DEFAULT_IOUNIT: u32 = 256 * 1024;
 
 pub const AT_REMOVEDIR: u32 = 0x200;
 // Linux dirent type constants
