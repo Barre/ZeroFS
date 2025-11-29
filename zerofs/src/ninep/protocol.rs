@@ -33,7 +33,7 @@ pub enum LockType {
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
 // Server configuration constants
-pub const P9_CHANNEL_SIZE: usize = 100;
+pub const P9_CHANNEL_SIZE: usize = 1000;
 pub const P9_MIN_MESSAGE_SIZE: u32 = 7;
 pub const P9_SIZE_FIELD_LEN: usize = 4;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
