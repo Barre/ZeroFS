@@ -406,8 +406,7 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        // Optimistically load inode and check parent permissions before lock
-        let _ = self.get_inode_cached(id).await?;
+        // Check parent permissions before lock (also validates inode exists)
         self.check_parent_execute_permissions(id, &creds).await?;
 
         let _guard = self.lock_manager.acquire_write(id).await;
@@ -1841,7 +1840,7 @@ impl ZeroFS {
             .acquire_multiple_write(vec![dirid, file_id])
             .await;
 
-        let dir_inode = self.get_inode_cached(dirid).await?;
+        let mut dir_inode = self.get_inode_cached(dirid).await?;
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
@@ -1867,8 +1866,6 @@ impl ZeroFS {
         };
 
         check_sticky_bit_delete(&dir_inode, &file_inode, &creds)?;
-
-        let mut dir_inode = self.get_inode_cached(dirid).await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -2057,15 +2054,15 @@ impl ZeroFS {
             return Err(FsError::NotFound);
         }
 
-        let source_inode = self.get_inode_cached(source_inode_id).await?;
+        let mut source_inode = self.get_inode_cached(source_inode_id).await?;
         if matches!(source_inode, Inode::Directory(_))
             && self.is_ancestor_of(source_inode_id, to_dirid).await?
         {
             return Err(FsError::InvalidArgument);
         }
 
-        let from_dir = self.get_inode_cached(from_dirid).await?;
-        let to_dir = if from_dirid != to_dirid {
+        let mut from_dir = self.get_inode_cached(from_dirid).await?;
+        let mut to_dir = if from_dirid != to_dirid {
             Some(self.get_inode_cached(to_dirid).await?)
         } else {
             None
@@ -2216,8 +2213,7 @@ impl ZeroFS {
             .add(&mut txn, to_dirid, to_name, source_inode_id);
 
         if from_dirid != to_dirid {
-            let mut moved_inode = self.get_inode_cached(source_inode_id).await?;
-            match &mut moved_inode {
+            match &mut source_inode {
                 Inode::Directory(d) => d.parent = to_dirid,
                 Inode::File(f) => {
                     // Lazy restoration: if nlink == 1, restore parent
@@ -2242,30 +2238,35 @@ impl ZeroFS {
                 }
             }
             self.inode_store
-                .save(&mut txn, source_inode_id, &moved_inode)?;
+                .save(&mut txn, source_inode_id, &source_inode)?;
         }
 
         let (now_sec, now_nsec) = get_current_time();
 
         let is_moved_dir = matches!(source_inode, Inode::Directory(_));
 
-        let mut from_dir_inode = self.get_inode_cached(from_dirid).await?;
-        if let Inode::Directory(d) = &mut from_dir_inode {
-            d.entry_count = d.entry_count.saturating_sub(1);
-            if is_moved_dir && from_dirid != to_dirid {
-                d.nlink = d.nlink.saturating_sub(1);
+        // Update directory metadata using already-fetched inodes
+        if let Inode::Directory(d) = &mut from_dir {
+            if from_dirid != to_dirid {
+                // Moving to different directory: source leaves from_dir
+                d.entry_count = d.entry_count.saturating_sub(1);
+                if is_moved_dir {
+                    d.nlink = d.nlink.saturating_sub(1);
+                }
+            } else if target_inode_id.is_some() {
+                // Same directory with target: only target was removed (source renamed in place)
+                d.entry_count = d.entry_count.saturating_sub(1);
             }
+            // If same dir without target: entry_count unchanged (rename only)
             d.mtime = now_sec;
             d.mtime_nsec = now_nsec;
             d.ctime = now_sec;
             d.ctime_nsec = now_nsec;
         }
-        self.inode_store
-            .save(&mut txn, from_dirid, &from_dir_inode)?;
+        self.inode_store.save(&mut txn, from_dirid, &from_dir)?;
 
-        if from_dirid != to_dirid {
-            let mut to_dir_inode = self.get_inode_cached(to_dirid).await?;
-            if let Inode::Directory(d) = &mut to_dir_inode {
+        if let Some(ref mut to_dir) = to_dir {
+            if let Inode::Directory(d) = to_dir {
                 if target_inode_id.is_none() {
                     d.entry_count += 1;
                 }
@@ -2280,19 +2281,7 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
-            self.inode_store.save(&mut txn, to_dirid, &to_dir_inode)?;
-        } else {
-            let mut dir_inode = self.get_inode_cached(from_dirid).await?;
-            if let Inode::Directory(d) = &mut dir_inode {
-                if target_inode_id.is_some() {
-                    d.entry_count = d.entry_count.saturating_sub(1);
-                }
-                d.mtime = now_sec;
-                d.mtime_nsec = now_nsec;
-                d.ctime = now_sec;
-                d.ctime_nsec = now_nsec;
-            }
-            self.inode_store.save(&mut txn, from_dirid, &dir_inode)?;
+            self.inode_store.save(&mut txn, to_dirid, to_dir)?;
         }
 
         if let Some(ref update) = target_stats_update {
