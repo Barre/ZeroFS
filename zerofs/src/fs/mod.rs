@@ -914,13 +914,12 @@ impl ZeroFS {
         }
     }
 
-    async fn readdir_internal(
+    pub async fn readdir(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         start_after: InodeId,
         max_entries: usize,
-        load_attrs: bool,
     ) -> Result<ReadDirResult, FsError> {
         debug!(
             "readdir: dirid={}, start_after={}, max_entries={}",
@@ -947,46 +946,37 @@ impl ZeroFS {
 
                 if !skip_special {
                     debug!("readdir: adding . entry for current directory");
-                    let dot_attr = if load_attrs {
+                    entries.push(DirEntry {
+                        fileid: dirid,
+                        name: b".".to_vec(),
+                        attr: InodeWithId {
+                            inode: &dir_inode,
+                            id: dirid,
+                        }
+                        .into(),
+                    });
+
+                    debug!("readdir: adding .. entry for parent directory");
+                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
+                    let parent_attr = if parent_id == dirid {
                         InodeWithId {
                             inode: &dir_inode,
                             id: dirid,
                         }
                         .into()
                     } else {
-                        FileAttributes::default()
-                    };
-                    entries.push(DirEntry {
-                        fileid: dirid,
-                        name: b".".to_vec(),
-                        attr: dot_attr,
-                    });
-
-                    debug!("readdir: adding .. entry for parent directory");
-                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
-                    let parent_attr = if load_attrs {
-                        if parent_id == dirid {
-                            InodeWithId {
+                        match self.get_inode_cached(parent_id).await {
+                            Ok(parent_inode) => InodeWithId {
+                                inode: &parent_inode,
+                                id: parent_id,
+                            }
+                            .into(),
+                            Err(_) => InodeWithId {
                                 inode: &dir_inode,
                                 id: dirid,
                             }
-                            .into()
-                        } else {
-                            match self.get_inode_cached(parent_id).await {
-                                Ok(parent_inode) => InodeWithId {
-                                    inode: &parent_inode,
-                                    id: parent_id,
-                                }
-                                .into(),
-                                Err(_) => InodeWithId {
-                                    inode: &dir_inode,
-                                    id: dirid,
-                                }
-                                .into(),
-                            }
+                            .into(),
                         }
-                    } else {
-                        FileAttributes::default()
                     };
                     entries.push(DirEntry {
                         fileid: parent_id,
@@ -1038,69 +1028,51 @@ impl ZeroFS {
                     dir_entries.push((inode_id, filename));
                 }
 
-                if load_attrs {
-                    const BUFFER_SIZE: usize = 256;
+                const BUFFER_SIZE: usize = 256;
 
-                    let inode_futures =
-                        stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
-                            debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
-                            match self.get_inode_cached(inode_id).await {
-                                Ok(inode) => {
-                                    debug!("readdir: loaded inode {} successfully", inode_id);
-                                    Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "readdir: skipping entry '{}' (inode {}) due to error: {:?}. Database may be corrupted.",
-                                        String::from_utf8_lossy(&name), inode_id, e
-                                    );
-                                    Ok(None)
-                                }
+                let inode_futures =
+                    stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
+                        debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
+                        match self.get_inode_cached(inode_id).await {
+                            Ok(inode) => {
+                                debug!("readdir: loaded inode {} successfully", inode_id);
+                                Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))
                             }
-                        });
-
-                    let loaded_entries: Vec<_> = inode_futures
-                        .buffered(BUFFER_SIZE)
-                        .collect::<Vec<_>>()
-                        .await
-                        .into_iter()
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect();
-
-                    for (inode_id, name, inode) in loaded_entries {
-                        let position = inode_positions.entry(inode_id).or_insert(0);
-                        let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
-                        *position += 1;
-
-                        entries.push(DirEntry {
-                            fileid: encoded_id,
-                            name,
-                            attr: InodeWithId {
-                                inode: &inode,
-                                id: inode_id,
+                            Err(e) => {
+                                tracing::error!(
+                                    "readdir: skipping entry '{}' (inode {}) due to error: {:?}. Database may be corrupted.",
+                                    String::from_utf8_lossy(&name), inode_id, e
+                                );
+                                Ok(None)
                             }
-                            .into(),
-                        });
-                        debug!("readdir: added entry with encoded id {}", encoded_id);
-                    }
-                } else {
-                    for (inode_id, name) in dir_entries {
-                        let position = inode_positions.entry(inode_id).or_insert(0);
-                        let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
-                        *position += 1;
+                        }
+                    });
 
-                        entries.push(DirEntry {
-                            fileid: encoded_id,
-                            name,
-                            attr: FileAttributes::default(),
-                        });
-                        debug!(
-                            "readdir: added entry with encoded id {} (no attrs)",
-                            encoded_id
-                        );
-                    }
+                let loaded_entries: Vec<_> = inode_futures
+                    .buffered(BUFFER_SIZE)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+
+                for (inode_id, name, inode) in loaded_entries {
+                    let position = inode_positions.entry(inode_id).or_insert(0);
+                    let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
+                    *position += 1;
+
+                    entries.push(DirEntry {
+                        fileid: encoded_id,
+                        name,
+                        attr: InodeWithId {
+                            inode: &inode,
+                            id: inode_id,
+                        }
+                        .into(),
+                    });
+                    debug!("readdir: added entry with encoded id {}", encoded_id);
                 }
 
                 let end = !has_more;
@@ -1119,31 +1091,6 @@ impl ZeroFS {
             }
             _ => Err(FsError::NotDirectory),
         }
-    }
-
-    pub async fn readdir(
-        &self,
-        auth: &AuthContext,
-        dirid: InodeId,
-        start_after: InodeId,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, FsError> {
-        self.readdir_internal(auth, dirid, start_after, max_entries, true)
-            .await
-    }
-
-    /// Public API: readdir without loading attributes (used by 9P)
-    /// Returns entries with default/empty attributes. Callers should load inodes separately
-    /// only for entries they actually need to return to the client.
-    pub async fn readdir_lite(
-        &self,
-        auth: &AuthContext,
-        dirid: InodeId,
-        start_after: InodeId,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, FsError> {
-        self.readdir_internal(auth, dirid, start_after, max_entries, false)
-            .await
     }
 
     // === Operations from link_ops.rs ===
