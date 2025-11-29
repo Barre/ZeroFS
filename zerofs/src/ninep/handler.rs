@@ -524,13 +524,8 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.get_inode_cached(child_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                let qid = inode_to_qid(&child_inode, child_id);
+            Ok((child_id, post_attr)) => {
+                let qid = attrs_to_qid(&post_attr, child_id);
 
                 let mut fid_entry = match self.session.fids.get_mut(&tc.fid) {
                     Some(entry) => entry,
@@ -735,13 +730,8 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.get_inode_cached(new_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                let qid = inode_to_qid(&new_inode, new_id);
+            Ok((new_id, post_attr)) => {
+                let qid = attrs_to_qid(&post_attr, new_id);
                 P9Message::new(tag, Message::Rmkdir(Rmkdir { qid }))
             }
             Err(e) => P9Message::error(tag, e.to_errno()),
@@ -776,13 +766,8 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.get_inode_cached(new_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                let qid = inode_to_qid(&new_inode, new_id);
+            Ok((new_id, post_attr)) => {
+                let qid = attrs_to_qid(&post_attr, new_id);
                 P9Message::new(tag, Message::Rsymlink(Rsymlink { qid }))
             }
             Err(e) => P9Message::error(tag, e.to_errno()),
@@ -827,19 +812,12 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.get_inode_cached(child_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                P9Message::new(
-                    tag,
-                    Message::Rmknod(Rmknod {
-                        qid: inode_to_qid(&child_inode, child_id),
-                    }),
-                )
-            }
+            Ok((child_id, post_attr)) => P9Message::new(
+                tag,
+                Message::Rmknod(Rmknod {
+                    qid: attrs_to_qid(&post_attr, child_id),
+                }),
+            ),
             Err(e) => P9Message::error(tag, e.to_errno()),
         }
     }
