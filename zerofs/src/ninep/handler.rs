@@ -255,36 +255,24 @@ impl NinePHandler {
             let name_bytes = Bytes::copy_from_slice(&wname.data);
             current_path.push(name_bytes.clone());
 
-            let inode = match self.filesystem.get_inode_cached(current_id).await {
+            // lookup() already verifies current_id is a directory and returns ENOTDIR if not
+            let creds = src_fid.creds;
+            let child_id = match self
+                .filesystem
+                .lookup(&creds, current_id, &name_bytes)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => return P9Message::error(tag, e.to_errno()),
+            };
+
+            let child_inode = match self.filesystem.get_inode_cached(child_id).await {
                 Ok(i) => i,
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             };
 
-            match inode {
-                Inode::Directory(ref _dir) => {
-                    let creds = src_fid.creds;
-                    match self
-                        .filesystem
-                        .lookup(&creds, current_id, &name_bytes)
-                        .await
-                    {
-                        Ok(child_id) => {
-                            let child_inode = match self.filesystem.get_inode_cached(child_id).await
-                            {
-                                Ok(i) => i,
-                                Err(e) => {
-                                    return P9Message::error(tag, e.to_errno());
-                                }
-                            };
-
-                            wqids.push(inode_to_qid(&child_inode, child_id));
-                            current_id = child_id;
-                        }
-                        Err(e) => return P9Message::error(tag, e.to_errno()),
-                    }
-                }
-                _ => return P9Message::error(tag, libc::ENOTDIR as u32),
-            }
+            wqids.push(inode_to_qid(&child_inode, child_id));
+            current_id = child_id;
         }
 
         if tw.newfid != tw.fid || !tw.wnames.is_empty() {
