@@ -2095,9 +2095,9 @@ impl ZeroFS {
             }
         }
 
-        if let Some(target_id) = target_inode_id {
-            let target_inode = self.get_inode_cached(target_id).await?;
-            if let Inode::Directory(dir) = &target_inode
+        let target = if let Some(target_id) = target_inode_id {
+            let inode = self.get_inode_cached(target_id).await?;
+            if let Inode::Directory(dir) = &inode
                 && dir.entry_count > 0
             {
                 return Err(FsError::NotEmpty);
@@ -2108,16 +2108,17 @@ impl ZeroFS {
             } else {
                 &from_dir
             };
-            check_sticky_bit_delete(target_dir, &target_inode, &creds)?;
-        }
+            check_sticky_bit_delete(target_dir, &inode, &creds)?;
+            Some((target_id, inode))
+        } else {
+            None
+        };
 
         let mut txn = self.db.new_transaction()?;
 
         let mut target_was_directory = false;
         let mut target_stats_update = None;
-        if let Some(target_id) = target_inode_id {
-            let existing_inode = self.get_inode_cached(target_id).await?;
-
+        if let Some((target_id, existing_inode)) = target {
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
             let (original_nlink, original_file_size, should_always_remove_stats) =
