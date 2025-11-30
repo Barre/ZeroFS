@@ -1,4 +1,5 @@
 use anyhow::Result;
+use mimalloc::MiMalloc;
 use std::io::BufRead;
 
 mod bucket_identity;
@@ -21,12 +22,8 @@ mod test_helpers;
 #[cfg(test)]
 mod posix_tests;
 
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
