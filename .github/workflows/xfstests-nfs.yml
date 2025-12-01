@@ -1,0 +1,181 @@
+name: xfstests-nfs
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  xfstests:
+    name: Run xfstests NFS Test Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk \
+            gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
+            libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
+            uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
+            libgdbm-compat-dev nfs-common
+          sudo apt-get install -y exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
+            xfslibs-dev || true
+          sudo apt-get install -y systemd-coredump systemd jq pkg-config
+
+      - name: Clone xfstests
+        run: |
+          git clone https://github.com/Barre/xfstests.git /tmp/xfstests
+
+      - name: Build xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          make
+          sudo make install
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Create ZeroFS data directories
+        run: |
+          mkdir -p ${{ github.workspace }}/zerofs-test-data
+          mkdir -p ${{ github.workspace }}/zerofs-scratch-data
+          mkdir -p /tmp/zerofs-cache-test
+          mkdir -p /tmp/zerofs-cache-scratch
+
+      - name: Start ZeroFS (TEST instance)
+        working-directory: zerofs
+        run: |
+          # Create ZeroFS configuration for TEST
+          cat > zerofs-test.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache-test"
+          disk_size_gb = 1.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "file://${{ github.workspace }}/zerofs-test-data"
+          encryption_password = "test-password-123"
+
+          [servers.nfs]
+          addresses = ["127.0.0.1:2049"]
+          EOF
+
+          # Start ZeroFS in the background
+          cargo run --profile ci -- run -c zerofs-test.toml &
+          echo $! > /tmp/zerofs-test.pid
+
+          # Wait for ZeroFS to start
+          echo "Waiting for ZeroFS TEST instance to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 2049; then
+              echo "ZeroFS TEST instance is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          if ! nc -z 127.0.0.1 2049; then
+            echo "ZeroFS TEST instance failed to start"
+            exit 1
+          fi
+
+      - name: Start ZeroFS (SCRATCH instance)
+        working-directory: zerofs
+        run: |
+          # Create ZeroFS configuration for SCRATCH
+          cat > zerofs-scratch.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache-scratch"
+          disk_size_gb = 1.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "file://${{ github.workspace }}/zerofs-scratch-data"
+          encryption_password = "test-password-123"
+
+          [servers.nfs]
+          addresses = ["127.0.0.1:20499"]
+          EOF
+
+          # Start ZeroFS in the background
+          cargo run --profile ci -- run -c zerofs-scratch.toml &
+          echo $! > /tmp/zerofs-scratch.pid
+
+          # Wait for ZeroFS to start
+          echo "Waiting for ZeroFS SCRATCH instance to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 20499; then
+              echo "ZeroFS SCRATCH instance is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          if ! nc -z 127.0.0.1 20499; then
+            echo "ZeroFS SCRATCH instance failed to start"
+            exit 1
+          fi
+
+      - name: Create mount points
+        run: |
+          sudo mkdir -p /mnt/test
+          sudo mkdir -p /mnt/scratch
+
+      - name: Configure xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          cat > local.config << 'EOF'
+          export FSTYP=nfs
+
+          export TEST_DIR=/mnt/test
+          export SCRATCH_MNT=/mnt/scratch
+
+          export TEST_DEV=localhost:/
+          export SCRATCH_DEV=127.0.0.1:/
+
+          export TEST_FS_MOUNT_OPTS="-o nolock,tcp,port=2049,mountport=2049,hard"
+          export NFS_MOUNT_OPTIONS="-o nolock,tcp,port=20499,mountport=20499,hard"
+          EOF
+
+          cat > excludes << 'EOF'
+          generic/035
+          generic/126
+          generic/394
+          generic/467
+          generic/263
+          generic/759
+          generic/760
+          generic/477
+          generic/564
+          generic/633
+          generic/696
+          generic/591
+          generic/615
+          EOF
+
+      - name: Run xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          sudo ./check -g quick -E excludes
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount filesystems
+          sudo umount /mnt/test || true
+          sudo umount /mnt/scratch || true
+
+          # Kill ZeroFS instances
+          if [ -f /tmp/zerofs-test.pid ]; then
+            kill $(cat /tmp/zerofs-test.pid) || true
+          fi
+          if [ -f /tmp/zerofs-scratch.pid ]; then
+            kill $(cat /tmp/zerofs-scratch.pid) || true
+          fi
+          pkill -f "zerofs-test.toml" || true
+          pkill -f "zerofs-scratch.toml" || true
