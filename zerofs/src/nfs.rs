@@ -255,6 +255,7 @@ impl NFSFileSystem for NFSAdapter {
                     fileid: e.fileid,
                     name: e.name.into(),
                     attr: (&e.attr).into(),
+                    cookie: e.cookie,
                 })
                 .collect(),
             end: result.end,
@@ -820,7 +821,7 @@ mod tests {
 
                 for entry in &result.entries[start_idx..] {
                     all_entries.push(String::from_utf8_lossy(&entry.name).to_string());
-                    last_fileid = entry.fileid;
+                    last_fileid = entry.cookie;  // Use cookie for pagination, not fileid
                 }
 
                 iterations += 1;
@@ -905,13 +906,13 @@ mod tests {
                 let name = String::from_utf8_lossy(&entry.name).to_string();
                 all_entries.push(name);
 
-                // Verify encoded fileid can be decoded properly
-                let encoded_id = EncodedFileId::from(entry.fileid);
-                let (real_inode, position) = encoded_id.decode();
+                // Verify cookie can be decoded properly
+                let encoded_cookie = EncodedFileId::from(entry.cookie);
+                let (real_inode, position) = encoded_cookie.decode();
                 assert!(real_inode > 0);
                 assert!(position < 65535); // Should be within u16 range
 
-                last_fileid = entry.fileid;
+                last_fileid = entry.cookie;  // Use cookie for pagination, not fileid
             }
 
             if result.end {
@@ -1039,7 +1040,7 @@ mod tests {
                     if entry.name.0 != b"." && entry.name.0 != b".." {
                         entries.push(String::from_utf8_lossy(&entry.name).to_string());
                     }
-                    last_id = entry.fileid;
+                    last_id = entry.cookie;  // Use cookie for pagination
                 }
                 if result.end {
                     break;
@@ -1058,7 +1059,7 @@ mod tests {
                     if entry.name.0 != b"." && entry.name.0 != b".." {
                         entries.push(String::from_utf8_lossy(&entry.name).to_string());
                     }
-                    last_id = entry.fileid;
+                    last_id = entry.cookie;  // Use cookie for pagination
                 }
                 if result.end {
                     break;

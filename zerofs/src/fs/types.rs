@@ -466,6 +466,7 @@ pub struct DirEntry {
     pub fileid: InodeId,
     pub name: Vec<u8>,
     pub attr: FileAttributes,
+    pub cookie: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -922,26 +922,37 @@ impl ZeroFS {
                 let mut entries = Vec::new();
                 let mut inode_positions = std::collections::HashMap::new();
 
-                let (start_inode, start_position) = if start_after == 0 {
-                    (0, 0)
+                // Reserved position values for . and .. in the cookie encoding
+                const POSITION_DOT: u16 = 0xFFFE;
+                const POSITION_DOTDOT: u16 = 0xFFFF;
+
+                // Decode cookie to determine what to skip
+                let (start_inode, start_position, skip_dot, skip_dotdot) = if start_after == 0 {
+                    (0, 0, false, false)
                 } else {
-                    EncodedFileId::from(start_after).decode()
+                    let (inode, pos) = EncodedFileId::from(start_after).decode();
+                    match pos {
+                        POSITION_DOT => (0, 0, true, false),    // After ".", show ".." and entries
+                        POSITION_DOTDOT => (0, 0, true, true),  // After "..", show entries only
+                        _ => (inode, pos, true, true),          // After regular entry
+                    }
                 };
 
-                let skip_special = start_after != 0;
-
-                if !skip_special {
+                if !skip_dot {
                     debug!("readdir: adding . entry for current directory");
                     entries.push(DirEntry {
-                        fileid: EncodedFileId::new(dirid, 0)?.as_raw(),
+                        fileid: EncodedFileId::from_inode(dirid)?.as_raw(),  // Encoded for handle
                         name: b".".to_vec(),
                         attr: InodeWithId {
                             inode: &dir_inode,
                             id: dirid,
                         }
                         .into(),
+                        cookie: EncodedFileId::new(dirid, POSITION_DOT)?.as_raw(),  // Encoded for d_off
                     });
+                }
 
+                if !skip_dotdot {
                     debug!("readdir: adding .. entry for parent directory");
                     let parent_id = if dirid == 0 { 0 } else { dir.parent };
                     let parent_attr = if parent_id == dirid {
@@ -965,13 +976,23 @@ impl ZeroFS {
                         }
                     };
                     entries.push(DirEntry {
-                        fileid: EncodedFileId::new(parent_id, 0)?.as_raw(),
+                        fileid: EncodedFileId::from_inode(parent_id)?.as_raw(),  // Encoded for handle
                         name: b"..".to_vec(),
                         attr: parent_attr,
+                        cookie: EncodedFileId::new(parent_id, POSITION_DOTDOT)?.as_raw(),  // Encoded for d_off
                     });
                 }
 
-                let iter = if start_after == 0 {
+                // Determine if we're resuming from . or ..
+                let is_after_dot_or_dotdot = if start_after == 0 {
+                    false
+                } else {
+                    let (_, pos) = EncodedFileId::from(start_after).decode();
+                    pos == POSITION_DOT || pos == POSITION_DOTDOT
+                };
+
+                // Use full list if starting fresh or after . or .., otherwise resume from specific inode
+                let iter = if start_after == 0 || is_after_dot_or_dotdot {
                     self.directory_store.list(dirid).await?
                 } else {
                     self.directory_store.list_from(dirid, start_inode).await?
@@ -979,7 +1000,7 @@ impl ZeroFS {
                 pin_mut!(iter);
 
                 let mut dir_entries = Vec::new();
-                let mut resuming = start_after != 0;
+                let mut resuming = start_after != 0 && !is_after_dot_or_dotdot;
                 let mut has_more = false;
 
                 while let Some(result) = iter.next().await {
@@ -1046,19 +1067,20 @@ impl ZeroFS {
 
                 for (inode_id, name, inode) in loaded_entries {
                     let position = inode_positions.entry(inode_id).or_insert(0);
-                    let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
+                    let cookie = EncodedFileId::new(inode_id, *position)?.as_raw();
                     *position += 1;
 
                     entries.push(DirEntry {
-                        fileid: encoded_id,
+                        fileid: EncodedFileId::from_inode(inode_id)?.as_raw(),  // Encoded for handle
                         name,
                         attr: InodeWithId {
                             inode: &inode,
                             id: inode_id,
                         }
                         .into(),
+                        cookie,  // Encoded for d_off
                     });
-                    debug!("readdir: added entry with encoded id {}", encoded_id);
+                    debug!("readdir: added entry with inode {} cookie {}", inode_id, cookie);
                 }
 
                 let end = !has_more;
@@ -3350,15 +3372,16 @@ mod tests {
         let result1 = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
         assert_eq!(result1.entries.len(), 6); // . .. file1.txt hardlink1.txt hardlink2.txt file2.txt
 
-        // Check that hardlinks have different encoded fileids
-        let file1_encoded = result1.entries[2].fileid;
-        let hardlink1_encoded = result1.entries[3].fileid;
-        let hardlink2_encoded = result1.entries[4].fileid;
+        // Check that hardlinks have different encoded cookies (for pagination)
+        // but same fileid (for d_ino - all point to same inode)
+        let file1_cookie = result1.entries[2].cookie;
+        let hardlink1_cookie = result1.entries[3].cookie;
+        let hardlink2_cookie = result1.entries[4].cookie;
 
-        // Decode to verify they point to the same inode
-        let (file1_inode, file1_pos) = EncodedFileId::from(file1_encoded).decode();
-        let (hardlink1_inode, hardlink1_pos) = EncodedFileId::from(hardlink1_encoded).decode();
-        let (hardlink2_inode, hardlink2_pos) = EncodedFileId::from(hardlink2_encoded).decode();
+        // Decode cookies to verify they point to the same inode with different positions
+        let (file1_inode, file1_pos) = EncodedFileId::from(file1_cookie).decode();
+        let (hardlink1_inode, hardlink1_pos) = EncodedFileId::from(hardlink1_cookie).decode();
+        let (hardlink2_inode, hardlink2_pos) = EncodedFileId::from(hardlink2_cookie).decode();
 
         assert_eq!(file1_inode, hardlink1_inode);
         assert_eq!(file1_inode, hardlink2_inode);
@@ -3366,9 +3389,13 @@ mod tests {
         assert_eq!(hardlink1_pos, 1);
         assert_eq!(hardlink2_pos, 2);
 
-        // Test pagination - start after the first hardlink
+        // Verify fileids are the same (raw inode for d_ino display)
+        assert_eq!(result1.entries[2].fileid, result1.entries[3].fileid);
+        assert_eq!(result1.entries[2].fileid, result1.entries[4].fileid);
+
+        // Test pagination - start after the first hardlink using cookie
         let result2 = fs
-            .readdir(&(&test_auth()).into(), 0, hardlink1_encoded, 10)
+            .readdir(&(&test_auth()).into(), 0, hardlink1_cookie, 10)
             .await
             .unwrap();
         assert_eq!(result2.entries.len(), 2); // hardlink2.txt file2.txt
