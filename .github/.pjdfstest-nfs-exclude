@@ -1,0 +1,6 @@
+tests/chmod/12.t
+tests/chown/00.t
+tests/chown/05.t
+tests/utimensat/08.t
+tests/ftruncate/00.t
+tests/link/06.t
