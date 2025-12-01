@@ -795,8 +795,8 @@ This enables persistent storage across workflow runs, shared artifacts between j
 ZeroFS has the following theoretical limits:
 
 - **Maximum file size**: 16 EiB (16 exbibytes = 18.4 exabytes) per file
-- **Maximum number of files create over filesystem lifespan**: 281 trillion (2^48)
-- **Maximum hardlinks per file**: 65,535 (across all directories)
+- **Maximum number of files over filesystem lifespan**: 2^64 (~18 quintillion)
+- **Maximum hardlinks per file**: ~4 billion (2^32)
 - **Maximum filesystem size**: 2^112 bytes
   - = 4,096 geopbytes (where 1 geopbyte = 2^100 bytes)
   - = 4.3 million yottabytes
@@ -804,8 +804,7 @@ ZeroFS has the following theoretical limits:
   - = 4.5 trillion exabytes
 
 These limits come from the filesystem design:
-- File IDs use 48 bits for the inode number and 16 bits for hardlink position
-- File sizes are stored as 64-bit integers
+- Inode IDs and file sizes are stored as 64-bit integers
 - The chunking system uses 256KB blocks with 64-bit indexing
 
 In practice, you'll encounter other constraints well before these theoretical limits, such as S3 provider limits, performance considerations with billions of objects, or simply running out of money.
