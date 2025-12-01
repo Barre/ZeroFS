@@ -931,7 +931,7 @@ impl ZeroFS {
                 if !skip_special {
                     debug!("readdir: adding . entry for current directory");
                     entries.push(DirEntry {
-                        fileid: dirid,
+                        fileid: EncodedFileId::new(dirid, 0)?.as_raw(),
                         name: b".".to_vec(),
                         attr: InodeWithId {
                             inode: &dir_inode,
@@ -963,7 +963,7 @@ impl ZeroFS {
                         }
                     };
                     entries.push(DirEntry {
-                        fileid: parent_id,
+                        fileid: EncodedFileId::new(parent_id, 0)?.as_raw(),
                         name: b"..".to_vec(),
                         attr: parent_attr,
                     });
