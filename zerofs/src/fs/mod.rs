@@ -303,7 +303,6 @@ impl ZeroFS {
         .await
     }
 
-    // === Operations from common.rs ===
     pub async fn is_ancestor_of(
         &self,
         ancestor_id: InodeId,
@@ -388,7 +387,6 @@ impl ZeroFS {
         Ok(())
     }
 
-    // === Operations from file_ops.rs ===
     pub async fn write(
         &self,
         auth: &AuthContext,
@@ -513,11 +511,6 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        // Optimistic existence check without holding lock
-        if self.directory_store.exists(dirid, name).await? {
-            return Err(FsError::Exists);
-        }
-
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.get_inode_cached(dirid).await?;
 
@@ -526,7 +519,6 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                // Re-check existence inside lock (should hit cache and be fast)
                 if self.directory_store.exists(dirid, name).await? {
                     return Err(FsError::Exists);
                 }
@@ -713,7 +705,6 @@ impl ZeroFS {
         Ok(())
     }
 
-    // === Operations from dir_ops.rs ===
     pub async fn lookup(
         &self,
         creds: &Credentials,
@@ -791,11 +782,6 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        // Optimistic existence check without holding lock
-        if self.directory_store.exists(dirid, name).await? {
-            return Err(FsError::Exists);
-        }
-
         let _guard = self.lock_manager.acquire_write(dirid).await;
         let mut dir_inode = self.get_inode_cached(dirid).await?;
 
@@ -804,7 +790,6 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
-                // Re-check existence inside lock (should hit cache and be fast)
                 if self.directory_store.exists(dirid, name).await? {
                     return Err(FsError::Exists);
                 }
@@ -1092,7 +1077,6 @@ impl ZeroFS {
         }
     }
 
-    // === Operations from link_ops.rs ===
     pub async fn symlink(
         &self,
         creds: &Credentials,
@@ -1309,7 +1293,6 @@ impl ZeroFS {
         Ok(())
     }
 
-    // === Operations from metadata_ops.rs ===
     pub async fn setattr(
         &self,
         creds: &Credentials,
@@ -1822,7 +1805,6 @@ impl ZeroFS {
         }
     }
 
-    // === Operations from remove_ops.rs ===
     pub async fn remove(
         &self,
         auth: &AuthContext,
@@ -1985,7 +1967,6 @@ impl ZeroFS {
         }
     }
 
-    // === Operations from rename_ops.rs ===
     pub async fn rename(
         &self,
         auth: &AuthContext,
@@ -2048,10 +2029,19 @@ impl ZeroFS {
             .acquire_multiple_write(all_inodes_to_lock)
             .await;
 
-        // Re-check inside lock to verify entry still points to same inode
-        let verified_id = self.directory_store.get(from_dirid, from_name).await?;
-        if verified_id != source_inode_id {
-            return Err(FsError::NotFound);
+        // Re-verify inside lock that entries still point to same inodes
+        let verified_source_id = self.directory_store.get(from_dirid, from_name).await?;
+        if verified_source_id != source_inode_id {
+            return Err(FsError::StaleHandle);
+        }
+
+        let verified_target_id = match self.directory_store.get(to_dirid, to_name).await {
+            Ok(id) => Some(id),
+            Err(FsError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        if verified_target_id != target_inode_id {
+            return Err(FsError::StaleHandle);
         }
 
         let mut source_inode = self.get_inode_cached(source_inode_id).await?;
