@@ -445,6 +445,8 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
                 file.mtime = now_sec;
                 file.mtime_nsec = now_nsec;
+                file.ctime = now_sec;
+                file.ctime_nsec = now_nsec;
 
                 // POSIX: Clear SUID/SGID bits on write by non-owner
                 if creds.uid != file.uid && creds.uid != 0 {
