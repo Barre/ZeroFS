@@ -12,8 +12,7 @@ use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{
-    FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime,
-    SetUid, Timestamp,
+    FileAttributes, FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
 };
 
 pub const DEFAULT_MSIZE: u32 = 256 * 1024;
@@ -57,9 +56,6 @@ pub struct Fid {
     pub opened: bool,
     pub mode: Option<u32>,
     pub creds: Credentials, // Store credentials per fid/session
-    // For directory reads: track position for sequential reads
-    pub dir_last_offset: u64, // Last offset we returned entries for
-    pub dir_last_cookie: u64, // Last cookie from readdir for continuation
 }
 
 #[derive(Debug)]
@@ -233,8 +229,6 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds,
-                dir_last_offset: 0,
-                dir_last_cookie: 0,
             },
         );
 
@@ -289,8 +283,6 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds: src_fid.creds, // Inherit credentials from source fid
-                dir_last_offset: 0,
-                dir_last_cookie: 0,
             };
             self.session.fids.insert(tw.newfid, new_fid);
         }
@@ -334,10 +326,6 @@ impl NinePHandler {
             fid_entry.qid = qid.clone();
             fid_entry.opened = true;
             fid_entry.mode = Some(tl.flags);
-            if matches!(inode, Inode::Directory(_)) {
-                fid_entry.dir_last_offset = 0;
-                fid_entry.dir_last_cookie = 0;
-            }
         }
 
         P9Message::new(tag, Message::Rlopen(Rlopen { qid, iounit }))
@@ -360,138 +348,50 @@ impl NinePHandler {
 
         let auth = self.make_auth_context(&fid_entry.creds);
 
-        let is_sequential = tr.offset == fid_entry.dir_last_offset;
+        // tr.offset is the cookie from the last entry the client received (0 for first call)
+        // Pass it directly to readdir which handles . and .. with cookies 1 and 2
+        match self
+            .filesystem
+            .readdir(
+                &(&auth).into(),
+                fid_entry.inode_id,
+                tr.offset,
+                P9_READDIR_BATCH_SIZE,
+            )
+            .await
+        {
+            Ok(result) => {
+                let mut dir_entries = Vec::new();
+                let mut total_size = 0usize;
 
-        let mut entries_to_return: Vec<(u64, Vec<u8>, u64, FileAttributes)> = Vec::new();
-
-        let (dir_attrs, parent_id, parent_attrs) =
-            match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
-                Ok(inode) => {
-                    let dir_attrs = FileAttributes::from(InodeWithId {
-                        inode: &inode,
-                        id: fid_entry.inode_id,
-                    });
-                    let parent_id = match &inode {
-                        Inode::Directory(dir) if fid_entry.inode_id != 0 => dir.parent,
-                        _ => 0,
+                for entry in result.entries {
+                    let dirent = DirEntry {
+                        qid: attrs_to_qid(&entry.attr, entry.fileid),
+                        offset: entry.cookie, // Use cookie as offset for client to resume
+                        type_: filetype_to_dt(entry.attr.file_type),
+                        name: P9String::new(entry.name),
                     };
-                    let parent_attrs = if parent_id == fid_entry.inode_id {
-                        dir_attrs.clone()
-                    } else {
-                        match self.filesystem.get_inode_cached(parent_id).await {
-                            Ok(parent_inode) => FileAttributes::from(InodeWithId {
-                                inode: &parent_inode,
-                                id: parent_id,
-                            }),
-                            Err(_) => dir_attrs.clone(),
-                        }
-                    };
-                    (dir_attrs, parent_id, parent_attrs)
+
+                    let entry_size = dirent.to_bytes().map(|b| b.len()).unwrap_or(0);
+
+                    if total_size + entry_size > tr.count as usize {
+                        break;
+                    }
+
+                    total_size += entry_size;
+                    dir_entries.push(dirent);
                 }
-                Err(e) => return P9Message::error(tag, e.to_errno()),
-            };
 
-        let mut current_offset: u64;
-        let mut cookie: u64;
-
-        if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
-            current_offset = tr.offset;
-            cookie = fid_entry.dir_last_cookie;
-        } else {
-            if tr.offset == 0 {
-                entries_to_return.push((0, b".".to_vec(), fid_entry.inode_id, dir_attrs.clone()));
-                entries_to_return.push((1, b"..".to_vec(), parent_id, parent_attrs));
-                current_offset = 2;
-            } else if tr.offset == 1 {
-                entries_to_return.push((1, b"..".to_vec(), parent_id, parent_attrs));
-                current_offset = 2;
-            } else {
-                current_offset = 2;
+                P9Message::new(
+                    tag,
+                    Message::Rreaddir(Rreaddir::from_entries(dir_entries).unwrap_or(Rreaddir {
+                        count: 0,
+                        data: Vec::new(),
+                    })),
+                )
             }
-            cookie = 0;
+            Err(e) => P9Message::error(tag, e.to_errno()),
         }
-
-        loop {
-            const BATCH_SIZE: usize = P9_READDIR_BATCH_SIZE;
-
-            match self
-                .filesystem
-                .readdir(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
-                .await
-            {
-                Ok(result) => {
-                    if result.entries.is_empty() && result.end {
-                        break;
-                    }
-
-                    let was_end = result.end;
-
-                    for entry in result.entries {
-                        if entry.name == b"." || entry.name == b".." {
-                            cookie = entry.cookie;
-                            continue;
-                        }
-
-                        if current_offset < tr.offset {
-                            current_offset += 1;
-                        } else {
-                            entries_to_return.push((
-                                current_offset,
-                                entry.name.clone(),
-                                entry.fileid,
-                                entry.attr,
-                            ));
-                            current_offset += 1;
-                        }
-
-                        cookie = entry.cookie;
-                    }
-
-                    if was_end {
-                        break;
-                    }
-
-                    if !entries_to_return.is_empty() {
-                        break;
-                    }
-                }
-                Err(e) => return P9Message::error(tag, e.to_errno()),
-            }
-        }
-
-        if let Some(mut fid) = self.session.fids.get_mut(&tr.fid) {
-            fid.dir_last_offset = current_offset;
-            fid.dir_last_cookie = cookie;
-        }
-
-        let mut dir_entries = Vec::new();
-        let mut total_size = 0usize;
-
-        for (offset, name, fileid, attrs) in entries_to_return {
-            let dirent = DirEntry {
-                qid: attrs_to_qid(&attrs, fileid),
-                offset: offset + 1,
-                type_: filetype_to_dt(attrs.file_type),
-                name: P9String::new(name),
-            };
-
-            let entry_size = dirent.to_bytes().map(|b| b.len()).unwrap_or(0);
-
-            if total_size + entry_size > tr.count as usize {
-                break;
-            }
-
-            total_size += entry_size;
-            dir_entries.push(dirent);
-        }
-
-        P9Message::new(
-            tag,
-            Message::Rreaddir(Rreaddir::from_entries(dir_entries).unwrap_or(Rreaddir {
-                count: 0,
-                data: Vec::new(),
-            })),
-        )
     }
 
     async fn handle_lcreate(&self, tag: u16, tc: Tlcreate) -> P9Message {

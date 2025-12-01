@@ -87,9 +87,4 @@ impl InodeStore {
         let next_id = self.next_id.load(Ordering::SeqCst);
         txn.put_bytes(&key, KeyCodec::encode_counter(next_id));
     }
-
-    #[cfg(test)]
-    pub fn set_next_id_for_testing(&self, id: u64) {
-        self.next_id.store(id, Ordering::SeqCst);
-    }
 }
