@@ -167,7 +167,7 @@ impl DirectoryStore {
         txn.put_bytes(&scan_key, KeyCodec::encode_dir_scan_value(entry_id, name));
     }
 
-    pub fn remove(
+    pub fn unlink_entry(
         &self,
         txn: &mut EncryptedTransaction,
         dir_id: InodeId,
@@ -179,6 +179,11 @@ impl DirectoryStore {
 
         let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
         txn.delete_bytes(&scan_key);
+    }
+
+    pub fn delete_directory(&self, txn: &mut EncryptedTransaction, dir_id: InodeId) {
+        let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
+        txn.delete_bytes(&counter_key);
     }
 
     pub async fn get_entry_with_cookie(

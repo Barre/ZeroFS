@@ -1872,6 +1872,7 @@ impl ZeroFS {
                             return Err(FsError::NotEmpty);
                         }
                         self.inode_store.delete(&mut txn, file_id);
+                        self.directory_store.delete_directory(&mut txn, file_id);
                         dir.nlink = dir.nlink.saturating_sub(1);
                         self.stats
                             .directories_deleted
@@ -1897,7 +1898,8 @@ impl ZeroFS {
                     }
                 }
 
-                self.directory_store.remove(&mut txn, dirid, name, cookie);
+                self.directory_store
+                    .unlink_entry(&mut txn, dirid, name, cookie);
 
                 dir.entry_count = dir.entry_count.saturating_sub(1);
                 dir.mtime = now_sec;
@@ -2169,6 +2171,7 @@ impl ZeroFS {
                 }
                 Inode::Directory(_) => {
                     self.inode_store.delete(&mut txn, target_id);
+                    self.directory_store.delete_directory(&mut txn, target_id);
                 }
                 Inode::Symlink(_) => {
                     self.inode_store.delete(&mut txn, target_id);
@@ -2198,11 +2201,11 @@ impl ZeroFS {
             }
 
             self.directory_store
-                .remove(&mut txn, to_dirid, to_name, target_cookie.unwrap());
+                .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         }
 
         self.directory_store
-            .remove(&mut txn, from_dirid, from_name, source_cookie);
+            .unlink_entry(&mut txn, from_dirid, from_name, source_cookie);
         let new_cookie = self
             .directory_store
             .allocate_cookie(to_dirid, &mut txn)
