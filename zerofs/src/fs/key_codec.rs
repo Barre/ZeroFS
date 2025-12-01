@@ -9,6 +9,7 @@ const PREFIX_DIR_SCAN: u8 = 0x04;
 const PREFIX_TOMBSTONE: u8 = 0x05;
 const PREFIX_STATS: u8 = 0x06;
 const PREFIX_SYSTEM: u8 = 0x07;
+const PREFIX_DIR_COOKIE: u8 = 0x08;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
@@ -28,6 +29,7 @@ pub enum KeyPrefix {
     Tombstone,
     Stats,
     System,
+    DirCookie,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -42,6 +44,7 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_TOMBSTONE => Ok(Self::Tombstone),
             PREFIX_STATS => Ok(Self::Stats),
             PREFIX_SYSTEM => Ok(Self::System),
+            PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
             _ => Err(()),
         }
     }
@@ -57,6 +60,7 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::Tombstone => PREFIX_TOMBSTONE,
             KeyPrefix::Stats => PREFIX_STATS,
             KeyPrefix::System => PREFIX_SYSTEM,
+            KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
         }
     }
 }
@@ -71,13 +75,14 @@ impl KeyPrefix {
             Self::Tombstone => "TOMBSTONE",
             Self::Stats => "STATS",
             Self::System => "SYSTEM",
+            Self::DirCookie => "DIR_COOKIE",
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ParsedKey {
-    DirScan { entry_id: InodeId, name: Vec<u8> },
+    DirScan { cookie: u64 },
     Tombstone { inode_id: InodeId },
     Unknown,
 }
@@ -108,12 +113,11 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn dir_scan_key(dir_id: InodeId, entry_id: InodeId, name: &[u8]) -> Bytes {
-        let mut key = Vec::with_capacity(KEY_CHUNK_SIZE + name.len());
+    pub fn dir_scan_key(dir_id: InodeId, cookie: u64) -> Bytes {
+        let mut key = Vec::with_capacity(KEY_CHUNK_SIZE);
         key.push(u8::from(KeyPrefix::DirScan));
         key.extend_from_slice(&dir_id.to_be_bytes());
-        key.extend_from_slice(&entry_id.to_be_bytes());
-        key.extend_from_slice(name);
+        key.extend_from_slice(&cookie.to_be_bytes());
         Bytes::from(key)
     }
 
@@ -124,18 +128,26 @@ impl KeyCodec {
         prefix
     }
 
-    // Build a key for resuming dir scan from a specific entry
-    pub fn dir_scan_resume_key(dir_id: InodeId, resume_from: InodeId) -> Bytes {
+    /// Build a key for resuming dir scan from a specific cookie
+    pub fn dir_scan_resume_key(dir_id: InodeId, resume_after_cookie: u64) -> Bytes {
         let mut key = Self::dir_scan_prefix(dir_id);
-        key.extend_from_slice(&resume_from.to_be_bytes());
+        key.extend_from_slice(&(resume_after_cookie + 1).to_be_bytes());
         Bytes::from(key)
     }
 
-    // Build the end key for a directory scan range (next directory)
+    /// Build the end key for a directory scan range (next directory)
     pub fn dir_scan_end_key(dir_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE);
         key.push(u8::from(KeyPrefix::DirScan));
         key.extend_from_slice(&(dir_id + 1).to_be_bytes());
+        Bytes::from(key)
+    }
+
+    /// Key for storing next cookie counter per directory
+    pub fn dir_cookie_counter_key(dir_id: InodeId) -> Bytes {
+        let mut key = Vec::with_capacity(KEY_INODE_SIZE);
+        key.push(u8::from(KeyPrefix::DirCookie));
+        key.extend_from_slice(&dir_id.to_be_bytes());
         Bytes::from(key)
     }
 
@@ -165,11 +177,10 @@ impl KeyCodec {
         };
 
         match prefix {
-            KeyPrefix::DirScan if key.len() > KEY_CHUNK_SIZE => {
-                if let Ok(entry_bytes) = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into() {
-                    let entry_id = u64::from_be_bytes(entry_bytes);
-                    let name = key[KEY_CHUNK_SIZE..].to_vec();
-                    ParsedKey::DirScan { entry_id, name }
+            KeyPrefix::DirScan if key.len() == KEY_CHUNK_SIZE => {
+                if let Ok(cookie_bytes) = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into() {
+                    let cookie = u64::from_be_bytes(cookie_bytes);
+                    ParsedKey::DirScan { cookie }
                 } else {
                     ParsedKey::Unknown
                 }
@@ -187,6 +198,27 @@ impl KeyCodec {
         }
     }
 
+    /// Encode dir_scan value: (entry_id, name)
+    pub fn encode_dir_scan_value(entry_id: InodeId, name: &[u8]) -> Bytes {
+        let mut value = Vec::with_capacity(U64_SIZE + name.len());
+        value.extend_from_slice(&entry_id.to_le_bytes());
+        value.extend_from_slice(name);
+        Bytes::from(value)
+    }
+
+    /// Decode dir_scan value: (entry_id, name)
+    pub fn decode_dir_scan_value(data: &[u8]) -> Result<(InodeId, Vec<u8>), FsError> {
+        if data.len() < U64_SIZE {
+            return Err(FsError::InvalidData);
+        }
+        let entry_bytes: [u8; U64_SIZE] = data[..U64_SIZE]
+            .try_into()
+            .map_err(|_| FsError::InvalidData)?;
+        let entry_id = u64::from_le_bytes(entry_bytes);
+        let name = data[U64_SIZE..].to_vec();
+        Ok((entry_id, name))
+    }
+
     pub fn encode_counter(value: u64) -> Bytes {
         Bytes::copy_from_slice(&value.to_le_bytes())
     }
@@ -199,18 +231,27 @@ impl KeyCodec {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    pub fn encode_dir_entry(inode_id: InodeId) -> Bytes {
-        Bytes::copy_from_slice(&inode_id.to_le_bytes())
+    pub fn encode_dir_entry(inode_id: InodeId, cookie: u64) -> Bytes {
+        let mut value = Vec::with_capacity(U64_SIZE * 2);
+        value.extend_from_slice(&inode_id.to_le_bytes());
+        value.extend_from_slice(&cookie.to_le_bytes());
+        Bytes::from(value)
     }
 
-    pub fn decode_dir_entry(data: &[u8]) -> Result<InodeId, FsError> {
-        if data.len() < U64_SIZE {
+    pub fn decode_dir_entry(data: &[u8]) -> Result<(InodeId, u64), FsError> {
+        if data.len() < U64_SIZE * 2 {
             return Err(FsError::InvalidData);
         }
-        let bytes: [u8; U64_SIZE] = data[..U64_SIZE]
+        let inode_bytes: [u8; U64_SIZE] = data[..U64_SIZE]
             .try_into()
             .map_err(|_| FsError::InvalidData)?;
-        Ok(u64::from_le_bytes(bytes))
+        let cookie_bytes: [u8; U64_SIZE] = data[U64_SIZE..U64_SIZE * 2]
+            .try_into()
+            .map_err(|_| FsError::InvalidData)?;
+        Ok((
+            u64::from_le_bytes(inode_bytes),
+            u64::from_le_bytes(cookie_bytes),
+        ))
     }
 
     pub fn encode_tombstone_size(size: u64) -> Bytes {
@@ -240,20 +281,27 @@ mod tests {
     #[test]
     fn test_dir_scan_parsing() {
         let dir_id = 10u64;
-        let entry_id = 20u64;
-        let name = b"test_file.txt";
-        let key = KeyCodec::dir_scan_key(dir_id, entry_id, name);
+        let cookie = 42u64;
+        let key = KeyCodec::dir_scan_key(dir_id, cookie);
 
         match KeyCodec::parse_key(&key) {
             ParsedKey::DirScan {
-                entry_id: parsed_entry,
-                name: parsed_name,
+                cookie: parsed_cookie,
             } => {
-                assert_eq!(parsed_entry, entry_id);
-                assert_eq!(parsed_name, name);
+                assert_eq!(parsed_cookie, cookie);
             }
             _ => panic!("Failed to parse dir scan key"),
         }
+    }
+
+    #[test]
+    fn test_dir_scan_value_encoding() {
+        let entry_id = 20u64;
+        let name = b"test_file.txt";
+        let encoded = KeyCodec::encode_dir_scan_value(entry_id, name);
+        let (decoded_id, decoded_name) = KeyCodec::decode_dir_scan_value(&encoded).unwrap();
+        assert_eq!(decoded_id, entry_id);
+        assert_eq!(decoded_name, name);
     }
 
     #[test]
@@ -282,9 +330,11 @@ mod tests {
 
         // Test dir entry encoding
         let inode_id = 999u64;
-        let encoded = KeyCodec::encode_dir_entry(inode_id);
-        let decoded = KeyCodec::decode_dir_entry(&encoded).unwrap();
-        assert_eq!(decoded, inode_id);
+        let cookie = 42u64;
+        let encoded = KeyCodec::encode_dir_entry(inode_id, cookie);
+        let (decoded_id, decoded_cookie) = KeyCodec::decode_dir_entry(&encoded).unwrap();
+        assert_eq!(decoded_id, inode_id);
+        assert_eq!(decoded_cookie, cookie);
 
         // Test tombstone size encoding
         let size = 1024u64;

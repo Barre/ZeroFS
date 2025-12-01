@@ -1,7 +1,6 @@
 use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
 use crate::fs::permissions::Credentials;
-use crate::fs::store::inode::EncodedFileId;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -10,8 +9,6 @@ use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
-
-const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
 
 /// Adapter struct that implements the NFS trait for ZeroFS.
 /// This prevents accidental direct calls to NFS trait methods on ZeroFS.
@@ -42,31 +39,23 @@ impl NFSFileSystem for NFSAdapter {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let encoded_dirid = EncodedFileId::from(dirid);
-        let real_dirid = encoded_dirid.inode_id();
         debug!(
             "lookup called: dirid={}, filename={}",
-            real_dirid,
+            dirid,
             String::from_utf8_lossy(filename)
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
 
-        let inode_id = self.fs.lookup(&creds, real_dirid, filename).await?;
-        Ok(EncodedFileId::from_inode(inode_id)?.into())
+        let inode_id = self.fs.lookup(&creds, dirid, filename).await?;
+        Ok(inode_id)
     }
 
     async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
-        let encoded_id = EncodedFileId::from(id);
-        let real_id = encoded_id.inode_id();
-        let inode = self.fs.get_inode_cached(real_id).await?;
-        Ok(InodeWithId {
-            inode: &inode,
-            id: real_id,
-        }
-        .into())
+        let inode = self.fs.get_inode_cached(id).await?;
+        Ok(InodeWithId { inode: &inode, id }.into())
     }
 
     async fn read(
@@ -77,10 +66,9 @@ impl NFSFileSystem for NFSAdapter {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         debug!("read called: id={}, offset={}, count={}", id, offset, count);
-        let real_id = EncodedFileId::from(id).inode_id();
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         self.fs
-            .read_file(&auth_ctx, real_id, offset, count)
+            .read_file(&auth_ctx, id, offset, count)
             .await
             .map(|(data, eof)| (data.to_vec(), eof))
             .map_err(|e| e.into())
@@ -93,20 +81,17 @@ impl NFSFileSystem for NFSAdapter {
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsstat3> {
-        let real_id = EncodedFileId::from(id).inode_id();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
             data.len(),
-            real_id,
+            id,
             offset
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let data_bytes = bytes::Bytes::copy_from_slice(data);
-        let file_attrs: crate::fs::types::FileAttributes = self
-            .fs
-            .write(&auth_ctx, real_id, offset, &data_bytes)
-            .await?;
+        let file_attrs: crate::fs::types::FileAttributes =
+            self.fs.write(&auth_ctx, id, offset, &data_bytes).await?;
         Ok((&file_attrs).into())
     }
 
@@ -117,11 +102,9 @@ impl NFSFileSystem for NFSAdapter {
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
-
         debug!(
             "create called: dirid={}, filename={}",
-            real_dirid,
+            dirid,
             String::from_utf8_lossy(filename)
         );
 
@@ -129,13 +112,10 @@ impl NFSFileSystem for NFSAdapter {
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(attr);
 
-        let (id, file_attrs): (u64, crate::fs::types::FileAttributes) = self
-            .fs
-            .create(&creds, real_dirid, filename, &fs_attr)
-            .await?;
+        let (id, file_attrs): (u64, crate::fs::types::FileAttributes) =
+            self.fs.create(&creds, dirid, filename, &fs_attr).await?;
 
-        let fattr: fattr3 = (&file_attrs).into();
-        Ok((EncodedFileId::from_inode(id)?.into(), fattr))
+        Ok((id, (&file_attrs).into()))
     }
 
     async fn create_exclusive(
@@ -144,19 +124,17 @@ impl NFSFileSystem for NFSAdapter {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
-
         debug!(
             "create_exclusive called: dirid={}, filename={:?}",
-            real_dirid, filename
+            dirid, filename
         );
 
         let id = self
             .fs
-            .create_exclusive(&auth.into(), real_dirid, filename)
+            .create_exclusive(&auth.into(), dirid, filename)
             .await?;
 
-        Ok(EncodedFileId::from_inode(id)?.into())
+        Ok(id)
     }
 
     async fn mkdir(
@@ -166,11 +144,9 @@ impl NFSFileSystem for NFSAdapter {
         dirname: &filename3,
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
-
         debug!(
             "mkdir called: dirid={}, dirname={}",
-            real_dirid,
+            dirid,
             String::from_utf8_lossy(dirname)
         );
 
@@ -178,8 +154,8 @@ impl NFSFileSystem for NFSAdapter {
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs): (u64, crate::fs::types::FileAttributes) =
-            self.fs.mkdir(&creds, real_dirid, dirname, &fs_attr).await?;
-        Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
+            self.fs.mkdir(&creds, dirid, dirname, &fs_attr).await?;
+        Ok((id, (&file_attrs).into()))
     }
 
     async fn remove(
@@ -188,15 +164,10 @@ impl NFSFileSystem for NFSAdapter {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
-
-        debug!(
-            "remove called: dirid={}, filename={:?}",
-            real_dirid, filename
-        );
+        debug!("remove called: dirid={}, filename={:?}", dirid, filename);
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
-        Ok(self.fs.remove(&auth_ctx, real_dirid, filename).await?)
+        Ok(self.fs.remove(&auth_ctx, dirid, filename).await?)
     }
 
     async fn rename(
@@ -207,20 +178,17 @@ impl NFSFileSystem for NFSAdapter {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        let real_from_dirid = EncodedFileId::from(from_dirid).inode_id();
-        let real_to_dirid = EncodedFileId::from(to_dirid).inode_id();
-
         debug!(
             "rename called: from_dirid={}, to_dirid={}",
-            real_from_dirid, real_to_dirid
+            from_dirid, to_dirid
         );
 
         self.fs
             .rename(
                 &auth.into(),
-                real_from_dirid,
+                from_dirid,
                 from_filename,
-                real_to_dirid,
+                to_dirid,
                 to_filename,
             )
             .await
@@ -234,19 +202,16 @@ impl NFSFileSystem for NFSAdapter {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<zerofs_nfsserve::vfs::ReadDirResult, nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
-
         debug!(
             "readdir called: dirid={}, start_after={}, max_entries={}",
-            real_dirid, start_after, max_entries
+            dirid, start_after, max_entries
         );
 
         let result = self
             .fs
-            .readdir(&auth.into(), real_dirid, start_after, max_entries)
+            .readdir(&auth.into(), dirid, start_after, max_entries)
             .await?;
 
-        // Convert our ReadDirResult to NFS ReadDirResult
         Ok(zerofs_nfsserve::vfs::ReadDirResult {
             entries: result
                 .entries
@@ -255,6 +220,7 @@ impl NFSFileSystem for NFSAdapter {
                     fileid: e.fileid,
                     name: e.name.into(),
                     attr: (&e.attr).into(),
+                    cookie: e.cookie,
                 })
                 .collect(),
             end: result.end,
@@ -267,14 +233,12 @@ impl NFSFileSystem for NFSAdapter {
         id: fileid3,
         setattr: sattr3,
     ) -> Result<fattr3, nfsstat3> {
-        let real_id = EncodedFileId::from(id).inode_id();
-
-        debug!("setattr called: id={}, setattr={:?}", real_id, setattr);
+        debug!("setattr called: id={}, setattr={:?}", id, setattr);
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
         let creds = Credentials::from_auth_context(&auth_ctx);
         let fs_attr = SetAttributes::from(setattr);
-        let file_attrs = self.fs.setattr(&creds, real_id, &fs_attr).await?;
+        let file_attrs = self.fs.setattr(&creds, id, &fs_attr).await?;
         Ok((&file_attrs).into())
     }
 
@@ -286,11 +250,9 @@ impl NFSFileSystem for NFSAdapter {
         symlink: &nfspath3,
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
-
         debug!(
             "symlink called: dirid={}, linkname={:?}, target={:?}",
-            real_dirid, linkname, symlink
+            dirid, linkname, symlink
         );
 
         let auth_ctx: crate::fs::types::AuthContext = auth.into();
@@ -298,18 +260,17 @@ impl NFSFileSystem for NFSAdapter {
         let fs_attr = SetAttributes::from(*attr);
         let (id, file_attrs) = self
             .fs
-            .symlink(&creds, real_dirid, &linkname.0, &symlink.0, &fs_attr)
+            .symlink(&creds, dirid, &linkname.0, &symlink.0, &fs_attr)
             .await
             .map_err(|e: crate::fs::errors::FsError| -> nfsstat3 { e.into() })?;
 
-        Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
+        Ok((id, (&file_attrs).into()))
     }
 
     async fn readlink(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         debug!("readlink called: id={}", id);
-        let real_id = EncodedFileId::from(id).inode_id();
 
-        let inode = self.fs.get_inode_cached(real_id).await?;
+        let inode = self.fs.get_inode_cached(id).await?;
 
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),
@@ -326,10 +287,9 @@ impl NFSFileSystem for NFSAdapter {
         attr: &sattr3,
         spec: Option<&specdata3>,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let real_dirid = EncodedFileId::from(dirid).inode_id();
         debug!(
             "mknod called: dirid={}, filename={:?}, ftype={:?}",
-            real_dirid, filename, ftype
+            dirid, filename, ftype
         );
 
         let rdev = match ftype {
@@ -343,10 +303,10 @@ impl NFSFileSystem for NFSAdapter {
         let fs_type = FileType::from(ftype);
         let (id, file_attrs) = self
             .fs
-            .mknod(&creds, real_dirid, &filename.0, fs_type, &fs_attr, rdev)
+            .mknod(&creds, dirid, &filename.0, fs_type, &fs_attr, rdev)
             .await?;
 
-        Ok((EncodedFileId::from_inode(id)?.into(), (&file_attrs).into()))
+        Ok((id, (&file_attrs).into()))
     }
 
     async fn link(
@@ -356,16 +316,14 @@ impl NFSFileSystem for NFSAdapter {
         linkdirid: fileid3,
         linkname: &filename3,
     ) -> Result<(), nfsstat3> {
-        let real_fileid = EncodedFileId::from(fileid).inode_id();
-        let real_linkdirid = EncodedFileId::from(linkdirid).inode_id();
         debug!(
             "link called: fileid={}, linkdirid={}, linkname={:?}",
-            real_fileid, real_linkdirid, linkname
+            fileid, linkdirid, linkname
         );
 
         Ok(self
             .fs
-            .link(&auth.into(), real_fileid, real_linkdirid, &linkname.0)
+            .link(&auth.into(), fileid, linkdirid, &linkname.0)
             .await?)
     }
 
@@ -376,32 +334,28 @@ impl NFSFileSystem for NFSAdapter {
         offset: u64,
         count: u32,
     ) -> Result<writeverf3, nfsstat3> {
-        let real_fileid = EncodedFileId::from(fileid).inode_id();
-
         tracing::debug!(
             "commit called: fileid={}, offset={}, count={}",
-            real_fileid,
+            fileid,
             offset,
             count
         );
 
         match self.fs.flush_coordinator.flush().await {
             Ok(_) => {
-                debug!("commit successful for file {}", real_fileid);
+                debug!("commit successful for file {}", fileid);
                 Ok(self.serverid())
             }
             Err(fs_error) => {
                 let nfsstat: nfsstat3 = fs_error.into();
-                tracing::error!("commit failed for file {}: {:?}", real_fileid, nfsstat);
+                tracing::error!("commit failed for file {}: {:?}", fileid, nfsstat);
                 Err(nfsstat)
             }
         }
     }
 
     async fn fsstat(&self, auth: &NfsAuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
-        let real_fileid = EncodedFileId::from(fileid).inode_id();
-
-        debug!("fsstat called: fileid={}", real_fileid);
+        debug!("fsstat called: fileid={}", fileid);
 
         let obj_attr = match self.getattr(auth, fileid).await {
             Ok(v) => post_op_attr::attributes(v),
@@ -410,15 +364,8 @@ impl NFSFileSystem for NFSAdapter {
 
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
 
-        // Get the next inode ID to determine how many more IDs can be allocated
         let next_inode_id = self.fs.inode_store.next_id();
-
-        // Available inodes = total possible inodes - allocated inode IDs
-        // This represents how many more inodes can be created (never increases since IDs aren't reused)
-        let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
-
-        // Total inodes for NFS = currently used + available to allocate
-        // This will be less than TOTAL_INODES if some allocated IDs have been freed
+        let available_inodes = u64::MAX.saturating_sub(next_inode_id);
         let total_inodes = used_inodes + available_inodes;
 
         // Use configured max_bytes from filesystem config
@@ -806,21 +753,21 @@ mod tests {
 
         for page_size in page_sizes {
             let mut all_entries = Vec::new();
-            let mut last_fileid = 0;
+            let mut last_cookie = 0u64;
             let mut iterations = 0;
 
             loop {
                 let result = fs
-                    .readdir(&test_auth(), 0, last_fileid, page_size)
+                    .readdir(&test_auth(), 0, last_cookie, page_size)
                     .await
                     .unwrap();
 
                 // Skip . and .. if we're at the beginning
-                let start_idx = if last_fileid == 0 { 2 } else { 0 };
+                let start_idx = if last_cookie == 0 { 2 } else { 0 };
 
                 for entry in &result.entries[start_idx..] {
                     all_entries.push(String::from_utf8_lossy(&entry.name).to_string());
-                    last_fileid = entry.fileid;
+                    last_cookie = entry.cookie;
                 }
 
                 iterations += 1;
@@ -890,28 +837,27 @@ mod tests {
 
         // Test pagination - should handle all entries correctly
         let mut all_entries = Vec::new();
-        let mut last_fileid = 0;
+        let mut last_cookie = 0u64;
         let page_size = 20;
 
         loop {
             let result = fs
-                .readdir(&test_auth(), 0, last_fileid, page_size)
+                .readdir(&test_auth(), 0, last_cookie, page_size)
                 .await
                 .unwrap();
 
-            let start_idx = if last_fileid == 0 { 2 } else { 0 };
+            let start_idx = if last_cookie == 0 { 2 } else { 0 };
 
             for entry in &result.entries[start_idx..] {
                 let name = String::from_utf8_lossy(&entry.name).to_string();
                 all_entries.push(name);
 
-                // Verify encoded fileid can be decoded properly
-                let encoded_id = EncodedFileId::from(entry.fileid);
-                let (real_inode, position) = encoded_id.decode();
-                assert!(real_inode > 0);
-                assert!(position < 65535); // Should be within u16 range
+                // With stable cookies, fileid is the raw inode
+                assert!(entry.fileid > 0);
+                // cookie is used for pagination
+                assert!(entry.cookie > 0);
 
-                last_fileid = entry.fileid;
+                last_cookie = entry.cookie;
             }
 
             if result.end {
@@ -993,19 +939,18 @@ mod tests {
         assert_eq!(result1.entries.len(), 5);
         assert!(!result1.end);
 
-        let last_id = result1.entries.last().unwrap().fileid;
+        let last_cookie = result1.entries.last().unwrap().cookie;
         let result2 = fs
-            .readdir(&test_auth(), exact_dir, last_id, 5)
+            .readdir(&test_auth(), exact_dir, last_cookie, 5)
             .await
             .unwrap();
         assert_eq!(result2.entries.len(), 5);
         assert!(result2.end);
 
-        // Test 4: Resume from non-existent cookie (should fail)
-        let fake_cookie = EncodedFileId::new(999999, 0).unwrap().as_raw();
-        let _result = fs.readdir(&test_auth(), 0, fake_cookie, 10).await;
-        // This should work but return no entries (or few entries if the inode exists)
-        // The implementation continues scanning from the encoded position
+        // Test 4: Resume from non-existent cookie (should return no entries)
+        let fake_cookie = 999999u64;
+        let result = fs.readdir(&test_auth(), 0, fake_cookie, 10).await.unwrap();
+        assert!(result.entries.is_empty() || result.end);
     }
 
     #[tokio::test]
@@ -1031,15 +976,15 @@ mod tests {
 
         let handle1 = tokio::spawn(async move {
             let mut entries = Vec::new();
-            let mut last_id = 0;
+            let mut last_cookie = 0u64;
 
             loop {
-                let result = fs1.readdir(&test_auth(), 0, last_id, 5).await.unwrap();
+                let result = fs1.readdir(&test_auth(), 0, last_cookie, 5).await.unwrap();
                 for entry in &result.entries {
                     if entry.name.0 != b"." && entry.name.0 != b".." {
                         entries.push(String::from_utf8_lossy(&entry.name).to_string());
                     }
-                    last_id = entry.fileid;
+                    last_cookie = entry.cookie;
                 }
                 if result.end {
                     break;
@@ -1050,15 +995,15 @@ mod tests {
 
         let handle2 = tokio::spawn(async move {
             let mut entries = Vec::new();
-            let mut last_id = 0;
+            let mut last_cookie = 0u64;
 
             loop {
-                let result = fs2.readdir(&test_auth(), 0, last_id, 7).await.unwrap();
+                let result = fs2.readdir(&test_auth(), 0, last_cookie, 7).await.unwrap();
                 for entry in &result.entries {
                     if entry.name.0 != b"." && entry.name.0 != b".." {
                         entries.push(String::from_utf8_lossy(&entry.name).to_string());
                     }
-                    last_id = entry.fileid;
+                    last_cookie = entry.cookie;
                 }
                 if result.end {
                     break;

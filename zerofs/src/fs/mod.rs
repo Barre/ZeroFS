@@ -33,7 +33,7 @@ use self::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, check_sticky_bit_delete,
     validate_mode,
 };
-use self::store::inode::{EncodedFileId, MAX_HARDLINKS_PER_INODE};
+use self::store::inode::MAX_HARDLINKS_PER_INODE;
 use self::types::{
     AuthContext, DirEntry, FileAttributes, FileType, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetSize, SetTime, SetUid,
@@ -525,7 +525,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
-                let file_id = self.inode_store.allocate()?;
+                let file_id = self.inode_store.allocate();
                 debug!(
                     "Allocated inode {} for file {}",
                     file_id,
@@ -561,10 +561,15 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
+                let cookie = self
+                    .directory_store
+                    .allocate_cookie(dirid, &mut txn)
+                    .await?;
 
                 self.inode_store
                     .save(&mut txn, file_id, &Inode::File(file_inode.clone()))?;
-                self.directory_store.add(&mut txn, dirid, name, file_id);
+                self.directory_store
+                    .add(&mut txn, dirid, name, file_id, cookie);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -796,7 +801,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
-                let new_dir_id = self.inode_store.allocate()?;
+                let new_dir_id = self.inode_store.allocate();
 
                 let (now_sec, now_nsec) = get_current_time();
 
@@ -852,13 +857,18 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
+                let cookie = self
+                    .directory_store
+                    .allocate_cookie(dirid, &mut txn)
+                    .await?;
 
                 self.inode_store.save(
                     &mut txn,
                     new_dir_id,
                     &Inode::Directory(new_dir_inode.clone()),
                 )?;
-                self.directory_store.add(&mut txn, dirid, name, new_dir_id);
+                self.directory_store
+                    .add(&mut txn, dirid, name, new_dir_id, cookie);
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -907,42 +917,32 @@ impl ZeroFS {
         start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
-        debug!(
-            "readdir: dirid={}, start_after={}, max_entries={}",
-            dirid, start_after, max_entries
-        );
-
         let dir_inode = self.get_inode_cached(dirid).await?;
 
         let creds = Credentials::from_auth_context(auth);
         check_access(&dir_inode, &creds, AccessMode::Read)?;
 
+        use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};
+
         match &dir_inode {
             Inode::Directory(dir) => {
                 let mut entries = Vec::new();
-                let mut inode_positions = std::collections::HashMap::new();
 
-                let (start_inode, start_position) = if start_after == 0 {
-                    (0, 0)
-                } else {
-                    EncodedFileId::from(start_after).decode()
-                };
-
-                let skip_special = start_after != 0;
-
-                if !skip_special {
-                    debug!("readdir: adding . entry for current directory");
+                // Handle . and .. based on start_after cookie
+                if start_after < COOKIE_DOT {
                     entries.push(DirEntry {
-                        fileid: EncodedFileId::new(dirid, 0)?.as_raw(),
+                        fileid: dirid,
                         name: b".".to_vec(),
                         attr: InodeWithId {
                             inode: &dir_inode,
                             id: dirid,
                         }
                         .into(),
+                        cookie: COOKIE_DOT,
                     });
+                }
 
-                    debug!("readdir: adding .. entry for parent directory");
+                if start_after < COOKIE_DOTDOT {
                     let parent_id = if dirid == 0 { 0 } else { dir.parent };
                     let parent_attr = if parent_id == dirid {
                         InodeWithId {
@@ -965,74 +965,50 @@ impl ZeroFS {
                         }
                     };
                     entries.push(DirEntry {
-                        fileid: EncodedFileId::new(parent_id, 0)?.as_raw(),
+                        fileid: parent_id,
                         name: b"..".to_vec(),
                         attr: parent_attr,
+                        cookie: COOKIE_DOTDOT,
                     });
                 }
 
-                let iter = if start_after == 0 {
+                // Get regular entries, starting after the given cookie
+                let iter = if start_after < COOKIE_DOTDOT {
                     self.directory_store.list(dirid).await?
                 } else {
-                    self.directory_store.list_from(dirid, start_inode).await?
+                    self.directory_store.list_from(dirid, start_after).await?
                 };
                 pin_mut!(iter);
 
                 let mut dir_entries = Vec::new();
-                let mut resuming = start_after != 0;
                 let mut has_more = false;
 
                 while let Some(result) = iter.next().await {
                     if dir_entries.len() >= max_entries - entries.len() {
-                        debug!("readdir: reached max_entries limit, found one more entry");
                         has_more = true;
                         break;
                     }
-
                     let entry = result?;
-                    let inode_id = entry.inode_id;
-                    let filename = entry.name;
-
-                    if resuming {
-                        if inode_id == start_inode {
-                            let pos = inode_positions.entry(inode_id).or_insert(0);
-                            if *pos <= start_position {
-                                *pos += 1;
-                                continue;
-                            }
-                        } else if inode_id < start_inode {
-                            continue;
-                        }
-                        resuming = false;
-                    }
-
-                    debug!(
-                        "readdir: found entry {} (inode {})",
-                        String::from_utf8_lossy(&filename),
-                        inode_id
-                    );
-                    dir_entries.push((inode_id, filename));
+                    dir_entries.push((entry.inode_id, entry.name, entry.cookie));
                 }
 
                 const BUFFER_SIZE: usize = 256;
 
-                let inode_futures =
-                    stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
-                        debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
+                let inode_futures = stream::iter(dir_entries.into_iter()).map(
+                    |(inode_id, name, cookie)| async move {
                         match self.get_inode_cached(inode_id).await {
-                            Ok(inode) => {
-                                debug!("readdir: loaded inode {} successfully", inode_id);
-                                Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))
-                            }
+                            Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
                             Err(e) => {
                                 tracing::error!(
-                                    "readdir: skipping entry '{}' (inode {}) due to error: {:?}. Database may be corrupted.",
-                                    String::from_utf8_lossy(&name), inode_id, e
+                                    "readdir: skipping entry (inode {}) due to error: {:?}",
+                                    inode_id,
+                                    e
                                 );
                                 Ok(None)
                             }
                         }
-                    });
+                    },
+                );
 
                 let loaded_entries: Vec<_> = inode_futures
                     .buffered(BUFFER_SIZE)
@@ -1044,36 +1020,26 @@ impl ZeroFS {
                     .flatten()
                     .collect();
 
-                for (inode_id, name, inode) in loaded_entries {
-                    let position = inode_positions.entry(inode_id).or_insert(0);
-                    let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
-                    *position += 1;
-
+                for (inode_id, name, inode, cookie) in loaded_entries {
                     entries.push(DirEntry {
-                        fileid: encoded_id,
+                        fileid: inode_id,
                         name,
                         attr: InodeWithId {
                             inode: &inode,
                             id: inode_id,
                         }
                         .into(),
+                        cookie,
                     });
-                    debug!("readdir: added entry with encoded id {}", encoded_id);
                 }
-
-                let end = !has_more;
-
-                let result = ReadDirResult { end, entries };
-                debug!(
-                    "readdir: returning {} entries, end={}",
-                    result.entries.len(),
-                    result.end
-                );
 
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
-                Ok(result)
+                Ok(ReadDirResult {
+                    entries,
+                    end: !has_more,
+                })
             }
             _ => Err(FsError::NotDirectory),
         }
@@ -1116,7 +1082,7 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
-        let new_id = self.inode_store.allocate()?;
+        let new_id = self.inode_store.allocate();
 
         let mode = match &attr.mode {
             SetMode::Set(m) => *m | 0o120000,
@@ -1150,9 +1116,14 @@ impl ZeroFS {
         });
 
         let mut txn = self.db.new_transaction()?;
+        let cookie = self
+            .directory_store
+            .allocate_cookie(dirid, &mut txn)
+            .await?;
 
         self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
-        self.directory_store.add(&mut txn, dirid, linkname, new_id);
+        self.directory_store
+            .add(&mut txn, dirid, linkname, new_id, cookie);
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -1235,13 +1206,17 @@ impl ZeroFS {
         }
 
         let mut txn = self.db.new_transaction()?;
+        let cookie = self
+            .directory_store
+            .allocate_cookie(linkdirid, &mut txn)
+            .await?;
         self.directory_store
-            .add(&mut txn, linkdirid, linkname, fileid);
+            .add(&mut txn, linkdirid, linkname, fileid, cookie);
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
             Inode::File(file) => {
-                if file.nlink >= MAX_HARDLINKS_PER_INODE {
+                if file.nlink == MAX_HARDLINKS_PER_INODE {
                     return Err(FsError::TooManyLinks);
                 }
                 file.nlink += 1;
@@ -1256,7 +1231,7 @@ impl ZeroFS {
             | Inode::Socket(special)
             | Inode::CharDevice(special)
             | Inode::BlockDevice(special) => {
-                if special.nlink >= MAX_HARDLINKS_PER_INODE {
+                if special.nlink == MAX_HARDLINKS_PER_INODE {
                     return Err(FsError::TooManyLinks);
                 }
                 special.nlink += 1;
@@ -1725,7 +1700,7 @@ impl ZeroFS {
                     return Err(FsError::Exists);
                 }
 
-                let special_id = self.inode_store.allocate()?;
+                let special_id = self.inode_store.allocate();
                 let (now_sec, now_nsec) = get_current_time();
 
                 let base_mode = match ftype {
@@ -1771,9 +1746,14 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
+                let cookie = self
+                    .directory_store
+                    .allocate_cookie(dirid, &mut txn)
+                    .await?;
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
-                self.directory_store.add(&mut txn, dirid, name, special_id);
+                self.directory_store
+                    .add(&mut txn, dirid, name, special_id, cookie);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -1817,7 +1797,10 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        let file_id = self.directory_store.get(dirid, name).await?;
+        let (file_id, cookie) = self
+            .directory_store
+            .get_entry_with_cookie(dirid, name)
+            .await?;
 
         let _guards = self
             .lock_manager
@@ -1834,8 +1817,11 @@ impl ZeroFS {
         }
 
         // Re-check inside lock to verify entry still points to same inode
-        let verified_id = self.directory_store.get(dirid, name).await?;
-        if verified_id != file_id {
+        let (verified_id, verified_cookie) = self
+            .directory_store
+            .get_entry_with_cookie(dirid, name)
+            .await?;
+        if verified_id != file_id || verified_cookie != cookie {
             return Err(FsError::NotFound);
         }
 
@@ -1911,7 +1897,7 @@ impl ZeroFS {
                     }
                 }
 
-                self.directory_store.remove(&mut txn, dirid, name, file_id);
+                self.directory_store.remove(&mut txn, dirid, name, cookie);
 
                 dir.entry_count = dir.entry_count.saturating_sub(1);
                 dir.mtime = now_sec;
@@ -2006,17 +1992,25 @@ impl ZeroFS {
         let creds = Credentials::from_auth_context(auth);
 
         // Look up all inode IDs without holding any locks
-        let source_inode_id = self.directory_store.get(from_dirid, from_name).await?;
+        let (source_inode_id, source_cookie) = self
+            .directory_store
+            .get_entry_with_cookie(from_dirid, from_name)
+            .await?;
 
         if to_dirid == source_inode_id {
             return Err(FsError::InvalidArgument);
         }
 
-        let target_inode_id = match self.directory_store.get(to_dirid, to_name).await {
-            Ok(id) => Some(id),
+        let target_entry = match self
+            .directory_store
+            .get_entry_with_cookie(to_dirid, to_name)
+            .await
+        {
+            Ok((id, cookie)) => Some((id, cookie)),
             Err(FsError::NotFound) => None,
             Err(e) => return Err(e),
         };
+        let target_inode_id = target_entry.map(|(id, _)| id);
 
         let mut all_inodes_to_lock = vec![from_dirid, source_inode_id];
         if from_dirid != to_dirid {
@@ -2032,19 +2026,27 @@ impl ZeroFS {
             .await;
 
         // Re-verify inside lock that entries still point to same inodes
-        let verified_source_id = self.directory_store.get(from_dirid, from_name).await?;
-        if verified_source_id != source_inode_id {
+        let (verified_source_id, verified_source_cookie) = self
+            .directory_store
+            .get_entry_with_cookie(from_dirid, from_name)
+            .await?;
+        if verified_source_id != source_inode_id || verified_source_cookie != source_cookie {
             return Err(FsError::StaleHandle);
         }
 
-        let verified_target_id = match self.directory_store.get(to_dirid, to_name).await {
-            Ok(id) => Some(id),
+        let verified_target_entry = match self
+            .directory_store
+            .get_entry_with_cookie(to_dirid, to_name)
+            .await
+        {
+            Ok((id, cookie)) => Some((id, cookie)),
             Err(FsError::NotFound) => None,
             Err(e) => return Err(e),
         };
-        if verified_target_id != target_inode_id {
+        if verified_target_entry.map(|(id, _)| id) != target_inode_id {
             return Err(FsError::StaleHandle);
         }
+        let target_cookie = verified_target_entry.map(|(_, cookie)| cookie);
 
         let mut source_inode = self.get_inode_cached(source_inode_id).await?;
         if matches!(source_inode, Inode::Directory(_))
@@ -2196,13 +2198,17 @@ impl ZeroFS {
             }
 
             self.directory_store
-                .remove(&mut txn, to_dirid, to_name, target_id);
+                .remove(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         }
 
         self.directory_store
-            .remove(&mut txn, from_dirid, from_name, source_inode_id);
+            .remove(&mut txn, from_dirid, from_name, source_cookie);
+        let new_cookie = self
+            .directory_store
+            .allocate_cookie(to_dirid, &mut txn)
+            .await?;
         self.directory_store
-            .add(&mut txn, to_dirid, to_name, source_inode_id);
+            .add(&mut txn, to_dirid, to_name, source_inode_id, new_cookie);
 
         if from_dirid != to_dirid {
             match &mut source_inode {
@@ -2334,7 +2340,6 @@ impl ZeroFS {
 mod tests {
     use super::*;
     use crate::fs::inode::FileInode;
-    use crate::fs::store::inode::{MAX_HARDLINKS_PER_INODE, MAX_INODE_ID};
     use crate::test_helpers::test_helpers_mod::test_auth;
 
     fn test_creds() -> Credentials {
@@ -2362,9 +2367,9 @@ mod tests {
     async fn test_allocate_inode() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
-        let inode1 = fs.inode_store.allocate().unwrap();
-        let inode2 = fs.inode_store.allocate().unwrap();
-        let inode3 = fs.inode_store.allocate().unwrap();
+        let inode1 = fs.inode_store.allocate();
+        let inode2 = fs.inode_store.allocate();
+        let inode3 = fs.inode_store.allocate();
 
         assert_ne!(inode1, 0);
         assert_ne!(inode2, 0);
@@ -2394,7 +2399,7 @@ mod tests {
         };
 
         let inode = Inode::File(file_inode.clone());
-        let inode_id = fs.inode_store.allocate().unwrap();
+        let inode_id = fs.inode_store.allocate();
 
         let mut txn = fs.db.new_transaction().unwrap();
         fs.inode_store.save(&mut txn, inode_id, &inode).unwrap();
@@ -2464,21 +2469,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_inode_id_limit() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
-
-        fs.inode_store.set_next_id_for_testing(MAX_INODE_ID);
-
-        let id = fs.inode_store.allocate().unwrap();
-        assert_eq!(id, MAX_INODE_ID);
-
-        let result = fs.inode_store.allocate();
-        assert!(matches!(result, Err(FsError::NoSpace)));
-
-        assert!(fs.inode_store.next_id() > MAX_INODE_ID);
-    }
-
-    #[tokio::test]
     async fn test_read_only_mode_operations() {
         use slatedb::DbBuilder;
         use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
@@ -2519,7 +2509,7 @@ mod tests {
         .await
         .unwrap();
 
-        let test_inode_id = fs_rw.inode_store.allocate().unwrap();
+        let test_inode_id = fs_rw.inode_store.allocate();
         let file_inode = FileInode {
             size: 2048,
             mtime: 1234567890,
@@ -3323,7 +3313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_readdir_encoding_with_hardlinks() {
+    async fn test_readdir_with_hardlinks_stable_cookies() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         // Create files with hardlinks
@@ -3341,7 +3331,7 @@ mod tests {
             .unwrap();
 
         // Create another file
-        let (_file2_id, _) = fs
+        let (file2_id, _) = fs
             .create(&test_creds(), 0, b"file2.txt", &SetAttributes::default())
             .await
             .unwrap();
@@ -3350,25 +3340,26 @@ mod tests {
         let result1 = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
         assert_eq!(result1.entries.len(), 6); // . .. file1.txt hardlink1.txt hardlink2.txt file2.txt
 
-        // Check that hardlinks have different encoded fileids
-        let file1_encoded = result1.entries[2].fileid;
-        let hardlink1_encoded = result1.entries[3].fileid;
-        let hardlink2_encoded = result1.entries[4].fileid;
+        // With stable cookies, hardlinks have the SAME fileid (raw inode) but DIFFERENT cookies
+        let file1_entry = &result1.entries[2];
+        let hardlink1_entry = &result1.entries[3];
+        let hardlink2_entry = &result1.entries[4];
+        let file2_entry = &result1.entries[5];
 
-        // Decode to verify they point to the same inode
-        let (file1_inode, file1_pos) = EncodedFileId::from(file1_encoded).decode();
-        let (hardlink1_inode, hardlink1_pos) = EncodedFileId::from(hardlink1_encoded).decode();
-        let (hardlink2_inode, hardlink2_pos) = EncodedFileId::from(hardlink2_encoded).decode();
+        // All hardlinks point to the same inode
+        assert_eq!(file1_entry.fileid, file1_id);
+        assert_eq!(hardlink1_entry.fileid, file1_id);
+        assert_eq!(hardlink2_entry.fileid, file1_id);
+        assert_eq!(file2_entry.fileid, file2_id);
 
-        assert_eq!(file1_inode, hardlink1_inode);
-        assert_eq!(file1_inode, hardlink2_inode);
-        assert_eq!(file1_pos, 0);
-        assert_eq!(hardlink1_pos, 1);
-        assert_eq!(hardlink2_pos, 2);
+        // Cookies are unique and stable for pagination
+        assert_ne!(file1_entry.cookie, hardlink1_entry.cookie);
+        assert_ne!(hardlink1_entry.cookie, hardlink2_entry.cookie);
+        assert_ne!(hardlink2_entry.cookie, file2_entry.cookie);
 
-        // Test pagination - start after the first hardlink
+        // Test pagination using cookies - start after the first hardlink
         let result2 = fs
-            .readdir(&(&test_auth()).into(), 0, hardlink1_encoded, 10)
+            .readdir(&(&test_auth()).into(), 0, hardlink1_entry.cookie, 10)
             .await
             .unwrap();
         assert_eq!(result2.entries.len(), 2); // hardlink2.txt file2.txt

@@ -12,7 +12,6 @@ use super::protocol::{
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
-use crate::fs::store::inode::EncodedFileId;
 use crate::fs::types::AuthContext;
 use bytes::BytesMut;
 use deku::prelude::*;
@@ -186,13 +185,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 continue;
             }
 
-            let encoded_id = EncodedFileId::from(entry.fileid);
-            let real_id = encoded_id.inode_id();
-
             let inode = self
                 .filesystem
                 .inode_store
-                .get(real_id)
+                .get(entry.fileid)
                 .await
                 .map_err(|e| {
                     NBDError::Io(std::io::Error::other(format!(

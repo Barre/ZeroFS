@@ -428,7 +428,7 @@ impl NinePHandler {
 
                     for entry in result.entries {
                         if entry.name == b"." || entry.name == b".." {
-                            cookie = entry.fileid;
+                            cookie = entry.cookie;
                             continue;
                         }
 
@@ -444,7 +444,7 @@ impl NinePHandler {
                             current_offset += 1;
                         }
 
-                        cookie = entry.fileid;
+                        cookie = entry.cookie;
                     }
 
                     if was_end {
