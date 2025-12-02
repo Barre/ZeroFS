@@ -56,7 +56,7 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 256 * 1024;
+pub const CHUNK_SIZE: usize = 32 * 1024;
 pub const STATS_SHARDS: usize = 100;
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 pub const NAME_MAX: usize = 255;
