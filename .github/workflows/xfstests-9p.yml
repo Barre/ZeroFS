@@ -171,6 +171,7 @@ jobs:
           generic/696
           generic/591
           generic/615
+          generic/525
           EOF
 
       - name: Run xfstests
