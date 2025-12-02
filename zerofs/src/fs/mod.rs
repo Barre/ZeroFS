@@ -439,7 +439,7 @@ impl ZeroFS {
 
                 let mut txn = self.db.new_transaction()?;
 
-                self.chunk_store.write(&mut txn, id, offset, data).await;
+                self.chunk_store.write(&mut txn, id, offset, data).await?;
 
                 file.size = new_size;
                 let (now_sec, now_nsec) = get_current_time();
@@ -650,7 +650,7 @@ impl ZeroFS {
                 }
 
                 let read_len = std::cmp::min(count as u64, file.size - offset);
-                let result_bytes = self.chunk_store.read(id, offset, read_len).await;
+                let result_bytes = self.chunk_store.read(id, offset, read_len).await?;
                 let eof = offset + read_len >= file.size;
 
                 self.stats
@@ -1359,7 +1359,7 @@ impl ZeroFS {
 
                         self.chunk_store
                             .truncate(&mut txn, id, old_size, new_size)
-                            .await;
+                            .await?;
 
                         self.inode_store.save(&mut txn, id, &inode)?;
 

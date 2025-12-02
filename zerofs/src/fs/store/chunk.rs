@@ -1,13 +1,14 @@
 use crate::encryption::{EncryptedDb, EncryptedTransaction};
-use crate::fs::CHUNK_SIZE;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
+use crate::fs::{CHUNK_SIZE, FsError};
 use bytes::{Bytes, BytesMut};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::error;
 
-const PARALLEL_CHUNK_OPS: usize = 1024;
+const PARALLEL_CHUNK_OPS: usize = 20;
 const ZERO_CHUNK: &[u8] = &[0u8; CHUNK_SIZE];
 
 #[derive(Clone)]
@@ -20,9 +21,18 @@ impl ChunkStore {
         Self { db }
     }
 
-    pub async fn get(&self, id: InodeId, chunk_idx: u64) -> Option<Bytes> {
+    pub async fn get(&self, id: InodeId, chunk_idx: u64) -> Result<Option<Bytes>, FsError> {
         let key = KeyCodec::chunk_key(id, chunk_idx);
-        self.db.get_bytes(&key).await.ok().flatten()
+        match self.db.get_bytes(&key).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                error!(
+                    "Failed to read chunk (inode={}, chunk={}): {}",
+                    id, chunk_idx, e
+                );
+                Err(FsError::IoError)
+            }
+        }
     }
 
     fn save(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64, data: Bytes) {
@@ -41,9 +51,9 @@ impl ChunkStore {
         }
     }
 
-    pub async fn read(&self, id: InodeId, offset: u64, length: u64) -> Bytes {
+    pub async fn read(&self, id: InodeId, offset: u64, length: u64) -> Result<Bytes, FsError> {
         if length == 0 {
-            return Bytes::new();
+            return Ok(Bytes::new());
         }
 
         let end = offset + length;
@@ -51,19 +61,21 @@ impl ChunkStore {
         let end_chunk = (end - 1) / CHUNK_SIZE as u64;
         let start_offset = (offset % CHUNK_SIZE as u64) as usize;
 
-        let chunks: Vec<Bytes> = stream::iter(start_chunk..=end_chunk)
+        let chunks: Result<Vec<Bytes>, FsError> = stream::iter(start_chunk..=end_chunk)
             .map(|chunk_idx| {
                 let store = self.clone();
                 async move {
                     store
                         .get(id, chunk_idx)
                         .await
-                        .unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK))
+                        .map(|opt_data| opt_data.unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK)))
                 }
             })
             .buffered(PARALLEL_CHUNK_OPS)
-            .collect()
+            .try_collect()
             .await;
+
+        let chunks = chunks?;
 
         let mut result = BytesMut::with_capacity(length as usize);
 
@@ -82,7 +94,7 @@ impl ChunkStore {
             result.extend_from_slice(&chunk_data[chunk_start..chunk_end]);
         }
 
-        result.freeze()
+        Ok(result.freeze())
     }
 
     pub async fn write(
@@ -91,37 +103,40 @@ impl ChunkStore {
         id: InodeId,
         offset: u64,
         data: &[u8],
-    ) {
+    ) -> Result<(), FsError> {
         if data.is_empty() {
-            return;
+            return Ok(());
         }
 
         let end_offset = offset + data.len() as u64;
         let start_chunk = offset / CHUNK_SIZE as u64;
         let end_chunk = (end_offset - 1) / CHUNK_SIZE as u64;
 
-        let existing_chunks: HashMap<u64, Bytes> = stream::iter(start_chunk..=end_chunk)
-            .map(|chunk_idx| {
-                let chunk_start = chunk_idx * CHUNK_SIZE as u64;
-                let chunk_end = chunk_start + CHUNK_SIZE as u64;
-                let will_overwrite_fully = offset <= chunk_start && end_offset >= chunk_end;
+        let existing_chunks: Result<HashMap<u64, Bytes>, FsError> =
+            stream::iter(start_chunk..=end_chunk)
+                .map(|chunk_idx| {
+                    let chunk_start = chunk_idx * CHUNK_SIZE as u64;
+                    let chunk_end = chunk_start + CHUNK_SIZE as u64;
+                    let will_overwrite_fully = offset <= chunk_start && end_offset >= chunk_end;
 
-                let store = self.clone();
-                async move {
-                    let data = if will_overwrite_fully {
-                        Bytes::from_static(ZERO_CHUNK)
-                    } else {
-                        store
-                            .get(id, chunk_idx)
-                            .await
-                            .unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK))
-                    };
-                    (chunk_idx, data)
-                }
-            })
-            .buffer_unordered(PARALLEL_CHUNK_OPS)
-            .collect()
-            .await;
+                    let store = self.clone();
+                    async move {
+                        let data = if will_overwrite_fully {
+                            Bytes::from_static(ZERO_CHUNK)
+                        } else {
+                            store
+                                .get(id, chunk_idx)
+                                .await?
+                                .unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK))
+                        };
+                        Ok::<(u64, Bytes), FsError>((chunk_idx, data))
+                    }
+                })
+                .buffer_unordered(PARALLEL_CHUNK_OPS)
+                .try_collect()
+                .await;
+
+        let existing_chunks = existing_chunks?;
 
         let mut data_offset = 0usize;
         for chunk_idx in start_chunk..=end_chunk {
@@ -147,6 +162,8 @@ impl ChunkStore {
 
             self.save(txn, id, chunk_idx, chunk.freeze());
         }
+
+        Ok(())
     }
 
     pub async fn truncate(
@@ -155,9 +172,9 @@ impl ChunkStore {
         id: InodeId,
         old_size: u64,
         new_size: u64,
-    ) {
+    ) -> Result<(), FsError> {
         if new_size >= old_size {
-            return;
+            return Ok(());
         }
 
         let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64);
@@ -172,7 +189,7 @@ impl ChunkStore {
             if clear_from > 0 {
                 let chunk_data = self
                     .get(id, last_chunk_idx)
-                    .await
+                    .await?
                     .map(|b| b.to_vec())
                     .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
 
@@ -181,6 +198,8 @@ impl ChunkStore {
                 self.save(txn, id, last_chunk_idx, Bytes::from(new_chunk_data));
             }
         }
+
+        Ok(())
     }
 
     pub async fn zero_range(
@@ -209,7 +228,7 @@ impl ChunkStore {
 
             if offset <= chunk_start && end_offset >= chunk_end {
                 self.delete(txn, id, chunk_idx);
-            } else if let Some(existing_data) = self.get(id, chunk_idx).await {
+            } else if let Ok(Some(existing_data)) = self.get(id, chunk_idx).await {
                 let zero_start = if offset > chunk_start {
                     (offset - chunk_start) as usize
                 } else {
