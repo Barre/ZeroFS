@@ -11,6 +11,8 @@ use chacha20poly1305::{
 };
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
+use slatedb::config::{DurabilityLevel, ReadOptions};
+
 const ARGON2_MEM_COST: u32 = 65536;
 const ARGON2_TIME_COST: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
@@ -162,11 +164,20 @@ pub async fn load_or_init_encryption_key(
     let key_manager = KeyManager::new();
 
     // Check if wrapped key exists in database
+    let read_options = ReadOptions {
+        durability_filter: DurabilityLevel::Memory,
+        dirty: true,
+    };
     let existing_key = match db_handle {
-        SlateDbHandle::ReadWrite(db) => db.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?,
+        SlateDbHandle::ReadWrite(db) => {
+            db.get_with_options(SYSTEM_WRAPPED_ENCRYPTION_KEY, &read_options)
+                .await?
+        }
         SlateDbHandle::ReadOnly(reader_swap) => {
             let reader = reader_swap.load();
-            reader.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?
+            reader
+                .get_with_options(SYSTEM_WRAPPED_ENCRYPTION_KEY, &read_options)
+                .await?
         }
     };
 
@@ -224,12 +235,20 @@ pub async fn change_encryption_password(
 
     let key_manager = KeyManager::new();
 
-    // Load current wrapped key
+    let read_options = ReadOptions {
+        durability_filter: DurabilityLevel::Memory,
+        dirty: true,
+    };
     let data = match db_handle {
-        SlateDbHandle::ReadWrite(db) => db.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?,
+        SlateDbHandle::ReadWrite(db) => {
+            db.get_with_options(SYSTEM_WRAPPED_ENCRYPTION_KEY, &read_options)
+                .await?
+        }
         SlateDbHandle::ReadOnly(reader_swap) => {
             let reader = reader_swap.load();
-            reader.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?
+            reader
+                .get_with_options(SYSTEM_WRAPPED_ENCRYPTION_KEY, &read_options)
+                .await?
         }
     }
     .ok_or_else(|| anyhow::anyhow!("No encryption key found in database"))?;

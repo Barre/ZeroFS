@@ -208,7 +208,7 @@ impl EncryptedDb {
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
-            ..Default::default()
+            dirty: true,
         };
 
         let encrypted = match &self.inner {
@@ -235,6 +235,7 @@ impl EncryptedDb {
         let encryptor = self.encryptor.clone();
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
+            dirty: true,
             read_ahead_bytes: 8 * 1024 * 1024, // 8MB read-ahead
             max_fetch_tasks: 8,
             ..Default::default()
