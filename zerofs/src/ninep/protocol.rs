@@ -34,8 +34,15 @@ pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
 // Server configuration constants
 pub const P9_CHANNEL_SIZE: usize = 1000;
-pub const P9_MIN_MESSAGE_SIZE: u32 = 7;
-pub const P9_SIZE_FIELD_LEN: usize = 4;
+pub const P9_SIZE_FIELD_LEN: usize = std::mem::size_of::<u32>();
+pub const P9_TYPE_FIELD_LEN: usize = std::mem::size_of::<u8>();
+pub const P9_TAG_FIELD_LEN: usize = std::mem::size_of::<u16>();
+pub const P9_COUNT_FIELD_LEN: usize = std::mem::size_of::<u32>();
+/// Header size: size[4] + type[1] + tag[2]
+pub const P9_HEADER_SIZE: usize = P9_SIZE_FIELD_LEN + P9_TYPE_FIELD_LEN + P9_TAG_FIELD_LEN;
+pub const P9_MIN_MESSAGE_SIZE: u32 = P9_HEADER_SIZE as u32;
+/// IO header overhead for Rread/Rreaddir: header + count[4]
+pub const P9_IOHDRSZ: u32 = (P9_HEADER_SIZE + P9_COUNT_FIELD_LEN) as u32;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
 pub const P9_MAX_GROUPS: usize = 16;
