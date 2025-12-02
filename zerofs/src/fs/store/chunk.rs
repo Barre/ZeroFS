@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const PARALLEL_CHUNK_OPS: usize = 1024;
+const ZERO_CHUNK: &[u8] = &[0u8; CHUNK_SIZE];
 
 #[derive(Clone)]
 pub struct ChunkStore {
@@ -57,7 +58,7 @@ impl ChunkStore {
                     store
                         .get(id, chunk_idx)
                         .await
-                        .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                        .unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK))
                 }
             })
             .buffered(PARALLEL_CHUNK_OPS)
@@ -108,12 +109,12 @@ impl ChunkStore {
                 let store = self.clone();
                 async move {
                     let data = if will_overwrite_fully {
-                        Bytes::from(vec![0u8; CHUNK_SIZE])
+                        Bytes::from_static(ZERO_CHUNK)
                     } else {
                         store
                             .get(id, chunk_idx)
                             .await
-                            .unwrap_or_else(|| Bytes::from(vec![0u8; CHUNK_SIZE]))
+                            .unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK))
                     };
                     (chunk_idx, data)
                 }
