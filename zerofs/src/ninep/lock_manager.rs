@@ -49,8 +49,8 @@ impl FileLockManager {
 
         // First, remove any existing locks from this session that overlap
         // This implements POSIX lock replacement behavior
+        let mut to_remove = Vec::new();
         if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
-            let mut to_remove = Vec::new();
             for lock_id in lock_ids.iter() {
                 if let Some(existing_lock) = self.locks.get(lock_id)
                     && existing_lock.inode_id == lock.inode_id
@@ -73,15 +73,15 @@ impl FileLockManager {
                     }
                 }
             }
+        }
 
-            for lock_id in to_remove {
-                if let Some((_, old_lock)) = self.locks.remove(&lock_id) {
-                    if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
-                        session_locks.retain(|id| id != &lock_id);
-                    }
-                    if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&old_lock.inode_id) {
-                        inode_locks.retain(|id| id != &lock_id);
-                    }
+        for lock_id in to_remove {
+            if let Some((_, old_lock)) = self.locks.remove(&lock_id) {
+                if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
+                    session_locks.retain(|id| id != &lock_id);
+                }
+                if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&old_lock.inode_id) {
+                    inode_locks.retain(|id| id != &lock_id);
                 }
             }
         }
