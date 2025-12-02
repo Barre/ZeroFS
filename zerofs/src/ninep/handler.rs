@@ -332,7 +332,11 @@ impl NinePHandler {
     }
 
     async fn handle_clunk(&self, tag: u16, tc: Tclunk) -> P9Message {
-        self.session.fids.remove(&tc.fid);
+        if let Some((_, fid_entry)) = self.session.fids.remove(&tc.fid) {
+            self.lock_manager
+                .unlock_range(fid_entry.inode_id, tc.fid, 0, 0, self.handler_id)
+                .await;
+        }
         P9Message::new(tag, Message::Rclunk(Rclunk))
     }
 
