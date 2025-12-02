@@ -2206,10 +2206,17 @@ impl ZeroFS {
 
         self.directory_store
             .unlink_entry(&mut txn, from_dirid, from_name, source_cookie);
-        let new_cookie = self
-            .directory_store
-            .allocate_cookie(to_dirid, &mut txn)
-            .await?;
+
+        // Reuse cookie when renaming within the same directory to avoid
+        // duplicate entries during readdir iteration
+        let new_cookie = if from_dirid == to_dirid {
+            source_cookie
+        } else {
+            self.directory_store
+                .allocate_cookie(to_dirid, &mut txn)
+                .await?
+        };
+
         self.directory_store
             .add(&mut txn, to_dirid, to_name, source_inode_id, new_cookie);
 
