@@ -501,6 +501,17 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
+        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
+        if (tw.data.len() as u64) + P9_IOHDRSZ as u64 > msize as u64 {
+            debug!(
+                "handle_write: rejecting write of {} bytes (exceeds msize {} - IOHDRSZ {})",
+                tw.data.len(),
+                msize,
+                P9_IOHDRSZ
+            );
+            return P9Message::error(tag, libc::EIO as u32);
+        }
+
         debug!(
             "handle_write: fid={}, inode_id={}, uid={}, gid={}, offset={}, data_len={}",
             tw.fid,
