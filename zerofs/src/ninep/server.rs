@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub enum Transport {
@@ -43,26 +44,36 @@ impl NinePServer {
         }
     }
 
-    pub async fn start(&self) -> std::io::Result<()> {
+    pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
             Transport::Tcp(addr) => {
                 let listener = TcpListener::bind(addr).await?;
                 info!("9P server listening on TCP {}", addr);
 
                 loop {
-                    let (stream, peer_addr) = listener.accept().await?;
-                    info!("9P client connected from {}", peer_addr);
-
-                    stream.set_nodelay(true)?;
-
-                    let filesystem = Arc::clone(&self.filesystem);
-                    let lock_manager = Arc::clone(&self.lock_manager);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client_stream(stream, filesystem, lock_manager).await
-                        {
-                            error!("Error handling 9P client {}: {}", peer_addr, e);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("9P TCP server shutting down on {}", addr);
+                            break;
                         }
-                    });
+                        result = listener.accept() => {
+                            let (stream, peer_addr) = result?;
+                            info!("9P client connected from {}", peer_addr);
+
+                            stream.set_nodelay(true)?;
+
+                            let filesystem = Arc::clone(&self.filesystem);
+                            let lock_manager = Arc::clone(&self.lock_manager);
+                            let client_shutdown = shutdown.child_token();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
+                                {
+                                    error!("Error handling 9P client {}: {}", peer_addr, e);
+                                }
+                            });
+                        }
+                    }
                 }
             }
             Transport::Unix(path) => {
@@ -77,20 +88,32 @@ impl NinePServer {
                 info!("9P server listening on Unix socket {:?}", path);
 
                 loop {
-                    let (stream, _) = listener.accept().await?;
-                    info!("9P client connected via Unix socket");
-
-                    let filesystem = Arc::clone(&self.filesystem);
-                    let lock_manager = Arc::clone(&self.lock_manager);
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client_stream(stream, filesystem, lock_manager).await
-                        {
-                            error!("Error handling 9P Unix client: {}", e);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("9P Unix socket server shutting down at {:?}", path);
+                            break;
                         }
-                    });
+                        result = listener.accept() => {
+                            let (stream, _) = result?;
+                            info!("9P client connected via Unix socket");
+
+                            let filesystem = Arc::clone(&self.filesystem);
+                            let lock_manager = Arc::clone(&self.lock_manager);
+                            let client_shutdown = shutdown.child_token();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
+                                {
+                                    error!("Error handling 9P Unix client: {}", e);
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 }
 
@@ -98,6 +121,7 @@ async fn handle_client_stream<S>(
     stream: S,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -118,7 +142,7 @@ where
         }
     });
 
-    let result = handle_client_loop(handler, &mut read_stream, tx).await;
+    let result = handle_client_loop(handler, &mut read_stream, tx, shutdown).await;
 
     lock_manager.release_session_locks(handler_id).await;
 
@@ -131,20 +155,30 @@ async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     read_stream: &mut R,
     tx: mpsc::Sender<(u16, Vec<u8>)>,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     loop {
         let mut size_buf = [0u8; P9_SIZE_FIELD_LEN];
-        match read_stream.read_exact(&mut size_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!("Client disconnected");
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                debug!("9P client handler shutting down");
                 return Ok(());
             }
-            Err(e) => {
-                return Err(e.into());
+            result = read_stream.read_exact(&mut size_buf) => {
+                match result {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        debug!("Client disconnected");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                }
             }
         }
 
