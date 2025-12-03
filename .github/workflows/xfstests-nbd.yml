@@ -1,0 +1,191 @@
+name: xfstests-nbd
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  xfstests:
+    name: Run xfstests XFS on NBD
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk \
+            gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
+            libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
+            uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
+            libgdbm-compat-dev nbd-client wget
+          sudo apt-get install -y exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
+            xfslibs-dev || true
+          sudo apt-get install -y systemd-coredump systemd jq pkg-config
+
+      - name: Setup MinIO bucket
+        run: |
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-xfs-test || true
+
+      - name: Clone xfstests
+        run: |
+          git clone https://github.com/Barre/xfstests.git /tmp/xfstests
+
+      - name: Build xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          make
+          sudo make install
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS
+        working-directory: zerofs
+        run: |
+          mkdir -p /tmp/zerofs-cache
+
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 2.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-xfs-test/xfs-test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          cargo run --profile ci -- run -c zerofs-ci.toml &
+
+          echo "Waiting for ZeroFS NBD server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "ZeroFS NBD server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          if ! nc -z 127.0.0.1 10809; then
+            echo "ZeroFS NBD server failed to start"
+            exit 1
+          fi
+
+      - name: Create NBD device files
+        run: |
+          echo "Mounting ZeroFS via 9P..."
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
+
+          echo "Creating NBD device files..."
+          sudo mkdir -p /mnt/zerofs/.nbd
+          sudo truncate -s 2G /mnt/zerofs/.nbd/test-device
+          sudo truncate -s 2G /mnt/zerofs/.nbd/scratch-device
+
+          sudo umount /mnt/zerofs
+
+      - name: Connect NBD devices
+        run: |
+          echo "Connecting TEST NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+          sudo blockdev --getsize64 /dev/nbd0
+
+          echo "Connecting SCRATCH NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd1 -N scratch-device
+          sudo blockdev --getsize64 /dev/nbd1
+
+      - name: Format XFS filesystems
+        run: |
+          echo "Formatting TEST device with XFS..."
+          sudo mkfs.xfs -f /dev/nbd0
+
+          echo "Formatting SCRATCH device with XFS..."
+          sudo mkfs.xfs -f /dev/nbd1
+
+      - name: Create mount points and mount TEST
+        run: |
+          sudo mkdir -p /mnt/test
+          sudo mkdir -p /mnt/scratch
+
+          echo "Mounting TEST filesystem..."
+          sudo mount /dev/nbd0 /mnt/test
+
+          # Verify mount
+          mount | grep nbd0
+
+      - name: Configure xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          cat > local.config << 'EOF'
+          export FSTYP=xfs
+
+          export TEST_DIR=/mnt/test
+          export TEST_DEV=/dev/nbd0
+
+          export SCRATCH_MNT=/mnt/scratch
+          export SCRATCH_DEV=/dev/nbd1
+          EOF
+
+          cat > excludes << 'EOF'
+          generic/081
+          EOF
+
+      - name: Run xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          sudo ./check -g quick -E excludes
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount filesystems
+          sudo umount /mnt/test || true
+          sudo umount /mnt/scratch || true
+
+          # Disconnect NBD devices
+          sudo nbd-client -d /dev/nbd0 || true
+          sudo nbd-client -d /dev/nbd1 || true
+
+          # Kill ZeroFS
+          pkill -f "zerofs.*run.*zerofs-ci.toml" || true
+
+          # Stop MinIO
+          docker stop minio || true
