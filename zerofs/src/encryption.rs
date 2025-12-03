@@ -21,6 +21,14 @@ use std::sync::Arc;
 
 const NONCE_SIZE: usize = 24;
 
+/// Fatal handler for SlateDB write errors.
+/// After a write failure, the database state is unknown - exit and let
+/// the eventual orchestrator restart the service to rebuild from a known-good state.
+pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
+    tracing::error!("Fatal write error, exiting: {}", err);
+    std::process::exit(1)
+}
+
 pub struct EncryptionManager {
     cipher: XChaCha20Poly1305,
 }
@@ -297,7 +305,11 @@ impl EncryptedDb {
         let (inner_batch, _cache_ops) = txn.into_inner().await?;
 
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.write_with_options(inner_batch, options).await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
 
@@ -313,7 +325,11 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.write_with_options(batch, options).await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.write_with_options(batch, options).await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
         Ok(())
@@ -340,8 +356,12 @@ impl EncryptedDb {
         let encrypted = self.encryptor.encrypt(key, value)?;
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
-                db.put_with_options(key, &encrypted, put_options, write_options)
-                    .await?
+                if let Err(e) = db
+                    .put_with_options(key, &encrypted, put_options, write_options)
+                    .await
+                {
+                    exit_on_write_error(e);
+                }
             }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
@@ -354,7 +374,11 @@ impl EncryptedDb {
         }
 
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.flush().await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.flush().await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
         Ok(())
@@ -362,7 +386,11 @@ impl EncryptedDb {
 
     pub async fn close(&self) -> Result<()> {
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => db.close().await?,
+            SlateDbHandle::ReadWrite(db) => {
+                if let Err(e) = db.close().await {
+                    exit_on_write_error(e);
+                }
+            }
             SlateDbHandle::ReadOnly(reader_swap) => {
                 let reader = reader_swap.load();
                 reader.close().await?
