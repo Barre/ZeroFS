@@ -11,6 +11,7 @@ use chacha20poly1305::{
 };
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
+
 const ARGON2_MEM_COST: u32 = 65536;
 const ARGON2_TIME_COST: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
