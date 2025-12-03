@@ -5,6 +5,7 @@ use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use zerofs_nfsserve::nfs::{ftype3, *};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -389,13 +390,14 @@ impl NFSFileSystem for NFSAdapter {
 pub async fn start_nfs_server_with_config(
     filesystem: Arc<ZeroFS>,
     socket: SocketAddr,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let adapter = NFSAdapter::new(filesystem);
     let listener = NFSTcpListener::bind(socket, adapter).await?;
 
     info!("NFS server listening on {}", socket);
 
-    listener.handle_forever().await?;
+    listener.handle_with_shutdown(shutdown).await?;
     Ok(())
 }
 

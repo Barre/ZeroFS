@@ -8,6 +8,7 @@ use slatedb::config::WriteOptions;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 const MAX_CHUNKS_PER_ROUND: usize = 10_000;
@@ -34,14 +35,29 @@ impl GarbageCollector {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
+    pub fn start(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(async move {
             info!("Starting garbage collection task (runs continuously)");
             loop {
-                if let Err(e) = self.run().await {
-                    tracing::error!("Garbage collection failed: {:?}", e);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("GC task shutting down");
+                        break;
+                    }
+                    result = self.run() => {
+                        if let Err(e) = result {
+                            tracing::error!("Garbage collection failed: {:?}", e);
+                        }
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("GC task shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                }
             }
         })
     }

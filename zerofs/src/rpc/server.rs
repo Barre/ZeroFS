@@ -8,7 +8,8 @@ use std::sync::Arc;
 use tarpc::server::{self, Channel};
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info};
 
 #[derive(Clone)]
 pub struct ZeroFsServiceImpl {
@@ -66,7 +67,11 @@ impl ZeroFsService for ZeroFsServiceImpl {
     }
 }
 
-pub async fn serve_tcp(addr: SocketAddr, service: ZeroFsServiceImpl) -> Result<()> {
+pub async fn serve_tcp(
+    addr: SocketAddr,
+    service: ZeroFsServiceImpl,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind RPC TCP server to {}", addr))?;
@@ -74,37 +79,58 @@ pub async fn serve_tcp(addr: SocketAddr, service: ZeroFsServiceImpl) -> Result<(
     info!("RPC server listening on {}", addr);
 
     loop {
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!("Failed to accept RPC TCP connection: {}", e);
-                continue;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("RPC TCP server shutting down on {}", addr);
+                break;
             }
-        };
+            result = listener.accept() => {
+                let (stream, peer_addr) = match result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!("Failed to accept RPC TCP connection: {}", e);
+                        continue;
+                    }
+                };
 
-        let service = service.clone();
-        tokio::spawn(async move {
-            let framed = Framed::new(stream, LengthDelimitedCodec::new());
-            let transport = tarpc::serde_transport::new(
-                framed,
-                tarpc::tokio_serde::formats::Bincode::default(),
-            );
+                let service = service.clone();
+                let client_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let framed = Framed::new(stream, LengthDelimitedCodec::new());
+                    let transport = tarpc::serde_transport::new(
+                        framed,
+                        tarpc::tokio_serde::formats::Bincode::default(),
+                    );
 
-            let channel = server::BaseChannel::new(server::Config::default(), transport);
+                    let channel = server::BaseChannel::new(server::Config::default(), transport);
 
-            info!("RPC client connected from {}", peer_addr);
-            channel
-                .execute(service.serve())
-                .for_each(|response| async move {
-                    tokio::spawn(response);
-                })
-                .await;
-            info!("RPC client disconnected from {}", peer_addr);
-        });
+                    info!("RPC client connected from {}", peer_addr);
+
+                    tokio::select! {
+                        _ = client_shutdown.cancelled() => {
+                            debug!("RPC client handler shutting down");
+                        }
+                        _ = channel
+                            .execute(service.serve())
+                            .for_each(|response| async move {
+                                tokio::spawn(response);
+                            }) => {
+                            info!("RPC client disconnected from {}", peer_addr);
+                        }
+                    }
+                });
+            }
+        }
     }
+
+    Ok(())
 }
 
-pub async fn serve_unix(socket_path: PathBuf, service: ZeroFsServiceImpl) -> Result<()> {
+pub async fn serve_unix(
+    socket_path: PathBuf,
+    service: ZeroFsServiceImpl,
+    shutdown: CancellationToken,
+) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
             .with_context(|| format!("Failed to remove existing socket file: {:?}", socket_path))?;
@@ -116,32 +142,48 @@ pub async fn serve_unix(socket_path: PathBuf, service: ZeroFsServiceImpl) -> Res
     info!("RPC server listening on Unix socket: {:?}", socket_path);
 
     loop {
-        let (stream, _peer_addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!("Failed to accept RPC Unix socket connection: {}", e);
-                continue;
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("RPC Unix socket server shutting down at {:?}", socket_path);
+                break;
             }
-        };
+            result = listener.accept() => {
+                let (stream, _peer_addr) = match result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!("Failed to accept RPC Unix socket connection: {}", e);
+                        continue;
+                    }
+                };
 
-        let service = service.clone();
-        tokio::spawn(async move {
-            let framed = Framed::new(stream, LengthDelimitedCodec::new());
-            let transport = tarpc::serde_transport::new(
-                framed,
-                tarpc::tokio_serde::formats::Bincode::default(),
-            );
+                let service = service.clone();
+                let client_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let framed = Framed::new(stream, LengthDelimitedCodec::new());
+                    let transport = tarpc::serde_transport::new(
+                        framed,
+                        tarpc::tokio_serde::formats::Bincode::default(),
+                    );
 
-            let channel = server::BaseChannel::new(server::Config::default(), transport);
+                    let channel = server::BaseChannel::new(server::Config::default(), transport);
 
-            info!("RPC client connected via Unix socket");
-            channel
-                .execute(service.serve())
-                .for_each(|response| async move {
-                    tokio::spawn(response);
-                })
-                .await;
-            info!("RPC client disconnected");
-        });
+                    info!("RPC client connected via Unix socket");
+                    tokio::select! {
+                        _ = client_shutdown.cancelled() => {
+                            debug!("RPC client handler shutting down");
+                        }
+                        _ = channel
+                            .execute(service.serve())
+                            .for_each(|response| async move {
+                                tokio::spawn(response);
+                            }) => {
+                            info!("RPC client disconnected");
+                        }
+                    }
+                });
+            }
+        }
     }
+
+    Ok(())
 }

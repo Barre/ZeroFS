@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
@@ -52,25 +53,34 @@ impl NBDServer {
         }
     }
 
-    pub async fn start(&self) -> std::io::Result<()> {
+    pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
             Transport::Tcp(socket) => {
                 let listener = TcpListener::bind(socket).await?;
                 info!("NBD server listening on {}", socket);
 
                 loop {
-                    let (stream, addr) = listener.accept().await?;
-                    info!("NBD client connected from {}", addr);
-
-                    stream.set_nodelay(true)?;
-
-                    let filesystem = Arc::clone(&self.filesystem);
-
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client_stream(stream, filesystem).await {
-                            error!("Error handling NBD client {}: {}", addr, e);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("NBD TCP server shutting down on {}", socket);
+                            break;
                         }
-                    });
+                        result = listener.accept() => {
+                            let (stream, addr) = result?;
+                            info!("NBD client connected from {}", addr);
+
+                            stream.set_nodelay(true)?;
+
+                            let filesystem = Arc::clone(&self.filesystem);
+                            let client_shutdown = shutdown.child_token();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_client_stream(stream, filesystem, client_shutdown).await {
+                                    error!("Error handling NBD client {}: {}", addr, e);
+                                }
+                            });
+                        }
+                    }
                 }
             }
             Transport::Unix(path) => {
@@ -86,23 +96,38 @@ impl NBDServer {
                 info!("NBD server listening on Unix socket {:?}", path);
 
                 loop {
-                    let (stream, _) = listener.accept().await?;
-                    info!("NBD client connected via Unix socket");
-
-                    let filesystem = Arc::clone(&self.filesystem);
-
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client_stream(stream, filesystem).await {
-                            error!("Error handling NBD Unix client: {}", e);
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("NBD Unix socket server shutting down at {:?}", path);
+                            break;
                         }
-                    });
+                        result = listener.accept() => {
+                            let (stream, _) = result?;
+                            info!("NBD client connected via Unix socket");
+
+                            let filesystem = Arc::clone(&self.filesystem);
+                            let client_shutdown = shutdown.child_token();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = handle_client_stream(stream, filesystem, client_shutdown).await {
+                                    error!("Error handling NBD Unix client: {}", e);
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 }
 
-async fn handle_client_stream<S>(stream: S, filesystem: Arc<ZeroFS>) -> Result<()>
+async fn handle_client_stream<S>(
+    stream: S,
+    filesystem: Arc<ZeroFS>,
+    shutdown: CancellationToken,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -110,7 +135,7 @@ where
     let reader = BufReader::new(reader);
     let writer = BufWriter::new(writer);
 
-    let mut session = NBDSession::new(reader, writer, filesystem);
+    let mut session = NBDSession::new(reader, writer, filesystem, shutdown);
     session.perform_handshake().await?;
 
     match session.negotiate_options().await {
@@ -136,15 +161,17 @@ struct NBDSession<R, W> {
     writer: W,
     filesystem: Arc<ZeroFS>,
     client_no_zeroes: bool,
+    shutdown: CancellationToken,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
-    fn new(reader: R, writer: W, filesystem: Arc<ZeroFS>) -> Self {
+    fn new(reader: R, writer: W, filesystem: Arc<ZeroFS>, shutdown: CancellationToken) -> Self {
         Self {
             reader,
             writer,
             filesystem,
             client_no_zeroes: false,
+            shutdown,
         }
     }
 
@@ -561,7 +588,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         loop {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
-            self.reader.read_exact(&mut request_buf).await?;
+
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    debug!("NBD client handler shutting down");
+                    return Ok(());
+                }
+                result = self.reader.read_exact(&mut request_buf) => {
+                    result?;
+                }
+            }
+
             let request = NBDRequest::from_bytes((&request_buf, 0))
                 .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?
                 .1;
