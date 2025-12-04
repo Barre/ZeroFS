@@ -123,7 +123,7 @@ jobs:
           EOF
 
           # Start ZeroFS in the background
-          cargo run --profile ci -- run -c zerofs-ci.toml &
+          ./target/ci/zerofs run -c zerofs-ci.toml &
 
           # Wait for ZeroFS to start
           echo "Waiting for ZeroFS to start..."
@@ -200,4 +200,4 @@ jobs:
           fi
 
           # Kill ZeroFS
-          pkill -f "cargo run --profile ci -- run -c zerofs-ci.toml" || true
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

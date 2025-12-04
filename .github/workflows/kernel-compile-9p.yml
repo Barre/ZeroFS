@@ -85,7 +85,7 @@ jobs:
           EOF
 
           # Start ZeroFS in the background with 9P enabled
-          cargo run --profile ci -- run -c zerofs-ci.toml &
+          ./target/ci/zerofs run -c zerofs-ci.toml &
 
           # Save PID for stats collection
           echo $! > /tmp/zerofs.pid
@@ -163,4 +163,4 @@ jobs:
           if [ -f /tmp/zerofs.pid ]; then
             kill $(cat /tmp/zerofs.pid) || true
           fi
-          pkill -f "cargo run --profile ci -- run -c zerofs-ci.toml" || true
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

@@ -80,7 +80,7 @@ jobs:
           EOF
 
           # Start ZeroFS with NBD support in the background
-          cargo run --profile ci -- run -c zerofs-ci.toml &
+          ./target/ci/zerofs run -c zerofs-ci.toml &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to start..."
@@ -317,7 +317,7 @@ jobs:
         run: |
           echo "Starting ZeroFS again..."
           # Config file should still exist from earlier
-          cargo run --profile ci -- run -c zerofs-ci.toml &
+          ./target/ci/zerofs run -c zerofs-ci.toml &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to restart..."
@@ -401,7 +401,7 @@ jobs:
           sudo nbd-client -d /dev/nbd0 || true
 
           # Kill ZeroFS
-          pkill -f "cargo run --profile ci -- run -c zerofs-ci.toml" || true
+          pkill -f "zerofs run -c zerofs-ci.toml" || true
 
           # Stop MinIO
           docker stop minio || true

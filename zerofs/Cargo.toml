@@ -61,9 +61,18 @@ uuid = { version = "1.17", features = ["v4"] }
 toml = "0.9"
 shellexpand = "3.1"
 clap = { version = "4.5", features = ["derive"] }
-tarpc = { version = "0.37", features = ["tokio1", "serde-transport"] }
-tokio-serde = { version = "0.9", features = ["bincode"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 chrono = "0.4"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protobuf-src = "2"
 
 [dev-dependencies]
 tempfile = "3.21"

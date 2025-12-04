@@ -99,7 +99,7 @@ jobs:
           EOF
 
           # Start ZeroFS in the background with 9P enabled
-          cargo run --profile ci -- run -c zerofs-ci.toml &
+          ./target/ci/zerofs run -c zerofs-ci.toml &
 
           # Wait for ZeroFS to start (9P runs on port 5564)
           echo "Waiting for ZeroFS 9P server to start..."
@@ -157,4 +157,4 @@ jobs:
           sudo umount /mnt/zerofs-9p || true
 
           # Kill ZeroFS
-          pkill -f "cargo run --profile ci -- run -c zerofs-ci.toml" || true
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

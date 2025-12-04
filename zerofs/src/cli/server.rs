@@ -214,7 +214,7 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::ZeroFsServiceImpl::new(checkpoint_manager);
+    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
