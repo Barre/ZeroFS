@@ -243,7 +243,7 @@ impl EncryptedDb {
         let encryptor = self.encryptor.clone();
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
-            read_ahead_bytes: 8 * 1024 * 1024, // 8MB read-ahead
+            read_ahead_bytes: 32 * 1024 * 1024,
             max_fetch_tasks: 8,
             ..Default::default()
         };
