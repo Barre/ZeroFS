@@ -388,7 +388,7 @@ jobs:
         with:
           usesh: true
           prepare: |
-            pkg install -y gmake curl
+            pkg install -y gmake curl cmake
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           run: |
             . $HOME/.cargo/env
