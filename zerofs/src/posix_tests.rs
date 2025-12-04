@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hardlink_parent_becomes_none() {
+    async fn test_hardlink_clears_parent_and_name() {
         let fs = create_test_fs().await;
         let creds = test_creds();
 
@@ -1049,6 +1049,7 @@ mod tests {
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, Some(0));
+                assert_eq!(f.name, Some(b"original.txt".to_vec()));
                 assert_eq!(f.nlink, 1);
             }
             _ => panic!("Expected file inode"),
@@ -1067,11 +1068,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Parent should become None when file is hardlinked
+        // Parent and name should become None when file is hardlinked
         let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
+                assert_eq!(f.name, None);
                 assert_eq!(f.nlink, 2);
             }
             _ => panic!("Expected file inode"),
@@ -1079,7 +1081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hardlink_parent_stays_none_after_unlink() {
+    async fn test_hardlink_parent_and_name_stay_none_after_unlink() {
         let fs = create_test_fs().await;
         let creds = test_creds();
 
@@ -1113,11 +1115,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Parent should stay None even when nlink drops back to 1
+        // Parent and name should stay None even when nlink drops back to 1
         let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
+                assert_eq!(f.name, None);
                 assert_eq!(f.nlink, 1);
             }
             _ => panic!("Expected file inode"),
@@ -1125,7 +1128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lazy_parent_restoration_on_rename() {
+    async fn test_lazy_parent_and_name_restoration_on_rename() {
         let fs = create_test_fs().await;
         let creds = test_creds();
 
@@ -1178,11 +1181,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Parent should be lazily restored on rename when nlink=1
+        // Parent and name should be lazily restored on rename when nlink=1
         let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, Some(dir_id));
+                assert_eq!(f.name, Some(b"moved.txt".to_vec()));
                 assert_eq!(f.nlink, 1);
             }
             _ => panic!("Expected file inode"),
@@ -1190,7 +1194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rename_hardlinked_file_parent_stays_none() {
+    async fn test_rename_hardlinked_file_parent_and_name_stay_none() {
         let fs = create_test_fs().await;
         let creds = test_creds();
 
@@ -1231,11 +1235,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Parent should stay None when renaming file with nlink > 1
+        // Parent and name should stay None when renaming file with nlink > 1
         let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
+                assert_eq!(f.name, None);
                 assert_eq!(f.nlink, 2);
             }
             _ => panic!("Expected file inode"),

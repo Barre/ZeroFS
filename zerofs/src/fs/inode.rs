@@ -17,6 +17,8 @@ pub struct FileInode {
     /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
     /// Lazily restored to Some(parent) when file becomes singly-linked again.
     pub parent: Option<InodeId>,
+    /// File name in parent directory. None when file has multiple hardlinks.
+    pub name: Option<Vec<u8>>,
     pub nlink: u32,
 }
 
@@ -33,6 +35,8 @@ pub struct DirectoryInode {
     pub gid: u32,
     pub entry_count: u64,
     pub parent: InodeId,
+    /// Directory name. None for root directory.
+    pub name: Option<Vec<u8>>,
     pub nlink: u32,
 }
 
@@ -51,6 +55,8 @@ pub struct SymlinkInode {
     /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
     /// Lazily restored to Some(parent) when file becomes singly-linked again.
     pub parent: Option<InodeId>,
+    /// Symlink name in parent directory. None when symlink has multiple hardlinks.
+    pub name: Option<Vec<u8>>,
     pub nlink: u32,
 }
 
@@ -68,6 +74,8 @@ pub struct SpecialInode {
     /// Parent directory ID. None when file has multiple hardlinks (nlink > 1).
     /// Lazily restored to Some(parent) when file becomes singly-linked again.
     pub parent: Option<InodeId>,
+    /// Name in parent directory. None when inode has multiple hardlinks.
+    pub name: Option<Vec<u8>>,
     pub nlink: u32,
     pub rdev: Option<(u32, u32)>, // For character and block devices (major, minor)
 }
@@ -92,6 +100,18 @@ impl Inode {
             Inode::Symlink(s) => s.parent,
             Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
                 s.parent
+            }
+        }
+    }
+
+    /// Get the name if available (None for root or hardlinked files).
+    pub fn name(&self) -> Option<&[u8]> {
+        match self {
+            Inode::Directory(d) => d.name.as_deref(),
+            Inode::File(f) => f.name.as_deref(),
+            Inode::Symlink(s) => s.name.as_deref(),
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                s.name.as_deref()
             }
         }
     }
@@ -178,6 +198,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: Some(0),
+            name: Some(b"test.txt".to_vec()),
             nlink: 1,
         };
 
@@ -212,6 +233,7 @@ mod tests {
             gid: 1000,
             entry_count: 2,
             parent: 0,
+            name: Some(b"testdir".to_vec()),
             nlink: 2,
         };
 
@@ -245,6 +267,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: Some(0),
+            name: Some(b"testlink".to_vec()),
             nlink: 1,
         };
 
@@ -278,6 +301,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: Some(0),
+            name: Some(b"test.txt".to_vec()),
             nlink: 1,
         };
 

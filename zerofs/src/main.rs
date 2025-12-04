@@ -97,6 +97,9 @@ async fn main() -> Result<()> {
                 cli::checkpoint::get_checkpoint_info(&config, &name).await?;
             }
         },
+        cli::Commands::Fatrace { config } => {
+            cli::fatrace::run_fatrace(config).await?;
+        }
     }
 
     Ok(())

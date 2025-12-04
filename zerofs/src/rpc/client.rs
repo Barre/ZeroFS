@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::net::UnixStream;
 use tonic::Code;
+use tonic::Streaming;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
@@ -149,5 +150,18 @@ impl RpcClient {
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(anyhow!("RPC call failed: {}", status.message())),
         }
+    }
+
+    pub async fn watch_file_access(&self) -> Result<Streaming<proto::FileAccessEvent>> {
+        let request = proto::WatchFileAccessRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .watch_file_access(request)
+            .await
+            .map_err(|s| anyhow!("Failed to start file access stream: {}", s.message()))?;
+
+        Ok(response.into_inner())
     }
 }
