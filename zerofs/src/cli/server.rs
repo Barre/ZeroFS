@@ -406,6 +406,7 @@ pub async fn build_slatedb(
         wal_enabled: false,
         l0_max_ssts,
         l0_sst_size_bytes: 256 * 1024 * 1024,
+        filter_bits_per_key: 20,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(PathBuf::from(cache_config.root_folder.clone())),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
