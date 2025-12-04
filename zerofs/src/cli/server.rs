@@ -3,6 +3,7 @@ use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
+use crate::fs::tracing::AccessTracer;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
@@ -207,6 +208,7 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    tracer: AccessTracer,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
@@ -214,7 +216,7 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager);
+    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, tracer);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -687,6 +689,7 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
+        fs.tracer.clone(),
         shutdown.clone(),
     )
     .await;

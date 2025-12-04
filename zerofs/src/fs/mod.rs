@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod permissions;
 pub mod stats;
 pub mod store;
+pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
 
@@ -19,6 +20,7 @@ use self::lock_manager::LockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
+use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
@@ -38,12 +40,12 @@ use self::types::{
     AuthContext, DirEntry, FileAttributes, FileType, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetSize, SetTime, SetUid,
 };
+use ::tracing::{debug, error};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error};
 
 fn get_current_uid_gid() -> (u32, u32) {
     (0, 0)
@@ -82,6 +84,7 @@ pub struct ZeroFS {
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: Arc<WriteCoordinator>,
     pub max_bytes: u64,
+    pub tracer: AccessTracer,
 }
 
 #[derive(Clone)]
@@ -141,7 +144,8 @@ impl ZeroFS {
                 gid,
                 entry_count: 0,
                 parent: 0,
-                nlink: 2, // . and ..
+                name: None, // Root has no name
+                nlink: 2,   // . and ..
             };
             let serialized = bincode::serialize(&Inode::Directory(root_dir))?;
             db.put_with_options(
@@ -187,6 +191,7 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             max_bytes,
+            tracer: AccessTracer::new(),
         };
 
         Ok(fs)
@@ -232,6 +237,62 @@ impl ZeroFS {
         );
 
         Ok(inode)
+    }
+
+    /// Resolve inode ID to full path components by walking parent chain
+    /// Returns Vec of path components (excluding root), in order from root to target
+    pub async fn resolve_path_components(&self, id: InodeId) -> Vec<Vec<u8>> {
+        const ROOT_INODE_ID: InodeId = 0;
+
+        if id == ROOT_INODE_ID {
+            return Vec::new();
+        }
+
+        let mut components = Vec::new();
+        let mut current_id = id;
+
+        while current_id != ROOT_INODE_ID {
+            if let Ok(inode) = self.get_inode_cached(current_id).await {
+                let parent_id = match inode.parent() {
+                    Some(p) => p,
+                    None => {
+                        // Hardlinked file - use placeholder
+                        components.push(format!("<inode:{}>", current_id).into_bytes());
+                        break;
+                    }
+                };
+
+                if let Some(name) = inode.name() {
+                    components.push(name.to_vec());
+                    current_id = parent_id;
+                } else {
+                    // Name not available (shouldn't happen for non-hardlinked files)
+                    components.push(format!("<inode:{}>", current_id).into_bytes());
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        components.reverse();
+        components
+    }
+
+    /// Resolve inode ID to full path string
+    pub async fn resolve_path_lossy(&self, id: InodeId) -> String {
+        let components = self.resolve_path_components(id).await;
+        if components.is_empty() {
+            return "/".to_string();
+        }
+        format!(
+            "/{}",
+            components
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        )
     }
 
     #[cfg(test)]
@@ -492,6 +553,16 @@ impl ZeroFS {
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
+                self.tracer
+                    .emit(
+                        || self.resolve_path_lossy(id),
+                        FileOperation::Write {
+                            offset,
+                            length: data.len() as u64,
+                        },
+                    )
+                    .await;
+
                 Ok(InodeWithId { inode: &inode, id }.into())
             }
             _ => Err(FsError::IsDirectory),
@@ -557,6 +628,7 @@ impl ZeroFS {
                         SetGid::NoChange => creds.gid,
                     },
                     parent: Some(dirid),
+                    name: Some(name.to_vec()),
                     nlink: 1,
                 };
 
@@ -596,6 +668,15 @@ impl ZeroFS {
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                self.tracer
+                    .emit(
+                        || self.resolve_path_lossy(file_id),
+                        FileOperation::Create {
+                            mode: file_inode.mode,
+                        },
+                    )
+                    .await;
 
                 let inode = Inode::File(file_inode);
                 let file_attrs = InodeWithId {
@@ -646,6 +727,12 @@ impl ZeroFS {
         match &inode {
             Inode::File(file) => {
                 if offset >= file.size {
+                    self.tracer
+                        .emit(
+                            || self.resolve_path_lossy(id),
+                            FileOperation::Read { offset, length: 0 },
+                        )
+                        .await;
                     return Ok((Bytes::new(), true));
                 }
 
@@ -658,6 +745,16 @@ impl ZeroFS {
                     .fetch_add(result_bytes.len() as u64, Ordering::Relaxed);
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                self.tracer
+                    .emit(
+                        || self.resolve_path_lossy(id),
+                        FileOperation::Read {
+                            offset,
+                            length: read_len,
+                        },
+                    )
+                    .await;
 
                 Ok((result_bytes, eof))
             }
@@ -709,6 +806,14 @@ impl ZeroFS {
             })?;
 
         debug!("Trim completed successfully for inode {}", id);
+
+        self.tracer
+            .emit(
+                || self.resolve_path_lossy(id),
+                FileOperation::Trim { offset, length },
+            )
+            .await;
+
         Ok(())
     }
 
@@ -740,6 +845,14 @@ impl ZeroFS {
                         String::from_utf8_lossy(filename),
                         inode_id
                     );
+                    self.tracer
+                        .emit(
+                            || self.resolve_path_lossy(inode_id),
+                            FileOperation::Lookup {
+                                filename: String::from_utf8_lossy(filename).to_string(),
+                            },
+                        )
+                        .await;
                     return Ok(inode_id);
                 }
 
@@ -757,6 +870,15 @@ impl ZeroFS {
                         };
                         let cache_value = CacheValue::DirEntry(inode_id);
                         self.cache.insert(cache_key, cache_value);
+
+                        self.tracer
+                            .emit(
+                                || self.resolve_path_lossy(inode_id),
+                                FileOperation::Lookup {
+                                    filename: String::from_utf8_lossy(filename).to_string(),
+                                },
+                            )
+                            .await;
 
                         Ok(inode_id)
                     }
@@ -853,6 +975,7 @@ impl ZeroFS {
                     gid: new_gid,
                     entry_count: 0,
                     parent: dirid,
+                    name: Some(name.to_vec()),
                     nlink: 2,
                 };
 
@@ -897,6 +1020,15 @@ impl ZeroFS {
                     .directories_created
                     .fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                self.tracer
+                    .emit(
+                        || self.resolve_path_lossy(new_dir_id),
+                        FileOperation::Mkdir {
+                            mode: new_dir_inode.mode,
+                        },
+                    )
+                    .await;
 
                 let new_inode = Inode::Directory(new_dir_inode);
                 let attrs = InodeWithId {
@@ -999,10 +1131,9 @@ impl ZeroFS {
                         match self.get_inode_cached(inode_id).await {
                             Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
                             Err(e) => {
-                                tracing::error!(
+                                error!(
                                     "readdir: skipping entry (inode {}) due to error: {:?}",
-                                    inode_id,
-                                    e
+                                    inode_id, e
                                 );
                                 Ok(None)
                             }
@@ -1035,6 +1166,15 @@ impl ZeroFS {
 
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                self.tracer
+                    .emit(
+                        || self.resolve_path_lossy(dirid),
+                        FileOperation::Readdir {
+                            count: entries.len() as u32,
+                        },
+                    )
+                    .await;
 
                 Ok(ReadDirResult {
                     entries,
@@ -1112,6 +1252,7 @@ impl ZeroFS {
             uid,
             gid,
             parent: Some(dirid),
+            name: Some(linkname.to_vec()),
             nlink: 1,
         });
 
@@ -1146,6 +1287,15 @@ impl ZeroFS {
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        self.tracer
+            .emit(
+                || self.resolve_path_lossy(new_id),
+                FileOperation::Symlink {
+                    target: String::from_utf8_lossy(target).to_string(),
+                },
+            )
+            .await;
 
         Ok((
             new_id,
@@ -1220,9 +1370,10 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 file.nlink += 1;
-                // When transitioning from 1 to 2+ links, clear parent for hardlinked files
+                // When transitioning from 1 to 2+ links, clear parent/name for hardlinked files
                 if file.nlink > 1 {
                     file.parent = None;
+                    file.name = None;
                 }
                 file.ctime = now_sec;
                 file.ctime_nsec = now_nsec;
@@ -1235,9 +1386,10 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 special.nlink += 1;
-                // When transitioning from 1 to 2+ links, clear parent for hardlinked files
+                // When transitioning from 1 to 2+ links, clear parent/name for hardlinked files
                 if special.nlink > 1 {
                     special.parent = None;
+                    special.name = None;
                 }
                 special.ctime = now_sec;
                 special.ctime_nsec = now_nsec;
@@ -1266,6 +1418,20 @@ impl ZeroFS {
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+        // Emit event with the original file's path and new link path
+        if self.tracer.has_subscribers() {
+            let file_path = self.resolve_path_lossy(fileid).await;
+            let dir_path = self.resolve_path_lossy(linkdirid).await;
+            let new_path = format!(
+                "{}/{}",
+                dir_path.trim_end_matches('/'),
+                String::from_utf8_lossy(linkname)
+            );
+            self.tracer
+                .emit(|| async { file_path }, FileOperation::Link { new_path })
+                .await;
+        }
 
         Ok(())
     }
@@ -1382,6 +1548,18 @@ impl ZeroFS {
                         }
 
                         self.cache.remove(CacheKey::Metadata(id));
+
+                        self.tracer
+                            .emit(
+                                || self.resolve_path_lossy(id),
+                                FileOperation::Setattr {
+                                    mode: match setattr.mode {
+                                        SetMode::Set(m) => Some(m),
+                                        SetMode::NoChange => None,
+                                    },
+                                },
+                            )
+                            .await;
 
                         return Ok(InodeWithId { inode: &inode, id }.into());
                     }
@@ -1658,6 +1836,18 @@ impl ZeroFS {
             CacheValue::Metadata(Arc::new(inode.clone())),
         );
 
+        self.tracer
+            .emit(
+                || self.resolve_path_lossy(id),
+                FileOperation::Setattr {
+                    mode: match setattr.mode {
+                        SetMode::Set(m) => Some(m),
+                        SetMode::NoChange => None,
+                    },
+                },
+            )
+            .await;
+
         Ok(InodeWithId { inode: &inode, id }.into())
     }
 
@@ -1733,6 +1923,7 @@ impl ZeroFS {
                         _ => creds.gid,
                     },
                     parent: Some(dirid),
+                    name: Some(name.to_vec()),
                     nlink: 1,
                     rdev,
                 };
@@ -1773,6 +1964,13 @@ impl ZeroFS {
                 self.global_stats.commit_update(&stats_update);
 
                 self.cache.remove(CacheKey::Metadata(dirid));
+
+                self.tracer
+                    .emit(
+                        || self.resolve_path_lossy(special_id),
+                        FileOperation::Mknod { mode: final_mode },
+                    )
+                    .await;
 
                 Ok((
                     special_id,
@@ -1836,6 +2034,13 @@ impl ZeroFS {
         };
 
         check_sticky_bit_delete(&dir_inode, &file_inode, &creds)?;
+
+        // Capture path before deletion for tracing (inode will be gone after)
+        let trace_path = if self.tracer.has_subscribers() {
+            Some(self.resolve_path_lossy(file_id).await)
+        } else {
+            None
+        };
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -1950,6 +2155,12 @@ impl ZeroFS {
                 self.cache.remove_batch(futures);
 
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                if let Some(path) = trace_path {
+                    self.tracer
+                        .emit(|| async { path }, FileOperation::Remove)
+                        .await;
+                }
 
                 Ok(())
             }
@@ -2072,6 +2283,13 @@ impl ZeroFS {
         }
 
         check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
+
+        // Capture old path before rename for tracing (name will change after)
+        let trace_old_path = if self.tracer.has_subscribers() {
+            Some(self.resolve_path_lossy(source_inode_id).await)
+        } else {
+            None
+        };
 
         // POSIX: Moving directories in sticky directories requires ownership of the moved directory
         if from_dirid != to_dirid
@@ -2220,34 +2438,43 @@ impl ZeroFS {
         self.directory_store
             .add(&mut txn, to_dirid, to_name, source_inode_id, new_cookie);
 
-        if from_dirid != to_dirid {
-            match &mut source_inode {
-                Inode::Directory(d) => d.parent = to_dirid,
-                Inode::File(f) => {
-                    // Lazy restoration: if nlink == 1, restore parent
-                    if f.nlink == 1 {
+        // Update source inode's name (and parent if directory changed)
+        // For hardlinked files (nlink > 1), parent/name are already None
+        let dir_changed = from_dirid != to_dirid;
+        match &mut source_inode {
+            Inode::Directory(d) => {
+                if dir_changed {
+                    d.parent = to_dirid;
+                }
+                d.name = Some(to_name.to_vec());
+            }
+            Inode::File(f) => {
+                if f.nlink == 1 {
+                    if dir_changed {
                         f.parent = Some(to_dirid);
                     }
-                }
-                Inode::Symlink(s) => {
-                    // Lazy restoration: if nlink == 1, restore parent
-                    if s.nlink == 1 {
-                        s.parent = Some(to_dirid);
-                    }
-                }
-                Inode::Fifo(s)
-                | Inode::Socket(s)
-                | Inode::CharDevice(s)
-                | Inode::BlockDevice(s) => {
-                    // Lazy restoration: if nlink == 1, restore parent
-                    if s.nlink == 1 {
-                        s.parent = Some(to_dirid);
-                    }
+                    f.name = Some(to_name.to_vec());
                 }
             }
-            self.inode_store
-                .save(&mut txn, source_inode_id, &source_inode)?;
+            Inode::Symlink(s) => {
+                if s.nlink == 1 {
+                    if dir_changed {
+                        s.parent = Some(to_dirid);
+                    }
+                    s.name = Some(to_name.to_vec());
+                }
+            }
+            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                if s.nlink == 1 {
+                    if dir_changed {
+                        s.parent = Some(to_dirid);
+                    }
+                    s.name = Some(to_name.to_vec());
+                }
+            }
         }
+        self.inode_store
+            .save(&mut txn, source_inode_id, &source_inode)?;
 
         let (now_sec, now_nsec) = get_current_time();
 
@@ -2342,6 +2569,19 @@ impl ZeroFS {
         }
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
+        // Emit rename event with old path and new path
+        if let Some(old_path) = trace_old_path {
+            let to_dir_path = self.resolve_path_lossy(to_dirid).await;
+            let new_path = format!(
+                "{}/{}",
+                to_dir_path.trim_end_matches('/'),
+                String::from_utf8_lossy(to_name)
+            );
+            self.tracer
+                .emit(|| async { old_path }, FileOperation::Rename { new_path })
+                .await;
+        }
+
         Ok(())
     }
 }
@@ -2405,6 +2645,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: Some(0),
+            name: Some(b"test.txt".to_vec()),
             nlink: 1,
         };
 
@@ -2532,6 +2773,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             parent: Some(0),
+            name: Some(b"test.txt".to_vec()),
             nlink: 1,
         };
         let mut txn = fs_rw.db.new_transaction().unwrap();

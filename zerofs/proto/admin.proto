@@ -12,6 +12,8 @@ service AdminService {
     rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse);
 
     rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
+
+    rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 }
 
 message CheckpointInfo {
@@ -47,4 +49,38 @@ message GetCheckpointInfoRequest {
 
 message GetCheckpointInfoResponse {
     CheckpointInfo checkpoint = 1;
+}
+
+message WatchFileAccessRequest {}
+
+message FileAccessEvent {
+    google.protobuf.Timestamp timestamp = 1;
+    FileOperation operation = 2;
+    string path = 3;
+    OperationParams params = 4;
+}
+
+enum FileOperation {
+    READ = 0;
+    WRITE = 1;
+    CREATE = 2;
+    REMOVE = 3;
+    RENAME = 4;
+    MKDIR = 5;
+    READDIR = 6;
+    LOOKUP = 7;
+    SETATTR = 8;
+    LINK = 9;
+    SYMLINK = 10;
+    MKNOD = 11;
+    TRIM = 12;
+}
+
+message OperationParams {
+    optional uint64 offset = 1;
+    optional uint64 length = 2;
+    optional uint32 mode = 3;
+    optional string new_path = 4;
+    optional string link_target = 5;
+    optional string filename = 6;
 }

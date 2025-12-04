@@ -1,11 +1,14 @@
 use crate::checkpoint_manager::CheckpointManager;
+use crate::fs::tracing::AccessTracer;
 use crate::rpc::proto::{self, admin_service_server::AdminService};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::{BroadcastStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -13,16 +16,23 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
+    tracer: AccessTracer,
 }
 
 impl AdminRpcServer {
-    pub fn new(checkpoint_manager: Arc<CheckpointManager>) -> Self {
-        Self { checkpoint_manager }
+    pub fn new(checkpoint_manager: Arc<CheckpointManager>, tracer: AccessTracer) -> Self {
+        Self {
+            checkpoint_manager,
+            tracer,
+        }
     }
 }
 
 #[tonic::async_trait]
 impl AdminService for AdminRpcServer {
+    type WatchFileAccessStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::FileAccessEvent, Status>> + Send>>;
+
     async fn create_checkpoint(
         &self,
         request: Request<proto::CreateCheckpointRequest>,
@@ -90,6 +100,19 @@ impl AdminService for AdminRpcServer {
                 name
             ))),
         }
+    }
+
+    async fn watch_file_access(
+        &self,
+        _request: Request<proto::WatchFileAccessRequest>,
+    ) -> Result<Response<Self::WatchFileAccessStream>, Status> {
+        let receiver = self.tracer.subscribe();
+
+        let stream = BroadcastStream::new(receiver)
+            .filter_map(|result| result.ok())
+            .map(|event| Ok(event.into()));
+
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 

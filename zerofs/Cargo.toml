@@ -67,7 +67,7 @@ prost = "0.14"
 prost-types = "0.14"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 chrono = "0.4"
 
 [build-dependencies]
