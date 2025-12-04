@@ -1,136 +1,125 @@
-use crate::checkpoint_manager::{CheckpointInfo, CheckpointManager};
-use crate::rpc::ZeroFsService;
+use crate::checkpoint_manager::CheckpointManager;
+use crate::rpc::proto::{self, admin_service_server::AdminService};
 use anyhow::{Context, Result};
-use futures::prelude::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tarpc::server::{self, Channel};
-use tokio::net::{TcpListener, UnixListener};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tonic::{Request, Response, Status};
+use tracing::info;
 
 #[derive(Clone)]
-pub struct ZeroFsServiceImpl {
+pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
 }
 
-impl ZeroFsServiceImpl {
+impl AdminRpcServer {
     pub fn new(checkpoint_manager: Arc<CheckpointManager>) -> Self {
         Self { checkpoint_manager }
     }
 }
 
-impl ZeroFsService for ZeroFsServiceImpl {
+#[tonic::async_trait]
+impl AdminService for AdminRpcServer {
     async fn create_checkpoint(
-        self,
-        _context: tarpc::context::Context,
-        name: String,
-    ) -> Result<CheckpointInfo, String> {
-        self.checkpoint_manager
+        &self,
+        request: Request<proto::CreateCheckpointRequest>,
+    ) -> Result<Response<proto::CreateCheckpointResponse>, Status> {
+        let name = request.into_inner().name;
+
+        let info = self
+            .checkpoint_manager
             .create_checkpoint(&name)
             .await
-            .map_err(|e| format!("Failed to create checkpoint: {}", e))
+            .map_err(|e| Status::internal(format!("Failed to create checkpoint: {}", e)))?;
+
+        Ok(Response::new(proto::CreateCheckpointResponse {
+            checkpoint: Some(info.into()),
+        }))
     }
 
     async fn list_checkpoints(
-        self,
-        _context: tarpc::context::Context,
-    ) -> Result<Vec<CheckpointInfo>, String> {
-        self.checkpoint_manager
+        &self,
+        _request: Request<proto::ListCheckpointsRequest>,
+    ) -> Result<Response<proto::ListCheckpointsResponse>, Status> {
+        let checkpoints = self
+            .checkpoint_manager
             .list_checkpoints()
             .await
-            .map_err(|e| format!("Failed to list checkpoints: {}", e))
+            .map_err(|e| Status::internal(format!("Failed to list checkpoints: {}", e)))?;
+
+        Ok(Response::new(proto::ListCheckpointsResponse {
+            checkpoints: checkpoints.into_iter().map(|c| c.into()).collect(),
+        }))
     }
 
     async fn delete_checkpoint(
-        self,
-        _context: tarpc::context::Context,
-        name: String,
-    ) -> Result<(), String> {
+        &self,
+        request: Request<proto::DeleteCheckpointRequest>,
+    ) -> Result<Response<proto::DeleteCheckpointResponse>, Status> {
+        let name = request.into_inner().name;
+
         self.checkpoint_manager
             .delete_checkpoint(&name)
             .await
-            .map_err(|e| format!("Failed to delete checkpoint: {}", e))
+            .map_err(|e| Status::internal(format!("Failed to delete checkpoint: {}", e)))?;
+
+        Ok(Response::new(proto::DeleteCheckpointResponse {}))
     }
 
     async fn get_checkpoint_info(
-        self,
-        _context: tarpc::context::Context,
-        name: String,
-    ) -> Result<Option<CheckpointInfo>, String> {
-        self.checkpoint_manager
+        &self,
+        request: Request<proto::GetCheckpointInfoRequest>,
+    ) -> Result<Response<proto::GetCheckpointInfoResponse>, Status> {
+        let name = request.into_inner().name;
+
+        let info = self
+            .checkpoint_manager
             .get_checkpoint_info(&name)
             .await
-            .map_err(|e| format!("Failed to get checkpoint info: {}", e))
+            .map_err(|e| Status::internal(format!("Failed to get checkpoint info: {}", e)))?;
+
+        match info {
+            Some(checkpoint) => Ok(Response::new(proto::GetCheckpointInfoResponse {
+                checkpoint: Some(checkpoint.into()),
+            })),
+            None => Err(Status::not_found(format!(
+                "Checkpoint '{}' not found",
+                name
+            ))),
+        }
     }
 }
 
+/// Serve gRPC over TCP
 pub async fn serve_tcp(
     addr: SocketAddr,
-    service: ZeroFsServiceImpl,
+    service: AdminRpcServer,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind RPC TCP server to {}", addr))?;
-
     info!("RPC server listening on {}", addr);
 
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                info!("RPC TCP server shutting down on {}", addr);
-                break;
-            }
-            result = listener.accept() => {
-                let (stream, peer_addr) = match result {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!("Failed to accept RPC TCP connection: {}", e);
-                        continue;
-                    }
-                };
+    let grpc_service = proto::admin_service_server::AdminServiceServer::new(service);
 
-                let service = service.clone();
-                let client_shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    let framed = Framed::new(stream, LengthDelimitedCodec::new());
-                    let transport = tarpc::serde_transport::new(
-                        framed,
-                        tarpc::tokio_serde::formats::Bincode::default(),
-                    );
+    tonic::transport::Server::builder()
+        .add_service(grpc_service)
+        .serve_with_shutdown(addr, shutdown.cancelled_owned())
+        .await
+        .with_context(|| format!("Failed to run RPC TCP server on {}", addr))?;
 
-                    let channel = server::BaseChannel::new(server::Config::default(), transport);
-
-                    info!("RPC client connected from {}", peer_addr);
-
-                    tokio::select! {
-                        _ = client_shutdown.cancelled() => {
-                            debug!("RPC client handler shutting down");
-                        }
-                        _ = channel
-                            .execute(service.serve())
-                            .for_each(|response| async move {
-                                tokio::spawn(response);
-                            }) => {
-                            info!("RPC client disconnected from {}", peer_addr);
-                        }
-                    }
-                });
-            }
-        }
-    }
-
+    info!("RPC TCP server shutting down on {}", addr);
     Ok(())
 }
 
+/// Serve gRPC over Unix socket
 pub async fn serve_unix(
     socket_path: PathBuf,
-    service: ZeroFsServiceImpl,
+    service: AdminRpcServer,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    // Remove existing socket file if present
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)
             .with_context(|| format!("Failed to remove existing socket file: {:?}", socket_path))?;
@@ -141,49 +130,16 @@ pub async fn serve_unix(
 
     info!("RPC server listening on Unix socket: {:?}", socket_path);
 
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                info!("RPC Unix socket server shutting down at {:?}", socket_path);
-                break;
-            }
-            result = listener.accept() => {
-                let (stream, _peer_addr) = match result {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        error!("Failed to accept RPC Unix socket connection: {}", e);
-                        continue;
-                    }
-                };
+    let uds_stream = UnixListenerStream::new(listener);
 
-                let service = service.clone();
-                let client_shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    let framed = Framed::new(stream, LengthDelimitedCodec::new());
-                    let transport = tarpc::serde_transport::new(
-                        framed,
-                        tarpc::tokio_serde::formats::Bincode::default(),
-                    );
+    let grpc_service = proto::admin_service_server::AdminServiceServer::new(service);
 
-                    let channel = server::BaseChannel::new(server::Config::default(), transport);
+    tonic::transport::Server::builder()
+        .add_service(grpc_service)
+        .serve_with_incoming_shutdown(uds_stream, shutdown.cancelled_owned())
+        .await
+        .with_context(|| format!("Failed to run RPC Unix socket server on {:?}", socket_path))?;
 
-                    info!("RPC client connected via Unix socket");
-                    tokio::select! {
-                        _ = client_shutdown.cancelled() => {
-                            debug!("RPC client handler shutting down");
-                        }
-                        _ = channel
-                            .execute(service.serve())
-                            .for_each(|response| async move {
-                                tokio::spawn(response);
-                            }) => {
-                            info!("RPC client disconnected");
-                        }
-                    }
-                });
-            }
-        }
-    }
-
+    info!("RPC Unix socket server shutting down at {:?}", socket_path);
     Ok(())
 }

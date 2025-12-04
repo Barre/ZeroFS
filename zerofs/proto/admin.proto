@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package zerofs.admin;
+
+import "google/protobuf/timestamp.proto";
+
+service AdminService {
+    rpc CreateCheckpoint(CreateCheckpointRequest) returns (CreateCheckpointResponse);
+
+    rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+    rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse);
+
+    rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
+}
+
+message CheckpointInfo {
+    // UUID as string
+    string id = 1;
+    string name = 2;
+    google.protobuf.Timestamp created_at = 3;
+}
+
+message CreateCheckpointRequest {
+    string name = 1;
+}
+
+message CreateCheckpointResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message ListCheckpointsRequest {}
+
+message ListCheckpointsResponse {
+    repeated CheckpointInfo checkpoints = 1;
+}
+
+message DeleteCheckpointRequest {
+    string name = 1;
+}
+
+message DeleteCheckpointResponse {}
+
+message GetCheckpointInfoRequest {
+    string name = 1;
+}
+
+message GetCheckpointInfoResponse {
+    CheckpointInfo checkpoint = 1;
+}

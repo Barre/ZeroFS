@@ -71,7 +71,7 @@ jobs:
           EOF
 
           # Start ZeroFS in the background
-          cargo run --profile ci -- run -c zerofs-test.toml &
+          ./target/ci/zerofs run -c zerofs-test.toml &
           echo $! > /tmp/zerofs-test.pid
 
           # Wait for ZeroFS to start
@@ -108,7 +108,7 @@ jobs:
           EOF
 
           # Start ZeroFS in the background
-          cargo run --profile ci -- run -c zerofs-scratch.toml &
+          ./target/ci/zerofs run -c zerofs-scratch.toml &
           echo $! > /tmp/zerofs-scratch.pid
 
           # Wait for ZeroFS to start
