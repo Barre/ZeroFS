@@ -61,26 +61,33 @@ impl ChunkStore {
         let end_chunk = (end - 1) / CHUNK_SIZE as u64;
         let start_offset = (offset % CHUNK_SIZE as u64) as usize;
 
-        let chunks: Result<Vec<Bytes>, FsError> = stream::iter(start_chunk..=end_chunk)
-            .map(|chunk_idx| {
-                let store = self.clone();
-                async move {
-                    store
-                        .get(id, chunk_idx)
-                        .await
-                        .map(|opt_data| opt_data.unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK)))
-                }
-            })
-            .buffered(PARALLEL_CHUNK_OPS)
-            .try_collect()
-            .await;
+        let start_key = KeyCodec::chunk_key(id, start_chunk);
+        let end_key = KeyCodec::chunk_key(id, end_chunk + 1);
 
-        let chunks = chunks?;
+        let mut chunk_map: HashMap<u64, Bytes> = HashMap::new();
+        let mut stream = self.db.scan(start_key..end_key).await.map_err(|e| {
+            error!("Failed to scan chunks (inode={}): {}", id, e);
+            FsError::IoError
+        })?;
+
+        while let Some(result) = stream.next().await {
+            let (key, value) = result.map_err(|e| {
+                error!("Failed to read chunk during scan (inode={}): {}", id, e);
+                FsError::IoError
+            })?;
+            if let Some(chunk_idx) = KeyCodec::parse_chunk_key(&key) {
+                chunk_map.insert(chunk_idx, value);
+            }
+        }
 
         let mut result = BytesMut::with_capacity(length as usize);
 
-        for (i, chunk_data) in chunks.into_iter().enumerate() {
-            let chunk_idx = start_chunk + i as u64;
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_data = chunk_map
+                .get(&chunk_idx)
+                .map(|b| b.as_ref())
+                .unwrap_or(ZERO_CHUNK);
+
             let chunk_start = if chunk_idx == start_chunk {
                 start_offset
             } else {

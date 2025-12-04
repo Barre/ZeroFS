@@ -105,6 +105,14 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
+    pub fn parse_chunk_key(key: &[u8]) -> Option<u64> {
+        if key.len() != KEY_CHUNK_SIZE || key[0] != PREFIX_CHUNK {
+            return None;
+        }
+        let chunk_bytes: [u8; U64_SIZE] = key[KEY_INODE_SIZE..KEY_CHUNK_SIZE].try_into().ok()?;
+        Some(u64::from_be_bytes(chunk_bytes))
+    }
+
     pub fn dir_entry_key(dir_id: InodeId, name: &[u8]) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE + name.len());
         key.push(u8::from(KeyPrefix::DirEntry));
