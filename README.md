@@ -25,7 +25,7 @@ ZeroFS makes S3 storage feel like a real filesystem. It provides **file-level ac
 - **NFS Server** - Mount as a network filesystem on any OS
 - **9P Server** - High-performance alternative with better POSIX semantics
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
-- **Always Encrypted** - ChaCha20-Poly1305 encryption with compression
+- **Always Encrypted** - XChaCha20-Poly1305 encryption with compression
 - **High Performance** - Multi-layered caching with microsecond latencies
 - **S3 Compatible** - Works with any S3-compatible storage
 
@@ -347,7 +347,7 @@ unix_socket = "/tmp/zerofs.rpc.sock"
 
 ### Encryption
 
-Encryption is always enabled in ZeroFS. All file data is encrypted using ChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
+Encryption is always enabled in ZeroFS. All file data is encrypted using XChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
 
 ```toml
 [storage]

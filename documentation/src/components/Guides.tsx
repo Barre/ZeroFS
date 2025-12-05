@@ -5,7 +5,7 @@ const guides = [
   {
     href: '/encryption',
     name: 'Encryption & Security',
-    description: 'Learn how ZeroFS encrypts your data with ChaCha20-Poly1305.',
+    description: 'Learn how ZeroFS encrypts your data with XChaCha20-Poly1305.',
   },
   {
     href: '/configuration',

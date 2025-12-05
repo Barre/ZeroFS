@@ -20,7 +20,7 @@ const ARGON2_PARALLELISM: u32 = 4;
 pub struct WrappedDataKey {
     /// Salt for Argon2 password derivation
     pub salt: String,
-    /// Nonce for ChaCha20-Poly1305 encryption of the DEK
+    /// Nonce for XChaCha20-Poly1305 encryption of the DEK
     pub nonce: [u8; 12],
     /// Encrypted data encryption key
     pub wrapped_dek: Vec<u8>,

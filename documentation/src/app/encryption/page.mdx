@@ -3,12 +3,12 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Encryption & Security',
   description:
-    'Learn how ZeroFS protects your data with ChaCha20-Poly1305 encryption, secure key management, and best practices for production deployments.',
+    'Learn how ZeroFS protects your data with XChaCha20-Poly1305 encryption, secure key management, and best practices for production deployments.',
 }
 
 # Encryption & Security
 
-ZeroFS encrypts all your data by default using ChaCha20-Poly1305. In this guide, we'll explore how encryption works, what's protected, and security best practices for deployments. {{ className: 'lead' }}
+ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide, we'll explore how encryption works, what's protected, and security best practices for deployments. {{ className: 'lead' }}
 
 ## How Encryption Works
 
@@ -25,7 +25,7 @@ ZeroFS encrypts all your data by default using ChaCha20-Poly1305. In this guide,
 
     ### Encryption Algorithm
 
-    - **Algorithm**: ChaCha20-Poly1305
+    - **Algorithm**: XChaCha20-Poly1305
     - **Compression**: LZ4 compression before encryption
     - **Key Derivation**: Argon2id
 
