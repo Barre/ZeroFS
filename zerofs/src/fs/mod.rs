@@ -2306,21 +2306,27 @@ impl ZeroFS {
             }
         }
 
-        let target = if let Some(target_id) = target_inode_id {
-            let inode = self.get_inode_cached(target_id).await?;
-            if let Inode::Directory(dir) = &inode
-                && dir.entry_count > 0
-            {
-                return Err(FsError::NotEmpty);
-            }
+        let same_inode = target_inode_id == Some(source_inode_id);
 
-            let target_dir = if let Some(ref to_dir) = to_dir {
-                to_dir
+        let target = if let Some(target_id) = target_inode_id {
+            if same_inode {
+                None
             } else {
-                &from_dir
-            };
-            check_sticky_bit_delete(target_dir, &inode, &creds)?;
-            Some((target_id, inode))
+                let inode = self.get_inode_cached(target_id).await?;
+                if let Inode::Directory(dir) = &inode
+                    && dir.entry_count > 0
+                {
+                    return Err(FsError::NotEmpty);
+                }
+
+                let target_dir = if let Some(ref to_dir) = to_dir {
+                    to_dir
+                } else {
+                    &from_dir
+                };
+                check_sticky_bit_delete(target_dir, &inode, &creds)?;
+                Some((target_id, inode))
+            }
         } else {
             None
         };
@@ -2420,6 +2426,11 @@ impl ZeroFS {
 
             self.directory_store
                 .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
+        } else if same_inode {
+            // When source and target are the same inode, we still need to unlink the target entry
+            // but we skip the inode processing above since we handle nlink when saving source_inode
+            self.directory_store
+                .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         }
 
         self.directory_store
@@ -2440,7 +2451,9 @@ impl ZeroFS {
 
         // Update source inode's name (and parent if directory changed)
         // For hardlinked files (nlink > 1), parent/name are already None
+        // When same_inode is true, we need to decrement nlink since we're removing the target entry
         let dir_changed = from_dirid != to_dirid;
+        let (now_sec, now_nsec) = get_current_time();
         match &mut source_inode {
             Inode::Directory(d) => {
                 if dir_changed {
@@ -2449,10 +2462,15 @@ impl ZeroFS {
                 d.name = Some(to_name.to_vec());
             }
             Inode::File(f) => {
+                // When renaming one hardlink over another to the same inode,
+                // decrement nlink since we're removing the target entry
+                if same_inode {
+                    f.nlink = f.nlink.saturating_sub(1);
+                    f.ctime = now_sec;
+                    f.ctime_nsec = now_nsec;
+                }
                 if f.nlink == 1 {
-                    if dir_changed {
-                        f.parent = Some(to_dirid);
-                    }
+                    f.parent = Some(to_dirid);
                     f.name = Some(to_name.to_vec());
                 }
             }
@@ -2465,18 +2483,19 @@ impl ZeroFS {
                 }
             }
             Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
+                if same_inode {
+                    s.nlink = s.nlink.saturating_sub(1);
+                    s.ctime = now_sec;
+                    s.ctime_nsec = now_nsec;
+                }
                 if s.nlink == 1 {
-                    if dir_changed {
-                        s.parent = Some(to_dirid);
-                    }
+                    s.parent = Some(to_dirid);
                     s.name = Some(to_name.to_vec());
                 }
             }
         }
         self.inode_store
             .save(&mut txn, source_inode_id, &source_inode)?;
-
-        let (now_sec, now_nsec) = get_current_time();
 
         let is_moved_dir = matches!(source_inode, Inode::Directory(_));
 
@@ -3673,6 +3692,99 @@ mod tests {
             }
             _ => panic!("Expected file inode"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_rename_hardlink_over_same_inode() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"test content".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        match &inode {
+            Inode::File(f) => assert_eq!(f.nlink, 1, "Initial nlink should be 1"),
+            _ => panic!("Expected file inode"),
+        }
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        match &inode {
+            Inode::File(f) => assert_eq!(f.nlink, 2, "After link, nlink should be 2"),
+            _ => panic!("Expected file inode"),
+        }
+
+        let root_inode = fs.inode_store.get(0).await.unwrap();
+        match &root_inode {
+            Inode::Directory(d) => assert_eq!(d.entry_count, 2, "Directory should have 2 entries"),
+            _ => panic!("Expected directory inode"),
+        }
+
+        fs.rename(
+            &(&test_auth()).into(),
+            0,
+            b"hardlink.txt",
+            0,
+            b"original.txt",
+        )
+        .await
+        .unwrap();
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        match &inode {
+            Inode::File(f) => {
+                assert_eq!(f.nlink, 1, "After rename, nlink should be 1");
+                // Since nlink is 1, parent and name should be set
+                assert_eq!(f.parent, Some(0), "Parent should be set to root");
+                assert_eq!(f.name, Some(b"original.txt".to_vec()), "Name should be set");
+            }
+            _ => panic!("Expected file inode"),
+        }
+
+        let root_inode = fs.inode_store.get(0).await.unwrap();
+        match &root_inode {
+            Inode::Directory(d) => assert_eq!(d.entry_count, 1, "Directory should have 1 entry"),
+            _ => panic!("Expected directory inode"),
+        }
+
+        let result = fs.directory_store.get(0, b"hardlink.txt").await;
+        assert!(matches!(result, Err(FsError::NotFound)));
+
+        let stored_id = fs.directory_store.get(0, b"original.txt").await.unwrap();
+        assert_eq!(stored_id, file_id, "original.txt should point to the file");
+
+        let (read_data, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(read_data.as_ref(), b"test content");
+
+        fs.remove(&(&test_auth()).into(), 0, b"original.txt")
+            .await
+            .unwrap();
+
+        let root_inode = fs.inode_store.get(0).await.unwrap();
+        match &root_inode {
+            Inode::Directory(d) => assert_eq!(d.entry_count, 0, "Directory should be empty"),
+            _ => panic!("Expected directory inode"),
+        }
+
+        let result = fs.inode_store.get(file_id).await;
+        assert!(matches!(result, Err(FsError::NotFound)));
     }
 
     #[tokio::test]
