@@ -278,7 +278,6 @@ impl ZeroFS {
     #[cfg(test)]
     pub async fn new_in_memory_with_encryption(encryption_key: [u8; 32]) -> anyhow::Result<Self> {
         use slatedb::DbBuilder;
-        use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
         use slatedb::object_store::path::Path;
 
         let object_store = slatedb::object_store::memory::InMemory::new();
@@ -292,16 +291,10 @@ impl ZeroFS {
             ..Default::default()
         };
 
-        let test_cache_bytes = 50_000_000u64;
-        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: test_cache_bytes,
-        }));
-
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
-                .with_memory_cache(cache)
                 .build()
                 .await?,
         );
@@ -2627,7 +2620,6 @@ mod tests {
     #[tokio::test]
     async fn test_read_only_mode_operations() {
         use slatedb::DbBuilder;
-        use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
         use slatedb::object_store::path::Path;
 
         let object_store = slatedb::object_store::memory::InMemory::new();
@@ -2642,16 +2634,10 @@ mod tests {
             ..Default::default()
         };
 
-        let test_cache_bytes = 50_000_000u64;
-        let cache = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: test_cache_bytes,
-        }));
-
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
-                .with_memory_cache(cache)
                 .build()
                 .await
                 .unwrap(),
