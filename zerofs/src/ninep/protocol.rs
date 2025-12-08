@@ -797,7 +797,4 @@ impl P9Message {
         }
     }
 
-    pub fn error(tag: u16, ecode: u32) -> Self {
-        Self::new(tag, Message::Rlerror(Rlerror { ecode }))
-    }
 }
