@@ -11,8 +11,6 @@ struct PreviousSnapshot {
     bytes_written: u64,
     read_operations: u64,
     write_operations: u64,
-    cache_hits: u64,
-    cache_misses: u64,
     timestamp: Instant,
 }
 
@@ -39,10 +37,6 @@ pub struct FileSystemStats {
     pub tombstones_processed: AtomicU64,
     pub gc_chunks_deleted: AtomicU64,
     pub gc_runs: AtomicU64,
-
-    // Cache statistics
-    pub cache_hits: AtomicU64,
-    pub cache_misses: AtomicU64,
 
     // Performance
     pub total_operations: AtomicU64,
@@ -71,8 +65,6 @@ impl FileSystemStats {
             tombstones_processed: AtomicU64::new(0),
             gc_chunks_deleted: AtomicU64::new(0),
             gc_runs: AtomicU64::new(0),
-            cache_hits: AtomicU64::new(0),
-            cache_misses: AtomicU64::new(0),
             total_operations: AtomicU64::new(0),
             last_snapshot: std::sync::Mutex::new(PreviousSnapshot {
                 total_operations: 0,
@@ -80,8 +72,6 @@ impl FileSystemStats {
                 bytes_written: 0,
                 read_operations: 0,
                 write_operations: 0,
-                cache_hits: 0,
-                cache_misses: 0,
                 timestamp: Instant::now(),
             }),
         }
@@ -109,8 +99,6 @@ impl FileSystemStats {
         let gc_chunks = self.gc_chunks_deleted.load(Ordering::Relaxed);
         let gc_runs = self.gc_runs.load(Ordering::Relaxed);
 
-        let cache_hits = self.cache_hits.load(Ordering::Relaxed);
-        let cache_misses = self.cache_misses.load(Ordering::Relaxed);
         let total_ops = self.total_operations.load(Ordering::Relaxed);
 
         let mut snapshot = self.last_snapshot.lock().unwrap();
@@ -146,24 +134,12 @@ impl FileSystemStats {
             0.0
         };
 
-        // Calculate interval cache rate
-        let interval_cache_hits = cache_hits - snapshot.cache_hits;
-        let interval_cache_misses = cache_misses - snapshot.cache_misses;
-        let interval_cache_rate = if interval_cache_hits + interval_cache_misses > 0 {
-            (interval_cache_hits as f64 / (interval_cache_hits + interval_cache_misses) as f64)
-                * 100.0
-        } else {
-            0.0
-        };
-
         *snapshot = PreviousSnapshot {
             total_operations: total_ops,
             bytes_read,
             bytes_written,
             read_operations: read_ops,
             write_operations: write_ops,
-            cache_hits,
-            cache_misses,
             timestamp: Instant::now(),
         };
 
@@ -263,33 +239,6 @@ impl FileSystemStats {
                 gc_chunks.to_formatted_string(&Locale::en),
                 gc_runs.to_formatted_string(&Locale::en)
             )),
-        ]);
-
-        // Cache Performance section
-        table.add_row(vec![
-            Cell::new("Cache Performance (5s interval)")
-                .fg(Color::Yellow)
-                .add_attribute(Attribute::Bold),
-            Cell::new(""),
-        ]);
-
-        let cache_color = if interval_cache_rate > 90.0 {
-            Color::Green
-        } else if interval_cache_rate > 70.0 {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-
-        table.add_row(vec![
-            Cell::new("  Hit rate"),
-            Cell::new(format!(
-                "{:.1}% ({} hits, {} misses)",
-                interval_cache_rate,
-                interval_cache_hits.to_formatted_string(&Locale::en),
-                interval_cache_misses.to_formatted_string(&Locale::en)
-            ))
-            .fg(cache_color),
         ]);
 
         table.to_string()

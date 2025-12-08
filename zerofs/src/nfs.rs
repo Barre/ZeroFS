@@ -55,7 +55,7 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn getattr(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<fattr3, nfsstat3> {
         debug!("getattr called: id={}", id);
-        let inode = self.fs.get_inode_cached(id).await?;
+        let inode = self.fs.inode_store.get(id).await?;
         Ok(InodeWithId { inode: &inode, id }.into())
     }
 
@@ -271,7 +271,7 @@ impl NFSFileSystem for NFSAdapter {
     async fn readlink(&self, _auth: &NfsAuthContext, id: fileid3) -> Result<nfspath3, nfsstat3> {
         debug!("readlink called: id={}", id);
 
-        let inode = self.fs.get_inode_cached(id).await?;
+        let inode = self.fs.inode_store.get(id).await?;
 
         match inode {
             Inode::Symlink(symlink) => Ok(nfspath3 { 0: symlink.target }),

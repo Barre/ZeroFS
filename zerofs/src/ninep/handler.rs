@@ -208,7 +208,7 @@ impl NinePHandler {
             groups_count: 1,
         };
 
-        let root_inode = match self.filesystem.get_inode_cached(0).await {
+        let root_inode = match self.filesystem.inode_store.get(0).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -260,7 +260,7 @@ impl NinePHandler {
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             };
 
-            let child_inode = match self.filesystem.get_inode_cached(child_id).await {
+            let child_inode = match self.filesystem.inode_store.get(child_id).await {
                 Ok(i) => i,
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             };
@@ -315,7 +315,7 @@ impl NinePHandler {
             tl.fid, inode_id, creds.uid, creds.gid, tl.flags
         );
 
-        let inode = match self.filesystem.get_inode_cached(inode_id).await {
+        let inode = match self.filesystem.inode_store.get(inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -553,7 +553,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
+        match self.filesystem.inode_store.get(fid_entry.inode_id).await {
             Ok(inode) => P9Message::new(
                 tag,
                 Message::Rgetattr(Rgetattr {
@@ -753,7 +753,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        let inode = match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
+        let inode = match self.filesystem.inode_store.get(fid_entry.inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -906,7 +906,7 @@ impl NinePHandler {
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
 
-        let child_inode = match self.filesystem.get_inode_cached(child_id).await {
+        let child_inode = match self.filesystem.inode_store.get(child_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
