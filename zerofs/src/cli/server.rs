@@ -560,7 +560,10 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
 
     info!("Starting ZeroFS server with {} backend", object_store);
     info!("DB Path: {}", actual_db_path);
-    info!("Base Cache Directory: {}", cache_config.root_folder.display());
+    info!(
+        "Base Cache Directory: {}",
+        cache_config.root_folder.display()
+    );
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
     info!("Checking bucket identity...");

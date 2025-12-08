@@ -704,10 +704,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // Handle zero-length read
         if length == 0 {
             // Spec says behavior is unspecified but server SHOULD NOT disconnect
-            if let Err(e) = self
-                .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                .await
-            {
+            if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                 debug!("Failed to send read reply: {:?}", e);
                 return NBD_EIO;
             }
@@ -736,7 +733,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBD_SUCCESS
             }
             Err(e) => {
-                error!("NBD read failed at offset {}, length {}: {:?}", offset, length, e);
+                error!(
+                    "NBD read failed at offset {}, length {}: {:?}",
+                    offset, length, e
+                );
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                 NBD_EIO
             }
@@ -763,10 +763,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         // Handle zero-length write
         if length == 0 {
-            if let Err(e) = self
-                .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                .await
-            {
+            if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                 debug!("Failed to send write reply: {:?}", e);
                 return NBD_EIO;
             }
@@ -797,17 +794,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     return NBD_EIO;
                 }
 
-                if let Err(e) = self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                    .await
-                {
+                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                     debug!("Failed to send write reply: {:?}", e);
                     return NBD_EIO;
                 }
                 NBD_SUCCESS
             }
             Err(e) => {
-                error!("NBD write failed at offset {}, length {}: {:?}", offset, length, e);
+                error!(
+                    "NBD write failed at offset {}, length {}: {:?}",
+                    offset, length, e
+                );
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
                 NBD_EIO
             }
@@ -817,10 +814,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_flush(&mut self, cookie: u64) -> u32 {
         match self.filesystem.flush_coordinator.flush().await {
             Ok(_) => {
-                if let Err(e) = self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                    .await
-                {
+                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                     debug!("Failed to send flush reply: {:?}", e);
                     return NBD_EIO;
                 }
@@ -852,10 +846,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // Handle zero-length trim
         if length == 0 {
             // Spec says behavior is unspecified but server SHOULD NOT disconnect
-            if let Err(e) = self
-                .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                .await
-            {
+            if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                 debug!("Failed to send trim reply: {:?}", e);
                 return NBD_EIO;
             }
@@ -882,10 +873,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     return NBD_EIO;
                 }
 
-                if let Err(e) = self
-                    .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                    .await
-                {
+                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                     debug!("Failed to send trim reply: {:?}", e);
                     return NBD_EIO;
                 }
@@ -915,10 +903,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         // Handle zero-length write_zeroes
         if length == 0 {
-            if let Err(e) = self
-                .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                .await
-            {
+            if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                 debug!("Failed to send write_zeroes reply: {:?}", e);
                 return NBD_EIO;
             }
@@ -960,7 +945,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
 
         if let Some(e) = write_error {
-            error!("NBD write_zeroes failed at offset {}: {:?}", current_offset, e);
+            error!(
+                "NBD write_zeroes failed at offset {}: {:?}",
+                current_offset, e
+            );
             let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
             NBD_EIO
         } else {
@@ -973,10 +961,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 return NBD_EIO;
             }
 
-            if let Err(e) = self
-                .send_simple_reply(cookie, NBD_SUCCESS, &[])
-                .await
-            {
+            if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
                 debug!("Failed to send write_zeroes reply: {:?}", e);
                 return NBD_EIO;
             }
@@ -996,10 +981,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return NBD_EINVAL;
         }
 
-        if let Err(e) = self
-            .send_simple_reply(cookie, NBD_SUCCESS, &[])
-            .await
-        {
+        if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
             debug!("Failed to send cache reply: {:?}", e);
             return NBD_EIO;
         }
