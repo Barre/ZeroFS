@@ -56,6 +56,36 @@ impl FileLockManager {
         }
     }
 
+    /// Inserts a lock into all tracking structures and returns the new lock ID.
+    /// Must be called while holding the lock_mutex.
+    fn insert_lock(&self, session_id: u64, lock: FileLock) -> LockId {
+        let lock_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
+        let inode_id = lock.inode_id;
+        self.locks.insert(lock_id, lock);
+        self.locks_by_session
+            .entry(session_id)
+            .or_default()
+            .push(lock_id);
+        self.locks_by_inode
+            .entry(inode_id)
+            .or_default()
+            .push(lock_id);
+        lock_id
+    }
+
+    /// Removes a lock from all tracking structures.
+    /// Must be called while holding the lock_mutex.
+    fn remove_lock(&self, session_id: u64, lock_id: LockId) {
+        if let Some((_, lock)) = self.locks.remove(&lock_id) {
+            if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
+                session_locks.retain(|id| id != &lock_id);
+            }
+            if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&lock.inode_id) {
+                inode_locks.retain(|id| id != &lock_id);
+            }
+        }
+    }
+
     /// Attempts to add a lock, returning the lock ID on success or `None` on conflict.
     pub async fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Option<LockId> {
         let _guard = self.lock_mutex.lock().await;
@@ -68,45 +98,24 @@ impl FileLockManager {
                 if let Some(existing_lock) = self.locks.get(lock_id)
                     && existing_lock.inode_id == lock.inode_id
                     && existing_lock.fid == lock.fid
+                    && lock.start < existing_lock.end()
+                    && lock.end() > existing_lock.start
                 {
-                    if lock.start < existing_lock.end() && lock.end() > existing_lock.start {
-                        // Overlapping lock from same session - mark for removal
-                        to_remove.push(*lock_id);
-                    }
+                    // Overlapping lock from same session - mark for removal
+                    to_remove.push(*lock_id);
                 }
             }
         }
 
         for lock_id in to_remove {
-            if let Some((_, old_lock)) = self.locks.remove(&lock_id) {
-                if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
-                    session_locks.retain(|id| id != &lock_id);
-                }
-                if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&old_lock.inode_id) {
-                    inode_locks.retain(|id| id != &lock_id);
-                }
-            }
+            self.remove_lock(session_id, lock_id);
         }
 
         if self.check_lock_conflict(lock.inode_id, &lock, session_id) {
             return None;
         }
 
-        let lock_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
-
-        self.locks.insert(lock_id, lock.clone());
-
-        self.locks_by_session
-            .entry(session_id)
-            .or_default()
-            .push(lock_id);
-
-        self.locks_by_inode
-            .entry(lock.inode_id)
-            .or_default()
-            .push(lock_id);
-
-        Some(lock_id)
+        Some(self.insert_lock(session_id, lock))
     }
 
     pub async fn unlock_range(
@@ -151,14 +160,7 @@ impl FileLockManager {
             let lock_end = existing_lock.end();
 
             // Remove the original lock
-            if let Some((_, _)) = self.locks.remove(&lock_id) {
-                if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
-                    session_locks.retain(|id| id != &lock_id);
-                }
-                if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&inode_id) {
-                    inode_locks.retain(|id| id != &lock_id);
-                }
-            }
+            self.remove_lock(session_id, lock_id);
 
             // Handle lock splitting if necessary
             if start > existing_lock.start && unlock_end < lock_end {
@@ -172,17 +174,7 @@ impl FileLockManager {
                     fid: existing_lock.fid,
                     inode_id: existing_lock.inode_id,
                 };
-
-                let first_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
-                self.locks.insert(first_id, first_part);
-                self.locks_by_session
-                    .entry(session_id)
-                    .or_default()
-                    .push(first_id);
-                self.locks_by_inode
-                    .entry(inode_id)
-                    .or_default()
-                    .push(first_id);
+                self.insert_lock(session_id, first_part);
 
                 // Create second part (after unlock range)
                 let second_length = if existing_lock.length == 0 {
@@ -200,17 +192,7 @@ impl FileLockManager {
                     fid: existing_lock.fid,
                     inode_id: existing_lock.inode_id,
                 };
-
-                let second_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
-                self.locks.insert(second_id, second_part);
-                self.locks_by_session
-                    .entry(session_id)
-                    .or_default()
-                    .push(second_id);
-                self.locks_by_inode
-                    .entry(inode_id)
-                    .or_default()
-                    .push(second_id);
+                self.insert_lock(session_id, second_part);
             } else if start <= existing_lock.start && unlock_end < lock_end {
                 // Keep only the part after unlock range
                 let new_length = if existing_lock.length == 0 {
@@ -228,17 +210,7 @@ impl FileLockManager {
                     fid: existing_lock.fid,
                     inode_id: existing_lock.inode_id,
                 };
-
-                let new_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
-                self.locks.insert(new_id, new_lock);
-                self.locks_by_session
-                    .entry(session_id)
-                    .or_default()
-                    .push(new_id);
-                self.locks_by_inode
-                    .entry(inode_id)
-                    .or_default()
-                    .push(new_id);
+                self.insert_lock(session_id, new_lock);
             } else if start > existing_lock.start && unlock_end >= lock_end {
                 // Keep only the part before unlock range
                 let new_lock = FileLock {
@@ -250,17 +222,7 @@ impl FileLockManager {
                     fid: existing_lock.fid,
                     inode_id: existing_lock.inode_id,
                 };
-
-                let new_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
-                self.locks.insert(new_id, new_lock);
-                self.locks_by_session
-                    .entry(session_id)
-                    .or_default()
-                    .push(new_id);
-                self.locks_by_inode
-                    .entry(inode_id)
-                    .or_default()
-                    .push(new_id);
+                self.insert_lock(session_id, new_lock);
             }
         }
 

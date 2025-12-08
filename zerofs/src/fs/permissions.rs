@@ -37,6 +37,10 @@ impl Credentials {
         creds
     }
 
+    pub fn with_gid(self, gid: u32) -> Self {
+        Self { gid, ..self }
+    }
+
     pub fn is_member_of_group(&self, gid: u32) -> bool {
         if self.gid == gid {
             return true;
