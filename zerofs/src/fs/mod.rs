@@ -30,7 +30,9 @@ pub use self::gc::GarbageCollector;
 pub use self::write_coordinator::SequenceGuard;
 
 use self::errors::FsError;
-use self::inode::{DirectoryInode, FileInode, Inode, InodeId, SpecialInode, SymlinkInode};
+use self::inode::{
+    DirectoryInode, FileInode, Inode, InodeAttrs, InodeId, SpecialInode, SymlinkInode,
+};
 use self::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, check_sticky_bit_delete,
     validate_mode,
@@ -349,15 +351,7 @@ impl ZeroFS {
 
         while current_id != 0 {
             let inode = self.inode_store.get(current_id).await?;
-            let parent_id = match inode {
-                Inode::Directory(d) => Some(d.parent),
-                Inode::File(f) => f.parent,
-                Inode::Symlink(s) => s.parent,
-                Inode::Fifo(s) => s.parent,
-                Inode::Socket(s) => s.parent,
-                Inode::CharDevice(s) => s.parent,
-                Inode::BlockDevice(s) => s.parent,
-            };
+            let parent_id = inode.parent();
 
             // If parent is None (file is hardlinked), can't determine ancestry
             let Some(pid) = parent_id else {
@@ -392,15 +386,7 @@ impl ZeroFS {
         }
 
         let inode = self.inode_store.get(id).await?;
-        let parent_id = match &inode {
-            Inode::Directory(d) => Some(d.parent),
-            Inode::File(f) => f.parent,
-            Inode::Symlink(s) => s.parent,
-            Inode::Fifo(s) => s.parent,
-            Inode::Socket(s) => s.parent,
-            Inode::CharDevice(s) => s.parent,
-            Inode::BlockDevice(s) => s.parent,
-        };
+        let parent_id = inode.parent();
 
         // If parent is None (file is hardlinked), skip parent permission checks
         let Some(mut current_id) = parent_id else {
@@ -1140,11 +1126,6 @@ impl ZeroFS {
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
 
-        let (_default_uid, _default_gid) = match &dir_inode {
-            Inode::Directory(d) => (d.uid, d.gid),
-            _ => (65534, 65534),
-        };
-
         let dir = match &mut dir_inode {
             Inode::Directory(d) => d,
             _ => return Err(FsError::NotDirectory),
@@ -1792,14 +1773,6 @@ impl ZeroFS {
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
-
-        let (_default_uid, _default_gid, _parent_mode) = match &dir_inode {
-            Inode::Directory(d) => (d.uid, d.gid, d.mode),
-            _ => {
-                debug!("Parent is not a directory");
-                return Err(FsError::NotDirectory);
-            }
-        };
 
         match &mut dir_inode {
             Inode::Directory(dir) => {

@@ -164,176 +164,41 @@ impl From<InodeWithId<'_>> for FileAttributes {
     fn from(inode_with_id: InodeWithId<'_>) -> Self {
         let inode = inode_with_id.inode;
         let inode_id = inode_with_id.id;
-        use super::inode::Inode;
+        use super::inode::{Inode, InodeAttrs};
 
-        match inode {
-            Inode::File(file) => FileAttributes {
-                file_type: FileType::Regular,
-                mode: file.mode,
-                nlink: file.nlink,
-                uid: file.uid,
-                gid: file.gid,
-                size: file.size,
-                used: file.size,
-                rdev: None,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: file.atime,
-                    nanoseconds: file.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: file.mtime,
-                    nanoseconds: file.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: file.ctime,
-                    nanoseconds: file.ctime_nsec,
-                },
+        // Type-specific fields
+        let (file_type, size, rdev) = match inode {
+            Inode::File(f) => (FileType::Regular, f.size, None),
+            Inode::Directory(_) => (FileType::Directory, 4096, None),
+            Inode::Symlink(s) => (FileType::Symlink, s.target.len() as u64, None),
+            Inode::Fifo(s) => (FileType::Fifo, 0, s.rdev),
+            Inode::Socket(s) => (FileType::Socket, 0, s.rdev),
+            Inode::CharDevice(s) => (FileType::CharDevice, 0, s.rdev),
+            Inode::BlockDevice(s) => (FileType::BlockDevice, 0, s.rdev),
+        };
+
+        FileAttributes {
+            file_type,
+            mode: inode.mode(),
+            nlink: inode.nlink(),
+            uid: inode.uid(),
+            gid: inode.gid(),
+            size,
+            used: size,
+            rdev,
+            fsid: 0,
+            fileid: inode_id,
+            atime: Timestamp {
+                seconds: inode.atime(),
+                nanoseconds: inode.atime_nsec(),
             },
-            Inode::Directory(dir) => FileAttributes {
-                file_type: FileType::Directory,
-                mode: dir.mode,
-                nlink: dir.nlink,
-                uid: dir.uid,
-                gid: dir.gid,
-                size: 4096,
-                used: 4096,
-                rdev: None,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: dir.atime,
-                    nanoseconds: dir.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: dir.mtime,
-                    nanoseconds: dir.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: dir.ctime,
-                    nanoseconds: dir.ctime_nsec,
-                },
+            mtime: Timestamp {
+                seconds: inode.mtime(),
+                nanoseconds: inode.mtime_nsec(),
             },
-            Inode::Symlink(sym) => FileAttributes {
-                file_type: FileType::Symlink,
-                mode: sym.mode,
-                nlink: sym.nlink,
-                uid: sym.uid,
-                gid: sym.gid,
-                size: sym.target.len() as u64,
-                used: sym.target.len() as u64,
-                rdev: None,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: sym.atime,
-                    nanoseconds: sym.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: sym.mtime,
-                    nanoseconds: sym.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: sym.ctime,
-                    nanoseconds: sym.ctime_nsec,
-                },
-            },
-            Inode::Fifo(special) => FileAttributes {
-                file_type: FileType::Fifo,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: special.rdev,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: special.atime,
-                    nanoseconds: special.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: special.mtime,
-                    nanoseconds: special.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: special.ctime,
-                    nanoseconds: special.ctime_nsec,
-                },
-            },
-            Inode::Socket(special) => FileAttributes {
-                file_type: FileType::Socket,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: special.rdev,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: special.atime,
-                    nanoseconds: special.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: special.mtime,
-                    nanoseconds: special.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: special.ctime,
-                    nanoseconds: special.ctime_nsec,
-                },
-            },
-            Inode::CharDevice(special) => FileAttributes {
-                file_type: FileType::CharDevice,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: special.rdev,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: special.atime,
-                    nanoseconds: special.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: special.mtime,
-                    nanoseconds: special.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: special.ctime,
-                    nanoseconds: special.ctime_nsec,
-                },
-            },
-            Inode::BlockDevice(special) => FileAttributes {
-                file_type: FileType::BlockDevice,
-                mode: special.mode,
-                nlink: special.nlink,
-                uid: special.uid,
-                gid: special.gid,
-                size: 0,
-                used: 0,
-                rdev: special.rdev,
-                fsid: 0,
-                fileid: inode_id,
-                atime: Timestamp {
-                    seconds: special.atime,
-                    nanoseconds: special.atime_nsec,
-                },
-                mtime: Timestamp {
-                    seconds: special.mtime,
-                    nanoseconds: special.mtime_nsec,
-                },
-                ctime: Timestamp {
-                    seconds: special.ctime,
-                    nanoseconds: special.ctime_nsec,
-                },
+            ctime: Timestamp {
+                seconds: inode.ctime(),
+                nanoseconds: inode.ctime_nsec(),
             },
         }
     }

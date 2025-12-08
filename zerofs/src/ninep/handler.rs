@@ -3,7 +3,7 @@ use super::lock_manager::{FileLock, FileLockManager};
 use super::protocol::*;
 use super::protocol::{P9_MAX_GROUPS, P9_MAX_NAME_LEN, P9_NOBODY_UID, P9_READDIR_BATCH_SIZE};
 use crate::fs::ZeroFS;
-use crate::fs::inode::{Inode, InodeId};
+use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{
     FileAttributes, FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
@@ -481,9 +481,8 @@ impl NinePHandler {
         self.filesystem
             .write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
             .await
-            .map_err(|e| {
+            .inspect_err(|&e| {
                 debug!("handle_write: write failed with error: {:?}", e);
-                e
             })?;
 
         debug!("handle_write: write succeeded");
@@ -909,19 +908,9 @@ pub fn inode_to_qid(inode: &Inode, inode_id: u64) -> Qid {
         _ => QID_TYPE_FILE,
     };
 
-    let mtime_secs = match inode {
-        Inode::File(f) => f.mtime,
-        Inode::Directory(d) => d.mtime,
-        Inode::Symlink(s) => s.mtime,
-        Inode::Fifo(s) => s.mtime,
-        Inode::Socket(s) => s.mtime,
-        Inode::CharDevice(s) => s.mtime,
-        Inode::BlockDevice(s) => s.mtime,
-    };
-
     Qid {
         type_,
-        version: mtime_secs as u32,
+        version: inode.mtime() as u32,
         path: inode_id,
     }
 }
@@ -953,138 +942,42 @@ pub fn filetype_to_dt(ft: FileType) -> u8 {
 }
 
 pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
-    let (
-        mode,
-        uid,
-        gid,
-        size,
-        atime_sec,
-        atime_nsec,
-        mtime_sec,
-        mtime_nsec,
-        ctime_sec,
-        ctime_nsec,
-        nlink,
-        rdev,
-    ) = match inode {
-        Inode::File(f) => (
-            f.mode | S_IFREG,
-            f.uid,
-            f.gid,
-            f.size,
-            f.atime,
-            f.atime_nsec,
-            f.mtime,
-            f.mtime_nsec,
-            f.ctime,
-            f.ctime_nsec,
-            f.nlink,
-            None,
-        ),
-        Inode::Directory(d) => (
-            d.mode | S_IFDIR,
-            d.uid,
-            d.gid,
-            0,
-            d.atime,
-            d.atime_nsec,
-            d.mtime,
-            d.mtime_nsec,
-            d.ctime,
-            d.ctime_nsec,
-            d.nlink,
-            None,
-        ),
-        Inode::Symlink(s) => (
-            s.mode | S_IFLNK,
-            s.uid,
-            s.gid,
-            s.target.len() as u64,
-            s.atime,
-            s.atime_nsec,
-            s.mtime,
-            s.mtime_nsec,
-            s.ctime,
-            s.ctime_nsec,
-            1,
-            None,
-        ),
+    let (type_bits, size, rdev) = match inode {
+        Inode::File(f) => (S_IFREG, f.size, 0),
+        Inode::Directory(_) => (S_IFDIR, 0, 0),
+        Inode::Symlink(s) => (S_IFLNK, s.target.len() as u64, 0),
         Inode::CharDevice(d) => (
-            d.mode | S_IFCHR,
-            d.uid,
-            d.gid,
+            S_IFCHR,
             0,
-            d.atime,
-            d.atime_nsec,
-            d.mtime,
-            d.mtime_nsec,
-            d.ctime,
-            d.ctime_nsec,
-            d.nlink,
             d.rdev
-                .map(|(major, minor)| ((major as u64) << 8) | (minor as u64)),
+                .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64)),
         ),
         Inode::BlockDevice(d) => (
-            d.mode | S_IFBLK,
-            d.uid,
-            d.gid,
+            S_IFBLK,
             0,
-            d.atime,
-            d.atime_nsec,
-            d.mtime,
-            d.mtime_nsec,
-            d.ctime,
-            d.ctime_nsec,
-            d.nlink,
             d.rdev
-                .map(|(major, minor)| ((major as u64) << 8) | (minor as u64)),
+                .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64)),
         ),
-        Inode::Fifo(s) => (
-            s.mode | S_IFIFO,
-            s.uid,
-            s.gid,
-            0,
-            s.atime,
-            s.atime_nsec,
-            s.mtime,
-            s.mtime_nsec,
-            s.ctime,
-            s.ctime_nsec,
-            s.nlink,
-            None,
-        ),
-        Inode::Socket(s) => (
-            s.mode | S_IFSOCK,
-            s.uid,
-            s.gid,
-            0,
-            s.atime,
-            s.atime_nsec,
-            s.mtime,
-            s.mtime_nsec,
-            s.ctime,
-            s.ctime_nsec,
-            s.nlink,
-            None,
-        ),
+        Inode::Fifo(_) => (S_IFIFO, 0, 0),
+        Inode::Socket(_) => (S_IFSOCK, 0, 0),
     };
 
     Stat {
         qid: inode_to_qid(inode, inode_id),
-        mode,
-        uid,
-        gid,
-        nlink: nlink as u64,
-        rdev: rdev.unwrap_or(0),
+        mode: inode.mode() | type_bits,
+        uid: inode.uid(),
+        gid: inode.gid(),
+        nlink: inode.nlink() as u64,
+        rdev,
         size,
         blksize: DEFAULT_BLKSIZE,
         blocks: size.div_ceil(BLOCK_SIZE),
-        atime_sec,
-        atime_nsec: atime_nsec as u64,
-        mtime_sec,
-        mtime_nsec: mtime_nsec as u64,
-        ctime_sec,
-        ctime_nsec: ctime_nsec as u64,
+        atime_sec: inode.atime(),
+        atime_nsec: inode.atime_nsec() as u64,
+        mtime_sec: inode.mtime(),
+        mtime_nsec: inode.mtime_nsec() as u64,
+        ctime_sec: inode.ctime(),
+        ctime_nsec: inode.ctime_nsec() as u64,
         btime_sec: 0,
         btime_nsec: 0,
         r#gen: 0,

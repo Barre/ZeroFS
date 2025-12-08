@@ -2,6 +2,20 @@ use serde::{Deserialize, Serialize};
 
 pub type InodeId = u64;
 
+pub trait InodeAttrs {
+    fn uid(&self) -> u32;
+    fn gid(&self) -> u32;
+    fn mode(&self) -> u32;
+    fn atime(&self) -> u64;
+    fn atime_nsec(&self) -> u32;
+    fn mtime(&self) -> u64;
+    fn mtime_nsec(&self) -> u32;
+    fn ctime(&self) -> u64;
+    fn ctime_nsec(&self) -> u32;
+    fn nlink(&self) -> u32;
+    fn parent(&self) -> Option<InodeId>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInode {
     pub size: u64,
@@ -80,6 +94,150 @@ pub struct SpecialInode {
     pub rdev: Option<(u32, u32)>, // For character and block devices (major, minor)
 }
 
+impl InodeAttrs for FileInode {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+    fn atime(&self) -> u64 {
+        self.atime
+    }
+    fn atime_nsec(&self) -> u32 {
+        self.atime_nsec
+    }
+    fn mtime(&self) -> u64 {
+        self.mtime
+    }
+    fn mtime_nsec(&self) -> u32 {
+        self.mtime_nsec
+    }
+    fn ctime(&self) -> u64 {
+        self.ctime
+    }
+    fn ctime_nsec(&self) -> u32 {
+        self.ctime_nsec
+    }
+    fn nlink(&self) -> u32 {
+        self.nlink
+    }
+    fn parent(&self) -> Option<InodeId> {
+        self.parent
+    }
+}
+
+impl InodeAttrs for DirectoryInode {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+    fn atime(&self) -> u64 {
+        self.atime
+    }
+    fn atime_nsec(&self) -> u32 {
+        self.atime_nsec
+    }
+    fn mtime(&self) -> u64 {
+        self.mtime
+    }
+    fn mtime_nsec(&self) -> u32 {
+        self.mtime_nsec
+    }
+    fn ctime(&self) -> u64 {
+        self.ctime
+    }
+    fn ctime_nsec(&self) -> u32 {
+        self.ctime_nsec
+    }
+    fn nlink(&self) -> u32 {
+        self.nlink
+    }
+    fn parent(&self) -> Option<InodeId> {
+        Some(self.parent)
+    }
+}
+
+impl InodeAttrs for SymlinkInode {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+    fn atime(&self) -> u64 {
+        self.atime
+    }
+    fn atime_nsec(&self) -> u32 {
+        self.atime_nsec
+    }
+    fn mtime(&self) -> u64 {
+        self.mtime
+    }
+    fn mtime_nsec(&self) -> u32 {
+        self.mtime_nsec
+    }
+    fn ctime(&self) -> u64 {
+        self.ctime
+    }
+    fn ctime_nsec(&self) -> u32 {
+        self.ctime_nsec
+    }
+    fn nlink(&self) -> u32 {
+        self.nlink
+    }
+    fn parent(&self) -> Option<InodeId> {
+        self.parent
+    }
+}
+
+impl InodeAttrs for SpecialInode {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+    fn atime(&self) -> u64 {
+        self.atime
+    }
+    fn atime_nsec(&self) -> u32 {
+        self.atime_nsec
+    }
+    fn mtime(&self) -> u64 {
+        self.mtime
+    }
+    fn mtime_nsec(&self) -> u32 {
+        self.mtime_nsec
+    }
+    fn ctime(&self) -> u64 {
+        self.ctime
+    }
+    fn ctime_nsec(&self) -> u32 {
+        self.ctime_nsec
+    }
+    fn nlink(&self) -> u32 {
+        self.nlink
+    }
+    fn parent(&self) -> Option<InodeId> {
+        self.parent
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Inode {
     File(FileInode),
@@ -91,19 +249,130 @@ pub enum Inode {
     BlockDevice(SpecialInode),
 }
 
-impl Inode {
-    /// Get the parent directory ID if available.
-    pub fn parent(&self) -> Option<InodeId> {
+impl InodeAttrs for Inode {
+    fn uid(&self) -> u32 {
         match self {
-            Inode::Directory(d) => Some(d.parent),
-            Inode::File(f) => f.parent,
-            Inode::Symlink(s) => s.parent,
-            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                s.parent
+            Inode::File(i) => i.uid(),
+            Inode::Directory(i) => i.uid(),
+            Inode::Symlink(i) => i.uid(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.uid()
             }
         }
     }
 
+    fn gid(&self) -> u32 {
+        match self {
+            Inode::File(i) => i.gid(),
+            Inode::Directory(i) => i.gid(),
+            Inode::Symlink(i) => i.gid(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.gid()
+            }
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        match self {
+            Inode::File(i) => i.mode(),
+            Inode::Directory(i) => i.mode(),
+            Inode::Symlink(i) => i.mode(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.mode()
+            }
+        }
+    }
+
+    fn atime(&self) -> u64 {
+        match self {
+            Inode::File(i) => i.atime(),
+            Inode::Directory(i) => i.atime(),
+            Inode::Symlink(i) => i.atime(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.atime()
+            }
+        }
+    }
+
+    fn atime_nsec(&self) -> u32 {
+        match self {
+            Inode::File(i) => i.atime_nsec(),
+            Inode::Directory(i) => i.atime_nsec(),
+            Inode::Symlink(i) => i.atime_nsec(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.atime_nsec()
+            }
+        }
+    }
+
+    fn mtime(&self) -> u64 {
+        match self {
+            Inode::File(i) => i.mtime(),
+            Inode::Directory(i) => i.mtime(),
+            Inode::Symlink(i) => i.mtime(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.mtime()
+            }
+        }
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        match self {
+            Inode::File(i) => i.mtime_nsec(),
+            Inode::Directory(i) => i.mtime_nsec(),
+            Inode::Symlink(i) => i.mtime_nsec(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.mtime_nsec()
+            }
+        }
+    }
+
+    fn ctime(&self) -> u64 {
+        match self {
+            Inode::File(i) => i.ctime(),
+            Inode::Directory(i) => i.ctime(),
+            Inode::Symlink(i) => i.ctime(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.ctime()
+            }
+        }
+    }
+
+    fn ctime_nsec(&self) -> u32 {
+        match self {
+            Inode::File(i) => i.ctime_nsec(),
+            Inode::Directory(i) => i.ctime_nsec(),
+            Inode::Symlink(i) => i.ctime_nsec(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.ctime_nsec()
+            }
+        }
+    }
+
+    fn nlink(&self) -> u32 {
+        match self {
+            Inode::File(i) => i.nlink(),
+            Inode::Directory(i) => i.nlink(),
+            Inode::Symlink(i) => i.nlink(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.nlink()
+            }
+        }
+    }
+
+    fn parent(&self) -> Option<InodeId> {
+        match self {
+            Inode::File(i) => i.parent(),
+            Inode::Directory(i) => i.parent(),
+            Inode::Symlink(i) => i.parent(),
+            Inode::Fifo(i) | Inode::Socket(i) | Inode::CharDevice(i) | Inode::BlockDevice(i) => {
+                i.parent()
+            }
+        }
+    }
+}
+
+impl Inode {
     /// Get the name if available (None for root or hardlinked files).
     pub fn name(&self) -> Option<&[u8]> {
         match self {
@@ -112,18 +381,6 @@ impl Inode {
             Inode::Symlink(s) => s.name.as_deref(),
             Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
                 s.name.as_deref()
-            }
-        }
-    }
-
-    /// Get the link count (nlink) for this inode.
-    pub fn nlink(&self) -> u32 {
-        match self {
-            Inode::Directory(d) => d.nlink,
-            Inode::File(f) => f.nlink,
-            Inode::Symlink(s) => s.nlink,
-            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                s.nlink
             }
         }
     }
@@ -154,26 +411,7 @@ impl Inode {
 
     /// Get uid/gid tuple for ownership checks.
     pub fn ownership(&self) -> (u32, u32) {
-        match self {
-            Inode::Directory(d) => (d.uid, d.gid),
-            Inode::File(f) => (f.uid, f.gid),
-            Inode::Symlink(s) => (s.uid, s.gid),
-            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                (s.uid, s.gid)
-            }
-        }
-    }
-
-    /// Get mode bits.
-    pub fn mode(&self) -> u32 {
-        match self {
-            Inode::Directory(d) => d.mode,
-            Inode::File(f) => f.mode,
-            Inode::Symlink(s) => s.mode,
-            Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                s.mode
-            }
-        }
+        (self.uid(), self.gid())
     }
 }
 
