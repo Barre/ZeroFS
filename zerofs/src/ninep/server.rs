@@ -1,7 +1,9 @@
+use super::errors::P9Error;
 use super::handler::NinePHandler;
 use super::lock_manager::FileLockManager;
 use super::protocol::{
-    P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN, P9Message,
+    Message, P9Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MIN_MESSAGE_SIZE,
+    P9_SIZE_FIELD_LEN, Rlerror,
 };
 use crate::fs::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
@@ -237,7 +239,12 @@ where
                         P9_DEBUG_BUFFER_SIZE,
                         &full_buf[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, full_buf.len())]
                     );
-                    let error_msg = P9Message::error(tag, libc::ENOSYS as u32);
+                    let error_msg = P9Message::new(
+                        tag,
+                        Message::Rlerror(Rlerror {
+                            ecode: P9Error::NotImplemented.to_errno(),
+                        }),
+                    );
                     let response_bytes = error_msg.to_bytes().map_err(|e| {
                         anyhow::anyhow!("Failed to serialize error response: {e:?}")
                     })?;
