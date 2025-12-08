@@ -357,3 +357,13 @@ impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
         }
     }
 }
+
+impl From<&super::permissions::Credentials> for AuthContext {
+    fn from(creds: &super::permissions::Credentials) -> Self {
+        Self {
+            uid: creds.uid,
+            gid: creds.gid,
+            gids: creds.groups[..creds.groups_count].to_vec(),
+        }
+    }
+}

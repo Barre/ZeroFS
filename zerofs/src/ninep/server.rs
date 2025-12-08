@@ -46,6 +46,23 @@ impl NinePServer {
         }
     }
 
+    fn spawn_client_handler<S>(&self, stream: S, shutdown: &CancellationToken, client_name: String)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let filesystem = Arc::clone(&self.filesystem);
+        let lock_manager = Arc::clone(&self.lock_manager);
+        let client_shutdown = shutdown.child_token();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
+            {
+                error!("Error handling 9P client {}: {}", client_name, e);
+            }
+        });
+    }
+
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
             Transport::Tcp(addr) => {
@@ -61,19 +78,8 @@ impl NinePServer {
                         result = listener.accept() => {
                             let (stream, peer_addr) = result?;
                             info!("9P client connected from {}", peer_addr);
-
                             stream.set_nodelay(true)?;
-
-                            let filesystem = Arc::clone(&self.filesystem);
-                            let lock_manager = Arc::clone(&self.lock_manager);
-                            let client_shutdown = shutdown.child_token();
-
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
-                                {
-                                    error!("Error handling 9P client {}: {}", peer_addr, e);
-                                }
-                            });
+                            self.spawn_client_handler(stream, &shutdown, peer_addr.to_string());
                         }
                     }
                 }
@@ -98,17 +104,7 @@ impl NinePServer {
                         result = listener.accept() => {
                             let (stream, _) = result?;
                             info!("9P client connected via Unix socket");
-
-                            let filesystem = Arc::clone(&self.filesystem);
-                            let lock_manager = Arc::clone(&self.lock_manager);
-                            let client_shutdown = shutdown.child_token();
-
-                            tokio::spawn(async move {
-                                if let Err(e) = handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
-                                {
-                                    error!("Error handling 9P Unix client: {}", e);
-                                }
-                            });
+                            self.spawn_client_handler(stream, &shutdown, "unix".to_string());
                         }
                     }
                 }

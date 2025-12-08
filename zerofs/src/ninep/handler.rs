@@ -6,7 +6,8 @@ use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{
-    FileAttributes, FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
+    AuthContext, FileAttributes, FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime,
+    SetUid, Timestamp,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -64,6 +65,53 @@ pub struct Session {
     pub fids: Arc<DashMap<u32, Fid>>,
 }
 
+impl From<&Tsetattr> for SetAttributes {
+    fn from(ts: &Tsetattr) -> Self {
+        SetAttributes {
+            mode: if ts.valid & SETATTR_MODE != 0 {
+                SetMode::Set(ts.mode)
+            } else {
+                SetMode::NoChange
+            },
+            uid: if ts.valid & SETATTR_UID != 0 {
+                SetUid::Set(ts.uid)
+            } else {
+                SetUid::NoChange
+            },
+            gid: if ts.valid & SETATTR_GID != 0 {
+                SetGid::Set(ts.gid)
+            } else {
+                SetGid::NoChange
+            },
+            size: if ts.valid & SETATTR_SIZE != 0 {
+                SetSize::Set(ts.size)
+            } else {
+                SetSize::NoChange
+            },
+            atime: if ts.valid & SETATTR_ATIME_SET != 0 {
+                SetTime::SetToClientTime(Timestamp {
+                    seconds: ts.atime_sec,
+                    nanoseconds: ts.atime_nsec as u32,
+                })
+            } else if ts.valid & SETATTR_ATIME != 0 {
+                SetTime::SetToServerTime
+            } else {
+                SetTime::NoChange
+            },
+            mtime: if ts.valid & SETATTR_MTIME_SET != 0 {
+                SetTime::SetToClientTime(Timestamp {
+                    seconds: ts.mtime_sec,
+                    nanoseconds: ts.mtime_nsec as u32,
+                })
+            } else if ts.valid & SETATTR_MTIME != 0 {
+                SetTime::SetToServerTime
+            } else {
+                SetTime::NoChange
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NinePHandler {
     filesystem: Arc<ZeroFS>,
@@ -91,14 +139,6 @@ impl NinePHandler {
 
     pub fn handler_id(&self) -> u64 {
         self.handler_id
-    }
-
-    fn make_auth_context(&self, creds: &Credentials) -> zerofs_nfsserve::vfs::AuthContext {
-        zerofs_nfsserve::vfs::AuthContext {
-            uid: creds.uid,
-            gid: creds.gid,
-            gids: creds.groups[..creds.groups_count].to_vec(),
-        }
     }
 
     fn get_fid(&self, fid: u32) -> P9Result<Fid> {
@@ -341,14 +381,14 @@ impl NinePHandler {
         let max_count = msize.saturating_sub(P9_IOHDRSZ);
         let count = tr.count.min(max_count);
 
-        let auth = self.make_auth_context(&fid_entry.creds);
+        let auth = AuthContext::from(&fid_entry.creds);
 
         // tr.offset is the cookie from the last entry the client received (0 for first call)
         // Pass it directly to readdir which handles . and .. with cookies 1 and 2
         let result = self
             .filesystem
             .readdir(
-                &(&auth).into(),
+                &auth,
                 fid_entry.inode_id,
                 tr.offset,
                 P9_READDIR_BATCH_SIZE,
@@ -433,11 +473,11 @@ impl NinePHandler {
         let max_count = msize.saturating_sub(P9_IOHDRSZ);
         let count = tr.count.min(max_count);
 
-        let auth = self.make_auth_context(&fid_entry.creds);
+        let auth = AuthContext::from(&fid_entry.creds);
 
         let (data, _eof) = self
             .filesystem
-            .read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, count)
+            .read_file(&auth, fid_entry.inode_id, tr.offset, count)
             .await?;
 
         Ok(Message::Rread(Rread {
@@ -474,12 +514,12 @@ impl NinePHandler {
             tw.data.len()
         );
 
-        let auth = self.make_auth_context(&fid_entry.creds);
+        let auth = AuthContext::from(&fid_entry.creds);
         let data_len = tw.data.len();
         let data = Bytes::from(tw.data);
 
         self.filesystem
-            .write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
+            .write(&auth, fid_entry.inode_id, tw.offset, &data)
             .await
             .inspect_err(|&e| {
                 debug!("handle_write: write failed with error: {:?}", e);
@@ -504,49 +544,7 @@ impl NinePHandler {
 
     async fn handle_setattr(&self, ts: Tsetattr) -> P9Result<Message> {
         let fid_entry = self.get_fid(ts.fid)?;
-
-        let attr = SetAttributes {
-            mode: if ts.valid & SETATTR_MODE != 0 {
-                SetMode::Set(ts.mode)
-            } else {
-                SetMode::NoChange
-            },
-            uid: if ts.valid & SETATTR_UID != 0 {
-                SetUid::Set(ts.uid)
-            } else {
-                SetUid::NoChange
-            },
-            gid: if ts.valid & SETATTR_GID != 0 {
-                SetGid::Set(ts.gid)
-            } else {
-                SetGid::NoChange
-            },
-            size: if ts.valid & SETATTR_SIZE != 0 {
-                SetSize::Set(ts.size)
-            } else {
-                SetSize::NoChange
-            },
-            atime: if ts.valid & SETATTR_ATIME_SET != 0 {
-                SetTime::SetToClientTime(Timestamp {
-                    seconds: ts.atime_sec,
-                    nanoseconds: ts.atime_nsec as u32,
-                })
-            } else if ts.valid & SETATTR_ATIME != 0 {
-                SetTime::SetToServerTime
-            } else {
-                SetTime::NoChange
-            },
-            mtime: if ts.valid & SETATTR_MTIME_SET != 0 {
-                SetTime::SetToClientTime(Timestamp {
-                    seconds: ts.mtime_sec,
-                    nanoseconds: ts.mtime_nsec as u32,
-                })
-            } else if ts.valid & SETATTR_MTIME != 0 {
-                SetTime::SetToServerTime
-            } else {
-                SetTime::NoChange
-            },
-        };
+        let attr = SetAttributes::from(&ts);
 
         self.filesystem
             .setattr(&fid_entry.creds, fid_entry.inode_id, &attr)
@@ -674,10 +672,10 @@ impl NinePHandler {
             file_id, dir_id, name_bytes, creds.uid, creds.gid
         );
 
-        let auth = self.make_auth_context(&creds);
+        let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .link(&(&auth).into(), file_id, dir_id, name_bytes)
+            .link(&auth, file_id, dir_id, name_bytes)
             .await?;
 
         Ok(Message::Rlink(Rlink))
@@ -706,11 +704,11 @@ impl NinePHandler {
 
         let new_name_bytes = Bytes::copy_from_slice(&tr.name.data);
 
-        let auth = self.make_auth_context(&creds);
+        let auth = AuthContext::from(&creds);
 
         self.filesystem
             .rename(
-                &(&auth).into(),
+                &auth,
                 source_parent_id,
                 source_name,
                 dest_parent_id,
@@ -725,11 +723,11 @@ impl NinePHandler {
         let old_dir_fid = self.get_fid(tr.olddirfid)?;
         let new_dir_fid = self.get_fid(tr.newdirfid)?;
 
-        let auth = self.make_auth_context(&old_dir_fid.creds);
+        let auth = AuthContext::from(&old_dir_fid.creds);
 
         self.filesystem
             .rename(
-                &(&auth).into(),
+                &auth,
                 old_dir_fid.inode_id,
                 &tr.oldname.data,
                 new_dir_fid.inode_id,
@@ -765,10 +763,10 @@ impl NinePHandler {
             return Err(P9Error::IsADirectory);
         }
 
-        let auth = self.make_auth_context(&creds);
+        let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .remove(&(&auth).into(), parent_id, &tu.name.data)
+            .remove(&auth, parent_id, &tu.name.data)
             .await?;
 
         Ok(Message::Runlinkat(Runlinkat))
