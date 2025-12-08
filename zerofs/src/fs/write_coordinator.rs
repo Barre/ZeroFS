@@ -58,7 +58,10 @@ impl WriteCoordinator {
             }
 
             if rx.changed().await.is_err() {
-                trace!("Write coordinator channel closed while waiting for seq {}", seq);
+                trace!(
+                    "Write coordinator channel closed while waiting for seq {}",
+                    seq
+                );
                 return;
             }
         }

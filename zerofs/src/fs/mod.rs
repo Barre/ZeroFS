@@ -1061,18 +1061,12 @@ impl ZeroFS {
                             Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
                             Err(FsError::NotFound) => {
                                 // Inode was deleted between directory listing and fetch - skip it
-                                debug!(
-                                    "readdir: skipping deleted entry (inode {})",
-                                    inode_id
-                                );
+                                debug!("readdir: skipping deleted entry (inode {})", inode_id);
                                 Ok(None)
                             }
                             Err(e) => {
                                 // Propagate actual errors (IO, corruption, etc.)
-                                error!(
-                                    "readdir: failed to load inode {}: {:?}",
-                                    inode_id, e
-                                );
+                                error!("readdir: failed to load inode {}: {:?}", inode_id, e);
                                 Err(e)
                             }
                         }

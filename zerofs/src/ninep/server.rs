@@ -2,8 +2,8 @@ use super::errors::P9Error;
 use super::handler::NinePHandler;
 use super::lock_manager::FileLockManager;
 use super::protocol::{
-    Message, P9Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MIN_MESSAGE_SIZE,
-    P9_SIZE_FIELD_LEN, Rlerror,
+    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN,
+    P9Message, Rlerror,
 };
 use crate::fs::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
