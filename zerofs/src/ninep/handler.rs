@@ -944,12 +944,13 @@ impl NinePHandler {
             inode_id: fid.inode_id,
         };
 
-        if let Err(e) = self
+        if self
             .lock_manager
             .try_add_lock(self.handler_id, new_lock)
             .await
+            .is_none()
         {
-            debug!("Lock conflict on inode {}: {:?}", fid.inode_id, e);
+            debug!("Lock conflict on inode {}", fid.inode_id);
             if (tl.flags & P9_LOCK_FLAGS_BLOCK) != 0 {
                 return Ok(Message::Rlock(Rlock {
                     status: LockStatus::Blocked,

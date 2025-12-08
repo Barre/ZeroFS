@@ -19,6 +19,18 @@ pub struct FileLock {
     pub inode_id: InodeId,
 }
 
+impl FileLock {
+    /// Returns the exclusive end of this lock's byte range.
+    /// A length of 0 means "to end of file" per POSIX, represented as u64::MAX.
+    pub fn end(&self) -> u64 {
+        if self.length == 0 {
+            u64::MAX
+        } else {
+            self.start.saturating_add(self.length)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileLockManager {
     // Locks indexed by inode for conflict checking
@@ -44,7 +56,8 @@ impl FileLockManager {
         }
     }
 
-    pub async fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Result<LockId, bool> {
+    /// Attempts to add a lock, returning the lock ID on success or `None` on conflict.
+    pub async fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Option<LockId> {
         let _guard = self.lock_mutex.lock().await;
 
         // First, remove any existing locks from this session that overlap
@@ -56,18 +69,7 @@ impl FileLockManager {
                     && existing_lock.inode_id == lock.inode_id
                     && existing_lock.fid == lock.fid
                 {
-                    let new_end = if lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        lock.start.saturating_add(lock.length)
-                    };
-                    let existing_end = if existing_lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        existing_lock.start.saturating_add(existing_lock.length)
-                    };
-
-                    if lock.start < existing_end && new_end > existing_lock.start {
+                    if lock.start < existing_lock.end() && lock.end() > existing_lock.start {
                         // Overlapping lock from same session - mark for removal
                         to_remove.push(*lock_id);
                     }
@@ -87,7 +89,7 @@ impl FileLockManager {
         }
 
         if self.check_lock_conflict(lock.inode_id, &lock, session_id) {
-            return Err(false);
+            return None;
         }
 
         let lock_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
@@ -104,7 +106,7 @@ impl FileLockManager {
             .or_default()
             .push(lock_id);
 
-        Ok(lock_id)
+        Some(lock_id)
     }
 
     pub async fn unlock_range(
@@ -132,14 +134,8 @@ impl FileLockManager {
                     && lock.inode_id == inode_id
                     && lock.fid == fid
                 {
-                    let lock_end = if lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        lock.start.saturating_add(lock.length)
-                    };
-
                     // Check if lock overlaps with unlock range
-                    if lock.start < unlock_end && lock_end > start {
+                    if lock.start < unlock_end && lock.end() > start {
                         locks_to_process.push((*lock_id, lock.clone()));
                     }
                 }
@@ -152,11 +148,7 @@ impl FileLockManager {
 
         // Process each overlapping lock
         for (lock_id, existing_lock) in locks_to_process {
-            let lock_end = if existing_lock.length == 0 {
-                u64::MAX
-            } else {
-                existing_lock.start.saturating_add(existing_lock.length)
-            };
+            let lock_end = existing_lock.end();
 
             // Remove the original lock
             if let Some((_, _)) = self.locks.remove(&lock_id) {
@@ -169,7 +161,6 @@ impl FileLockManager {
             }
 
             // Handle lock splitting if necessary
-            // Case 1: Unlock range is completely within the lock - split into two
             if start > existing_lock.start && unlock_end < lock_end {
                 // Create first part (before unlock range)
                 let first_part = FileLock {
@@ -220,9 +211,7 @@ impl FileLockManager {
                     .entry(inode_id)
                     .or_default()
                     .push(second_id);
-            }
-            // Case 2: Unlock range covers the start of the lock
-            else if start <= existing_lock.start && unlock_end < lock_end {
+            } else if start <= existing_lock.start && unlock_end < lock_end {
                 // Keep only the part after unlock range
                 let new_length = if existing_lock.length == 0 {
                     0 // Keep infinite length
@@ -250,9 +239,7 @@ impl FileLockManager {
                     .entry(inode_id)
                     .or_default()
                     .push(new_id);
-            }
-            // Case 3: Unlock range covers the end of the lock
-            else if start > existing_lock.start && unlock_end >= lock_end {
+            } else if start > existing_lock.start && unlock_end >= lock_end {
                 // Keep only the part before unlock range
                 let new_lock = FileLock {
                     lock_type: existing_lock.lock_type,
@@ -275,7 +262,6 @@ impl FileLockManager {
                     .or_default()
                     .push(new_id);
             }
-            // Case 4: Unlock range completely covers the lock - already removed
         }
 
         true
@@ -293,18 +279,8 @@ impl FileLockManager {
                     }
 
                     // Check if ranges overlap
-                    let new_end = if new_lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        new_lock.start.saturating_add(new_lock.length)
-                    };
-                    let existing_end = if existing_lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        existing_lock.start.saturating_add(existing_lock.length)
-                    };
-
-                    if new_lock.start < existing_end && new_end > existing_lock.start {
+                    if new_lock.start < existing_lock.end() && new_lock.end() > existing_lock.start
+                    {
                         // Ranges overlap, check compatibility
                         match (new_lock.lock_type, existing_lock.lock_type) {
                             (LockType::ReadLock, LockType::ReadLock) => {
@@ -341,18 +317,9 @@ impl FileLockManager {
                     }
 
                     // Check if ranges overlap
-                    let test_end = if test_lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        test_lock.start.saturating_add(test_lock.length)
-                    };
-                    let existing_end = if existing_lock.length == 0 {
-                        u64::MAX
-                    } else {
-                        existing_lock.start.saturating_add(existing_lock.length)
-                    };
-
-                    if test_lock.start < existing_end && test_end > existing_lock.start {
+                    if test_lock.start < existing_lock.end()
+                        && test_lock.end() > existing_lock.start
+                    {
                         // Ranges overlap, check compatibility
                         match (test_lock.lock_type, existing_lock.lock_type) {
                             (LockType::ReadLock, LockType::ReadLock) => {
