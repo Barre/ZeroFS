@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use tokio_stream::StreamExt;
 
 pub async fn run_fatrace(config_path: PathBuf) -> Result<()> {
-    let settings = Settings::from_file(config_path.to_str().unwrap())
+    let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let rpc_config = settings

@@ -360,7 +360,10 @@ impl NFSFileSystem for NFSAdapter {
 
         let obj_attr = match self.getattr(auth, fileid).await {
             Ok(v) => post_op_attr::attributes(v),
-            Err(_) => post_op_attr::Void,
+            Err(e) => {
+                debug!("fsstat: getattr failed for fileid {}: {:?}", fileid, e);
+                post_op_attr::Void
+            }
         };
 
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();

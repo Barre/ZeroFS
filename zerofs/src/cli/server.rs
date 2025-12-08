@@ -140,7 +140,8 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
 
     match fs.lookup(&creds, 0, nbd_name).await {
         Ok(_) => info!(".nbd directory already exists"),
-        Err(_) => {
+        Err(e) => {
+            debug!(".nbd directory lookup returned: {:?}, will create it", e);
             let attr = SetAttributes {
                 mode: crate::fs::types::SetMode::Set(0o755),
                 uid: crate::fs::types::SetUid::Set(0),
@@ -190,8 +191,7 @@ async fn start_nbd_servers(
             "Starting NBD server on Unix socket {} (devices dynamically discovered from .nbd/)",
             socket_path.display()
         );
-        let nbd_unix_server =
-            NBDServer::new_unix(Arc::clone(&fs), socket_path.to_str().unwrap().to_string());
+        let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs), socket_path);
         let shutdown_clone = shutdown.clone();
         handles.push(tokio::spawn(async move {
             if let Err(e) = nbd_unix_server.start(shutdown_clone).await {
@@ -410,7 +410,7 @@ pub async fn build_slatedb(
         l0_sst_size_bytes: 256 * 1024 * 1024,
         filter_bits_per_key: 20,
         object_store_cache_options: ObjectStoreCacheOptions {
-            root_folder: Some(PathBuf::from(cache_config.root_folder.clone())),
+            root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
             part_size_bytes: 16 * 1024 * 1024,
             cache_puts: false,
@@ -546,7 +546,7 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
-        root_folder: settings.cache.dir.to_str().unwrap().to_string(),
+        root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
@@ -560,23 +560,22 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
 
     info!("Starting ZeroFS server with {} backend", object_store);
     info!("DB Path: {}", actual_db_path);
-    info!("Base Cache Directory: {}", cache_config.root_folder);
+    info!("Base Cache Directory: {}", cache_config.root_folder.display());
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
     info!("Checking bucket identity...");
     let bucket =
         bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path).await?;
 
-    let original_cache_root = cache_config.root_folder.clone();
     let cache_config = CacheConfig {
-        root_folder: format!("{}/{}", original_cache_root, bucket.cache_directory_name()),
+        root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
         ..cache_config
     };
 
     info!(
         "Bucket ID: {}, Cache directory: {}",
         bucket.id(),
-        cache_config.root_folder
+        cache_config.root_folder.display()
     );
 
     if !db_mode.is_read_only() {
@@ -633,7 +632,7 @@ pub async fn run_server(
         .with_writer(std::io::stderr)
         .init();
 
-    let settings = Settings::from_file(config_path.to_str().unwrap())
+    let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let db_mode = match (read_only, &checkpoint_name) {
