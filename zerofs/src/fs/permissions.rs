@@ -1,5 +1,5 @@
 use super::errors::FsError;
-use super::inode::Inode;
+use super::inode::{Inode, InodeAttrs};
 use super::types::AuthContext;
 
 const S_IRUSR: u32 = 0o400;
@@ -62,15 +62,7 @@ pub enum AccessMode {
 }
 
 pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Result<(), FsError> {
-    let (uid, gid, file_mode) = match inode {
-        Inode::File(f) => (f.uid, f.gid, f.mode),
-        Inode::Directory(d) => (d.uid, d.gid, d.mode),
-        Inode::Symlink(s) => (s.uid, s.gid, s.mode),
-        Inode::Fifo(s) => (s.uid, s.gid, s.mode),
-        Inode::Socket(s) => (s.uid, s.gid, s.mode),
-        Inode::CharDevice(s) => (s.uid, s.gid, s.mode),
-        Inode::BlockDevice(s) => (s.uid, s.gid, s.mode),
-    };
+    let (uid, gid, file_mode) = (inode.uid(), inode.gid(), inode.mode());
 
     if creds.uid == 0 {
         if let AccessMode::Execute = mode
@@ -103,17 +95,7 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
 }
 
 pub fn check_ownership(inode: &Inode, creds: &Credentials) -> Result<(), FsError> {
-    let uid = match inode {
-        Inode::File(f) => f.uid,
-        Inode::Directory(d) => d.uid,
-        Inode::Symlink(s) => s.uid,
-        Inode::Fifo(s) => s.uid,
-        Inode::Socket(s) => s.uid,
-        Inode::CharDevice(s) => s.uid,
-        Inode::BlockDevice(s) => s.uid,
-    };
-
-    if creds.uid == 0 || creds.uid == uid {
+    if creds.uid == 0 || creds.uid == inode.uid() {
         Ok(())
     } else {
         Err(FsError::OperationNotPermitted)
@@ -125,22 +107,13 @@ pub fn check_sticky_bit_delete(
     target: &Inode,
     creds: &Credentials,
 ) -> Result<(), FsError> {
-    if let Inode::Directory(parent_dir) = parent
-        && parent_dir.mode & S_ISVTX != 0
+    if parent.is_directory()
+        && parent.mode() & S_ISVTX != 0
+        && creds.uid != 0
+        && creds.uid != parent.uid()
+        && creds.uid != target.uid()
     {
-        let target_uid = match target {
-            Inode::File(f) => f.uid,
-            Inode::Directory(d) => d.uid,
-            Inode::Symlink(s) => s.uid,
-            Inode::Fifo(s) => s.uid,
-            Inode::Socket(s) => s.uid,
-            Inode::CharDevice(s) => s.uid,
-            Inode::BlockDevice(s) => s.uid,
-        };
-
-        if creds.uid != 0 && creds.uid != parent_dir.uid && creds.uid != target_uid {
-            return Err(FsError::PermissionDenied);
-        }
+        return Err(FsError::PermissionDenied);
     }
     Ok(())
 }
@@ -154,17 +127,7 @@ pub fn can_set_times(
     creds: &Credentials,
     setting_to_current_time: bool,
 ) -> Result<(), FsError> {
-    let uid = match inode {
-        Inode::File(f) => f.uid,
-        Inode::Directory(d) => d.uid,
-        Inode::Symlink(s) => s.uid,
-        Inode::Fifo(s) => s.uid,
-        Inode::Socket(s) => s.uid,
-        Inode::CharDevice(s) => s.uid,
-        Inode::BlockDevice(s) => s.uid,
-    };
-
-    if creds.uid == 0 || creds.uid == uid {
+    if creds.uid == 0 || creds.uid == inode.uid() {
         return Ok(());
     }
 
