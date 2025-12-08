@@ -12,6 +12,8 @@ pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
 
+use std::path::PathBuf;
+
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
@@ -38,7 +40,7 @@ use self::types::{
     AuthContext, DirEntry, FileAttributes, FileType, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetSize, SetTime, SetUid,
 };
-use ::tracing::{debug, error};
+use ::tracing::{debug, error, warn};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
@@ -50,9 +52,13 @@ fn get_current_uid_gid() -> (u32, u32) {
 }
 
 pub fn get_current_time() -> (u64, u32) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("System time is before UNIX epoch: {:?}", e);
+            std::time::Duration::ZERO
+        }
+    };
     (now.as_secs(), now.subsec_nanos())
 }
 
@@ -86,7 +92,7 @@ pub struct ZeroFS {
 
 #[derive(Clone)]
 pub struct CacheConfig {
-    pub root_folder: String,
+    pub root_folder: PathBuf,
     pub max_cache_size_gb: f64,
     pub memory_cache_size_gb: Option<f64>,
 }
@@ -1012,18 +1018,12 @@ impl ZeroFS {
                         }
                         .into()
                     } else {
-                        match self.inode_store.get(parent_id).await {
-                            Ok(parent_inode) => InodeWithId {
-                                inode: &parent_inode,
-                                id: parent_id,
-                            }
-                            .into(),
-                            Err(_) => InodeWithId {
-                                inode: &dir_inode,
-                                id: dirid,
-                            }
-                            .into(),
+                        let parent_inode = self.inode_store.get(parent_id).await?;
+                        InodeWithId {
+                            inode: &parent_inode,
+                            id: parent_id,
                         }
+                        .into()
                     };
                     entries.push(DirEntry {
                         fileid: parent_id,
@@ -1059,12 +1059,21 @@ impl ZeroFS {
                     |(inode_id, name, cookie)| async move {
                         match self.inode_store.get(inode_id).await {
                             Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
-                            Err(e) => {
-                                error!(
-                                    "readdir: skipping entry (inode {}) due to error: {:?}",
-                                    inode_id, e
+                            Err(FsError::NotFound) => {
+                                // Inode was deleted between directory listing and fetch - skip it
+                                debug!(
+                                    "readdir: skipping deleted entry (inode {})",
+                                    inode_id
                                 );
                                 Ok(None)
+                            }
+                            Err(e) => {
+                                // Propagate actual errors (IO, corruption, etc.)
+                                error!(
+                                    "readdir: failed to load inode {}: {:?}",
+                                    inode_id, e
+                                );
+                                Err(e)
                             }
                         }
                     },

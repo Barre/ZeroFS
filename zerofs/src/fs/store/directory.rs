@@ -7,6 +7,7 @@ use futures::Stream;
 use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Reserved cookie values
 /// 0 is reserved for "start from beginning" (not a valid entry cookie)
@@ -55,7 +56,10 @@ impl DirectoryStore {
         let current = match self.db.get_bytes(&counter_key).await {
             Ok(Some(data)) => KeyCodec::decode_counter(&data)?,
             Ok(None) => COOKIE_FIRST_ENTRY,
-            Err(_) => return Err(FsError::IoError),
+            Err(e) => {
+                warn!("Failed to get cookie counter for dir {}: {:?}", dir_id, e);
+                return Err(FsError::IoError);
+            }
         };
         txn.put_bytes(&counter_key, KeyCodec::encode_counter(current + 1));
         Ok(current)

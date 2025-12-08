@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io::BufRead;
 
 mod bucket_identity;
@@ -35,12 +35,12 @@ async fn main() -> Result<()> {
     match cli.command {
         cli::Commands::Init { path } => {
             println!("Generating configuration file at: {}", path.display());
-            config::Settings::write_default_config(path.to_str().unwrap())?;
+            config::Settings::write_default_config(&path)?;
             println!("Configuration file created successfully!");
             println!("Edit the file and run: zerofs run -c {}", path.display());
         }
         cli::Commands::ChangePassword { config } => {
-            let settings = match config::Settings::from_file(config.to_str().unwrap()) {
+            let settings = match config::Settings::from_file(&config) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("✗ Failed to load config: {:#}", e);
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
             std::io::stdin()
                 .lock()
                 .read_line(&mut new_password)
-                .unwrap();
+                .context("Failed to read password from stdin")?;
             let new_password = new_password.trim().to_string();
             eprintln!("New password read successfully.");
 

@@ -30,7 +30,8 @@ impl BucketIdentity {
                 tracing::info!("Found existing bucket ID: {}", uuid);
                 uuid
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!("Bucket ID marker not found ({}), creating new one", e);
                 let new_id = Uuid::new_v4();
                 tracing::info!("Creating new bucket ID: {}", new_id);
 

@@ -9,13 +9,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub async fn list_keys(config_path: PathBuf) -> Result<()> {
-    let settings = Settings::from_file(config_path.to_str().unwrap())
+    let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let url = settings.storage.url.clone();
 
     let cache_config = CacheConfig {
-        root_folder: settings.cache.dir.to_str().unwrap().to_string(),
+        root_folder: settings.cache.dir.clone(),
         max_cache_size_gb: settings.cache.disk_size_gb,
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
@@ -31,11 +31,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             .await?;
 
     let cache_config = CacheConfig {
-        root_folder: format!(
-            "{}/{}",
-            cache_config.root_folder,
-            bucket.cache_directory_name()
-        ),
+        root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
         ..cache_config
     };
 

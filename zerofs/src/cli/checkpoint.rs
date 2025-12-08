@@ -5,7 +5,7 @@ use comfy_table::{Table, presets::UTF8_FULL};
 use std::path::Path;
 
 async fn connect_rpc_client(config_path: &Path) -> Result<RpcClient> {
-    let settings = Settings::from_file(config_path.to_str().unwrap())
+    let settings = Settings::from_file(config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let rpc_config = settings

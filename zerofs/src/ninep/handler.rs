@@ -135,7 +135,10 @@ impl NinePHandler {
     async fn handle_version(&self, tag: u16, tv: Tversion) -> P9Message {
         let version_str = match tv.version.as_str() {
             Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
+            Err(e) => {
+                debug!("Invalid version string encoding: {:?}", e);
+                return P9Message::error(tag, libc::EINVAL as u32);
+            }
         };
 
         debug!("Client requested version: {}", version_str);
@@ -167,7 +170,10 @@ impl NinePHandler {
     async fn handle_attach(&self, tag: u16, ta: Tattach) -> P9Message {
         let username = match ta.uname.as_str() {
             Ok(s) => s,
-            Err(_) => return P9Message::error(tag, libc::EINVAL as u32),
+            Err(e) => {
+                debug!("Invalid username encoding: {:?}", e);
+                return P9Message::error(tag, libc::EINVAL as u32);
+            }
         };
 
         debug!(
@@ -1027,11 +1033,9 @@ impl NinePHandler {
             .try_add_lock(self.handler_id, new_lock)
             .await
         {
-            Ok(_lock_id) => {
-                // Lock acquired successfully
-            }
-            Err(_) => {
-                // Conflict detected
+            Ok(_lock_id) => {}
+            Err(e) => {
+                debug!("Lock conflict on inode {}: {:?}", fid.inode_id, e);
                 if (tl.flags & P9_LOCK_FLAGS_BLOCK) != 0 {
                     return P9Message::new(
                         tag,

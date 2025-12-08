@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
+use tracing::trace;
 
 pub type SequenceNumber = u64;
 
@@ -57,6 +58,7 @@ impl WriteCoordinator {
             }
 
             if rx.changed().await.is_err() {
+                trace!("Write coordinator channel closed while waiting for seq {}", seq);
                 return;
             }
         }
