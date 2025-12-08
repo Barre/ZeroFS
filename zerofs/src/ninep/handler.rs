@@ -101,6 +101,14 @@ impl NinePHandler {
         }
     }
 
+    fn get_fid(&self, fid: u32) -> P9Result<Fid> {
+        self.session
+            .fids
+            .get(&fid)
+            .ok_or(P9Error::BadFid)
+            .map(|f| f.clone())
+    }
+
     pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
         let result = match msg {
             Message::Tversion(tv) => self.handle_version(tv).await,
@@ -237,12 +245,7 @@ impl NinePHandler {
     }
 
     async fn handle_walk(&self, tw: Twalk) -> P9Result<Message> {
-        let src_fid = self
-            .session
-            .fids
-            .get(&tw.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let src_fid = self.get_fid(tw.fid)?;
 
         let mut current_path = src_fid.path.clone();
         let mut current_id = src_fid.inode_id;
@@ -289,12 +292,7 @@ impl NinePHandler {
     }
 
     async fn handle_lopen(&self, tl: Tlopen) -> P9Result<Message> {
-        let fid_entry = self
-            .session
-            .fids
-            .get(&tl.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid_entry = self.get_fid(tl.fid)?;
 
         if fid_entry.opened {
             return Err(P9Error::FidAlreadyOpen);
@@ -332,12 +330,7 @@ impl NinePHandler {
     }
 
     async fn handle_readdir(&self, tr: Treaddir) -> P9Result<Message> {
-        let fid_entry = self
-            .session
-            .fids
-            .get(&tr.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_entry.opened {
             return Err(P9Error::FidNotOpen);
@@ -392,24 +385,16 @@ impl NinePHandler {
     }
 
     async fn handle_lcreate(&self, tc: Tlcreate) -> P9Result<Message> {
-        let parent_fid = self
-            .session
-            .fids
-            .get(&tc.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let parent_fid = self.get_fid(tc.fid)?;
 
         if parent_fid.opened {
             return Err(P9Error::FidAlreadyOpen);
         }
 
-        let mut temp_creds = parent_fid.creds;
-        temp_creds.gid = tc.gid;
-
         let (child_id, post_attr) = self
             .filesystem
             .create(
-                &temp_creds,
+                &parent_fid.creds.with_gid(tc.gid),
                 parent_fid.inode_id,
                 &tc.name.data,
                 &SetAttributes {
@@ -437,12 +422,7 @@ impl NinePHandler {
     }
 
     async fn handle_read(&self, tr: Tread) -> P9Result<Message> {
-        let fid_entry = self
-            .session
-            .fids
-            .get(&tr.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_entry.opened {
             return Err(P9Error::FidNotOpen);
@@ -467,12 +447,7 @@ impl NinePHandler {
     }
 
     async fn handle_write(&self, tw: Twrite) -> P9Result<Message> {
-        let fid_entry = self
-            .session
-            .fids
-            .get(&tw.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_entry.opened {
             return Err(P9Error::FidNotOpen);
@@ -518,12 +493,7 @@ impl NinePHandler {
     }
 
     async fn handle_getattr(&self, tg: Tgetattr) -> P9Result<Message> {
-        let fid_entry = self
-            .session
-            .fids
-            .get(&tg.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid_entry = self.get_fid(tg.fid)?;
 
         let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
 
@@ -534,10 +504,7 @@ impl NinePHandler {
     }
 
     async fn handle_setattr(&self, ts: Tsetattr) -> P9Result<Message> {
-        let fid_entry = self.session.fids.get(&ts.fid).ok_or(P9Error::BadFid)?;
-        let inode_id = fid_entry.inode_id;
-        let creds = fid_entry.creds;
-        drop(fid_entry);
+        let fid_entry = self.get_fid(ts.fid)?;
 
         let attr = SetAttributes {
             mode: if ts.valid & SETATTR_MODE != 0 {
@@ -582,38 +549,35 @@ impl NinePHandler {
             },
         };
 
-        self.filesystem.setattr(&creds, inode_id, &attr).await?;
+        self.filesystem
+            .setattr(&fid_entry.creds, fid_entry.inode_id, &attr)
+            .await?;
         Ok(Message::Rsetattr(Rsetattr))
     }
 
     async fn handle_mkdir(&self, tm: Tmkdir) -> P9Result<Message> {
-        let parent_fid = self
-            .session
-            .fids
-            .get(&tm.dfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
-
-        let parent_id = parent_fid.inode_id;
-        let creds = parent_fid.creds;
+        let parent_fid = self.get_fid(tm.dfid)?;
 
         debug!(
             "handle_mkdir: parent_id={}, name={:?}, dfid={}, mode={:o}, gid={}, fid uid={}, fid gid={}",
-            parent_id, &tm.name.data, tm.dfid, tm.mode, tm.gid, creds.uid, creds.gid
+            parent_fid.inode_id,
+            &tm.name.data,
+            tm.dfid,
+            tm.mode,
+            tm.gid,
+            parent_fid.creds.uid,
+            parent_fid.creds.gid
         );
-
-        let mut temp_creds = creds;
-        temp_creds.gid = tm.gid;
 
         let (new_id, post_attr) = self
             .filesystem
             .mkdir(
-                &temp_creds,
-                parent_id,
+                &parent_fid.creds.with_gid(tm.gid),
+                parent_fid.inode_id,
                 &tm.name.data,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode),
-                    uid: SetUid::Set(creds.uid),
+                    uid: SetUid::Set(parent_fid.creds.uid),
                     gid: SetGid::Set(tm.gid),
                     ..Default::default()
                 },
@@ -625,29 +589,18 @@ impl NinePHandler {
     }
 
     async fn handle_symlink(&self, ts: Tsymlink) -> P9Result<Message> {
-        let parent_fid = self
-            .session
-            .fids
-            .get(&ts.dfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
-
-        let parent_id = parent_fid.inode_id;
-        let creds = parent_fid.creds;
-
-        let mut temp_creds = creds;
-        temp_creds.gid = ts.gid;
+        let parent_fid = self.get_fid(ts.dfid)?;
 
         let (new_id, post_attr) = self
             .filesystem
             .symlink(
-                &temp_creds,
-                parent_id,
+                &parent_fid.creds.with_gid(ts.gid),
+                parent_fid.inode_id,
                 &ts.name.data,
                 &ts.symtgt.data,
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
-                    uid: SetUid::Set(creds.uid),
+                    uid: SetUid::Set(parent_fid.creds.uid),
                     gid: SetGid::Set(ts.gid),
                     ..Default::default()
                 },
@@ -659,15 +612,7 @@ impl NinePHandler {
     }
 
     async fn handle_mknod(&self, tm: Tmknod) -> P9Result<Message> {
-        let parent_fid = self
-            .session
-            .fids
-            .get(&tm.dfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
-
-        let mut temp_creds = parent_fid.creds;
-        temp_creds.gid = tm.gid;
+        let parent_fid = self.get_fid(tm.dfid)?;
 
         let file_type = tm.mode & 0o170000; // S_IFMT
         let device_type = match file_type {
@@ -681,7 +626,7 @@ impl NinePHandler {
         let (child_id, post_attr) = self
             .filesystem
             .mknod(
-                &temp_creds,
+                &parent_fid.creds.with_gid(tm.gid),
                 parent_fid.inode_id,
                 &tm.name.data,
                 device_type,
@@ -704,12 +649,7 @@ impl NinePHandler {
     }
 
     async fn handle_readlink(&self, tr: Treadlink) -> P9Result<Message> {
-        let fid_entry = self
-            .session
-            .fids
-            .get(&tr.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid_entry = self.get_fid(tr.fid)?;
 
         let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
 
@@ -722,18 +662,8 @@ impl NinePHandler {
     }
 
     async fn handle_link(&self, tl: Tlink) -> P9Result<Message> {
-        let dir_fid = self
-            .session
-            .fids
-            .get(&tl.dfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
-        let file_fid = self
-            .session
-            .fids
-            .get(&tl.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let dir_fid = self.get_fid(tl.dfid)?;
+        let file_fid = self.get_fid(tl.fid)?;
 
         let dir_id = dir_fid.inode_id;
         let file_id = file_fid.inode_id;
@@ -755,18 +685,8 @@ impl NinePHandler {
     }
 
     async fn handle_rename(&self, tr: Trename) -> P9Result<Message> {
-        let source_fid = self
-            .session
-            .fids
-            .get(&tr.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
-        let dest_fid = self
-            .session
-            .fids
-            .get(&tr.dfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let source_fid = self.get_fid(tr.fid)?;
+        let dest_fid = self.get_fid(tr.dfid)?;
 
         if source_fid.path.is_empty() {
             return Err(P9Error::InvalidArgument);
@@ -803,18 +723,8 @@ impl NinePHandler {
     }
 
     async fn handle_renameat(&self, tr: Trenameat) -> P9Result<Message> {
-        let old_dir_fid = self
-            .session
-            .fids
-            .get(&tr.olddirfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
-        let new_dir_fid = self
-            .session
-            .fids
-            .get(&tr.newdirfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let old_dir_fid = self.get_fid(tr.olddirfid)?;
+        let new_dir_fid = self.get_fid(tr.newdirfid)?;
 
         let auth = self.make_auth_context(&old_dir_fid.creds);
 
@@ -832,12 +742,7 @@ impl NinePHandler {
     }
 
     async fn handle_unlinkat(&self, tu: Tunlinkat) -> P9Result<Message> {
-        let dir_fid = self
-            .session
-            .fids
-            .get(&tu.dirfid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let dir_fid = self.get_fid(tu.dirfid)?;
 
         let parent_id = dir_fid.inode_id;
         let creds = dir_fid.creds;
@@ -917,12 +822,7 @@ impl NinePHandler {
     }
 
     async fn handle_lock(&self, tl: Tlock) -> P9Result<Message> {
-        let fid = self
-            .session
-            .fids
-            .get(&tl.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid = self.get_fid(tl.fid)?;
 
         if matches!(tl.lock_type, LockType::Unlock) {
             self.lock_manager
@@ -966,12 +866,7 @@ impl NinePHandler {
     }
 
     async fn handle_getlock(&self, tg: Tgetlock) -> P9Result<Message> {
-        let fid = self
-            .session
-            .fids
-            .get(&tg.fid)
-            .ok_or(P9Error::BadFid)?
-            .clone();
+        let fid = self.get_fid(tg.fid)?;
 
         let test_lock = FileLock {
             lock_type: tg.lock_type,
