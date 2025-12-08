@@ -23,7 +23,7 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { git = "https://github.com/slatedb/slatedb.git", default-features = false, rev = "d490e5ba5504851347aabb138316a068e9c3c419", features = [
+slatedb = { git = "https://github.com/slatedb/slatedb.git", default-features = false, rev = "0da25b2c53aeb2692df44614806375d31fc3f499", features = [
     "wal_disable",
     "moka",
 ] }
