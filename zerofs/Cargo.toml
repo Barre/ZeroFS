@@ -23,10 +23,10 @@ lto = false
 codegen-units = 16
 
 [dependencies]
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "d490e5ba5504851347aabb138316a068e9c3c419", features = [
+slatedb = { git = "https://github.com/slatedb/slatedb.git", default-features = false, rev = "d490e5ba5504851347aabb138316a068e9c3c419", features = [
     "wal_disable",
+    "moka",
 ] }
-foyer-memory = "0.20.1"
 fastant = "0.1.11"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.19.0"
