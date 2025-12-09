@@ -65,7 +65,7 @@ pub async fn change_password(
         memory_cache_size_gb: settings.cache.memory_size_gb,
     };
 
-    let (slatedb, _) = build_slatedb(
+    let (slatedb, _, _) = build_slatedb(
         object_store,
         &cache_config,
         actual_db_path,

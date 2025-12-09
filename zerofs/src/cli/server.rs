@@ -375,7 +375,11 @@ pub async fn build_slatedb(
     db_path: String,
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
-) -> Result<(SlateDbHandle, Option<CheckpointRefreshParams>)> {
+) -> Result<(
+    SlateDbHandle,
+    Option<CheckpointRefreshParams>,
+    Option<tokio::runtime::Handle>,
+)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -475,7 +479,11 @@ pub async fn build_slatedb(
                     .await?,
             );
 
-            Ok((SlateDbHandle::ReadWrite(slatedb), None))
+            Ok((
+                SlateDbHandle::ReadWrite(slatedb),
+                None,
+                Some(runtime_handle),
+            ))
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
@@ -514,6 +522,7 @@ pub async fn build_slatedb(
             Ok((
                 SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 Some(checkpoint_params),
+                None,
             ))
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
@@ -529,7 +538,7 @@ pub async fn build_slatedb(
                 .await?,
             );
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
         }
     }
 }
@@ -540,6 +549,7 @@ pub struct InitResult {
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
+    pub maintenance_runtime: Option<tokio::runtime::Handle>,
 }
 
 async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Result<InitResult> {
@@ -593,7 +603,7 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
 
     info!("Loading or initializing encryption key");
 
-    let (slatedb, checkpoint_params) = build_slatedb(
+    let (slatedb, checkpoint_params, maintenance_runtime) = build_slatedb(
         object_store.clone(),
         &cache_config,
         actual_db_path.clone(),
@@ -619,6 +629,7 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
         object_store,
         db_path: actual_db_path,
         db_handle,
+        maintenance_runtime,
     })
 }
 
@@ -705,7 +716,7 @@ pub async fn run_server(
             fs.chunk_store.clone(),
             Arc::clone(&fs.stats),
         ));
-        Some(gc.start(shutdown.clone()))
+        Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
     } else {
         None
     };

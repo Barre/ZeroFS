@@ -36,8 +36,20 @@ impl GarbageCollector {
         }
     }
 
-    pub fn start(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn start(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> JoinHandle<()> {
+        let spawn_fn = move |fut| {
+            if let Some(rt) = runtime {
+                rt.spawn(fut)
+            } else {
+                tokio::spawn(fut)
+            }
+        };
+
+        spawn_fn(async move {
             info!("Starting garbage collection task (runs continuously)");
             loop {
                 tokio::select! {
