@@ -341,7 +341,7 @@ pub struct ReadDirResult {
 }
 
 /// Protocol-agnostic authentication context
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthContext {
     pub uid: u32,
     pub gid: u32,
