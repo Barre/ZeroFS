@@ -171,7 +171,7 @@ impl NinePHandler {
             Message::Trenameat(tr) => self.handle_renameat(tr).await,
             Message::Tunlinkat(tu) => self.handle_unlinkat(tu).await,
             Message::Tfsync(tf) => self.handle_fsync(tf).await,
-            Message::Tflush(_) => Err(P9Error::NotSupported),
+            Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
             Message::Txattrwalk(_) => Err(P9Error::NotSupported),
             Message::Tstatfs(ts) => self.handle_statfs(ts).await,
             Message::Tlock(tl) => self.handle_lock(tl).await,
