@@ -2,20 +2,20 @@ use super::errors::P9Error;
 use super::handler::NinePHandler;
 use super::lock_manager::FileLockManager;
 use super::protocol::{
-    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN,
-    P9Message, Rlerror,
+    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE,
+    P9_SIZE_FIELD_LEN, P9Message, Rlerror,
 };
 use crate::fs::ZeroFS;
-use crate::ninep::handler::DEFAULT_MSIZE;
-use bytes::BytesMut;
 use dashmap::DashMap;
 use deku::prelude::*;
+use futures::StreamExt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
+use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -128,7 +128,7 @@ where
     let handler = Arc::new(NinePHandler::new(filesystem, lock_manager.clone()));
     let handler_id = handler.handler_id();
 
-    let (mut read_stream, mut write_stream) = tokio::io::split(stream);
+    let (read_stream, mut write_stream) = tokio::io::split(stream);
 
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
@@ -141,7 +141,7 @@ where
         }
     });
 
-    let result = handle_client_loop(handler, &mut read_stream, tx, shutdown).await;
+    let result = handle_client_loop(handler, read_stream, tx, shutdown).await;
 
     lock_manager.release_session_locks(handler_id).await;
 
@@ -160,7 +160,7 @@ type PendingFlushes = Arc<DashMap<u16, u16>>;
 
 async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
-    read_stream: &mut R,
+    read_stream: R,
     tx: mpsc::Sender<(u16, Vec<u8>)>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()>
@@ -170,41 +170,49 @@ where
     let inflight: InflightRequests = Arc::new(DashMap::new());
     let pending_flushes: PendingFlushes = Arc::new(DashMap::new());
 
-    loop {
-        let mut size_buf = [0u8; P9_SIZE_FIELD_LEN];
+    // 9P framing: 4-byte little-endian size field at offset 0, where
+    // size includes the size field itself (e.g., size=21 means 21 total bytes).
+    let codec = LengthDelimitedCodec::builder()
+        .little_endian()
+        .length_field_offset(0)
+        .length_field_length(P9_SIZE_FIELD_LEN)
+        .length_adjustment(0)
+        .num_skip(0)
+        .max_frame_length(P9_MAX_MSIZE as usize)
+        .new_read(read_stream);
 
-        tokio::select! {
+    tokio::pin!(codec);
+
+    loop {
+        let full_buf = tokio::select! {
             _ = shutdown.cancelled() => {
                 debug!("9P client handler shutting down");
                 return Ok(());
             }
-            result = read_stream.read_exact(&mut size_buf) => {
+            result = codec.next() => {
                 match result {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    Some(Ok(buf)) => buf,
+                    Some(Err(e)) => {
+                        // Check if it's a frame size error (message too large)
+                        let err_str = e.to_string();
+                        if err_str.contains("frame size") {
+                            error!("Invalid message size: {} (max: {} bytes)", err_str, P9_MAX_MSIZE);
+                            return Err(anyhow::anyhow!("Invalid message size"));
+                        }
+                        return Err(e.into());
+                    }
+                    None => {
                         debug!("Client disconnected");
                         return Ok(());
                     }
-                    Err(e) => {
-                        return Err(e.into());
-                    }
                 }
             }
+        };
+
+        if full_buf.len() < P9_MIN_MESSAGE_SIZE as usize {
+            error!("Message too short: {} bytes", full_buf.len());
+            return Err(anyhow::anyhow!("Message too short"));
         }
-
-        let size = u32::from_le_bytes(size_buf);
-        if !(P9_MIN_MESSAGE_SIZE..=DEFAULT_MSIZE).contains(&size) {
-            error!("Invalid message size: {}", size);
-            return Err(anyhow::anyhow!("Invalid message size"));
-        }
-
-        let mut full_buf = BytesMut::with_capacity(size as usize);
-        full_buf.extend_from_slice(&size_buf);
-        full_buf.resize(size as usize, 0);
-
-        read_stream
-            .read_exact(&mut full_buf[P9_SIZE_FIELD_LEN..])
-            .await?;
 
         match P9Message::from_bytes((&full_buf, 0)) {
             Ok((_, parsed)) => {
@@ -298,7 +306,7 @@ where
                     );
                     debug!(
                         "Message size: {}, buffer (first {} bytes): {:?}",
-                        size,
+                        full_buf.len(),
                         P9_DEBUG_BUFFER_SIZE,
                         &full_buf[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, full_buf.len())]
                     );

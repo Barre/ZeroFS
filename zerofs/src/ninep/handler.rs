@@ -211,7 +211,7 @@ impl NinePHandler {
             }));
         }
 
-        let msize = tv.msize.min(DEFAULT_MSIZE);
+        let msize = tv.msize.min(P9_MAX_MSIZE);
         self.session.msize.store(msize, AtomicOrdering::Relaxed);
 
         Ok(Message::Rversion(Rversion {

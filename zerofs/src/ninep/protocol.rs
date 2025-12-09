@@ -32,7 +32,9 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-// Server configuration constants
+/// Maximum message size we accept. Used for codec frame limit.
+pub const P9_MAX_MSIZE: u32 = 1024 * 1024;
+
 pub const P9_CHANNEL_SIZE: usize = 1000;
 pub const P9_SIZE_FIELD_LEN: usize = std::mem::size_of::<u32>();
 pub const P9_TYPE_FIELD_LEN: usize = std::mem::size_of::<u8>();
