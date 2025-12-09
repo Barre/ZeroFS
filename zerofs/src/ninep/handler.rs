@@ -198,6 +198,10 @@ impl NinePHandler {
 
         debug!("Client requested version: {}", version_str);
 
+        // Per 9P spec, Tversion resets all connection state.
+        // All fids are implicitly clunked and the session is reset.
+        self.session.fids.clear();
+
         if !version_str.contains("9P2000.L") {
             // We only support 9P2000.L
             debug!("Client doesn't support 9P2000.L, returning unknown");
@@ -291,22 +295,49 @@ impl NinePHandler {
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
 
-        for wname in &tw.wnames {
+        for (i, wname) in tw.wnames.iter().enumerate() {
             let name_bytes = Bytes::copy_from_slice(&wname.data);
-            current_path.push(name_bytes.clone());
 
             let creds = src_fid.creds;
-            let child_id = self
+            let child_id = match self
                 .filesystem
                 .lookup(&creds, current_id, &name_bytes)
-                .await?;
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    // Per 9P spec: if first element fails, return error.
+                    // If later element fails, return partial Rwalk with qids so far.
+                    if i == 0 {
+                        return Err(e.into());
+                    }
+                    // Partial walk - return what we have so far (newfid is NOT created)
+                    return Ok(Message::Rwalk(Rwalk {
+                        nwqid: wqids.len() as u16,
+                        wqids,
+                    }));
+                }
+            };
 
-            let child_inode = self.filesystem.inode_store.get(child_id).await?;
+            let child_inode = match self.filesystem.inode_store.get(child_id).await {
+                Ok(inode) => inode,
+                Err(e) => {
+                    if i == 0 {
+                        return Err(e.into());
+                    }
+                    return Ok(Message::Rwalk(Rwalk {
+                        nwqid: wqids.len() as u16,
+                        wqids,
+                    }));
+                }
+            };
 
+            current_path.push(name_bytes);
             wqids.push(inode_to_qid(&child_inode, child_id));
             current_id = child_id;
         }
 
+        // Only create newfid if the walk fully succeeded
         if tw.newfid != tw.fid || !tw.wnames.is_empty() {
             // Check if newfid is already in use
             if tw.newfid != tw.fid && self.session.fids.contains_key(&tw.newfid) {
