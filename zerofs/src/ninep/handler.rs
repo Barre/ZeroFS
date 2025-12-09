@@ -387,12 +387,7 @@ impl NinePHandler {
         // Pass it directly to readdir which handles . and .. with cookies 1 and 2
         let result = self
             .filesystem
-            .readdir(
-                &auth,
-                fid_entry.inode_id,
-                tr.offset,
-                P9_READDIR_BATCH_SIZE,
-            )
+            .readdir(&auth, fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
             .await?;
 
         let mut dir_entries = Vec::new();
