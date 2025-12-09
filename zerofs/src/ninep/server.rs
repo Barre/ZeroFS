@@ -8,6 +8,7 @@ use super::protocol::{
 use crate::fs::ZeroFS;
 use crate::ninep::handler::DEFAULT_MSIZE;
 use bytes::BytesMut;
+use dashmap::DashMap;
 use deku::prelude::*;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -149,6 +150,14 @@ where
     result
 }
 
+/// Tracks in-flight requests by tag, with a Notify to signal completion.
+type InflightRequests = Arc<DashMap<u16, Arc<tokio::sync::Notify>>>;
+
+/// Tracks the latest Tflush tag for each oldtag. Only the last flush gets a response.
+/// Per 9P spec: "should a server receive a request and then multiple flushes for that
+/// request, it need respond only to the last flush."
+type PendingFlushes = Arc<DashMap<u16, u16>>;
+
 async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     read_stream: &mut R,
@@ -158,6 +167,9 @@ async fn handle_client_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let inflight: InflightRequests = Arc::new(DashMap::new());
+    let pending_flushes: PendingFlushes = Arc::new(DashMap::new());
+
     loop {
         let mut size_buf = [0u8; P9_SIZE_FIELD_LEN];
 
@@ -203,11 +215,61 @@ where
 
                 let tag = parsed.tag;
                 let body = parsed.body;
+
+                let flush_oldtag = if let Message::Tflush(ref tflush) = body {
+                    // Register this as the latest flush for oldtag (overwrites any previous)
+                    pending_flushes.insert(tflush.oldtag, tag);
+                    Some(tflush.oldtag)
+                } else {
+                    None
+                };
+
+                let notify = if flush_oldtag.is_none() {
+                    let notify = Arc::new(tokio::sync::Notify::new());
+                    inflight.insert(tag, Arc::clone(&notify));
+                    Some(notify)
+                } else {
+                    None
+                };
+
                 let handler = Arc::clone(&handler);
                 let tx = tx.clone();
+                let inflight = Arc::clone(&inflight);
+                let pending_flushes = Arc::clone(&pending_flushes);
 
                 tokio::spawn(async move {
                     let response = handler.handle_message(tag, body).await;
+
+                    // For Tflush: wait for the flushed request to complete before sending Rflush.
+                    // This ensures the flushed request's response is sent first, per 9P spec:
+                    // "The server may respond to the pending request before responding to Tflush"
+                    if let Some(oldtag) = flush_oldtag {
+                        if let Some(old_notify) =
+                            inflight.get(&oldtag).map(|r| Arc::clone(r.value()))
+                        {
+                            debug!("Tflush: waiting for oldtag {} to complete", oldtag);
+                            old_notify.notified().await;
+                            debug!("Tflush: oldtag {} completed", oldtag);
+                        }
+
+                        // Only send Rflush if we're still the latest flush for this oldtag.
+                        // If a newer Tflush arrived, it supersedes us and we stay silent.
+                        let is_latest = pending_flushes
+                            .get(&oldtag)
+                            .is_some_and(|latest_tag| *latest_tag == tag);
+
+                        if !is_latest {
+                            debug!(
+                                "Tflush: tag {} superseded by newer flush for oldtag {}",
+                                tag, oldtag
+                            );
+                            return;
+                        }
+
+                        // We're the latest - clean up and send response
+                        pending_flushes.remove(&oldtag);
+                    }
+
                     match response.to_bytes() {
                         Ok(response_bytes) => {
                             if let Err(e) = tx.send((tag, response_bytes)).await {
@@ -217,6 +279,11 @@ where
                         Err(e) => {
                             error!("Failed to serialize response for tag {}: {:?}", tag, e);
                         }
+                    }
+
+                    if let Some(notify) = notify {
+                        inflight.remove(&tag);
+                        notify.notify_waiters();
                     }
                 });
             }
