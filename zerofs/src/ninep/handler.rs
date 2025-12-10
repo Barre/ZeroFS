@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use tracing::debug;
 
 pub const DEFAULT_MSIZE: u32 = 256 * 1024;
-pub const DEFAULT_IOUNIT: u32 = 256 * 1024;
 
 pub const AT_REMOVEDIR: u32 = 0x200;
 // Linux dirent type constants
@@ -53,7 +52,6 @@ pub struct Fid {
     pub path: Vec<bytes::Bytes>,
     pub inode_id: InodeId,
     pub qid: Qid,
-    pub iounit: u32,
     pub opened: bool,
     pub mode: Option<u32>,
     pub creds: Credentials, // Store credentials per fid/session
@@ -139,6 +137,12 @@ impl NinePHandler {
 
     pub fn handler_id(&self) -> u64 {
         self.handler_id
+    }
+
+    /// Per 9P spec, iounit may be zero, in which case the client calculates
+    /// the maximum I/O size based on the negotiated msize.
+    fn iounit(&self) -> u32 {
+        0
     }
 
     fn get_fid(&self, fid: u32) -> P9Result<Fid> {
@@ -278,7 +282,6 @@ impl NinePHandler {
                 path: vec![],
                 inode_id: 0,
                 qid: qid.clone(),
-                iounit: DEFAULT_IOUNIT,
                 opened: false,
                 mode: None,
                 creds,
@@ -348,7 +351,6 @@ impl NinePHandler {
                 path: current_path,
                 inode_id: current_id,
                 qid: wqids.last().cloned().unwrap_or(src_fid.qid),
-                iounit: src_fid.iounit,
                 opened: false,
                 mode: None,
                 creds: src_fid.creds, // Inherit credentials from source fid
@@ -371,7 +373,6 @@ impl NinePHandler {
 
         let inode_id = fid_entry.inode_id;
         let creds = fid_entry.creds;
-        let iounit = fid_entry.iounit;
 
         debug!(
             "handle_lopen: fid={}, inode_id={}, uid={}, gid={}, flags={:#x}",
@@ -388,7 +389,10 @@ impl NinePHandler {
             fid_entry.mode = Some(tl.flags);
         }
 
-        Ok(Message::Rlopen(Rlopen { qid, iounit }))
+        Ok(Message::Rlopen(Rlopen {
+            qid,
+            iounit: self.iounit(),
+        }))
     }
 
     async fn handle_clunk(&self, tc: Tclunk) -> Message {
@@ -483,7 +487,7 @@ impl NinePHandler {
 
         Ok(Message::Rlcreate(Rlcreate {
             qid,
-            iounit: DEFAULT_IOUNIT,
+            iounit: self.iounit(),
         }))
     }
 
