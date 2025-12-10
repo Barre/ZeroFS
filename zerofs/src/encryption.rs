@@ -222,6 +222,7 @@ impl EncryptedDb {
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
+            cache_blocks: true,
             ..Default::default()
         };
 
@@ -255,7 +256,8 @@ impl EncryptedDb {
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
             read_ahead_bytes: 1024 * 1024,
-            max_fetch_tasks: 4,
+            cache_blocks: true,
+            max_fetch_tasks: 8,
             ..Default::default()
         };
         let iter = match &self.inner {
