@@ -76,7 +76,7 @@ jobs:
         run: |
           rm -rf /tmp/pgo-data
 
-          RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" \
+          RUSTFLAGS="--cfg tokio_unstable -Cprofile-generate=/tmp/pgo-data" \
             cargo build --release --target=x86_64-unknown-linux-gnu
 
       - name: Run profiling workloads
@@ -375,12 +375,12 @@ jobs:
       - name: Build with PGO (cross)
         if: matrix.use_cross
         run: |
-          cd zerofs && RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
 
       - name: Build with PGO (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd'
         run: |
-          cd zerofs && RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'
@@ -400,7 +400,7 @@ jobs:
             cp pgo-data/Cargo.lock zerofs/
 
             cd zerofs
-            RUSTFLAGS="-C profile-use=$(pwd)/merged.profdata" cargo build --release
+            RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release
 
             file target/release/zerofs
             ls -lh target/release/zerofs
