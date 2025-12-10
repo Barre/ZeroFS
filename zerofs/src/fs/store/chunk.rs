@@ -167,7 +167,11 @@ impl ChunkStore {
                 .copy_from_slice(&data[data_offset..data_offset + write_len]);
             data_offset += write_len;
 
-            self.save(txn, id, chunk_idx, chunk.freeze());
+            if chunk.as_ref() == ZERO_CHUNK {
+                self.delete(txn, id, chunk_idx);
+            } else {
+                self.save(txn, id, chunk_idx, chunk.freeze());
+            }
         }
 
         Ok(())
@@ -194,15 +198,16 @@ impl ChunkStore {
             let clear_from = (new_size % CHUNK_SIZE as u64) as usize;
 
             if clear_from > 0 {
-                let chunk_data = self
-                    .get(id, last_chunk_idx)
-                    .await?
-                    .map(|b| b.to_vec())
-                    .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]);
+                let existing = self.get(id, last_chunk_idx).await?;
+                let mut chunk =
+                    BytesMut::from(existing.as_ref().map(|b| b.as_ref()).unwrap_or(ZERO_CHUNK));
+                chunk[clear_from..].fill(0);
 
-                let mut new_chunk_data = chunk_data;
-                new_chunk_data[clear_from..].fill(0);
-                self.save(txn, id, last_chunk_idx, Bytes::from(new_chunk_data));
+                if chunk.as_ref() == ZERO_CHUNK {
+                    self.delete(txn, id, last_chunk_idx);
+                } else {
+                    self.save(txn, id, last_chunk_idx, chunk.freeze());
+                }
             }
         }
 
@@ -250,7 +255,7 @@ impl ChunkStore {
                 let mut chunk_data = BytesMut::from(existing_data.as_ref());
                 chunk_data[zero_start..zero_end].fill(0);
 
-                if chunk_data.iter().all(|&b| b == 0) {
+                if chunk_data.as_ref() == ZERO_CHUNK {
                     self.delete(txn, id, chunk_idx);
                 } else {
                     self.save(txn, id, chunk_idx, chunk_data.freeze());
