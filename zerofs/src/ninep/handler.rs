@@ -1053,9 +1053,9 @@ mod tests {
                 assert_eq!(rstatfs.namelen, 255);
 
                 // Verify totals match our constants
-                const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
+                const TOTAL_BYTES: u64 = u64::MAX;
                 const TOTAL_INODES: u64 = 1 << 48;
-                assert_eq!(rstatfs.blocks * 4096, TOTAL_BYTES);
+                assert_eq!(rstatfs.blocks, TOTAL_BYTES.div_ceil(4096));
                 // Total files = used + free, which will be <= TOTAL_INODES
                 assert!(rstatfs.files <= TOTAL_INODES);
                 assert_eq!(rstatfs.files, rstatfs.ffree); // Since no files created yet, all are free

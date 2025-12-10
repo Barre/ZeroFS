@@ -310,7 +310,7 @@ impl ZeroFS {
         Self::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             encryption_key,
-            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
+            u64::MAX,
         )
         .await
     }
@@ -333,7 +333,7 @@ impl ZeroFS {
         Self::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             encryption_key,
-            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
+            u64::MAX,
         )
         .await
     }
@@ -2622,7 +2622,7 @@ mod tests {
         let fs_rw = ZeroFS::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             test_key,
-            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
+            u64::MAX,
         )
         .await
         .unwrap();
