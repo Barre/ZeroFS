@@ -8,7 +8,6 @@ pub enum P9Error {
     FidInUse,
     InvalidEncoding,
     InvalidArgument,
-    MessageTooLarge,
     NotADirectory,
     IsADirectory,
     NotASymlink,
@@ -31,7 +30,6 @@ impl P9Error {
             | P9Error::InvalidArgument
             | P9Error::NotASymlink
             | P9Error::InvalidDeviceType => libc::EINVAL as u32,
-            P9Error::MessageTooLarge => libc::EIO as u32,
             P9Error::NotADirectory => libc::ENOTDIR as u32,
             P9Error::IsADirectory => libc::EISDIR as u32,
             P9Error::LockConflict => libc::EAGAIN as u32,
