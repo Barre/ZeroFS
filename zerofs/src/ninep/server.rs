@@ -6,6 +6,7 @@ use super::protocol::{
     P9_SIZE_FIELD_LEN, P9Message, Rlerror,
 };
 use crate::fs::ZeroFS;
+use crate::task::spawn_named;
 use dashmap::DashMap;
 use deku::prelude::*;
 use futures::StreamExt;
@@ -55,7 +56,7 @@ impl NinePServer {
         let lock_manager = Arc::clone(&self.lock_manager);
         let client_shutdown = shutdown.child_token();
 
-        tokio::spawn(async move {
+        spawn_named("9p-client", async move {
             if let Err(e) =
                 handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
             {
@@ -132,7 +133,7 @@ where
 
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
-    let writer_task = tokio::spawn(async move {
+    let writer_task = spawn_named("9p-writer", async move {
         while let Some((tag, response_bytes)) = rx.recv().await {
             if let Err(e) = write_stream.write_all(&response_bytes).await {
                 error!("Failed to write response for tag {}: {}", tag, e);
@@ -239,7 +240,7 @@ where
                 let inflight = Arc::clone(&inflight);
                 let pending_flushes = Arc::clone(&pending_flushes);
 
-                tokio::spawn(async move {
+                spawn_named("9p-request", async move {
                     let response = handler.handle_message(tag, body).await;
 
                     // For Tflush: wait for the flushed request to complete before sending Rflush.

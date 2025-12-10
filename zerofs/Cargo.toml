@@ -30,7 +30,7 @@ slatedb = { git = "https://github.com/slatedb/slatedb.git", default-features = f
 fastant = "0.1.11"
 tikv-jemallocator = { version = "0.6.1", features = ["background_threads"] }
 zerofs_nfsserve = "0.19.0"
-tokio = { version = "1.48", features = ["full"] }
+tokio = { version = "1.48", features = ["full", "tracing"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"
 tracing = "0.1"

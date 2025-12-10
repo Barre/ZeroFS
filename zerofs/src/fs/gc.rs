@@ -3,6 +3,7 @@ use crate::fs::CHUNK_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
 use crate::fs::store::{ChunkStore, TombstoneStore};
+use crate::task::{spawn_named, spawn_named_on};
 use bytes::Bytes;
 use slatedb::config::WriteOptions;
 use std::sync::Arc;
@@ -41,15 +42,7 @@ impl GarbageCollector {
         shutdown: CancellationToken,
         runtime: Option<tokio::runtime::Handle>,
     ) -> JoinHandle<()> {
-        let spawn_fn = move |fut| {
-            if let Some(rt) = runtime {
-                rt.spawn(fut)
-            } else {
-                tokio::spawn(fut)
-            }
-        };
-
-        spawn_fn(async move {
+        let fut = async move {
             info!("Starting garbage collection task (runs continuously)");
             loop {
                 tokio::select! {
@@ -72,7 +65,13 @@ impl GarbageCollector {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
                 }
             }
-        })
+        };
+
+        if let Some(rt) = runtime {
+            spawn_named_on("gc", fut, &rt)
+        } else {
+            spawn_named("gc", fut)
+        }
     }
 
     pub async fn run(&self) -> Result<(), FsError> {
