@@ -22,7 +22,12 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
+[features]
+default = []
+tokio-console = ["dep:console-subscriber"]
+
 [dependencies]
+console-subscriber = { version = "0.5", optional = true }
 slatedb = { git = "https://github.com/slatedb/slatedb.git", default-features = false, rev = "0da25b2c53aeb2692df44614806375d31fc3f499", features = [
     "wal_disable",
     "moka",
