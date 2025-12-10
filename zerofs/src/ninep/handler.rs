@@ -523,17 +523,6 @@ impl NinePHandler {
             return Err(P9Error::FidNotOpen);
         }
 
-        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
-        if (tw.data.len() as u64) + P9_IOHDRSZ as u64 > msize as u64 {
-            debug!(
-                "write: rejecting write of {} bytes (exceeds msize {} - IOHDRSZ {})",
-                tw.data.len(),
-                msize,
-                P9_IOHDRSZ
-            );
-            return Err(P9Error::MessageTooLarge);
-        }
-
         debug!(
             "write: fid={}, inode_id={}, uid={}, gid={}, offset={}, data_len={}",
             tw.fid,
