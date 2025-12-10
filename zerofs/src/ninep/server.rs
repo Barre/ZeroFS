@@ -193,12 +193,6 @@ where
                 match result {
                     Some(Ok(buf)) => buf,
                     Some(Err(e)) => {
-                        // Check if it's a frame size error (message too large)
-                        let err_str = e.to_string();
-                        if err_str.contains("frame size") {
-                            error!("Invalid message size: {} (max: {} bytes)", err_str, P9_MAX_MSIZE);
-                            return Err(anyhow::anyhow!("Invalid message size"));
-                        }
                         return Err(e.into());
                     }
                     None => {
@@ -316,9 +310,7 @@ where
                             ecode: P9Error::NotImplemented.to_errno(),
                         }),
                     );
-                    let response_bytes = error_msg.to_bytes().map_err(|e| {
-                        anyhow::anyhow!("Failed to serialize error response: {e:?}")
-                    })?;
+                    let response_bytes = error_msg.to_bytes().expect("Failed to serialize Rlerror");
 
                     if let Err(e) = tx.send((tag, response_bytes)).await {
                         error!("Failed to send error response: {}", e);
