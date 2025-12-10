@@ -111,8 +111,8 @@ impl NBDHandler {
         Ok(devices)
     }
 
-    /// Handle LIST option - returns list of all devices
-    pub async fn handle_list_option(&self) -> OptionResult {
+    /// Rreturns list of all devices
+    pub async fn list(&self) -> OptionResult {
         match self.list_devices().await {
             Ok(devices) => {
                 let mut replies = Vec::new();
@@ -129,8 +129,8 @@ impl NBDHandler {
         }
     }
 
-    /// Handle INFO option - returns device info without completing negotiation
-    pub async fn handle_info_option(&self, data: &[u8]) -> OptionResult {
+    /// Returns device info without completing negotiation
+    pub async fn info(&self, data: &[u8]) -> OptionResult {
         if data.len() < 4 {
             return OptionResult::Continue(vec![OptionReply::error(NBD_REP_ERR_INVALID)]);
         }
@@ -172,8 +172,8 @@ impl NBDHandler {
         }
     }
 
-    /// Handle GO option - returns device info and completes negotiation
-    pub async fn handle_go_option(&self, data: &[u8]) -> OptionResult {
+    /// Returns device info and completes negotiation
+    pub async fn go(&self, data: &[u8]) -> OptionResult {
         if data.len() < 4 {
             return OptionResult::Error(
                 NBDError::Protocol("Invalid GO option".to_string()),
@@ -258,7 +258,7 @@ impl NBDHandler {
         }
     }
 
-    pub async fn handle_read(
+    pub async fn read(
         &self,
         inode: u64,
         offset: u64,
@@ -281,7 +281,7 @@ impl NBDHandler {
         Ok(data)
     }
 
-    pub async fn handle_write(
+    pub async fn write(
         &self,
         inode: u64,
         offset: u64,
@@ -302,11 +302,7 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn handle_flush(&self) -> CommandResult<()> {
-        self.flush().await
-    }
-
-    pub async fn handle_trim(
+    pub async fn trim(
         &self,
         inode: u64,
         offset: u64,
@@ -334,7 +330,7 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn handle_write_zeroes(
+    pub async fn write_zeroes(
         &self,
         inode: u64,
         offset: u64,
@@ -380,19 +376,14 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn handle_cache(
-        &self,
-        offset: u64,
-        length: u32,
-        device_size: u64,
-    ) -> CommandResult<()> {
+    pub async fn cache(&self, offset: u64, length: u32, device_size: u64) -> CommandResult<()> {
         if offset + length as u64 > device_size {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())
     }
 
-    async fn flush(&self) -> CommandResult<()> {
+    pub async fn flush(&self) -> CommandResult<()> {
         self.filesystem
             .flush_coordinator
             .flush()

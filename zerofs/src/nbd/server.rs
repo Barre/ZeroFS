@@ -247,7 +247,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_list_option(&mut self, length: u32) -> Result<()> {
         self.drain_option_data(length).await?;
-        let result = self.handler.handle_list_option().await;
+        let result = self.handler.list().await;
         self.process_option_result(NBD_OPT_LIST, result).await?;
         Ok(())
     }
@@ -290,14 +290,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_info_option(&mut self, length: u32) -> Result<()> {
         let data = self.read_option_data(length).await?;
-        let result = self.handler.handle_info_option(&data).await;
+        let result = self.handler.info(&data).await;
         self.process_option_result(NBD_OPT_INFO, result).await?;
         Ok(())
     }
 
     async fn handle_go_option(&mut self, length: u32) -> Result<NBDDevice> {
         let data = self.read_option_data(length).await?;
-        let result = self.handler.handle_go_option(&data).await;
+        let result = self.handler.go(&data).await;
         match self.process_option_result(NBD_OPT_GO, result).await? {
             Some(device) => Ok(device),
             None => Err(NBDError::DeviceNotFound(Vec::new())),
@@ -399,7 +399,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBDCommand::Read => {
                     let result = self
                         .handler
-                        .handle_read(device.inode, request.offset, request.length, device.size)
+                        .read(device.inode, request.offset, request.length, device.size)
                         .await;
                     self.send_read_result(request.cookie, result).await;
                 }
@@ -420,13 +420,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     return Ok(());
                 }
                 NBDCommand::Flush => {
-                    let result = self.handler.handle_flush().await;
+                    let result = self.handler.flush().await;
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Trim => {
                     let result = self
                         .handler
-                        .handle_trim(
+                        .trim(
                             device.inode,
                             request.offset,
                             request.length,
@@ -439,7 +439,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBDCommand::WriteZeroes => {
                     let result = self
                         .handler
-                        .handle_write_zeroes(
+                        .write_zeroes(
                             device.inode,
                             request.offset,
                             request.length,
@@ -452,7 +452,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 NBDCommand::Cache => {
                     let result = self
                         .handler
-                        .handle_cache(request.offset, request.length, device.size)
+                        .cache(request.offset, request.length, device.size)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
@@ -497,7 +497,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .map_err(|_| CommandError::IoError)?;
 
         let data = data.freeze();
-        self.handler.handle_write(inode, offset, &data, fua).await
+        self.handler.write(inode, offset, &data, fua).await
     }
 
     /// Send read result (with data) as NBD reply
