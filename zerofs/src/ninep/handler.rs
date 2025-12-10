@@ -155,31 +155,31 @@ impl NinePHandler {
 
     pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
         let result = match msg {
-            Message::Tversion(tv) => self.handle_version(tv).await,
-            Message::Tattach(ta) => self.handle_attach(ta).await,
-            Message::Twalk(tw) => self.handle_walk(tw).await,
-            Message::Tlopen(tl) => self.handle_lopen(tl).await,
-            Message::Tlcreate(tc) => self.handle_lcreate(tc).await,
-            Message::Tread(tr) => self.handle_read(tr).await,
-            Message::Twrite(tw) => self.handle_write(tw).await,
-            Message::Tclunk(tc) => Ok(self.handle_clunk(tc).await),
-            Message::Treaddir(tr) => self.handle_readdir(tr).await,
-            Message::Tgetattr(tg) => self.handle_getattr(tg).await,
-            Message::Tsetattr(ts) => self.handle_setattr(ts).await,
-            Message::Tmkdir(tm) => self.handle_mkdir(tm).await,
-            Message::Tsymlink(ts) => self.handle_symlink(ts).await,
-            Message::Tmknod(tm) => self.handle_mknod(tm).await,
-            Message::Treadlink(tr) => self.handle_readlink(tr).await,
-            Message::Tlink(tl) => self.handle_link(tl).await,
-            Message::Trename(tr) => self.handle_rename(tr).await,
-            Message::Trenameat(tr) => self.handle_renameat(tr).await,
-            Message::Tunlinkat(tu) => self.handle_unlinkat(tu).await,
-            Message::Tfsync(tf) => self.handle_fsync(tf).await,
+            Message::Tversion(tv) => self.version(tv).await,
+            Message::Tattach(ta) => self.attach(ta).await,
+            Message::Twalk(tw) => self.walk(tw).await,
+            Message::Tlopen(tl) => self.lopen(tl).await,
+            Message::Tlcreate(tc) => self.lcreate(tc).await,
+            Message::Tread(tr) => self.read(tr).await,
+            Message::Twrite(tw) => self.write(tw).await,
+            Message::Tclunk(tc) => Ok(self.clunk(tc).await),
+            Message::Treaddir(tr) => self.readdir(tr).await,
+            Message::Tgetattr(tg) => self.getattr(tg).await,
+            Message::Tsetattr(ts) => self.setattr(ts).await,
+            Message::Tmkdir(tm) => self.mkdir(tm).await,
+            Message::Tsymlink(ts) => self.symlink(ts).await,
+            Message::Tmknod(tm) => self.mknod(tm).await,
+            Message::Treadlink(tr) => self.readlink(tr).await,
+            Message::Tlink(tl) => self.link(tl).await,
+            Message::Trename(tr) => self.rename(tr).await,
+            Message::Trenameat(tr) => self.renameat(tr).await,
+            Message::Tunlinkat(tu) => self.unlinkat(tu).await,
+            Message::Tfsync(tf) => self.fsync(tf).await,
             Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
             Message::Txattrwalk(_) => Err(P9Error::NotSupported),
-            Message::Tstatfs(ts) => self.handle_statfs(ts).await,
-            Message::Tlock(tl) => self.handle_lock(tl).await,
-            Message::Tgetlock(tg) => self.handle_getlock(tg).await,
+            Message::Tstatfs(ts) => self.statfs(ts).await,
+            Message::Tlock(tl) => self.lock(tl).await,
+            Message::Tgetlock(tg) => self.getlock(tg).await,
             _ => Err(P9Error::NotImplemented),
         };
 
@@ -194,7 +194,7 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_version(&self, tv: Tversion) -> P9Result<Message> {
+    async fn version(&self, tv: Tversion) -> P9Result<Message> {
         let version_str = tv.version.as_str().map_err(|e| {
             debug!("Invalid version string encoding: {:?}", e);
             P9Error::InvalidEncoding
@@ -224,14 +224,14 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_attach(&self, ta: Tattach) -> P9Result<Message> {
+    async fn attach(&self, ta: Tattach) -> P9Result<Message> {
         let username = ta.uname.as_str().map_err(|e| {
             debug!("Invalid username encoding: {:?}", e);
             P9Error::InvalidEncoding
         })?;
 
         debug!(
-            "handle_attach: fid={}, afid={}, uname={}, aname={:?}, n_uname={}",
+            "attach: fid={}, afid={}, uname={}, aname={:?}, n_uname={}",
             ta.fid,
             ta.afid,
             username,
@@ -291,7 +291,7 @@ impl NinePHandler {
         Ok(Message::Rattach(Rattach { qid }))
     }
 
-    async fn handle_walk(&self, tw: Twalk) -> P9Result<Message> {
+    async fn walk(&self, tw: Twalk) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
         let mut current_path = src_fid.path.clone();
@@ -364,7 +364,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_lopen(&self, tl: Tlopen) -> P9Result<Message> {
+    async fn lopen(&self, tl: Tlopen) -> P9Result<Message> {
         let fid_entry = self.get_fid(tl.fid)?;
 
         if fid_entry.opened {
@@ -375,7 +375,7 @@ impl NinePHandler {
         let creds = fid_entry.creds;
 
         debug!(
-            "handle_lopen: fid={}, inode_id={}, uid={}, gid={}, flags={:#x}",
+            "lopen: fid={}, inode_id={}, uid={}, gid={}, flags={:#x}",
             tl.fid, inode_id, creds.uid, creds.gid, tl.flags
         );
 
@@ -395,7 +395,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_clunk(&self, tc: Tclunk) -> Message {
+    async fn clunk(&self, tc: Tclunk) -> Message {
         if let Some((_, fid_entry)) = self.session.fids.remove(&tc.fid) {
             self.lock_manager
                 .unlock_range(fid_entry.inode_id, tc.fid, 0, 0, self.handler_id)
@@ -404,7 +404,7 @@ impl NinePHandler {
         Message::Rclunk(Rclunk)
     }
 
-    async fn handle_readdir(&self, tr: Treaddir) -> P9Result<Message> {
+    async fn readdir(&self, tr: Treaddir) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_entry.opened {
@@ -454,7 +454,7 @@ impl NinePHandler {
         ))
     }
 
-    async fn handle_lcreate(&self, tc: Tlcreate) -> P9Result<Message> {
+    async fn lcreate(&self, tc: Tlcreate) -> P9Result<Message> {
         let parent_fid = self.get_fid(tc.fid)?;
 
         if parent_fid.opened {
@@ -491,7 +491,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_read(&self, tr: Tread) -> P9Result<Message> {
+    async fn read(&self, tr: Tread) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
         if !fid_entry.opened {
@@ -516,7 +516,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_write(&self, tw: Twrite) -> P9Result<Message> {
+    async fn write(&self, tw: Twrite) -> P9Result<Message> {
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_entry.opened {
@@ -526,7 +526,7 @@ impl NinePHandler {
         let msize = self.session.msize.load(AtomicOrdering::Relaxed);
         if (tw.data.len() as u64) + P9_IOHDRSZ as u64 > msize as u64 {
             debug!(
-                "handle_write: rejecting write of {} bytes (exceeds msize {} - IOHDRSZ {})",
+                "write: rejecting write of {} bytes (exceeds msize {} - IOHDRSZ {})",
                 tw.data.len(),
                 msize,
                 P9_IOHDRSZ
@@ -535,7 +535,7 @@ impl NinePHandler {
         }
 
         debug!(
-            "handle_write: fid={}, inode_id={}, uid={}, gid={}, offset={}, data_len={}",
+            "write: fid={}, inode_id={}, uid={}, gid={}, offset={}, data_len={}",
             tw.fid,
             fid_entry.inode_id,
             fid_entry.creds.uid,
@@ -552,16 +552,16 @@ impl NinePHandler {
             .write(&auth, fid_entry.inode_id, tw.offset, &data)
             .await
             .inspect_err(|&e| {
-                debug!("handle_write: write failed with error: {:?}", e);
+                debug!("write: failed with error: {:?}", e);
             })?;
 
-        debug!("handle_write: write succeeded");
+        debug!("write: succeeded");
         Ok(Message::Rwrite(Rwrite {
             count: data_len as u32,
         }))
     }
 
-    async fn handle_getattr(&self, tg: Tgetattr) -> P9Result<Message> {
+    async fn getattr(&self, tg: Tgetattr) -> P9Result<Message> {
         let fid_entry = self.get_fid(tg.fid)?;
 
         let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
@@ -572,7 +572,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_setattr(&self, ts: Tsetattr) -> P9Result<Message> {
+    async fn setattr(&self, ts: Tsetattr) -> P9Result<Message> {
         let fid_entry = self.get_fid(ts.fid)?;
         let attr = SetAttributes::from(&ts);
 
@@ -582,11 +582,11 @@ impl NinePHandler {
         Ok(Message::Rsetattr(Rsetattr))
     }
 
-    async fn handle_mkdir(&self, tm: Tmkdir) -> P9Result<Message> {
+    async fn mkdir(&self, tm: Tmkdir) -> P9Result<Message> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         debug!(
-            "handle_mkdir: parent_id={}, name={:?}, dfid={}, mode={:o}, gid={}, fid uid={}, fid gid={}",
+            "mkdir: parent_id={}, name={:?}, dfid={}, mode={:o}, gid={}, fid uid={}, fid gid={}",
             parent_fid.inode_id,
             &tm.name.data,
             tm.dfid,
@@ -615,7 +615,7 @@ impl NinePHandler {
         Ok(Message::Rmkdir(Rmkdir { qid }))
     }
 
-    async fn handle_symlink(&self, ts: Tsymlink) -> P9Result<Message> {
+    async fn symlink(&self, ts: Tsymlink) -> P9Result<Message> {
         let parent_fid = self.get_fid(ts.dfid)?;
 
         let (new_id, post_attr) = self
@@ -638,7 +638,7 @@ impl NinePHandler {
         Ok(Message::Rsymlink(Rsymlink { qid }))
     }
 
-    async fn handle_mknod(&self, tm: Tmknod) -> P9Result<Message> {
+    async fn mknod(&self, tm: Tmknod) -> P9Result<Message> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         let file_type = tm.mode & 0o170000; // S_IFMT
@@ -675,7 +675,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_readlink(&self, tr: Treadlink) -> P9Result<Message> {
+    async fn readlink(&self, tr: Treadlink) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
         let inode = self.filesystem.inode_store.get(fid_entry.inode_id).await?;
@@ -688,7 +688,7 @@ impl NinePHandler {
         }
     }
 
-    async fn handle_link(&self, tl: Tlink) -> P9Result<Message> {
+    async fn link(&self, tl: Tlink) -> P9Result<Message> {
         let dir_fid = self.get_fid(tl.dfid)?;
         let file_fid = self.get_fid(tl.fid)?;
 
@@ -698,7 +698,7 @@ impl NinePHandler {
         let name_bytes = &tl.name.data;
 
         debug!(
-            "handle_link: file_id={}, dir_id={}, name={:?}, uid={}, gid={}",
+            "link: file_id={}, dir_id={}, name={:?}, uid={}, gid={}",
             file_id, dir_id, name_bytes, creds.uid, creds.gid
         );
 
@@ -711,7 +711,7 @@ impl NinePHandler {
         Ok(Message::Rlink(Rlink))
     }
 
-    async fn handle_rename(&self, tr: Trename) -> P9Result<Message> {
+    async fn rename(&self, tr: Trename) -> P9Result<Message> {
         let source_fid = self.get_fid(tr.fid)?;
         let dest_fid = self.get_fid(tr.dfid)?;
 
@@ -749,7 +749,7 @@ impl NinePHandler {
         Ok(Message::Rrename(Rrename))
     }
 
-    async fn handle_renameat(&self, tr: Trenameat) -> P9Result<Message> {
+    async fn renameat(&self, tr: Trenameat) -> P9Result<Message> {
         let old_dir_fid = self.get_fid(tr.olddirfid)?;
         let new_dir_fid = self.get_fid(tr.newdirfid)?;
 
@@ -768,7 +768,7 @@ impl NinePHandler {
         Ok(Message::Rrenameat(Rrenameat))
     }
 
-    async fn handle_unlinkat(&self, tu: Tunlinkat) -> P9Result<Message> {
+    async fn unlinkat(&self, tu: Tunlinkat) -> P9Result<Message> {
         let dir_fid = self.get_fid(tu.dirfid)?;
 
         let parent_id = dir_fid.inode_id;
@@ -802,7 +802,7 @@ impl NinePHandler {
         Ok(Message::Runlinkat(Runlinkat))
     }
 
-    async fn handle_fsync(&self, tf: Tfsync) -> P9Result<Message> {
+    async fn fsync(&self, tf: Tfsync) -> P9Result<Message> {
         if !self.session.fids.contains_key(&tf.fid) {
             return Err(P9Error::BadFid);
         }
@@ -811,7 +811,7 @@ impl NinePHandler {
         Ok(Message::Rfsync(Rfsync))
     }
 
-    async fn handle_statfs(&self, ts: Tstatfs) -> P9Result<Message> {
+    async fn statfs(&self, ts: Tstatfs) -> P9Result<Message> {
         if !self.session.fids.contains_key(&ts.fid) {
             return Err(P9Error::BadFid);
         }
@@ -848,7 +848,7 @@ impl NinePHandler {
         Ok(Message::Rstatfs(statfs))
     }
 
-    async fn handle_lock(&self, tl: Tlock) -> P9Result<Message> {
+    async fn lock(&self, tl: Tlock) -> P9Result<Message> {
         let fid = self.get_fid(tl.fid)?;
 
         if matches!(tl.lock_type, LockType::Unlock) {
@@ -892,7 +892,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn handle_getlock(&self, tg: Tgetlock) -> P9Result<Message> {
+    async fn getlock(&self, tg: Tgetlock) -> P9Result<Message> {
         let fid = self.get_fid(tg.fid)?;
 
         let test_lock = FileLock {
