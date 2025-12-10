@@ -2,6 +2,7 @@ use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager};
 use super::protocol::*;
 use super::protocol::{P9_MAX_GROUPS, P9_MAX_NAME_LEN, P9_NOBODY_UID, P9_READDIR_BATCH_SIZE};
+use crate::deku_bytes::DekuBytes;
 use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::Credentials;
@@ -449,7 +450,7 @@ impl NinePHandler {
         Ok(Message::Rreaddir(
             Rreaddir::from_entries(dir_entries).unwrap_or(Rreaddir {
                 count: 0,
-                data: Vec::new(),
+                data: DekuBytes::default(),
             }),
         ))
     }
@@ -512,7 +513,7 @@ impl NinePHandler {
 
         Ok(Message::Rread(Rread {
             count: data.len() as u32,
-            data: data.to_vec(),
+            data: DekuBytes::from(data),
         }))
     }
 
@@ -1132,7 +1133,7 @@ mod tests {
             fid: 2,
             offset: 0,
             count: data.len() as u32,
-            data,
+            data: DekuBytes::from(data),
         });
         handler.handle_message(5, write_msg).await;
 

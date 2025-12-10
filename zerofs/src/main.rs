@@ -5,6 +5,7 @@ mod bucket_identity;
 mod checkpoint_manager;
 mod cli;
 mod config;
+mod deku_bytes;
 mod encryption;
 mod fs;
 mod key_management;

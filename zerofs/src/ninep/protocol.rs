@@ -1,3 +1,4 @@
+use crate::deku_bytes::DekuBytes;
 use deku::prelude::*;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
@@ -215,8 +216,8 @@ pub struct Twrite {
     pub offset: u64,
     #[deku(endian = "little")]
     pub count: u32,
-    #[deku(count = "count")]
-    pub data: Vec<u8>,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -472,8 +473,8 @@ pub struct Rlcreate {
 pub struct Rread {
     #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(count = "count")]
-    pub data: Vec<u8>,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -486,8 +487,8 @@ pub struct Rwrite {
 pub struct Rreaddir {
     #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
-    #[deku(count = "count")]
-    pub data: Vec<u8>,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
 }
 
 impl Rreaddir {
@@ -502,7 +503,7 @@ impl Rreaddir {
 
         Ok(Rreaddir {
             count: data.len() as u32,
-            data,
+            data: DekuBytes::from(data),
         })
     }
 
@@ -513,7 +514,7 @@ impl Rreaddir {
         let mut offset = 0;
 
         while offset < self.data.len() {
-            let remaining = &self.data[offset..];
+            let remaining = &self.data.0[offset..];
             let (_, entry) = DirEntry::from_bytes((remaining, 0))?;
 
             // Calculate how many bytes were consumed
