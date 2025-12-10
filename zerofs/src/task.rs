@@ -23,3 +23,14 @@ where
         .spawn_on(future, handle)
         .expect("failed to spawn task")
 }
+
+pub fn spawn_blocking_named<T, F>(name: &str, f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::Builder::new()
+        .name(name)
+        .spawn_blocking(f)
+        .expect("failed to spawn blocking task")
+}
