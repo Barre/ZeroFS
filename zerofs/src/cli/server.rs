@@ -9,6 +9,7 @@ use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
+use crate::task::spawn_named;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
@@ -79,7 +80,7 @@ async fn start_nfs_servers(
         let fs_clone = Arc::clone(&fs);
         let addr = *addr;
         let shutdown_clone = shutdown.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn_named("nfs-server", async move {
             match crate::nfs::start_nfs_server_with_config(fs_clone, addr, shutdown_clone).await {
                 Ok(()) => Ok(()),
                 Err(e) => Err(std::io::Error::other(e.to_string())),
@@ -106,7 +107,7 @@ async fn start_ninep_servers(
             info!("Starting 9P server on {}", addr);
             let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
             let shutdown_clone = shutdown.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(spawn_named("9p-server", async move {
                 ninep_tcp_server.start(shutdown_clone).await
             }));
         }
@@ -121,7 +122,7 @@ async fn start_ninep_servers(
         let ninep_unix_server =
             crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
         let shutdown_clone = shutdown.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn_named("9p-unix-server", async move {
             ninep_unix_server.start(shutdown_clone).await
         }));
     }
@@ -176,7 +177,7 @@ async fn start_nbd_servers(
             );
             let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
             let shutdown_clone = shutdown.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(spawn_named("nbd-server", async move {
                 if let Err(e) = nbd_tcp_server.start(shutdown_clone).await {
                     Err(e)
                 } else {
@@ -193,7 +194,7 @@ async fn start_nbd_servers(
         );
         let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs), socket_path);
         let shutdown_clone = shutdown.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn_named("nbd-unix-server", async move {
             if let Err(e) = nbd_unix_server.start(shutdown_clone).await {
                 Err(e)
             } else {
@@ -224,7 +225,7 @@ async fn start_rpc_servers(
             info!("Starting RPC server on {}", addr);
             let service = service.clone();
             let shutdown_clone = shutdown.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(spawn_named("rpc-server", async move {
                 crate::rpc::server::serve_tcp(addr, service, shutdown_clone)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
@@ -240,7 +241,7 @@ async fn start_rpc_servers(
         let socket_path = socket_path.clone();
         let service = service.clone();
         let shutdown_clone = shutdown.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn_named("rpc-unix-server", async move {
             crate::rpc::server::serve_unix(socket_path, service, shutdown_clone)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))
@@ -251,7 +252,7 @@ async fn start_rpc_servers(
 }
 
 fn start_stats_reporting(fs: Arc<ZeroFS>, shutdown: CancellationToken) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    spawn_named("stats-reporting", async move {
         info!("Starting stats reporting task (reports to debug every 5 seconds)");
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -273,7 +274,7 @@ fn start_periodic_flush(
     interval_secs: u64,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    spawn_named("periodic-flush", async move {
         info!(
             "Starting periodic flush task (flushes every {} seconds)",
             interval_secs
@@ -307,7 +308,7 @@ fn start_checkpoint_refresh(
 ) -> JoinHandle<()> {
     let db_path = params.db_path;
     let object_store = params.object_store;
-    tokio::spawn(async move {
+    spawn_named("checkpoint-refresh", async move {
         info!("Starting checkpoint refresh task",);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             CHECKPOINT_REFRESH_INTERVAL_SECS,

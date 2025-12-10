@@ -15,6 +15,7 @@ mod ninep;
 mod parse_object_store;
 mod rpc;
 mod storage_compatibility;
+mod task;
 
 #[cfg(test)]
 mod test_helpers;
