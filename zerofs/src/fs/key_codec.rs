@@ -224,27 +224,6 @@ impl KeyCodec {
         }
     }
 
-    /// Encode dir_scan value: (entry_id, name)
-    pub fn encode_dir_scan_value(entry_id: InodeId, name: &[u8]) -> Bytes {
-        let mut value = Vec::with_capacity(U64_SIZE + name.len());
-        value.extend_from_slice(&entry_id.to_le_bytes());
-        value.extend_from_slice(name);
-        Bytes::from(value)
-    }
-
-    /// Decode dir_scan value: (entry_id, name)
-    pub fn decode_dir_scan_value(data: &[u8]) -> Result<(InodeId, Vec<u8>), FsError> {
-        if data.len() < U64_SIZE {
-            return Err(FsError::InvalidData);
-        }
-        let entry_bytes: [u8; U64_SIZE] = data[..U64_SIZE]
-            .try_into()
-            .map_err(|_| FsError::InvalidData)?;
-        let entry_id = u64::from_le_bytes(entry_bytes);
-        let name = data[U64_SIZE..].to_vec();
-        Ok((entry_id, name))
-    }
-
     pub fn encode_counter(value: u64) -> Bytes {
         Bytes::copy_from_slice(&value.to_le_bytes())
     }
@@ -318,16 +297,6 @@ mod tests {
             }
             _ => panic!("Failed to parse dir scan key"),
         }
-    }
-
-    #[test]
-    fn test_dir_scan_value_encoding() {
-        let entry_id = 20u64;
-        let name = b"test_file.txt";
-        let encoded = KeyCodec::encode_dir_scan_value(entry_id, name);
-        let (decoded_id, decoded_name) = KeyCodec::decode_dir_scan_value(&encoded).unwrap();
-        assert_eq!(decoded_id, entry_id);
-        assert_eq!(decoded_name, name);
     }
 
     #[test]

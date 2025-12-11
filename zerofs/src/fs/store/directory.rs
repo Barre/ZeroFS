@@ -1,10 +1,11 @@
 use crate::encryption::{EncryptedDb, EncryptedTransaction};
 use crate::fs::errors::FsError;
-use crate::fs::inode::InodeId;
+use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::warn;
@@ -16,11 +17,66 @@ pub const COOKIE_DOTDOT: u64 = 2;
 /// First cookie value for regular entries
 pub const COOKIE_FIRST_ENTRY: u64 = 3;
 
+/// Value stored in directory scan entries.
+/// For entries with nlink=1, we embed the full inode to avoid separate lookups.
+/// For hardlinked entries (nlink>1), we store just a reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DirScanValue {
+    /// Full inode embedded: used when nlink == 1
+    WithInode { inode_id: InodeId, inode: Inode },
+    /// Reference only: used when nlink > 1 (hardlinks)
+    Reference { inode_id: InodeId },
+}
+
+impl DirScanValue {
+    pub fn inode_id(&self) -> InodeId {
+        match self {
+            DirScanValue::WithInode { inode_id, .. } => *inode_id,
+            DirScanValue::Reference { inode_id } => *inode_id,
+        }
+    }
+
+    pub fn inode(&self) -> Option<&Inode> {
+        match self {
+            DirScanValue::WithInode { inode, .. } => Some(inode),
+            DirScanValue::Reference { .. } => None,
+        }
+    }
+}
+
+/// Encode directory scan entry value: name + DirScanValue
+fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
+    let value_bytes =
+        bincode::serialize(value).expect("DirScanValue serialization should not fail");
+    let mut buf = Vec::with_capacity(4 + name.len() + value_bytes.len());
+    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(&value_bytes);
+    Bytes::from(buf)
+}
+
+/// Decode directory scan entry value: returns (name, DirScanValue)
+fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
+    if data.len() < 4 {
+        return Err(FsError::InvalidData);
+    }
+    let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+    if data.len() < 4 + name_len {
+        return Err(FsError::InvalidData);
+    }
+    let name = data[4..4 + name_len].to_vec();
+    let value: DirScanValue =
+        bincode::deserialize(&data[4 + name_len..]).map_err(|_| FsError::InvalidData)?;
+    Ok((name, value))
+}
+
 #[derive(Debug, Clone)]
 pub struct DirEntryInfo {
     pub name: Vec<u8>,
     pub inode_id: InodeId,
     pub cookie: u64,
+    /// Embedded inode if available (None for hardlinked entries)
+    pub inode: Option<Inode>,
 }
 
 #[derive(Clone)]
@@ -98,12 +154,13 @@ impl DirectoryStore {
                         ParsedKey::DirScan { cookie } => cookie,
                         _ => return Some((Err(FsError::InvalidData), iter)),
                     };
-                    match KeyCodec::decode_dir_scan_value(&value) {
-                        Ok((inode_id, name)) => Some((
+                    match decode_dir_scan_value(&value) {
+                        Ok((name, scan_value)) => Some((
                             Ok(DirEntryInfo {
                                 name,
-                                inode_id,
+                                inode_id: scan_value.inode_id(),
                                 cookie,
+                                inode: scan_value.inode().cloned(),
                             }),
                             iter,
                         )),
@@ -138,12 +195,13 @@ impl DirectoryStore {
                         ParsedKey::DirScan { cookie } => cookie,
                         _ => return Some((Err(FsError::InvalidData), iter)),
                     };
-                    match KeyCodec::decode_dir_scan_value(&value) {
-                        Ok((inode_id, name)) => Some((
+                    match decode_dir_scan_value(&value) {
+                        Ok((name, scan_value)) => Some((
                             Ok(DirEntryInfo {
                                 name,
-                                inode_id,
+                                inode_id: scan_value.inode_id(),
                                 cookie,
+                                inode: scan_value.inode().cloned(),
                             }),
                             iter,
                         )),
@@ -156,6 +214,9 @@ impl DirectoryStore {
         })))
     }
 
+    /// Add a directory entry.
+    /// If `inode` is provided, it will be embedded in the scan entry (for nlink=1 entries).
+    /// If `inode` is None, only a reference is stored (for hardlinked entries).
     pub fn add(
         &self,
         txn: &mut EncryptedTransaction,
@@ -163,12 +224,21 @@ impl DirectoryStore {
         name: &[u8],
         entry_id: InodeId,
         cookie: u64,
+        inode: Option<&Inode>,
     ) {
         let entry_key = KeyCodec::dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
 
+        let scan_value = match inode {
+            Some(inode) => DirScanValue::WithInode {
+                inode_id: entry_id,
+                inode: inode.clone(),
+            },
+            None => DirScanValue::Reference { inode_id: entry_id },
+        };
+
         let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
-        txn.put_bytes(&scan_key, KeyCodec::encode_dir_scan_value(entry_id, name));
+        txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
     }
 
     pub fn unlink_entry(
@@ -205,5 +275,44 @@ impl DirectoryStore {
             .ok_or(FsError::NotFound)?;
 
         KeyCodec::decode_dir_entry(&entry_data)
+    }
+
+    /// Update the embedded inode in a directory scan entry.
+    /// Used when inode attributes change (write, setattr, etc.).
+    /// Does nothing if the entry doesn't exist (already unlinked).
+    pub async fn update_inode_in_entry(
+        &self,
+        txn: &mut EncryptedTransaction,
+        dir_id: InodeId,
+        name: &[u8],
+        inode_id: InodeId,
+        inode: &Inode,
+    ) -> Result<(), FsError> {
+        let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
+        let scan_value = DirScanValue::WithInode {
+            inode_id,
+            inode: inode.clone(),
+        };
+        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+        txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
+
+        Ok(())
+    }
+
+    /// Convert a directory scan entry to a Reference (for hardlinks).
+    /// Used when nlink goes from 1 to 2+.
+    pub async fn convert_to_reference(
+        &self,
+        txn: &mut EncryptedTransaction,
+        dir_id: InodeId,
+        name: &[u8],
+        inode_id: InodeId,
+    ) -> Result<(), FsError> {
+        let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
+        let scan_value = DirScanValue::Reference { inode_id };
+        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+        txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
+
+        Ok(())
     }
 }
