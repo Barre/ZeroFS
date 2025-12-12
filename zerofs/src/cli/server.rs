@@ -1,4 +1,5 @@
 use crate::bucket_identity;
+use crate::cache::FoyerCache;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
@@ -17,7 +18,6 @@ use slatedb::config::{
     CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
     ObjectStoreCacheOptions,
 };
-use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::object_store::path::Path;
 use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
@@ -445,11 +445,7 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    let cache = Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
-        max_capacity: slatedb_memory_cache_bytes,
-        time_to_live: None,
-        time_to_idle: None,
-    }));
+    let cache = Arc::new(FoyerCache::new(slatedb_memory_cache_bytes as usize));
 
     let db_path = Path::from(db_path);
 
