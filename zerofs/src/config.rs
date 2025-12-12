@@ -414,7 +414,7 @@ impl Settings {
         toml_string.push_str("\n# Optional filesystem quota configuration\n");
         toml_string
             .push_str("# Limit the maximum size of the filesystem to prevent unlimited growth\n");
-        toml_string.push_str("# If not specified, defaults to 8 EiB (effectively unlimited)\n");
+        toml_string.push_str("# If not specified, defaults to 16 EiB (effectively unlimited)\n");
         toml_string.push_str("\n# [filesystem]\n");
         toml_string.push_str("# max_size_gb = 100.0  # Limit filesystem to 100 GB\n");
 
