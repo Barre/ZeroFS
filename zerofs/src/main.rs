@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::io::BufRead;
 
 mod bucket_identity;
+mod cache;
 mod checkpoint_manager;
 mod cli;
 mod config;

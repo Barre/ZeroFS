@@ -154,17 +154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-lock"
-version = "3.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd03604047cee9b6ce9de9f70c6cd540a0520c813cbd49bae61f33ab80ed1dc"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "pin-project-lite",
-]
-
-[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,6 +1035,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1061,8 +1056,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "642093b1a72c4a0ef89862484d669a353e732974781bb9c49a979526d1e30edc"
 dependencies = [
  "equivalent",
- "foyer-common",
- "foyer-memory",
+ "foyer-common 0.18.1",
+ "foyer-memory 0.18.1",
  "foyer-storage",
  "madsim-tokio",
  "mixtrics",
@@ -1094,6 +1089,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "foyer-common"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9ea2c266c9d93ea37c3960f2d0bb625981eefd38120eb06542804bf8169a187"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cfg-if",
+ "itertools",
+ "madsim-tokio",
+ "mixtrics",
+ "parking_lot",
+ "pin-project",
+ "tokio",
+ "twox-hash",
+]
+
+[[package]]
 name = "foyer-intrusive-collections"
 version = "0.10.0-dev"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1112,7 +1125,7 @@ dependencies = [
  "bitflags",
  "cmsketch",
  "equivalent",
- "foyer-common",
+ "foyer-common 0.18.1",
  "foyer-intrusive-collections",
  "hashbrown 0.15.5",
  "itertools",
@@ -1122,6 +1135,32 @@ dependencies = [
  "pin-project",
  "serde",
  "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "foyer-memory"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09941796e5f8301e82e81e0c9e7514a8443524a461f9a2177500c7525aa73723"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "bitflags",
+ "cmsketch",
+ "equivalent",
+ "foyer-common 0.21.1",
+ "foyer-intrusive-collections",
+ "futures-util",
+ "hashbrown 0.16.0",
+ "itertools",
+ "madsim-tokio",
+ "mixtrics",
+ "parking_lot",
+ "paste",
+ "pin-project",
+ "serde",
  "tokio",
  "tracing",
 ]
@@ -1138,8 +1177,8 @@ dependencies = [
  "bytes",
  "equivalent",
  "flume",
- "foyer-common",
- "foyer-memory",
+ "foyer-common 0.18.1",
+ "foyer-memory 0.18.1",
  "fs4",
  "futures-core",
  "futures-util",
@@ -1356,7 +1395,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -1364,6 +1403,11 @@ name = "hashbrown"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hdrhistogram"
@@ -1986,27 +2030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moka"
-version = "0.12.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8261cd88c312e0004c1d51baad2980c66528dfdb2bee62003e643a4d8f86b077"
-dependencies = [
- "async-lock",
- "crossbeam-channel",
- "crossbeam-epoch",
- "crossbeam-utils",
- "equivalent",
- "event-listener",
- "futures-util",
- "parking_lot",
- "portable-atomic",
- "rustc_version",
- "smallvec",
- "tagptr",
- "uuid",
-]
-
-[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2331,12 +2354,6 @@ dependencies = [
  "opaque-debug",
  "universal-hash",
 ]
-
-[[package]]
-name = "portable-atomic"
-version = "1.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84267b20a16ea918e43c6a88433c2d54fa145c92a811b5b047ccbe153674483"
 
 [[package]]
 name = "potential_utf"
@@ -3084,7 +3101,6 @@ dependencies = [
  "foyer",
  "futures",
  "log",
- "moka",
  "object_store",
  "once_cell",
  "ouroboros",
@@ -3207,12 +3223,6 @@ dependencies = [
  "quote",
  "syn 2.0.110",
 ]
-
-[[package]]
-name = "tagptr"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tap"
@@ -4308,7 +4318,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4324,6 +4334,7 @@ dependencies = [
  "dashmap",
  "deku",
  "fastant",
+ "foyer-memory 0.21.1",
  "futures",
  "generic-array",
  "hex",
