@@ -412,7 +412,7 @@ pub async fn build_slatedb(
     let settings = slatedb::config::Settings {
         wal_enabled: false,
         l0_max_ssts,
-        l0_sst_size_bytes: 1024 * 1024 * 1024,
+        l0_sst_size_bytes: 128 * 1024 * 1024,
         filter_bits_per_key: 10,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(cache_config.root_folder.clone()),
@@ -424,7 +424,7 @@ pub async fn build_slatedb(
         max_unflushed_bytes,
         compactor_options: Some(slatedb::config::CompactorOptions {
             max_concurrent_compactions,
-            max_sst_size: 256 * 1024 * 1024,
+            max_sst_size: 1024 * 1024 * 1024,
             ..Default::default()
         }),
         compression_codec: None, // Disable compression - we handle it in encryption layer
