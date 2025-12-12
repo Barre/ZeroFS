@@ -143,7 +143,7 @@ ZeroFS supports configurable filesystem size limits:
 max_size_gb = 100.0  # Limit filesystem to 100 GB
 ```
 
-When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 16 EiB (effectively unlimited).
 
 ## LSM Tree Performance Tuning
 

@@ -170,7 +170,7 @@ url = "s3://my-bucket/zerofs-data"
 encryption_password = "${ZEROFS_PASSWORD}"
 
 [filesystem]
-max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 8 EiB)
+max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 16 EiB)
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
@@ -294,7 +294,7 @@ ZeroFS supports configurable filesystem size limits:
 max_size_gb = 100.0  # Limit filesystem to 100 GB
 ```
 
-When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 8 EiB (effectively unlimited).
+When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 16 EiB (effectively unlimited).
 
 ### Multiple Instances
 
@@ -797,11 +797,7 @@ ZeroFS has the following theoretical limits:
 - **Maximum file size**: 16 EiB (16 exbibytes = 18.4 exabytes) per file
 - **Maximum number of files over filesystem lifespan**: 2^64 (~18 quintillion)
 - **Maximum hardlinks per file**: ~4 billion (2^32)
-- **Maximum filesystem size**: 2^112 bytes
-  - = 4,096 geopbytes (where 1 geopbyte = 2^100 bytes)
-  - = 4.3 million yottabytes
-  - = 4.4 billion zettabytes
-  - = 4.5 trillion exabytes
+- **Maximum filesystem size**: 16 EiB (16 exbibytes = 18.4 exabytes)
 
 These limits come from the filesystem design:
 - Inode IDs and file sizes are stored as 64-bit integers
