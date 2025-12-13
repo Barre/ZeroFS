@@ -8,7 +8,6 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
-use futures::stream::Stream;
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
@@ -19,6 +18,7 @@ use slatedb::{
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio_stream::Stream;
 
 const NONCE_SIZE: usize = 24;
 
@@ -236,12 +236,18 @@ impl EncryptedDb {
 
         match encrypted {
             Some(encrypted) => {
-                let encryptor = self.encryptor.clone();
-                let key = key.clone();
-                let decrypted =
+                let is_chunk = key.first().and_then(|&b| KeyPrefix::try_from(b).ok())
+                    == Some(KeyPrefix::Chunk);
+
+                let decrypted = if is_chunk {
+                    let encryptor = self.encryptor.clone();
+                    let key = key.clone();
                     spawn_blocking_named("decrypt", move || encryptor.decrypt(&key, &encrypted))
                         .await
-                        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+                        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??
+                } else {
+                    self.encryptor.decrypt(key, &encrypted)?
+                };
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
             None => Ok(None),
@@ -268,41 +274,36 @@ impl EncryptedDb {
             }
         };
 
-        Ok(Box::pin(futures::stream::unfold(
-            (iter, encryptor),
-            |(mut iter, encryptor)| async move {
-                match iter.next().await {
-                    Ok(Some(kv)) => {
-                        let key = kv.key;
-                        let encrypted_value = kv.value;
+        let (tx_in, mut rx_in) = tokio::sync::mpsc::channel::<(Bytes, Bytes)>(32);
+        let (tx_out, rx_out) = tokio::sync::mpsc::channel::<Result<(Bytes, Bytes)>>(32);
 
-                        // Skip decryption for system keys that use different encryption
-                        // (wrapped_encryption_key uses password-derived encryption)
-                        if key.as_ref() == crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY {
-                            return Some((Ok((key, encrypted_value)), (iter, encryptor)));
-                        }
-
-                        match encryptor.decrypt(&key, &encrypted_value) {
-                            Ok(decrypted) => {
-                                Some((Ok((key, Bytes::from(decrypted))), (iter, encryptor)))
-                            }
-                            Err(e) => Some((
-                                Err(anyhow::anyhow!(
-                                    "Decryption failed for key {:?}: {}",
-                                    key,
-                                    e
-                                )),
-                                (iter, encryptor),
-                            )),
-                        }
-                    }
-                    Ok(None) => None,
-                    Err(e) => Some((
-                        Err(anyhow::anyhow!("Iterator error: {}", e)),
-                        (iter, encryptor),
-                    )),
+        spawn_blocking_named("scan-decrypt", move || {
+            while let Some((key, encrypted)) = rx_in.blocking_recv() {
+                let result = if key.as_ref() == crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY
+                {
+                    Ok((key, encrypted))
+                } else {
+                    encryptor
+                        .decrypt(&key, &encrypted)
+                        .map(|dec| (key, Bytes::from(dec)))
+                };
+                if tx_out.blocking_send(result).is_err() {
+                    break;
                 }
-            },
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut iter = iter;
+            while let Ok(Some(kv)) = iter.next().await {
+                if tx_in.send((kv.key, kv.value)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            rx_out,
         )))
     }
 
@@ -366,13 +367,19 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let encryptor = self.encryptor.clone();
-        let key_clone = key.clone();
-        let value = value.to_vec();
-        let encrypted =
+        let is_chunk =
+            key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk);
+
+        let encrypted = if is_chunk {
+            let encryptor = self.encryptor.clone();
+            let key_clone = key.clone();
+            let value = value.to_vec();
             spawn_blocking_named("encrypt", move || encryptor.encrypt(&key_clone, &value))
                 .await
-                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??
+        } else {
+            self.encryptor.encrypt(key, value)?
+        };
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
