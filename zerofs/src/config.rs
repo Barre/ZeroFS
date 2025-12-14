@@ -1,9 +1,85 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+
+/// Compression algorithm configuration for chunk data.
+/// Supports lz4 and zstd.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompressionConfig {
+    /// LZ4 compression: fast with moderate compression ratio (default)
+    #[default]
+    Lz4,
+    /// Zstd compression with configurable level (1-22)
+    /// Level 1 is fastest, level 22 is maximum compression
+    Zstd(i32),
+}
+
+impl Serialize for CompressionConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            CompressionConfig::Lz4 => serializer.serialize_str("lz4"),
+            CompressionConfig::Zstd(level) => serializer.serialize_str(&format!("zstd-{}", level)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompressionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompressionConfigVisitor;
+
+        impl de::Visitor<'_> for CompressionConfigVisitor {
+            type Value = CompressionConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("'lz4' or 'zstd-{level}' where level is 1-22")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<CompressionConfig, E>
+            where
+                E: de::Error,
+            {
+                if value == "lz4" {
+                    return Ok(CompressionConfig::Lz4);
+                }
+
+                if let Some(level_str) = value.strip_prefix("zstd-") {
+                    let level: i32 = level_str.parse().map_err(|_| {
+                        de::Error::invalid_value(
+                            de::Unexpected::Str(value),
+                            &"'zstd-{level}' where level is a number 1-22",
+                        )
+                    })?;
+
+                    if !(1..=22).contains(&level) {
+                        return Err(de::Error::invalid_value(
+                            de::Unexpected::Signed(level as i64),
+                            &"zstd level must be between 1 and 22",
+                        ));
+                    }
+
+                    return Ok(CompressionConfig::Zstd(level));
+                }
+
+                Err(de::Error::invalid_value(
+                    de::Unexpected::Str(value),
+                    &"'lz4' or 'zstd-{level}' where level is 1-22",
+                ))
+            }
+        }
+
+        deserializer.deserialize_str(CompressionConfigVisitor)
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +123,9 @@ pub struct StorageConfig {
 pub struct FilesystemConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_size_gb: Option<f64>,
+    /// Compression algorithm for chunk data: "lz4" (default) or "zstd-{level}" where level is 1-22
+    #[serde(default)]
+    pub compression: CompressionConfig,
 }
 
 impl FilesystemConfig {
@@ -323,6 +402,13 @@ impl Settings {
             .unwrap_or(u64::MAX)
     }
 
+    pub fn compression(&self) -> CompressionConfig {
+        self.filesystem
+            .as_ref()
+            .map(|fs| fs.compression)
+            .unwrap_or_default()
+    }
+
     pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = config_path.as_ref();
         let content = fs::read_to_string(path)
@@ -411,12 +497,24 @@ impl Settings {
         toml_string.push_str("# default_region = \"us-east-1\"\n");
         toml_string.push_str("# allow_http = \"true\"  # For non-HTTPS endpoints\n");
 
-        toml_string.push_str("\n# Optional filesystem quota configuration\n");
+        toml_string.push_str("\n# Optional filesystem configuration\n");
         toml_string
             .push_str("# Limit the maximum size of the filesystem to prevent unlimited growth\n");
         toml_string.push_str("# If not specified, defaults to 16 EiB (effectively unlimited)\n");
+        toml_string.push_str("#\n");
+        toml_string.push_str("# Compression algorithm for chunk data:\n");
+        toml_string.push_str("#   - \"lz4\" (default): Fast compression, moderate ratio\n");
+        toml_string.push_str("#   - \"zstd-{level}\": Configurable compression (level 1-22)\n");
+        toml_string.push_str("#     Level 1 is fastest, level 22 is maximum compression\n");
+        toml_string.push_str("#     Recommended for zstd: zstd-3 for balanced speed/compression\n");
+        toml_string.push_str("#\n");
+        toml_string
+            .push_str("# Note: Compression can be changed at any time. Existing data remains\n");
+        toml_string
+            .push_str("# readable regardless of compression setting (auto-detected on read).\n");
         toml_string.push_str("\n# [filesystem]\n");
-        toml_string.push_str("# max_size_gb = 100.0  # Limit filesystem to 100 GB\n");
+        toml_string.push_str("# max_size_gb = 100.0   # Limit filesystem to 100 GB\n");
+        toml_string.push_str("# compression = \"lz4\"  # or \"zstd-3\", \"zstd-19\", etc.\n");
 
         toml_string.push_str("\n# Optional LSM tree tuning parameters\n");
         toml_string

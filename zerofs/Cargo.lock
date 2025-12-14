@@ -4318,7 +4318,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.22.2"
+version = "0.22.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4368,6 +4368,7 @@ dependencies = [
  "url",
  "uuid",
  "zerofs_nfsserve",
+ "zstd",
 ]
 
 [[package]]

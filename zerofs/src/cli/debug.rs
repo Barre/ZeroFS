@@ -54,7 +54,10 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     let encrypted_db = match slatedb {
         // We don't write but we want the "current" view of the DB
         SlateDbHandle::ReadWrite(db) => {
-            let encryptor = Arc::new(crate::encryption::EncryptionManager::new(&encryption_key));
+            let encryptor = Arc::new(crate::encryption::EncryptionManager::new(
+                &encryption_key,
+                crate::config::CompressionConfig::default(),
+            ));
             crate::encryption::EncryptedDb::new(db, encryptor)
         }
         SlateDbHandle::ReadOnly(_) => {

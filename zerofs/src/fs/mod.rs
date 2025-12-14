@@ -22,6 +22,7 @@ use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
+use crate::config::CompressionConfig;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
 use std::sync::Arc;
@@ -104,8 +105,9 @@ impl ZeroFS {
         slatedb: crate::encryption::SlateDbHandle,
         encryption_key: [u8; 32],
         max_bytes: u64,
+        compression: CompressionConfig,
     ) -> anyhow::Result<Self> {
-        let encryptor = Arc::new(EncryptionManager::new(&encryption_key));
+        let encryptor = Arc::new(EncryptionManager::new(&encryption_key, compression));
 
         let lock_manager = Arc::new(LockManager::new());
 
@@ -311,6 +313,7 @@ impl ZeroFS {
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             encryption_key,
             u64::MAX,
+            CompressionConfig::default(),
         )
         .await
     }
@@ -334,6 +337,7 @@ impl ZeroFS {
             crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             encryption_key,
             u64::MAX,
+            CompressionConfig::default(),
         )
         .await
     }
@@ -2690,6 +2694,7 @@ mod tests {
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             test_key,
             u64::MAX,
+            CompressionConfig::default(),
         )
         .await
         .unwrap();
