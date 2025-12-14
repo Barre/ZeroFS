@@ -309,7 +309,7 @@ jobs:
             os: ubuntu-24.04-arm
             platform: linux
             use_cross: false
-            bolt: true
+            bolt: false
           - target: armv7-unknown-linux-gnueabihf
             arch: armv7
             os: ubuntu-latest
@@ -437,12 +437,9 @@ jobs:
         if: matrix.bolt
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18 linux-tools-common build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
-          sudo apt-get install -y linux-tools-$(uname -r) || sudo apt-get install -y linux-tools-azure || true
-          sudo ln -sf /usr/lib/llvm-18/bin/llvm-bolt /usr/local/bin/llvm-bolt
-          sudo ln -sf /usr/lib/llvm-18/bin/perf2bolt /usr/local/bin/perf2bolt
-          sudo ln -sf /usr/lib/llvm-18/bin/merge-fdata /usr/local/bin/merge-fdata
-          sudo sysctl -w kernel.perf_event_paranoid=-1
+          sudo apt-get install -y llvm-18 build-essential libncurses-dev bison flex libssl-dev libelf-dev bc llvm-bolt
+          sudo ln -sf /usr/lib/llvm-18/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a
+          sudo ln -sf /usr/lib/llvm-18/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a
 
       - name: Start MinIO for BOLT profiling
         if: matrix.bolt
@@ -471,7 +468,11 @@ jobs:
         if: matrix.bolt
         run: |
           BINARY="$(pwd)/artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
-          mkdir -p /tmp/zerofs-cache
+          mkdir -p /tmp/zerofs-cache /tmp/bolt-profile
+
+          llvm-bolt $BINARY -instrument -o ${BINARY}.inst \
+            -instrumentation-file=/tmp/bolt-profile/prof \
+            -instrumentation-file-append-pid
 
           cat > zerofs-bolt.toml << EOF
           [cache]
@@ -493,7 +494,7 @@ jobs:
           allow_http = "true"
           EOF
 
-          $BINARY run -c zerofs-bolt.toml &
+          ${BINARY}.inst run -c zerofs-bolt.toml &
           ZEROFS_PID=$!
 
           for i in {1..30}; do
@@ -503,9 +504,6 @@ jobs:
             fi
             sleep 1
           done
-
-          sudo perf record -e cpu-clock -g -p $ZEROFS_PID -o /tmp/perf-bolt.data &
-          PERF_PID=$!
 
           sudo mkdir -p /mnt/zerofs
           sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
@@ -522,22 +520,21 @@ jobs:
           cd /
 
           sudo umount /mnt/zerofs || true
-          sudo kill -INT $PERF_PID || true
-          wait $PERF_PID || true
           kill -TERM $ZEROFS_PID || true
           wait $ZEROFS_PID || true
 
-          sudo chown $(id -u):$(id -g) /tmp/perf-bolt.data
+          echo "BOLT profile files:"
+          ls -lh /tmp/bolt-profile/
+
+          merge-fdata /tmp/bolt-profile/prof.* -o /tmp/bolt.fdata
 
       - name: Apply BOLT optimization
         if: matrix.bolt
         run: |
           BINARY="artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
 
-          perf2bolt -p /tmp/perf-bolt.data -o bolt.fdata $BINARY
-
           llvm-bolt $BINARY -o ${BINARY}.bolt \
-            -data=bolt.fdata \
+            -data=/tmp/bolt.fdata \
             -reorder-blocks=ext-tsp \
             -reorder-functions=hfsort+ \
             -split-functions \
@@ -545,6 +542,7 @@ jobs:
             -dyno-stats
 
           mv ${BINARY}.bolt $BINARY
+          rm -f ${BINARY}.inst
           echo "BOLT optimization applied successfully"
           ls -lh artifacts/
 
