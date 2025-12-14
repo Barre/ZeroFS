@@ -114,6 +114,7 @@ jobs:
               fi
               sleep 1
             done
+
             sudo mkdir -p /mnt/zerofs
             sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
             cd /mnt/zerofs
@@ -163,6 +164,7 @@ jobs:
               fi
               sleep 1
             done
+
             sudo mkdir -p /mnt/zerofs
             sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
             sudo mkdir -p /mnt/zerofs/.nbd
@@ -209,6 +211,7 @@ jobs:
               fi
               sleep 1
             done
+
             sudo mkdir -p /mnt/zerofs
             sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
             cd /mnt/zerofs
@@ -299,12 +302,14 @@ jobs:
             arch: amd64
             os: ubuntu-latest
             platform: linux
-            use_cross: true
+            use_cross: false
+            bolt: true
           - target: aarch64-unknown-linux-gnu
             arch: arm64
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             platform: linux
-            use_cross: true
+            use_cross: false
+            bolt: true
           - target: armv7-unknown-linux-gnueabihf
             arch: armv7
             os: ubuntu-latest
@@ -373,14 +378,24 @@ jobs:
           cp pgo-data/Cargo.lock zerofs/
 
       - name: Build with PGO (cross)
-        if: matrix.use_cross
+        if: matrix.use_cross && !matrix.bolt
         run: |
           cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
 
+      - name: Build with PGO + BOLT relocs (cross)
+        if: matrix.use_cross && matrix.bolt
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --target ${{ matrix.target }}
+
       - name: Build with PGO (cargo)
-        if: matrix.use_cross == false && matrix.platform != 'freebsd'
+        if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
         run: |
           cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
+
+      - name: Build with PGO + BOLT relocs (cargo)
+        if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'
@@ -417,6 +432,121 @@ jobs:
             cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
           fi
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+
+      - name: Install BOLT dependencies
+        if: matrix.bolt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 linux-tools-common build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+          sudo apt-get install -y linux-tools-$(uname -r) || sudo apt-get install -y linux-tools-azure || true
+          sudo ln -sf /usr/lib/llvm-18/bin/llvm-bolt /usr/local/bin/llvm-bolt
+          sudo ln -sf /usr/lib/llvm-18/bin/perf2bolt /usr/local/bin/perf2bolt
+          sudo ln -sf /usr/lib/llvm-18/bin/merge-fdata /usr/local/bin/merge-fdata
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+
+      - name: Start MinIO for BOLT profiling
+        if: matrix.bolt
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          wget -q https://dl.min.io/client/mc/release/linux-${{ matrix.arch }}/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/bolt-profile || true
+
+      - name: Collect BOLT profile on PGO binary
+        if: matrix.bolt
+        run: |
+          BINARY="$(pwd)/artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
+          mkdir -p /tmp/zerofs-cache
+
+          cat > zerofs-bolt.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 0.5
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://bolt-profile/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          $BINARY run -c zerofs-bolt.toml &
+          ZEROFS_PID=$!
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          sudo perf record -e cpu-clock -g -p $ZEROFS_PID -o /tmp/perf-bolt.data &
+          PERF_PID=$!
+
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+
+          cd /mnt/zerofs
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+          tar -xf linux-6.11.tar.xz
+          cd linux-6.11
+          make tinyconfig
+          make -j$(nproc)
+          cd /mnt/zerofs
+          dd if=/dev/urandom of=500mb.bin bs=1M count=500
+          dd if=500mb.bin of=/dev/null bs=1M
+          cd /
+
+          sudo umount /mnt/zerofs || true
+          sudo kill -INT $PERF_PID || true
+          wait $PERF_PID || true
+          kill -TERM $ZEROFS_PID || true
+          wait $ZEROFS_PID || true
+
+          sudo chown $(id -u):$(id -g) /tmp/perf-bolt.data
+
+      - name: Apply BOLT optimization
+        if: matrix.bolt
+        run: |
+          BINARY="artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
+
+          perf2bolt -p /tmp/perf-bolt.data -o bolt.fdata $BINARY
+
+          llvm-bolt $BINARY -o ${BINARY}.bolt \
+            -data=bolt.fdata \
+            -reorder-blocks=ext-tsp \
+            -reorder-functions=hfsort+ \
+            -split-functions \
+            -split-all-cold \
+            -dyno-stats
+
+          mv ${BINARY}.bolt $BINARY
+          echo "BOLT optimization applied successfully"
+          ls -lh artifacts/
 
       - name: Generate attestation for binary
         uses: actions/attest-build-provenance@v1
