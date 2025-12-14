@@ -25,7 +25,7 @@ ZeroFS makes S3 storage feel like a real filesystem. It provides **file-level ac
 - **NFS Server** - Mount as a network filesystem on any OS
 - **9P Server** - High-performance alternative with better POSIX semantics
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
-- **Always Encrypted** - XChaCha20-Poly1305 encryption with compression
+- **Always Encrypted** - XChaCha20-Poly1305 encryption with LZ4 or Zstd compression
 - **High Performance** - Multi-layered caching with microsecond latencies
 - **S3 Compatible** - Works with any S3-compatible storage
 
@@ -171,6 +171,7 @@ encryption_password = "${ZEROFS_PASSWORD}"
 
 [filesystem]
 max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 16 EiB)
+compression = "lz4"  # Optional: "lz4" (default) or "zstd-{1-22}"
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
@@ -296,6 +297,22 @@ max_size_gb = 100.0  # Limit filesystem to 100 GB
 
 When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 16 EiB (effectively unlimited).
 
+### Compression
+
+ZeroFS compresses file data before encryption. Choose between fast or high-ratio compression:
+
+```toml
+[filesystem]
+compression = "lz4"      # Fast compression (default)
+# or
+compression = "zstd-3"   # Zstd with level 1-22
+```
+
+- **`lz4`** (default): Very fast, moderate compression ratio
+- **`zstd-{level}`**: Configurable compression (1=fast, 22=maximum compression)
+
+You can change compression at any time without migration.
+
 ### Multiple Instances
 
 ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.
@@ -347,7 +364,7 @@ unix_socket = "/tmp/zerofs.rpc.sock"
 
 ### Encryption
 
-Encryption is always enabled in ZeroFS. All file data is encrypted using XChaCha20-Poly1305 authenticated encryption with lz4 compression. Configure your password in the configuration file:
+Encryption is always enabled in ZeroFS. All file data is compressed (LZ4 or Zstd) and encrypted using XChaCha20-Poly1305 authenticated encryption. Configure your password in the configuration file:
 
 ```toml
 [storage]

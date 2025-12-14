@@ -1,3 +1,5 @@
+use crate::config::CompressionConfig;
+use crate::fs::CHUNK_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::key_codec::KeyPrefix;
 use crate::task::spawn_blocking_named;
@@ -22,6 +24,8 @@ use tokio_stream::Stream;
 
 const NONCE_SIZE: usize = 24;
 
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 /// Fatal handler for SlateDB write errors.
 /// After a write failure, the database state is unknown - exit and let
 /// the eventual orchestrator restart the service to rebuild from a known-good state.
@@ -33,10 +37,11 @@ pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
 #[derive(Clone)]
 pub struct EncryptionManager {
     cipher: XChaCha20Poly1305,
+    compression: CompressionConfig,
 }
 
 impl EncryptionManager {
-    pub fn new(master_key: &[u8; 32]) -> Self {
+    pub fn new(master_key: &[u8; 32], compression: CompressionConfig) -> Self {
         let hk = Hkdf::<Sha256>::new(None, master_key);
 
         let mut encryption_key = [0u8; 32];
@@ -46,6 +51,7 @@ impl EncryptionManager {
 
         Self {
             cipher: XChaCha20Poly1305::new(Key::from_slice(&encryption_key)),
+            compression,
         }
     }
 
@@ -57,7 +63,11 @@ impl EncryptionManager {
         // Check if this is a chunk key to decide on compression
         let data =
             if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
-                lz4_flex::compress_prepend_size(plaintext)
+                match self.compression {
+                    CompressionConfig::Lz4 => lz4_flex::compress_prepend_size(plaintext),
+                    CompressionConfig::Zstd(level) => zstd::bulk::compress(plaintext, level)
+                        .map_err(|e| anyhow::anyhow!("Zstd compression failed: {}", e))?,
+                }
             } else {
                 plaintext.to_vec()
             };
@@ -89,10 +99,14 @@ impl EncryptionManager {
             .decrypt(nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
-        // Decompress chunks
         if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
-            lz4_flex::decompress_size_prepended(&decrypted)
-                .map_err(|e| anyhow::anyhow!("Decompression failed: {}", e))
+            if decrypted.len() >= 4 && decrypted[..4] == ZSTD_MAGIC {
+                zstd::bulk::decompress(&decrypted, CHUNK_SIZE)
+                    .map_err(|e| anyhow::anyhow!("Zstd decompression failed: {}", e))
+            } else {
+                lz4_flex::decompress_size_prepended(&decrypted)
+                    .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {}", e))
+            }
         } else {
             Ok(decrypted)
         }
@@ -424,5 +438,117 @@ impl EncryptedDb {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::key_codec::KeyCodec;
+
+    fn chunk_key() -> Vec<u8> {
+        KeyCodec::chunk_key(1, 0).to_vec()
+    }
+
+    fn non_chunk_key() -> Vec<u8> {
+        KeyCodec::inode_key(1).to_vec()
+    }
+
+    #[test]
+    fn test_lz4_compress_decompress() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Lz4);
+        let plaintext = vec![0u8; 1024];
+        let key = chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_zstd_compress_decompress() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(3));
+        let plaintext = vec![0u8; 1024];
+        let key = chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_zstd_high_level_compress_decompress() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(19));
+        let plaintext = vec![42u8; 8192];
+        let key = chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_cross_algorithm_lz4_written_zstd_configured() {
+        // Write with lz4
+        let lz4_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Lz4);
+        let plaintext = vec![1u8; 2048];
+        let key = chunk_key();
+
+        let encrypted = lz4_manager.encrypt(&key, &plaintext).unwrap();
+
+        // Read with zstd configured - should auto-detect lz4
+        let zstd_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(3));
+        let decrypted = zstd_manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_cross_algorithm_zstd_written_lz4_configured() {
+        // Write with zstd
+        let zstd_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(5));
+        let plaintext = vec![2u8; 2048];
+        let key = chunk_key();
+
+        let encrypted = zstd_manager.encrypt(&key, &plaintext).unwrap();
+
+        // Read with lz4 configured - should auto-detect zstd
+        let lz4_manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Lz4);
+        let decrypted = lz4_manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_non_chunk_data_not_compressed() {
+        let manager = EncryptionManager::new(&[0u8; 32], CompressionConfig::Zstd(3));
+        let plaintext = b"metadata content".to_vec();
+        let key = non_chunk_key();
+
+        let encrypted = manager.encrypt(&key, &plaintext).unwrap();
+        let decrypted = manager.decrypt(&key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_zstd_magic_detection() {
+        // Verify zstd compressed data starts with magic bytes
+        let data = vec![0u8; 1024];
+        let compressed = zstd::bulk::compress(&data, 3).unwrap();
+
+        assert!(compressed.starts_with(&ZSTD_MAGIC));
+    }
+
+    #[test]
+    fn test_lz4_no_zstd_magic() {
+        // Verify lz4 compressed data does NOT start with zstd magic
+        let data = vec![0u8; 1024];
+        let compressed = lz4_flex::compress_prepend_size(&data);
+
+        assert!(!compressed.starts_with(&ZSTD_MAGIC));
     }
 }

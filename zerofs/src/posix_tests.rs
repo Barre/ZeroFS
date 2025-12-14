@@ -1329,6 +1329,7 @@ mod tests {
                 )),
                 [0u8; 32],
                 1_000_000,
+                crate::config::CompressionConfig::default(),
             )
             .await
             .unwrap(),
@@ -1381,6 +1382,7 @@ mod tests {
                 )),
                 [0u8; 32],
                 1_000_000,
+                crate::config::CompressionConfig::default(),
             )
             .await
             .unwrap(),
@@ -1430,6 +1432,7 @@ mod tests {
                 )),
                 [0u8; 32],
                 1_000_000,
+                crate::config::CompressionConfig::default(),
             )
             .await
             .unwrap(),

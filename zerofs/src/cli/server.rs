@@ -611,7 +611,13 @@ async fn initialize_filesystem(settings: &Settings, db_mode: DatabaseMode) -> Re
     let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
 
     let db_handle = slatedb.clone();
-    let fs = ZeroFS::new_with_slatedb(slatedb, encryption_key, settings.max_bytes()).await?;
+    let fs = ZeroFS::new_with_slatedb(
+        slatedb,
+        encryption_key,
+        settings.max_bytes(),
+        settings.compression(),
+    )
+    .await?;
 
     Ok(InitResult {
         fs: Arc::new(fs),

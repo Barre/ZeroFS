@@ -145,6 +145,32 @@ max_size_gb = 100.0  # Limit filesystem to 100 GB
 
 When the quota is reached, write operations return `ENOSPC` (No space left on device). Delete and truncate operations continue to work, allowing you to free space. If not specified, the filesystem defaults to 16 EiB (effectively unlimited).
 
+## Compression
+
+ZeroFS compresses file data (chunks) before encryption. You can choose between two compression algorithms:
+
+```toml
+[filesystem]
+compression = "lz4"      # Fast compression (default)
+# or
+compression = "zstd-3"   # Zstd with level 3
+```
+
+### Algorithms
+
+- **`lz4`** (default): Very fast compression and decompression with moderate compression ratio. Best for workloads where speed is critical.
+
+- **`zstd-{level}`**: Zstandard compression with configurable level from 1 to 22. Lower levels (1-5) are faster, higher levels (15-22) achieve better compression but are slower.
+
+### Changing Compression On-the-fly
+
+You can change the compression algorithm at any time without migration:
+
+- **New writes** use the currently configured algorithm
+- **Existing data** remains readable regardless of how it was compressed
+- Compression format is auto-detected per-chunk when reading
+
+
 ## LSM Tree Performance Tuning
 
 ZeroFS uses an LSM (Log-Structured Merge) tree as its underlying storage engine. For advanced performance tuning, you can configure LSM parameters:
@@ -281,6 +307,7 @@ encryption_password = "very-secure-password-here"
 
 [filesystem]
 max_size_gb = 500.0            # Optional: limit filesystem size
+compression = "lz4"            # Optional: "lz4" (default) or "zstd-{1-22}"
 
 [lsm]
 l0_max_ssts = 16               # Trigger compaction with fewer SST files
