@@ -28,7 +28,7 @@ tokio-console = ["dep:console-subscriber"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
-slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "a29aa447cf1909f653f017f622edae244dca8654", features = [
+slatedb = { git = "https://github.com/slatedb/slatedb.git", rev = "53db737d56fd39427e20abd1714d007b1fcd0c59", features = [
     "wal_disable",
 ] }
 fastant = "0.1.11"
