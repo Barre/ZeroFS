@@ -417,7 +417,7 @@ pub async fn build_slatedb(
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
-            cache_puts: false,
+            cache_puts: true,
             ..Default::default()
         },
         flush_interval: Some(std::time::Duration::from_secs(30)),
