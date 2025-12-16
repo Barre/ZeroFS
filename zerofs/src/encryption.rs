@@ -89,11 +89,9 @@ impl EncryptionManager {
             return Err(anyhow::anyhow!("Invalid ciphertext: too short"));
         }
 
-        // Extract nonce and ciphertext
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
         let nonce = XNonce::from_slice(nonce_bytes);
 
-        // Decrypt
         let decrypted = self
             .cipher
             .decrypt(nonce, ciphertext)
@@ -116,7 +114,6 @@ impl EncryptionManager {
 pub struct EncryptedTransaction {
     inner: WriteBatch,
     encryptor: Arc<EncryptionManager>,
-    cache_ops: Vec<(Bytes, Option<Bytes>)>,
     pending_operations: Vec<(Bytes, Bytes)>,
 }
 
@@ -125,27 +122,21 @@ impl EncryptedTransaction {
         Self {
             inner: WriteBatch::new(),
             encryptor,
-            cache_ops: Vec::new(),
+
             pending_operations: Vec::new(),
         }
     }
 
     pub fn put_bytes(&mut self, key: &bytes::Bytes, value: Bytes) {
-        if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
-            self.cache_ops.push((key.clone(), Some(value.clone())));
-        }
         self.pending_operations.push((key.clone(), value));
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {
-        if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
-            self.cache_ops.push((key.clone(), None));
-        }
         self.inner.delete(key);
     }
 
     #[allow(clippy::type_complexity)]
-    pub async fn into_inner(self) -> Result<(WriteBatch, Vec<(Bytes, Option<Bytes>)>)> {
+    pub async fn into_inner(self) -> Result<WriteBatch> {
         let mut inner = self.inner;
 
         if !self.pending_operations.is_empty() {
@@ -169,7 +160,7 @@ impl EncryptedTransaction {
             }
         }
 
-        Ok((inner, self.cache_ops))
+        Ok(inner)
     }
 }
 
@@ -196,7 +187,6 @@ impl SlateDbHandle {
     }
 }
 
-// Encrypted DB wrapper
 pub struct EncryptedDb {
     inner: SlateDbHandle,
     encryptor: Arc<EncryptionManager>,
@@ -330,7 +320,7 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let (inner_batch, _cache_ops) = txn.into_inner().await?;
+        let inner_batch = txn.into_inner().await?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
@@ -388,6 +378,7 @@ impl EncryptedDb {
             let encryptor = self.encryptor.clone();
             let key_clone = key.clone();
             let value = value.to_vec();
+
             spawn_blocking_named("encrypt", move || encryptor.encrypt(&key_clone, &value))
                 .await
                 .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??
