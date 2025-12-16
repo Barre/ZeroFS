@@ -206,7 +206,7 @@ impl ZeroFS {
         self.inode_store.save_counter(&mut txn);
 
         let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
-        let (inner_batch, _cache_ops) = encrypt_result.map_err(|_| FsError::IoError)?;
+        let inner_batch = encrypt_result.map_err(|_| FsError::IoError)?;
 
         self.db
             .write_raw_batch(
