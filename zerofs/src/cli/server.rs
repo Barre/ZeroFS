@@ -16,9 +16,10 @@ use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
 use slatedb::config::{
     CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
-    ObjectStoreCacheOptions,
+    ObjectStoreCacheOptions, SizeTieredCompactionSchedulerOptions,
 };
 use slatedb::object_store::path::Path;
+use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use slatedb::{DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -465,11 +466,21 @@ pub async fn build_slatedb(
     match db_mode {
         DatabaseMode::ReadWrite => {
             info!("Opening database in read-write mode");
+
             let slatedb = Arc::new(
                 DbBuilder::new(db_path, object_store)
                     .with_settings(settings)
                     .with_gc_runtime(runtime_handle.clone())
                     .with_compaction_runtime(runtime_handle.clone())
+                    .with_compaction_scheduler_supplier(Arc::new(
+                        SizeTieredCompactionSchedulerSupplier::new(
+                            SizeTieredCompactionSchedulerOptions {
+                                max_compaction_sources: 32,
+                                include_size_threshold: 2.0,
+                                ..Default::default()
+                            },
+                        ),
+                    ))
                     .with_memory_cache(cache)
                     .build()
                     .await?,
