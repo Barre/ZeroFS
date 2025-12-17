@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG TARGETPLATFORM
 ARG TARGETARCH
@@ -6,7 +6,7 @@ ARG TARGETVARIANT
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
+    libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the appropriate binary based on the target platform

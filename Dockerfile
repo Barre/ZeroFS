@@ -1,4 +1,4 @@
-FROM rust:1.88-slim AS builder
+FROM rust:1.92.0-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -16,11 +16,11 @@ WORKDIR /usr/src/zerofs
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
+    libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/zerofs/target/release/zerofs /usr/local/bin/zerofs
