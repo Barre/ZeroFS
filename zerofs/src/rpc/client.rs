@@ -15,6 +15,13 @@ pub struct RpcClient {
     client: AdminServiceClient<Channel>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ListedFile {
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
 impl RpcClient {
     pub async fn connect_tcp(addr: SocketAddr) -> Result<Self> {
         let endpoint = format!("http://{}", addr);
@@ -163,5 +170,58 @@ impl RpcClient {
             .map_err(|s| anyhow!("Failed to start file access stream: {}", s.message()))?;
 
         Ok(response.into_inner())
+    }
+
+    pub async fn truncate_file(&self, path: &str, size: u64) -> Result<()> {
+        let request = proto::TruncateFileRequest {
+            path: path.to_string(),
+            size,
+        };
+
+        self.client
+            .clone()
+            .truncate_file(request)
+            .await
+            .map_err(|s| anyhow!("Failed to truncate file: {}", s.message()))?;
+
+        Ok(())
+    }
+
+    pub async fn remove_file(&self, path: &str) -> Result<()> {
+        let request = proto::RemoveFileRequest {
+            path: path.to_string(),
+        };
+
+        self.client
+            .clone()
+            .remove_file(request)
+            .await
+            .map_err(|s| anyhow!("Failed to remove file: {}", s.message()))?;
+
+        Ok(())
+    }
+
+    pub async fn list_files(&self, path: &str) -> Result<Vec<ListedFile>> {
+        let request = proto::ListFilesRequest {
+            path: path.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .list_files(request)
+            .await
+            .map_err(|s| anyhow!("Failed to list files: {}", s.message()))?
+            .into_inner();
+
+        Ok(response
+            .entries
+            .into_iter()
+            .map(|e| ListedFile {
+                path: e.path,
+                size: e.size,
+                is_dir: e.is_dir,
+            })
+            .collect())
     }
 }

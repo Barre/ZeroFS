@@ -14,6 +14,15 @@ service AdminService {
     rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
 
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
+
+    // Create or truncate a file to a specific size
+    rpc TruncateFile(TruncateFileRequest) returns (TruncateFileResponse);
+
+    // Remove a file
+    rpc RemoveFile(RemoveFileRequest) returns (RemoveFileResponse);
+
+    // List files in a directory (non-recursive)
+    rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
 }
 
 message CheckpointInfo {
@@ -83,4 +92,35 @@ message OperationParams {
     optional string new_path = 4;
     optional string link_target = 5;
     optional string filename = 6;
+}
+
+message TruncateFileRequest {
+    // Absolute or relative path to file
+    string path = 1;
+    // Desired file size in bytes
+    uint64 size = 2;
+}
+
+message TruncateFileResponse {}
+
+message RemoveFileRequest {
+    // Absolute or relative path to file
+    string path = 1;
+}
+
+message RemoveFileResponse {}
+
+message ListFilesRequest {
+    // Directory path to list (empty or "/" lists root)
+    string path = 1;
+}
+
+message FileEntry {
+    string path = 1;
+    uint64 size = 2;
+    bool is_dir = 3;
+}
+
+message ListFilesResponse {
+    repeated FileEntry entries = 1;
 }

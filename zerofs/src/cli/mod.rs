@@ -5,7 +5,10 @@ pub mod checkpoint;
 pub mod debug;
 pub mod fatrace;
 pub mod password;
+pub mod remove;
 pub mod server;
+pub mod truncate;
+pub mod ls;
 
 #[derive(Parser)]
 #[command(name = "zerofs")]
@@ -58,6 +61,38 @@ pub enum Commands {
     Fatrace {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Filesystem file operations via RPC
+    Fs {
+        #[command(subcommand)]
+        subcommand: FsCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FsCommands {
+    /// Truncate or create a file via RPC
+    Truncate {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Path to the file to truncate (absolute or relative to root)
+        path: String,
+        /// Desired size in bytes
+        size: u64,
+    },
+    /// Delete a file via RPC
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Path to the file to delete (absolute or relative to root)
+        path: String,
+    },
+    /// List files in a directory via RPC
+    Ls {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Directory prefix to list (empty or "/" lists root)
+        prefix: String,
     },
 }
 

@@ -102,6 +102,17 @@ async fn main() -> Result<()> {
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
         }
+        cli::Commands::Fs { subcommand } => match subcommand {
+            cli::FsCommands::Truncate { config, path, size } => {
+                cli::truncate::truncate_file(&config, &path, size).await?;
+            }
+            cli::FsCommands::Delete { config, path } => {
+                cli::remove::remove_file(&config, &path).await?;
+            }
+            cli::FsCommands::Ls { config, prefix } => {
+                cli::ls::list_files(&config, &prefix).await?;
+            }
+        },
     }
 
     Ok(())

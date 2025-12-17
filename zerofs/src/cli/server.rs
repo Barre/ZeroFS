@@ -210,6 +210,7 @@ async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
     tracer: AccessTracer,
+    filesystem: Arc<ZeroFS>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
@@ -217,7 +218,8 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, tracer);
+    let service =
+        crate::rpc::server::AdminRpcServer::new(checkpoint_manager, tracer, filesystem);
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -715,6 +717,7 @@ pub async fn run_server(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
         fs.tracer.clone(),
+        Arc::clone(&fs),
         shutdown.clone(),
     )
     .await;
