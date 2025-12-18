@@ -1,3 +1,5 @@
+import { Mermaid } from '@/components/Mermaid'
+
 export const metadata = {
   title: 'Standalone Compactor',
   description:
@@ -32,7 +34,7 @@ By default, compaction runs within the main ZeroFS server process. For high-thro
   </Col>
   <Col>
 
-    ```mermaid
+<Mermaid chart={`
     graph TB
         SERVER[ZeroFS Server<br/>--no-compactor]
         COMPACT[Compactor]
@@ -40,7 +42,7 @@ By default, compaction runs within the main ZeroFS server process. For high-thro
 
         SERVER --> S3
         COMPACT --> S3
-    ```
+    `} />
 
   </Col>
 </Row>
@@ -98,14 +100,3 @@ Consider separating the compactor when:
 - **Multi-tenant environments**: Prevent compaction from affecting other services
 
 For most workloads, the built-in compactor is sufficient and simpler to operate.
-
----
-
-<div className="not-prose mt-6 flex gap-3">
-  <Button href="/configuration" variant="text" arrow="right">
-    Configuration reference
-  </Button>
-  <Button href="/architecture" variant="outline">
-    Architecture overview
-  </Button>
-</div>
