@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod checkpoint;
+pub mod compactor;
 pub mod debug;
 pub mod fatrace;
 pub mod password;
@@ -32,6 +33,9 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
+        /// Run without the built-in compactor (use with external compactor)
+        #[arg(long)]
+        no_compactor: bool,
     },
     /// Change the encryption password
     ///
@@ -56,6 +60,14 @@ pub enum Commands {
     },
     /// Trace file system operations in real-time
     Fatrace {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Run standalone compactor for the database
+    ///
+    /// Use this to run compaction on a separate instance from the writer.
+    /// The writer should be started with --no-compactor flag.
+    Compactor {
         #[arg(short, long)]
         config: PathBuf,
     },

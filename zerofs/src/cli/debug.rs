@@ -46,6 +46,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         actual_db_path,
         super::server::DatabaseMode::ReadWrite,
         settings.lsm,
+        false, // don't disable compactor
     )
     .await?;
 
