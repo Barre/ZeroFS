@@ -78,8 +78,9 @@ async fn main() -> Result<()> {
             config,
             read_only,
             checkpoint,
+            no_compactor,
         } => {
-            cli::server::run_server(config, read_only, checkpoint).await?;
+            cli::server::run_server(config, read_only, checkpoint, no_compactor).await?;
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
@@ -102,6 +103,9 @@ async fn main() -> Result<()> {
         },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
+        }
+        cli::Commands::Compactor { config } => {
+            cli::compactor::run_compactor(config).await?;
         }
     }
 

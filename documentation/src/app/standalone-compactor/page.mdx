@@ -1,0 +1,111 @@
+export const metadata = {
+  title: 'Standalone Compactor',
+  description:
+    'Run compaction on a separate instance to offload work from the main ZeroFS server.',
+}
+
+# Standalone Compactor
+
+ZeroFS supports running compaction as a separate process, allowing you to offload this CPU and I/O intensive work from your main server instance. {{ className: 'lead' }}
+
+## Overview
+
+Compaction is an essential background process in ZeroFS's LSM tree storage engine. It merges sorted runs to:
+
+- **Reduce storage space** by removing old versions of updated/deleted data
+- **Improve read performance** by reducing the number of files to search
+
+By default, compaction runs within the main ZeroFS server process. For high-throughput workloads, you can run a standalone compactor on a separate machine.
+
+## Architecture
+
+<Row>
+  <Col>
+
+    In a separated compactor setup:
+
+    1. **Writer instance**: Runs with `--no-compactor` flag, handling all read/write operations
+    2. **Compactor instance**: Runs `zerofs compactor`, exclusively handling compaction
+
+    Both instances access the same object storage backend. The compactor coordinates with the writer through the shared manifest.
+
+  </Col>
+  <Col>
+
+    ```mermaid
+    graph TB
+        SERVER[ZeroFS Server<br/>--no-compactor]
+        COMPACT[Compactor]
+        S3[(S3/GCS/<br/>Azure)]
+
+        SERVER --> S3
+        COMPACT --> S3
+    ```
+
+  </Col>
+</Row>
+
+## Usage
+
+### Starting the Writer Without Compaction
+
+Start your main ZeroFS server with the `--no-compactor` flag:
+
+```bash
+zerofs run -c zerofs.toml --no-compactor
+```
+
+This disables the built-in compactor, leaving the database in a state where SST files accumulate in level 0 until an external compactor processes them.
+
+### Starting the Standalone Compactor
+
+On a separate instance (or the same machine), run the compactor:
+
+```bash
+zerofs compactor -c zerofs.toml
+```
+
+The compactor reads the same configuration file to access the storage backend and uses the `[lsm]` settings for compaction parameters.
+
+<Note>
+  The compactor only needs access to the object storage backend. It doesn't need to run any network servers (NFS, 9P, NBD).
+</Note>
+
+## Configuration
+
+The standalone compactor uses the same configuration file as the main server. The relevant sections are:
+
+```toml
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "your-password"
+
+[aws]
+access_key_id = "..."
+secret_access_key = "..."
+
+[lsm]
+max_concurrent_compactions = 8  # Number of parallel compaction jobs
+```
+
+## When to Use a Standalone Compactor
+
+Consider separating the compactor when:
+
+- **Reduce egress costs**: Run a small compactor instance in the same region/zone as your S3 bucket. Compaction reads and rewrites large amounts of data during merges - keeping it co-located with the bucket avoids expensive cross-region data transfer fees while your main ZeroFS server can run anywhere.
+- **High write throughput**: Compaction competes with reads and writes for CPU and I/O
+- **Latency-sensitive workloads**: Isolate compaction spikes from user requests
+- **Multi-tenant environments**: Prevent compaction from affecting other services
+
+For most workloads, the built-in compactor is sufficient and simpler to operate.
+
+---
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/configuration" variant="text" arrow="right">
+    Configuration reference
+  </Button>
+  <Button href="/architecture" variant="outline">
+    Architecture overview
+  </Button>
+</div>

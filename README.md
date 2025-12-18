@@ -362,6 +362,35 @@ addresses = ["127.0.0.1:7000"]
 unix_socket = "/tmp/zerofs.rpc.sock"
 ```
 
+### Standalone Compactor
+
+ZeroFS uses an LSM (Log-Structured Merge) tree as its storage engine. Compaction is a background process that merges sorted data files (SSTs) to reclaim space from deleted/updated data and improve read performance by reducing the number of files to search. This process is CPU and I/O intensive.
+
+By default, compaction runs within the main ZeroFS server. For demanding workloads, you can run a standalone compactor on a separate instance:
+
+**Start the writer without compaction:**
+
+```bash
+zerofs run -c zerofs.toml --no-compactor
+```
+
+**Start the standalone compactor** (on the same or different machine):
+
+```bash
+zerofs compactor -c zerofs.toml
+```
+
+Both instances access the same object storage backend.
+
+**When to use a standalone compactor:**
+
+- **Reduce egress costs**: Run a small compactor instance in the same region/zone as your S3 bucket. Compaction reads and writes large amounts of data - keeping it in the same zone avoids cross-region data transfer fees while your main server can run anywhere.
+- **Isolate resource usage**: Compaction competes with user requests for CPU and I/O. Separating it prevents latency spikes during heavy compaction.
+- **Cost optimization**: Run the compactor on cheaper spot/preemptible instances since it can be safely interrupted.
+
+The compactor uses the same configuration file and respects `[lsm].max_concurrent_compactions` for parallelism.
+
+
 ### Encryption
 
 Encryption is always enabled in ZeroFS. All file data is compressed (LZ4 or Zstd) and encrypted using XChaCha20-Poly1305 authenticated encryption. Configure your password in the configuration file:

@@ -71,6 +71,7 @@ pub async fn change_password(
         actual_db_path,
         crate::cli::server::DatabaseMode::ReadWrite,
         settings.lsm,
+        false,
     )
     .await
     .map_err(|e| PasswordError::Other(e.to_string()))?;
