@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "0.22.6"
+version = "0.22.7"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
@@ -25,6 +25,7 @@ codegen-units = 16
 [features]
 default = []
 tokio-console = ["dep:console-subscriber"]
+failpoints = ["dep:fail"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -75,6 +76,7 @@ tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 chrono = "0.4"
+fail = { version = "0.5", features = ["failpoints"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
@@ -82,3 +84,9 @@ protobuf-src = "2"
 
 [dev-dependencies]
 tempfile = "3.21"
+futures = "0.3"
+
+[[test]]
+name = "failpoints"
+path = "tests/failpoints/mod.rs"
+required-features = ["failpoints"]

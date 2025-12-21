@@ -24,6 +24,9 @@ mod test_helpers;
 #[cfg(test)]
 mod posix_tests;
 
+#[cfg(feature = "failpoints")]
+mod failpoints;
+
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 

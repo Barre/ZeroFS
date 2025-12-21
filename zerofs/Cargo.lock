@@ -924,6 +924,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fail"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5e43d0f78a42ad591453aedb1d7ae631ce7ee445c7643691055a9ed8d3b01c"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "fail-parallel"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4318,7 +4329,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.22.6"
+version = "0.22.7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4333,6 +4344,7 @@ dependencies = [
  "console-subscriber",
  "dashmap",
  "deku",
+ "fail",
  "fastant",
  "foyer-memory 0.21.1",
  "futures",
