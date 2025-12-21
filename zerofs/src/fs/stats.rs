@@ -29,6 +29,12 @@ pub struct StatsUpdate<'a> {
     pub _guard: tokio::sync::RwLockWriteGuard<'a, ()>,
 }
 
+impl Default for FileSystemGlobalStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileSystemGlobalStats {
     pub fn new() -> Self {
         let shards = (0..STATS_SHARDS)
