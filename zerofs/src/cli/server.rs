@@ -490,7 +490,7 @@ pub async fn build_slatedb(
                         SizeTieredCompactionSchedulerSupplier::new(
                             SizeTieredCompactionSchedulerOptions {
                                 max_compaction_sources: 32,
-                                include_size_threshold: 2.0,
+                                include_size_threshold: 4.0,
                                 ..Default::default()
                             },
                         ),
