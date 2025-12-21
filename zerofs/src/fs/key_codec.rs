@@ -33,8 +33,8 @@ const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 
 pub const SYSTEM_WRAPPED_ENCRYPTION_KEY: &[u8] = b"system:wrapped_encryption_key";
 
-const U64_SIZE: usize = 8;
-const KEY_INODE_SIZE: usize = 9;
+const U64_SIZE: usize = std::mem::size_of::<u64>();
+const KEY_INODE_SIZE: usize = 1 + U64_SIZE;
 const KEY_CHUNK_SIZE: usize = 17;
 const KEY_TOMBSTONE_SIZE: usize = 17;
 
