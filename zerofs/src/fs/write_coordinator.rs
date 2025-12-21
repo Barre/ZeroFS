@@ -104,6 +104,12 @@ impl WriteCoordinator {
     }
 }
 
+impl Default for WriteCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// RAII guard: marks sequence as abandoned on drop if not committed
 pub struct SequenceGuard {
     sequence: SequenceNumber,

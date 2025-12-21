@@ -22,6 +22,12 @@ pub struct MultiLockGuard {
     _guards: Vec<ShardLockGuard>,
 }
 
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LockManager {
     pub fn new() -> Self {
         Self {

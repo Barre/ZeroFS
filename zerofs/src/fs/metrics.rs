@@ -45,6 +45,12 @@ pub struct FileSystemStats {
     last_snapshot: std::sync::Mutex<PreviousSnapshot>,
 }
 
+impl Default for FileSystemStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileSystemStats {
     pub fn new() -> Self {
         Self {
