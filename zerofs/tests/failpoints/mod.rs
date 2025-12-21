@@ -292,7 +292,7 @@ async fn test_crash_create_after_inode() {
     fail::cfg(fp::CREATE_AFTER_INODE, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .create(
@@ -336,7 +336,7 @@ async fn test_crash_create_after_dir_entry() {
     fail::cfg(fp::CREATE_AFTER_DIR_ENTRY, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .create(
@@ -381,7 +381,7 @@ async fn test_crash_create_after_commit() {
 
     // Use spawn to isolate the panic - JoinHandle returns Err if task panics
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .create(
@@ -1014,7 +1014,7 @@ async fn test_multiple_successful_operations_then_crash() {
     fail::cfg(fp::WRITE_AFTER_COMMIT, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let auth_clone = auth.clone();
     let handle = tokio::task::spawn(async move {
         let (id, _) = fs_clone
@@ -1232,7 +1232,7 @@ async fn test_crash_symlink_after_inode() {
     fail::cfg(fp::SYMLINK_AFTER_INODE, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .symlink(
@@ -1278,7 +1278,7 @@ async fn test_crash_symlink_after_dir_entry() {
     fail::cfg(fp::SYMLINK_AFTER_DIR_ENTRY, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .symlink(
@@ -1324,7 +1324,7 @@ async fn test_crash_symlink_after_commit() {
     fail::cfg(fp::SYMLINK_AFTER_COMMIT, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .symlink(
@@ -1371,7 +1371,7 @@ async fn test_crash_mkdir_after_inode() {
     fail::cfg(fp::MKDIR_AFTER_INODE, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .mkdir(&creds_clone, 0, b"newdir", &SetAttributes::default())
@@ -1411,7 +1411,7 @@ async fn test_crash_mkdir_after_dir_entry() {
     fail::cfg(fp::MKDIR_AFTER_DIR_ENTRY, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .mkdir(&creds_clone, 0, b"newdir", &SetAttributes::default())
@@ -1451,7 +1451,7 @@ async fn test_crash_mkdir_after_commit() {
     fail::cfg(fp::MKDIR_AFTER_COMMIT, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .mkdir(&creds_clone, 0, b"newdir", &SetAttributes::default())
@@ -1501,7 +1501,7 @@ async fn test_crash_truncate_after_chunks() {
     fail::cfg(fp::TRUNCATE_AFTER_CHUNKS, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .setattr(
@@ -1562,7 +1562,7 @@ async fn test_crash_truncate_after_inode() {
     fail::cfg(fp::TRUNCATE_AFTER_INODE, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .setattr(
@@ -1623,7 +1623,7 @@ async fn test_crash_truncate_after_commit() {
     fail::cfg(fp::TRUNCATE_AFTER_COMMIT, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .setattr(
@@ -1676,7 +1676,7 @@ async fn test_crash_mknod_after_inode() {
     fail::cfg(fp::MKNOD_AFTER_INODE, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .mknod(
@@ -1723,7 +1723,7 @@ async fn test_crash_mknod_after_dir_entry() {
     fail::cfg(fp::MKNOD_AFTER_DIR_ENTRY, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .mknod(
@@ -1770,7 +1770,7 @@ async fn test_crash_mknod_after_commit() {
     fail::cfg(fp::MKNOD_AFTER_COMMIT, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
-    let creds_clone = creds.clone();
+    let creds_clone = creds;
     let handle = tokio::task::spawn(async move {
         fs_clone
             .mknod(
