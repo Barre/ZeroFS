@@ -378,10 +378,10 @@ impl<'a> ConsistencyChecker<'a> {
                 self.valid_inodes.insert(inode_id);
                 self.report.stats.inodes_checked += 1;
 
-                if let Ok(inode) = bincode::deserialize::<Inode>(&value) {
-                    if matches!(inode, Inode::Directory(_)) {
-                        self.directory_inodes.insert(inode_id);
-                    }
+                if let Ok(inode) = bincode::deserialize::<Inode>(&value)
+                    && matches!(inode, Inode::Directory(_))
+                {
+                    self.directory_inodes.insert(inode_id);
                 }
             }
         }
@@ -723,23 +723,20 @@ impl<'a> ConsistencyChecker<'a> {
 
                     if let Ok(inode) = self.fs.inode_store.get(inode_id).await {
                         let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
-                        if let Ok(Some(scan_value)) = self.fs.db.get_bytes(&scan_key).await {
-                            if let Ok((_, dsv)) = Self::decode_dir_scan_value(&scan_value) {
-                                if let DirScanValue::WithInode {
-                                    inode: embedded, ..
-                                } = dsv
-                                {
-                                    if !inodes_equal(&embedded, &inode) {
-                                        self.report.errors.push(
-                                            ConsistencyError::StaleEmbeddedInode {
-                                                dir_id,
-                                                name: name.clone(),
-                                                inode_id,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
+                        if let Ok(Some(scan_value)) = self.fs.db.get_bytes(&scan_key).await
+                            && let Ok((_, dsv)) = Self::decode_dir_scan_value(&scan_value)
+                            && let DirScanValue::WithInode {
+                                inode: embedded, ..
+                            } = dsv
+                            && !inodes_equal(&embedded, &inode)
+                        {
+                            self.report
+                                .errors
+                                .push(ConsistencyError::StaleEmbeddedInode {
+                                    dir_id,
+                                    name: name.clone(),
+                                    inode_id,
+                                });
                         }
                     }
                 }
@@ -776,17 +773,17 @@ impl<'a> ConsistencyChecker<'a> {
                             name: name.clone(),
                             cookie: *cookie,
                         });
-                } else if let Some(scan_name) = dir_scans.get(cookie) {
-                    if scan_name != name {
-                        self.report
-                            .errors
-                            .push(ConsistencyError::DirEntryCookieMismatch {
-                                dir_id,
-                                name: name.clone(),
-                                entry_cookie: *cookie,
-                                scan_cookie: *cookie,
-                            });
-                    }
+                } else if let Some(scan_name) = dir_scans.get(cookie)
+                    && scan_name != name
+                {
+                    self.report
+                        .errors
+                        .push(ConsistencyError::DirEntryCookieMismatch {
+                            dir_id,
+                            name: name.clone(),
+                            entry_cookie: *cookie,
+                            scan_cookie: *cookie,
+                        });
                 }
             }
 
@@ -805,18 +802,18 @@ impl<'a> ConsistencyChecker<'a> {
             }
 
             let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
-            if let Ok(Some(data)) = self.fs.db.get_bytes(&counter_key).await {
-                if let Ok(counter) = KeyCodec::decode_counter(&data) {
-                    if max_cookie > 0 && counter <= max_cookie {
-                        self.report
-                            .errors
-                            .push(ConsistencyError::DirCookieCounterTooLow {
-                                dir_id,
-                                stored_counter: counter,
-                                max_cookie,
-                            });
-                    }
-                }
+            if let Ok(Some(data)) = self.fs.db.get_bytes(&counter_key).await
+                && let Ok(counter) = KeyCodec::decode_counter(&data)
+                && max_cookie > 0
+                && counter <= max_cookie
+            {
+                self.report
+                    .errors
+                    .push(ConsistencyError::DirCookieCounterTooLow {
+                        dir_id,
+                        stored_counter: counter,
+                        max_cookie,
+                    });
             }
         }
 
