@@ -1,4 +1,6 @@
 use crate::encryption::EncryptedDb;
+#[cfg(feature = "failpoints")]
+use crate::failpoints::{self as fp, fail_point};
 use crate::fs::errors::FsError;
 use crate::task::spawn_named;
 use std::sync::Arc;
@@ -26,6 +28,9 @@ impl FlushCoordinator {
                 }
 
                 let result = db.flush().await.map_err(|_| FsError::IoError);
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::FLUSH_AFTER_COMPLETE);
 
                 for sender in pending_senders.drain(..) {
                     let _ = sender.send(result);

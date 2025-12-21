@@ -12,8 +12,6 @@ pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
 
-use std::path::PathBuf;
-
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
@@ -25,7 +23,13 @@ use self::write_coordinator::WriteCoordinator;
 use crate::config::CompressionConfig;
 use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
 use slatedb::config::{PutOptions, WriteOptions};
+use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "failpoints")]
+use crate::failpoints as fp;
+#[cfg(feature = "failpoints")]
+use fp::fail_point;
 
 pub use self::gc::GarbageCollector;
 pub use self::write_coordinator::SequenceGuard;
@@ -464,6 +468,9 @@ impl ZeroFS {
 
                 self.chunk_store.write(&mut txn, id, offset, data).await?;
 
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::WRITE_AFTER_CHUNK);
+
                 file.size = new_size;
                 let (now_sec, now_nsec) = get_current_time();
                 file.mtime = now_sec;
@@ -479,6 +486,9 @@ impl ZeroFS {
                 let parent_name_for_update = file.parent.zip(file.name.clone());
 
                 self.inode_store.save(&mut txn, id, &inode)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::WRITE_AFTER_INODE);
 
                 if let Some((parent_id, name)) = parent_name_for_update {
                     self.directory_store
@@ -501,6 +511,9 @@ impl ZeroFS {
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::WRITE_AFTER_COMMIT);
 
                 if let Some(update) = stats_update {
                     self.global_stats.commit_update(&update);
@@ -605,6 +618,10 @@ impl ZeroFS {
 
                 let file_inode_enum = Inode::File(file_inode.clone());
                 self.inode_store.save(&mut txn, file_id, &file_inode_enum)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CREATE_AFTER_INODE);
+
                 self.directory_store.add(
                     &mut txn,
                     dirid,
@@ -614,13 +631,25 @@ impl ZeroFS {
                     Some(&file_inode_enum),
                 );
 
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CREATE_AFTER_DIR_ENTRY);
+
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
                 dir.mtime_nsec = now_nsec;
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 let stats_update = self.global_stats.prepare_inode_create(file_id).await;
                 self.global_stats
@@ -632,6 +661,9 @@ impl ZeroFS {
                     .inspect_err(|e| {
                         error!("Failed to write batch: {:?}", e);
                     })?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CREATE_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -929,6 +961,10 @@ impl ZeroFS {
                 let new_dir_inode_enum = Inode::Directory(new_dir_inode.clone());
                 self.inode_store
                     .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKDIR_AFTER_INODE);
+
                 self.directory_store.add(
                     &mut txn,
                     dirid,
@@ -937,6 +973,9 @@ impl ZeroFS {
                     cookie,
                     Some(&new_dir_inode_enum),
                 );
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKDIR_AFTER_DIR_ENTRY);
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -948,7 +987,16 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
                 self.global_stats
@@ -956,6 +1004,9 @@ impl ZeroFS {
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKDIR_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -1213,6 +1264,10 @@ impl ZeroFS {
             .await?;
 
         self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::SYMLINK_AFTER_INODE);
+
         self.directory_store.add(
             &mut txn,
             dirid,
@@ -1222,13 +1277,25 @@ impl ZeroFS {
             Some(&symlink_inode),
         );
 
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::SYMLINK_AFTER_DIR_ENTRY);
+
         dir.entry_count += 1;
         dir.mtime = now_sec;
         dir.mtime_nsec = now_nsec;
         dir.ctime = now_sec;
         dir.ctime_nsec = now_nsec;
 
+        let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
         self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+        if let Some((parent_id, dir_name)) = parent_update_info {
+            self.directory_store
+                .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                .await
+                .ok();
+        }
 
         let stats_update = self.global_stats.prepare_inode_create(new_id).await;
         self.global_stats
@@ -1236,6 +1303,9 @@ impl ZeroFS {
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::SYMLINK_AFTER_COMMIT);
 
         self.global_stats.commit_update(&stats_update);
 
@@ -1322,6 +1392,9 @@ impl ZeroFS {
         self.directory_store
             .add(&mut txn, linkdirid, linkname, fileid, cookie, None);
 
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_DIR_ENTRY);
+
         if let Some((orig_parent, orig_name)) = original_parent_name {
             self.directory_store
                 .convert_to_reference(&mut txn, orig_parent, &orig_name, fileid)
@@ -1362,17 +1435,37 @@ impl ZeroFS {
 
         self.inode_store.save(&mut txn, fileid, &file_inode)?;
 
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_INODE);
+
         link_dir.entry_count += 1;
         link_dir.mtime = now_sec;
         link_dir.mtime_nsec = now_nsec;
         link_dir.ctime = now_sec;
         link_dir.ctime_nsec = now_nsec;
 
+        let link_dir_inode_updated = Inode::Directory(link_dir.clone());
         self.inode_store
-            .save(&mut txn, linkdirid, &Inode::Directory(link_dir))?;
+            .save(&mut txn, linkdirid, &link_dir_inode_updated)?;
+
+        if let Some(dir_name) = &link_dir.name {
+            self.directory_store
+                .update_inode_in_entry(
+                    &mut txn,
+                    link_dir.parent,
+                    dir_name,
+                    linkdirid,
+                    &link_dir_inode_updated,
+                )
+                .await
+                .ok();
+        }
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_COMMIT);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -1485,9 +1578,15 @@ impl ZeroFS {
                             .truncate(&mut txn, id, old_size, new_size)
                             .await?;
 
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::TRUNCATE_AFTER_CHUNKS);
+
                         let parent_name_for_update = file.parent.zip(file.name.clone());
 
                         self.inode_store.save(&mut txn, id, &inode)?;
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::TRUNCATE_AFTER_INODE);
 
                         if let Some((parent_id, name)) = parent_name_for_update {
                             self.directory_store
@@ -1508,6 +1607,9 @@ impl ZeroFS {
 
                         let mut seq_guard = self.write_coordinator.allocate_sequence();
                         self.commit_transaction(txn, &mut seq_guard).await?;
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::TRUNCATE_AFTER_COMMIT);
 
                         if let Some(update) = stats_update {
                             self.global_stats.commit_update(&update);
@@ -1903,8 +2005,15 @@ impl ZeroFS {
                     .await?;
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKNOD_AFTER_INODE);
+
                 self.directory_store
                     .add(&mut txn, dirid, name, special_id, cookie, Some(&inode));
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKNOD_AFTER_DIR_ENTRY);
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -1912,7 +2021,16 @@ impl ZeroFS {
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 let stats_update = self.global_stats.prepare_inode_create(special_id).await;
                 self.global_stats
@@ -1920,6 +2038,9 @@ impl ZeroFS {
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::MKNOD_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
 
@@ -2021,12 +2142,19 @@ impl ZeroFS {
                                     .delete_range(&mut txn, file_id, 0, total_chunks);
                             } else {
                                 self.tombstone_store.add(&mut txn, file_id, file.size);
+
+                                #[cfg(feature = "failpoints")]
+                                fail_point!(fp::REMOVE_AFTER_TOMBSTONE);
+
                                 self.stats
                                     .tombstones_created
                                     .fetch_add(1, Ordering::Relaxed);
                             }
 
                             self.inode_store.delete(&mut txn, file_id);
+
+                            #[cfg(feature = "failpoints")]
+                            fail_point!(fp::REMOVE_AFTER_INODE_DELETE);
                             self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -2035,7 +2163,15 @@ impl ZeroFS {
                             return Err(FsError::NotEmpty);
                         }
                         self.inode_store.delete(&mut txn, file_id);
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::RMDIR_AFTER_INODE_DELETE);
+
                         self.directory_store.delete_directory(&mut txn, file_id);
+
+                        #[cfg(feature = "failpoints")]
+                        fail_point!(fp::RMDIR_AFTER_DIR_CLEANUP);
+
                         dir.nlink = dir.nlink.saturating_sub(1);
                         self.stats
                             .directories_deleted
@@ -2064,13 +2200,25 @@ impl ZeroFS {
                 self.directory_store
                     .unlink_entry(&mut txn, dirid, name, cookie);
 
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::REMOVE_AFTER_DIR_UNLINK);
+
                 dir.entry_count = dir.entry_count.saturating_sub(1);
                 dir.mtime = now_sec;
                 dir.mtime_nsec = now_nsec;
                 dir.ctime = now_sec;
                 dir.ctime_nsec = now_nsec;
 
+                let parent_update_info = dir.name.clone().map(|n| (dir.parent, n));
+
                 self.inode_store.save(&mut txn, dirid, &dir_inode)?;
+
+                if let Some((parent_id, dir_name)) = parent_update_info {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &dir_name, dirid, &dir_inode)
+                        .await
+                        .ok();
+                }
 
                 // For directories and symlinks: always remove from stats
                 // For files and special files: only remove if this is the last link
@@ -2096,6 +2244,9 @@ impl ZeroFS {
 
                 let mut seq_guard = self.write_coordinator.allocate_sequence();
                 self.commit_transaction(txn, &mut seq_guard).await?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::REMOVE_AFTER_COMMIT);
 
                 if let Some(update) = stats_update {
                     self.global_stats.commit_update(&update);
@@ -2361,6 +2512,9 @@ impl ZeroFS {
                 }
             }
 
+            #[cfg(feature = "failpoints")]
+            fail_point!(fp::RENAME_AFTER_TARGET_DELETE);
+
             // For directories and symlinks: always remove from stats
             // For files and special files: only remove if this is the last link
             if should_always_remove_stats || original_nlink <= 1 {
@@ -2380,6 +2534,9 @@ impl ZeroFS {
 
         self.directory_store
             .unlink_entry(&mut txn, from_dirid, from_name, source_cookie);
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::RENAME_AFTER_SOURCE_UNLINK);
 
         let dir_changed = from_dirid != to_dirid;
         let (now_sec, now_nsec) = get_current_time();
@@ -2444,6 +2601,9 @@ impl ZeroFS {
             embed_inode,
         );
 
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::RENAME_AFTER_NEW_ENTRY);
+
         self.inode_store
             .save(&mut txn, source_inode_id, &source_inode)?;
 
@@ -2468,6 +2628,21 @@ impl ZeroFS {
         }
         self.inode_store.save(&mut txn, from_dirid, &from_dir)?;
 
+        if let Inode::Directory(from_dir_data) = &from_dir
+            && let Some(dir_name) = &from_dir_data.name
+        {
+            self.directory_store
+                .update_inode_in_entry(
+                    &mut txn,
+                    from_dir_data.parent,
+                    dir_name,
+                    from_dirid,
+                    &from_dir,
+                )
+                .await
+                .ok();
+        }
+
         if let Some(ref mut to_dir) = to_dir {
             if let Inode::Directory(d) = to_dir {
                 if target_inode_id.is_none() {
@@ -2484,7 +2659,20 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
+            let to_dir_update_info = if let Inode::Directory(d) = &to_dir {
+                d.name.clone().map(|n| (d.parent, n))
+            } else {
+                None
+            };
+
             self.inode_store.save(&mut txn, to_dirid, to_dir)?;
+
+            if let Some((parent_id, dir_name)) = to_dir_update_info {
+                self.directory_store
+                    .update_inode_in_entry(&mut txn, parent_id, &dir_name, to_dirid, to_dir)
+                    .await
+                    .ok();
+            }
         }
 
         if let Some(ref update) = target_stats_update {
@@ -2493,6 +2681,9 @@ impl ZeroFS {
 
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::RENAME_AFTER_COMMIT);
 
         if let Some(update) = target_stats_update {
             self.global_stats.commit_update(&update);

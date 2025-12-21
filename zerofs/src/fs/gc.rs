@@ -12,6 +12,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+#[cfg(feature = "failpoints")]
+use crate::failpoints as fp;
+#[cfg(feature = "failpoints")]
+use fp::fail_point;
+
 const MAX_CHUNKS_PER_ROUND: usize = 10_000;
 const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
 
@@ -146,6 +151,9 @@ impl GarbageCollector {
                         .await
                         .map_err(|_| FsError::IoError)?;
 
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::GC_AFTER_CHUNK_DELETE);
+
                     chunks_deleted_this_round += chunks_to_delete;
                     chunks_remaining_in_round -= chunks_to_delete;
 
@@ -183,6 +191,9 @@ impl GarbageCollector {
                     )
                     .await
                     .map_err(|_| FsError::IoError)?;
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::GC_AFTER_TOMBSTONE_UPDATE);
 
                 self.stats
                     .tombstones_processed
