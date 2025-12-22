@@ -22,6 +22,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
 
+type KeyCache = foyer_memory::Cache<Bytes, Bytes>;
+
 const NONCE_SIZE: usize = 24;
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -115,6 +117,15 @@ pub struct EncryptedTransaction {
     inner: WriteBatch,
     encryptor: Arc<EncryptionManager>,
     pending_operations: Vec<(Bytes, Bytes)>,
+    deleted_keys: Vec<Bytes>,
+}
+
+/// Result of preparing a transaction for commit, containing the write batch
+/// and metadata needed for cache updates.
+pub struct PreparedTransaction {
+    pub batch: WriteBatch,
+    pub pending_operations: Vec<(Bytes, Bytes)>,
+    pub deleted_keys: Vec<Bytes>,
 }
 
 impl EncryptedTransaction {
@@ -122,8 +133,8 @@ impl EncryptedTransaction {
         Self {
             inner: WriteBatch::new(),
             encryptor,
-
             pending_operations: Vec::new(),
+            deleted_keys: Vec::new(),
         }
     }
 
@@ -132,20 +143,22 @@ impl EncryptedTransaction {
     }
 
     pub fn delete_bytes(&mut self, key: &bytes::Bytes) {
+        self.deleted_keys.push(key.clone());
         self.inner.delete(key);
     }
 
     #[allow(clippy::type_complexity)]
-    pub async fn into_inner(self) -> Result<WriteBatch> {
+    pub async fn into_inner(self) -> Result<PreparedTransaction> {
         let mut inner = self.inner;
+        let pending_operations = self.pending_operations;
+        let deleted_keys = self.deleted_keys;
 
-        if !self.pending_operations.is_empty() {
-            let operations = self.pending_operations;
+        let encrypted_pending = if !pending_operations.is_empty() {
+            let ops = pending_operations.clone();
             let encryptor = self.encryptor.clone();
 
             let encrypted_operations = spawn_blocking_named("encrypt-batch", move || {
-                operations
-                    .into_iter()
+                ops.into_iter()
                     .map(|(key, value)| {
                         let encrypted = encryptor.encrypt(&key, &value)?;
                         Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
@@ -158,9 +171,16 @@ impl EncryptedTransaction {
             for (key, encrypted) in encrypted_operations {
                 inner.put(&key, &encrypted);
             }
-        }
+            pending_operations
+        } else {
+            pending_operations
+        };
 
-        Ok(inner)
+        Ok(PreparedTransaction {
+            batch: inner,
+            pending_operations: encrypted_pending,
+            deleted_keys,
+        })
     }
 }
 
@@ -187,9 +207,24 @@ impl SlateDbHandle {
     }
 }
 
+/// Maximum number of cached metadata entries (everything except chunks).
+const KEY_CACHE_MAX_ENTRIES: usize = 100_000;
+
 pub struct EncryptedDb {
     inner: SlateDbHandle,
     encryptor: Arc<EncryptionManager>,
+    /// Cache for decrypted non-chunk key-value pairs.
+    key_cache: KeyCache,
+}
+
+fn is_chunk_key(key: &[u8]) -> bool {
+    key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk)
+}
+
+fn build_key_cache() -> KeyCache {
+    foyer_memory::CacheBuilder::new(KEY_CACHE_MAX_ENTRIES)
+        .with_shards(128)
+        .build()
 }
 
 impl EncryptedDb {
@@ -197,6 +232,7 @@ impl EncryptedDb {
         Self {
             inner: SlateDbHandle::ReadWrite(db),
             encryptor,
+            key_cache: build_key_cache(),
         }
     }
 
@@ -204,6 +240,7 @@ impl EncryptedDb {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
             encryptor,
+            key_cache: build_key_cache(),
         }
     }
 
@@ -224,6 +261,14 @@ impl EncryptedDb {
     }
 
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
+        let is_chunk = is_chunk_key(key);
+
+        let use_cache = !is_chunk && !self.is_read_only();
+
+        if use_cache && let Some(entry) = self.key_cache.get(key) {
+            return Ok(Some(entry.value().clone()));
+        }
+
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
             cache_blocks: true,
@@ -240,9 +285,6 @@ impl EncryptedDb {
 
         match encrypted {
             Some(encrypted) => {
-                let is_chunk = key.first().and_then(|&b| KeyPrefix::try_from(b).ok())
-                    == Some(KeyPrefix::Chunk);
-
                 let decrypted = if is_chunk {
                     let encryptor = self.encryptor.clone();
                     let key = key.clone();
@@ -252,7 +294,13 @@ impl EncryptedDb {
                 } else {
                     self.encryptor.decrypt(key, &encrypted)?
                 };
-                Ok(Some(bytes::Bytes::from(decrypted)))
+                let result = bytes::Bytes::from(decrypted);
+
+                if use_cache {
+                    self.key_cache.insert(key.clone(), result.clone());
+                }
+
+                Ok(Some(result))
             }
             None => Ok(None),
         }
@@ -320,15 +368,25 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let inner_batch = txn.into_inner().await?;
+        let prepared = txn.into_inner().await?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
-                if let Err(e) = db.write_with_options(inner_batch, options).await {
+                if let Err(e) = db.write_with_options(prepared.batch, options).await {
                     exit_on_write_error(e);
                 }
             }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+        }
+
+        for key in prepared.deleted_keys {
+            self.key_cache.remove(&key);
+        }
+
+        for (key, value) in prepared.pending_operations {
+            if !is_chunk_key(&key) {
+                self.key_cache.insert(key, value);
+            }
         }
 
         Ok(())
@@ -337,6 +395,8 @@ impl EncryptedDb {
     pub(crate) async fn write_raw_batch(
         &self,
         batch: WriteBatch,
+        pending_operations: Vec<(Bytes, Bytes)>,
+        deleted_keys: Vec<Bytes>,
         options: &WriteOptions,
     ) -> Result<()> {
         if self.is_read_only() {
@@ -350,6 +410,17 @@ impl EncryptedDb {
             }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
+
+        for key in deleted_keys {
+            self.key_cache.remove(&key);
+        }
+
+        for (key, value) in pending_operations {
+            if !is_chunk_key(&key) {
+                self.key_cache.insert(key, value);
+            }
+        }
+
         Ok(())
     }
 
@@ -371,8 +442,7 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let is_chunk =
-            key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk);
+        let is_chunk = is_chunk_key(key);
 
         let encrypted = if is_chunk {
             let encryptor = self.encryptor.clone();
@@ -397,6 +467,12 @@ impl EncryptedDb {
             }
             SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
         }
+
+        if !is_chunk {
+            self.key_cache
+                .insert(key.clone(), Bytes::copy_from_slice(value));
+        }
+
         Ok(())
     }
 
