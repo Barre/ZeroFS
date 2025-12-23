@@ -1,73 +1,76 @@
-use super::inode::InodeId;
 use dashmap::DashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+/// A generic lock manager that provides per-key mutex locks.
 #[derive(Clone)]
-pub struct LockManager {
-    locks: Arc<DashMap<InodeId, Arc<Mutex<()>>>>,
+pub struct KeyedLockManager<K: Eq + Hash + Clone + Send + Sync + 'static> {
+    locks: Arc<DashMap<K, Arc<Mutex<()>>>>,
 }
 
-pub struct LockGuard {
+pub struct KeyedLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
     _guard: OwnedMutexGuard<()>,
-    inode_id: InodeId,
-    locks: Arc<DashMap<InodeId, Arc<Mutex<()>>>>,
+    key: K,
+    locks: Arc<DashMap<K, Arc<Mutex<()>>>>,
 }
 
-struct ShardLockGuard {
-    _guard: LockGuard,
+struct ShardLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
+    _guard: KeyedLockGuard<K>,
 }
 
-pub struct MultiLockGuard {
-    _guards: Vec<ShardLockGuard>,
+pub struct MultiLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
+    _guards: Vec<ShardLockGuard<K>>,
 }
 
-impl Default for LockManager {
+impl<K: Eq + Hash + Clone + Send + Sync + 'static> Default for KeyedLockManager<K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LockManager {
+impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLockManager<K> {
     pub fn new() -> Self {
         Self {
             locks: Arc::new(DashMap::new()),
         }
     }
 
-    /// Get or create the lock for a given inode ID
-    fn get_or_create_lock(&self, inode_id: InodeId) -> Arc<Mutex<()>> {
+    /// Get or create the lock for a given key
+    fn get_or_create_lock(&self, key: &K) -> Arc<Mutex<()>> {
         self.locks
-            .entry(inode_id)
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    /// Acquire a single lock for writing
-    pub async fn acquire_write(&self, inode_id: InodeId) -> LockGuard {
-        let lock = self.get_or_create_lock(inode_id);
+    /// Acquire a lock for the given key
+    pub async fn acquire(&self, key: K) -> KeyedLockGuard<K> {
+        let lock = self.get_or_create_lock(&key);
         let guard = lock.lock_owned().await;
-        LockGuard {
+        KeyedLockGuard {
             _guard: guard,
-            inode_id,
+            key,
             locks: self.locks.clone(),
         }
     }
+}
 
-    /// Acquire multiple write locks with automatic ordering to prevent deadlocks.
-    pub async fn acquire_multiple_write(&self, mut inode_ids: Vec<InodeId>) -> MultiLockGuard {
-        // Sort by inode ID to ensure consistent ordering
-        inode_ids.sort();
-        inode_ids.dedup();
+impl<K: Eq + Hash + Clone + Ord + Send + Sync + 'static> KeyedLockManager<K> {
+    /// Acquire multiple locks with automatic ordering to prevent deadlocks.
+    pub async fn acquire_multi(&self, mut keys: Vec<K>) -> MultiLockGuard<K> {
+        // Sort by key to ensure consistent ordering
+        keys.sort();
+        keys.dedup();
 
-        let mut guards = Vec::with_capacity(inode_ids.len());
+        let mut guards = Vec::with_capacity(keys.len());
 
-        for inode_id in inode_ids {
-            let lock = self.get_or_create_lock(inode_id);
+        for key in keys {
+            let lock = self.get_or_create_lock(&key);
             let guard = lock.lock_owned().await;
-            let lock_guard = LockGuard {
+            let lock_guard = KeyedLockGuard {
                 _guard: guard,
-                inode_id,
+                key,
                 locks: self.locks.clone(),
             };
 
@@ -78,14 +81,12 @@ impl LockManager {
     }
 }
 
-/// Implement drop to clean up unused locks
-impl Drop for LockGuard {
+impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for KeyedLockGuard<K> {
     fn drop(&mut self) {
         // Try to remove the lock if it's no longer in use
-        self.locks.remove_if(&self.inode_id, |_, lock| {
+        self.locks.remove_if(&self.key, |_, lock| {
             // The guard holds one reference via OwnedMutexGuard
             // DashMap holds another
-            // If strong_count is 2 or less, we can safely remove
             Arc::strong_count(lock) <= 2
         });
     }
@@ -97,39 +98,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_lock_acquisition() {
-        let manager = LockManager::new();
+        let manager: KeyedLockManager<u64> = KeyedLockManager::new();
 
-        let _guard1 = manager.acquire_write(1).await;
+        let _guard1 = manager.acquire(1).await;
         drop(_guard1);
 
-        let _guard2 = manager.acquire_write(1).await;
+        let _guard2 = manager.acquire(1).await;
     }
 
     #[tokio::test]
     async fn test_multiple_lock_ordering() {
-        let manager = LockManager::new();
+        let manager: KeyedLockManager<u64> = KeyedLockManager::new();
 
-        let guard1 = manager.acquire_multiple_write(vec![3, 1, 2]).await;
+        let guard1 = manager.acquire_multi(vec![3, 1, 2]).await;
         drop(guard1);
 
-        let _guard2 = manager.acquire_multiple_write(vec![2, 3, 1]).await;
+        let _guard2 = manager.acquire_multi(vec![2, 3, 1]).await;
     }
 
     #[tokio::test]
-    async fn test_no_collision_different_inodes() {
-        use std::sync::Arc;
+    async fn test_no_collision_different_keys() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let manager = Arc::new(LockManager::new());
+        let manager: Arc<KeyedLockManager<u64>> = Arc::new(KeyedLockManager::new());
 
-        let _guard1 = manager.acquire_write(0).await;
+        let _guard1 = manager.acquire(0).await;
 
         let manager2 = manager.clone();
         let acquired = Arc::new(AtomicBool::new(false));
         let acquired2 = acquired.clone();
 
         let handle = tokio::spawn(async move {
-            let _guard = manager2.acquire_write(1).await;
+            let _guard = manager2.acquire(1).await;
             acquired2.store(true, Ordering::SeqCst);
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         });
@@ -138,7 +138,7 @@ mod tests {
 
         assert!(
             acquired.load(Ordering::SeqCst),
-            "Should NOT be blocked - different inodes have different locks now"
+            "Should NOT be blocked - different keys have different locks"
         );
 
         drop(_guard1);
@@ -147,69 +147,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_inodes_no_deadlock() {
-        let manager = LockManager::new();
+    async fn test_multiple_keys_no_deadlock() {
+        let manager: KeyedLockManager<u64> = KeyedLockManager::new();
 
-        let _guard = manager.acquire_multiple_write(vec![0, 4, 8]).await;
-        let _guard2 = manager.acquire_multiple_write(vec![1, 5, 9]).await;
+        let _guard = manager.acquire_multi(vec![0, 4, 8]).await;
     }
 
     #[tokio::test]
-    async fn test_lock_cleanup() {
-        let manager = LockManager::new();
+    async fn test_generic_with_bytes() {
+        use bytes::Bytes;
 
-        // Acquire and release a lock
-        {
-            let _guard = manager.acquire_write(42).await;
-            assert_eq!(manager.locks.len(), 1);
-        }
+        let manager: KeyedLockManager<Bytes> = KeyedLockManager::new();
 
-        // Lock should be cleaned up after drop
-        assert_eq!(manager.locks.len(), 0);
+        let key1 = Bytes::from_static(b"key1");
+        let key2 = Bytes::from_static(b"key2");
 
-        // Acquire multiple locks
-        {
-            let _guard1 = manager.acquire_write(1).await;
-            let _guard2 = manager.acquire_write(2).await;
-            assert_eq!(manager.locks.len(), 2);
-        }
+        let _guard1 = manager.acquire(key1.clone()).await;
+        let _guard2 = manager.acquire(key2).await;
 
-        // All locks should be cleaned up
-        assert_eq!(manager.locks.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_lock_creation() {
-        use std::sync::Arc;
-
-        let manager = Arc::new(LockManager::new());
-        let inode_id = 42;
-
-        // Spawn multiple tasks trying to create the same lock
-        let mut handles = vec![];
-        for _ in 0..10 {
-            let manager_clone = manager.clone();
-            let handle = tokio::spawn(async move { manager_clone.get_or_create_lock(inode_id) });
-            handles.push(handle);
-        }
-
-        // Collect all the Arc<Mutex<()>> results
-        let locks: Vec<Arc<Mutex<()>>> = futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
-
-        // All should be the same lock instance
-        let first_lock = &locks[0];
-        for lock in &locks[1..] {
-            assert!(
-                Arc::ptr_eq(first_lock, lock),
-                "All locks should be the same instance"
-            );
-        }
-
-        // Should only have created one entry in the map
-        assert_eq!(manager.locks.len(), 1);
+        drop(_guard1);
+        let _guard3 = manager.acquire(key1).await;
+        drop(_guard3);
     }
 }

@@ -14,7 +14,7 @@ pub mod write_coordinator;
 
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
-use self::lock_manager::LockManager;
+use self::lock_manager::KeyedLockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
@@ -88,7 +88,7 @@ pub struct ZeroFS {
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
-    pub lock_manager: Arc<LockManager>,
+    pub lock_manager: Arc<KeyedLockManager<InodeId>>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
@@ -113,7 +113,7 @@ impl ZeroFS {
     ) -> anyhow::Result<Self> {
         let encryptor = Arc::new(EncryptionManager::new(&encryption_key, compression));
 
-        let lock_manager = Arc::new(LockManager::new());
+        let lock_manager = Arc::new(KeyedLockManager::new());
 
         let db = Arc::new(match slatedb {
             crate::encryption::SlateDbHandle::ReadWrite(db) => EncryptedDb::new(db, encryptor),
@@ -436,7 +436,7 @@ impl ZeroFS {
         // Check parent permissions before lock (also validates inode exists)
         self.check_parent_execute_permissions(id, &creds).await?;
 
-        let _guard = self.lock_manager.acquire_write(id).await;
+        let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
 
         // NFS RFC 1813 section 4.4: Allow owners to write to their files regardless of permission bits
@@ -564,7 +564,7 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _guard = self.lock_manager.acquire_write(dirid).await;
+        let _guard = self.lock_manager.acquire(dirid).await;
         let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
@@ -777,7 +777,7 @@ impl ZeroFS {
             id, offset, length
         );
 
-        let _guard = self.lock_manager.acquire_write(id).await;
+        let _guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
@@ -886,7 +886,7 @@ impl ZeroFS {
             String::from_utf8_lossy(name)
         );
 
-        let _guard = self.lock_manager.acquire_write(dirid).await;
+        let _guard = self.lock_manager.acquire(dirid).await;
         let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
@@ -1210,7 +1210,7 @@ impl ZeroFS {
             target
         );
 
-        let _guard = self.lock_manager.acquire_write(dirid).await;
+        let _guard = self.lock_manager.acquire(dirid).await;
         let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
@@ -1350,7 +1350,7 @@ impl ZeroFS {
 
         let _guards = self
             .lock_manager
-            .acquire_multiple_write(vec![fileid, linkdirid])
+            .acquire_multi(vec![fileid, linkdirid])
             .await;
 
         let link_dir_inode = self.inode_store.get(linkdirid).await?;
@@ -1496,7 +1496,7 @@ impl ZeroFS {
         setattr: &SetAttributes,
     ) -> Result<FileAttributes, FsError> {
         debug!("setattr: id={}, setattr={:?}", id, setattr);
-        let _guard = self.lock_manager.acquire_write(id).await;
+        let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
 
         self.check_parent_execute_permissions(id, creds).await?;
@@ -1941,7 +1941,7 @@ impl ZeroFS {
             ftype
         );
 
-        let _guard = self.lock_manager.acquire_write(dirid).await;
+        let _guard = self.lock_manager.acquire(dirid).await;
         let mut dir_inode = self.inode_store.get(dirid).await?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
@@ -2081,10 +2081,7 @@ impl ZeroFS {
             .get_entry_with_cookie(dirid, name)
             .await?;
 
-        let _guards = self
-            .lock_manager
-            .acquire_multiple_write(vec![dirid, file_id])
-            .await;
+        let _guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
 
         let mut dir_inode = self.inode_store.get(dirid).await?;
         check_access(&dir_inode, &creds, AccessMode::Write)?;
@@ -2333,10 +2330,7 @@ impl ZeroFS {
             all_inodes_to_lock.push(target_id);
         }
 
-        let _guards = self
-            .lock_manager
-            .acquire_multiple_write(all_inodes_to_lock)
-            .await;
+        let _guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
 
         // Re-verify inside lock that entries still point to same inodes
         let (verified_source_id, verified_source_cookie) = self
