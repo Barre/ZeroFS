@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "0.22.8"
+version = "0.22.9"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
