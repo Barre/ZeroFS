@@ -10,6 +10,7 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
+use dashmap::DashMap;
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
@@ -20,9 +21,75 @@ use slatedb::{
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use tokio_stream::Stream;
 
 type KeyCache = foyer_memory::Cache<Bytes, Bytes>;
+
+struct CacheLockManager {
+    locks: DashMap<Bytes, Arc<RwLock<()>>>,
+}
+
+impl CacheLockManager {
+    fn new() -> Self {
+        Self {
+            locks: DashMap::new(),
+        }
+    }
+
+    fn get_or_create_lock(&self, key: &Bytes) -> Arc<RwLock<()>> {
+        self.locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    async fn acquire_read(&self, key: &Bytes) -> CacheReadGuard<'_> {
+        let lock = self.get_or_create_lock(key);
+        let guard = lock.read_owned().await;
+        CacheReadGuard {
+            _guard: guard,
+            key: key.clone(),
+            locks: &self.locks,
+        }
+    }
+
+    async fn acquire_write(&self, key: &Bytes) -> CacheWriteGuard<'_> {
+        let lock = self.get_or_create_lock(key);
+        let guard = lock.write_owned().await;
+        CacheWriteGuard {
+            _guard: guard,
+            key: key.clone(),
+            locks: &self.locks,
+        }
+    }
+}
+
+struct CacheReadGuard<'a> {
+    _guard: OwnedRwLockReadGuard<()>,
+    key: Bytes,
+    locks: &'a DashMap<Bytes, Arc<RwLock<()>>>,
+}
+
+impl Drop for CacheReadGuard<'_> {
+    fn drop(&mut self) {
+        self.locks
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) <= 2);
+    }
+}
+
+struct CacheWriteGuard<'a> {
+    _guard: OwnedRwLockWriteGuard<()>,
+    key: Bytes,
+    locks: &'a DashMap<Bytes, Arc<RwLock<()>>>,
+}
+
+impl Drop for CacheWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.locks
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) <= 2);
+    }
+}
 
 const NONCE_SIZE: usize = 24;
 
@@ -62,7 +129,6 @@ impl EncryptionManager {
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        // Check if this is a chunk key to decide on compression
         let data =
             if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
                 match self.compression {
@@ -215,6 +281,7 @@ pub struct EncryptedDb {
     encryptor: Arc<EncryptionManager>,
     /// Cache for decrypted non-chunk key-value pairs.
     key_cache: KeyCache,
+    cache_locks: CacheLockManager,
 }
 
 fn is_chunk_key(key: &[u8]) -> bool {
@@ -233,6 +300,7 @@ impl EncryptedDb {
             inner: SlateDbHandle::ReadWrite(db),
             encryptor,
             key_cache: build_key_cache(),
+            cache_locks: CacheLockManager::new(),
         }
     }
 
@@ -241,6 +309,7 @@ impl EncryptedDb {
             inner: SlateDbHandle::ReadOnly(db_reader),
             encryptor,
             key_cache: build_key_cache(),
+            cache_locks: CacheLockManager::new(),
         }
     }
 
@@ -262,8 +331,13 @@ impl EncryptedDb {
 
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let is_chunk = is_chunk_key(key);
-
         let use_cache = !is_chunk && !self.is_read_only();
+
+        let _cache_guard = if use_cache {
+            Some(self.cache_locks.acquire_read(key).await)
+        } else {
+            None
+        };
 
         if use_cache && let Some(entry) = self.key_cache.get(key) {
             return Ok(Some(entry.value().clone()));
@@ -370,23 +444,45 @@ impl EncryptedDb {
 
         let prepared = txn.into_inner().await?;
 
+        let cache_deletes: Vec<_> = prepared
+            .deleted_keys
+            .into_iter()
+            .filter(|k| !is_chunk_key(k))
+            .collect();
+        let cache_puts: Vec<_> = prepared
+            .pending_operations
+            .into_iter()
+            .filter(|(k, _)| !is_chunk_key(k))
+            .collect();
+
+        let mut lock_keys: Vec<_> = cache_deletes
+            .iter()
+            .cloned()
+            .chain(cache_puts.iter().map(|(k, _)| k.clone()))
+            .collect();
+        lock_keys.sort();
+        lock_keys.dedup();
+
+        let mut _guards = Vec::with_capacity(lock_keys.len());
+        for key in &lock_keys {
+            _guards.push(self.cache_locks.acquire_write(key).await);
+        }
+
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
                 if let Err(e) = db.write_with_options(prepared.batch, options).await {
                     exit_on_write_error(e);
                 }
             }
-            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+            SlateDbHandle::ReadOnly(_) => unreachable!(),
         }
 
-        for key in prepared.deleted_keys {
+        for key in cache_deletes {
             self.key_cache.remove(&key);
         }
 
-        for (key, value) in prepared.pending_operations {
-            if !is_chunk_key(&key) {
-                self.key_cache.insert(key, value);
-            }
+        for (key, value) in cache_puts {
+            self.key_cache.insert(key, value);
         }
 
         Ok(())
@@ -402,23 +498,44 @@ impl EncryptedDb {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
+
+        let cache_deletes: Vec<_> = deleted_keys
+            .into_iter()
+            .filter(|k| !is_chunk_key(k))
+            .collect();
+        let cache_puts: Vec<_> = pending_operations
+            .into_iter()
+            .filter(|(k, _)| !is_chunk_key(k))
+            .collect();
+
+        let mut lock_keys: Vec<_> = cache_deletes
+            .iter()
+            .cloned()
+            .chain(cache_puts.iter().map(|(k, _)| k.clone()))
+            .collect();
+        lock_keys.sort();
+        lock_keys.dedup();
+
+        let mut _guards = Vec::with_capacity(lock_keys.len());
+        for key in &lock_keys {
+            _guards.push(self.cache_locks.acquire_write(key).await);
+        }
+
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
                 if let Err(e) = db.write_with_options(batch, options).await {
                     exit_on_write_error(e);
                 }
             }
-            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+            SlateDbHandle::ReadOnly(_) => unreachable!(),
         }
 
-        for key in deleted_keys {
+        for key in cache_deletes {
             self.key_cache.remove(&key);
         }
 
-        for (key, value) in pending_operations {
-            if !is_chunk_key(&key) {
-                self.key_cache.insert(key, value);
-            }
+        for (key, value) in cache_puts {
+            self.key_cache.insert(key, value);
         }
 
         Ok(())
@@ -444,6 +561,12 @@ impl EncryptedDb {
 
         let is_chunk = is_chunk_key(key);
 
+        let _cache_guard = if !is_chunk {
+            Some(self.cache_locks.acquire_write(key).await)
+        } else {
+            None
+        };
+
         let encrypted = if is_chunk {
             let encryptor = self.encryptor.clone();
             let key_clone = key.clone();
@@ -465,7 +588,7 @@ impl EncryptedDb {
                     exit_on_write_error(e);
                 }
             }
-            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+            SlateDbHandle::ReadOnly(_) => unreachable!(),
         }
 
         if !is_chunk {
@@ -487,7 +610,7 @@ impl EncryptedDb {
                     exit_on_write_error(e);
                 }
             }
-            SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
+            SlateDbHandle::ReadOnly(_) => unreachable!(),
         }
         Ok(())
     }
