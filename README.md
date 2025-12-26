@@ -127,6 +127,39 @@ cargo install zerofs
 docker pull ghcr.io/barre/zerofs:latest
 ```
 
+#### Via Nix
+```nix
+# flake.nix
+{
+  inputs.zerofs.url = "github:Barre/ZeroFS";
+
+  outputs = { nixpkgs, zerofs, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        { nixpkgs.overlays = [ zerofs.overlays.default ]; }
+        zerofs.nixosModules.default
+        {
+          services.zerofs = {
+            enable = true;
+            settings = {
+              cache.dir = "/var/cache/zerofs";
+              cache.disk_size_gb = 10.0;
+              storage.url = "s3://my-bucket/zerofs-data";
+              storage.encryption_password = "\${ZEROFS_PASSWORD}";
+              servers.nfs.addresses = [ "127.0.0.1:2049" ];
+              aws = {
+                access_key_id = "\${AWS_ACCESS_KEY_ID}";
+                secret_access_key = "\${AWS_SECRET_ACCESS_KEY}";
+              };
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
 ### Getting Started
 
 ```bash
