@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+title: ZeroFS
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Pierre
+    family-names: Barre
+    email: pierre@barre.sh
+repository-code: 'https://github.com/Barre/ZeroFS'
+url: 'https://www.zerofs.net/'
+license: AGPL-3.0
