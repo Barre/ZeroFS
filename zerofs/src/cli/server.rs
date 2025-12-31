@@ -449,6 +449,10 @@ pub async fn build_slatedb(
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
             }),
+            compactions_options: Some(GarbageCollectorDirectoryOptions {
+                interval: Some(Duration::from_mins(1)),
+                min_age: Duration::from_mins(1),
+            }),
         }),
         ..Default::default()
     };
