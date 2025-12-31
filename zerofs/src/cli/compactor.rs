@@ -2,15 +2,11 @@ use crate::config::Settings;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use slatedb::CompactorBuilder;
-use slatedb::config::{
-    CompactorOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
-    SizeTieredCompactionSchedulerOptions,
-};
+use slatedb::config::{CompactorOptions, SizeTieredCompactionSchedulerOptions};
 use slatedb::object_store::path::Path;
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::info;
 
 /// Run standalone compactor for the database.
@@ -54,21 +50,6 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         ..Default::default()
     };
 
-    let gc_options = GarbageCollectorOptions {
-        wal_options: Some(GarbageCollectorDirectoryOptions {
-            interval: Some(Duration::from_secs(60)),
-            min_age: Duration::from_secs(60),
-        }),
-        manifest_options: Some(GarbageCollectorDirectoryOptions {
-            interval: Some(Duration::from_secs(60)),
-            min_age: Duration::from_secs(60),
-        }),
-        compacted_options: Some(GarbageCollectorDirectoryOptions {
-            interval: Some(Duration::from_secs(60)),
-            min_age: Duration::from_secs(60),
-        }),
-    };
-
     let compactor = Arc::new(
         CompactorBuilder::new(db_path, object_store)
             .with_options(compactor_options)
@@ -79,7 +60,6 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
                     ..Default::default()
                 },
             )))
-            .with_gc_options(gc_options)
             .build(),
     );
 
