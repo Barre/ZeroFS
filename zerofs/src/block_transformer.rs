@@ -8,6 +8,7 @@ use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
 use slatedb::BlockTransformer;
+use slatedb::config::SstBlockSize;
 use std::sync::Arc;
 
 use crate::config::CompressionConfig;
@@ -73,8 +74,8 @@ impl TransformerInner {
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
         // Auto-detect compression algorithm based on magic bytes
         if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-            // Zstd compressed - use generous max size for block data
-            zstd::bulk::decompress(data, 64 * 1024 * 1024)
+            // Zstd compressed, capacity is SlateDB max block size
+            zstd::bulk::decompress(data, SstBlockSize::Block64Kib.as_bytes())
                 .map_err(|e| slatedb::Error::data(format!("Zstd decompression failed: {}", e)))
         } else {
             // LZ4 compressed
