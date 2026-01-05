@@ -1,8 +1,12 @@
 #[cfg(test)]
 mod tests {
+    use crate::block_transformer::ZeroFsBlockTransformer;
+    use crate::config::CompressionConfig;
+    use crate::db::SlateDbHandle;
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::{AuthContext, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid};
+    use slatedb::BlockTransformer;
     use std::sync::Arc;
 
     async fn create_test_fs() -> Arc<ZeroFS> {
@@ -1316,20 +1320,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_quota_write_enforcement() {
+        let test_key = [0u8; 32];
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
         let fs = Arc::new(
             ZeroFS::new_with_slatedb(
-                crate::encryption::SlateDbHandle::ReadWrite(Arc::new(
+                SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota"),
-                        Arc::new(slatedb::object_store::memory::InMemory::new()),
+                        object_store,
                     )
+                    .with_block_transformer(block_transformer)
                     .build()
                     .await
                     .unwrap(),
                 )),
-                [0u8; 32],
                 1_000_000,
-                crate::config::CompressionConfig::default(),
             )
             .await
             .unwrap(),
@@ -1369,20 +1378,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_quota_setattr_enforcement() {
+        let test_key = [0u8; 32];
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
         let fs = Arc::new(
             ZeroFS::new_with_slatedb(
-                crate::encryption::SlateDbHandle::ReadWrite(Arc::new(
+                SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota_setattr"),
-                        Arc::new(slatedb::object_store::memory::InMemory::new()),
+                        object_store,
                     )
+                    .with_block_transformer(block_transformer)
                     .build()
                     .await
                     .unwrap(),
                 )),
-                [0u8; 32],
                 1_000_000,
-                crate::config::CompressionConfig::default(),
             )
             .await
             .unwrap(),
@@ -1419,20 +1433,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_quota_allows_deletes_when_over_limit() {
+        let test_key = [0u8; 32];
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
         let fs = Arc::new(
             ZeroFS::new_with_slatedb(
-                crate::encryption::SlateDbHandle::ReadWrite(Arc::new(
+                SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota_over"),
-                        Arc::new(slatedb::object_store::memory::InMemory::new()),
+                        object_store,
                     )
+                    .with_block_transformer(block_transformer)
                     .build()
                     .await
                     .unwrap(),
                 )),
-                [0u8; 32],
                 1_000_000,
-                crate::config::CompressionConfig::default(),
             )
             .await
             .unwrap(),

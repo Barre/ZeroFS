@@ -30,8 +30,8 @@ impl BucketIdentity {
                 tracing::info!("Found existing bucket ID: {}", uuid);
                 uuid
             }
-            Err(e) => {
-                tracing::debug!("Bucket ID marker not found ({}), creating new one", e);
+            Err(slatedb::object_store::Error::NotFound { .. }) => {
+                tracing::debug!("Bucket ID marker not found, creating new one");
                 let new_id = Uuid::new_v4();
                 tracing::info!("Creating new bucket ID: {}", new_id);
 
@@ -41,6 +41,9 @@ impl BucketIdentity {
                     .map_err(|e| anyhow::anyhow!("Failed to write bucket ID marker: {e:#?}"))?;
 
                 new_id
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to read bucket ID marker: {e:#?}"));
             }
         };
 

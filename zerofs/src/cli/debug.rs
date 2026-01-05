@@ -1,10 +1,14 @@
+use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::config::Settings;
-use crate::encryption::SlateDbHandle;
+use crate::db::SlateDbHandle;
 use crate::fs::CacheConfig;
-use crate::fs::key_codec::{KeyPrefix, SYSTEM_WRAPPED_ENCRYPTION_KEY};
+use crate::fs::key_codec::KeyPrefix;
 use crate::key_management;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use slatedb::BlockTransformer;
+use slatedb::config::{DurabilityLevel, ScanOptions};
+use slatedb::object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,6 +44,14 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     crate::cli::password::validate_password(&password)
         .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
+    let db_path = Path::from(actual_db_path.clone());
+    let encryption_key =
+        key_management::load_or_init_encryption_key(&object_store, &db_path, &password, false)
+            .await?;
+
+    let block_transformer: Arc<dyn BlockTransformer> =
+        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
+
     let (slatedb, _, _) = super::server::build_slatedb(
         object_store,
         &cache_config,
@@ -47,106 +59,96 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         super::server::DatabaseMode::ReadWrite,
         settings.lsm,
         false, // don't disable compactor
+        block_transformer,
     )
     .await?;
 
-    let encryption_key = key_management::load_or_init_encryption_key(&slatedb, &password).await?;
-
-    let encrypted_db = match slatedb {
-        // We don't write but we want the "current" view of the DB
-        SlateDbHandle::ReadWrite(db) => {
-            let encryptor = Arc::new(crate::encryption::EncryptionManager::new(
-                &encryption_key,
-                crate::config::CompressionConfig::default(),
-            ));
-            crate::encryption::EncryptedDb::new(db, encryptor)
-        }
+    let db = match slatedb {
+        SlateDbHandle::ReadWrite(db) => db,
         SlateDbHandle::ReadOnly(_) => {
-            unimplemented!("We do not expect a ReadOnly DB in write mode");
+            return Err(anyhow::anyhow!(
+                "Expected read-write mode for debug command"
+            ));
         }
     };
 
     println!("Scanning all keys in the database...\n");
 
-    let iter = encrypted_db.scan(..).await?;
-    futures::pin_mut!(iter);
+    let scan_options = ScanOptions {
+        durability_filter: DurabilityLevel::Memory,
+        read_ahead_bytes: 1024 * 1024,
+        cache_blocks: true,
+        max_fetch_tasks: 8,
+        ..Default::default()
+    };
+
+    let mut iter = db.scan_with_options::<&[u8], _>(.., &scan_options).await?;
 
     let mut count = 0;
     let mut count_by_prefix: std::collections::HashMap<KeyPrefix, usize> =
         std::collections::HashMap::new();
 
-    while let Some(result) = futures::StreamExt::next(&mut iter).await {
-        match result {
-            Ok((key, _value)) => {
-                if key.as_ref() == SYSTEM_WRAPPED_ENCRYPTION_KEY {
-                    println!("[SYSTEM] key=system:wrapped_encryption_key");
-                    count += 1;
-                    continue;
+    while let Ok(Some(kv)) = iter.next().await {
+        let key = kv.key;
+
+        let prefix = match key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) {
+            Some(p) => p,
+            None => {
+                if key.is_empty() {
+                    println!("Empty key found");
+                } else {
+                    println!("Unknown prefix: 0x{:02x} - Key: {:?}", key[0], key);
                 }
-
-                let prefix = match key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) {
-                    Some(p) => p,
-                    None => {
-                        if key.is_empty() {
-                            println!("Empty key found");
-                        } else {
-                            println!("Unknown prefix: 0x{:02x} - Key: {:?}", key[0], key);
-                        }
-                        continue;
-                    }
-                };
-
-                *count_by_prefix.entry(prefix).or_insert(0) += 1;
-
-                print!("[{}] ", prefix.as_str());
-
-                match prefix {
-                    KeyPrefix::Inode if key.len() == 9 => {
-                        let inode_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                        println!("inode_id={}", inode_id);
-                    }
-                    KeyPrefix::Chunk if key.len() == 17 => {
-                        let inode_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                        let chunk_index = u64::from_be_bytes(key[9..17].try_into().unwrap());
-                        println!("inode_id={}, chunk_index={}", inode_id, chunk_index);
-                    }
-                    KeyPrefix::DirEntry if key.len() > 9 => {
-                        let dir_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                        let name = String::from_utf8_lossy(&key[9..]);
-                        println!("dir_id={}, name=\"{}\"", dir_id, name);
-                    }
-                    KeyPrefix::DirScan if key.len() > 17 => {
-                        let dir_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                        let entry_id = u64::from_be_bytes(key[9..17].try_into().unwrap());
-                        let name = String::from_utf8_lossy(&key[17..]);
-                        println!(
-                            "dir_id={}, entry_id={}, name=\"{}\"",
-                            dir_id, entry_id, name
-                        );
-                    }
-                    KeyPrefix::Tombstone if key.len() == 17 => {
-                        let timestamp = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                        let inode_id = u64::from_be_bytes(key[9..17].try_into().unwrap());
-                        println!("timestamp={}, inode_id={}", timestamp, inode_id);
-                    }
-                    KeyPrefix::Stats if key.len() == 9 => {
-                        let shard_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                        println!("shard_id={}", shard_id);
-                    }
-                    KeyPrefix::System => {
-                        println!("subtype=0x{:02x}", key.get(1).unwrap_or(&0));
-                    }
-                    _ => {
-                        println!("raw={:?}", key);
-                    }
-                }
-
-                count += 1;
+                continue;
             }
-            Err(e) => {
-                eprintln!("Error scanning database: {}", e);
+        };
+
+        *count_by_prefix.entry(prefix).or_insert(0) += 1;
+
+        print!("[{}] ", prefix.as_str());
+
+        match prefix {
+            KeyPrefix::Inode if key.len() == 9 => {
+                let inode_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                println!("inode_id={}", inode_id);
+            }
+            KeyPrefix::Chunk if key.len() == 17 => {
+                let inode_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                let chunk_index = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                println!("inode_id={}, chunk_index={}", inode_id, chunk_index);
+            }
+            KeyPrefix::DirEntry if key.len() > 9 => {
+                let dir_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                let name = String::from_utf8_lossy(&key[9..]);
+                println!("dir_id={}, name=\"{}\"", dir_id, name);
+            }
+            KeyPrefix::DirScan if key.len() > 17 => {
+                let dir_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                let entry_id = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                let name = String::from_utf8_lossy(&key[17..]);
+                println!(
+                    "dir_id={}, entry_id={}, name=\"{}\"",
+                    dir_id, entry_id, name
+                );
+            }
+            KeyPrefix::Tombstone if key.len() == 17 => {
+                let timestamp = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                let inode_id = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                println!("timestamp={}, inode_id={}", timestamp, inode_id);
+            }
+            KeyPrefix::Stats if key.len() == 9 => {
+                let shard_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
+                println!("shard_id={}", shard_id);
+            }
+            KeyPrefix::System => {
+                println!("subtype=0x{:02x}", key.get(1).unwrap_or(&0));
+            }
+            _ => {
+                println!("raw={:?}", key);
             }
         }
+
+        count += 1;
     }
 
     println!("\n=== Summary ===");

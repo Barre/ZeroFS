@@ -1,6 +1,9 @@
+use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::config::Settings;
+use crate::key_management;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use slatedb::BlockTransformer;
 use slatedb::CompactorBuilder;
 use slatedb::config::{CompactorOptions, SizeTieredCompactionSchedulerOptions};
 use slatedb::object_store::path::Path;
@@ -37,6 +40,18 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
     info!("Storage URL: {}", settings.storage.url);
     info!("DB Path: {}", db_path);
 
+    let password = settings.storage.encryption_password.clone();
+    super::password::validate_password(&password)
+        .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
+
+    info!("Loading encryption key from object store");
+    let encryption_key =
+        key_management::load_or_init_encryption_key(&object_store, &db_path, &password, true)
+            .await?;
+
+    let block_transformer: Arc<dyn BlockTransformer> =
+        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
+
     let max_concurrent_compactions = settings
         .lsm
         .map(|c| c.max_concurrent_compactions())
@@ -60,6 +75,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
                     ..Default::default()
                 },
             )))
+            .with_block_transformer(block_transformer)
             .build(),
     );
 

@@ -1,28 +1,33 @@
-use crate::encryption::SlateDbHandle;
-use crate::fs::key_codec::SYSTEM_WRAPPED_ENCRYPTION_KEY;
 use crate::task::spawn_blocking_named;
 use anyhow::Result;
 use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHasher, SaltString},
 };
+use bytes::Bytes;
 use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
+    Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
+use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload};
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const ARGON2_MEM_COST: u32 = 65536;
 const ARGON2_TIME_COST: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 4;
+
+/// Filename for the wrapped encryption key in object store
+const WRAPPED_KEY_FILENAME: &str = "zerofs.key";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct WrappedDataKey {
     /// Salt for Argon2 password derivation
     pub salt: String,
     /// Nonce for XChaCha20-Poly1305 encryption of the DEK
-    pub nonce: [u8; 12],
+    pub nonce: [u8; 24],
     /// Encrypted data encryption key
     pub wrapped_dek: Vec<u8>,
     /// Version for future compatibility
@@ -73,12 +78,12 @@ impl KeyManager {
         let kek = self.derive_kek(password, &salt)?;
 
         // Generate random nonce for wrapping
-        let mut nonce_bytes = [0u8; 12];
+        let mut nonce_bytes = [0u8; 24];
         thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Encrypt DEK with KEK
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&kek));
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
         let wrapped_dek = cipher
             .encrypt(nonce, dek.as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to wrap DEK: {}", e))?;
@@ -110,8 +115,8 @@ impl KeyManager {
         let kek = self.derive_kek(password, &salt)?;
 
         // Decrypt DEK with KEK
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&kek));
-        let nonce = Nonce::from_slice(&wrapped_key.nonce);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
+        let nonce = XNonce::from_slice(&wrapped_key.nonce);
 
         let dek_vec = cipher
             .decrypt(nonce, wrapped_key.wrapped_dek.as_ref())
@@ -138,11 +143,11 @@ impl KeyManager {
         let salt = SaltString::generate(&mut thread_rng());
         let kek = self.derive_kek(new_password, &salt)?;
 
-        let mut nonce_bytes = [0u8; 12];
+        let mut nonce_bytes = [0u8; 24];
         thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&kek));
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
         let wrapped_dek = cipher
             .encrypt(nonce, dek.as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to rewrap DEK: {}", e))?;
@@ -156,28 +161,68 @@ impl KeyManager {
     }
 }
 
-/// Load or initialize encryption key from database
+/// Get the path for the wrapped key file in object store
+fn wrapped_key_path(db_path: &Path) -> Path {
+    let mut path = db_path.clone();
+    path = path.child(WRAPPED_KEY_FILENAME);
+    path
+}
+
+/// Load wrapped key from object store
+pub async fn load_wrapped_key_from_object_store(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+) -> Result<Option<WrappedDataKey>> {
+    let key_path = wrapped_key_path(db_path);
+
+    match object_store.get(&key_path).await {
+        Ok(result) => {
+            let data = result.bytes().await?;
+            let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
+            Ok(Some(wrapped_key))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("Failed to load wrapped key: {}", e)),
+    }
+}
+
+/// Save wrapped key to object store
+pub async fn save_wrapped_key_to_object_store(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    wrapped_key: &WrappedDataKey,
+) -> Result<()> {
+    let key_path = wrapped_key_path(db_path);
+
+    let serialized = bincode::serialize(wrapped_key)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
+
+    object_store
+        .put(&key_path, PutPayload::from(Bytes::from(serialized)))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to save wrapped key: {}", e))?;
+
+    Ok(())
+}
+
+/// Load or initialize encryption key from object store.
+///
+/// This loads the wrapped encryption key from the object store and unwraps it
+/// using the provided password. If no key exists, a new one is generated and
+/// stored.
 pub async fn load_or_init_encryption_key(
-    db_handle: &SlateDbHandle,
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
     password: &str,
+    read_only: bool,
 ) -> Result<[u8; 32]> {
     let key_manager = KeyManager::new();
 
-    // Check if wrapped key exists in database
-    let existing_key = match db_handle {
-        SlateDbHandle::ReadWrite(db) => db.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?,
-        SlateDbHandle::ReadOnly(reader_swap) => {
-            let reader = reader_swap.load();
-            reader.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?
-        }
-    };
+    let existing_key = load_wrapped_key_from_object_store(object_store, db_path).await?;
 
     match existing_key {
-        Some(data) => {
-            // Key exists, unwrap it
-            let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
-
+        Some(wrapped_key) => {
             let password = password.to_string();
             spawn_blocking_named("argon2-unwrap", move || {
                 key_manager.unwrap_key(&password, &wrapped_key)
@@ -186,8 +231,7 @@ pub async fn load_or_init_encryption_key(
             .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
         }
         None => {
-            // First time setup - generate new key
-            if db_handle.is_read_only() {
+            if read_only {
                 return Err(anyhow::anyhow!(
                     "Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first."
                 ));
@@ -200,24 +244,7 @@ pub async fn load_or_init_encryption_key(
             .await
             .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
-            // Store wrapped key in database
-            let serialized = bincode::serialize(&wrapped_key)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
-
-            match db_handle {
-                SlateDbHandle::ReadWrite(db) => {
-                    db.put_with_options(
-                        SYSTEM_WRAPPED_ENCRYPTION_KEY,
-                        &serialized,
-                        &slatedb::config::PutOptions::default(),
-                        &slatedb::config::WriteOptions {
-                            await_durable: false,
-                        },
-                    )
-                    .await?;
-                }
-                SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
-            }
+            save_wrapped_key_to_object_store(object_store, db_path, &wrapped_key).await?;
 
             Ok(dek)
         }
@@ -226,28 +253,16 @@ pub async fn load_or_init_encryption_key(
 
 /// Change the password used to encrypt the DEK
 pub async fn change_encryption_password(
-    db_handle: &SlateDbHandle,
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
     old_password: &str,
     new_password: &str,
 ) -> Result<()> {
-    if db_handle.is_read_only() {
-        return Err(anyhow::anyhow!("Cannot change password in read-only mode"));
-    }
-
     let key_manager = KeyManager::new();
 
-    // Load current wrapped key
-    let data = match db_handle {
-        SlateDbHandle::ReadWrite(db) => db.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?,
-        SlateDbHandle::ReadOnly(reader_swap) => {
-            let reader = reader_swap.load();
-            reader.get(SYSTEM_WRAPPED_ENCRYPTION_KEY).await?
-        }
-    }
-    .ok_or_else(|| anyhow::anyhow!("No encryption key found in database"))?;
-
-    let wrapped_key: WrappedDataKey = bincode::deserialize(&data)
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize wrapped key: {}", e))?;
+    let wrapped_key = load_wrapped_key_from_object_store(object_store, db_path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No encryption key found"))?;
 
     let old_password = old_password.to_string();
     let new_password = new_password.to_string();
@@ -257,23 +272,7 @@ pub async fn change_encryption_password(
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
-    let serialized = bincode::serialize(&new_wrapped_key)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize wrapped key: {}", e))?;
-
-    match db_handle {
-        SlateDbHandle::ReadWrite(db) => {
-            db.put_with_options(
-                SYSTEM_WRAPPED_ENCRYPTION_KEY,
-                &serialized,
-                &slatedb::config::PutOptions::default(),
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await?;
-        }
-        SlateDbHandle::ReadOnly(_) => unreachable!("Already checked read-only above"),
-    }
+    save_wrapped_key_to_object_store(object_store, db_path, &new_wrapped_key).await?;
 
     Ok(())
 }

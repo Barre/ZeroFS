@@ -1,7 +1,6 @@
-use crate::cli::server::build_slatedb;
 use crate::config::Settings;
-use crate::fs::CacheConfig;
 use crate::key_management;
+use slatedb::object_store::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +32,10 @@ pub fn validate_password(password: &str) -> Result<(), PasswordError> {
     Ok(())
 }
 
+/// Change the encryption password.
+///
+/// The encryption key is stored in object store (not in SlateDB), so we don't need
+/// to open the database to change the password.
 pub async fn change_password(
     settings: &Settings,
     new_password: String,
@@ -57,44 +60,16 @@ pub async fn change_password(
     .map_err(|e| PasswordError::Other(e.to_string()))?;
 
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
-    let actual_db_path = path_from_url.to_string();
+    let db_path = Path::from(path_from_url.to_string());
 
-    let cache_config = CacheConfig {
-        root_folder: settings.cache.dir.clone(),
-        max_cache_size_gb: settings.cache.disk_size_gb,
-        memory_cache_size_gb: settings.cache.memory_size_gb,
-    };
-
-    let (slatedb, _, _) = build_slatedb(
-        object_store,
-        &cache_config,
-        actual_db_path,
-        crate::cli::server::DatabaseMode::ReadWrite,
-        settings.lsm,
-        false,
+    key_management::change_encryption_password(
+        &object_store,
+        &db_path,
+        current_password,
+        &new_password,
     )
     .await
-    .map_err(|e| PasswordError::Other(e.to_string()))?;
-
-    key_management::change_encryption_password(&slatedb, current_password, &new_password)
-        .await
-        .map_err(|e| PasswordError::EncryptionError(e.to_string()))?;
-
-    match &slatedb {
-        crate::encryption::SlateDbHandle::ReadWrite(db) => {
-            db.flush()
-                .await
-                .map_err(|e| PasswordError::Other(e.to_string()))?;
-            db.close()
-                .await
-                .map_err(|e| PasswordError::Other(e.to_string()))?;
-        }
-        crate::encryption::SlateDbHandle::ReadOnly(_) => {
-            return Err(PasswordError::Other(
-                "Cannot change password in read-only mode".to_string(),
-            ));
-        }
-    }
+    .map_err(|e| PasswordError::EncryptionError(e.to_string()))?;
 
     Ok(())
 }

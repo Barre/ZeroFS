@@ -1,4 +1,4 @@
-use crate::encryption::{EncryptedDb, EncryptedTransaction};
+use crate::db::{Db, Transaction};
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::{CHUNK_SIZE, FsError};
@@ -13,11 +13,11 @@ const ZERO_CHUNK: &[u8] = &[0u8; CHUNK_SIZE];
 
 #[derive(Clone)]
 pub struct ChunkStore {
-    db: Arc<EncryptedDb>,
+    db: Arc<Db>,
 }
 
 impl ChunkStore {
-    pub fn new(db: Arc<EncryptedDb>) -> Self {
+    pub fn new(db: Arc<Db>) -> Self {
         Self { db }
     }
 
@@ -35,17 +35,17 @@ impl ChunkStore {
         }
     }
 
-    fn save(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64, data: Bytes) {
+    fn save(&self, txn: &mut Transaction, id: InodeId, chunk_idx: u64, data: Bytes) {
         let key = KeyCodec::chunk_key(id, chunk_idx);
         txn.put_bytes(&key, data);
     }
 
-    pub fn delete(&self, txn: &mut EncryptedTransaction, id: InodeId, chunk_idx: u64) {
+    pub fn delete(&self, txn: &mut Transaction, id: InodeId, chunk_idx: u64) {
         let key = KeyCodec::chunk_key(id, chunk_idx);
         txn.delete_bytes(&key);
     }
 
-    pub fn delete_range(&self, txn: &mut EncryptedTransaction, id: InodeId, start: u64, end: u64) {
+    pub fn delete_range(&self, txn: &mut Transaction, id: InodeId, start: u64, end: u64) {
         for chunk_idx in start..end {
             self.delete(txn, id, chunk_idx);
         }
@@ -106,7 +106,7 @@ impl ChunkStore {
 
     pub async fn write(
         &self,
-        txn: &mut EncryptedTransaction,
+        txn: &mut Transaction,
         id: InodeId,
         offset: u64,
         data: &[u8],
@@ -179,7 +179,7 @@ impl ChunkStore {
 
     pub async fn truncate(
         &self,
-        txn: &mut EncryptedTransaction,
+        txn: &mut Transaction,
         id: InodeId,
         old_size: u64,
         new_size: u64,
@@ -216,7 +216,7 @@ impl ChunkStore {
 
     pub async fn zero_range(
         &self,
-        txn: &mut EncryptedTransaction,
+        txn: &mut Transaction,
         id: InodeId,
         offset: u64,
         length: u64,
