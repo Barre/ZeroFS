@@ -7,8 +7,7 @@ use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::path::Path;
 use std::sync::Arc;
-use zerofs::config::CompressionConfig;
-use zerofs::encryption::SlateDbHandle;
+use zerofs::db::SlateDbHandle;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::types::{AuthContext, SetAttributes};
@@ -34,15 +33,12 @@ fn test_creds() -> Credentials {
 struct CrashTestContext {
     /// In-memory object store that persists across "restarts"
     object_store: Arc<dyn ObjectStore>,
-    /// Encryption key for the filesystem
-    encryption_key: [u8; 32],
 }
 
 impl CrashTestContext {
     fn new() -> Self {
         Self {
             object_store: Arc::new(InMemory::new()),
-            encryption_key: [0u8; 32], // Test key
         }
     }
 
@@ -64,14 +60,9 @@ impl CrashTestContext {
         );
 
         Arc::new(
-            ZeroFS::new_with_slatedb(
-                SlateDbHandle::ReadWrite(slatedb),
-                self.encryption_key,
-                u64::MAX,
-                CompressionConfig::default(),
-            )
-            .await
-            .unwrap(),
+            ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX)
+                .await
+                .unwrap(),
         )
     }
 
