@@ -8,7 +8,6 @@ use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
 use slatedb::BlockTransformer;
-use slatedb::config::SstBlockSize;
 use std::sync::Arc;
 
 use crate::config::CompressionConfig;
@@ -66,19 +65,28 @@ impl TransformerInner {
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
         match self.compression {
             CompressionConfig::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
-            CompressionConfig::Zstd(level) => zstd::bulk::compress(data, level)
-                .map_err(|e| slatedb::Error::data(format!("Zstd compression failed: {}", e))),
+            CompressionConfig::Zstd(level) => {
+                let compressed = zstd::bulk::compress(data, level)
+                    .map_err(|e| slatedb::Error::data(format!("Zstd compression failed: {}", e)))?;
+                // Prepend original size as little-endian u32 for decompression
+                let size = data.len() as u32;
+                let mut result = Vec::with_capacity(4 + compressed.len());
+                result.extend_from_slice(&size.to_le_bytes());
+                result.extend_from_slice(&compressed);
+                Ok(result)
+            }
         }
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
         // Auto-detect compression algorithm based on magic bytes
-        if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-            // Zstd compressed, capacity is SlateDB max block size
-            zstd::bulk::decompress(data, SstBlockSize::Block64Kib.as_bytes() * 2)
+        // Zstd format: [u32 size][zstd data with magic at offset 4]
+        if data.len() >= 8 && data[4..8] == ZSTD_MAGIC {
+            let size = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
+            zstd::bulk::decompress(&data[4..], size)
                 .map_err(|e| slatedb::Error::data(format!("Zstd decompression failed: {}", e)))
         } else {
-            // LZ4 compressed
+            // LZ4 compressed (also has size prepended by lz4_flex)
             lz4_flex::decompress_size_prepended(data)
                 .map_err(|e| slatedb::Error::data(format!("LZ4 decompression failed: {}", e)))
         }
@@ -226,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn test_large_data() {
         let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Zstd(3));
-        let data = Bytes::from(vec![0xABu8; SstBlockSize::Block64Kib.as_bytes()]);
+        let data = Bytes::from(vec![0xABu8; 1024 * 1024]);
 
         let encoded = transformer.encode(data.clone()).await.unwrap();
         let decoded = transformer.decode(encoded).await.unwrap();
