@@ -425,7 +425,6 @@ After changing the password, update your configuration file or environment varia
 
 **Not Encrypted:**
 - Key structure (inode IDs, directory entry names)
-- Database structure (LSM tree levels, bloom filters)
 
 This design is intentional. Encrypting keys would severely impact performance as LSM trees need to compare and sort keys during compaction. The key structure reveals filesystem hierarchy but not file contents.
 
