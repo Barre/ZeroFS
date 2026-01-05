@@ -491,7 +491,7 @@ pub async fn build_slatedb(
             let mut builder = DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
-                .with_sst_block_size(slatedb::SstBlockSize::Block16Kib)
+                .with_sst_block_size(slatedb::SstBlockSize::Block4Kib)
                 .with_memory_cache(cache)
                 .with_block_transformer(block_transformer);
 

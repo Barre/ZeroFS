@@ -226,8 +226,7 @@ mod tests {
     #[tokio::test]
     async fn test_large_data() {
         let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Zstd(3));
-        // 1MB of data
-        let data = Bytes::from(vec![0xABu8; 1024 * 1024]);
+        let data = Bytes::from(vec![0xABu8; SstBlockSize::Block64Kib.as_bytes()]);
 
         let encoded = transformer.encode(data.clone()).await.unwrap();
         let decoded = transformer.decode(encoded).await.unwrap();
