@@ -20,8 +20,7 @@ use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
-use crate::config::CompressionConfig;
-use crate::encryption::{EncryptedDb, EncryptedTransaction, EncryptionManager};
+use crate::db::{Db, SlateDbHandle, Transaction};
 use slatedb::config::{PutOptions, WriteOptions};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,7 +82,7 @@ pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
 }
 #[derive(Clone)]
 pub struct ZeroFS {
-    pub db: Arc<EncryptedDb>,
+    pub db: Arc<Db>,
     pub chunk_store: ChunkStore,
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
@@ -105,21 +104,12 @@ pub struct CacheConfig {
 }
 
 impl ZeroFS {
-    pub async fn new_with_slatedb(
-        slatedb: crate::encryption::SlateDbHandle,
-        encryption_key: [u8; 32],
-        max_bytes: u64,
-        compression: CompressionConfig,
-    ) -> anyhow::Result<Self> {
-        let encryptor = Arc::new(EncryptionManager::new(&encryption_key, compression));
-
+    pub async fn new_with_slatedb(slatedb: SlateDbHandle, max_bytes: u64) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
 
         let db = Arc::new(match slatedb {
-            crate::encryption::SlateDbHandle::ReadWrite(db) => EncryptedDb::new(db, encryptor),
-            crate::encryption::SlateDbHandle::ReadOnly(reader) => {
-                EncryptedDb::new_read_only(reader, encryptor)
-            }
+            SlateDbHandle::ReadWrite(db) => Db::new(db),
+            SlateDbHandle::ReadOnly(reader) => Db::new_read_only(reader),
         });
 
         let counter_key = KeyCodec::system_counter_key();
@@ -204,19 +194,16 @@ impl ZeroFS {
 
     pub async fn commit_transaction(
         &self,
-        mut txn: EncryptedTransaction,
+        mut txn: Transaction,
         seq_guard: &mut SequenceGuard,
     ) -> Result<(), FsError> {
         self.inode_store.save_counter(&mut txn);
 
-        let (encrypt_result, _) = tokio::join!(txn.into_inner(), seq_guard.wait_for_predecessors());
-        let prepared = encrypt_result.map_err(|_| FsError::IoError)?;
+        seq_guard.wait_for_predecessors().await;
 
         self.db
-            .write_raw_batch(
-                prepared.batch,
-                prepared.pending_operations,
-                prepared.deleted_keys,
+            .write_with_options(
+                txn.into_inner(),
                 &WriteOptions {
                     await_durable: false,
                 },
@@ -286,21 +273,21 @@ impl ZeroFS {
 
     #[cfg(test)]
     pub async fn new_in_memory() -> anyhow::Result<Self> {
-        // Use a fixed test key for in-memory tests
-        let test_key = [0u8; 32];
-        Self::new_in_memory_with_encryption(test_key).await
-    }
-
-    #[cfg(test)]
-    pub async fn new_in_memory_with_encryption(encryption_key: [u8; 32]) -> anyhow::Result<Self> {
+        use crate::block_transformer::ZeroFsBlockTransformer;
+        use crate::config::CompressionConfig;
+        use slatedb::BlockTransformer;
         use slatedb::DbBuilder;
         use slatedb::object_store::path::Path;
 
+        let test_key = [0u8; 32];
         let object_store = slatedb::object_store::memory::InMemory::new();
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
 
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
         let settings = slatedb::config::Settings {
-            compression_codec: None, // Disable compression - we handle it in encryption layer
+            compression_codec: None,
             compactor_options: Some(slatedb::config::CompactorOptions {
                 ..Default::default()
             }),
@@ -311,41 +298,45 @@ impl ZeroFS {
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_settings(settings)
+                .with_block_transformer(block_transformer)
                 .build()
                 .await?,
         );
 
-        Self::new_with_slatedb(
-            crate::encryption::SlateDbHandle::ReadWrite(slatedb),
-            encryption_key,
-            u64::MAX,
-            CompressionConfig::default(),
-        )
-        .await
+        Self::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX).await
     }
 
     #[cfg(test)]
     pub async fn new_in_memory_read_only(
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-        encryption_key: [u8; 32],
     ) -> anyhow::Result<Self> {
+        use crate::block_transformer::ZeroFsBlockTransformer;
+        use crate::config::CompressionConfig;
         use arc_swap::ArcSwap;
+        use slatedb::BlockTransformer;
         use slatedb::DbReader;
         use slatedb::config::DbReaderOptions;
         use slatedb::object_store::path::Path;
 
+        let test_key = [0u8; 32];
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
         let db_path = Path::from("test_slatedb");
         let reader = Arc::new(
-            DbReader::open(db_path, object_store, None, DbReaderOptions::default()).await?,
+            DbReader::open(
+                db_path,
+                object_store,
+                None,
+                DbReaderOptions {
+                    block_transformer: Some(block_transformer),
+                    ..Default::default()
+                },
+            )
+            .await?,
         );
 
-        Self::new_with_slatedb(
-            crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
-            encryption_key,
-            u64::MAX,
-            CompressionConfig::default(),
-        )
-        .await
+        Self::new_with_slatedb(SlateDbHandle::ReadOnly(ArcSwap::new(reader)), u64::MAX).await
     }
 
     pub async fn is_ancestor_of(
@@ -2856,10 +2847,17 @@ mod tests {
         use slatedb::DbBuilder;
         use slatedb::object_store::path::Path;
 
+        use crate::block_transformer::ZeroFsBlockTransformer;
+        use crate::config::CompressionConfig;
+        use slatedb::BlockTransformer;
+
         let object_store = slatedb::object_store::memory::InMemory::new();
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
 
         let test_key = [0u8; 32];
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
         let settings = slatedb::config::Settings {
             compression_codec: None,
             compactor_options: Some(slatedb::config::CompactorOptions {
@@ -2872,19 +2870,15 @@ mod tests {
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
+                .with_block_transformer(block_transformer)
                 .build()
                 .await
                 .unwrap(),
         );
 
-        let fs_rw = ZeroFS::new_with_slatedb(
-            crate::encryption::SlateDbHandle::ReadWrite(slatedb),
-            test_key,
-            u64::MAX,
-            CompressionConfig::default(),
-        )
-        .await
-        .unwrap();
+        let fs_rw = ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX)
+            .await
+            .unwrap();
 
         let test_inode_id = fs_rw.inode_store.allocate();
         let file_inode = FileInode {
@@ -2913,9 +2907,7 @@ mod tests {
         fs_rw.flush_coordinator.flush().await.unwrap();
         drop(fs_rw);
 
-        let fs_ro = ZeroFS::new_in_memory_read_only(object_store, test_key)
-            .await
-            .unwrap();
+        let fs_ro = ZeroFS::new_in_memory_read_only(object_store).await.unwrap();
 
         let root_inode = fs_ro.inode_store.get(0).await.unwrap();
         assert!(matches!(root_inode, Inode::Directory(_)));

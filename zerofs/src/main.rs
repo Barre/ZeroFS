@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use std::io::BufRead;
 
+mod block_transformer;
 mod bucket_identity;
 mod cache;
 mod checkpoint_manager;
 mod cli;
 mod config;
+mod db;
 mod deku_bytes;
-mod encryption;
 mod fs;
 mod key_management;
 mod nbd;

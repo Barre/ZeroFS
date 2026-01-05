@@ -1,4 +1,4 @@
-use crate::encryption::{EncryptedDb, EncryptedTransaction};
+use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::{KeyCodec, KeyPrefix, ParsedKey};
@@ -17,15 +17,15 @@ pub struct TombstoneEntry {
 
 #[derive(Clone)]
 pub struct TombstoneStore {
-    db: Arc<EncryptedDb>,
+    db: Arc<Db>,
 }
 
 impl TombstoneStore {
-    pub fn new(db: Arc<EncryptedDb>) -> Self {
+    pub fn new(db: Arc<Db>) -> Self {
         Self { db }
     }
 
-    pub fn add(&self, txn: &mut EncryptedTransaction, inode_id: InodeId, size: u64) {
+    pub fn add(&self, txn: &mut Transaction, inode_id: InodeId, size: u64) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -34,11 +34,11 @@ impl TombstoneStore {
         txn.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }
 
-    pub fn update(&self, txn: &mut EncryptedTransaction, key: &Bytes, new_size: u64) {
+    pub fn update(&self, txn: &mut Transaction, key: &Bytes, new_size: u64) {
         txn.put_bytes(key, KeyCodec::encode_tombstone_size(new_size));
     }
 
-    pub fn remove(&self, txn: &mut EncryptedTransaction, key: &Bytes) {
+    pub fn remove(&self, txn: &mut Transaction, key: &Bytes) {
         txn.delete_bytes(key);
     }
 

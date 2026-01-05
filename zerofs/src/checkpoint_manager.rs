@@ -1,4 +1,4 @@
-use crate::encryption::SlateDbHandle;
+use crate::db::SlateDbHandle;
 use anyhow::{Result, anyhow};
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};

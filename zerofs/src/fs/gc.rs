@@ -1,4 +1,4 @@
-use crate::encryption::EncryptedDb;
+use crate::db::Db;
 use crate::fs::CHUNK_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
@@ -21,7 +21,7 @@ const MAX_CHUNKS_PER_ROUND: usize = 10_000;
 const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
 
 pub struct GarbageCollector {
-    db: Arc<EncryptedDb>,
+    db: Arc<Db>,
     tombstone_store: TombstoneStore,
     chunk_store: ChunkStore,
     stats: Arc<FileSystemStats>,
@@ -29,7 +29,7 @@ pub struct GarbageCollector {
 
 impl GarbageCollector {
     pub fn new(
-        db: Arc<EncryptedDb>,
+        db: Arc<Db>,
         tombstone_store: TombstoneStore,
         chunk_store: ChunkStore,
         stats: Arc<FileSystemStats>,
@@ -143,7 +143,7 @@ impl GarbageCollector {
                 if chunks_to_delete > 0 {
                     self.db
                         .write_with_options(
-                            txn,
+                            txn.into_inner(),
                             &WriteOptions {
                                 await_durable: false,
                             },
@@ -184,7 +184,7 @@ impl GarbageCollector {
 
                 self.db
                     .write_with_options(
-                        txn,
+                        txn.into_inner(),
                         &WriteOptions {
                             await_durable: false,
                         },

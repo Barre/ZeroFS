@@ -1,4 +1,4 @@
-use crate::encryption::EncryptedDb;
+use crate::db::Db;
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::errors::FsError;
@@ -13,7 +13,7 @@ pub struct FlushCoordinator {
 }
 
 impl FlushCoordinator {
-    pub fn new(db: Arc<EncryptedDb>) -> Self {
+    pub fn new(db: Arc<Db>) -> Self {
         let (sender, mut receiver) =
             mpsc::unbounded_channel::<oneshot::Sender<Result<(), FsError>>>();
 

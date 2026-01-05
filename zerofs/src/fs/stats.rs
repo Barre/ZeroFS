@@ -145,7 +145,7 @@ impl FileSystemGlobalStats {
     pub fn add_to_transaction(
         &self,
         update: &StatsUpdate,
-        txn: &mut crate::encryption::EncryptedTransaction,
+        txn: &mut crate::db::Transaction,
     ) -> Result<(), FsError> {
         let shard_bytes = bincode::serialize(&update.shard_data)?;
         txn.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
