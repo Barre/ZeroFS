@@ -36,7 +36,7 @@ fastant = "0.1.11"
 foyer-memory = "0.21"
 zerofs_nfsserve = "0.19.0"
 mimalloc = { version = "0.1", features = ["v3"] }
-tokio = { version = "1.48", features = ["full", "tracing"] }
+tokio = { version = "1.49", features = ["full", "tracing"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"
 tracing = "0.1"
