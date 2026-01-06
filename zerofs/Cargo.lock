@@ -3145,7 +3145,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=71f0eec4f9c0e04d940224749371550a16dccdcd#71f0eec4f9c0e04d940224749371550a16dccdcd"
+source = "git+https://github.com/Barre/slatedb.git?rev=48db1c2d9b1a1d76a7120cb2befcb97088553a30#48db1c2d9b1a1d76a7120cb2befcb97088553a30"
 dependencies = [
  "anyhow",
  "async-trait",
