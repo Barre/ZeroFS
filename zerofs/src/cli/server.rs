@@ -422,7 +422,7 @@ pub async fn build_slatedb(
     } else {
         Some(slatedb::config::CompactorOptions {
             max_concurrent_compactions,
-            max_sst_size: 1024 * 1024 * 1024,
+            max_sst_size: 256 * 1024 * 1024,
             ..Default::default()
         })
     };
