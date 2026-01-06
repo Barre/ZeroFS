@@ -7,7 +7,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use zerofs_nfsserve::nfs::{ftype3, *};
+use zerofs::fs::CHUNK_SIZE;
+use zerofs_nfsserve::nfs::{
+    FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
+    fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, writeverf3,
+};
 use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
 
@@ -353,6 +357,40 @@ impl NFSFileSystem for NFSAdapter {
                 Err(nfsstat)
             }
         }
+    }
+
+    async fn fsinfo(&self, auth: &NfsAuthContext, id: fileid3) -> Result<fsinfo3, nfsstat3> {
+        debug!("fsinfo called: id={}", id);
+
+        let obj_attr = match self.getattr(auth, id).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(e) => {
+                debug!("fsinfo: getattr failed for id {}: {:?}", id, e);
+                post_op_attr::Void
+            }
+        };
+
+        // Use configured max_bytes from filesystem config, capped at 8 EiB
+        // to avoid breaking NFS clients that can't handle larger values
+        const MAX_NFS_BYTES: u64 = 8 * (1 << 60); // 8 EiB
+        let maxfilesize = self.fs.max_bytes.min(MAX_NFS_BYTES);
+
+        Ok(fsinfo3 {
+            obj_attributes: obj_attr,
+            rtmax: 1024 * 1024,
+            rtpref: 1024 * 1024,
+            rtmult: CHUNK_SIZE as u32,
+            wtmax: 1024 * 1024,
+            wtpref: 1024 * 1024,
+            wtmult: CHUNK_SIZE as u32,
+            dtpref: 1024 * 1024,
+            maxfilesize,
+            time_delta: nfstime3 {
+                seconds: 0,
+                nseconds: 1,
+            },
+            properties: FSF_LINK | FSF_SYMLINK | FSF_HOMOGENEOUS | FSF_CANSETTIME,
+        })
     }
 
     async fn fsstat(&self, auth: &NfsAuthContext, fileid: fileid3) -> Result<fsstat3, nfsstat3> {
