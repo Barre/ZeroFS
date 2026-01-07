@@ -109,6 +109,9 @@ async fn main() -> Result<()> {
         cli::Commands::Compactor { config } => {
             cli::compactor::run_compactor(config).await?;
         }
+        cli::Commands::Flush { config } => {
+            cli::flush::flush(&config).await?;
+        }
     }
 
     Ok(())

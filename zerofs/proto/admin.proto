@@ -14,7 +14,13 @@ service AdminService {
     rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
 
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
+
+    rpc Flush(FlushRequest) returns (FlushResponse);
 }
+
+message FlushRequest {}
+
+message FlushResponse {}
 
 message CheckpointInfo {
     // UUID as string
