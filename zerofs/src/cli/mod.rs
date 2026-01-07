@@ -8,6 +8,7 @@ pub mod checkpoint;
 pub mod compactor;
 pub mod debug;
 pub mod fatrace;
+pub mod flush;
 pub mod password;
 pub mod server;
 
@@ -71,6 +72,11 @@ pub enum Commands {
     /// Use this to run compaction on a separate instance from the writer.
     /// The writer should be started with --no-compactor flag.
     Compactor {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Flush pending writes to storage
+    Flush {
         #[arg(short, long)]
         config: PathBuf,
     },

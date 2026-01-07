@@ -164,4 +164,16 @@ impl RpcClient {
 
         Ok(response.into_inner())
     }
+
+    pub async fn flush(&self) -> Result<()> {
+        let request = proto::FlushRequest {};
+
+        self.client
+            .clone()
+            .flush(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
 }

@@ -1,4 +1,5 @@
 use crate::checkpoint_manager::CheckpointManager;
+use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::tracing::AccessTracer;
 use crate::rpc::proto::{self, admin_service_server::AdminService};
 use anyhow::{Context, Result};
@@ -16,13 +17,19 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
+    flush_coordinator: FlushCoordinator,
     tracer: AccessTracer,
 }
 
 impl AdminRpcServer {
-    pub fn new(checkpoint_manager: Arc<CheckpointManager>, tracer: AccessTracer) -> Self {
+    pub fn new(
+        checkpoint_manager: Arc<CheckpointManager>,
+        flush_coordinator: FlushCoordinator,
+        tracer: AccessTracer,
+    ) -> Self {
         Self {
             checkpoint_manager,
+            flush_coordinator,
             tracer,
         }
     }
@@ -113,6 +120,18 @@ impl AdminService for AdminRpcServer {
             .map(|event| Ok(event.into()));
 
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn flush(
+        &self,
+        _request: Request<proto::FlushRequest>,
+    ) -> Result<Response<proto::FlushResponse>, Status> {
+        self.flush_coordinator
+            .flush()
+            .await
+            .map_err(|e| Status::internal(format!("Flush failed: {:?}", e)))?;
+
+        Ok(Response::new(proto::FlushResponse {}))
     }
 }
 
