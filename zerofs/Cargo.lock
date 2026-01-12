@@ -3145,7 +3145,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=48db1c2d9b1a1d76a7120cb2befcb97088553a30#48db1c2d9b1a1d76a7120cb2befcb97088553a30"
+source = "git+https://github.com/Barre/slatedb.git?rev=469bd5fff33db8fde0c49d5dbc1b923f6fabe271#469bd5fff33db8fde0c49d5dbc1b923f6fabe271"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4466,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.23.4"
+version = "0.23.5"
 dependencies = [
  "anyhow",
  "arc-swap",
