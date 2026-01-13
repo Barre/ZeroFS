@@ -29,7 +29,7 @@ failpoints = ["dep:fail"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
-slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "469bd5fff33db8fde0c49d5dbc1b923f6fabe271", features = [
+slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "2e2521ac372bb1fa9abfa9b809e636fbcb43f3d3", features = [
     "wal_disable",
 ] }
 fastant = "0.1.11"
