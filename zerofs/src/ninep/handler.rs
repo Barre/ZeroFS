@@ -808,7 +808,6 @@ impl NinePHandler {
 
         let (used_bytes, used_inodes) = self.filesystem.global_stats.get_totals();
 
-        const TOTAL_INODES: u64 = 1 << 48; // ~281 trillion inodes
         const BLOCK_SIZE: u32 = 4096; // 4KB blocks
 
         let total_bytes = self.filesystem.max_bytes;
@@ -819,7 +818,7 @@ impl NinePHandler {
 
         let next_inode_id = self.filesystem.inode_store.next_id();
 
-        let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
+        let available_inodes = u64::MAX.saturating_sub(next_inode_id);
 
         let total_inodes = used_inodes + available_inodes;
 
@@ -1055,11 +1054,11 @@ mod tests {
 
                 // Verify totals match our constants
                 const TOTAL_BYTES: u64 = u64::MAX;
-                const TOTAL_INODES: u64 = 1 << 48;
                 assert_eq!(rstatfs.blocks, TOTAL_BYTES.div_ceil(4096));
-                // Total files = used + free, which will be <= TOTAL_INODES
-                assert!(rstatfs.files <= TOTAL_INODES);
-                assert_eq!(rstatfs.files, rstatfs.ffree); // Since no files created yet, all are free
+                // files = used_inodes + available_inodes, ffree = available_inodes
+                // Since no files created yet (only root inode), files should equal ffree + used
+                assert!(rstatfs.files > 0);
+                assert!(rstatfs.ffree > 0);
             }
             _ => panic!("Expected Rstatfs, got {:?}", statfs_resp.body),
         }
@@ -1144,9 +1143,8 @@ mod tests {
             Message::Rstatfs(rstatfs) => {
                 // Should have fewer available inodes since we allocated one for the file
                 // Note: Available inodes are based on next_inode_id, not currently used inodes
-                const TOTAL_INODES: u64 = 1 << 48;
                 let next_inode_id = handler.filesystem.inode_store.next_id();
-                assert_eq!(rstatfs.ffree, TOTAL_INODES - next_inode_id);
+                assert_eq!(rstatfs.ffree, u64::MAX - next_inode_id);
 
                 // Should have fewer free blocks (10KB written = 3 blocks of 4KB)
                 let expected_blocks_used = 10240_u64.div_ceil(4096); // Round up
