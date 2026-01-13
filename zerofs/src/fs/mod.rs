@@ -826,13 +826,18 @@ impl ZeroFS {
             String::from_utf8_lossy(filename)
         );
 
-        let dir_inode = self.inode_store.get(dirid).await?;
+        let (dir_inode_result, entry_result) = tokio::join!(
+            self.inode_store.get(dirid),
+            self.directory_store.get(dirid, filename)
+        );
+
+        let dir_inode = dir_inode_result?;
 
         match dir_inode {
             Inode::Directory(_) => {
                 check_access(&dir_inode, creds, AccessMode::Execute)?;
 
-                match self.directory_store.get(dirid, filename).await {
+                match entry_result {
                     Ok(inode_id) => {
                         debug!(
                             "lookup found: {} -> inode {}",
