@@ -238,6 +238,7 @@ export const navigation: Array<NavGroup> = [
     links: [
       { title: 'Introduction', href: '/' },
       { title: 'Quickstart', href: '/quickstart' },
+      { title: 'Durability & Consistency', href: '/durability' },
       { title: 'Architecture', href: '/architecture' },
       { title: 'Encryption & Security', href: '/encryption' },
       { title: 'Configuration', href: '/configuration' },
