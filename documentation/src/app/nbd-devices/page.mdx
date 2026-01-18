@@ -45,7 +45,7 @@ zerofs run --config zerofs.toml
 
 Configuration options:
 - `addresses` - Array of bind addresses for NBD TCP server (default: ["127.0.0.1:10809"])
-- `socket` - Unix socket path for NBD (optional)
+- `unix_socket` - Unix socket path for NBD (optional)
 
 ## Device Management
 
@@ -192,7 +192,7 @@ url = "s3://my-bucket/us-east-db"
 encryption_password = "shared-key"
 
 [aws]
-region = "us-east-1"
+default_region = "us-east-1"
 
 [servers.nbd]
 addresses = ["0.0.0.0:10809"]
@@ -208,7 +208,7 @@ url = "s3://my-bucket/eu-west-db"
 encryption_password = "shared-key"
 
 [aws]
-region = "eu-west-1"
+default_region = "eu-west-1"
 
 [servers.nbd]
 addresses = ["0.0.0.0:10809"]
@@ -412,10 +412,10 @@ systemctl start zerofs-nbd
 ## Next Steps
 
 <div className="not-prose mt-6 flex gap-3">
-  <Button href="/filesystem-operations" arrow="right">
-    Learn about filesystem operations
+  <Button href="/9p-access" arrow="right">
+    Explore 9P file access
   </Button>
-  <Button href="/caching" variant="outline">
-    Understand caching architecture
+  <Button href="/architecture" variant="outline">
+    Understand system architecture
   </Button>
 </div>

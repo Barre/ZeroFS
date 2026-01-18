@@ -78,7 +78,7 @@ encryption_password = "your-secure-password"
 [aws]
 access_key_id = "your-access-key"
 secret_access_key = "your-secret-key"
-region = "us-east-1"
+default_region = "us-east-1"
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]
@@ -364,5 +364,5 @@ Congratulations! You now have a fully functional filesystem backed by S3. Here a
 
 - [Configure NBD block devices](/nbd-devices) for raw block storage
 - [Learn about encryption](/encryption) and how your data is protected
-- [Optimize performance](/caching) with caching configuration
+- [Configure ZeroFS](/configuration) for your use case
 - [Explore advanced architectures](/advanced-use-cases) like geo-distributed storage

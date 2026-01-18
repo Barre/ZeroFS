@@ -47,7 +47,7 @@ encryption_password = "secure-password-here"
 [aws]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-region = "us-east-1"              # Optional, defaults to us-east-1
+default_region = "us-east-1"      # Optional, defaults to us-east-1
 endpoint = "https://s3.amazonaws.com"  # Optional for S3-compatible services
 allow_http = "false"                # Set to true for non-HTTPS endpoints
 ```
@@ -123,7 +123,7 @@ addresses = ["0.0.0.0:2049"]  # Bind addresses (default: ["127.0.0.1:2049"])
 ```toml
 [servers.ninep]
 addresses = ["0.0.0.0:5564"]  # Bind addresses (default: ["127.0.0.1:5564"])
-unix_socket = "/tmp/zerofs.sock"
+unix_socket = "/tmp/zerofs.9p.sock"
 ```
 
 ### NBD Server
@@ -318,7 +318,7 @@ flush_interval_secs = 60       # Flush less frequently for better throughput
 [aws]
 access_key_id = "your-key"
 secret_access_key = "your-secret"
-region = "us-east-1"
+default_region = "us-east-1"
 
 [servers.nfs]
 addresses = ["0.0.0.0:2049"]
