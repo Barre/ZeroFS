@@ -5,9 +5,8 @@ use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
 use slatedb::CompactorBuilder;
-use slatedb::config::{CompactorOptions, SizeTieredCompactionSchedulerOptions};
+use slatedb::config::CompactorOptions;
 use slatedb::object_store::path::Path;
-use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -68,13 +67,6 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
     let compactor = Arc::new(
         CompactorBuilder::new(db_path, object_store)
             .with_options(compactor_options)
-            .with_scheduler_supplier(Arc::new(SizeTieredCompactionSchedulerSupplier::new(
-                SizeTieredCompactionSchedulerOptions {
-                    max_compaction_sources: 32,
-                    include_size_threshold: 4.0,
-                    ..Default::default()
-                },
-            )))
             .with_block_transformer(block_transformer)
             .build(),
     );
