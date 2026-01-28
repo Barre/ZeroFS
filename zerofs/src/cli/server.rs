@@ -18,10 +18,9 @@ use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
 use slatedb::config::{
     CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
-    ObjectStoreCacheOptions, SizeTieredCompactionSchedulerOptions,
+    ObjectStoreCacheOptions,
 };
 use slatedb::object_store::path::Path;
-use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use slatedb::{BlockTransformer, DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -499,17 +498,7 @@ pub async fn build_slatedb(
                 .with_block_transformer(block_transformer);
 
             if !disable_compactor {
-                builder = builder
-                    .with_compaction_runtime(runtime_handle.clone())
-                    .with_compaction_scheduler_supplier(Arc::new(
-                        SizeTieredCompactionSchedulerSupplier::new(
-                            SizeTieredCompactionSchedulerOptions {
-                                max_compaction_sources: 32,
-                                include_size_threshold: 4.0,
-                                ..Default::default()
-                            },
-                        ),
-                    ));
+                builder = builder.with_compaction_runtime(runtime_handle.clone());
             }
 
             let slatedb = Arc::new(builder.build().await?);
