@@ -190,6 +190,7 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
 # default_region = "us-east-1"
 # allow_http = "true"  # For non-HTTPS endpoints
+# conditional_put = "redis://localhost:6379"  # For S3-compatible stores without conditional put support
 
 # [azure]
 # storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
@@ -220,7 +221,10 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
 # default_region = "us-east-1"
 # allow_http = "true"  # For non-HTTPS endpoints (e.g., MinIO)
+# conditional_put = "redis://localhost:6379"  # For S3-compatible stores without conditional put support
 ```
+
+> **Note:** ZeroFS requires conditional write (put-if-not-exists) support for fencing. AWS S3 supports this natively. For S3-compatible object stores that do not support conditional puts, set `conditional_put` to a Redis URL. ZeroFS will use Redis to coordinate conditional write operations.
 
 #### Microsoft Azure
 ```toml
