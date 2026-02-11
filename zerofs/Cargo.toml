@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
@@ -41,7 +41,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-object_store = { version = "0.12.4", features = ["aws", "azure", "gcp"] }
+object_store = { version = "=0.12.4", features = ["aws", "azure", "gcp"] }
 bytes = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
@@ -75,6 +75,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 chrono = "0.4"
 fail = { version = "0.5", features = ["failpoints"], optional = true }
+
+[patch.crates-io]
+object_store = { git = "https://github.com/Barre/arrow-rs-object-store", branch = "feat/s3-redis-conditional-put-0.12.4" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

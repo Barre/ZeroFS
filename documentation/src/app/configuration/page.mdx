@@ -50,11 +50,25 @@ secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 region = "us-east-1"              # Optional, defaults to us-east-1
 endpoint = "https://s3.amazonaws.com"  # Optional for S3-compatible services
 allow_http = "false"                # Set to true for non-HTTPS endpoints
+conditional_put = "redis://localhost:6379"  # For stores without conditional put support
 ```
 
 <Note>
 For S3-compatible services like MinIO or Cloudflare R2, set the `endpoint` field to the service endpoint.
 </Note>
+
+#### Conditional Put Support
+
+ZeroFS requires conditional write (put-if-not-exists) support for fencing. AWS S3 supports this natively, so the `conditional_put` option is not needed when using AWS S3 directly.
+
+For S3-compatible object stores that do not support conditional puts, set `conditional_put` to a Redis URL. ZeroFS will use Redis to coordinate conditional write operations:
+
+```toml
+[aws]
+conditional_put = "redis://localhost:6379"
+```
+
+This is required for object stores that return success instead of an error when a put-if-not-exists operation targets an existing object.
 
 ### Azure Blob Storage
 
@@ -241,6 +255,7 @@ encryption_password = "your-secure-password"
 [aws]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+# conditional_put = "redis://localhost:6379"  # Only needed for S3-compatible stores without conditional put support
 
 [servers.nfs]
 addresses = ["0.0.0.0:2049"]
