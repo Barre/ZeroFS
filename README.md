@@ -155,6 +155,7 @@ The configuration file has sections for:
 - **Cache** - Local cache settings for performance
 - **Storage** - S3/Azure/local backend configuration and encryption
 - **Servers** - Enable/disable NFS, 9P, and NBD servers
+- **LSM tuning** - Write-ahead log, compaction, and flush settings
 - **Cloud credentials** - AWS or Azure authentication
 
 ### Example Configuration
@@ -183,6 +184,10 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
+
+[lsm]
+wal_enabled = true  # WAL reduces compaction churn from frequent fsyncs (default: true)
+                    # Disable for bulk data loading where fsyncs are rare
 
 [aws]
 access_key_id = "${AWS_ACCESS_KEY_ID}"
@@ -751,7 +756,7 @@ These microsecond-level latencies are 4-5 orders of magnitude faster than raw S3
 - Multi-layered cache: Memory block cache, metadata cache, and configurable disk cache
 - Compression: Reduces data transfer and increases effective cache capacity
 - Parallel prefetching: Overlaps S3 requests to hide latency
-- Buffering through WAL + memtables: Batches writes to minimize S3 operations
+- Write-ahead log (WAL): Absorbs fsyncs without flushing the memtable, preventing small SST files and reducing compaction churn. Can be disabled for bulk loading workloads where fsyncs are rare
 
 <p align="center">
   <a href="https://asciinema.org/a/ovxTV0zTpjE1xcxn5CXehCTTN" target="_blank">View SQLite Benchmark Demo</a>

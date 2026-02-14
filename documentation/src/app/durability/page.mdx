@@ -132,7 +132,7 @@ ZeroFS requires no recovery procedure after unexpected termination.
 
     **Self-Describing State**: The database manifest describes the complete set of valid SST files. On startup, ZeroFS reads the manifest and has immediate access to the latest consistent state.
 
-    **No Write-Ahead Log Dependencies**: Unlike filesystems that require WAL replay to reconstruct state, ZeroFS state is fully materialized in SST files and the manifest.
+    **Write-Ahead Log (WAL)**: WAL is enabled by default to reduce compaction overhead from frequent fsyncs (see [Configuration Guide](/configuration) for details). Whether WAL is enabled or disabled does not affect durability guarantees. When enabled, any WAL entries since the last SST flush are replayed on startup — this only covers data not yet flushed to SSTs, so recovery remains fast.
 
   </Col>
   <Col>

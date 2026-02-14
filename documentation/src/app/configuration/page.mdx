@@ -207,6 +207,8 @@ flush_interval_secs = 30         # Interval between periodic flushes (in seconds
 
 - **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Lower values flush more frequently. Higher values improve write throughput by batching more data before flushing. Note that `fsync` calls on NBD and 9P always trigger an immediate flush regardless of this interval.
 
+- **`wal_enabled`** (default: `true`): Controls the write-ahead log (WAL). Can be changed at any time without data loss. Without WAL, each `fsync` flushes the memtable and produces a small SST, leading to compaction churn. With WAL, fsyncs write to the WAL instead, so the memtable keeps growing and flushes produce properly-sized SSTs. Disable WAL for bulk data loading where fsyncs are rare — the extra write per mutation becomes unnecessary overhead.
+
 <Note>
 These are advanced settings. The defaults are optimized for most workloads. Only modify these if you understand LSM tree behavior and are experiencing specific performance issues.
 </Note>
