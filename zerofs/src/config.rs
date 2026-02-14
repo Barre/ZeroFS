@@ -152,6 +152,9 @@ pub struct LsmConfig {
     /// Interval in seconds between periodic flushes
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flush_interval_secs: Option<u64>,
+    /// Whether the write-ahead log (WAL) is enabled
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wal_enabled: Option<bool>,
 }
 
 impl LsmConfig {
@@ -197,6 +200,10 @@ impl LsmConfig {
         self.flush_interval_secs
             .unwrap_or(Self::DEFAULT_FLUSH_INTERVAL_SECS)
             .max(Self::MIN_FLUSH_INTERVAL_SECS)
+    }
+
+    pub fn wal_enabled(&self) -> bool {
+        self.wal_enabled.unwrap_or(true)
     }
 }
 
@@ -526,6 +533,7 @@ impl Settings {
         toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
+        toml_string.push_str("# wal_enabled = true               # Whether the write-ahead log (WAL) is enabled (default: true)\n");
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 
