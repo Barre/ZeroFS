@@ -1,0 +1,42 @@
+export const metadata = {
+  title: 'Separate WAL Object Store',
+  description:
+    'Use a faster object store for WAL writes to reduce fsync latency.',
+}
+
+# Separate WAL Object Store
+
+Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL's backing store. You can point the WAL at a separate, lower-latency store to reduce this latency. {{ className: 'lead' }}
+
+## Overview
+
+By default the WAL goes to the same object store as everything else. If fsync latency matters for your workload, you can configure a separate WAL store for example local NVMe, S3 Express One Zone, or a nearby S3-compatible service.
+
+## Configuration
+
+Add a `[wal]` section to your configuration file:
+
+```toml
+[wal]
+url = "file:///mnt/nvme/zerofs-wal"
+```
+
+The `[wal]` section supports its own credential blocks (`[wal.aws]`, `[wal.azure]`, `[wal.gcp]`), independent from the main storage credentials:
+
+```toml
+[wal]
+url = "s3://my-wal-bucket/zerofs-wal"
+
+[wal.aws]
+access_key_id = "${WAL_AWS_KEY}"
+secret_access_key = "${WAL_AWS_SECRET}"
+endpoint = "https://s3-endpoint.example.com"
+```
+
+If no `[wal]` section is present, the WAL is written to the main object store.
+
+## Important Constraints
+
+Whether you use a separate WAL store is decided at filesystem creation time. The underlying storage engine records this in its manifest, so you cannot add or remove a separate WAL store on an existing filesystem.
+
+You can move the WAL to a different location by updating the `[wal]` URL and credentials, but you must manually migrate the WAL files from the old store to the new one before starting ZeroFS.

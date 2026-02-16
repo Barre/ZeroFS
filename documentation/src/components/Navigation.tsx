@@ -244,6 +244,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'Configuration', href: '/configuration' },
       { title: 'Checkpoints', href: '/checkpoints' },
       { title: 'Standalone Compactor', href: '/standalone-compactor' },
+      { title: 'Separate WAL Store', href: '/separate-wal' },
       { title: 'Troubleshooting', href: '/troubleshooting' },
       { title: 'Advanced Use Cases', href: '/advanced-use-cases' },
     ],

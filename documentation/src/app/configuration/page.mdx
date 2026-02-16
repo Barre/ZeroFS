@@ -222,6 +222,21 @@ Consider tuning these parameters if you're experiencing:
 - **CPU / Network underutilization**: Increase `max_concurrent_compactions` on high-core systems
 - **Memory pressure**: Decrease `max_unflushed_gb` to reduce memory usage
 
+## Separate WAL Object Store
+
+By default the WAL is written to the same object store as everything else. You can point it at a separate, lower-latency store to reduce fsync latency. See [Separate WAL Store](/separate-wal) for details.
+
+```toml
+[wal]
+url = "file:///mnt/nvme/zerofs-wal"
+```
+
+The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials.
+
+<Note>
+Whether you use a separate WAL store is decided at filesystem creation time and cannot be changed later.
+</Note>
+
 ## Multiple Instances
 
 ZeroFS supports running multiple instances on the same storage backend: one read-write instance and multiple read-only instances.

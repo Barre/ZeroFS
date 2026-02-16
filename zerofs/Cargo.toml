@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
@@ -77,7 +77,7 @@ chrono = "0.4"
 fail = { version = "0.5", features = ["failpoints"], optional = true }
 
 [patch.crates-io]
-object_store = { git = "https://github.com/Barre/arrow-rs-object-store", branch = "feat/s3-redis-conditional-put-0.12.4" }
+object_store = { git = "https://github.com/Barre/arrow-rs-object-store", rev = "01b0349f126c9eda8e7ad8767c7e4868debe3602" }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -83,6 +83,41 @@ impl<'de> Deserialize<'de> for CompressionConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
+pub struct WalConfig {
+    #[serde(deserialize_with = "deserialize_expandable_string")]
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws: Option<AwsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub azure: Option<AzureConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gcp: Option<GcsConfig>,
+}
+
+impl WalConfig {
+    pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
+        let mut env_vars = Vec::new();
+        if let Some(aws) = &self.aws {
+            for (k, v) in &aws.0 {
+                env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
+            }
+        }
+        if let Some(azure) = &self.azure {
+            for (k, v) in &azure.0 {
+                env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
+            }
+        }
+        if let Some(gcp) = &self.gcp {
+            for (k, v) in &gcp.0 {
+                env_vars.push((format!("google_{}", k.to_lowercase()), v.clone()));
+            }
+        }
+        env_vars
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub cache: CacheConfig,
     pub storage: StorageConfig,
@@ -97,6 +132,8 @@ pub struct Settings {
     pub azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcp: Option<GcsConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wal: Option<WalConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -490,6 +527,7 @@ impl Settings {
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
+            wal: None,
         }
     }
 
@@ -534,6 +572,14 @@ impl Settings {
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
         toml_string.push_str("# wal_enabled = true               # Whether the write-ahead log (WAL) is enabled (default: true)\n");
+
+        toml_string.push_str("\n# Optional separate WAL (Write-Ahead Log) object store\n");
+        toml_string.push_str("# Use a faster/closer store for WAL to improve fsync latency\n");
+        toml_string.push_str(
+            "# This is decided at filesystem creation time and cannot be changed later.\n",
+        );
+        toml_string.push_str("\n# [wal]\n");
+        toml_string.push_str("# url = \"file:///mnt/nvme/zerofs-wal\"\n");
 
         toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
 

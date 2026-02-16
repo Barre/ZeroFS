@@ -399,6 +399,20 @@ Both instances access the same object storage backend.
 
 The compactor uses the same configuration file and respects `[lsm].max_concurrent_compactions` for parallelism.
 
+### Separate WAL Object Store
+
+Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL's backing store. By default the WAL goes to the same S3 bucket as everything else. You can point it at a separate, lower-latency store instead — local NVMe, S3 Express One-Zone, a nearby S3-compatible service, etc.
+
+```toml
+[wal]
+url = "file:///mnt/nvme/zerofs-wal"
+```
+
+The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. If no `[wal]` section is present, the WAL is written to the main object store.
+
+Whether you use a separate WAL store is decided at filesystem creation time. The underlying storage engine records this in its manifest, so you cannot add or remove a separate WAL store on an existing filesystem.
+
+You can move the WAL to a different location by updating the `[wal]` URL and credentials, but you must manually migrate the WAL files from the old store to the new one before starting ZeroFS.
 
 ### Encryption
 

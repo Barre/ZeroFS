@@ -32,6 +32,22 @@ use tracing::{debug, info};
 
 const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
 
+/// Parse a WAL config into an object store rooted at the full URL path.
+pub(crate) fn parse_wal_object_store(
+    wal_config: &crate::config::WalConfig,
+) -> Result<Arc<dyn object_store::ObjectStore>> {
+    let env_vars = wal_config.cloud_provider_env_vars();
+    let (store, path) = parse_url_opts(&wal_config.url.parse()?, env_vars.into_iter())?;
+    let path_str: &str = path.as_ref();
+    if path_str.is_empty() {
+        Ok(Arc::from(store))
+    } else {
+        Ok(Arc::new(object_store::prefix::PrefixStore::new(
+            store, path,
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum DatabaseMode {
     ReadWrite,
@@ -52,7 +68,11 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
     let db_path = Path::from(path_from_url.to_string());
 
-    let admin = AdminBuilder::new(db_path, object_store).build();
+    let mut admin_builder = AdminBuilder::new(db_path, object_store);
+    if let Some(wal_config) = &settings.wal {
+        admin_builder = admin_builder.with_wal_object_store(parse_wal_object_store(wal_config)?);
+    }
+    let admin = admin_builder.build();
 
     let checkpoints = admin
         .list_checkpoints(Some(name))
@@ -309,6 +329,7 @@ fn start_checkpoint_refresh(
     params: CheckpointRefreshParams,
     db: Arc<crate::db::Db>,
     block_transformer: Arc<dyn slatedb::BlockTransformer>,
+    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let db_path = params.db_path;
@@ -320,7 +341,11 @@ fn start_checkpoint_refresh(
         ));
 
         let db_path = Path::from(db_path);
-        let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
+        let mut admin_builder = AdminBuilder::new(db_path.clone(), object_store.clone());
+        if let Some(wal_store) = wal_object_store {
+            admin_builder = admin_builder.with_wal_object_store(wal_store);
+        }
+        let admin = admin_builder.build();
 
         loop {
             tokio::select! {
@@ -378,6 +403,7 @@ fn start_checkpoint_refresh(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
     cache_config: &CacheConfig,
@@ -386,6 +412,7 @@ pub async fn build_slatedb(
     lsm_config: Option<crate::config::LsmConfig>,
     disable_compactor: bool,
     block_transformer: Arc<dyn BlockTransformer>,
+    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
 ) -> Result<(
     SlateDbHandle,
     Option<CheckpointRefreshParams>,
@@ -499,6 +526,10 @@ pub async fn build_slatedb(
                 .with_memory_cache(cache)
                 .with_block_transformer(block_transformer);
 
+            if let Some(wal_store) = wal_object_store {
+                builder = builder.with_wal_object_store(wal_store);
+            }
+
             if !disable_compactor {
                 builder = builder.with_compaction_runtime(runtime_handle.clone());
             }
@@ -514,7 +545,12 @@ pub async fn build_slatedb(
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
 
-            let admin = AdminBuilder::new(db_path.clone(), object_store.clone()).build();
+            let mut admin_builder = AdminBuilder::new(db_path.clone(), object_store.clone());
+            if let Some(wal_store) = &wal_object_store {
+                admin_builder = admin_builder.with_wal_object_store(wal_store.clone());
+            }
+            let admin = admin_builder.build();
+
             let checkpoint_result = admin
                 .create_detached_checkpoint(&CheckpointOptions {
                     lifetime: Some(std::time::Duration::from_secs(
@@ -575,6 +611,7 @@ pub struct InitResult {
     pub fs: Arc<ZeroFS>,
     pub checkpoint_params: Option<CheckpointRefreshParams>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
+    pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
@@ -648,6 +685,14 @@ async fn initialize_filesystem(
     let block_transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
+    let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
+        if let Some(wal_config) = &settings.wal {
+            info!("Using separate WAL object store: {}", wal_config.url);
+            Some(parse_wal_object_store(wal_config)?)
+        } else {
+            None
+        };
+
     let (slatedb, checkpoint_params, maintenance_runtime) = build_slatedb(
         object_store.clone(),
         &cache_config,
@@ -656,6 +701,7 @@ async fn initialize_filesystem(
         settings.lsm,
         disable_compactor,
         block_transformer.clone(),
+        wal_object_store.clone(),
     )
     .await?;
 
@@ -666,6 +712,7 @@ async fn initialize_filesystem(
         fs: Arc::new(fs),
         checkpoint_params,
         object_store,
+        wal_object_store,
         db_path: actual_db_path,
         db_handle,
         maintenance_runtime,
@@ -757,6 +804,7 @@ pub async fn run_server(
         init_result.db_handle,
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
+        init_result.wal_object_store.clone(),
     ));
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
@@ -798,6 +846,7 @@ pub async fn run_server(
             params,
             Arc::clone(&fs.db),
             init_result.block_transformer.clone(),
+            init_result.wal_object_store,
             shutdown.clone(),
         )
     });

@@ -21,8 +21,17 @@ pub struct CheckpointManager {
 }
 
 impl CheckpointManager {
-    pub fn new(db_handle: SlateDbHandle, path: Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let admin = slatedb::admin::AdminBuilder::new(path, object_store).build();
+    pub fn new(
+        db_handle: SlateDbHandle,
+        path: Path,
+        object_store: Arc<dyn ObjectStore>,
+        wal_object_store: Option<Arc<dyn ObjectStore>>,
+    ) -> Self {
+        let mut admin_builder = slatedb::admin::AdminBuilder::new(path, object_store);
+        if let Some(wal_store) = wal_object_store {
+            admin_builder = admin_builder.with_wal_object_store(wal_store);
+        }
+        let admin = admin_builder.build();
         Self { db_handle, admin }
     }
 

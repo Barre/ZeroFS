@@ -52,6 +52,13 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     let block_transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
+    let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
+        if let Some(wal_config) = &settings.wal {
+            Some(super::server::parse_wal_object_store(wal_config)?)
+        } else {
+            None
+        };
+
     let (slatedb, _, _) = super::server::build_slatedb(
         object_store,
         &cache_config,
@@ -60,6 +67,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         settings.lsm,
         false, // don't disable compactor
         block_transformer,
+        wal_object_store,
     )
     .await?;
 
