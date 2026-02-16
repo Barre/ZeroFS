@@ -80,6 +80,7 @@ enum FileOperation {
     SYMLINK = 10;
     MKNOD = 11;
     TRIM = 12;
+    FSYNC = 13;
 }
 
 message OperationParams {

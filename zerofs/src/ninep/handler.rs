@@ -5,6 +5,7 @@ use super::protocol::{P9_MAX_GROUPS, P9_MAX_NAME_LEN, P9_NOBODY_UID, P9_READDIR_
 use crate::deku_bytes::DekuBytes;
 use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
+use crate::fs::tracing::FileOperation;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{
     AuthContext, FileAttributes, FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime,
@@ -793,11 +794,32 @@ impl NinePHandler {
     }
 
     async fn fsync(&self, tf: Tfsync) -> P9Result<Message> {
-        if !self.session.fids.contains_key(&tf.fid) {
-            return Err(P9Error::BadFid);
-        }
+        let fid = self.get_fid(tf.fid)?;
+        let fid_path = fid.path.clone();
 
         self.filesystem.flush_coordinator.flush().await?;
+
+        self.filesystem
+            .tracer
+            .emit(
+                || async {
+                    if fid_path.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!(
+                            "/{}",
+                            fid_path
+                                .iter()
+                                .map(|b| String::from_utf8_lossy(b).to_string())
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        )
+                    }
+                },
+                FileOperation::Fsync,
+            )
+            .await;
+
         Ok(Message::Rfsync(Rfsync))
     }
 

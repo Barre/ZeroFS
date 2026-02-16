@@ -7,6 +7,7 @@ use super::protocol::{
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
+use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::Bytes;
 use deku::DekuContainerWrite;
@@ -296,7 +297,7 @@ impl NBDHandler {
         self.filesystem.write(&auth, inode, offset, data).await?;
 
         if fua {
-            self.flush().await?;
+            self.flush(inode).await?;
         }
 
         Ok(())
@@ -324,7 +325,7 @@ impl NBDHandler {
             .await?;
 
         if fua {
-            self.flush().await?;
+            self.flush(inode).await?;
         }
 
         Ok(())
@@ -370,7 +371,7 @@ impl NBDHandler {
         }
 
         if fua {
-            self.flush().await?;
+            self.flush(inode).await?;
         }
 
         Ok(())
@@ -383,11 +384,21 @@ impl NBDHandler {
         Ok(())
     }
 
-    pub async fn flush(&self) -> CommandResult<()> {
+    pub async fn flush(&self, inode: u64) -> CommandResult<()> {
         self.filesystem
             .flush_coordinator
             .flush()
             .await
-            .map_err(|_| CommandError::IoError)
+            .map_err(|_| CommandError::IoError)?;
+
+        self.filesystem
+            .tracer
+            .emit(
+                || self.filesystem.resolve_path_lossy(inode),
+                FileOperation::Fsync,
+            )
+            .await;
+
+        Ok(())
     }
 }

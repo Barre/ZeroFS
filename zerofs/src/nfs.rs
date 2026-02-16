@@ -1,5 +1,6 @@
 use crate::fs::ZeroFS;
 use crate::fs::inode::Inode;
+use crate::fs::tracing::FileOperation;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use async_trait::async_trait;
@@ -349,6 +350,13 @@ impl NFSFileSystem for NFSAdapter {
         match self.fs.flush_coordinator.flush().await {
             Ok(_) => {
                 debug!("commit successful for file {}", fileid);
+                self.fs
+                    .tracer
+                    .emit(
+                        || self.fs.resolve_path_lossy(fileid),
+                        FileOperation::Fsync,
+                    )
+                    .await;
                 Ok(self.serverid())
             }
             Err(fs_error) => {

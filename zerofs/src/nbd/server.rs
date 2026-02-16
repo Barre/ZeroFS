@@ -420,7 +420,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     return Ok(());
                 }
                 NBDCommand::Flush => {
-                    let result = self.handler.flush().await;
+                    let result = self.handler.flush(device.inode).await;
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Trim => {

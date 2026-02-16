@@ -21,6 +21,7 @@ impl fmt::Display for proto::FileOperation {
             proto::FileOperation::Symlink => "symlink",
             proto::FileOperation::Mknod => "mknod  ",
             proto::FileOperation::Trim => "trim   ",
+            proto::FileOperation::Fsync => "fsync  ",
         };
         write!(f, "{}", s)
     }
@@ -144,6 +145,10 @@ impl From<FileAccessEvent> for proto::FileAccessEvent {
                     length: Some(length),
                     ..Default::default()
                 },
+            ),
+            FileOperation::Fsync => (
+                proto::FileOperation::Fsync as i32,
+                proto::OperationParams::default(),
             ),
         };
 
