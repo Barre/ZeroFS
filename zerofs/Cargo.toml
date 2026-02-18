@@ -23,9 +23,10 @@ lto = false
 codegen-units = 16
 
 [features]
-default = []
+default = ["vendored-protoc"]
 tokio-console = ["dep:console-subscriber"]
 failpoints = ["dep:fail"]
+vendored-protoc = ["dep:protobuf-src"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -81,7 +82,7 @@ object_store = { git = "https://github.com/Barre/arrow-rs-object-store", rev = "
 
 [build-dependencies]
 tonic-prost-build = "0.14"
-protobuf-src = "2"
+protobuf-src = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.21"
