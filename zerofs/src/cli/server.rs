@@ -21,7 +21,7 @@ use slatedb::config::{
     ObjectStoreCacheOptions,
 };
 use slatedb::object_store::path::Path;
-use slatedb::{BlockTransformer, DbBuilder, DbReader};
+use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -448,21 +448,12 @@ pub async fn build_slatedb(
 
     let wal_enabled = lsm_config.map(|c| c.wal_enabled()).unwrap_or(true);
 
-    let compactor_options = if disable_compactor {
-        None
-    } else {
-        Some(slatedb::config::CompactorOptions {
-            max_concurrent_compactions,
-            max_sst_size: 256 * 1024 * 1024,
-            ..Default::default()
-        })
-    };
-
     let settings = slatedb::config::Settings {
         wal_enabled,
         l0_max_ssts,
         l0_sst_size_bytes: 128 * 1024 * 1024,
         filter_bits_per_key: 10,
+        compactor_options: None,
         object_store_cache_options: ObjectStoreCacheOptions {
             root_folder: Some(cache_config.root_folder.clone()),
             max_cache_size_bytes: Some(slatedb_object_cache_bytes),
@@ -471,7 +462,6 @@ pub async fn build_slatedb(
         },
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
-        compactor_options,
         compression_codec: None, // Disable compression - we handle it in encryption layer
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
@@ -519,11 +509,11 @@ pub async fn build_slatedb(
                 info!("Opening database in read-write mode");
             }
 
-            let mut builder = DbBuilder::new(db_path, object_store)
+            let mut builder = DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block4Kib)
-                .with_memory_cache(cache)
+                .with_db_cache(cache)
                 .with_block_transformer(block_transformer);
 
             if let Some(wal_store) = wal_object_store {
@@ -531,7 +521,15 @@ pub async fn build_slatedb(
             }
 
             if !disable_compactor {
-                builder = builder.with_compaction_runtime(runtime_handle.clone());
+                let compactor = CompactorBuilder::new(db_path, object_store)
+                    .with_runtime(runtime_handle.clone())
+                    .with_options(slatedb::config::CompactorOptions {
+                        max_concurrent_compactions,
+                        max_sst_size: 256 * 1024 * 1024,
+                        ..Default::default()
+                    });
+
+                builder = builder.with_compactor_builder(compactor);
             }
 
             let slatedb = Arc::new(builder.build().await?);

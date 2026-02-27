@@ -286,18 +286,9 @@ impl ZeroFS {
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
 
-        let settings = slatedb::config::Settings {
-            compression_codec: None,
-            compactor_options: Some(slatedb::config::CompactorOptions {
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
-                .with_settings(settings)
                 .with_block_transformer(block_transformer)
                 .build()
                 .await?,
@@ -2878,18 +2869,9 @@ mod tests {
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
 
-        let settings = slatedb::config::Settings {
-            compression_codec: None,
-            compactor_options: Some(slatedb::config::CompactorOptions {
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), object_store.clone())
-                .with_settings(settings)
                 .with_block_transformer(block_transformer)
                 .build()
                 .await
