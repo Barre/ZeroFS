@@ -3234,7 +3234,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=da3a3a52958a5ba32a34d4cfc5d47569f6440373#da3a3a52958a5ba32a34d4cfc5d47569f6440373"
+source = "git+https://github.com/Barre/slatedb.git?rev=491de682bd6b029676601d10f6e3cfee4d6e80bf#491de682bd6b029676601d10f6e3cfee4d6e80bf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3280,7 +3280,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=da3a3a52958a5ba32a34d4cfc5d47569f6440373#da3a3a52958a5ba32a34d4cfc5d47569f6440373"
+source = "git+https://github.com/Barre/slatedb.git?rev=491de682bd6b029676601d10f6e3cfee4d6e80bf#491de682bd6b029676601d10f6e3cfee4d6e80bf"
 dependencies = [
  "chrono",
  "tokio",
@@ -3289,7 +3289,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=da3a3a52958a5ba32a34d4cfc5d47569f6440373#da3a3a52958a5ba32a34d4cfc5d47569f6440373"
+source = "git+https://github.com/Barre/slatedb.git?rev=491de682bd6b029676601d10f6e3cfee4d6e80bf#491de682bd6b029676601d10f6e3cfee4d6e80bf"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4719,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -44,16 +44,9 @@ impl CrashTestContext {
 
     /// Create a new filesystem instance
     async fn create_fs(&self) -> Arc<ZeroFS> {
-        let settings = Settings {
-            compression_codec: None,
-            compactor_options: Some(slatedb::config::CompactorOptions::default()),
-            ..Default::default()
-        };
-
         let db_path = Path::from("slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path, Arc::clone(&self.object_store))
-                .with_settings(settings)
                 .build()
                 .await
                 .unwrap(),
