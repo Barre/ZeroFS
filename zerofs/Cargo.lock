@@ -3234,7 +3234,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=491de682bd6b029676601d10f6e3cfee4d6e80bf#491de682bd6b029676601d10f6e3cfee4d6e80bf"
+source = "git+https://github.com/Barre/slatedb.git?rev=ac472bfbfb1c276586b7692ef6b946841942d5c6#ac472bfbfb1c276586b7692ef6b946841942d5c6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3280,7 +3280,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=491de682bd6b029676601d10f6e3cfee4d6e80bf#491de682bd6b029676601d10f6e3cfee4d6e80bf"
+source = "git+https://github.com/Barre/slatedb.git?rev=ac472bfbfb1c276586b7692ef6b946841942d5c6#ac472bfbfb1c276586b7692ef6b946841942d5c6"
 dependencies = [
  "chrono",
  "tokio",
@@ -3289,7 +3289,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.10.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=491de682bd6b029676601d10f6e3cfee4d6e80bf#491de682bd6b029676601d10f6e3cfee4d6e80bf"
+source = "git+https://github.com/Barre/slatedb.git?rev=ac472bfbfb1c276586b7692ef6b946841942d5c6#ac472bfbfb1c276586b7692ef6b946841942d5c6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4773,9 +4773,9 @@ dependencies = [
 
 [[package]]
 name = "zerofs_nfsserve"
-version = "0.19.0"
+version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d77a28d248c17d7408a27137892f3b5c75f19f58d98ea16b158463409d5ed25"
+checksum = "8ab1054157974adae5bd04fa88fb189be0a4d8846e29c9cd7653cf48ab1fa418"
 dependencies = [
  "anyhow",
  "async-trait",
