@@ -102,18 +102,6 @@ impl Db {
         self.inner.is_read_only()
     }
 
-    pub fn swap_reader(&self, new_reader: Arc<DbReader>) -> Result<()> {
-        match &self.inner {
-            SlateDbHandle::ReadOnly(reader_swap) => {
-                reader_swap.store(new_reader);
-                Ok(())
-            }
-            SlateDbHandle::ReadWrite(_) => Err(anyhow::anyhow!(
-                "Cannot swap reader on a read-write database"
-            )),
-        }
-    }
-
     pub async fn get_bytes(&self, key: &Bytes) -> Result<Option<Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,

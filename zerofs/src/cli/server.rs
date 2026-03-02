@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
 use slatedb::config::{
-    CheckpointOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
+    DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
     ObjectStoreCacheOptions,
 };
 use slatedb::object_store::path::Path;
@@ -29,8 +29,6 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-
-const CHECKPOINT_REFRESH_INTERVAL_SECS: u64 = 10;
 
 /// Parse a WAL config into an object store rooted at the full URL path.
 pub(crate) fn parse_wal_object_store(
@@ -320,89 +318,6 @@ fn start_periodic_flush(
     })
 }
 
-pub struct CheckpointRefreshParams {
-    pub db_path: String,
-    pub object_store: Arc<dyn object_store::ObjectStore>,
-}
-
-fn start_checkpoint_refresh(
-    params: CheckpointRefreshParams,
-    db: Arc<crate::db::Db>,
-    block_transformer: Arc<dyn slatedb::BlockTransformer>,
-    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-    shutdown: CancellationToken,
-) -> JoinHandle<()> {
-    let db_path = params.db_path;
-    let object_store = params.object_store;
-    spawn_named("checkpoint-refresh", async move {
-        info!("Starting checkpoint refresh task",);
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            CHECKPOINT_REFRESH_INTERVAL_SECS,
-        ));
-
-        let db_path = Path::from(db_path);
-        let mut admin_builder = AdminBuilder::new(db_path.clone(), object_store.clone());
-        if let Some(wal_store) = wal_object_store {
-            admin_builder = admin_builder.with_wal_object_store(wal_store);
-        }
-        let admin = admin_builder.build();
-
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("Checkpoint refresh task shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    match admin
-                        .create_detached_checkpoint(&CheckpointOptions {
-                            lifetime: Some(std::time::Duration::from_secs(
-                                CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
-                            )),
-                            ..Default::default()
-                        })
-                        .await
-                    {
-                        Ok(checkpoint_result) => {
-                            debug!("Created new checkpoint with ID: {}", checkpoint_result.id);
-
-                            match DbReader::open(
-                                db_path.clone(),
-                                object_store.clone(),
-                                Some(checkpoint_result.id),
-                                DbReaderOptions {
-                                    block_transformer: Some(block_transformer.clone()),
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            {
-                                Ok(new_reader) => {
-                                    if let Err(e) = db.swap_reader(Arc::new(new_reader)) {
-                                        tracing::error!("Failed to swap reader: {:?}", e);
-                                        continue;
-                                    }
-
-                                    debug!("Successfully refreshed reader");
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to create new DbReader with checkpoint: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create checkpoint: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -413,11 +328,7 @@ pub async fn build_slatedb(
     disable_compactor: bool,
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-) -> Result<(
-    SlateDbHandle,
-    Option<CheckpointRefreshParams>,
-    Option<tokio::runtime::Handle>,
-)> {
+) -> Result<(SlateDbHandle, Option<tokio::runtime::Handle>)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -534,60 +445,23 @@ pub async fn build_slatedb(
 
             let slatedb = Arc::new(builder.build().await?);
 
-            Ok((
-                SlateDbHandle::ReadWrite(slatedb),
-                None,
-                Some(runtime_handle),
-            ))
+            Ok((SlateDbHandle::ReadWrite(slatedb), Some(runtime_handle)))
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
 
-            let mut admin_builder = AdminBuilder::new(db_path.clone(), object_store.clone());
-            if let Some(wal_store) = &wal_object_store {
-                admin_builder = admin_builder.with_wal_object_store(wal_store.clone());
-            }
-            let admin = admin_builder.build();
-
-            let checkpoint_result = admin
-                .create_detached_checkpoint(&CheckpointOptions {
-                    lifetime: Some(std::time::Duration::from_secs(
-                        CHECKPOINT_REFRESH_INTERVAL_SECS * 10,
-                    )),
-                    ..Default::default()
-                })
-                .await?;
-
-            info!(
-                "Created initial checkpoint with ID: {}",
-                checkpoint_result.id
-            );
-
-            let db_path_str = db_path.to_string();
             let reader_options = DbReaderOptions {
                 block_transformer: Some(block_transformer),
                 ..Default::default()
             };
-            let reader = Arc::new(
-                DbReader::open(
-                    db_path,
-                    object_store.clone(),
-                    Some(checkpoint_result.id),
-                    reader_options,
-                )
-                .await?,
-            );
+            let mut reader_builder =
+                DbReader::builder(db_path, object_store).with_options(reader_options);
+            if let Some(wal_store) = wal_object_store {
+                reader_builder = reader_builder.with_wal_object_store(wal_store);
+            }
+            let reader = Arc::new(reader_builder.build().await?);
 
-            let checkpoint_params = CheckpointRefreshParams {
-                db_path: db_path_str,
-                object_store,
-            };
-
-            Ok((
-                SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
-                Some(checkpoint_params),
-                None,
-            ))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
@@ -596,24 +470,26 @@ pub async fn build_slatedb(
                 block_transformer: Some(block_transformer),
                 ..Default::default()
             };
-            let reader = Arc::new(
-                DbReader::open(db_path, object_store, Some(checkpoint_id), reader_options).await?,
-            );
+            let mut reader_builder = DbReader::builder(db_path, object_store)
+                .with_checkpoint_id(checkpoint_id)
+                .with_options(reader_options);
+            if let Some(wal_store) = wal_object_store {
+                reader_builder = reader_builder.with_wal_object_store(wal_store);
+            }
+            let reader = Arc::new(reader_builder.build().await?);
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
         }
     }
 }
 
 pub struct InitResult {
     pub fs: Arc<ZeroFS>,
-    pub checkpoint_params: Option<CheckpointRefreshParams>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
-    pub block_transformer: Arc<dyn BlockTransformer>,
 }
 
 async fn initialize_filesystem(
@@ -691,7 +567,7 @@ async fn initialize_filesystem(
             None
         };
 
-    let (slatedb, checkpoint_params, maintenance_runtime) = build_slatedb(
+    let (slatedb, maintenance_runtime) = build_slatedb(
         object_store.clone(),
         &cache_config,
         actual_db_path.clone(),
@@ -708,13 +584,11 @@ async fn initialize_filesystem(
 
     Ok(InitResult {
         fs: Arc::new(fs),
-        checkpoint_params,
         object_store,
         wal_object_store,
         db_path: actual_db_path,
         db_handle,
         maintenance_runtime,
-        block_transformer,
     })
 }
 
@@ -769,7 +643,6 @@ pub async fn run_server(
 
     let init_result = initialize_filesystem(&settings, db_mode, no_compactor).await?;
     let fs = init_result.fs;
-    let checkpoint_params = init_result.checkpoint_params;
 
     if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
@@ -839,16 +712,6 @@ pub async fn run_server(
         None
     };
 
-    let checkpoint_handle = checkpoint_params.map(|params| {
-        start_checkpoint_refresh(
-            params,
-            Arc::clone(&fs.db),
-            init_result.block_transformer.clone(),
-            init_result.wal_object_store,
-            shutdown.clone(),
-        )
-    });
-
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let mut server_handles = Vec::new();
@@ -888,10 +751,6 @@ pub async fn run_server(
     if let Some(flush_handle) = flush_handle {
         let _ = flush_handle.await;
     }
-    if let Some(checkpoint_handle) = checkpoint_handle {
-        let _ = checkpoint_handle.await;
-    }
-
     info!("Performing final flush and closing database...");
     if !db_mode.is_read_only()
         && let Err(e) = fs.flush_coordinator.flush().await
