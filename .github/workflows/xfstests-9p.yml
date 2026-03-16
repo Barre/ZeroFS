@@ -105,7 +105,7 @@ jobs:
           [cache]
           dir = "/tmp/zerofs-cache-scratch"
           disk_size_gb = 1.0
-          memory_size_gb = 1.0
+          memory_size_gb = 0.1
 
           [storage]
           url = "file://${{ github.workspace }}/zerofs-scratch-data"
