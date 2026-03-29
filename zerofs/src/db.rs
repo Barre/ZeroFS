@@ -224,6 +224,13 @@ impl Db {
         Ok(())
     }
 
+    pub fn slatedb_metrics(&self) -> Option<Arc<slatedb::stats::StatRegistry>> {
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => Some(db.metrics()),
+            SlateDbHandle::ReadOnly(_) => None,
+        }
+    }
+
     pub async fn close(&self) -> Result<()> {
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
