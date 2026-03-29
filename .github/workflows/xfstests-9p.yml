@@ -76,6 +76,9 @@ jobs:
 
           [servers.ninep]
           unix_socket = "/tmp/zerofs-test.9p.sock"
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background
@@ -113,6 +116,9 @@ jobs:
 
           [servers.ninep]
           unix_socket = "/tmp/zerofs-scratch.9p.sock"
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background

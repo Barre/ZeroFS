@@ -69,6 +69,9 @@ jobs:
 
           [servers.nfs]
           addresses = ["127.0.0.1:2049"]
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background
@@ -106,6 +109,9 @@ jobs:
 
           [servers.nfs]
           addresses = ["127.0.0.1:20499"]
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background
