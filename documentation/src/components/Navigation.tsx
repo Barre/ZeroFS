@@ -245,8 +245,10 @@ export const navigation: Array<NavGroup> = [
       { title: 'Checkpoints', href: '/checkpoints' },
       { title: 'Standalone Compactor', href: '/standalone-compactor' },
       { title: 'Separate WAL Store', href: '/separate-wal' },
+      { title: 'Prometheus Metrics', href: '/prometheus' },
       { title: 'Troubleshooting', href: '/troubleshooting' },
       { title: 'Advanced Use Cases', href: '/advanced-use-cases' },
+      { title: 'Telemetry', href: '/telemetry' },
     ],
   },
   {

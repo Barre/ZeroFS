@@ -1,0 +1,66 @@
+export const metadata = {
+  title: 'Telemetry',
+  description:
+    'Learn about the anonymous usage data ZeroFS collects, what is sent, and how to disable it.',
+}
+
+# Telemetry
+
+ZeroFS collects anonymous usage data to help improve the project. This page explains exactly what is collected, how it is sent, and how to disable it. {{ className: 'lead' }}
+
+## What Is Collected
+
+ZeroFS sends two types of events to [PostHog](https://posthog.com):
+
+### Startup Event
+
+Sent once each time the server starts:
+
+| Property | Example | Purpose |
+| --- | --- | --- |
+| `version` | `1.0.6` | Track adoption of new releases |
+| `os` | `linux` | Know which platforms to prioritize |
+| `arch` | `x86_64` | Know which architectures to support |
+| `backend_type` | `s3`, `gcs`, `azure`, `local` | Understand which storage backends are used |
+| `protocols` | `["nfs", "9p"]` | Understand which protocols are used |
+
+### Filesystem Stats
+
+Sent once on startup, then every hour:
+
+| Property | Example | Purpose |
+| --- | --- | --- |
+| `version` | `1.0.6` | Correlate stats with versions |
+| `used_bytes` | `1073741824` | Understand typical filesystem sizes |
+| `used_inodes` | `4521` | Understand typical file counts |
+| `max_bytes` | `107374182400` | Understand quota configurations |
+| `compression` | `Lz4` | Understand compression preferences |
+| `cache_disk_gb` | `10.0` | Understand cache sizing |
+| `cache_memory_gb` | `2.0` | Understand memory cache sizing |
+
+### What Is NOT Collected
+
+- No file names, paths, or contents
+- No encryption passwords or keys
+- No IP addresses or hostnames
+- No cloud provider credentials
+- No personally identifiable information
+
+### Anonymous Identity
+
+A random UUID is generated on first run and stored locally in your cache directory as `zerofs-telemetry-id`. This ID is used to count unique installations and is not linked to any personal information.
+
+## How to Disable
+
+Add the following to your configuration file:
+
+```toml
+[telemetry]
+enabled = false
+```
+
+When the `[telemetry]` section is absent from the config, telemetry is enabled by default.
+
+## Implementation
+
+Telemetry is implemented as simple HTTPS POST requests to PostHog's ingestion API. Events are sent asynchronously with a 5 second timeout and never block filesystem operations. All errors are silently ignored. The source code is in [`src/telemetry.rs`](https://github.com/Barre/ZeroFS/blob/main/zerofs/src/telemetry.rs).
