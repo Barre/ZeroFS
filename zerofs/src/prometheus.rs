@@ -6,8 +6,8 @@ use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use slatedb::stats::{MetricType, StatRegistry};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +31,10 @@ pub fn start(
     let mut handles = Vec::new();
 
     for &addr in &config.addresses {
-        tracing::info!("Prometheus metrics server listening on http://{}/metrics", addr);
+        tracing::info!(
+            "Prometheus metrics server listening on http://{}/metrics",
+            addr
+        );
         let server_handle = handle.clone();
         let server_shutdown = shutdown.clone();
         handles.push(spawn_named("prometheus-http", async move {
