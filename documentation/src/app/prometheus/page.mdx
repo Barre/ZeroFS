@@ -1,0 +1,105 @@
+export const metadata = {
+  title: 'Prometheus Metrics',
+  description:
+    'Monitor ZeroFS with Prometheus - available metrics, configuration, and scraping setup.',
+}
+
+# Prometheus Metrics
+
+ZeroFS can expose metrics in Prometheus format via an HTTP endpoint for operational monitoring and alerting. {{ className: 'lead' }}
+
+## Configuration
+
+Add a `[prometheus]` section to your configuration file:
+
+```toml
+[prometheus]
+addresses = ["127.0.0.1:9091"]
+```
+
+This starts an HTTP server on the specified address. Metrics are available at `/metrics`:
+
+```bash
+curl http://127.0.0.1:9091/metrics
+```
+
+Multiple bind addresses are supported, following the same pattern as other ZeroFS servers:
+
+```toml
+[prometheus]
+addresses = ["127.0.0.1:9091", "0.0.0.0:9091"]
+```
+
+When the `[prometheus]` section is absent, no metrics endpoint is started.
+
+## Available Metrics
+
+### Filesystem Operations
+
+Counters that track cumulative operations since server start:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_files_created_total` | counter | Files created |
+| `zerofs_files_deleted_total` | counter | Files deleted |
+| `zerofs_files_renamed_total` | counter | Files renamed |
+| `zerofs_directories_created_total` | counter | Directories created |
+| `zerofs_directories_deleted_total` | counter | Directories deleted |
+| `zerofs_directories_renamed_total` | counter | Directories renamed |
+| `zerofs_links_created_total` | counter | Links created |
+| `zerofs_links_deleted_total` | counter | Links deleted |
+| `zerofs_links_renamed_total` | counter | Links renamed |
+
+### I/O
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_read_operations_total` | counter | Total read operations |
+| `zerofs_write_operations_total` | counter | Total write operations |
+| `zerofs_bytes_read_total` | counter | Total bytes read |
+| `zerofs_bytes_written_total` | counter | Total bytes written |
+| `zerofs_total_operations` | counter | Total operations across all types |
+
+### Garbage Collection
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_tombstones_created_total` | counter | Tombstones created for deleted data |
+| `zerofs_tombstones_processed_total` | counter | Tombstones processed by GC |
+| `zerofs_gc_chunks_deleted_total` | counter | Data chunks reclaimed by GC |
+| `zerofs_gc_runs_total` | counter | Number of GC cycles completed |
+
+### Filesystem State
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_used_bytes` | gauge | Total bytes stored in the filesystem |
+| `zerofs_used_inodes` | gauge | Total active inodes (files, directories, symlinks) |
+
+### SlateDB (LSM Engine)
+
+ZeroFS exposes internal metrics from the SlateDB storage engine. These are prefixed with `slatedb_` and include compaction and storage statistics. The exact metrics depend on the SlateDB version and are dynamically discovered at runtime.
+
+Common SlateDB metrics include:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `slatedb_compactor_bytes_compacted` | counter | Total bytes processed by compaction |
+| `slatedb_compactor_running_compactions` | gauge | Number of active compaction tasks |
+| `slatedb_compactor_total_bytes_being_compacted` | gauge | Bytes currently being compacted |
+
+<Note>
+SlateDB metrics are only available in read-write mode. Read-only instances do not expose SlateDB metrics.
+</Note>
+
+## Prometheus Scrape Configuration
+
+Add ZeroFS as a target in your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'zerofs'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9091']
+```
