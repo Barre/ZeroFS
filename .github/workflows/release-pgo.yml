@@ -103,6 +103,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
             ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
@@ -153,6 +156,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
             ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
@@ -200,6 +206,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
             ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
@@ -492,6 +501,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
 
           ${BINARY}.inst run -c zerofs-bolt.toml &

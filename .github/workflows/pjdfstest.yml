@@ -120,6 +120,9 @@ jobs:
           secret_access_key = "minioadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
+
+          [telemetry]
+          enabled = false
           EOF
 
           # Start ZeroFS in the background
