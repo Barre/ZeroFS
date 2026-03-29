@@ -641,6 +641,8 @@ pub async fn run_server(
         }
     };
 
+    crate::telemetry::send_startup_event(&settings);
+
     let init_result = initialize_filesystem(&settings, db_mode, no_compactor).await?;
     let fs = init_result.fs;
 
@@ -649,6 +651,25 @@ pub async fn run_server(
     }
 
     let shutdown = CancellationToken::new();
+
+    let telemetry_handle = crate::telemetry::start_periodic_reporting(
+        &settings,
+        Arc::clone(&fs.global_stats),
+        shutdown.clone(),
+    );
+
+    let prometheus_handles = if let Some(ref prometheus_config) = settings.prometheus {
+        let slatedb_registry = fs.db.slatedb_metrics();
+        crate::prometheus::start(
+            prometheus_config,
+            Arc::clone(&fs.stats),
+            Arc::clone(&fs.global_stats),
+            slatedb_registry,
+            shutdown.clone(),
+        )
+    } else {
+        Vec::new()
+    };
 
     let nfs_handles = start_nfs_servers(
         Arc::clone(&fs),
@@ -750,6 +771,12 @@ pub async fn run_server(
     let _ = stats_handle.await;
     if let Some(flush_handle) = flush_handle {
         let _ = flush_handle.await;
+    }
+    if let Some(handle) = telemetry_handle {
+        let _ = handle.await;
+    }
+    for handle in prometheus_handles {
+        let _ = handle.await;
     }
     info!("Performing final flush and closing database...");
     if !db_mode.is_read_only()
