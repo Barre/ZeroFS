@@ -15,9 +15,11 @@ mod nbd;
 mod nfs;
 mod ninep;
 mod parse_object_store;
+mod prometheus;
 mod rpc;
 mod storage_compatibility;
 mod task;
+mod telemetry;
 
 #[cfg(test)]
 mod test_helpers;
