@@ -371,6 +371,29 @@ addresses = ["127.0.0.1:7000"]
 unix_socket = "/tmp/zerofs.rpc.sock"
 ```
 
+### Real-Time Monitoring
+
+ZeroFS includes a built-in TUI dashboard for monitoring filesystem activity in real-time:
+
+```bash
+zerofs monitor -c zerofs.toml
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/monitor_command.png" alt="ZeroFS Monitor" width="700">
+</p>
+
+The dashboard shows:
+- **I/O Throughput** - Read/write bandwidth over time with line graphs
+- **IOPS** - Read/write operations per second
+- **Storage Usage** - Current disk usage with capacity gauge
+- **Operation Counters** - File, directory, and link operations since startup
+- **Garbage Collection** - Tombstone and chunk cleanup stats
+
+The monitor connects to the running ZeroFS instance via RPC and streams stats at 250ms intervals. Use `--interval` to adjust the refresh rate.
+
+Requires the RPC server to be configured (see [Checkpoints](#checkpoints) for RPC configuration).
+
 ### Standalone Compactor
 
 ZeroFS uses an LSM (Log-Structured Merge) tree as its storage engine. Compaction is a background process that merges sorted data files (SSTs) to reclaim space from deleted/updated data and improve read performance by reducing the number of files to search. This process is CPU and I/O intensive.
