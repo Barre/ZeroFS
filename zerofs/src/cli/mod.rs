@@ -9,6 +9,7 @@ pub mod compactor;
 pub mod debug;
 pub mod fatrace;
 pub mod flush;
+pub mod monitor;
 pub mod password;
 pub mod server;
 
@@ -79,6 +80,14 @@ pub enum Commands {
     Flush {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Monitor filesystem activity in real-time
+    Monitor {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Stats refresh interval in milliseconds
+        #[arg(long, default_value = "250")]
+        interval: u32,
     },
 }
 
