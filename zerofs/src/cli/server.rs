@@ -226,11 +226,15 @@ async fn start_nbd_servers(
     handles
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
     flush_coordinator: FlushCoordinator,
     tracer: AccessTracer,
+    fs_stats: Arc<crate::fs::metrics::FileSystemStats>,
+    global_stats: Arc<crate::fs::stats::FileSystemGlobalStats>,
+    max_bytes: u64,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
@@ -238,8 +242,14 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service =
-        crate::rpc::server::AdminRpcServer::new(checkpoint_manager, flush_coordinator, tracer);
+    let service = crate::rpc::server::AdminRpcServer::new(
+        checkpoint_manager,
+        flush_coordinator,
+        tracer,
+        fs_stats,
+        global_stats,
+        max_bytes,
+    );
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -703,6 +713,9 @@ pub async fn run_server(
         checkpoint_manager,
         fs.flush_coordinator.clone(),
         fs.tracer.clone(),
+        Arc::clone(&fs.stats),
+        Arc::clone(&fs.global_stats),
+        fs.max_bytes,
         shutdown.clone(),
     )
     .await;

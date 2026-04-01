@@ -1,5 +1,7 @@
 use crate::checkpoint_manager::CheckpointManager;
 use crate::fs::flush_coordinator::FlushCoordinator;
+use crate::fs::metrics::FileSystemStats;
+use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::tracing::AccessTracer;
 use crate::rpc::proto::{self, admin_service_server::AdminService};
 use anyhow::{Context, Result};
@@ -7,9 +9,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{BroadcastStream, UnixListenerStream};
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream, UnixListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -19,6 +22,9 @@ pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
     flush_coordinator: FlushCoordinator,
     tracer: AccessTracer,
+    fs_stats: Arc<FileSystemStats>,
+    global_stats: Arc<FileSystemGlobalStats>,
+    max_bytes: u64,
 }
 
 impl AdminRpcServer {
@@ -26,11 +32,17 @@ impl AdminRpcServer {
         checkpoint_manager: Arc<CheckpointManager>,
         flush_coordinator: FlushCoordinator,
         tracer: AccessTracer,
+        fs_stats: Arc<FileSystemStats>,
+        global_stats: Arc<FileSystemGlobalStats>,
+        max_bytes: u64,
     ) -> Self {
         Self {
             checkpoint_manager,
             flush_coordinator,
             tracer,
+            fs_stats,
+            global_stats,
+            max_bytes,
         }
     }
 }
@@ -39,6 +51,9 @@ impl AdminRpcServer {
 impl AdminService for AdminRpcServer {
     type WatchFileAccessStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::FileAccessEvent, Status>> + Send>>;
+
+    type StreamStatsStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::StatsSnapshot, Status>> + Send>>;
 
     async fn create_checkpoint(
         &self,
@@ -132,6 +147,47 @@ impl AdminService for AdminRpcServer {
             .map_err(|e| Status::internal(format!("Flush failed: {:?}", e)))?;
 
         Ok(Response::new(proto::FlushResponse {}))
+    }
+
+    async fn stream_stats(
+        &self,
+        request: Request<proto::StreamStatsRequest>,
+    ) -> Result<Response<Self::StreamStatsStream>, Status> {
+        let interval_ms = request.into_inner().interval_ms.max(250) as u64;
+        let fs_stats = Arc::clone(&self.fs_stats);
+        let global_stats = Arc::clone(&self.global_stats);
+        let max_bytes = self.max_bytes;
+
+        let interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+        let stream = IntervalStream::new(interval).map(move |_| {
+            let (used_bytes, used_inodes) = global_stats.get_totals();
+            Ok(proto::StatsSnapshot {
+                timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+                files_created: fs_stats.files_created.load(Ordering::Relaxed),
+                files_deleted: fs_stats.files_deleted.load(Ordering::Relaxed),
+                files_renamed: fs_stats.files_renamed.load(Ordering::Relaxed),
+                directories_created: fs_stats.directories_created.load(Ordering::Relaxed),
+                directories_deleted: fs_stats.directories_deleted.load(Ordering::Relaxed),
+                directories_renamed: fs_stats.directories_renamed.load(Ordering::Relaxed),
+                links_created: fs_stats.links_created.load(Ordering::Relaxed),
+                links_deleted: fs_stats.links_deleted.load(Ordering::Relaxed),
+                links_renamed: fs_stats.links_renamed.load(Ordering::Relaxed),
+                read_operations: fs_stats.read_operations.load(Ordering::Relaxed),
+                write_operations: fs_stats.write_operations.load(Ordering::Relaxed),
+                bytes_read: fs_stats.bytes_read.load(Ordering::Relaxed),
+                bytes_written: fs_stats.bytes_written.load(Ordering::Relaxed),
+                tombstones_created: fs_stats.tombstones_created.load(Ordering::Relaxed),
+                tombstones_processed: fs_stats.tombstones_processed.load(Ordering::Relaxed),
+                gc_chunks_deleted: fs_stats.gc_chunks_deleted.load(Ordering::Relaxed),
+                gc_runs: fs_stats.gc_runs.load(Ordering::Relaxed),
+                total_operations: fs_stats.total_operations.load(Ordering::Relaxed),
+                used_bytes,
+                used_inodes,
+                max_bytes,
+            })
+        });
+
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
