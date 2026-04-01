@@ -1,6 +1,6 @@
 [package]
 name = "zerofs"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 description = "A high-performance filesystem that makes S3 your primary storage with NFS, 9P, and NBD support"
 license = "AGPL-3.0"
@@ -82,6 +82,8 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 serde_json = "1.0"
 hyper = { version = "1", features = ["http1", "server"] }
 http-body-util = "0.1"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 [patch.crates-io]
 object_store = { git = "https://github.com/Barre/arrow-rs-object-store", rev = "01b0349f126c9eda8e7ad8767c7e4868debe3602" }

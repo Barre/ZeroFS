@@ -114,6 +114,9 @@ async fn main() -> Result<()> {
         cli::Commands::Flush { config } => {
             cli::flush::flush(&config).await?;
         }
+        cli::Commands::Monitor { config, interval } => {
+            cli::monitor::run_monitor(config, interval).await?;
+        }
     }
 
     Ok(())
