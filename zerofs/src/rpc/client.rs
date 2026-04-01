@@ -165,6 +165,19 @@ impl RpcClient {
         Ok(response.into_inner())
     }
 
+    pub async fn stream_stats(&self, interval_ms: u32) -> Result<Streaming<proto::StatsSnapshot>> {
+        let request = proto::StreamStatsRequest { interval_ms };
+
+        let response = self
+            .client
+            .clone()
+            .stream_stats(request)
+            .await
+            .map_err(|s| anyhow!("Failed to start stats stream: {}", s.message()))?;
+
+        Ok(response.into_inner())
+    }
+
     pub async fn flush(&self) -> Result<()> {
         let request = proto::FlushRequest {};
 
