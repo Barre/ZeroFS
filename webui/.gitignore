@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+src/lib/grpc/gen
 dist-ssr
 public/v86
 *.local
