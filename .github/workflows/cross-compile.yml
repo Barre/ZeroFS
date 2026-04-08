@@ -9,8 +9,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  build-webui:
+    name: Build WebUI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install VM image build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools squashfs-tools
+
+      - name: Build WebUI
+        run: make webui
+
+      - name: Upload WebUI dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+          retention-days: 1
+
   cross-compile:
     name: Cross compile for ${{ matrix.target }}
+    needs: build-webui
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -61,6 +89,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Download WebUI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+
       - name: Install cross (Linux only)
         if: matrix.platform == 'linux'
         run: |
@@ -70,13 +104,13 @@ jobs:
         if: matrix.platform == 'linux'
         working-directory: zerofs
         run: |
-          cross build --profile ci --target ${{ matrix.target }}
+          cross build --profile ci --features webui --target ${{ matrix.target }}
 
       - name: Build with cargo (macOS)
         if: matrix.platform == 'darwin'
         working-directory: zerofs
         run: |
-          cargo build --profile ci --target ${{ matrix.target }}
+          cargo build --profile ci --features webui --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |

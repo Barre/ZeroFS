@@ -296,9 +296,36 @@ jobs:
           name: pgo-profile-data-merged
           path: pgo-data/
 
+  build-webui:
+    name: Build WebUI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install VM image build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools squashfs-tools
+
+      - name: Build WebUI
+        run: make webui
+
+      - name: Upload WebUI dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+          retention-days: 1
+
   build-release:
     name: Build optimized for ${{ matrix.target }}
-    needs: merge-pgo-data
+    needs: [merge-pgo-data, build-webui]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -369,6 +396,12 @@ jobs:
           name: pgo-profile-data-merged
           path: pgo-data/
 
+      - name: Download WebUI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+
       - name: Install Rust
         if: matrix.platform != 'freebsd'
         uses: dtolnay/rust-toolchain@stable
@@ -389,22 +422,22 @@ jobs:
       - name: Build with PGO (cross)
         if: matrix.use_cross && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cross)
         if: matrix.use_cross && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'
@@ -424,7 +457,7 @@ jobs:
             cp pgo-data/Cargo.lock zerofs/
 
             cd zerofs
-            RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release
+            RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui
 
             file target/release/zerofs
             ls -lh target/release/zerofs
