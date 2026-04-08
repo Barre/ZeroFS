@@ -20,6 +20,8 @@ mod rpc;
 mod storage_compatibility;
 mod task;
 mod telemetry;
+#[cfg(feature = "webui")]
+mod webui;
 
 #[cfg(test)]
 mod test_helpers;
