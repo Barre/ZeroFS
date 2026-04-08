@@ -1,0 +1,128 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'PostgreSQL in the Browser',
+  description: 'Running PostgreSQL on S3 from a browser tab, through a chain of protocols that were never designed to work together.',
+}
+
+export const sections = [
+  { title: 'The chain', id: 'the-chain' },
+  { title: 'Why it works', id: 'why-it-works' },
+  { title: 'Try it', id: 'try-it' },
+  { title: 'What this opens up', id: 'what-this-opens-up' },
+]
+
+# PostgreSQL in the Browser
+
+The ZeroFS [Web UI](/web-ui) terminal boots a Linux VM inside the browser and mounts ZeroFS as its root filesystem. Because ZeroFS implements real POSIX semantics over 9P, software running inside that VM can do things you would not normally expect from a browser tab including running PostgreSQL with its data directory on S3. {{ className: 'lead' }}
+
+This is early, exploratory territory. The point is not that you should run databases this way today, but that the building blocks are composing in ways that open up genuinely new possibilities.
+
+<iframe
+  width="100%"
+  style={{ aspectRatio: '16/9' }}
+  src="https://www.youtube.com/embed/3EBh8Y8aYAo?si=7TeJ6CJrWr44moR7"
+  title="PostgreSQL in the Browser with ZeroFS"
+  frameBorder="0"
+  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+  referrerPolicy="strict-origin-when-cross-origin"
+  allowFullScreen
+/>
+
+---
+
+## The chain {{ id: 'the-chain' }}
+
+A write from PostgreSQL passes through six boundaries before reaching S3:
+
+```
+psql → PostgreSQL → Linux kernel → virtio-9p → v86 → WebSocket → ZeroFS → S3
+```
+
+<Mermaid chart={`
+sequenceDiagram
+    participant PG as PostgreSQL
+    participant K as Linux Kernel
+    participant V as v86 (x86 emulator)
+    participant WS as WebSocket
+    participant Z as ZeroFS 9P Handler
+    participant S3 as S3
+
+    PG->>K: write(fd, data)
+    K->>V: virtio-9p Twrite
+    V->>WS: binary frame
+    WS->>Z: 9P Twrite
+    Z->>S3: PutObject
+    S3-->>Z: OK
+    Z-->>WS: 9P Rwrite
+    WS-->>V: binary frame
+    V-->>K: virtio-9p completion
+    K-->>PG: bytes written
+`} />
+
+PostgreSQL thinks it is writing to a local filesystem. The Linux kernel thinks it is talking to a 9P fileserver. ZeroFS thinks it is serving a normal 9P client. None of them are aware of the layers above or below.
+
+## Why it works {{ id: 'why-it-works' }}
+
+The Web UI terminal uses [v86](https://github.com/copy/v86), a JavaScript x86 emulator that runs a real Linux kernel in the browser. The guest kernel has 9P support compiled in and mounts a virtio-9p device that v86 bridges over a WebSocket back to ZeroFS. On the ZeroFS side, the WebSocket terminates at the same `NinePHandler` that serves TCP clients. The guest kernel gets a filesystem that behaves identically to one mounted from a regular terminal.
+
+PostgreSQL is demanding about its filesystem. This works because ZeroFS does not have a reduced mode for browser connections: the same transactional code path described in the [durability documentation](/durability) handles every 9P session regardless of transport.
+
+The 9P server does not care whether the bytes arrived over TCP from a `mount -t 9p` command or over a WebSocket from a JavaScript x86 emulator. The protocol is the same either way.
+
+## Try it {{ id: 'try-it' }}
+
+Enable the Web UI in your ZeroFS configuration:
+
+```toml
+[servers.webui]
+addresses = ["127.0.0.1:8080"]
+uid = 1000
+gid = 1000
+```
+
+Start ZeroFS, open `http://127.0.0.1:8080`, and switch to the terminal tab. The VM boots in a few seconds and drops you into a shell at `/mnt`.
+
+The VM ships with BusyBox, it does not include PostgreSQL out of the box. You need to place the PostgreSQL binaries on the ZeroFS filesystem itself, which you can do from any other client (NFS, 9P, or the Web UI file manager). Since `/mnt` is your S3 bucket, anything you put there is visible to the VM immediately.
+
+```bash
+# From another machine or the file manager, copy a static PostgreSQL
+# build onto the ZeroFS filesystem, e.g. into /postgres
+
+# Then from the terminal tab:
+export PATH=/mnt/postgres/bin:$PATH
+export LD_LIBRARY_PATH=/mnt/postgres/lib
+
+initdb -D /mnt/pgdata
+pg_ctl -D /mnt/pgdata -l /mnt/pgdata/logfile start
+psql -d postgres
+```
+
+```sql
+CREATE TABLE notes (id serial, body text);
+INSERT INTO notes (body) VALUES ('written from a browser tab');
+SELECT * FROM notes;
+```
+
+The data is in S3. Close the tab, reopen it, start PostgreSQL again, and the rows are still there.
+
+## What this opens up {{ id: 'what-this-opens-up' }}
+
+A 128 MB VM inside a JavaScript x86 emulator is not going to replace a database server. The performance ceiling is low and the emulation overhead is real. But PostgreSQL is just one example of what becomes possible when a browser tab has access to a real filesystem backed by cloud storage.
+
+The reason this works at all is that each layer speaks a well-defined protocol to the next one. PostgreSQL does not know about WebSockets. The kernel does not know about S3. v86 does not know about databases. The composition produces something none of them were designed for individually.
+
+A database that boots from nothing in a browser tab and persists its data to S3 is a new kind of primitive. So is a compiler, or a mail server, or anything else that assumes POSIX underneath. The browser is turning into a real operating environment, and having a filesystem there changes what software can run in it.
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/web-ui" arrow="right">
+    Web UI
+  </Button>
+  <Button href="/durability" variant="outline">
+    Durability & Consistency
+  </Button>
+</div>

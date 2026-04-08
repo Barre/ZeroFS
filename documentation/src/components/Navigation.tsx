@@ -264,6 +264,7 @@ export const navigation: Array<NavGroup> = [
     title: 'Resources',
     links: [
       { title: 'Web UI', href: '/web-ui' },
+      { title: 'PostgreSQL in the Browser', href: '/postgresql-in-the-browser' },
       { title: 'NFS File Access', href: '/nfs-access' },
       { title: '9P File Access', href: '/9p-access' },
       { title: 'NBD Block Devices', href: '/nbd-devices' },
