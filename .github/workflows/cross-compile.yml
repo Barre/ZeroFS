@@ -103,6 +103,8 @@ jobs:
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
         working-directory: zerofs
+        env:
+          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:/webui/dist:ro"
         run: |
           cross build --profile ci --features webui --target ${{ matrix.target }}
 
