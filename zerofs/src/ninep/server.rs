@@ -1,6 +1,6 @@
 use super::errors::P9Error;
-use super::handler::NinePHandler;
-use super::lock_manager::FileLockManager;
+pub(crate) use super::handler::NinePHandler;
+pub(crate) use super::lock_manager::FileLockManager;
 use super::protocol::{
     Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE,
     P9_SIZE_FIELD_LEN, P9Message, Rlerror,
@@ -159,6 +159,131 @@ type InflightRequests = Arc<DashMap<u16, Arc<tokio::sync::Notify>>>;
 /// request, it need respond only to the last flush."
 type PendingFlushes = Arc<DashMap<u16, u16>>;
 
+/// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
+/// and WebSocket transports.
+pub(crate) fn dispatch_9p_frame(
+    full_buf: &[u8],
+    handler: &Arc<NinePHandler>,
+    tx: &mpsc::Sender<(u16, Vec<u8>)>,
+    inflight: &InflightRequests,
+    pending_flushes: &PendingFlushes,
+) -> anyhow::Result<()> {
+    if full_buf.len() < P9_MIN_MESSAGE_SIZE as usize {
+        error!("Message too short: {} bytes", full_buf.len());
+        return Err(anyhow::anyhow!("Message too short"));
+    }
+
+    match P9Message::from_bytes((full_buf, 0)) {
+        Ok((_, parsed)) => {
+            debug!(
+                "Received message type {} tag {}: {:?}",
+                parsed.type_, parsed.tag, parsed.body
+            );
+
+            let tag = parsed.tag;
+            let body = parsed.body;
+
+            let flush_oldtag = if let Message::Tflush(ref tflush) = body {
+                pending_flushes.insert(tflush.oldtag, tag);
+                Some(tflush.oldtag)
+            } else {
+                None
+            };
+
+            let notify = if flush_oldtag.is_none() {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                inflight.insert(tag, Arc::clone(&notify));
+                Some(notify)
+            } else {
+                None
+            };
+
+            let handler = Arc::clone(handler);
+            let tx = tx.clone();
+            let inflight = Arc::clone(inflight);
+            let pending_flushes = Arc::clone(pending_flushes);
+
+            spawn_named("9p-request", async move {
+                let response = handler.handle_message(tag, body).await;
+
+                if let Some(oldtag) = flush_oldtag {
+                    if let Some(old_notify) =
+                        inflight.get(&oldtag).map(|r| Arc::clone(r.value()))
+                    {
+                        debug!("Tflush: waiting for oldtag {} to complete", oldtag);
+                        old_notify.notified().await;
+                        debug!("Tflush: oldtag {} completed", oldtag);
+                    }
+
+                    let is_latest = pending_flushes
+                        .get(&oldtag)
+                        .is_some_and(|latest_tag| *latest_tag == tag);
+
+                    if !is_latest {
+                        debug!(
+                            "Tflush: tag {} superseded by newer flush for oldtag {}",
+                            tag, oldtag
+                        );
+                        return;
+                    }
+
+                    pending_flushes.remove(&oldtag);
+                }
+
+                match response.to_bytes() {
+                    Ok(response_bytes) => {
+                        if let Err(e) = tx.send((tag, response_bytes)).await {
+                            warn!("Failed to send response for tag {}: {}", tag, e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize response for tag {}: {:?}", tag, e);
+                    }
+                }
+
+                if let Some(notify) = notify {
+                    inflight.remove(&tag);
+                    notify.notify_waiters();
+                }
+            });
+            Ok(())
+        }
+        Err(e) => {
+            if full_buf.len() >= P9_MIN_MESSAGE_SIZE as usize {
+                let tag = u16::from_le_bytes([full_buf[5], full_buf[6]]);
+                let msg_type = full_buf[4];
+                debug!(
+                    "Failed to parse message type {} (0x{:02x}) tag {}: {:?}",
+                    msg_type, msg_type, tag, e
+                );
+                debug!(
+                    "Message size: {}, buffer (first {} bytes): {:?}",
+                    full_buf.len(),
+                    P9_DEBUG_BUFFER_SIZE,
+                    &full_buf[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, full_buf.len())]
+                );
+                let error_msg = P9Message::new(
+                    tag,
+                    Message::Rlerror(Rlerror {
+                        ecode: P9Error::NotImplemented.to_errno(),
+                    }),
+                );
+                let response_bytes = error_msg.to_bytes().expect("Failed to serialize Rlerror");
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send((tag, response_bytes)).await {
+                        error!("Failed to send error response: {}", e);
+                    }
+                });
+                Ok(())
+            } else {
+                debug!("Message too short to parse: {:?}", e);
+                Err(anyhow::anyhow!("Failed to parse message: {e:?}"))
+            }
+        }
+    }
+}
+
 async fn handle_client_loop<R>(
     handler: Arc<NinePHandler>,
     read_stream: R,
@@ -171,8 +296,6 @@ where
     let inflight: InflightRequests = Arc::new(DashMap::new());
     let pending_flushes: PendingFlushes = Arc::new(DashMap::new());
 
-    // 9P framing: 4-byte little-endian size field at offset 0, where
-    // size includes the size field itself (e.g., size=21 means 21 total bytes).
     let codec = LengthDelimitedCodec::builder()
         .little_endian()
         .length_field_offset(0)
@@ -204,124 +327,6 @@ where
             }
         };
 
-        if full_buf.len() < P9_MIN_MESSAGE_SIZE as usize {
-            error!("Message too short: {} bytes", full_buf.len());
-            return Err(anyhow::anyhow!("Message too short"));
-        }
-
-        match P9Message::from_bytes((&full_buf, 0)) {
-            Ok((_, parsed)) => {
-                debug!(
-                    "Received message type {} tag {}: {:?}",
-                    parsed.type_, parsed.tag, parsed.body
-                );
-
-                let tag = parsed.tag;
-                let body = parsed.body;
-
-                let flush_oldtag = if let Message::Tflush(ref tflush) = body {
-                    // Register this as the latest flush for oldtag (overwrites any previous)
-                    pending_flushes.insert(tflush.oldtag, tag);
-                    Some(tflush.oldtag)
-                } else {
-                    None
-                };
-
-                let notify = if flush_oldtag.is_none() {
-                    let notify = Arc::new(tokio::sync::Notify::new());
-                    inflight.insert(tag, Arc::clone(&notify));
-                    Some(notify)
-                } else {
-                    None
-                };
-
-                let handler = Arc::clone(&handler);
-                let tx = tx.clone();
-                let inflight = Arc::clone(&inflight);
-                let pending_flushes = Arc::clone(&pending_flushes);
-
-                spawn_named("9p-request", async move {
-                    let response = handler.handle_message(tag, body).await;
-
-                    // For Tflush: wait for the flushed request to complete before sending Rflush.
-                    // This ensures the flushed request's response is sent first, per 9P spec:
-                    // "The server may respond to the pending request before responding to Tflush"
-                    if let Some(oldtag) = flush_oldtag {
-                        if let Some(old_notify) =
-                            inflight.get(&oldtag).map(|r| Arc::clone(r.value()))
-                        {
-                            debug!("Tflush: waiting for oldtag {} to complete", oldtag);
-                            old_notify.notified().await;
-                            debug!("Tflush: oldtag {} completed", oldtag);
-                        }
-
-                        // Only send Rflush if we're still the latest flush for this oldtag.
-                        // If a newer Tflush arrived, it supersedes us and we stay silent.
-                        let is_latest = pending_flushes
-                            .get(&oldtag)
-                            .is_some_and(|latest_tag| *latest_tag == tag);
-
-                        if !is_latest {
-                            debug!(
-                                "Tflush: tag {} superseded by newer flush for oldtag {}",
-                                tag, oldtag
-                            );
-                            return;
-                        }
-
-                        // We're the latest - clean up and send response
-                        pending_flushes.remove(&oldtag);
-                    }
-
-                    match response.to_bytes() {
-                        Ok(response_bytes) => {
-                            if let Err(e) = tx.send((tag, response_bytes)).await {
-                                warn!("Failed to send response for tag {}: {}", tag, e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize response for tag {}: {:?}", tag, e);
-                        }
-                    }
-
-                    if let Some(notify) = notify {
-                        inflight.remove(&tag);
-                        notify.notify_waiters();
-                    }
-                });
-            }
-            Err(e) => {
-                // Failed to parse message - check if we can at least get the tag
-                if full_buf.len() >= P9_MIN_MESSAGE_SIZE as usize {
-                    let tag = u16::from_le_bytes([full_buf[5], full_buf[6]]);
-                    let msg_type = full_buf[4];
-                    debug!(
-                        "Failed to parse message type {} (0x{:02x}) tag {}: {:?}",
-                        msg_type, msg_type, tag, e
-                    );
-                    debug!(
-                        "Message size: {}, buffer (first {} bytes): {:?}",
-                        full_buf.len(),
-                        P9_DEBUG_BUFFER_SIZE,
-                        &full_buf[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, full_buf.len())]
-                    );
-                    let error_msg = P9Message::new(
-                        tag,
-                        Message::Rlerror(Rlerror {
-                            ecode: P9Error::NotImplemented.to_errno(),
-                        }),
-                    );
-                    let response_bytes = error_msg.to_bytes().expect("Failed to serialize Rlerror");
-
-                    if let Err(e) = tx.send((tag, response_bytes)).await {
-                        error!("Failed to send error response: {}", e);
-                        return Err(e.into());
-                    }
-                } else {
-                    debug!("Message too short to parse: {:?}", e);
-                    return Err(anyhow::anyhow!("Failed to parse message: {e:?}"));
-                }
-            }
-        };
+        dispatch_9p_frame(&full_buf, &handler, &tx, &inflight, &pending_flushes)?;
     }
 }
