@@ -10,7 +10,7 @@ ALPINE_VERSION="3.21"
 ALPINE_RELEASE="3.21.3"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/x86/alpine-virt-${ALPINE_RELEASE}-x86.iso"
 ALPINE_SHA256="e837d1d67aced3157652a51f2c22bee582a95ad03863a6a25b5c1c1bbc9a3d84"
-BIOS_URL_BASE="https://raw.githubusercontent.com/copy/v86/4e4bf556350916a9a5139a4b3756af0971d56f8c/bios/seabios.bin"
+BIOS_URL_BASE="https://raw.githubusercontent.com/copy/v86/4e4bf556350916a9a5139a4b3756af0971d56f8c/bios"
 SEABIOS_SHA256="73e3f359102e3a9982c35fce98eb7cd08f18303ac7f1ba6ebfbe6cdc1c244d98"
 
 verify_sha256() {
