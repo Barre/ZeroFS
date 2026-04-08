@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "generate": "buf generate",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -47,6 +48,8 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.4.0",
+    "@bufbuild/buf": "^1.67.0",
+    "@bufbuild/protoc-gen-es": "^2.11.0",
     "prettier": "^3.8.1",
     "tailwindcss": "^4.2.2",
     "typescript": "~5.9.3",
