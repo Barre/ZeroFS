@@ -249,6 +249,7 @@ async fn start_rpc_servers(
         fs_stats,
         global_stats,
         max_bytes,
+        shutdown.clone(),
     );
     let mut handles = Vec::new();
 
@@ -708,6 +709,8 @@ pub async fn run_server(
         init_result.object_store,
         init_result.wal_object_store.clone(),
     ));
+    #[cfg(feature = "webui")]
+    let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
@@ -748,11 +751,36 @@ pub async fn run_server(
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
+    #[cfg(feature = "webui")]
+    let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
+        let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
+            checkpoint_manager_for_webui,
+            fs.flush_coordinator.clone(),
+            fs.tracer.clone(),
+            Arc::clone(&fs.stats),
+            Arc::clone(&fs.global_stats),
+            fs.max_bytes,
+            shutdown.clone(),
+        );
+        let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
+        crate::webui::start(
+            webui_config,
+            Arc::clone(&fs),
+            webui_lock_manager,
+            webui_rpc_service,
+            shutdown.clone(),
+        )
+    } else {
+        Vec::new()
+    };
+
     let mut server_handles = Vec::new();
     server_handles.extend(nfs_handles);
     server_handles.extend(ninep_handles);
     server_handles.extend(nbd_handles);
     server_handles.extend(rpc_handles);
+    #[cfg(feature = "webui")]
+    server_handles.extend(webui_handles);
 
     if server_handles.is_empty() {
         return Err(anyhow::anyhow!(
