@@ -271,7 +271,10 @@ pub struct WebUIConfig {
 }
 
 fn default_webui_address() -> std::net::SocketAddr {
-    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080)
+    std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        8080,
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

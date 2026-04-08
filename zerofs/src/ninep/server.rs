@@ -207,9 +207,7 @@ pub(crate) fn dispatch_9p_frame(
                 let response = handler.handle_message(tag, body).await;
 
                 if let Some(oldtag) = flush_oldtag {
-                    if let Some(old_notify) =
-                        inflight.get(&oldtag).map(|r| Arc::clone(r.value()))
-                    {
+                    if let Some(old_notify) = inflight.get(&oldtag).map(|r| Arc::clone(r.value())) {
                         debug!("Tflush: waiting for oldtag {} to complete", oldtag);
                         old_notify.notified().await;
                         debug!("Tflush: oldtag {} completed", oldtag);

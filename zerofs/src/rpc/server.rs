@@ -151,7 +151,10 @@ impl AdminService for AdminRpcServer {
             .filter_map(|result| result.ok())
             .map(|event| Ok(event.into()));
 
-        Ok(Response::new(take_until_cancelled(stream, self.shutdown.clone())))
+        Ok(Response::new(take_until_cancelled(
+            stream,
+            self.shutdown.clone(),
+        )))
     }
 
     async fn flush(
@@ -175,9 +178,9 @@ impl AdminService for AdminRpcServer {
         let global_stats = Arc::clone(&self.global_stats);
         let max_bytes = self.max_bytes;
 
-        let stream = IntervalStream::new(tokio::time::interval(
-            std::time::Duration::from_millis(interval_ms),
-        ))
+        let stream = IntervalStream::new(tokio::time::interval(std::time::Duration::from_millis(
+            interval_ms,
+        )))
         .map(move |_| {
             let (used_bytes, used_inodes) = global_stats.get_totals();
             Ok(proto::StatsSnapshot {
@@ -206,7 +209,10 @@ impl AdminService for AdminRpcServer {
             })
         });
 
-        Ok(Response::new(take_until_cancelled(stream, self.shutdown.clone())))
+        Ok(Response::new(take_until_cancelled(
+            stream,
+            self.shutdown.clone(),
+        )))
     }
 }
 
