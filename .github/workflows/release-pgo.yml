@@ -422,14 +422,14 @@ jobs:
       - name: Build with PGO (cross)
         if: matrix.use_cross && !matrix.bolt
         env:
-          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:/webui/dist:ro"
+          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:${{ github.workspace }}/webui/dist:ro"
         run: |
           cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cross)
         if: matrix.use_cross && matrix.bolt
         env:
-          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:/webui/dist:ro"
+          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:${{ github.workspace }}/webui/dist:ro"
         run: |
           cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --features webui --target ${{ matrix.target }}
 
