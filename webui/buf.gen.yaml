@@ -1,0 +1,8 @@
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: src/lib/grpc/gen
+    opt:
+      - target=ts
+inputs:
+  - directory: ../zerofs/proto
