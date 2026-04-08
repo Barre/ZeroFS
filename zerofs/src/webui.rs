@@ -151,9 +151,6 @@ pub fn start(
     rpc_service: AdminRpcServer,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
-    let addr = config.address;
-    info!("Web UI server listening on http://{}", addr);
-
     let state = AppState {
         filesystem,
         lock_manager,
@@ -181,17 +178,24 @@ pub fn start(
         .route("/", get(serve_index))
         .with_state(state);
 
-    vec![spawn_named("webui-http", async move {
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("Failed to bind Web UI server to {}: {}", addr, e);
-                return Ok(());
-            }
-        };
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    })]
+    let mut handles = Vec::new();
+    for &addr in &config.addresses {
+        info!("Web UI server listening on http://{}", addr);
+        let app = app.clone();
+        let shutdown = shutdown.clone();
+        handles.push(spawn_named("webui-http", async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind Web UI server to {}: {}", addr, e);
+                    return Ok(());
+                }
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }));
+    }
+    handles
 }
