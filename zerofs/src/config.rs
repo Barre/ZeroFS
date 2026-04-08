@@ -266,15 +266,17 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WebUIConfig {
-    #[serde(default = "default_webui_address")]
-    pub address: std::net::SocketAddr,
+    #[serde(default = "default_webui_addresses")]
+    pub addresses: HashSet<SocketAddr>,
 }
 
-fn default_webui_address() -> std::net::SocketAddr {
-    std::net::SocketAddr::new(
+fn default_webui_addresses() -> HashSet<SocketAddr> {
+    let mut set = HashSet::new();
+    set.insert(SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
         8080,
-    )
+    ));
+    set
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -572,7 +574,9 @@ impl Settings {
                     addresses: Some(default_rpc_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.rpc.sock")),
                 }),
-                webui: None,
+                webui: Some(WebUIConfig {
+                    addresses: default_webui_addresses(),
+                }),
             },
             filesystem: None,
             lsm: None,
