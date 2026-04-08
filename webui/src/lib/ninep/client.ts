@@ -146,6 +146,7 @@ export class NinePClient {
   private pending = new Map<number, PendingRequest>();
   private nextTag = 0;
   private nextFid = 1; // 0 is ROOT_FID
+  private freeFids: number[] = [];
   private msize = DEFAULT_MSIZE;
   private stateListeners = new Set<(state: ConnectionState) => void>();
   private _state: ConnectionState = "disconnected";
@@ -218,6 +219,7 @@ export class NinePClient {
     this.setState("connecting");
     this.nextTag = 0;
     this.nextFid = 1;
+    this.freeFids.length = 0;
     this.pending.clear();
 
     return new Promise<void>((resolve, reject) => {
@@ -289,7 +291,7 @@ export class NinePClient {
   }
 
   private allocFid(): number {
-    return this.nextFid++;
+    return this.freeFids.pop() ?? this.nextFid++;
   }
 
   private rawSend(buf: ArrayBuffer, overrideTag?: number): Promise<ResponseMessage> {
@@ -335,6 +337,7 @@ export class NinePClient {
   private async clunk(fid: number): Promise<void> {
     const tag = this.allocTag();
     await this.send(encodeTclunk(tag, fid));
+    this.freeFids.push(fid);
   }
 
   private async walkPath(path: string): Promise<{ fid: number; qids: Qid[] }> {
