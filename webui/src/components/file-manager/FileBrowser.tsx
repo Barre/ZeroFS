@@ -99,6 +99,7 @@ export function FileBrowser({
   onCreate,
   onCreateCancel,
 }: FileBrowserProps) {
+  "use no memo";
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const lastClickedRef = useRef<string | null>(null);
@@ -186,6 +187,7 @@ export function FileBrowser({
   const LIST_ROW_H = 41;
   const gridCols = Math.max(1, Math.floor((gridWidth - 2 * GRID_PAD + GRID_GAP) / (GRID_ITEM_MIN + GRID_GAP)));
 
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: view === "grid" ? Math.ceil(sorted.length / gridCols) : sorted.length,
     getScrollElement: () => containerRef.current,
@@ -249,13 +251,12 @@ export function FileBrowser({
                         onDragLeave={(e) => onDirDragLeave(e, entry)}
                         onDrop={(e) => onDirDrop(e, entry)}
                         style={{ height: GRID_ROW_H - GRID_GAP }}
-                        className={`flex flex-col items-center gap-2 p-4 rounded-lg text-center cursor-pointer transition-all ${
-                          dropTarget === entry.name
+                        className={`flex flex-col items-center gap-2 p-4 rounded-lg text-center cursor-pointer transition-all ${dropTarget === entry.name
                             ? "bg-[#316dca33] ring-1 ring-[#316dca66]"
                             : selectedNames.has(entry.name)
                               ? "bg-[#316dca26]"
                               : "bg-background hover:bg-accent"
-                        } ${i === focusIndex ? "ring-1 ring-primary/50" : ""}`}
+                          } ${i === focusIndex ? "ring-1 ring-primary/50" : ""}`}
                         onClick={(e) => handleClick(e, entry.name)}
                         onDoubleClick={() => onOpen(entry)}
                       >
@@ -405,13 +406,12 @@ export function FileBrowser({
                     onDragOver={(e) => onDirDragOver(e, entry)}
                     onDragLeave={(e) => onDirDragLeave(e, entry)}
                     onDrop={(e) => onDirDrop(e, entry)}
-                    className={`border-b border-border/40 border-l-2 cursor-pointer transition-colors group ${
-                      dropTarget === entry.name
+                    className={`border-b border-border/40 border-l-2 cursor-pointer transition-colors group ${dropTarget === entry.name
                         ? "bg-[#316dca33]"
                         : selectedNames.has(entry.name)
                           ? "bg-[#316dca26]"
                           : "hover:bg-accent"
-                    } ${i === focusIndex ? "border-l-primary" : "border-l-transparent"}`}
+                      } ${i === focusIndex ? "border-l-primary" : "border-l-transparent"}`}
                     onClick={(e) => handleClick(e, entry.name)}
                     onDoubleClick={() => onOpen(entry)}
                   >
