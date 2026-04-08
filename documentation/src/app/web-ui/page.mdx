@@ -1,0 +1,97 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'Web UI',
+  description: 'File manager, live dashboard, and in-browser terminal over 9P WebSocket.',
+}
+
+export const sections = [
+  { title: 'Configuration', id: 'configuration' },
+  { title: 'File Manager', id: 'file-manager' },
+  { title: 'Dashboard', id: 'dashboard' },
+  { title: '9P on the Web', id: '9p-on-the-web' },
+  { title: 'The Terminal', id: 'the-terminal' },
+]
+
+# Web UI
+
+ZeroFS includes a web interface compiled into the binary — a file manager, a live dashboard, and a terminal that runs a Linux VM in your browser with its root filesystem on ZeroFS. {{ className: 'lead' }}
+
+## Configuration {{ id: 'configuration' }}
+
+```toml
+[servers.webui]
+addresses = ["127.0.0.1:8080"]
+```
+
+Open `http://127.0.0.1:8080` after starting ZeroFS. All assets are embedded in the binary.
+
+## File Manager {{ id: 'file-manager' }}
+
+![ZeroFS Web UI File Manager](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/file_manager.png)
+
+Tabs, drag-and-drop uploads (folders too), file previews, search.
+
+## Dashboard {{ id: 'dashboard' }}
+
+![ZeroFS Web UI Dashboard](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/dashboard.png)
+
+Streams live stats over gRPC-web: I/O throughput, IOPS, storage usage, operation counters, GC activity, and a file access tracer showing recent operations.
+
+## 9P on the Web {{ id: '9p-on-the-web' }}
+
+The file manager doesn't use a REST API but speaks 9P, the same binary protocol that the Linux kernel speaks when you `mount -t 9p`. The transport is a WebSocket instead of TCP but the messages on the wire are identical.
+
+We already had a 9P server that handles permissions, streaming, renames, directory listings and more. Building a REST API on top would have meant reimplementing all of that, so instead we wrote a [9P client in TypeScript](https://github.com/Barre/zerofs/tree/main/webui/src/lib/ninep) and pointed it at a WebSocket.
+
+When you open the UI, the browser connects to `/ws/9p` where the connection is upgraded and hands it to the same `NinePHandler` that serves other clients over TCP. From that point on the browser is just another 9P session.
+
+<Mermaid chart={`
+sequenceDiagram
+    participant Browser
+    participant WebSocket
+    participant 9P Handler
+    participant VFS
+    participant S3
+
+    Browser->>WebSocket: Tversion
+    9P Handler-->>Browser: Rversion
+
+    Browser->>WebSocket: Tattach
+    9P Handler-->>Browser: Rattach
+
+    Browser->>WebSocket: Twalk /photos
+    9P Handler->>VFS: lookup
+    9P Handler-->>Browser: Rwalk
+
+    Browser->>WebSocket: Tread
+    VFS->>S3: fetch (cache miss)
+    9P Handler-->>Browser: Rread
+`} />
+
+## The Terminal {{ id: 'the-terminal' }}
+
+![ZeroFS Web UI Terminal](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png)
+
+The terminal boots a Linux VM in the browser using [v86](https://github.com/copy/v86), a JavaScript x86 emulator. It's a real Linux kernel with BusyBox coreutils so `ls`, `cat`, `mkdir`, `rm` all work and go through to S3.
+
+v86 emulates a virtio-9p device that the guest kernel mounts with `mount -t 9p -o trans=virtio`, and v86 bridges that to a WebSocket back to ZeroFS:
+
+```
+sh → kernel 9P → virtio-9p (v86) → WebSocket → ZeroFS → S3
+```
+
+The VM has 128 MB of RAM, boots in a few seconds, and drops you into a shell at `/mnt`.
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/9p-access" arrow="right">
+    9P file access
+  </Button>
+  <Button href="/configuration" variant="outline">
+    Configuration reference
+  </Button>
+</div>
