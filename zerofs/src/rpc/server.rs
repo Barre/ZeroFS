@@ -13,6 +13,20 @@ use std::sync::atomic::Ordering;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream, UnixListenerStream};
+
+/// Wrap a tokio_stream Stream so it ends when the CancellationToken fires.
+fn take_until_cancelled<S: tokio_stream::Stream + Unpin + Send + 'static>(
+    mut stream: S,
+    shutdown: CancellationToken,
+) -> Pin<Box<dyn tokio_stream::Stream<Item = S::Item> + Send>> {
+    let output = futures::stream::poll_fn(move |cx| {
+        if shutdown.is_cancelled() {
+            return std::task::Poll::Ready(None);
+        }
+        Pin::new(&mut stream).poll_next(cx)
+    });
+    Box::pin(output)
+}
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::info;
@@ -25,6 +39,7 @@ pub struct AdminRpcServer {
     fs_stats: Arc<FileSystemStats>,
     global_stats: Arc<FileSystemGlobalStats>,
     max_bytes: u64,
+    shutdown: CancellationToken,
 }
 
 impl AdminRpcServer {
@@ -35,6 +50,7 @@ impl AdminRpcServer {
         fs_stats: Arc<FileSystemStats>,
         global_stats: Arc<FileSystemGlobalStats>,
         max_bytes: u64,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             checkpoint_manager,
@@ -43,6 +59,7 @@ impl AdminRpcServer {
             fs_stats,
             global_stats,
             max_bytes,
+            shutdown,
         }
     }
 }
@@ -134,7 +151,7 @@ impl AdminService for AdminRpcServer {
             .filter_map(|result| result.ok())
             .map(|event| Ok(event.into()));
 
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(take_until_cancelled(stream, self.shutdown.clone())))
     }
 
     async fn flush(
@@ -158,8 +175,10 @@ impl AdminService for AdminRpcServer {
         let global_stats = Arc::clone(&self.global_stats);
         let max_bytes = self.max_bytes;
 
-        let interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
-        let stream = IntervalStream::new(interval).map(move |_| {
+        let stream = IntervalStream::new(tokio::time::interval(
+            std::time::Duration::from_millis(interval_ms),
+        ))
+        .map(move |_| {
             let (used_bytes, used_inodes) = global_stats.get_totals();
             Ok(proto::StatsSnapshot {
                 timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
@@ -187,7 +206,7 @@ impl AdminService for AdminRpcServer {
             })
         });
 
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(take_until_cancelled(stream, self.shutdown.clone())))
     }
 }
 
