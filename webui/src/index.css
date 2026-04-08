@@ -1,0 +1,201 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #151b23;
+  --color-foreground: #d1d7e0;
+  --color-muted: #9198a1;
+  --color-muted-foreground: #656c76;
+  --color-border: #3d444d;
+  --color-border-bright: #656c76;
+  --color-card: #212830;
+  --color-card-foreground: #d1d7e0;
+  --color-surface: #262c36;
+  --color-primary: #478be6;
+  --color-primary-foreground: #f0f6fc;
+  --color-destructive: #e5534b;
+  --color-accent: #262c36;
+  --color-accent-foreground: #d1d7e0;
+  --color-success: #57ab5a;
+  --color-warning: #c69026;
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", "SF Mono", ui-monospace, monospace;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3d444d;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #656c76;
+}
+
+/* Hide focus rings for mouse clicks, show for keyboard navigation */
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Surfaces */
+.card-surface {
+  background: var(--color-card);
+  border: 1px solid var(--color-border);
+}
+
+.card-surface-raised {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-bright);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(0, 0, 0, 0.2);
+}
+
+.glow-primary:hover {
+  box-shadow: 0 0 16px rgba(71, 139, 230, 0.2);
+}
+
+/* Checkerboard for transparent image preview */
+.checkerboard {
+  background-image: conic-gradient(#212830 25%, #151b23 0% 50%, #212830 0% 75%, #151b23 0%);
+  background-size: 16px 16px;
+}
+
+/* Animations */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes spinOnce {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes tooltipIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes overlayIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes overlayOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes dialogIn {
+  from {
+    opacity: 0;
+    scale: 0.96;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+
+@keyframes dialogOut {
+  from {
+    opacity: 1;
+    scale: 1;
+  }
+  to {
+    opacity: 0;
+    scale: 0.96;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    translate: 0 12px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 1;
+    translate: 0 0;
+  }
+  to {
+    opacity: 0;
+    translate: 0 12px;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fadeOut {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
