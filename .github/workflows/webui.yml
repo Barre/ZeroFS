@@ -5,11 +5,13 @@ on:
     branches: ["main"]
     paths:
       - "webui/**"
+      - "zerofs/proto/**"
       - "Makefile"
   pull_request:
     branches: ["main"]
     paths:
       - "webui/**"
+      - "zerofs/proto/**"
       - "Makefile"
 
 jobs:
@@ -27,6 +29,7 @@ jobs:
           cache: "npm"
           cache-dependency-path: webui/package-lock.json
       - run: npm ci
+      - run: npx buf generate
       - run: npm run lint
 
   build:
