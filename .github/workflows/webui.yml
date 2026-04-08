@@ -1,0 +1,44 @@
+name: WebUI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "webui/**"
+      - "Makefile"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "webui/**"
+      - "Makefile"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: webui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: webui/package-lock.json
+      - name: Install VM image build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libarchive-tools squashfs-tools
+      - run: make webui
