@@ -304,8 +304,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: "npm"
           cache-dependency-path: webui/package-lock.json
 
       - name: Install VM image build dependencies
@@ -621,6 +621,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: zerofs-*-pgo
 
       - name: Create tarball
         run: |
