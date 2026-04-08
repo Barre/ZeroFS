@@ -142,6 +142,7 @@ impl NinePHandler {
 
     /// Set a (uid, gid) override that will be used for all sessions instead of
     /// trusting the client-provided credentials in Tattach.
+    #[cfg(feature = "webui")]
     pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
         self.credential_override = Some((uid, gid));
         self
