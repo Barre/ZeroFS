@@ -268,6 +268,8 @@ pub struct ServerConfig {
 pub struct WebUIConfig {
     #[serde(default = "default_webui_addresses")]
     pub addresses: HashSet<SocketAddr>,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 fn default_webui_addresses() -> HashSet<SocketAddr> {
@@ -576,6 +578,8 @@ impl Settings {
                 }),
                 webui: Some(WebUIConfig {
                     addresses: default_webui_addresses(),
+                    uid: 1000,
+                    gid: 1000,
                 }),
             },
             filesystem: None,

@@ -75,6 +75,8 @@ ZeroFS includes a web interface. Add this to your config:
 ```toml
 [servers.webui]
 addresses = ["127.0.0.1:8080"]
+uid = 1000
+gid = 1000
 ```
 
 <p align="center">

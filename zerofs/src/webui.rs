@@ -30,6 +30,8 @@ struct WebUIAssets;
 struct AppState {
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
+    uid: u32,
+    gid: u32,
 }
 
 async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -37,10 +39,10 @@ async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> i
 }
 
 async fn handle_9p_ws(socket: WebSocket, state: AppState) {
-    let handler = Arc::new(NinePHandler::new(
-        state.filesystem,
-        state.lock_manager.clone(),
-    ));
+    let handler = Arc::new(
+        NinePHandler::new(state.filesystem, state.lock_manager.clone())
+            .with_credential_override(state.uid, state.gid),
+    );
     let handler_id = handler.handler_id();
     let inflight: Arc<DashMap<u16, Arc<tokio::sync::Notify>>> = Arc::new(DashMap::new());
     let pending_flushes: Arc<DashMap<u16, u16>> = Arc::new(DashMap::new());
@@ -154,6 +156,8 @@ pub fn start(
     let state = AppState {
         filesystem,
         lock_manager,
+        uid: config.uid,
+        gid: config.gid,
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS

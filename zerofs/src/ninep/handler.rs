@@ -118,6 +118,8 @@ pub struct NinePHandler {
     session: Arc<Session>,
     lock_manager: Arc<FileLockManager>,
     handler_id: u64,
+    /// If set, overrides the client-provided credentials on attach.
+    credential_override: Option<(u32, u32)>,
 }
 
 impl NinePHandler {
@@ -134,11 +136,30 @@ impl NinePHandler {
             session,
             lock_manager,
             handler_id: HANDLER_COUNTER.fetch_add(1, AtomicOrdering::SeqCst),
+            credential_override: None,
         }
+    }
+
+    /// Set a (uid, gid) override that will be used for all sessions instead of
+    /// trusting the client-provided credentials in Tattach.
+    pub fn with_credential_override(mut self, uid: u32, gid: u32) -> Self {
+        self.credential_override = Some((uid, gid));
+        self
     }
 
     pub fn handler_id(&self) -> u64 {
         self.handler_id
+    }
+
+    /// Returns the effective GID for a create-type operation. When a credential
+    /// override is active, the server-configured GID is used instead of
+    /// whatever the client sent.
+    fn effective_gid(&self, client_gid: u32, fid_creds: &Credentials) -> u32 {
+        if self.credential_override.is_some() {
+            fid_creds.gid
+        } else {
+            client_gid
+        }
     }
 
     /// Per 9P spec, iounit may be zero, in which case the client calculates
@@ -241,31 +262,40 @@ impl NinePHandler {
             ta.n_uname
         );
 
-        // In 9P2000.L, we trust the client and use UID as GID as a reasonable default
-        // Operations that support it can override the GID
-        // Special case: n_uname=-1 (0xFFFFFFFF) means "unspecified", use mapping based on uname
-        let uid = if ta.n_uname == 0xFFFFFFFF {
-            // When n_uname is -1, map based on the string username
-            match username {
-                "root" => 0,
-                _ => {
-                    // For other users, we could look them up, but for now just use nobody
-                    debug!(
-                        "Unknown user '{}' with n_uname=-1, using nobody ({})",
-                        username, P9_NOBODY_UID
-                    );
-                    P9_NOBODY_UID
-                }
-            }
+        let (uid, gid) = if let Some((override_uid, override_gid)) = self.credential_override {
+            debug!(
+                "Using credential override: uid={}, gid={} (client requested uname={}, n_uname={})",
+                override_uid, override_gid, username, ta.n_uname
+            );
+            (override_uid, override_gid)
         } else {
-            ta.n_uname
+            // In 9P2000.L, we trust the client and use UID as GID as a reasonable default
+            // Operations that support it can override the GID
+            // Special case: n_uname=-1 (0xFFFFFFFF) means "unspecified", use mapping based on uname
+            let uid = if ta.n_uname == 0xFFFFFFFF {
+                // When n_uname is -1, map based on the string username
+                match username {
+                    "root" => 0,
+                    _ => {
+                        // For other users, we could look them up, but for now just use nobody
+                        debug!(
+                            "Unknown user '{}' with n_uname=-1, using nobody ({})",
+                            username, P9_NOBODY_UID
+                        );
+                        P9_NOBODY_UID
+                    }
+                }
+            } else {
+                ta.n_uname
+            };
+            (uid, uid)
         };
 
         let mut groups = [0u32; P9_MAX_GROUPS];
-        groups[0] = uid; // User is always member of their own group
+        groups[0] = gid; // User is always member of their primary group
         let creds = Credentials {
             uid,
-            gid: uid, // Primary GID defaults to UID
+            gid,
             groups,
             groups_count: 1,
         };
@@ -463,16 +493,17 @@ impl NinePHandler {
             return Err(P9Error::FidAlreadyOpen);
         }
 
+        let gid = self.effective_gid(tc.gid, &parent_fid.creds);
         let (child_id, post_attr) = self
             .filesystem
             .create(
-                &parent_fid.creds.with_gid(tc.gid),
+                &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &tc.name.data,
                 &SetAttributes {
                     mode: SetMode::Set(tc.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(tc.gid),
+                    gid: SetGid::Set(gid),
                     ..Default::default()
                 },
             )
@@ -587,16 +618,17 @@ impl NinePHandler {
             parent_fid.creds.gid
         );
 
+        let gid = self.effective_gid(tm.gid, &parent_fid.creds);
         let (new_id, post_attr) = self
             .filesystem
             .mkdir(
-                &parent_fid.creds.with_gid(tm.gid),
+                &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &tm.name.data,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(tm.gid),
+                    gid: SetGid::Set(gid),
                     ..Default::default()
                 },
             )
@@ -609,17 +641,18 @@ impl NinePHandler {
     async fn symlink(&self, ts: Tsymlink) -> P9Result<Message> {
         let parent_fid = self.get_fid(ts.dfid)?;
 
+        let gid = self.effective_gid(ts.gid, &parent_fid.creds);
         let (new_id, post_attr) = self
             .filesystem
             .symlink(
-                &parent_fid.creds.with_gid(ts.gid),
+                &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &ts.name.data,
                 &ts.symtgt.data,
                 &SetAttributes {
                     mode: SetMode::Set(SYMLINK_DEFAULT_MODE),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(ts.gid),
+                    gid: SetGid::Set(gid),
                     ..Default::default()
                 },
             )
@@ -641,17 +674,18 @@ impl NinePHandler {
             _ => return Err(P9Error::InvalidDeviceType),
         };
 
+        let gid = self.effective_gid(tm.gid, &parent_fid.creds);
         let (child_id, post_attr) = self
             .filesystem
             .mknod(
-                &parent_fid.creds.with_gid(tm.gid),
+                &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &tm.name.data,
                 device_type,
                 &SetAttributes {
                     mode: SetMode::Set(tm.mode & 0o7777),
                     uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(tm.gid),
+                    gid: SetGid::Set(gid),
                     ..Default::default()
                 },
                 match device_type {

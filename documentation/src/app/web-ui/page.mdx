@@ -22,7 +22,11 @@ ZeroFS includes a web interface compiled into the binary — a file manager, a l
 ```toml
 [servers.webui]
 addresses = ["127.0.0.1:8080"]
+uid = 1000
+gid = 1000
 ```
+
+`uid` and `gid` control the POSIX identity used for all file operations from the Web UI. Files created through the browser will be owned by this user and group, and permission checks will be applied accordingly. Both fields are required.
 
 Open `http://127.0.0.1:8080` after starting ZeroFS. All assets are embedded in the binary.
 
