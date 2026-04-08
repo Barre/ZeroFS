@@ -77,15 +77,25 @@ ZeroFS includes a web interface. Add this to your config:
 addresses = ["127.0.0.1:8080"]
 ```
 
-<!-- TODO: screenshot of the file manager -->
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/file_manager.png" alt="ZeroFS Web UI File Manager"
+  width="700">
+  </p>
 
 The file manager talks to ZeroFS over 9P via WebSocket. Drag-and-drop uploads work, including entire folders.
 
-<!-- TODO: screenshot of the dashboard -->
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/dashboard.png" alt="ZeroFS Web UI Dashboard"
+  width="700">
+  </p>
+
 
 The dashboard streams live stats (throughput, IOPS, storage usage, operation counters, GC) over gRPC-web.
 
-<!-- TODO: screenshot of the terminal -->
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Dashboard"
+  width="700">
+  </p>
 
 The terminal runs a Linux VM in the browser using [v86](https://github.com/copy/v86). Its root filesystem is the ZeroFS instance, mounted over the same 9P WebSocket.
 
