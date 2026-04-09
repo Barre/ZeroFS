@@ -95,17 +95,20 @@ async fn start_nfs_servers(
     };
     let mut handles = Vec::new();
 
-    for addr in &config.addresses {
-        info!("Starting NFS server on {}", addr);
-        let fs_clone = Arc::clone(&fs);
-        let addr = *addr;
-        let shutdown_clone = shutdown.clone();
-        handles.push(spawn_named("nfs-server", async move {
-            match crate::nfs::start_nfs_server_with_config(fs_clone, addr, shutdown_clone).await {
-                Ok(()) => Ok(()),
-                Err(e) => Err(std::io::Error::other(e.to_string())),
-            }
-        }));
+    if let Some(addresses) = &config.addresses {
+        for addr in addresses {
+            info!("Starting NFS server on {}", addr);
+            let fs_clone = Arc::clone(&fs);
+            let addr = *addr;
+            let shutdown_clone = shutdown.clone();
+            handles.push(spawn_named("nfs-server", async move {
+                match crate::nfs::start_nfs_server_with_config(fs_clone, addr, shutdown_clone).await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                }
+            }));
+        }
     }
 
     handles
