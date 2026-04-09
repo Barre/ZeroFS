@@ -284,8 +284,8 @@ fn default_webui_addresses() -> HashSet<SocketAddr> {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NfsConfig {
-    #[serde(default = "default_nfs_addresses")]
-    pub addresses: HashSet<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub addresses: Option<HashSet<SocketAddr>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -562,7 +562,7 @@ impl Settings {
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
-                    addresses: default_nfs_addresses(),
+                    addresses: Some(default_nfs_addresses()),
                 }),
                 ninep: Some(NinePConfig {
                     addresses: Some(default_9p_addresses()),
