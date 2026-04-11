@@ -342,10 +342,10 @@ max_size_gb = 500.0            # Optional: limit filesystem size
 compression = "lz4"            # Optional: "lz4" (default) or "zstd-{1-22}"
 
 [lsm]
-l0_max_ssts = 16               # Trigger compaction with fewer SST files
-max_unflushed_gb = 2.0         # Allow more data batching for better write throughput
-max_concurrent_compactions = 16  # Use more CPU cores for compaction
-flush_interval_secs = 60       # Flush less frequently for better throughput
+l0_max_ssts = 16               
+max_unflushed_gb = 2.0        
+max_concurrent_compactions = 16  
+flush_interval_secs = 60      
 
 [aws]
 access_key_id = "your-key"

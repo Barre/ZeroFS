@@ -3,7 +3,6 @@ use std::io::BufRead;
 
 mod block_transformer;
 mod bucket_identity;
-mod cache;
 mod checkpoint_manager;
 mod cli;
 mod config;
@@ -32,10 +31,12 @@ mod posix_tests;
 #[cfg(feature = "failpoints")]
 mod failpoints;
 
-use mimalloc::MiMalloc;
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
 
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {

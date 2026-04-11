@@ -22,6 +22,7 @@ use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use crate::db::{Db, SlateDbHandle, Transaction};
 use slatedb::config::{PutOptions, WriteOptions};
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -104,11 +105,15 @@ pub struct CacheConfig {
 }
 
 impl ZeroFS {
-    pub async fn new_with_slatedb(slatedb: SlateDbHandle, max_bytes: u64) -> anyhow::Result<Self> {
+    pub async fn new_with_slatedb(
+        slatedb: SlateDbHandle,
+        max_bytes: u64,
+        metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
 
         let db = Arc::new(match slatedb {
-            SlateDbHandle::ReadWrite(db) => Db::new(db),
+            SlateDbHandle::ReadWrite(db) => Db::new(db, metrics_recorder),
             SlateDbHandle::ReadOnly(reader) => Db::new_read_only(reader),
         });
 
@@ -294,7 +299,7 @@ impl ZeroFS {
                 .await?,
         );
 
-        Self::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX).await
+        Self::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None).await
     }
 
     #[cfg(test)]
@@ -306,7 +311,6 @@ impl ZeroFS {
         use arc_swap::ArcSwap;
         use slatedb::BlockTransformer;
         use slatedb::DbReader;
-        use slatedb::config::DbReaderOptions;
         use slatedb::object_store::path::Path;
 
         let test_key = [0u8; 32];
@@ -315,19 +319,18 @@ impl ZeroFS {
 
         let db_path = Path::from("test_slatedb");
         let reader = Arc::new(
-            DbReader::open(
-                db_path,
-                object_store,
-                None,
-                DbReaderOptions {
-                    block_transformer: Some(block_transformer),
-                    ..Default::default()
-                },
-            )
-            .await?,
+            DbReader::builder(db_path, object_store)
+                .with_block_transformer(block_transformer)
+                .build()
+                .await?,
         );
 
-        Self::new_with_slatedb(SlateDbHandle::ReadOnly(ArcSwap::new(reader)), u64::MAX).await
+        Self::new_with_slatedb(
+            SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+            u64::MAX,
+            None,
+        )
+        .await
     }
 
     pub async fn is_ancestor_of(
@@ -1494,7 +1497,14 @@ impl ZeroFS {
         id: InodeId,
         setattr: &SetAttributes,
     ) -> Result<FileAttributes, FsError> {
-        debug!("setattr: id={}, setattr={:?}", id, setattr);
+        debug!(
+            "setattr: id={}, setattr={:?}, creds=(uid={}, gid={}, groups={:?})",
+            id,
+            setattr,
+            creds.uid,
+            creds.gid,
+            &creds.groups[..creds.groups_count]
+        );
         let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
 
@@ -1510,11 +1520,26 @@ impl ZeroFS {
         let changing_gid = matches!(&setattr.gid, SetGid::Set(_));
 
         if (changing_uid || changing_gid) && creds.uid != 0 {
+            debug!(
+                "setattr: non-root chown attempt: creds.uid={}, inode.uid={}, changing_uid={}, changing_gid={}, setattr.uid={:?}, setattr.gid={:?}",
+                creds.uid,
+                inode.uid(),
+                changing_uid,
+                changing_gid,
+                setattr.uid,
+                setattr.gid
+            );
             check_ownership(&inode, creds)?;
 
             if let SetUid::Set(new_uid) = setattr.uid
                 && new_uid != creds.uid
             {
+                debug!(
+                    "setattr: denied uid change from {} to {} by non-root user {}",
+                    inode.uid(),
+                    new_uid,
+                    creds.uid
+                );
                 return Err(FsError::OperationNotPermitted);
             }
 
@@ -1522,6 +1547,10 @@ impl ZeroFS {
             if let SetGid::Set(new_gid) = setattr.gid
                 && !creds.is_member_of_group(new_gid)
             {
+                debug!(
+                    "setattr: denied gid change to {} - user {} is not a member of that group",
+                    new_gid, creds.uid
+                );
                 return Err(FsError::OperationNotPermitted);
             }
         }
@@ -2878,7 +2907,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let fs_rw = ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX)
+        let fs_rw = ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None)
             .await
             .unwrap();
 

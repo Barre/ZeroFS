@@ -199,7 +199,7 @@ pub struct LsmConfig {
 }
 
 impl LsmConfig {
-    /// Default l0_max_ssts: 16
+    /// Default l0_max_ssts: 16.
     pub const DEFAULT_L0_MAX_SSTS: usize = 16;
     /// Default max_unflushed_gb: 1.0 GiB
     pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;

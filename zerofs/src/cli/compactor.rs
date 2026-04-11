@@ -60,7 +60,8 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
 
     let compactor_options = CompactorOptions {
         max_concurrent_compactions,
-        max_sst_size: 1024 * 1024 * 1024,
+        max_sst_size: 512 * 1024 * 1024,
+        max_fetch_tasks: 8,
         ..Default::default()
     };
 

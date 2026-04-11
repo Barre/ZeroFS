@@ -22,6 +22,13 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
+# Release build with debug symbols preserved so `jeprof` can resolve Rust
+# call sites in jemalloc heap dumps. Use with `--features heap-profiling`.
+[profile.release-prof]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
 [features]
 default = ["vendored-protoc"]
 tokio-console = ["dep:console-subscriber"]
@@ -29,16 +36,18 @@ failpoints = ["dep:fail"]
 vendored-protoc = ["dep:protobuf-src"]
 webui = ["dep:rust-embed", "dep:axum", "dep:tonic-web", "dep:tower-http"]
 
+
 [dependencies]
 reqwest = { version = "0.12", default-features = false }
 console-subscriber = { version = "0.5", optional = true }
-slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "ac472bfbfb1c276586b7692ef6b946841942d5c6", features = [
+slatedb = { git = "https://github.com/Barre/slatedb.git", branch = "memory-allocation-fixes", features = [
     "wal_disable",
 ] }
+slatedb-common = { git = "https://github.com/Barre/slatedb.git", branch = "memory-allocation-fixes" }
 fastant = "0.1.11"
 foyer-memory = "0.22"
 zerofs_nfsserve = "0.19.1"
-mimalloc = { version = "0.1", features = ["v3"] }
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 tokio = { version = "1.49", features = ["full", "tracing"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"
