@@ -10,6 +10,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::{DbReader, WriteBatch};
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -59,7 +60,7 @@ impl Transaction {
     }
 
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
-        self.inner.put(key, &value);
+        self.inner.put_bytes(key.clone(), value);
     }
 
     pub fn delete_bytes(&mut self, key: &Bytes) {
@@ -83,18 +84,24 @@ impl Default for Transaction {
 /// simply passes through operations without additional encryption/decryption.
 pub struct Db {
     inner: SlateDbHandle,
+    metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
 }
 
 impl Db {
-    pub fn new(db: Arc<slatedb::Db>) -> Self {
+    pub fn new(
+        db: Arc<slatedb::Db>,
+        metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    ) -> Self {
         Self {
             inner: SlateDbHandle::ReadWrite(db),
+            metrics_recorder,
         }
     }
 
     pub fn new_read_only(db_reader: ArcSwap<DbReader>) -> Self {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
+            metrics_recorder: None,
         }
     }
 
@@ -224,11 +231,8 @@ impl Db {
         Ok(())
     }
 
-    pub fn slatedb_metrics(&self) -> Option<Arc<slatedb::stats::StatRegistry>> {
-        match &self.inner {
-            SlateDbHandle::ReadWrite(db) => Some(db.metrics()),
-            SlateDbHandle::ReadOnly(_) => None,
-        }
+    pub fn slatedb_metrics(&self) -> Option<Arc<DefaultMetricsRecorder>> {
+        self.metrics_recorder.clone()
     }
 
     pub async fn close(&self) -> Result<()> {

@@ -1,6 +1,5 @@
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
-use crate::cache::FoyerCache;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
@@ -17,11 +16,11 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use slatedb::admin::AdminBuilder;
 use slatedb::config::{
-    DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions,
-    ObjectStoreCacheOptions,
+    GarbageCollectorDirectoryOptions, GarbageCollectorOptions, ObjectStoreCacheOptions,
 };
 use slatedb::object_store::path::Path;
 use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader};
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -342,7 +341,11 @@ pub async fn build_slatedb(
     disable_compactor: bool,
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-) -> Result<(SlateDbHandle, Option<tokio::runtime::Handle>)> {
+) -> Result<(
+    SlateDbHandle,
+    Option<tokio::runtime::Handle>,
+    Option<Arc<DefaultMetricsRecorder>>,
+)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -387,7 +390,8 @@ pub async fn build_slatedb(
         },
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
-        compression_codec: None, // Disable compression - we handle it in encryption layer
+        compression_codec: None, // Disable compression as we handle it in encryption layer
+        l0_flush_parallelism: 4,
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
@@ -409,7 +413,12 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    let cache = Arc::new(FoyerCache::new(slatedb_memory_cache_bytes as usize));
+    let cache = Arc::new(slatedb::db_cache::foyer::FoyerCache::new_with_opts(
+        slatedb::db_cache::foyer::FoyerCacheOptions {
+            max_capacity: slatedb_memory_cache_bytes,
+            ..Default::default()
+        },
+    ));
 
     let db_path = Path::from(db_path);
 
@@ -434,12 +443,15 @@ pub async fn build_slatedb(
                 info!("Opening database in read-write mode");
             }
 
+            let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+
             let mut builder = DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
                 .with_gc_runtime(runtime_handle.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block4Kib)
                 .with_db_cache(cache)
-                .with_block_transformer(block_transformer);
+                .with_block_transformer(block_transformer)
+                .with_metrics_recorder(metrics_recorder.clone());
 
             if let Some(wal_store) = wal_object_store {
                 builder = builder.with_wal_object_store(wal_store);
@@ -451,6 +463,7 @@ pub async fn build_slatedb(
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
+                        max_fetch_tasks: 8,
                         ..Default::default()
                     });
 
@@ -459,40 +472,36 @@ pub async fn build_slatedb(
 
             let slatedb = Arc::new(builder.build().await?);
 
-            Ok((SlateDbHandle::ReadWrite(slatedb), Some(runtime_handle)))
+            Ok((
+                SlateDbHandle::ReadWrite(slatedb),
+                Some(runtime_handle),
+                Some(metrics_recorder),
+            ))
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
 
-            let reader_options = DbReaderOptions {
-                block_transformer: Some(block_transformer),
-                ..Default::default()
-            };
             let mut reader_builder =
-                DbReader::builder(db_path, object_store).with_options(reader_options);
+                DbReader::builder(db_path, object_store).with_block_transformer(block_transformer);
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
             let reader = Arc::new(reader_builder.build().await?);
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
 
-            let reader_options = DbReaderOptions {
-                block_transformer: Some(block_transformer),
-                ..Default::default()
-            };
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_checkpoint_id(checkpoint_id)
-                .with_options(reader_options);
+                .with_block_transformer(block_transformer);
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
             let reader = Arc::new(reader_builder.build().await?);
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
         }
     }
 }
@@ -581,7 +590,7 @@ async fn initialize_filesystem(
             None
         };
 
-    let (slatedb, maintenance_runtime) = build_slatedb(
+    let (slatedb, maintenance_runtime, metrics_recorder) = build_slatedb(
         object_store.clone(),
         &cache_config,
         actual_db_path.clone(),
@@ -594,13 +603,14 @@ async fn initialize_filesystem(
     .await?;
 
     let db_handle = slatedb.clone();
-    let fs = ZeroFS::new_with_slatedb(slatedb, settings.max_bytes()).await?;
+    let fs =
+        ZeroFS::new_with_slatedb(slatedb, settings.max_bytes(), metrics_recorder.clone()).await?;
 
     Ok(InitResult {
         fs: Arc::new(fs),
         object_store,
         wal_object_store,
-        db_path: actual_db_path,
+        db_path: actual_db_path.to_string(),
         db_handle,
         maintenance_runtime,
     })

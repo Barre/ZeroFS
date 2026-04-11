@@ -4,7 +4,7 @@ use crate::fs::stats::FileSystemGlobalStats;
 use crate::task::spawn_named;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use slatedb::stats::{MetricType, StatRegistry};
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -20,7 +20,7 @@ pub fn start(
     config: &PrometheusConfig,
     fs_stats: Arc<FileSystemStats>,
     global_stats: Arc<FileSystemGlobalStats>,
-    slatedb_registry: Option<Arc<StatRegistry>>,
+    slatedb_registry: Option<Arc<DefaultMetricsRecorder>>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -159,17 +159,22 @@ fn collect_global_stats(stats: &FileSystemGlobalStats) {
     gauge!("zerofs_used_inodes").set(used_inodes as f64);
 }
 
-fn collect_slatedb_stats(registry: &StatRegistry) {
-    for name in registry.names() {
-        if let Some(stat) = registry.lookup(name) {
-            let prom_name = format!("slatedb_{}", name.replace('/', "_"));
-            match stat.metric_type() {
-                MetricType::Counter => {
-                    counter!(prom_name).absolute(stat.get() as u64);
-                }
-                MetricType::Gauge => {
-                    gauge!(prom_name).set(stat.get() as f64);
-                }
+fn collect_slatedb_stats(recorder: &DefaultMetricsRecorder) {
+    let snapshot = recorder.snapshot();
+    for metric in snapshot.all() {
+        let prom_name = format!("slatedb_{}", metric.name.replace('.', "_"));
+        match &metric.value {
+            MetricValue::Counter(v) => {
+                counter!(prom_name).absolute(*v);
+            }
+            MetricValue::Gauge(v) => {
+                gauge!(prom_name).set(*v as f64);
+            }
+            MetricValue::UpDownCounter(v) => {
+                gauge!(prom_name).set(*v as f64);
+            }
+            MetricValue::Histogram { sum, .. } => {
+                gauge!(prom_name).set(*sum);
             }
         }
     }
