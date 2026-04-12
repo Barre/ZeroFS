@@ -86,7 +86,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         durability_filter: DurabilityLevel::Memory,
         read_ahead_bytes: 1024 * 1024,
         cache_blocks: false,
-        max_fetch_tasks: 8,
+        max_fetch_tasks: 4,
         ..Default::default()
     };
 

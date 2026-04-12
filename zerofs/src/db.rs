@@ -133,9 +133,9 @@ impl Db {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
-            read_ahead_bytes: 1024 * 1024,
+            read_ahead_bytes: 4 * 1024 * 1024,
             cache_blocks: true,
-            max_fetch_tasks: 16,
+            max_fetch_tasks: 4,
             ..Default::default()
         };
 

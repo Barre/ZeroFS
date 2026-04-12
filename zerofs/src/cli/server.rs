@@ -463,7 +463,7 @@ pub async fn build_slatedb(
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
-                        max_fetch_tasks: 8,
+                        max_fetch_tasks: 4,
                         ..Default::default()
                     });
 
