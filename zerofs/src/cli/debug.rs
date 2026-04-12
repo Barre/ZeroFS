@@ -85,7 +85,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     let scan_options = ScanOptions {
         durability_filter: DurabilityLevel::Memory,
         read_ahead_bytes: 1024 * 1024,
-        cache_blocks: true,
+        cache_blocks: false,
         max_fetch_tasks: 8,
         ..Default::default()
     };
