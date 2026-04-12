@@ -3875,7 +3875,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.12.0"
-source = "git+https://github.com/Barre/slatedb.git?branch=memory-allocation-fixes#5ef7ae1d3bd3bc8e2230ce3a2275e89d78d03dbf"
+source = "git+https://github.com/Barre/slatedb.git?rev=d14e9c177244ce2820e7c2fc7e1d1f63c1758577#d14e9c177244ce2820e7c2fc7e1d1f63c1758577"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3922,7 +3922,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.12.0"
-source = "git+https://github.com/Barre/slatedb.git?branch=memory-allocation-fixes#5ef7ae1d3bd3bc8e2230ce3a2275e89d78d03dbf"
+source = "git+https://github.com/Barre/slatedb.git?rev=d14e9c177244ce2820e7c2fc7e1d1f63c1758577#d14e9c177244ce2820e7c2fc7e1d1f63c1758577"
 dependencies = [
  "chrono",
  "log",
@@ -3933,7 +3933,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.12.0"
-source = "git+https://github.com/Barre/slatedb.git?branch=memory-allocation-fixes#5ef7ae1d3bd3bc8e2230ce3a2275e89d78d03dbf"
+source = "git+https://github.com/Barre/slatedb.git?rev=d14e9c177244ce2820e7c2fc7e1d1f63c1758577#d14e9c177244ce2820e7c2fc7e1d1f63c1758577"
 dependencies = [
  "async-trait",
  "bytes",
