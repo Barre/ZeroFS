@@ -244,7 +244,7 @@ impl LsmConfig {
     }
 
     pub fn wal_enabled(&self) -> bool {
-        self.wal_enabled.unwrap_or(true)
+        self.wal_enabled.unwrap_or(false)
     }
 }
 
@@ -633,7 +633,7 @@ impl Settings {
         toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
-        toml_string.push_str("# wal_enabled = true               # Whether the write-ahead log (WAL) is enabled (default: true)\n");
+        toml_string.push_str("# wal_enabled = false              # Whether the write-ahead log (WAL) is enabled (default: false)\n");
 
         toml_string.push_str("\n# Optional separate WAL (Write-Ahead Log) object store\n");
         toml_string.push_str("# Use a faster/closer store for WAL to improve fsync latency\n");

@@ -224,8 +224,8 @@ addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
 [lsm]
-wal_enabled = true  # WAL reduces compaction churn from frequent fsyncs (default: true)
-                    # Disable for bulk data loading where fsyncs are rare
+wal_enabled = false  # WAL reduces compaction churn from frequent fsyncs (default: false)
+                     # Enable for fsync-heavy workloads to reduce compaction overhead
 
 [aws]
 access_key_id = "${AWS_ACCESS_KEY_ID}"
