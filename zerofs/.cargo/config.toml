@@ -3,3 +3,6 @@ rustflags = ["-C", "target-cpu=x86-64-v3", "--cfg", "tokio_unstable"]
 
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+
+[env]
+JEMALLOC_SYS_WITH_MALLOC_CONF = "retain:false,dirty_decay_ms:0,muzzy_decay_ms:0,background_thread:true"

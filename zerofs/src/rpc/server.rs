@@ -27,9 +27,44 @@ fn take_until_cancelled<S: tokio_stream::Stream + Unpin + Send + 'static>(
     });
     Box::pin(output)
 }
+use tikv_jemalloc_ctl::{epoch as jemalloc_epoch, stats as jemalloc_stats};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 use tracing::info;
+
+/// Snapshot of jemalloc memory statistics.
+#[derive(Clone, Copy, Default)]
+pub struct JemallocMemStats {
+    /// Bytes actively allocated by the application.
+    pub allocated: u64,
+    /// Bytes in physically resident pages mapped by the allocator.
+    pub resident: u64,
+    /// Bytes in active pages mapped by the allocator.
+    pub mapped: u64,
+    /// Bytes in virtual memory mappings retained for future reuse.
+    pub retained: u64,
+    /// Bytes dedicated to allocator metadata.
+    pub metadata: u64,
+}
+
+impl JemallocMemStats {
+    /// Read current jemalloc stats. Advances the epoch first so the values
+    /// are fresh.
+    pub fn read() -> Self {
+        // Advance the epoch to refresh cached stats
+        if jemalloc_epoch::mib().and_then(|e| e.advance()).is_err() {
+            return Self::default();
+        }
+
+        Self {
+            allocated: jemalloc_stats::allocated::read().unwrap_or(0) as u64,
+            resident: jemalloc_stats::resident::read().unwrap_or(0) as u64,
+            mapped: jemalloc_stats::mapped::read().unwrap_or(0) as u64,
+            retained: jemalloc_stats::retained::read().unwrap_or(0) as u64,
+            metadata: jemalloc_stats::metadata::read().unwrap_or(0) as u64,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AdminRpcServer {
@@ -177,12 +212,12 @@ impl AdminService for AdminRpcServer {
         let fs_stats = Arc::clone(&self.fs_stats);
         let global_stats = Arc::clone(&self.global_stats);
         let max_bytes = self.max_bytes;
-
         let stream = IntervalStream::new(tokio::time::interval(std::time::Duration::from_millis(
             interval_ms,
         )))
         .map(move |_| {
             let (used_bytes, used_inodes) = global_stats.get_totals();
+            let mem = JemallocMemStats::read();
             Ok(proto::StatsSnapshot {
                 timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
                 files_created: fs_stats.files_created.load(Ordering::Relaxed),
@@ -206,6 +241,11 @@ impl AdminService for AdminRpcServer {
                 used_bytes,
                 used_inodes,
                 max_bytes,
+                jemalloc_allocated: mem.allocated,
+                jemalloc_resident: mem.resident,
+                jemalloc_mapped: mem.mapped,
+                jemalloc_retained: mem.retained,
+                jemalloc_metadata: mem.metadata,
             })
         });
 

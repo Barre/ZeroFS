@@ -1290,8 +1290,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "642093b1a72c4a0ef89862484d669a353e732974781bb9c49a979526d1e30edc"
 dependencies = [
  "equivalent",
- "foyer-common 0.18.1",
- "foyer-memory 0.18.1",
+ "foyer-common",
+ "foyer-memory",
  "foyer-storage",
  "madsim-tokio",
  "mixtrics",
@@ -1323,22 +1323,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "foyer-common"
-version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3db80d5dece93adb7ad709c84578794724a9cba342a7e566c3551c7ec626789"
-dependencies = [
- "anyhow",
- "bytes",
- "cfg-if",
- "foyer-tokio",
- "mixtrics",
- "parking_lot",
- "pin-project",
- "twox-hash",
-]
-
-[[package]]
 name = "foyer-intrusive-collections"
 version = "0.10.0-dev"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,7 +1341,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cmsketch",
  "equivalent",
- "foyer-common 0.18.1",
+ "foyer-common",
  "foyer-intrusive-collections",
  "hashbrown 0.15.5",
  "itertools",
@@ -1368,31 +1352,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "foyer-memory"
-version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db907f40a527ca2aa2f40a5f68b32ea58aa70f050cd233518e9ffd402cfba6ce"
-dependencies = [
- "anyhow",
- "bitflags 2.11.0",
- "cmsketch",
- "equivalent",
- "foyer-common 0.22.3",
- "foyer-intrusive-collections",
- "foyer-tokio",
- "futures-util",
- "hashbrown 0.16.1",
- "itertools",
- "mea",
- "mixtrics",
- "parking_lot",
- "paste",
- "pin-project",
- "serde",
  "tracing",
 ]
 
@@ -1408,8 +1367,8 @@ dependencies = [
  "bytes",
  "equivalent",
  "flume",
- "foyer-common 0.18.1",
- "foyer-memory 0.18.1",
+ "foyer-common",
+ "foyer-memory",
  "fs4",
  "futures-core",
  "futures-util",
@@ -1428,15 +1387,6 @@ dependencies = [
  "tracing",
  "twox-hash",
  "zstd",
-]
-
-[[package]]
-name = "foyer-tokio"
-version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6577b05a7ffad0db555aedf00bfe52af818220fc4c1c3a7a12520896fc38627"
-dependencies = [
- "tokio",
 ]
 
 [[package]]
@@ -2309,15 +2259,6 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest",
-]
-
-[[package]]
-name = "mea"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6747f54621d156e1b47eb6b25f39a941b9fc347f98f67d25d8881ff99e8ed832"
-dependencies = [
- "slab",
 ]
 
 [[package]]
@@ -4215,6 +4156,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "tikv-jemalloc-sys"
 version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5674,7 +5626,6 @@ dependencies = [
  "deku",
  "fail",
  "fastant",
- "foyer-memory 0.22.3",
  "futures",
  "hkdf",
  "http-body-util",
@@ -5701,6 +5652,7 @@ dependencies = [
  "slatedb-common",
  "tempfile",
  "thiserror 2.0.18",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",

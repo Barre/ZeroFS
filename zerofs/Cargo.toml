@@ -45,9 +45,9 @@ slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "d14e9c177244ce2
 ] }
 slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "d14e9c177244ce2820e7c2fc7e1d1f63c1758577" }
 fastant = "0.1.11"
-foyer-memory = "0.22"
 zerofs_nfsserve = "0.19.1"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tokio = { version = "1.49", features = ["full", "tracing"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"

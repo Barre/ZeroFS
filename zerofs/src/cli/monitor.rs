@@ -198,6 +198,7 @@ fn ui(f: &mut Frame, app: &MonitorApp) {
         Constraint::Fill(1),   // IOPS chart
         Constraint::Length(3), // sparkline + storage row
         Constraint::Length(5), // counters row
+        Constraint::Length(3), // memory row
         Constraint::Length(1), // footer
     ])
     .split(f.area());
@@ -233,6 +234,9 @@ fn ui(f: &mut Frame, app: &MonitorApp) {
         .split(outer[4]);
     render_operations(f, app, row4[0]);
     render_gc_stats(f, app, row4[1]);
+
+    // Memory row
+    render_memory_stats(f, app, outer[5]);
 
     // Footer
     let footer = Paragraph::new("Press q to quit")
@@ -467,6 +471,55 @@ fn render_gc_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let para = Paragraph::new(lines).block(
         Block::bordered()
             .title(" Garbage Collection (since startup) ")
+            .title_style(Style::default().fg(Color::Yellow).bold()),
+    );
+    f.render_widget(para, area);
+}
+
+fn render_memory_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
+    let s = app.current.as_ref();
+    let allocated = s.map(|s| s.jemalloc_allocated).unwrap_or(0);
+    let resident = s.map(|s| s.jemalloc_resident).unwrap_or(0);
+    let retained = s.map(|s| s.jemalloc_retained).unwrap_or(0);
+    let metadata = s.map(|s| s.jemalloc_metadata).unwrap_or(0);
+
+    let fragmentation = if allocated > 0 {
+        ((resident as f64 - allocated as f64) / allocated as f64 * 100.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    let lines = vec![Line::from(vec![
+        Span::styled("Allocated  ", Style::default().fg(Color::White)),
+        Span::styled(
+            format_bytes_human(allocated),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("   "),
+        Span::styled("Resident   ", Style::default().fg(Color::White)),
+        Span::styled(
+            format_bytes_human(resident),
+            Style::default().fg(if fragmentation > 50.0 {
+                Color::Red
+            } else if fragmentation > 25.0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            }),
+        ),
+        Span::raw("   "),
+        Span::styled("Frag  ", Style::default().fg(Color::White)),
+        Span::raw(format!("{:.1}%", fragmentation)),
+        Span::raw("   "),
+        Span::styled("Retained  ", Style::default().fg(Color::White)),
+        Span::raw(format_bytes_human(retained)),
+        Span::raw("   "),
+        Span::styled("Metadata  ", Style::default().fg(Color::White)),
+        Span::raw(format_bytes_human(metadata)),
+    ])];
+    let para = Paragraph::new(lines).block(
+        Block::bordered()
+            .title(" jemalloc Memory ")
             .title_style(Style::default().fg(Color::Yellow).bold()),
     );
     f.render_widget(para, area);
