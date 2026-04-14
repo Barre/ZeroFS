@@ -374,7 +374,7 @@ pub async fn build_slatedb(
         .map(|c| c.max_concurrent_compactions())
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
 
-    let wal_enabled = lsm_config.map(|c| c.wal_enabled()).unwrap_or(true);
+    let wal_enabled = lsm_config.map(|c| c.wal_enabled()).unwrap_or(false);
 
     let settings = slatedb::config::Settings {
         wal_enabled,
