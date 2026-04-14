@@ -57,6 +57,7 @@ pub fn start(
                     if let Some(ref registry) = slatedb_registry {
                         collect_slatedb_stats(registry);
                     }
+                    collect_jemalloc_stats();
                     upkeep_handle.run_upkeep();
                 }
             }
@@ -157,6 +158,15 @@ fn collect_global_stats(stats: &FileSystemGlobalStats) {
     let (used_bytes, used_inodes) = stats.get_totals();
     gauge!("zerofs_used_bytes").set(used_bytes as f64);
     gauge!("zerofs_used_inodes").set(used_inodes as f64);
+}
+
+fn collect_jemalloc_stats() {
+    let mem = crate::rpc::server::JemallocMemStats::read();
+    gauge!("zerofs_jemalloc_allocated_bytes").set(mem.allocated as f64);
+    gauge!("zerofs_jemalloc_resident_bytes").set(mem.resident as f64);
+    gauge!("zerofs_jemalloc_mapped_bytes").set(mem.mapped as f64);
+    gauge!("zerofs_jemalloc_retained_bytes").set(mem.retained as f64);
+    gauge!("zerofs_jemalloc_metadata_bytes").set(mem.metadata as f64);
 }
 
 fn collect_slatedb_stats(recorder: &DefaultMetricsRecorder) {

@@ -121,4 +121,10 @@ message StatsSnapshot {
     uint64 used_bytes = 20;
     uint64 used_inodes = 21;
     uint64 max_bytes = 22;
+    // jemalloc memory stats
+    uint64 jemalloc_allocated = 23;
+    uint64 jemalloc_resident = 24;
+    uint64 jemalloc_mapped = 25;
+    uint64 jemalloc_retained = 26;
+    uint64 jemalloc_metadata = 27;
 }
