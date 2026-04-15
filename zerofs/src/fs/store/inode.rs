@@ -81,10 +81,4 @@ impl InodeStore {
         let key = KeyCodec::inode_key(id);
         txn.delete_bytes(&key);
     }
-
-    pub fn save_counter(&self, txn: &mut Transaction) {
-        let key = KeyCodec::system_counter_key();
-        let next_id = self.next_id.load(Ordering::SeqCst);
-        txn.put_bytes(&key, KeyCodec::encode_counter(next_id));
-    }
 }

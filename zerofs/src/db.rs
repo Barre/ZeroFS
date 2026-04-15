@@ -47,28 +47,48 @@ pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+enum TxOp {
+    Put(Bytes, Bytes),
+    Delete(Bytes),
+}
+
 /// Transaction for batching database writes.
+///
+/// Ops are recorded as a flat vector so the commit coordinator can replay
+/// several transactions into a single merged `WriteBatch` via [`apply_to`].
 pub struct Transaction {
-    inner: WriteBatch,
+    ops: Vec<TxOp>,
 }
 
 impl Transaction {
     pub fn new() -> Self {
-        Self {
-            inner: WriteBatch::new(),
-        }
+        Self { ops: Vec::new() }
     }
 
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
-        self.inner.put_bytes(key.clone(), value);
+        self.ops.push(TxOp::Put(key.clone(), value));
     }
 
     pub fn delete_bytes(&mut self, key: &Bytes) {
-        self.inner.delete(key);
+        self.ops.push(TxOp::Delete(key.clone()));
+    }
+
+    /// Replay this transaction's ops into `target`. SlateDB's `WriteBatch`
+    /// already dedupes per key, so calling this on multiple transactions
+    /// produces one merged batch with last-write-wins per key.
+    pub fn apply_to(self, target: &mut WriteBatch) {
+        for op in self.ops {
+            match op {
+                TxOp::Put(k, v) => target.put_bytes(k, v),
+                TxOp::Delete(k) => target.delete(k),
+            }
+        }
     }
 
     pub fn into_inner(self) -> WriteBatch {
-        self.inner
+        let mut batch = WriteBatch::new();
+        self.apply_to(&mut batch);
+        batch
     }
 }
 
