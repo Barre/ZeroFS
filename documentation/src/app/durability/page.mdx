@@ -76,16 +76,21 @@ ZeroFS provides a total order over all write operations. This order is preserved
 
     ### Ordering Guarantee
 
-    The WriteCoordinator assigns monotonically increasing sequence numbers to operations. Each operation must wait for all predecessors to complete before committing:
+    All write transactions are submitted through a single commit coalescer: each operation sends its transaction to a dedicated worker task that drains the queue, merges pending transactions into one `WriteBatch`, and issues a single atomic write:
 
     ```rust
-    let seq = write_coordinator.allocate_sequence();
-    seq.wait_for_predecessors().await;
-    db.write(txn).await;
-    seq.mark_committed();
+    // caller
+    write_coordinator.commit(txn).await;
+
+    // worker (single task, FIFO drain)
+    let mut batch = vec![rx.recv().await];
+    while let Ok(m) = rx.try_recv() { batch.push(m); }
+    let mut merged = WriteBatch::new();
+    for (txn, _) in &batch { txn.apply_to(&mut merged); }
+    db.write(merged).await;
     ```
 
-    This mechanism ensures that if operation A completes before operation B begins, then in any consistent state of the filesystem, the visibility of B implies the visibility of A.
+    Per-resource locks (inode, directory, stats shard) serialize any operations that observe each other's state, so if operation A completes before operation B begins, B's transaction is sent strictly after A's commit returned — and therefore lands in a strictly later batch. The visibility of B implies the visibility of A.
 
     ### Formal Property
 
@@ -110,7 +115,7 @@ ZeroFS provides a total order over all write operations. This order is preserved
 
     Such reordering can result in states where a later write is visible while an earlier write is not. Applications that depend on ordering semantics (databases, logging systems, configuration management) may observe inconsistent state after recovery.
 
-    ZeroFS eliminates this class of problems by construction. The sequence number mechanism enforces a total order that survives crashes.
+    ZeroFS eliminates this class of problems by construction. The single-writer commit path enforces a total order over batches that survives crashes.
 
   </Col>
 </Row>
@@ -399,7 +404,7 @@ ZeroFS provides the following durability and consistency guarantees:
     Filesystem operations are atomic. Each operation either completes fully or has no effect. Partial or torn writes are not possible.
   </Property>
   <Property name="Total Ordering">
-    All operations are assigned sequence numbers that define a total order. This order is preserved across crashes. If operation B is visible after recovery, all operations that completed before B started are also visible.
+    All write operations flow through a single-writer commit path that defines a total order over batches. This order is preserved across crashes. If operation B is visible after recovery, all operations that completed before B started are also visible.
   </Property>
   <Property name="Immediate Recovery">
     No recovery procedure is required after unexpected termination. The filesystem resumes operation by reading the current manifest from object storage.

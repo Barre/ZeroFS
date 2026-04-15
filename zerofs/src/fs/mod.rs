@@ -20,7 +20,7 @@ use self::stats::{FileSystemGlobalStats, StatsShardData};
 use self::store::{ChunkStore, DirectoryStore, InodeStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
-use crate::db::{Db, SlateDbHandle, Transaction};
+use crate::db::{Db, SlateDbHandle};
 use slatedb::config::{PutOptions, WriteOptions};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
@@ -32,7 +32,6 @@ use crate::failpoints as fp;
 use fp::fail_point;
 
 pub use self::gc::GarbageCollector;
-pub use self::write_coordinator::SequenceGuard;
 
 use self::errors::FsError;
 use self::inode::{
@@ -92,7 +91,7 @@ pub struct ZeroFS {
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
-    pub write_coordinator: Arc<WriteCoordinator>,
+    pub write_coordinator: WriteCoordinator,
     pub max_bytes: u64,
     pub tracer: AccessTracer,
 }
@@ -172,12 +171,12 @@ impl ZeroFS {
         }
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
-        let write_coordinator = Arc::new(WriteCoordinator::new());
         let stats = Arc::new(FileSystemStats::new());
         let chunk_store = ChunkStore::new(db.clone());
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
+        let write_coordinator = WriteCoordinator::new(db.clone(), inode_store.clone());
 
         let fs = Self {
             db: db.clone(),
@@ -195,29 +194,6 @@ impl ZeroFS {
         };
 
         Ok(fs)
-    }
-
-    pub async fn commit_transaction(
-        &self,
-        mut txn: Transaction,
-        seq_guard: &mut SequenceGuard,
-    ) -> Result<(), FsError> {
-        self.inode_store.save_counter(&mut txn);
-
-        seq_guard.wait_for_predecessors().await;
-
-        self.db
-            .write_with_options(
-                txn.into_inner(),
-                &WriteOptions {
-                    await_durable: false,
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)?;
-
-        seq_guard.mark_committed();
-        Ok(())
     }
 
     /// Resolve inode ID to full path components by walking parent chain
@@ -495,8 +471,7 @@ impl ZeroFS {
                 };
 
                 let db_write_start = std::time::Instant::now();
-                let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard).await?;
+                self.write_coordinator.commit(txn).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
 
                 #[cfg(feature = "failpoints")]
@@ -645,12 +620,9 @@ impl ZeroFS {
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
-                let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard)
-                    .await
-                    .inspect_err(|e| {
-                        error!("Failed to write batch: {:?}", e);
-                    })?;
+                self.write_coordinator.commit(txn).await.inspect_err(|e| {
+                    error!("Failed to write batch: {:?}", e);
+                })?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_COMMIT);
@@ -789,12 +761,9 @@ impl ZeroFS {
             .zero_range(&mut txn, id, offset, length, file.size)
             .await;
 
-        let mut seq_guard = self.write_coordinator.allocate_sequence();
-        self.commit_transaction(txn, &mut seq_guard)
-            .await
-            .inspect_err(|e| {
-                error!("Failed to commit trim batch: {}", e);
-            })?;
+        self.write_coordinator.commit(txn).await.inspect_err(|e| {
+            error!("Failed to commit trim batch: {}", e);
+        })?;
 
         debug!("Trim completed successfully for inode {}", id);
 
@@ -1000,8 +969,7 @@ impl ZeroFS {
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
-                let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard).await?;
+                self.write_coordinator.commit(txn).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_COMMIT);
@@ -1302,8 +1270,7 @@ impl ZeroFS {
         self.global_stats
             .add_to_transaction(&stats_update, &mut txn)?;
 
-        let mut seq_guard = self.write_coordinator.allocate_sequence();
-        self.commit_transaction(txn, &mut seq_guard).await?;
+        self.write_coordinator.commit(txn).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::SYMLINK_AFTER_COMMIT);
@@ -1465,8 +1432,7 @@ impl ZeroFS {
                 .ok();
         }
 
-        let mut seq_guard = self.write_coordinator.allocate_sequence();
-        self.commit_transaction(txn, &mut seq_guard).await?;
+        self.write_coordinator.commit(txn).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::LINK_AFTER_COMMIT);
@@ -1635,8 +1601,7 @@ impl ZeroFS {
                             None
                         };
 
-                        let mut seq_guard = self.write_coordinator.allocate_sequence();
-                        self.commit_transaction(txn, &mut seq_guard).await?;
+                        self.write_coordinator.commit(txn).await?;
 
                         #[cfg(feature = "failpoints")]
                         fail_point!(fp::TRUNCATE_AFTER_COMMIT);
@@ -1933,8 +1898,7 @@ impl ZeroFS {
                 .await?;
         }
 
-        let mut seq_guard = self.write_coordinator.allocate_sequence();
-        self.commit_transaction(txn, &mut seq_guard).await?;
+        self.write_coordinator.commit(txn).await?;
 
         self.tracer
             .emit(
@@ -2069,8 +2033,7 @@ impl ZeroFS {
                 self.global_stats
                     .add_to_transaction(&stats_update, &mut txn)?;
 
-                let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard).await?;
+                self.write_coordinator.commit(txn).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_COMMIT);
@@ -2272,8 +2235,7 @@ impl ZeroFS {
                     self.global_stats.add_to_transaction(update, &mut txn)?;
                 }
 
-                let mut seq_guard = self.write_coordinator.allocate_sequence();
-                self.commit_transaction(txn, &mut seq_guard).await?;
+                self.write_coordinator.commit(txn).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::REMOVE_AFTER_COMMIT);
@@ -2706,8 +2668,7 @@ impl ZeroFS {
             self.global_stats.add_to_transaction(update, &mut txn)?;
         }
 
-        let mut seq_guard = self.write_coordinator.allocate_sequence();
-        self.commit_transaction(txn, &mut seq_guard).await?;
+        self.write_coordinator.commit(txn).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);
@@ -2817,8 +2778,7 @@ mod tests {
 
         let mut txn = fs.db.new_transaction().unwrap();
         fs.inode_store.save(&mut txn, inode_id, &inode).unwrap();
-        let mut seq_guard = fs.write_coordinator.allocate_sequence();
-        fs.commit_transaction(txn, &mut seq_guard).await.unwrap();
+        fs.write_coordinator.commit(txn).await.unwrap();
 
         let loaded_inode = fs.inode_store.get(inode_id).await.unwrap();
         match loaded_inode {
@@ -2932,8 +2892,7 @@ mod tests {
             .inode_store
             .save(&mut txn, test_inode_id, &Inode::File(file_inode.clone()))
             .unwrap();
-        let mut seq_guard = fs_rw.write_coordinator.allocate_sequence();
-        fs_rw.commit_transaction(txn, &mut seq_guard).await.unwrap();
+        fs_rw.write_coordinator.commit(txn).await.unwrap();
 
         fs_rw.flush_coordinator.flush().await.unwrap();
         drop(fs_rw);
@@ -3788,8 +3747,7 @@ mod tests {
         }
         let mut txn = fs.db.new_transaction().unwrap();
         fs.inode_store.save(&mut txn, file_id, &inode).unwrap();
-        let mut seq_guard = fs.write_coordinator.allocate_sequence();
-        fs.commit_transaction(txn, &mut seq_guard).await.unwrap();
+        fs.write_coordinator.commit(txn).await.unwrap();
 
         // Create one more hardlink - should succeed
         let result = fs

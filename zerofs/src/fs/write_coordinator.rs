@@ -1,139 +1,95 @@
-use dashmap::DashMap;
+//! Commit coalescer: batched DB writes through a single worker task.
+//!
+//! Each `commit(txn)` call sends the transaction through an mpsc channel to one
+//! worker task. The worker drains all currently-queued messages, merges their
+//! ops into a single `WriteBatch`, attaches a `system_counter_key` write if the
+//! inode counter advanced since the last emission, submits one
+//! `db.write_with_options`, and replies to every caller in the batch.
+
+use crate::db::{Db, Transaction};
+use crate::fs::errors::FsError;
+use crate::fs::key_codec::KeyCodec;
+use crate::fs::store::InodeStore;
+use crate::task::spawn_named;
+use slatedb::WriteBatch;
+use slatedb::config::WriteOptions;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::watch;
-use tracing::trace;
+use tokio::sync::{mpsc, oneshot};
 
-pub type SequenceNumber = u64;
+type Reply = oneshot::Sender<Result<(), FsError>>;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum SequenceState {
-    Pending,
-    Abandoned,
-    Committed,
-}
-
+#[derive(Clone)]
 pub struct WriteCoordinator {
-    next_sequence: AtomicU64,
-    /// All sequences <= this value are complete
-    committed_watermark: AtomicU64,
-    pending_sequences: DashMap<SequenceNumber, SequenceState>,
-    watermark_sender: watch::Sender<u64>,
-    watermark_receiver: watch::Receiver<u64>,
+    sender: mpsc::UnboundedSender<(Transaction, Reply)>,
 }
 
 impl WriteCoordinator {
-    pub fn new() -> Self {
-        let (tx, rx) = watch::channel(0);
-        Self {
-            next_sequence: AtomicU64::new(1),
-            committed_watermark: AtomicU64::new(0),
-            pending_sequences: DashMap::new(),
-            watermark_sender: tx,
-            watermark_receiver: rx,
-        }
+    pub fn new(db: Arc<Db>, inode_store: InodeStore) -> Self {
+        // Capture synchronously: the spawned task starts later, by which point
+        // callers may already have bumped `next_id`. If we captured inside the
+        // task we'd over-shoot and skip the first emit.
+        let initial_counter = inode_store.next_id();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        spawn_named(
+            "commit-worker",
+            worker_loop(db, inode_store, receiver, initial_counter),
+        );
+        Self { sender }
     }
 
-    pub fn allocate_sequence(self: &Arc<Self>) -> SequenceGuard {
-        let seq = self.next_sequence.fetch_add(1, Ordering::SeqCst);
-        self.pending_sequences.insert(seq, SequenceState::Pending);
-        SequenceGuard {
-            sequence: seq,
-            coordinator: Arc::clone(self),
-            completed: false,
-        }
-    }
-
-    pub async fn wait_for_predecessors(&self, seq: SequenceNumber) {
-        let target = seq.saturating_sub(1);
-
-        if self.committed_watermark.load(Ordering::SeqCst) >= target {
-            return;
-        }
-
-        let mut rx = self.watermark_receiver.clone();
-        loop {
-            if self.committed_watermark.load(Ordering::SeqCst) >= target {
-                return;
-            }
-
-            if rx.changed().await.is_err() {
-                trace!(
-                    "Write coordinator channel closed while waiting for seq {}",
-                    seq
-                );
-                return;
-            }
-        }
-    }
-
-    fn mark_committed(&self, seq: SequenceNumber) {
-        if let Some(mut slot) = self.pending_sequences.get_mut(&seq) {
-            *slot = SequenceState::Committed;
-        }
-        self.try_advance_watermark();
-    }
-
-    fn mark_abandoned(&self, seq: SequenceNumber) {
-        if let Some(mut slot) = self.pending_sequences.get_mut(&seq) {
-            *slot = SequenceState::Abandoned;
-        }
-        self.try_advance_watermark();
-    }
-
-    fn try_advance_watermark(&self) {
-        let mut current = self.committed_watermark.load(Ordering::SeqCst);
-
-        loop {
-            let next = current + 1;
-
-            let can_advance = match self.pending_sequences.get(&next) {
-                Some(slot) => matches!(*slot, SequenceState::Committed | SequenceState::Abandoned),
-                None => false,
-            };
-
-            if can_advance {
-                self.pending_sequences.remove(&next);
-                self.committed_watermark.store(next, Ordering::SeqCst);
-                let _ = self.watermark_sender.send(next);
-                current = next;
-            } else {
-                break;
-            }
-        }
+    pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send((txn, reply_tx))
+            .map_err(|_| FsError::IoError)?;
+        reply_rx.await.map_err(|_| FsError::IoError)?
     }
 }
 
-impl Default for WriteCoordinator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+async fn worker_loop(
+    db: Arc<Db>,
+    inode_store: InodeStore,
+    mut rx: mpsc::UnboundedReceiver<(Transaction, Reply)>,
+    initial_counter: u64,
+) {
+    let mut last_emitted_counter = initial_counter;
 
-/// RAII guard: marks sequence as abandoned on drop if not committed
-pub struct SequenceGuard {
-    sequence: SequenceNumber,
-    coordinator: Arc<WriteCoordinator>,
-    completed: bool,
-}
-
-impl SequenceGuard {
-    pub async fn wait_for_predecessors(&self) {
-        self.coordinator.wait_for_predecessors(self.sequence).await;
-    }
-
-    pub fn mark_committed(&mut self) {
-        if !self.completed {
-            self.completed = true;
-            self.coordinator.mark_committed(self.sequence);
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while let Ok(msg) = rx.try_recv() {
+            batch.push(msg);
         }
-    }
-}
 
-impl Drop for SequenceGuard {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.coordinator.mark_abandoned(self.sequence);
+        let mut merged = WriteBatch::new();
+        let mut replies = Vec::with_capacity(batch.len());
+        for (txn, reply) in batch {
+            txn.apply_to(&mut merged);
+            replies.push(reply);
+        }
+
+        // Emit the inode counter only if `next_id` actually advanced since the
+        // last emission. See the module doc for why this value is always a safe
+        // upper bound on every inode id in this batch.
+        let current = inode_store.next_id();
+        if current > last_emitted_counter {
+            merged.put_bytes(
+                KeyCodec::system_counter_key(),
+                KeyCodec::encode_counter(current),
+            );
+            last_emitted_counter = current;
+        }
+
+        let result = db
+            .write_with_options(
+                merged,
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|_| FsError::IoError);
+        for reply in replies {
+            let _ = reply.send(result);
         }
     }
 }
@@ -141,168 +97,80 @@ impl Drop for SequenceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::fs::ZeroFS;
+    use bytes::Bytes;
 
-    #[tokio::test]
-    async fn test_sequential_commits() {
-        let coordinator = Arc::new(WriteCoordinator::new());
-
-        let mut guard1 = coordinator.allocate_sequence();
-        let mut guard2 = coordinator.allocate_sequence();
-        let mut guard3 = coordinator.allocate_sequence();
-
-        assert_eq!(guard1.sequence, 1);
-        assert_eq!(guard2.sequence, 2);
-        assert_eq!(guard3.sequence, 3);
-
-        guard1.wait_for_predecessors().await;
-        guard1.mark_committed();
-
-        guard2.wait_for_predecessors().await;
-        guard2.mark_committed();
-
-        guard3.wait_for_predecessors().await;
-        guard3.mark_committed();
-
-        assert_eq!(coordinator.committed_watermark.load(Ordering::SeqCst), 3);
+    async fn make_fs() -> ZeroFS {
+        ZeroFS::new_in_memory().await.unwrap()
     }
 
     #[tokio::test]
-    async fn test_out_of_order_waits() {
-        let coordinator = Arc::new(WriteCoordinator::new());
-
-        let mut guard1 = coordinator.allocate_sequence();
-        let mut guard2 = coordinator.allocate_sequence();
-
-        let coord_clone = Arc::clone(&coordinator);
-        let handle = tokio::spawn(async move {
-            guard2.wait_for_predecessors().await;
-            guard2.mark_committed();
-        });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(coord_clone.committed_watermark.load(Ordering::SeqCst), 0);
-
-        guard1.wait_for_predecessors().await;
-        guard1.mark_committed();
-
-        handle.await.unwrap();
-
-        assert_eq!(coord_clone.committed_watermark.load(Ordering::SeqCst), 2);
+    async fn commits_single_transaction() {
+        let fs = make_fs().await;
+        let mut txn = Transaction::new();
+        let key = Bytes::from("single/key");
+        txn.put_bytes(&key, Bytes::from_static(b"value"));
+        fs.write_coordinator.commit(txn).await.unwrap();
+        let v = fs.db.get_bytes(&key).await.unwrap();
+        assert_eq!(v.as_deref(), Some(&b"value"[..]));
     }
 
     #[tokio::test]
-    async fn test_abandoned_sequence_unblocks_successors() {
-        let coordinator = Arc::new(WriteCoordinator::new());
-
-        let guard1 = coordinator.allocate_sequence();
-        let mut guard2 = coordinator.allocate_sequence();
-
-        drop(guard1);
-
-        guard2.wait_for_predecessors().await;
-        guard2.mark_committed();
-
-        assert_eq!(coordinator.committed_watermark.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn test_first_sequence_no_wait() {
-        let coordinator = Arc::new(WriteCoordinator::new());
-
-        let mut guard1 = coordinator.allocate_sequence();
-
-        guard1.wait_for_predecessors().await;
-        guard1.mark_committed();
-
-        assert_eq!(coordinator.committed_watermark.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_many_concurrent_sequences() {
-        let coordinator = Arc::new(WriteCoordinator::new());
-        let num_sequences = 100;
-
-        let guards: Vec<_> = (0..num_sequences)
-            .map(|_| coordinator.allocate_sequence())
-            .collect();
-
-        let handles: Vec<_> = guards
-            .into_iter()
-            .map(|mut guard| {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_micros((guard.sequence * 7) % 100)).await;
-                    guard.wait_for_predecessors().await;
-                    guard.mark_committed();
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.await.unwrap();
+    async fn coalesces_concurrent_commits() {
+        let fs = make_fs().await;
+        let coord = fs.write_coordinator.clone();
+        let mut handles = Vec::new();
+        for i in 0u64..32 {
+            let c = coord.clone();
+            handles.push(tokio::spawn(async move {
+                let mut txn = Transaction::new();
+                txn.put_bytes(
+                    &Bytes::from(format!("coalesce/{i}")),
+                    Bytes::from(vec![1u8; 8]),
+                );
+                c.commit(txn).await
+            }));
         }
-
-        assert_eq!(
-            coordinator.committed_watermark.load(Ordering::SeqCst),
-            num_sequences as u64
-        );
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        for i in 0u64..32 {
+            let v = fs
+                .db
+                .get_bytes(&Bytes::from(format!("coalesce/{i}")))
+                .await
+                .unwrap();
+            assert!(v.is_some());
+        }
     }
 
-    /// sequences allocated AFTER locks prevents deadlock.
-    /// Task A holds lock, Task B waits for lock (no sequence), Task C is independent.
-    /// C should complete without waiting for B.
     #[tokio::test]
-    async fn test_sequence_allocation_after_lock_prevents_deadlock() {
-        use tokio::sync::Mutex;
+    async fn counter_emitted_only_when_advanced() {
+        let fs = make_fs().await;
+        let counter_key = KeyCodec::system_counter_key();
+        let before = fs.db.get_bytes(&counter_key).await.unwrap();
 
-        let coordinator = Arc::new(WriteCoordinator::new());
-        let lock_a = Arc::new(Mutex::new(()));
-        let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // A commit that doesn't allocate any inode.
+        let mut txn = Transaction::new();
+        txn.put_bytes(&Bytes::from("nocounter/key"), Bytes::from_static(b"v"));
+        fs.write_coordinator.commit(txn).await.unwrap();
 
-        let coord_a = Arc::clone(&coordinator);
-        let lock_a_clone = Arc::clone(&lock_a);
-        let completed_a = Arc::clone(&completed);
-        let task_a = tokio::spawn(async move {
-            let _guard = lock_a_clone.lock().await;
-            let mut seq = coord_a.allocate_sequence();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            seq.wait_for_predecessors().await;
-            seq.mark_committed();
-            completed_a.fetch_add(1, Ordering::SeqCst);
-        });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let coord_b = Arc::clone(&coordinator);
-        let lock_a_clone2 = Arc::clone(&lock_a);
-        let completed_b = Arc::clone(&completed);
-        let task_b = tokio::spawn(async move {
-            let _guard = lock_a_clone2.lock().await;
-            let mut seq = coord_b.allocate_sequence();
-            seq.wait_for_predecessors().await;
-            seq.mark_committed();
-            completed_b.fetch_add(1, Ordering::SeqCst);
-        });
-
-        let coord_c = Arc::clone(&coordinator);
-        let completed_c = Arc::clone(&completed);
-        let task_c = tokio::spawn(async move {
-            let mut seq = coord_c.allocate_sequence();
-            seq.wait_for_predecessors().await;
-            seq.mark_committed();
-            completed_c.fetch_add(1, Ordering::SeqCst);
-        });
-
-        let result = tokio::time::timeout(Duration::from_millis(100), task_c).await;
-        assert!(
-            result.is_ok(),
-            "Task C should complete without waiting for Task B"
+        let after = fs.db.get_bytes(&counter_key).await.unwrap();
+        assert_eq!(
+            before, after,
+            "counter key should not change without allocate"
         );
 
-        task_a.await.unwrap();
-        task_b.await.unwrap();
+        // Now allocate and commit; counter must advance on disk.
+        let _id = fs.inode_store.allocate();
+        let mut txn = Transaction::new();
+        txn.put_bytes(&Bytes::from("withcounter/key"), Bytes::from_static(b"v"));
+        fs.write_coordinator.commit(txn).await.unwrap();
 
-        assert_eq!(completed.load(Ordering::SeqCst), 3);
-        assert_eq!(coordinator.committed_watermark.load(Ordering::SeqCst), 3);
+        let after_allocate = fs.db.get_bytes(&counter_key).await.unwrap();
+        assert_ne!(
+            after, after_allocate,
+            "counter key should advance after allocate"
+        );
     }
 }
