@@ -352,8 +352,7 @@ impl NFSFileSystem for NFSAdapter {
                 debug!("commit successful for file {}", fileid);
                 self.fs
                     .tracer
-                    .emit(|| self.fs.resolve_path_lossy(fileid), FileOperation::Fsync)
-                    .await;
+                    .emit(&self.fs.inode_store, fileid, FileOperation::Fsync);
                 Ok(self.serverid())
             }
             Err(fs_error) => {

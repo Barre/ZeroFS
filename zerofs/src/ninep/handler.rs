@@ -834,26 +834,23 @@ impl NinePHandler {
 
         self.filesystem.flush_coordinator.flush().await?;
 
-        self.filesystem
-            .tracer
-            .emit(
-                || async {
-                    if fid_path.is_empty() {
-                        "/".to_string()
-                    } else {
-                        format!(
-                            "/{}",
-                            fid_path
-                                .iter()
-                                .map(|b| String::from_utf8_lossy(b).to_string())
-                                .collect::<Vec<_>>()
-                                .join("/")
-                        )
-                    }
-                },
-                FileOperation::Fsync,
-            )
-            .await;
+        {
+            let path = if fid_path.is_empty() {
+                "/".to_string()
+            } else {
+                format!(
+                    "/{}",
+                    fid_path
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )
+            };
+            self.filesystem
+                .tracer
+                .emit_with_path(path, FileOperation::Fsync);
+        }
 
         Ok(Message::Rfsync(Rfsync))
     }

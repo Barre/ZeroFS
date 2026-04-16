@@ -393,11 +393,7 @@ impl NBDHandler {
 
         self.filesystem
             .tracer
-            .emit(
-                || self.filesystem.resolve_path_lossy(inode),
-                FileOperation::Fsync,
-            )
-            .await;
+            .emit(&self.filesystem.inode_store, inode, FileOperation::Fsync);
 
         Ok(())
     }
