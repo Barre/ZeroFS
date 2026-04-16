@@ -4,3 +4,6 @@ tests/chown/05.t
 tests/utimensat/08.t
 tests/ftruncate/00.t
 tests/link/06.t
+tests/truncate/05.t
+tests/chmod/05.t
+tests/ftruncate/05.t
