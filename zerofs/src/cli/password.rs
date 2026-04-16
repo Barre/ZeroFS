@@ -55,7 +55,7 @@ pub async fn change_password(
             .url
             .parse::<url::Url>()
             .map_err(|e| PasswordError::Other(e.to_string()))?,
-        env_vars.into_iter(),
+        env_vars,
     )
     .map_err(|e| PasswordError::Other(e.to_string()))?;
 

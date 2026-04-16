@@ -995,8 +995,8 @@ impl ZeroFS {
                         .map(|&i| (i, dir_entries[i].0))
                         .collect();
 
-                    let inode_futures = stream::iter(lookup_entries.into_iter()).map(
-                        |(idx, inode_id)| async move {
+                    let inode_futures =
+                        stream::iter(lookup_entries).map(|(idx, inode_id)| async move {
                             match self.inode_store.get(inode_id).await {
                                 Ok(inode) => Ok::<_, FsError>((idx, Some(inode))),
                                 Err(FsError::NotFound) => {
@@ -1008,8 +1008,7 @@ impl ZeroFS {
                                     Err(e)
                                 }
                             }
-                        },
-                    );
+                        });
 
                     let loaded_inodes: Vec<_> = inode_futures
                         .buffered(BUFFER_SIZE)

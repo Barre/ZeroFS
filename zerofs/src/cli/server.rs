@@ -34,7 +34,7 @@ pub(crate) fn parse_wal_object_store(
     wal_config: &crate::config::WalConfig,
 ) -> Result<Arc<dyn object_store::ObjectStore>> {
     let env_vars = wal_config.cloud_provider_env_vars();
-    let (store, path) = parse_url_opts(&wal_config.url.parse()?, env_vars.into_iter())?;
+    let (store, path) = parse_url_opts(&wal_config.url.parse()?, env_vars)?;
     let path_str: &str = path.as_ref();
     if path_str.is_empty() {
         Ok(Arc::from(store))
@@ -60,8 +60,7 @@ impl DatabaseMode {
 
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) =
-        parse_url_opts(&settings.storage.url.parse()?, env_vars.into_iter())?;
+    let (object_store, path_from_url) = parse_url_opts(&settings.storage.url.parse()?, env_vars)?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
     let db_path = Path::from(path_from_url.to_string());
 
@@ -530,7 +529,7 @@ async fn initialize_filesystem(
 
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.into_iter())?;
+    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars)?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
 
     let actual_db_path = path_from_url.to_string();

@@ -25,7 +25,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     };
 
     let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.into_iter())?;
+    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars)?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
 
     let actual_db_path = path_from_url.to_string();
