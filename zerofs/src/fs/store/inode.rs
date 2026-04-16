@@ -1,6 +1,6 @@
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
-use crate::fs::inode::{Inode, InodeId};
+use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::key_codec::KeyCodec;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -80,5 +80,61 @@ impl InodeStore {
     pub fn delete(&self, txn: &mut Transaction, id: InodeId) {
         let key = KeyCodec::inode_key(id);
         txn.delete_bytes(&key);
+    }
+
+    /// Resolve inode ID to full path components by walking parent chain.
+    /// Returns Vec of path components (excluding root), in order from root to target.
+    pub async fn resolve_path_components(&self, id: InodeId) -> Vec<Vec<u8>> {
+        const ROOT_INODE_ID: InodeId = 0;
+
+        if id == ROOT_INODE_ID {
+            return Vec::new();
+        }
+
+        let mut components = Vec::new();
+        let mut current_id = id;
+
+        while current_id != ROOT_INODE_ID {
+            if let Ok(inode) = self.get(current_id).await {
+                let parent_id = match inode.parent() {
+                    Some(p) => p,
+                    None => {
+                        // Hardlinked file - use placeholder
+                        components.push(format!("<inode:{}>", current_id).into_bytes());
+                        break;
+                    }
+                };
+
+                if let Some(name) = inode.name() {
+                    components.push(name.to_vec());
+                    current_id = parent_id;
+                } else {
+                    // Name not available (shouldn't happen for non-hardlinked files)
+                    components.push(format!("<inode:{}>", current_id).into_bytes());
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        components.reverse();
+        components
+    }
+
+    /// Resolve inode ID to full path string.
+    pub async fn resolve_path_lossy(&self, id: InodeId) -> String {
+        let components = self.resolve_path_components(id).await;
+        if components.is_empty() {
+            return "/".to_string();
+        }
+        format!(
+            "/{}",
+            components
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        )
     }
 }

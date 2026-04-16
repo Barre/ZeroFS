@@ -1,3 +1,5 @@
+use crate::fs::inode::InodeId;
+use crate::fs::store::inode::InodeStore;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
@@ -59,8 +61,8 @@ pub struct FileAccessEvent {
 /// for each operation that occurs.
 ///
 /// The tracer is designed to have zero overhead when no subscribers are
-/// connected - the `has_subscribers()` check should be used before doing
-/// any expensive work like path resolution.
+/// connected - path resolution and event dispatch are skipped entirely
+/// when no one is listening.
 #[derive(Clone)]
 pub struct AccessTracer {
     sender: broadcast::Sender<FileAccessEvent>,
@@ -73,9 +75,6 @@ impl AccessTracer {
     }
 
     /// Returns true if there are any active subscribers.
-    ///
-    /// Use this to avoid expensive operations (like path resolution)
-    /// when no one is listening.
     pub fn has_subscribers(&self) -> bool {
         self.sender.receiver_count() > 0
     }
@@ -85,33 +84,47 @@ impl AccessTracer {
         self.sender.subscribe()
     }
 
-    /// Emit a file access event with lazy path resolution.
+    /// Emit a file access event, resolving the path from an inode ID.
     ///
-    /// The path is only resolved if there are active subscribers,
-    /// ensuring zero overhead when no one is listening.
-    pub async fn emit<F, Fut>(&self, resolve_path: F, operation: FileOperation)
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = String>,
-    {
+    /// If there are active subscribers, spawns a background task to resolve
+    /// the path and broadcast the event. Returns immediately without blocking.
+    pub fn emit(&self, inode_store: &InodeStore, id: InodeId, operation: FileOperation) {
         if !self.has_subscribers() {
             return;
         }
-
-        let path = resolve_path().await;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let event = FileAccessEvent {
-            timestamp,
-            operation,
-            path,
-        };
-        // Ignore send errors (no receivers is OK)
-        let _ = self.sender.send(event);
+        let inode_store = inode_store.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let path = inode_store.resolve_path_lossy(id).await;
+            send_event(&sender, path, operation);
+        });
     }
+
+    /// Emit a file access event with an already-resolved path.
+    ///
+    /// If there are active subscribers, spawns a background task to broadcast
+    /// the event. Returns immediately without blocking.
+    pub fn emit_with_path(&self, path: String, operation: FileOperation) {
+        if !self.has_subscribers() {
+            return;
+        }
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            send_event(&sender, path, operation);
+        });
+    }
+}
+
+fn send_event(sender: &broadcast::Sender<FileAccessEvent>, path: String, operation: FileOperation) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = sender.send(FileAccessEvent {
+        timestamp,
+        operation,
+        path,
+    });
 }
 
 impl Default for AccessTracer {
