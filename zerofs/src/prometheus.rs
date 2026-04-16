@@ -172,7 +172,7 @@ fn collect_jemalloc_stats() {
 fn collect_slatedb_stats(recorder: &DefaultMetricsRecorder) {
     let snapshot = recorder.snapshot();
     for metric in snapshot.all() {
-        let prom_name = format!("slatedb_{}", metric.name.replace('.', "_"));
+        let prom_name = metric.name.replace('.', "_");
         match &metric.value {
             MetricValue::Counter(v) => {
                 counter!(prom_name).absolute(*v);
