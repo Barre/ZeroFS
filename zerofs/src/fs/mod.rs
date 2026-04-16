@@ -339,44 +339,6 @@ impl ZeroFS {
         Ok(false)
     }
 
-    /// Check execute permission on all parent directories leading to a file
-    ///
-    /// NOTE: This function has a known race condition - parent directory permissions
-    /// could change after we check them but before the operation completes. This is
-    /// accepted because:
-    /// - The race window is extremely small
-    /// - Fixing it would require complex multi-directory locking  
-    /// - NFS traditionally has relaxed consistency semantics
-    pub async fn check_parent_execute_permissions(
-        &self,
-        id: InodeId,
-        creds: &Credentials,
-    ) -> Result<(), FsError> {
-        if id == 0 {
-            return Ok(());
-        }
-
-        let inode = self.inode_store.get(id).await?;
-        let parent_id = inode.parent();
-
-        // If parent is None (file is hardlinked), skip parent permission checks
-        let Some(mut current_id) = parent_id else {
-            return Ok(());
-        };
-        while current_id != 0 {
-            let parent_inode = self.inode_store.get(current_id).await?;
-
-            check_access(&parent_inode, creds, AccessMode::Execute)?;
-
-            current_id = match &parent_inode {
-                Inode::Directory(d) => d.parent,
-                _ => return Err(FsError::NotDirectory),
-            };
-        }
-
-        Ok(())
-    }
-
     pub async fn write(
         &self,
         auth: &AuthContext,
@@ -393,9 +355,6 @@ impl ZeroFS {
         );
 
         let creds = Credentials::from_auth_context(auth);
-
-        // Check parent permissions before lock (also validates inode exists)
-        self.check_parent_execute_permissions(id, &creds).await?;
 
         let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
@@ -682,8 +641,6 @@ impl ZeroFS {
         let inode = self.inode_store.get(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
-
-        self.check_parent_execute_permissions(id, &creds).await?;
 
         check_access(&inode, &creds, AccessMode::Read)?;
 
@@ -1330,9 +1287,6 @@ impl ZeroFS {
         check_access(&link_dir_inode, &creds, AccessMode::Write)?;
         check_access(&link_dir_inode, &creds, AccessMode::Execute)?;
 
-        self.check_parent_execute_permissions(fileid, &creds)
-            .await?;
-
         let mut link_dir = match link_dir_inode {
             Inode::Directory(d) => d,
             _ => return Err(FsError::NotDirectory),
@@ -1473,8 +1427,6 @@ impl ZeroFS {
         );
         let _guard = self.lock_manager.acquire(id).await;
         let mut inode = self.inode_store.get(id).await?;
-
-        self.check_parent_execute_permissions(id, creds).await?;
 
         // For chmod (mode change), must be owner
         if matches!(setattr.mode, SetMode::Set(_)) {
@@ -3871,93 +3823,6 @@ mod tests {
 
         let result = fs.inode_store.get(file_id).await;
         assert!(matches!(result, Err(FsError::NotFound)));
-    }
-
-    #[tokio::test]
-    async fn test_parent_directory_execute_permissions() {
-        let fs = ZeroFS::new_in_memory().await.unwrap();
-
-        let (dir_id, _) = fs
-            .mkdir(&test_creds(), 0, b"test_dir", &SetAttributes::default())
-            .await
-            .unwrap();
-
-        let (file_id, _) = fs
-            .create(
-                &test_creds(),
-                dir_id,
-                b"test.txt",
-                &SetAttributes::default(),
-            )
-            .await
-            .unwrap();
-
-        fs.write(
-            &(&test_auth()).into(),
-            file_id,
-            0,
-            &Bytes::from(b"initial data".to_vec()),
-        )
-        .await
-        .unwrap();
-
-        let no_exec_attrs = SetAttributes {
-            mode: SetMode::Set(0o644),
-            ..Default::default()
-        };
-
-        fs.setattr(&test_creds(), dir_id, &no_exec_attrs)
-            .await
-            .unwrap();
-
-        let chmod_attrs = SetAttributes {
-            mode: SetMode::Set(0o600),
-            ..Default::default()
-        };
-
-        let result = fs.setattr(&test_creds(), file_id, &chmod_attrs).await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs.read_file(&(&test_auth()).into(), file_id, 0, 100).await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let result = fs
-            .write(
-                &(&test_auth()).into(),
-                file_id,
-                0,
-                &Bytes::from(b"new data".to_vec()),
-            )
-            .await;
-        assert!(matches!(result, Err(FsError::PermissionDenied)));
-
-        let exec_attrs = SetAttributes {
-            mode: SetMode::Set(0o755),
-            ..Default::default()
-        };
-
-        fs.setattr(&test_creds(), dir_id, &exec_attrs)
-            .await
-            .unwrap();
-
-        fs.setattr(&test_creds(), file_id, &chmod_attrs)
-            .await
-            .unwrap();
-
-        let (data, _) = fs
-            .read_file(&(&test_auth()).into(), file_id, 0, 100)
-            .await
-            .unwrap();
-        assert_eq!(data.as_ref(), b"initial data");
-
-        fs.write(
-            &(&test_auth()).into(),
-            file_id,
-            0,
-            &Bytes::from(b"updated data".to_vec()),
-        )
-        .await
-        .unwrap();
     }
 
     #[tokio::test]
