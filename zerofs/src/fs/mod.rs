@@ -532,6 +532,7 @@ impl ZeroFS {
                 self.global_stats.commit_update(&stats_update);
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 self.tracer.emit(
@@ -664,6 +665,9 @@ impl ZeroFS {
 
         debug!("Trim completed successfully for inode {}", id);
 
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
         self.tracer.emit(
             &self.inode_store,
             id,
@@ -703,6 +707,9 @@ impl ZeroFS {
                             String::from_utf8_lossy(filename),
                             inode_id
                         );
+
+                        self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
+                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                         self.tracer.emit(
                             &self.inode_store,
@@ -874,6 +881,7 @@ impl ZeroFS {
                 self.stats
                     .directories_created
                     .fetch_add(1, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 self.tracer.emit(
@@ -1171,6 +1179,7 @@ impl ZeroFS {
         self.global_stats.commit_update(&stats_update);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
         self.tracer.emit(
@@ -1327,6 +1336,7 @@ impl ZeroFS {
         fail_point!(fp::LINK_AFTER_COMMIT);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
         // Emit event with the original file's path and new link path
@@ -1495,6 +1505,9 @@ impl ZeroFS {
                         if let Some(update) = stats_update {
                             self.global_stats.commit_update(&update);
                         }
+
+                        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                         self.tracer.emit(
                             &self.inode_store,
@@ -1785,6 +1798,8 @@ impl ZeroFS {
 
         self.write_coordinator.commit(txn).await?;
 
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
         self.tracer.emit(
             &self.inode_store,
             id,
@@ -1923,6 +1938,10 @@ impl ZeroFS {
                 fail_point!(fp::MKNOD_AFTER_COMMIT);
 
                 self.global_stats.commit_update(&stats_update);
+
+                self.stats.files_created.fetch_add(1, Ordering::Relaxed);
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 self.tracer.emit(
                     &self.inode_store,
@@ -2127,6 +2146,7 @@ impl ZeroFS {
                     self.global_stats.commit_update(&update);
                 }
 
+                self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
                 if let Some(path) = trace_path {
@@ -2572,6 +2592,7 @@ impl ZeroFS {
             }
             _ => {}
         }
+        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
         // Emit rename event with old path and new path
