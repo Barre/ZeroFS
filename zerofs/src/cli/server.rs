@@ -10,14 +10,19 @@ use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
+use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::parse_url_opts;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use slatedb::admin::AdminBuilder;
-use slatedb::config::{
-    GarbageCollectorDirectoryOptions, GarbageCollectorOptions, ObjectStoreCacheOptions,
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
+    Spawner,
 };
+use slatedb::admin::AdminBuilder;
+use slatedb::config::GarbageCollectorDirectoryOptions;
+use slatedb::config::GarbageCollectorOptions;
+use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::path::Path;
 use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader};
 use slatedb_common::metrics::DefaultMetricsRecorder;
@@ -330,6 +335,58 @@ fn start_periodic_flush(
     })
 }
 
+pub(crate) async fn build_parts_hybrid(
+    cache_root: &std::path::Path,
+    disk_bytes: usize,
+    foyer_handle: &tokio::runtime::Handle,
+) -> Result<foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>> {
+    use crate::object_store_prefetch::PartKey;
+    use bytes::Bytes;
+
+    const PARTS_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+
+    let parts_root = cache_root.join("parts_cache");
+    tokio::fs::create_dir_all(&parts_root)
+        .await
+        .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
+    HybridCacheBuilder::new()
+        .with_name("zerofs-object-prefetch-parts")
+        .memory(PARTS_MEMORY_BYTES)
+        .with_weighter(|_: &PartKey, v: &Bytes| v.len())
+        .storage()
+        .with_spawner(Spawner::from(foyer_handle.clone()))
+        .with_io_engine_config(PsyncIoEngineConfig::new())
+        .with_engine_config(
+            BlockEngineConfig::new(
+                FsDeviceBuilder::new(&parts_root)
+                    .with_capacity(disk_bytes)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("parts foyer device build failed: {e}"))?,
+            )
+            .with_block_size(64 * 1024 * 1024),
+        )
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("parts foyer hybrid build failed: {e}"))
+}
+
+/// Compute (parts_disk_bytes, decoded_blocks_disk_bytes) from a total disk
+/// budget. Parts get 10% of the budget, clamped to [256 MiB, 10 GiB]; the
+/// decoded-blocks hybrid takes the rest. Floors at 256 MiB so neither side
+/// collapses to zero on tiny configurations.
+pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
+    const MIN_PARTS_BYTES: usize = 1024 * 1024 * 1024;
+    const MAX_PARTS_BYTES: usize = 10_usize
+        .saturating_mul(1024)
+        .saturating_mul(1024)
+        .saturating_mul(1024);
+
+    let parts = (total_disk_bytes / 10).clamp(MIN_PARTS_BYTES, MAX_PARTS_BYTES);
+    let parts = parts.min(total_disk_bytes.saturating_sub(MIN_PARTS_BYTES));
+    let decoded = total_disk_bytes.saturating_sub(parts).max(MIN_PARTS_BYTES);
+    (parts, decoded)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -348,17 +405,17 @@ pub async fn build_slatedb(
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
-    info!(
-        "Cache allocation - Disk: {:.2}GB, Memory: {:.2}GB",
-        total_disk_cache_gb, total_memory_cache_gb,
-    );
-
-    let slatedb_object_cache_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
-    let slatedb_memory_cache_bytes = (total_memory_cache_gb * 1_000_000_000.0) as u64;
+    let total_disk_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
+    let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
+    let hybrid_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
 
     info!(
-        "SlateDB in-memory block cache: {} MB",
-        slatedb_memory_cache_bytes / 1_000_000
+        "Cache allocation - Disk: {:.2}GB total ({} MB decoded-blocks + {} MB raw-parts), \
+         Memory: {:.2}GB",
+        total_disk_cache_gb,
+        hybrid_disk_bytes / 1_000_000,
+        parts_disk_bytes / 1_000_000,
+        total_memory_cache_gb,
     );
 
     let l0_max_ssts = lsm_config
@@ -379,14 +436,7 @@ pub async fn build_slatedb(
         wal_enabled,
         l0_max_ssts,
         l0_sst_size_bytes: 128 * 1024 * 1024,
-        filter_bits_per_key: 10,
         compactor_options: None,
-        object_store_cache_options: ObjectStoreCacheOptions {
-            root_folder: Some(cache_config.root_folder.clone()),
-            max_cache_size_bytes: Some(slatedb_object_cache_bytes),
-            cache_puts: true,
-            ..Default::default()
-        },
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
         compression_codec: None, // Disable compression as we handle it in encryption layer
@@ -408,16 +458,55 @@ pub async fn build_slatedb(
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
             }),
+            detach_options: None,
         }),
         ..Default::default()
     };
 
-    let cache = Arc::new(slatedb::db_cache::foyer::FoyerCache::new_with_opts(
-        slatedb::db_cache::foyer::FoyerCacheOptions {
-            max_capacity: slatedb_memory_cache_bytes,
-            ..Default::default()
-        },
-    ));
+    let foyer_handle = {
+        let rt = Runtime::new().expect("failed to build foyer runtime");
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || {
+            rt.block_on(async { std::future::pending::<()>().await });
+        });
+        handle
+    };
+
+    let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
+    tokio::fs::create_dir_all(&hybrid_cache_root)
+        .await
+        .with_context(|| {
+            format!(
+                "creating foyer hybrid cache dir at {}",
+                hybrid_cache_root.display()
+            )
+        })?;
+
+    let hybrid = HybridCacheBuilder::new()
+        .with_name("zerofs-slatedb-hybrid")
+        .memory(hybrid_memory_bytes)
+        .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
+        .storage()
+        .with_spawner(Spawner::from(foyer_handle.clone()))
+        .with_io_engine_config(PsyncIoEngineConfig::new())
+        .with_engine_config(
+            BlockEngineConfig::new(
+                FsDeviceBuilder::new(&hybrid_cache_root)
+                    .with_capacity(hybrid_disk_bytes)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("foyer device build failed: {e}"))?,
+            )
+            .with_block_size(64 * 1024 * 1024),
+        )
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("foyer hybrid build failed: {e}"))?;
+    let cache = Arc::new(FoyerHybridCache::new_with_cache(hybrid));
+
+    let parts_cache =
+        build_parts_hybrid(&cache_config.root_folder, parts_disk_bytes, &foyer_handle).await?;
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(PrefetchingObjectStore::new(object_store, parts_cache));
 
     let db_path = Path::from(db_path);
 

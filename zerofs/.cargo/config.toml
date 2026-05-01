@@ -1,8 +1,15 @@
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3", "--cfg", "tokio_unstable"]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "--cfg", "tokio_unstable",
+    "--cfg", "io_uring_skip_arch_check",
+]
 
 [build]
-rustflags = ["--cfg", "tokio_unstable"]
+rustflags = [
+    "--cfg", "tokio_unstable",
+    "--cfg", "io_uring_skip_arch_check",
+]
 
 [env]
 JEMALLOC_SYS_WITH_MALLOC_CONF = "retain:true,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true"
