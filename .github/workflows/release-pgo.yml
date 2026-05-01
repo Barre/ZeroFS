@@ -76,7 +76,7 @@ jobs:
         run: |
           rm -rf /tmp/pgo-data
 
-          RUSTFLAGS="--cfg tokio_unstable -Cprofile-generate=/tmp/pgo-data" \
+          RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -Cprofile-generate=/tmp/pgo-data" \
             cargo build --release --target=x86_64-unknown-linux-gnu
 
       - name: Run profiling workloads
@@ -424,24 +424,24 @@ jobs:
         env:
           CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:${{ github.workspace }}/webui/dist:ro"
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cross build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cross)
         if: matrix.use_cross && matrix.bolt
         env:
           CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:${{ github.workspace }}/webui/dist:ro"
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'
@@ -461,7 +461,7 @@ jobs:
             cp pgo-data/Cargo.lock zerofs/
 
             cd zerofs
-            RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui
+            RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui
 
             file target/release/zerofs
             ls -lh target/release/zerofs
