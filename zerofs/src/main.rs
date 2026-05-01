@@ -13,6 +13,7 @@ mod key_management;
 mod nbd;
 mod nfs;
 mod ninep;
+mod object_store_prefetch;
 mod parse_object_store;
 mod prometheus;
 mod rpc;
