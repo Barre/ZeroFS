@@ -100,6 +100,10 @@ jobs:
         run: |
           cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Configure jemalloc page size for aarch64
+        if: startsWith(matrix.target, 'aarch64-') && matrix.platform == 'darwin'
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
+
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
         working-directory: zerofs
