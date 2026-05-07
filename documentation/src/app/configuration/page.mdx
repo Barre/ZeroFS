@@ -195,6 +195,8 @@ l0_max_ssts = 16                 # Max SST files in L0 before compaction
 max_unflushed_gb = 1.0           # Max unflushed data before forcing flush (in GB)
 max_concurrent_compactions = 8   # Max concurrent compaction operations
 flush_interval_secs = 30         # Interval between periodic flushes (in seconds)
+wal_enabled = false              # Whether the write-ahead log is enabled
+sync_writes = false              # Make every write durable on return (HA mode)
 ```
 
 ### Parameters
@@ -208,6 +210,8 @@ flush_interval_secs = 30         # Interval between periodic flushes (in seconds
 - **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Lower values flush more frequently. Higher values improve write throughput by batching more data before flushing. Note that `fsync` calls on NBD and 9P always trigger an immediate flush regardless of this interval.
 
 - **`wal_enabled`** (default: `false`): Controls the write-ahead log (WAL). Can be changed at any time without data loss. Without WAL, each `fsync` flushes the memtable and produces a small SST, leading to compaction churn. With WAL, fsyncs write to the WAL instead, so the memtable keeps growing and flushes produce properly-sized SSTs. Enable WAL for fsync-heavy workloads to reduce compaction overhead.
+
+- **`sync_writes`** (default: `false`): When enabled, every write is durably flushed before returning success, eliminating the "in-memory unflushed" window between fsync calls. This does **not** change POSIX fsync semantics: with the default `false`, explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs writes *between* fsync calls. Trades per-op latency (one round-trip per concurrent batch, since concurrent writes still coalesce) for zero unflushed data on crash. Pair with `wal_enabled = true`, without the WAL, every write blocks on a memtable->L0 SST flush. See the [Eliminating the Durability Window](/durability#eliminating-the-durability-window) section for guidance on when to enable.
 
 <Note>
 These are advanced settings. The defaults are optimized for most workloads. Only modify these if you understand LSM tree behavior and are experiencing specific performance issues.

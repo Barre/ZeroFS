@@ -691,8 +691,14 @@ async fn initialize_filesystem(
     .await?;
 
     let db_handle = slatedb.clone();
-    let fs =
-        ZeroFS::new_with_slatedb(slatedb, settings.max_bytes(), metrics_recorder.clone()).await?;
+    let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
+    let fs = ZeroFS::new_with_slatedb(
+        slatedb,
+        settings.max_bytes(),
+        metrics_recorder.clone(),
+        sync_writes,
+    )
+    .await?;
 
     Ok(InitResult {
         fs: Arc::new(fs),

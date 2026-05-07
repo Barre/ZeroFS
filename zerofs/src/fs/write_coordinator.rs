@@ -8,6 +8,7 @@
 
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
+use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::store::InodeStore;
 use crate::task::spawn_named;
@@ -24,7 +25,12 @@ pub struct WriteCoordinator {
 }
 
 impl WriteCoordinator {
-    pub fn new(db: Arc<Db>, inode_store: InodeStore) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        inode_store: InodeStore,
+        flush_coordinator: FlushCoordinator,
+        sync_writes: bool,
+    ) -> Self {
         // Capture synchronously: the spawned task starts later, by which point
         // callers may already have bumped `next_id`. If we captured inside the
         // task we'd over-shoot and skip the first emit.
@@ -32,7 +38,14 @@ impl WriteCoordinator {
         let (sender, receiver) = mpsc::unbounded_channel();
         spawn_named(
             "commit-worker",
-            worker_loop(db, inode_store, receiver, initial_counter),
+            worker_loop(
+                db,
+                inode_store,
+                flush_coordinator,
+                sync_writes,
+                receiver,
+                initial_counter,
+            ),
         );
         Self { sender }
     }
@@ -49,6 +62,8 @@ impl WriteCoordinator {
 async fn worker_loop(
     db: Arc<Db>,
     inode_store: InodeStore,
+    flush_coordinator: FlushCoordinator,
+    sync_writes: bool,
     mut rx: mpsc::UnboundedReceiver<(Transaction, Reply)>,
     initial_counter: u64,
 ) {
@@ -79,7 +94,7 @@ async fn worker_loop(
             last_emitted_counter = current;
         }
 
-        let result = db
+        let mut result = db
             .write_with_options(
                 merged,
                 &WriteOptions {
@@ -88,6 +103,15 @@ async fn worker_loop(
             )
             .await
             .map_err(|_| FsError::IoError);
+
+        // In sync_writes mode, force a flush after the batch is committed so
+        // every caller in the batch only sees Ok once their data is durable in
+        // object storage. FlushCoordinator coalesces concurrent flush requests
+        // into a single db.flush()
+        if sync_writes && result.is_ok() {
+            result = flush_coordinator.flush().await;
+        }
+
         for reply in replies {
             let _ = reply.send(result);
         }
@@ -141,6 +165,32 @@ mod tests {
                 .await
                 .unwrap();
             assert!(v.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_writes_commits_persist() {
+        let fs = ZeroFS::new_in_memory_with_sync_writes(true).await.unwrap();
+        let coord = fs.write_coordinator.clone();
+        let mut handles = Vec::new();
+        for i in 0u64..16 {
+            let c = coord.clone();
+            handles.push(tokio::spawn(async move {
+                let mut txn = Transaction::new();
+                txn.put_bytes(&Bytes::from(format!("sync/{i}")), Bytes::from(vec![2u8; 8]));
+                c.commit(txn).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        for i in 0u64..16 {
+            let v = fs
+                .db
+                .get_bytes(&Bytes::from(format!("sync/{i}")))
+                .await
+                .unwrap();
+            assert!(v.is_some(), "sync/{i} not durable after sync_writes commit");
         }
     }
 

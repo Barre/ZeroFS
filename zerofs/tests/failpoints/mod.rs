@@ -53,7 +53,7 @@ impl CrashTestContext {
         );
 
         Arc::new(
-            ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None)
+            ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None, false)
                 .await
                 .unwrap(),
         )

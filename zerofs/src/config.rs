@@ -196,6 +196,18 @@ pub struct LsmConfig {
     /// Whether the write-ahead log (WAL) is enabled
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wal_enabled: Option<bool>,
+    /// When true, every committed write is durably flushed to object storage
+    /// before returning success. Trades per-op latency for zero unflushed data
+    /// in case of a crash. Pair with `wal_enabled = true` for acceptable
+    /// performance.
+    ///
+    /// This does NOT change POSIX semantics: with `sync_writes = false` (the
+    /// default), explicit fsync from clients is still honored and
+    /// waits for durable persistence. The flag only changes what happens to
+    /// writes between fsync calls, making them durable on return rather than
+    /// buffered until the next flush.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sync_writes: Option<bool>,
 }
 
 impl LsmConfig {
@@ -245,6 +257,10 @@ impl LsmConfig {
 
     pub fn wal_enabled(&self) -> bool {
         self.wal_enabled.unwrap_or(false)
+    }
+
+    pub fn sync_writes(&self) -> bool {
+        self.sync_writes.unwrap_or(false)
     }
 }
 
@@ -634,6 +650,11 @@ impl Settings {
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
         toml_string.push_str("# wal_enabled = false              # Whether the write-ahead log (WAL) is enabled (default: false)\n");
+        toml_string.push_str("# sync_writes = false              # Flush every write to object storage before returning success (default: false).\n");
+        toml_string.push_str("                                   # Does NOT affect POSIX fsync semantics: explicit fsync from clients\n");
+        toml_string.push_str("                                   # is always honored. This flag only governs writes between fsync calls. When on,\n");
+        toml_string.push_str("                                   # they become durable on return instead of buffered until the next periodic flush.\n");
+        toml_string.push_str("                                   # wal_enabled = true is strongly recommended when this is on.\n");
 
         toml_string.push_str("\n# Optional separate WAL (Write-Ahead Log) object store\n");
         toml_string.push_str("# Use a faster/closer store for WAL to improve fsync latency\n");

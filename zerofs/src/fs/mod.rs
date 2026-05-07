@@ -108,6 +108,7 @@ impl ZeroFS {
         slatedb: SlateDbHandle,
         max_bytes: u64,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+        sync_writes: bool,
     ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
 
@@ -176,7 +177,12 @@ impl ZeroFS {
         let directory_store = DirectoryStore::new(db.clone());
         let inode_store = InodeStore::new(db.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone());
-        let write_coordinator = WriteCoordinator::new(db.clone(), inode_store.clone());
+        let write_coordinator = WriteCoordinator::new(
+            db.clone(),
+            inode_store.clone(),
+            flush_coordinator.clone(),
+            sync_writes,
+        );
 
         let fs = Self {
             db: db.clone(),
@@ -198,6 +204,11 @@ impl ZeroFS {
 
     #[cfg(test)]
     pub async fn new_in_memory() -> anyhow::Result<Self> {
+        Self::new_in_memory_with_sync_writes(false).await
+    }
+
+    #[cfg(test)]
+    pub async fn new_in_memory_with_sync_writes(sync_writes: bool) -> anyhow::Result<Self> {
         use crate::block_transformer::ZeroFsBlockTransformer;
         use crate::config::CompressionConfig;
         use slatedb::BlockTransformer;
@@ -219,7 +230,13 @@ impl ZeroFS {
                 .await?,
         );
 
-        Self::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None).await
+        Self::new_with_slatedb(
+            SlateDbHandle::ReadWrite(slatedb),
+            u64::MAX,
+            None,
+            sync_writes,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -249,6 +266,7 @@ impl ZeroFS {
             SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             u64::MAX,
             None,
+            false,
         )
         .await
     }
@@ -2767,9 +2785,10 @@ mod tests {
                 .unwrap(),
         );
 
-        let fs_rw = ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None)
-            .await
-            .unwrap();
+        let fs_rw =
+            ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None, false)
+                .await
+                .unwrap();
 
         let test_inode_id = fs_rw.inode_store.allocate();
         let file_inode = FileInode {

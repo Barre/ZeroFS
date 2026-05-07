@@ -1340,6 +1340,7 @@ mod tests {
                 )),
                 1_000_000,
                 None,
+                false,
             )
             .await
             .unwrap(),
@@ -1399,6 +1400,7 @@ mod tests {
                 )),
                 1_000_000,
                 None,
+                false,
             )
             .await
             .unwrap(),
@@ -1455,6 +1457,7 @@ mod tests {
                 )),
                 1_000_000,
                 None,
+                false,
             )
             .await
             .unwrap(),

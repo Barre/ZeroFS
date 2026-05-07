@@ -216,6 +216,24 @@ ZeroFS follows standard POSIX durability semantics. Write operations are buffere
   </Col>
 </Row>
 
+## Eliminating the Durability Window
+
+By default, writes between fsync calls live in the memtable and become durable only when the next periodic flush, capacity threshold, or explicit fsync persists them. For workloads that need every write durable on return, set `sync_writes = true` in the `[lsm]` section.
+
+When enabled, the commit coordinator forces a flush after every coalesced write batch before returning success to the caller. Concurrent writes still merge into a single batch and a single flush.
+
+<Note>
+This flag does not change POSIX semantics. With `sync_writes = false` (the default), explicit `fsync` from clients is always honored and waits for durable persistence, the same behavior all major filesystems implement. The flag only governs what happens to writes *between* fsync calls.
+</Note>
+
+The trade-off is per-operation latency. Without the WAL, each batch waits for a memtable->L0 SST flush, which is unsuitable for chatty workloads. With the WAL enabled, each batch waits for a WAL append which is much cheaper, especially when paired with a [separate WAL store](/separate-wal) on lower-latency storage. **Always pair `sync_writes = true` with `wal_enabled = true`.**
+
+```toml
+[lsm]
+sync_writes = true
+wal_enabled = true
+```
+
 ## Protocol Considerations
 
 The durability guarantees available to applications depend on the access protocol.
