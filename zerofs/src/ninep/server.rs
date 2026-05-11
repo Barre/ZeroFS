@@ -48,17 +48,29 @@ impl NinePServer {
         }
     }
 
-    fn spawn_client_handler<S>(&self, stream: S, shutdown: &CancellationToken, client_name: String)
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    fn spawn_client_handler<R, W>(
+        &self,
+        read_stream: R,
+        write_stream: W,
+        shutdown: &CancellationToken,
+        client_name: String,
+    ) where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
         let filesystem = Arc::clone(&self.filesystem);
         let lock_manager = Arc::clone(&self.lock_manager);
         let client_shutdown = shutdown.child_token();
 
         spawn_named("9p-client", async move {
-            if let Err(e) =
-                handle_client_stream(stream, filesystem, lock_manager, client_shutdown).await
+            if let Err(e) = handle_client_stream(
+                read_stream,
+                write_stream,
+                filesystem,
+                lock_manager,
+                client_shutdown,
+            )
+            .await
             {
                 error!("Error handling 9P client {}: {}", client_name, e);
             }
@@ -81,7 +93,8 @@ impl NinePServer {
                             let (stream, peer_addr) = result?;
                             info!("9P client connected from {}", peer_addr);
                             stream.set_nodelay(true)?;
-                            self.spawn_client_handler(stream, &shutdown, peer_addr.to_string());
+                            let (read_half, write_half) = stream.into_split();
+                            self.spawn_client_handler(read_half, write_half, &shutdown, peer_addr.to_string());
                         }
                     }
                 }
@@ -106,7 +119,8 @@ impl NinePServer {
                         result = listener.accept() => {
                             let (stream, _) = result?;
                             info!("9P client connected via Unix socket");
-                            self.spawn_client_handler(stream, &shutdown, "unix".to_string());
+                            let (read_half, write_half) = stream.into_split();
+                            self.spawn_client_handler(read_half, write_half, &shutdown, "unix".to_string());
                         }
                     }
                 }
@@ -117,19 +131,19 @@ impl NinePServer {
     }
 }
 
-async fn handle_client_stream<S>(
-    stream: S,
+async fn handle_client_stream<R, W>(
+    read_stream: R,
+    mut write_stream: W,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let handler = Arc::new(NinePHandler::new(filesystem, lock_manager.clone()));
     let handler_id = handler.handler_id();
-
-    let (read_stream, mut write_stream) = tokio::io::split(stream);
 
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
