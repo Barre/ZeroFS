@@ -165,13 +165,15 @@ where
     result
 }
 
-/// Tracks in-flight requests by tag, with a Notify to signal completion.
-type InflightRequests = Arc<DashMap<u16, Arc<tokio::sync::Notify>>>;
+/// Tracks in-flight requests by tag. The `Notify` is allocated lazily when a
+/// Tflush actually arrives for the tag — most requests are never flushed, so the
+/// common path stores just `None` and avoids a per-request heap allocation.
+pub(crate) type InflightRequests = Arc<DashMap<u16, Option<Arc<tokio::sync::Notify>>>>;
 
 /// Tracks the latest Tflush tag for each oldtag. Only the last flush gets a response.
 /// Per 9P spec: "should a server receive a request and then multiple flushes for that
 /// request, it need respond only to the last flush."
-type PendingFlushes = Arc<DashMap<u16, u16>>;
+pub(crate) type PendingFlushes = Arc<DashMap<u16, u16>>;
 
 /// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
 /// and WebSocket transports.
@@ -201,14 +203,10 @@ pub(crate) fn dispatch_9p_frame(
                 pending_flushes.insert(tflush.oldtag, tag);
                 Some(tflush.oldtag)
             } else {
-                None
-            };
-
-            let notify = if flush_oldtag.is_none() {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                inflight.insert(tag, Arc::clone(&notify));
-                Some(notify)
-            } else {
+                // Track the in-flight tag without allocating a Notify. A Tflush
+                // handler will lazily upgrade the entry to Some(Notify) if one
+                // ever arrives for this tag.
+                inflight.insert(tag, None);
                 None
             };
 
@@ -221,9 +219,28 @@ pub(crate) fn dispatch_9p_frame(
                 let response = handler.handle_message(tag, body).await;
 
                 if let Some(oldtag) = flush_oldtag {
-                    if let Some(old_notify) = inflight.get(&oldtag).map(|r| Arc::clone(r.value())) {
+                    // Lazily install a Notify in the target's inflight entry.
+                    // If the entry is gone, the target already completed.
+                    let target_notify = inflight.get_mut(&oldtag).map(|mut entry| {
+                        let slot = entry.value_mut();
+                        if let Some(n) = slot.as_ref() {
+                            Arc::clone(n)
+                        } else {
+                            let n = Arc::new(tokio::sync::Notify::new());
+                            *slot = Some(Arc::clone(&n));
+                            n
+                        }
+                    });
+
+                    if let Some(notify) = target_notify {
                         debug!("Tflush: waiting for oldtag {} to complete", oldtag);
-                        old_notify.notified().await;
+                        let permit = notify.notified();
+                        tokio::pin!(permit);
+                        // Arm the waiter before any further checks so that a
+                        // concurrent notify_waiters from the target cannot be
+                        // lost; if it already fired, enable() returns Ready.
+                        permit.as_mut().enable();
+                        permit.await;
                         debug!("Tflush: oldtag {} completed", oldtag);
                     }
 
@@ -253,9 +270,10 @@ pub(crate) fn dispatch_9p_frame(
                     }
                 }
 
-                if let Some(notify) = notify {
-                    inflight.remove(&tag);
-                    notify.notify_waiters();
+                if flush_oldtag.is_none() {
+                    if let Some((_, Some(notify))) = inflight.remove(&tag) {
+                        notify.notify_waiters();
+                    }
                 }
             });
             Ok(())
