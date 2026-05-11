@@ -61,6 +61,15 @@ impl ChunkStore {
         let end_chunk = (end - 1) / CHUNK_SIZE as u64;
         let start_offset = (offset % CHUNK_SIZE as u64) as usize;
 
+        // Fast path: read fits in a single chunk, skip the scan.
+        if start_chunk == end_chunk {
+            let chunk_end = start_offset + length as usize;
+            return Ok(match self.get(id, start_chunk).await? {
+                Some(data) => data.slice(start_offset..chunk_end),
+                None => Bytes::copy_from_slice(&ZERO_CHUNK[start_offset..chunk_end]),
+            });
+        }
+
         let start_key = KeyCodec::chunk_key(id, start_chunk);
         let end_key = KeyCodec::chunk_key(id, end_chunk + 1);
 
