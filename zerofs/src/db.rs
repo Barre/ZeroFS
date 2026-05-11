@@ -181,6 +181,53 @@ impl Db {
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
+    /// Prefix scan that consults SlateDB SST filters to skip non-matching SSTs.
+    ///
+    /// `seek_to` lets the caller advance to the first interesting key inside the
+    /// prefix without re-fetching the leading blocks; `read_ahead_bytes` controls
+    /// SlateDB's read-ahead within the iterator.
+    pub async fn scan_prefix(
+        &self,
+        prefix: Bytes,
+        seek_to: Option<Bytes>,
+        read_ahead_bytes: usize,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send>>> {
+        let scan_options = ScanOptions {
+            durability_filter: DurabilityLevel::Memory,
+            read_ahead_bytes,
+            cache_blocks: true,
+            max_fetch_tasks: 4,
+            ..Default::default()
+        };
+
+        let mut iter = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => {
+                db.scan_prefix_with_options(prefix, &scan_options).await?
+            }
+            SlateDbHandle::ReadOnly(reader_swap) => {
+                let reader = reader_swap.load();
+                reader
+                    .scan_prefix_with_options(prefix, &scan_options)
+                    .await?
+            }
+        };
+
+        if let Some(key) = seek_to {
+            iter.seek(key).await?;
+        }
+
+        Ok(Box::pin(futures::stream::unfold(
+            iter,
+            |mut iter| async move {
+                match iter.next().await {
+                    Ok(Some(kv)) => Some((Ok((kv.key, kv.value)), iter)),
+                    Ok(None) => None,
+                    Err(e) => Some((Err(e.into()), iter)),
+                }
+            },
+        )))
+    }
+
     pub async fn write_with_options(
         &self,
         batch: WriteBatch,

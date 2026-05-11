@@ -47,6 +47,7 @@ impl CrashTestContext {
         let db_path = Path::from("slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path, Arc::clone(&self.object_store))
+                .with_filter_policies(zerofs::fs::filter_policy::filter_policies())
                 .build()
                 .await
                 .unwrap(),

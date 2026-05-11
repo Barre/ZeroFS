@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod filter_policy;
 pub mod flush_coordinator;
 pub mod gc;
 pub mod inode;
@@ -226,6 +227,7 @@ impl ZeroFS {
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .build()
                 .await?,
         );
@@ -258,6 +260,7 @@ impl ZeroFS {
         let reader = Arc::new(
             DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .build()
                 .await?,
         );
@@ -2780,6 +2783,7 @@ mod tests {
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .build()
                 .await
                 .unwrap(),
