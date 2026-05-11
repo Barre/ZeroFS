@@ -44,8 +44,8 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState) {
             .with_credential_override(state.uid, state.gid),
     );
     let handler_id = handler.handler_id();
-    let inflight: Arc<DashMap<u16, Arc<tokio::sync::Notify>>> = Arc::new(DashMap::new());
-    let pending_flushes: Arc<DashMap<u16, u16>> = Arc::new(DashMap::new());
+    let inflight: crate::ninep::server::InflightRequests = Arc::new(DashMap::new());
+    let pending_flushes: crate::ninep::server::PendingFlushes = Arc::new(DashMap::new());
 
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
