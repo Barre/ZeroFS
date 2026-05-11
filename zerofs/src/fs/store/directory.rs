@@ -138,12 +138,11 @@ impl DirectoryStore {
         dir_id: InodeId,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
     {
-        let start_key = Bytes::from(KeyCodec::dir_scan_prefix(dir_id));
-        let end_key = KeyCodec::dir_scan_end_key(dir_id);
+        let prefix = Bytes::from(KeyCodec::dir_scan_prefix(dir_id));
 
         let iter = self
             .db
-            .scan(start_key..end_key)
+            .scan_prefix(prefix, None, 256 * 1024)
             .await
             .map_err(|_| FsError::IoError)?;
 
@@ -179,12 +178,12 @@ impl DirectoryStore {
         resume_after_cookie: u64,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
     {
-        let start_key = KeyCodec::dir_scan_resume_key(dir_id, resume_after_cookie);
-        let end_key = KeyCodec::dir_scan_end_key(dir_id);
+        let prefix = Bytes::from(KeyCodec::dir_scan_prefix(dir_id));
+        let seek_to = KeyCodec::dir_scan_resume_key(dir_id, resume_after_cookie);
 
         let iter = self
             .db
-            .scan(start_key..end_key)
+            .scan_prefix(prefix, Some(seek_to), 256 * 1024)
             .await
             .map_err(|_| FsError::IoError)?;
 

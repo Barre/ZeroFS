@@ -159,7 +159,10 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    /// Build the end key for a directory scan range (next directory)
+    /// Build the end key for a directory scan range (next directory).
+    /// Used by external consumers (e.g. failpoint consistency checks) that
+    /// scan a fixed dir's entries via plain `scan(start..end)`.
+    #[allow(dead_code)]
     pub fn dir_scan_end_key(dir_id: InodeId) -> Bytes {
         let mut key = Vec::with_capacity(KEY_INODE_SIZE);
         key.push(u8::from(KeyPrefix::DirScan));

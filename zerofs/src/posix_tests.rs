@@ -1334,6 +1334,7 @@ mod tests {
                         object_store,
                     )
                     .with_block_transformer(block_transformer)
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .build()
                     .await
                     .unwrap(),
@@ -1394,6 +1395,7 @@ mod tests {
                         object_store,
                     )
                     .with_block_transformer(block_transformer)
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .build()
                     .await
                     .unwrap(),
@@ -1451,6 +1453,7 @@ mod tests {
                         object_store,
                     )
                     .with_block_transformer(block_transformer)
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .build()
                     .await
                     .unwrap(),
