@@ -231,7 +231,7 @@ pub(crate) fn dispatch_9p_frame(
             let pending_flushes = Arc::clone(pending_flushes);
 
             spawn_named("9p-request", async move {
-                let response = handler.handle_message(tag, body).await;
+                let response = Box::pin(handler.handle_message(tag, body)).await;
 
                 if let Some(oldtag) = flush_oldtag {
                     // Lazily install a Notify in the target's inflight entry.
