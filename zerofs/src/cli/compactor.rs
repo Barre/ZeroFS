@@ -85,6 +85,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         CompactorBuilder::new(db_path, object_store)
             .with_options(compactor_options)
             .with_block_transformer(block_transformer)
+            .with_filter_policies(crate::fs::filter_policy::filter_policies())
             .build(),
     );
 

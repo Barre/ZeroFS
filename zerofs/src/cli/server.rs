@@ -539,6 +539,7 @@ pub async fn build_slatedb(
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_metrics_recorder(metrics_recorder.clone());
 
             if let Some(wal_store) = wal_object_store {
@@ -548,6 +549,7 @@ pub async fn build_slatedb(
             if !disable_compactor {
                 let compactor = CompactorBuilder::new(db_path, object_store)
                     .with_runtime(runtime_handle.clone())
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
@@ -569,8 +571,9 @@ pub async fn build_slatedb(
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
 
-            let mut reader_builder =
-                DbReader::builder(db_path, object_store).with_block_transformer(block_transformer);
+            let mut reader_builder = DbReader::builder(db_path, object_store)
+                .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies());
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -583,7 +586,8 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_checkpoint_id(checkpoint_id)
-                .with_block_transformer(block_transformer);
+                .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies());
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
