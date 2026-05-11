@@ -133,7 +133,7 @@ impl NinePServer {
 
 async fn handle_client_stream<R, W>(
     read_stream: R,
-    mut write_stream: W,
+    write_stream: W,
     filesystem: Arc<ZeroFS>,
     lock_manager: Arc<FileLockManager>,
     shutdown: CancellationToken,
@@ -148,10 +148,25 @@ where
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
     let writer_task = spawn_named("9p-writer", async move {
-        while let Some((tag, response_bytes)) = rx.recv().await {
-            if let Err(e) = write_stream.write_all(&response_bytes).await {
+        let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, write_stream);
+        loop {
+            let (tag, response_bytes) = match rx.recv().await {
+                Some(msg) => msg,
+                None => break,
+            };
+            if let Err(e) = writer.write_all(&response_bytes).await {
                 error!("Failed to write response for tag {}: {}", tag, e);
-                break;
+                return;
+            }
+            while let Ok((_, more)) = rx.try_recv() {
+                if let Err(e) = writer.write_all(&more).await {
+                    error!("Failed to write response: {}", e);
+                    return;
+                }
+            }
+            if let Err(e) = writer.flush().await {
+                error!("Failed to flush writer: {}", e);
+                return;
             }
         }
     });
@@ -270,10 +285,10 @@ pub(crate) fn dispatch_9p_frame(
                     }
                 }
 
-                if flush_oldtag.is_none() {
-                    if let Some((_, Some(notify))) = inflight.remove(&tag) {
-                        notify.notify_waiters();
-                    }
+                if flush_oldtag.is_none()
+                    && let Some((_, Some(notify))) = inflight.remove(&tag)
+                {
+                    notify.notify_waiters();
                 }
             });
             Ok(())
