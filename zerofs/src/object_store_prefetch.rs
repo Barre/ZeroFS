@@ -63,6 +63,7 @@ impl PrefetchingObjectStore {
         );
         let heads = foyer::CacheBuilder::new(HEADS_CAPACITY_ENTRIES)
             .with_name("zerofs-object-prefetch-heads")
+            .with_eviction_config(foyer::S3FifoConfig::default())
             .build();
         Self {
             inner,

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
-    Spawner,
+    S3FifoConfig, Spawner,
 };
 use slatedb::admin::AdminBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
@@ -352,6 +352,7 @@ pub(crate) async fn build_parts_hybrid(
     HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
         .memory(PARTS_MEMORY_BYTES)
+        .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
         .with_spawner(Spawner::from(foyer_handle.clone()))
@@ -485,6 +486,7 @@ pub async fn build_slatedb(
     let hybrid = HybridCacheBuilder::new()
         .with_name("zerofs-slatedb-hybrid")
         .memory(hybrid_memory_bytes)
+        .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
         .storage()
         .with_spawner(Spawner::from(foyer_handle.clone()))
