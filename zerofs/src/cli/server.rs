@@ -29,7 +29,6 @@ use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -338,7 +337,6 @@ fn start_periodic_flush(
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     disk_bytes: usize,
-    foyer_handle: &tokio::runtime::Handle,
 ) -> Result<foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>> {
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
@@ -355,7 +353,7 @@ pub(crate) async fn build_parts_hybrid(
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
-        .with_spawner(Spawner::from(foyer_handle.clone()))
+        .with_spawner(Spawner::current())
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(
             BlockEngineConfig::new(
@@ -398,11 +396,7 @@ pub async fn build_slatedb(
     disable_compactor: bool,
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-) -> Result<(
-    SlateDbHandle,
-    Option<tokio::runtime::Handle>,
-    Option<Arc<DefaultMetricsRecorder>>,
-)> {
+) -> Result<(SlateDbHandle, Option<Arc<DefaultMetricsRecorder>>)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -464,15 +458,6 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    let foyer_handle = {
-        let rt = Runtime::new().expect("failed to build foyer runtime");
-        let handle = rt.handle().clone();
-        std::thread::spawn(move || {
-            rt.block_on(async { std::future::pending::<()>().await });
-        });
-        handle
-    };
-
     let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
     tokio::fs::create_dir_all(&hybrid_cache_root)
         .await
@@ -489,7 +474,7 @@ pub async fn build_slatedb(
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
         .storage()
-        .with_spawner(Spawner::from(foyer_handle.clone()))
+        .with_spawner(Spawner::current())
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(
             BlockEngineConfig::new(
@@ -505,25 +490,11 @@ pub async fn build_slatedb(
         .map_err(|e| anyhow::anyhow!("foyer hybrid build failed: {e}"))?;
     let cache = Arc::new(FoyerHybridCache::new_with_cache(hybrid));
 
-    let parts_cache =
-        build_parts_hybrid(&cache_config.root_folder, parts_disk_bytes, &foyer_handle).await?;
+    let parts_cache = build_parts_hybrid(&cache_config.root_folder, parts_disk_bytes).await?;
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(PrefetchingObjectStore::new(object_store, parts_cache));
 
     let db_path = Path::from(db_path);
-
-    // This may look weird, but this is required to not drop the runtime handle from the async context
-    let (runtime_handle, _runtime_keeper) = tokio::task::spawn_blocking(|| {
-        let runtime = Runtime::new().unwrap();
-        let handle = runtime.handle().clone();
-
-        let runtime_keeper = std::thread::spawn(move || {
-            runtime.block_on(async { std::future::pending::<()>().await });
-        });
-
-        (handle, runtime_keeper)
-    })
-    .await?;
 
     match db_mode {
         DatabaseMode::ReadWrite => {
@@ -537,7 +508,7 @@ pub async fn build_slatedb(
 
             let mut builder = DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
-                .with_gc_runtime(runtime_handle.clone())
+                .with_gc_runtime(tokio::runtime::Handle::current())
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
@@ -550,7 +521,7 @@ pub async fn build_slatedb(
 
             if !disable_compactor {
                 let compactor = CompactorBuilder::new(db_path, object_store)
-                    .with_runtime(runtime_handle.clone())
+                    .with_runtime(tokio::runtime::Handle::current())
                     .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
@@ -564,11 +535,7 @@ pub async fn build_slatedb(
 
             let slatedb = Arc::new(builder.build().await?);
 
-            Ok((
-                SlateDbHandle::ReadWrite(slatedb),
-                Some(runtime_handle),
-                Some(metrics_recorder),
-            ))
+            Ok((SlateDbHandle::ReadWrite(slatedb), Some(metrics_recorder)))
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
@@ -581,7 +548,7 @@ pub async fn build_slatedb(
             }
             let reader = Arc::new(reader_builder.build().await?);
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
@@ -595,7 +562,7 @@ pub async fn build_slatedb(
             }
             let reader = Arc::new(reader_builder.build().await?);
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
         }
     }
 }
@@ -606,7 +573,6 @@ pub struct InitResult {
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
-    pub maintenance_runtime: Option<tokio::runtime::Handle>,
 }
 
 async fn initialize_filesystem(
@@ -684,7 +650,7 @@ async fn initialize_filesystem(
             None
         };
 
-    let (slatedb, maintenance_runtime, metrics_recorder) = build_slatedb(
+    let (slatedb, metrics_recorder) = build_slatedb(
         object_store.clone(),
         &cache_config,
         actual_db_path.clone(),
@@ -712,7 +678,6 @@ async fn initialize_filesystem(
         wal_object_store,
         db_path: actual_db_path.to_string(),
         db_handle,
-        maintenance_runtime,
     })
 }
 
@@ -843,7 +808,7 @@ pub async fn run_server(
             fs.chunk_store.clone(),
             Arc::clone(&fs.stats),
         ));
-        Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
+        Some(gc.start(shutdown.clone()))
     } else {
         None
     };
