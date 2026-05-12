@@ -65,19 +65,10 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         ..Default::default()
     };
 
-    let foyer_handle = {
-        let rt = tokio::runtime::Runtime::new().expect("failed to build foyer runtime");
-        let handle = rt.handle().clone();
-        std::thread::spawn(move || {
-            rt.block_on(async { std::future::pending::<()>().await });
-        });
-        handle
-    };
     let total_disk_bytes = (settings.cache.disk_size_gb * 1_000_000_000.0) as usize;
     let (parts_disk_bytes, _) = super::server::split_disk_budget(total_disk_bytes);
     let parts_cache =
-        super::server::build_parts_hybrid(&settings.cache.dir, parts_disk_bytes, &foyer_handle)
-            .await?;
+        super::server::build_parts_hybrid(&settings.cache.dir, parts_disk_bytes).await?;
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(PrefetchingObjectStore::new(object_store, parts_cache));
 
