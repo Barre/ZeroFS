@@ -73,6 +73,10 @@ impl Transaction {
         self.ops.push(TxOp::Delete(key.clone()));
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
     /// Replay this transaction's ops into `target`. SlateDB's `WriteBatch`
     /// already dedupes per key, so calling this on multiple transactions
     /// produces one merged batch with last-write-wins per key.
