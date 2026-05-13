@@ -77,7 +77,9 @@ async fn worker_loop(
 
         let mut merged = WriteBatch::new();
         let mut replies = Vec::with_capacity(batch.len());
+        let mut any_ops = false;
         for (txn, reply) in batch {
+            any_ops |= !txn.is_empty();
             txn.apply_to(&mut merged);
             replies.push(reply);
         }
@@ -92,23 +94,31 @@ async fn worker_loop(
                 KeyCodec::encode_counter(current),
             );
             last_emitted_counter = current;
+            any_ops = true;
         }
 
-        let mut result = db
-            .write_with_options(
+        // SlateDB rejects empty WriteBatches. A batch can be empty when every
+        // queued txn was a no-op (e.g. a sub-chunk trim against a fully sparse
+        // region produces no chunk writes) and no inode was allocated. Reply
+        // Ok without touching the db; there's nothing to make durable either.
+        let mut result = if any_ops {
+            db.write_with_options(
                 merged,
                 &WriteOptions {
                     await_durable: false,
                 },
             )
             .await
-            .map_err(|_| FsError::IoError);
+            .map_err(|_| FsError::IoError)
+        } else {
+            Ok(())
+        };
 
         // In sync_writes mode, force a flush after the batch is committed so
         // every caller in the batch only sees Ok once their data is durable in
         // object storage. FlushCoordinator coalesces concurrent flush requests
         // into a single db.flush()
-        if sync_writes && result.is_ok() {
+        if sync_writes && result.is_ok() && any_ops {
             result = flush_coordinator.flush().await;
         }
 
@@ -192,6 +202,20 @@ mod tests {
                 .unwrap();
             assert!(v.is_some(), "sync/{i} not durable after sync_writes commit");
         }
+    }
+
+    #[tokio::test]
+    async fn empty_transaction_is_noop_not_fatal() {
+        // SlateDB rejects empty WriteBatches with "empty write batch not
+        // allowed". A no-op txn (e.g. sub-chunk trim on a fully sparse range)
+        // must short-circuit before reaching the db.
+        let fs = make_fs().await;
+        let txn = Transaction::new();
+        assert!(txn.is_empty());
+        fs.write_coordinator
+            .commit(txn)
+            .await
+            .expect("empty txn should commit as a no-op");
     }
 
     #[tokio::test]

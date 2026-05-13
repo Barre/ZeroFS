@@ -669,6 +669,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trim_on_fully_sparse_file() {
+        let fs = create_test_fs().await;
+        let creds = test_creds();
+        let auth = AuthContext {
+            uid: 1000,
+            gid: 1000,
+            gids: vec![1000],
+        };
+
+        let (file_id, _) = fs
+            .create(&creds, 0, b"sparse.img", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.setattr(
+            &creds,
+            file_id,
+            &SetAttributes {
+                size: SetSize::Set(50 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        fs.trim(&auth, file_id, 0, 1024)
+            .await
+            .expect("trim on sparse file must succeed");
+    }
+
+    #[tokio::test]
     async fn test_sparse_file_operations() {
         let fs = create_test_fs().await;
         let creds = test_creds();
