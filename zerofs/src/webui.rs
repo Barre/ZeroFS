@@ -69,7 +69,7 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState) {
     loop {
         match ws_rx.next().await {
             Some(Ok(WsMessage::Binary(data))) => {
-                if let Err(e) = dispatch_9p_frame(&data, &handler, &tx, &inflight, &pending_flushes)
+                if let Err(e) = dispatch_9p_frame(data, &handler, &tx, &inflight, &pending_flushes)
                 {
                     error!("9P WebSocket dispatch error: {}", e);
                     break;

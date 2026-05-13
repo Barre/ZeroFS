@@ -2,11 +2,12 @@ use super::errors::P9Error;
 pub(crate) use super::handler::NinePHandler;
 pub(crate) use super::lock_manager::FileLockManager;
 use super::protocol::{
-    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE,
-    P9_SIZE_FIELD_LEN, P9Message, Rlerror,
+    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
+    P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
 };
 use crate::fs::ZeroFS;
 use crate::task::spawn_named;
+use bytes::Bytes;
 use dashmap::DashMap;
 use deku::prelude::*;
 use futures::StreamExt;
@@ -19,6 +20,10 @@ use tokio::sync::mpsc;
 use tokio_util::codec::LengthDelimitedCodec;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// 9P message type byte for Tflush. Kept here so the reader can recognise a
+/// flush from the raw frame header without deku-parsing the whole body.
+const TFLUSH_TYPE: u8 = 108;
 
 pub enum Transport {
     Tcp(SocketAddr),
@@ -192,141 +197,141 @@ pub(crate) type PendingFlushes = Arc<DashMap<u16, u16>>;
 
 /// Dispatch a single 9P frame buffer. Shared between TCP (via LengthDelimitedCodec)
 /// and WebSocket transports.
+///
+/// The reader task only does the cheap header extraction and inflight bookkeeping; the deku parse is
+/// performed inside the spawned per-request task so the single per-connection
+/// reader doesn't bottleneck on it.
 pub(crate) fn dispatch_9p_frame(
-    full_buf: &[u8],
+    frame: Bytes,
     handler: &Arc<NinePHandler>,
     tx: &mpsc::Sender<(u16, Vec<u8>)>,
     inflight: &InflightRequests,
     pending_flushes: &PendingFlushes,
 ) -> anyhow::Result<()> {
-    if full_buf.len() < P9_MIN_MESSAGE_SIZE as usize {
-        error!("Message too short: {} bytes", full_buf.len());
+    if frame.len() < P9_MIN_MESSAGE_SIZE as usize {
+        error!("Message too short: {} bytes", frame.len());
         return Err(anyhow::anyhow!("Message too short"));
     }
 
-    match P9Message::from_bytes((full_buf, 0)) {
-        Ok((_, parsed)) => {
-            debug!(
-                "Received message type {} tag {}: {:?}",
-                parsed.type_, parsed.tag, parsed.body
-            );
+    let type_byte = frame[4];
+    let tag = u16::from_le_bytes([frame[5], frame[6]]);
 
-            let tag = parsed.tag;
-            let body = parsed.body;
-
-            let flush_oldtag = if let Message::Tflush(ref tflush) = body {
-                pending_flushes.insert(tflush.oldtag, tag);
-                Some(tflush.oldtag)
-            } else {
-                // Track the in-flight tag without allocating a Notify. A Tflush
-                // handler will lazily upgrade the entry to Some(Notify) if one
-                // ever arrives for this tag.
-                inflight.insert(tag, None);
-                None
-            };
-
-            let handler = Arc::clone(handler);
-            let tx = tx.clone();
-            let inflight = Arc::clone(inflight);
-            let pending_flushes = Arc::clone(pending_flushes);
-
-            spawn_named("9p-request", async move {
-                let response = Box::pin(handler.handle_message(tag, body)).await;
-
-                if let Some(oldtag) = flush_oldtag {
-                    // Lazily install a Notify in the target's inflight entry.
-                    // If the entry is gone, the target already completed.
-                    let target_notify = inflight.get_mut(&oldtag).map(|mut entry| {
-                        let slot = entry.value_mut();
-                        if let Some(n) = slot.as_ref() {
-                            Arc::clone(n)
-                        } else {
-                            let n = Arc::new(tokio::sync::Notify::new());
-                            *slot = Some(Arc::clone(&n));
-                            n
-                        }
-                    });
-
-                    if let Some(notify) = target_notify {
-                        debug!("Tflush: waiting for oldtag {} to complete", oldtag);
-                        let permit = notify.notified();
-                        tokio::pin!(permit);
-                        // Arm the waiter before any further checks so that a
-                        // concurrent notify_waiters from the target cannot be
-                        // lost; if it already fired, enable() returns Ready.
-                        permit.as_mut().enable();
-                        permit.await;
-                        debug!("Tflush: oldtag {} completed", oldtag);
-                    }
-
-                    let is_latest = pending_flushes
-                        .get(&oldtag)
-                        .is_some_and(|latest_tag| *latest_tag == tag);
-
-                    if !is_latest {
-                        debug!(
-                            "Tflush: tag {} superseded by newer flush for oldtag {}",
-                            tag, oldtag
-                        );
-                        return;
-                    }
-
-                    pending_flushes.remove(&oldtag);
-                }
-
-                match response.to_bytes() {
-                    Ok(response_bytes) => {
-                        if let Err(e) = tx.send((tag, response_bytes)).await {
-                            warn!("Failed to send response for tag {}: {}", tag, e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize response for tag {}: {:?}", tag, e);
-                    }
-                }
-
-                if flush_oldtag.is_none()
-                    && let Some((_, Some(notify))) = inflight.remove(&tag)
-                {
-                    notify.notify_waiters();
-                }
-            });
-            Ok(())
+    // Tflush's body is just a u16 oldtag at offset P9_HEADER_SIZE. Peel it
+    // here so the reader can register pending_flushes before yielding,
+    // otherwise a later flush for the same oldtag could be dropped if it
+    // arrives before this frame's spawned task runs.
+    let flush_oldtag = if type_byte == TFLUSH_TYPE {
+        if frame.len() < P9_HEADER_SIZE + 2 {
+            error!("Tflush message too short: {} bytes", frame.len());
+            return Err(anyhow::anyhow!("Tflush message too short"));
         }
-        Err(e) => {
-            if full_buf.len() >= P9_MIN_MESSAGE_SIZE as usize {
-                let tag = u16::from_le_bytes([full_buf[5], full_buf[6]]);
-                let msg_type = full_buf[4];
+        let oldtag = u16::from_le_bytes([frame[P9_HEADER_SIZE], frame[P9_HEADER_SIZE + 1]]);
+        pending_flushes.insert(oldtag, tag);
+        Some(oldtag)
+    } else {
+        // Track the in-flight tag without allocating a Notify. A Tflush
+        // handler will lazily upgrade the entry to Some(Notify) if one
+        // ever arrives for this tag.
+        inflight.insert(tag, None);
+        None
+    };
+
+    let handler = Arc::clone(handler);
+    let tx = tx.clone();
+    let inflight = Arc::clone(inflight);
+    let pending_flushes = Arc::clone(pending_flushes);
+
+    spawn_named("9p-request", async move {
+        // Parse off the reader task. On parse failure we still need to honour
+        // the inflight/flush bookkeeping installed above, so we synthesise an
+        // Rlerror response rather than bailing early.
+        let response = match P9Message::from_bytes((&frame, 0)) {
+            Ok((_, parsed)) => {
+                debug!(
+                    "Received message type {} tag {}: {:?}",
+                    parsed.type_, parsed.tag, parsed.body
+                );
+                Box::pin(handler.handle_message(tag, parsed.body)).await
+            }
+            Err(e) => {
                 debug!(
                     "Failed to parse message type {} (0x{:02x}) tag {}: {:?}",
-                    msg_type, msg_type, tag, e
+                    type_byte, type_byte, tag, e
                 );
                 debug!(
                     "Message size: {}, buffer (first {} bytes): {:?}",
-                    full_buf.len(),
+                    frame.len(),
                     P9_DEBUG_BUFFER_SIZE,
-                    &full_buf[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, full_buf.len())]
+                    &frame[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, frame.len())]
                 );
-                let error_msg = P9Message::new(
+                P9Message::new(
                     tag,
                     Message::Rlerror(Rlerror {
                         ecode: P9Error::NotImplemented.to_errno(),
                     }),
+                )
+            }
+        };
+
+        if let Some(oldtag) = flush_oldtag {
+            // Lazily install a Notify in the target's inflight entry.
+            // If the entry is gone, the target already completed.
+            let target_notify = inflight.get_mut(&oldtag).map(|mut entry| {
+                let slot = entry.value_mut();
+                if let Some(n) = slot.as_ref() {
+                    Arc::clone(n)
+                } else {
+                    let n = Arc::new(tokio::sync::Notify::new());
+                    *slot = Some(Arc::clone(&n));
+                    n
+                }
+            });
+
+            if let Some(notify) = target_notify {
+                debug!("Tflush: waiting for oldtag {} to complete", oldtag);
+                let permit = notify.notified();
+                tokio::pin!(permit);
+                // Arm the waiter before any further checks so that a
+                // concurrent notify_waiters from the target cannot be
+                // lost; if it already fired, enable() returns Ready.
+                permit.as_mut().enable();
+                permit.await;
+                debug!("Tflush: oldtag {} completed", oldtag);
+            }
+
+            let is_latest = pending_flushes
+                .get(&oldtag)
+                .is_some_and(|latest_tag| *latest_tag == tag);
+
+            if !is_latest {
+                debug!(
+                    "Tflush: tag {} superseded by newer flush for oldtag {}",
+                    tag, oldtag
                 );
-                let response_bytes = error_msg.to_bytes().expect("Failed to serialize Rlerror");
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send((tag, response_bytes)).await {
-                        error!("Failed to send error response: {}", e);
-                    }
-                });
-                Ok(())
-            } else {
-                debug!("Message too short to parse: {:?}", e);
-                Err(anyhow::anyhow!("Failed to parse message: {e:?}"))
+                return;
+            }
+
+            pending_flushes.remove(&oldtag);
+        }
+
+        match response.to_bytes() {
+            Ok(response_bytes) => {
+                if let Err(e) = tx.send((tag, response_bytes)).await {
+                    warn!("Failed to send response for tag {}: {}", tag, e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to serialize response for tag {}: {:?}", tag, e);
             }
         }
-    }
+
+        if flush_oldtag.is_none()
+            && let Some((_, Some(notify))) = inflight.remove(&tag)
+        {
+            notify.notify_waiters();
+        }
+    });
+    Ok(())
 }
 
 async fn handle_client_loop<R>(
@@ -360,7 +365,7 @@ where
             }
             result = codec.next() => {
                 match result {
-                    Some(Ok(buf)) => buf,
+                    Some(Ok(buf)) => buf.freeze(),
                     Some(Err(e)) => {
                         return Err(e.into());
                     }
@@ -372,6 +377,6 @@ where
             }
         };
 
-        dispatch_9p_frame(&full_buf, &handler, &tx, &inflight, &pending_flushes)?;
+        dispatch_9p_frame(full_buf, &handler, &tx, &inflight, &pending_flushes)?;
     }
 }
