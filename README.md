@@ -506,16 +506,21 @@ After changing the password, update your configuration file or environment varia
 
 #### What's Encrypted vs What's Not
 
-**Encrypted:**
-- All file contents (in 32K chunks)
-- File metadata values (permissions, timestamps, etc.)
+Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to a block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
-**Not Encrypted:**
-- Key structure (inode IDs, directory entry names)
+**Encrypted at rest:**
+- All file contents (in 32K chunks).
+- File metadata values (permissions, timestamps, ownership, directory-entry payloads, etc.).
+- All keys *inside* data blocks (inode IDs, directory entry names, chunk indices), since each block is encrypted as a unit.
+- SST index blocks (block offsets + per-block first-key markers) and bloom filter blocks.
 
-This design is intentional. Encrypting keys would severely impact performance as LSM trees need to compare and sort keys during compaction. The key structure reveals filesystem hierarchy but not file contents.
+**Visible in plaintext on the object store:**
+- Per-SST `first_key` and `last_key` written into the SST footer's flatbuffer (`SsTableInfo`). For a directory-entry SST this leaks the lexicographically-first and -last `(dir_id, filename)` pair the file contains, not every filename in the SST, but enough that an attacker walking SST footers can sample some directory contents.
+- The SlateDB manifest: SST IDs, segment prefixes (the strings `"meta"` and `"chunk"`), object sizes, checkpoint pointers, format version.
+- SST blob IDs, sizes, and counts (anything visible to an S3 LIST).
 
-This should be fine for most use-cases but if you need to hide directory structure and filenames, you can layer a filename-encrypting filesystem like gocryptfs on top of ZeroFS.
+**Local cache directory (`[cache] dir`):**
+ZeroFS's on-disk block cache stores **decrypted, decompressed** SST blocks. Encryption is at the block transformer; once a block is fetched from object storage and decrypted, the plaintext form is what gets cached locally so subsequent reads don't pay the decrypt + decompress cost. Treat the cache directory as containing sensitive data and protect it with normal filesystem permissions (or place it on an encrypted volume) if local-disk confidentiality matters to your threat model.
 
 ## Mounting the Filesystem
 
