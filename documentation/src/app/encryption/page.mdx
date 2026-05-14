@@ -55,36 +55,47 @@ ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide
 
 ## What's Encrypted
 
-Understanding what ZeroFS encrypts helps you assess its security for your use case:
+Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to ZeroFS's block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 <Row>
   <Col>
 
-    ### Encrypted Data
+    ### Encrypted at Rest
 
     <Properties>
       <Property name="File Contents" type="encrypted">
         All file data is encrypted in 32KB chunks using unique nonces
       </Property>
       <Property name="File Metadata" type="encrypted">
-        Permissions, timestamps, ownership, and other inode data
+        Permissions, timestamps, ownership, directory-entry payloads, symlink targets, and other inode data
       </Property>
-      <Property name="Symbolic Links" type="encrypted">
-        Link target paths are encrypted
+      <Property name="Keys Inside Blocks" type="encrypted">
+        Inode IDs, directory entry names, chunk identifiers, each block is encrypted as a unit, so the keys it indexes are protected
+      </Property>
+      <Property name="SST Index & Filter Blocks" type="encrypted">
+        Per-block first-key markers and bloom filter contents
       </Property>
     </Properties>
 
-    ### Not Encrypted
+    ### Visible in Plaintext on the Object Store
 
     <Properties>
-      <Property name="Directory Structure" type="plaintext">
-        Directory names and hierarchy remain visible
+      <Property name="Per-SST First/Last Key" type="plaintext">
+        The SST footer's `SsTableInfo` flatbuffer stores each SST's first and last key in plaintext. For a directory-entry SST this leaks the lexicographically-first and -last `(dir_id, filename)` it contains.
       </Property>
-      <Property name="File Names" type="plaintext">
-        Individual file names are not encrypted
+      <Property name="Manifest" type="plaintext">
+        SST IDs, segment prefixes (`"meta"`, `"chunk"`), object sizes, checkpoint pointers, format version
       </Property>
-      <Property name="Database Keys" type="plaintext">
-        LSM tree keys (inode IDs, chunk identifiers)
+      <Property name="Object Metadata" type="plaintext">
+        SST blob names, sizes, and counts (anything visible to an S3 LIST).
+      </Property>
+    </Properties>
+
+    ### Local Cache Directory
+
+    <Properties>
+      <Property name="Cache Contents" type="plaintext">
+        The on-disk cache (default `~/.cache/zerofs`) stores **decrypted, decompressed** SST blocks so subsequent reads don't pay the decrypt cost.
       </Property>
     </Properties>
 
@@ -92,7 +103,7 @@ Understanding what ZeroFS encrypts helps you assess its security for your use ca
   <Col>
 
     ```bash {{ title: 'What S3 Sees' }}
-    # Encrypted file contents in S3:
+    # Encrypted block payloads in SST data files:
     s3://bucket/path/
     ├── compacted
     │   ├── 01K1JW549K0H0MV3FH28CKBWTY.sst
@@ -100,17 +111,17 @@ Understanding what ZeroFS encrypts helps you assess its security for your use ca
     │   ├── 01K1JW54KE1XMV5DQG9KQ5R9B5.sst
     ├── manifest
     │   ├── 00000000000000000001.manifest
-    │   ├── 00000000000000000002.manifest
-    │   ├── 00000000000000000003.manifest
-    │   ├── 00000000000000000004.manifest
+    │   └── ...
     └── wal
-    ├── 00000000000000000001.sst
-    ├── 00000000000000000002.sst
-    ├── 00000000000000000003.sst
-    └── 00000000000000000004.sst
-    # Each SST contains:
-    # - Keys: inode:123, chunk:123/0
-    # - Values: [encrypted data + auth tag]
+        ├── 00000000000000000001.sst
+        └── ...
+    # Inside each SST:
+    # - Data blocks: encrypted (keys + values opaque on disk)
+    # - Index blocks: encrypted (per-block first-key markers)
+    # - Filter blocks: encrypted (bloom filter bytes)
+    # - SST footer (SsTableInfo): plaintext, includes
+    #   the SST's first and last key
+    # The manifest is plaintext.
     ```
 
   </Col>
