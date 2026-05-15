@@ -1365,7 +1365,10 @@ mod tests {
                         object_store,
                     )
                     .with_block_transformer(block_transformer)
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                    .with_segment_extractor(Arc::new(
+                        crate::segment_extractor::ZeroFsSegmentExtractor,
+                    ))
                     .build()
                     .await
                     .unwrap(),
@@ -1373,6 +1376,7 @@ mod tests {
                 1_000_000,
                 None,
                 false,
+                true,
             )
             .await
             .unwrap(),
@@ -1426,7 +1430,10 @@ mod tests {
                         object_store,
                     )
                     .with_block_transformer(block_transformer)
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                    .with_segment_extractor(Arc::new(
+                        crate::segment_extractor::ZeroFsSegmentExtractor,
+                    ))
                     .build()
                     .await
                     .unwrap(),
@@ -1434,6 +1441,7 @@ mod tests {
                 1_000_000,
                 None,
                 false,
+                true,
             )
             .await
             .unwrap(),
@@ -1484,7 +1492,10 @@ mod tests {
                         object_store,
                     )
                     .with_block_transformer(block_transformer)
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                    .with_segment_extractor(Arc::new(
+                        crate::segment_extractor::ZeroFsSegmentExtractor,
+                    ))
                     .build()
                     .await
                     .unwrap(),
@@ -1492,6 +1503,7 @@ mod tests {
                 1_000_000,
                 None,
                 false,
+                true,
             )
             .await
             .unwrap(),

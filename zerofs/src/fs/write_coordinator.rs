@@ -29,6 +29,7 @@ impl WriteCoordinator {
         db: Arc<Db>,
         inode_store: InodeStore,
         flush_coordinator: FlushCoordinator,
+        key_codec: Arc<KeyCodec>,
         sync_writes: bool,
     ) -> Self {
         // Capture synchronously: the spawned task starts later, by which point
@@ -42,6 +43,7 @@ impl WriteCoordinator {
                 db,
                 inode_store,
                 flush_coordinator,
+                key_codec,
                 sync_writes,
                 receiver,
                 initial_counter,
@@ -63,6 +65,7 @@ async fn worker_loop(
     db: Arc<Db>,
     inode_store: InodeStore,
     flush_coordinator: FlushCoordinator,
+    key_codec: Arc<KeyCodec>,
     sync_writes: bool,
     mut rx: mpsc::UnboundedReceiver<(Transaction, Reply)>,
     initial_counter: u64,
@@ -90,7 +93,7 @@ async fn worker_loop(
         let current = inode_store.next_id();
         if current > last_emitted_counter {
             merged.put_bytes(
-                KeyCodec::system_counter_key(),
+                key_codec.system_counter_key(),
                 KeyCodec::encode_counter(current),
             );
             last_emitted_counter = current;
@@ -106,6 +109,7 @@ async fn worker_loop(
                 merged,
                 &WriteOptions {
                     await_durable: false,
+                    ..Default::default()
                 },
             )
             .await
@@ -138,11 +142,18 @@ mod tests {
         ZeroFS::new_in_memory().await.unwrap()
     }
 
+    fn codec() -> KeyCodec {
+        // `new_in_memory` creates v2-segmented volumes.
+        KeyCodec::new(true)
+    }
+
     #[tokio::test]
     async fn commits_single_transaction() {
         let fs = make_fs().await;
         let mut txn = Transaction::new();
-        let key = Bytes::from("single/key");
+        // Use a real codec-built key so the segment extractor (when v2 is
+        // enabled by `new_in_memory`) accepts it.
+        let key = codec().chunk_key(1, 0);
         txn.put_bytes(&key, Bytes::from_static(b"value"));
         fs.write_coordinator.commit(txn).await.unwrap();
         let v = fs.db.get_bytes(&key).await.unwrap();
@@ -153,15 +164,14 @@ mod tests {
     async fn coalesces_concurrent_commits() {
         let fs = make_fs().await;
         let coord = fs.write_coordinator.clone();
+        let codec = codec();
         let mut handles = Vec::new();
         for i in 0u64..32 {
             let c = coord.clone();
+            let k = codec.chunk_key(1, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(
-                    &Bytes::from(format!("coalesce/{i}")),
-                    Bytes::from(vec![1u8; 8]),
-                );
+                txn.put_bytes(&k, Bytes::from(vec![1u8; 8]));
                 c.commit(txn).await
             }));
         }
@@ -169,11 +179,7 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..32 {
-            let v = fs
-                .db
-                .get_bytes(&Bytes::from(format!("coalesce/{i}")))
-                .await
-                .unwrap();
+            let v = fs.db.get_bytes(&codec.chunk_key(1, i)).await.unwrap();
             assert!(v.is_some());
         }
     }
@@ -182,12 +188,14 @@ mod tests {
     async fn sync_writes_commits_persist() {
         let fs = ZeroFS::new_in_memory_with_sync_writes(true).await.unwrap();
         let coord = fs.write_coordinator.clone();
+        let codec = codec();
         let mut handles = Vec::new();
         for i in 0u64..16 {
             let c = coord.clone();
+            let k = codec.chunk_key(2, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&Bytes::from(format!("sync/{i}")), Bytes::from(vec![2u8; 8]));
+                txn.put_bytes(&k, Bytes::from(vec![2u8; 8]));
                 c.commit(txn).await
             }));
         }
@@ -195,12 +203,11 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..16 {
-            let v = fs
-                .db
-                .get_bytes(&Bytes::from(format!("sync/{i}")))
-                .await
-                .unwrap();
-            assert!(v.is_some(), "sync/{i} not durable after sync_writes commit");
+            let v = fs.db.get_bytes(&codec.chunk_key(2, i)).await.unwrap();
+            assert!(
+                v.is_some(),
+                "chunk {i} not durable after sync_writes commit"
+            );
         }
     }
 
@@ -221,12 +228,12 @@ mod tests {
     #[tokio::test]
     async fn counter_emitted_only_when_advanced() {
         let fs = make_fs().await;
-        let counter_key = KeyCodec::system_counter_key();
+        let counter_key = codec().system_counter_key();
         let before = fs.db.get_bytes(&counter_key).await.unwrap();
 
         // A commit that doesn't allocate any inode.
         let mut txn = Transaction::new();
-        txn.put_bytes(&Bytes::from("nocounter/key"), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().chunk_key(3, 0), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after = fs.db.get_bytes(&counter_key).await.unwrap();
@@ -238,7 +245,7 @@ mod tests {
         // Now allocate and commit; counter must advance on disk.
         let _id = fs.inode_store.allocate();
         let mut txn = Transaction::new();
-        txn.put_bytes(&Bytes::from("withcounter/key"), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().chunk_key(3, 1), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after_allocate = fs.db.get_bytes(&counter_key).await.unwrap();

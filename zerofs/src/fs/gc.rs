@@ -138,6 +138,7 @@ impl GarbageCollector {
                             txn.into_inner(),
                             &WriteOptions {
                                 await_durable: false,
+                                ..Default::default()
                             },
                         )
                         .await
@@ -179,6 +180,7 @@ impl GarbageCollector {
                         txn.into_inner(),
                         &WriteOptions {
                             await_durable: false,
+                            ..Default::default()
                         },
                     )
                     .await

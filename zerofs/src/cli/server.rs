@@ -396,6 +396,7 @@ pub async fn build_slatedb(
     disable_compactor: bool,
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
+    segments_enabled: bool,
 ) -> Result<(SlateDbHandle, Option<Arc<DefaultMetricsRecorder>>)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
@@ -512,8 +513,14 @@ pub async fn build_slatedb(
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
                 .with_metrics_recorder(metrics_recorder.clone());
+
+            if segments_enabled {
+                builder = builder.with_segment_extractor(Arc::new(
+                    crate::segment_extractor::ZeroFsSegmentExtractor,
+                ));
+            }
 
             if let Some(wal_store) = wal_object_store {
                 builder = builder.with_wal_object_store(wal_store);
@@ -522,7 +529,9 @@ pub async fn build_slatedb(
             if !disable_compactor {
                 let compactor = CompactorBuilder::new(db_path, object_store)
                     .with_runtime(tokio::runtime::Handle::current())
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies(
+                        segments_enabled,
+                    ))
                     .with_options(slatedb::config::CompactorOptions {
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
@@ -542,7 +551,7 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies());
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -556,7 +565,7 @@ pub async fn build_slatedb(
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_checkpoint_id(checkpoint_id)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies());
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -650,6 +659,18 @@ async fn initialize_filesystem(
             None
         };
 
+    let segments_enabled = crate::segment_extractor::should_enable_segments(
+        &object_store,
+        &db_path,
+        wal_object_store.as_ref(),
+    )
+    .await?;
+    if segments_enabled {
+        info!("Segment-oriented compaction enabled (RFC-0024); using v2 key layout");
+    } else {
+        info!("Segment-oriented compaction disabled; using legacy v1 key layout");
+    }
+
     let (slatedb, metrics_recorder) = build_slatedb(
         object_store.clone(),
         &cache_config,
@@ -659,6 +680,7 @@ async fn initialize_filesystem(
         disable_compactor,
         block_transformer.clone(),
         wal_object_store.clone(),
+        segments_enabled,
     )
     .await?;
 
@@ -669,6 +691,7 @@ async fn initialize_filesystem(
         settings.max_bytes(),
         metrics_recorder.clone(),
         sync_writes,
+        segments_enabled,
     )
     .await?;
 

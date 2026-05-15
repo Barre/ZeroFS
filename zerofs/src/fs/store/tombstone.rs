@@ -18,11 +18,12 @@ pub struct TombstoneEntry {
 #[derive(Clone)]
 pub struct TombstoneStore {
     db: Arc<Db>,
+    key_codec: Arc<KeyCodec>,
 }
 
 impl TombstoneStore {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+        Self { db, key_codec }
     }
 
     pub fn add(&self, txn: &mut Transaction, inode_id: InodeId, size: u64) {
@@ -30,7 +31,7 @@ impl TombstoneStore {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let key = KeyCodec::tombstone_key(timestamp, inode_id);
+        let key = self.key_codec.tombstone_key(timestamp, inode_id);
         txn.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }
 
@@ -46,7 +47,8 @@ impl TombstoneStore {
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<TombstoneEntry, FsError>> + Send + '_>>, FsError>
     {
-        let (start, end) = KeyCodec::prefix_range(KeyPrefix::Tombstone);
+        let (start, end) = self.key_codec.prefix_range(KeyPrefix::Tombstone);
+        let codec = self.key_codec.clone();
 
         let iter = self
             .db
@@ -54,27 +56,30 @@ impl TombstoneStore {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        Ok(Box::pin(futures::stream::unfold(iter, |mut iter| async {
-            match futures::StreamExt::next(&mut iter).await {
-                Some(Ok((key, value))) => match KeyCodec::parse_key(&key) {
-                    ParsedKey::Tombstone { inode_id } => {
-                        match KeyCodec::decode_tombstone_size(&value) {
-                            Ok(remaining_size) => Some((
-                                Ok(TombstoneEntry {
-                                    key,
-                                    inode_id,
-                                    remaining_size,
-                                }),
-                                iter,
-                            )),
-                            Err(e) => Some((Err(e), iter)),
+        Ok(Box::pin(futures::stream::unfold(
+            (iter, codec),
+            |(mut iter, codec)| async move {
+                match futures::StreamExt::next(&mut iter).await {
+                    Some(Ok((key, value))) => match codec.parse_key(&key) {
+                        ParsedKey::Tombstone { inode_id } => {
+                            match KeyCodec::decode_tombstone_size(&value) {
+                                Ok(remaining_size) => Some((
+                                    Ok(TombstoneEntry {
+                                        key,
+                                        inode_id,
+                                        remaining_size,
+                                    }),
+                                    (iter, codec),
+                                )),
+                                Err(e) => Some((Err(e), (iter, codec))),
+                            }
                         }
-                    }
-                    _ => Some((Err(FsError::InvalidData), iter)),
-                },
-                Some(Err(_)) => Some((Err(FsError::IoError), iter)),
-                None => None,
-            }
-        })))
+                        _ => Some((Err(FsError::InvalidData), (iter, codec))),
+                    },
+                    Some(Err(_)) => Some((Err(FsError::IoError), (iter, codec))),
+                    None => None,
+                }
+            },
+        )))
     }
 }

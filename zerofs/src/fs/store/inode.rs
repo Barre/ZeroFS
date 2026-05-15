@@ -11,13 +11,15 @@ pub const MAX_HARDLINKS_PER_INODE: u32 = u32::MAX;
 #[derive(Clone)]
 pub struct InodeStore {
     db: Arc<Db>,
+    key_codec: Arc<KeyCodec>,
     next_id: Arc<AtomicU64>,
 }
 
 impl InodeStore {
-    pub fn new(db: Arc<Db>, initial_next_id: u64) -> Self {
+    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>, initial_next_id: u64) -> Self {
         Self {
             db,
+            key_codec,
             next_id: Arc::new(AtomicU64::new(initial_next_id)),
         }
     }
@@ -31,7 +33,7 @@ impl InodeStore {
     }
 
     pub async fn get(&self, id: InodeId) -> Result<Inode, FsError> {
-        let key = KeyCodec::inode_key(id);
+        let key = self.key_codec.inode_key(id);
 
         let data = self
             .db
@@ -71,14 +73,14 @@ impl InodeStore {
         id: InodeId,
         inode: &Inode,
     ) -> Result<(), Box<bincode::ErrorKind>> {
-        let key = KeyCodec::inode_key(id);
+        let key = self.key_codec.inode_key(id);
         let data = bincode::serialize(inode)?;
         txn.put_bytes(&key, Bytes::from(data));
         Ok(())
     }
 
     pub fn delete(&self, txn: &mut Transaction, id: InodeId) {
-        let key = KeyCodec::inode_key(id);
+        let key = self.key_codec.inode_key(id);
         txn.delete_bytes(&key);
     }
 

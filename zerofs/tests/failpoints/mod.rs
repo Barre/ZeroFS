@@ -47,16 +47,23 @@ impl CrashTestContext {
         let db_path = Path::from("slatedb");
         let slatedb = Arc::new(
             DbBuilder::new(db_path, Arc::clone(&self.object_store))
-                .with_filter_policies(zerofs::fs::filter_policy::filter_policies())
+                .with_filter_policies(zerofs::fs::filter_policy::filter_policies(true))
+                .with_segment_extractor(Arc::new(zerofs::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
                 .unwrap(),
         );
 
         Arc::new(
-            ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None, false)
-                .await
-                .unwrap(),
+            ZeroFS::new_with_slatedb(
+                SlateDbHandle::ReadWrite(slatedb),
+                u64::MAX,
+                None,
+                false,
+                true,
+            )
+            .await
+            .unwrap(),
         )
     }
 

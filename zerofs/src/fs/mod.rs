@@ -110,21 +110,23 @@ impl ZeroFS {
         max_bytes: u64,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
         sync_writes: bool,
+        use_segment_layout: bool,
     ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
+        let key_codec = Arc::new(KeyCodec::new(use_segment_layout));
 
         let db = Arc::new(match slatedb {
             SlateDbHandle::ReadWrite(db) => Db::new(db, metrics_recorder),
             SlateDbHandle::ReadOnly(reader) => Db::new_read_only(reader),
         });
 
-        let counter_key = KeyCodec::system_counter_key();
+        let counter_key = key_codec.system_counter_key();
         let next_inode_id = match db.get_bytes(&counter_key).await? {
             Some(data) => KeyCodec::decode_counter(&data)?,
             None => 1,
         };
 
-        let root_inode_key = KeyCodec::inode_key(0);
+        let root_inode_key = key_codec.inode_key(0);
         if db.get_bytes(&root_inode_key).await?.is_none() {
             if db.is_read_only() {
                 return Err(anyhow::anyhow!(
@@ -156,15 +158,16 @@ impl ZeroFS {
                 &PutOptions::default(),
                 &WriteOptions {
                     await_durable: false,
+                    ..Default::default()
                 },
             )
             .await?;
         }
 
-        let global_stats = Arc::new(FileSystemGlobalStats::new());
+        let global_stats = Arc::new(FileSystemGlobalStats::new(key_codec.clone()));
 
         for i in 0..STATS_SHARDS {
-            let shard_key = KeyCodec::stats_shard_key(i);
+            let shard_key = key_codec.stats_shard_key(i);
             if let Some(data) = db.get_bytes(&shard_key).await?
                 && let Ok(shard_data) = bincode::deserialize::<StatsShardData>(&data)
             {
@@ -174,14 +177,15 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
-        let chunk_store = ChunkStore::new(db.clone());
-        let directory_store = DirectoryStore::new(db.clone());
-        let inode_store = InodeStore::new(db.clone(), next_inode_id);
-        let tombstone_store = TombstoneStore::new(db.clone());
+        let chunk_store = ChunkStore::new(db.clone(), key_codec.clone());
+        let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
+        let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
+        let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
         let write_coordinator = WriteCoordinator::new(
             db.clone(),
             inode_store.clone(),
             flush_coordinator.clone(),
+            key_codec.clone(),
             sync_writes,
         );
 
@@ -227,7 +231,8 @@ impl ZeroFS {
         let slatedb = Arc::new(
             DbBuilder::new(db_path, object_store)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await?,
         );
@@ -237,6 +242,7 @@ impl ZeroFS {
             u64::MAX,
             None,
             sync_writes,
+            true,
         )
         .await
     }
@@ -260,7 +266,7 @@ impl ZeroFS {
         let reader = Arc::new(
             DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
                 .build()
                 .await?,
         );
@@ -270,6 +276,7 @@ impl ZeroFS {
             u64::MAX,
             None,
             false,
+            true,
         )
         .await
     }
@@ -2718,16 +2725,17 @@ mod tests {
     #[tokio::test]
     async fn test_inode_key_generation() {
         use crate::fs::key_codec::{KeyCodec, KeyPrefix};
-        // Test binary key format: [PREFIX_INODE | inode_id(8 bytes BE)]
-        let key0 = KeyCodec::inode_key(0);
+        let codec = KeyCodec::new(false);
+        // v1 layout: [PREFIX_INODE | inode_id(8 bytes BE)]
+        let key0 = codec.inode_key(0);
         assert_eq!(key0[0], u8::from(KeyPrefix::Inode));
         assert_eq!(&key0[1..9], &0u64.to_be_bytes());
 
-        let key42 = KeyCodec::inode_key(42);
+        let key42 = codec.inode_key(42);
         assert_eq!(key42[0], u8::from(KeyPrefix::Inode));
         assert_eq!(&key42[1..9], &42u64.to_be_bytes());
 
-        let key999 = KeyCodec::inode_key(999);
+        let key999 = codec.inode_key(999);
         assert_eq!(key999[0], u8::from(KeyPrefix::Inode));
         assert_eq!(&key999[1..9], &999u64.to_be_bytes());
     }
@@ -2735,18 +2743,19 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_key_generation() {
         use crate::fs::key_codec::{KeyCodec, KeyPrefix};
-        // Test binary key format: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
-        let key = KeyCodec::chunk_key(1, 0);
+        let codec = KeyCodec::new(false);
+        // v1 layout: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
+        let key = codec.chunk_key(1, 0);
         assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
         assert_eq!(&key[1..9], &1u64.to_be_bytes());
         assert_eq!(&key[9..17], &0u64.to_be_bytes());
 
-        let key = KeyCodec::chunk_key(42, 10);
+        let key = codec.chunk_key(42, 10);
         assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
         assert_eq!(&key[1..9], &42u64.to_be_bytes());
         assert_eq!(&key[9..17], &10u64.to_be_bytes());
 
-        let key = KeyCodec::chunk_key(999, 999);
+        let key = codec.chunk_key(999, 999);
         assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
         assert_eq!(&key[1..9], &999u64.to_be_bytes());
         assert_eq!(&key[9..17], &999u64.to_be_bytes());
@@ -2783,16 +2792,22 @@ mod tests {
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
                 .unwrap(),
         );
 
-        let fs_rw =
-            ZeroFS::new_with_slatedb(SlateDbHandle::ReadWrite(slatedb), u64::MAX, None, false)
-                .await
-                .unwrap();
+        let fs_rw = ZeroFS::new_with_slatedb(
+            SlateDbHandle::ReadWrite(slatedb),
+            u64::MAX,
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
 
         let test_inode_id = fs_rw.inode_store.allocate();
         let file_inode = FileInode {
@@ -2867,7 +2882,7 @@ mod tests {
         assert_eq!(fattr.size, 0);
 
         // Check that the file was added to the directory
-        let entry_key = KeyCodec::dir_entry_key(0, b"test.txt");
+        let entry_key = KeyCodec::new(true).dir_entry_key(0, b"test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -3076,7 +3091,7 @@ mod tests {
             .unwrap();
 
         // Check that the file was removed from the directory
-        let entry_key = KeyCodec::dir_entry_key(0, b"test.txt");
+        let entry_key = KeyCodec::new(true).dir_entry_key(0, b"test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap();
         assert!(entry_data.is_none());
 
@@ -3137,10 +3152,10 @@ mod tests {
             .unwrap();
 
         // Check old entry is gone and new entry exists
-        let old_entry_key = KeyCodec::dir_entry_key(0, b"old.txt");
+        let old_entry_key = KeyCodec::new(true).dir_entry_key(0, b"old.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
-        let new_entry_key = KeyCodec::dir_entry_key(0, b"new.txt");
+        let new_entry_key = KeyCodec::new(true).dir_entry_key(0, b"new.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -3184,11 +3199,11 @@ mod tests {
             .unwrap();
 
         // Check that file1.txt no longer exists
-        let old_entry_key = KeyCodec::dir_entry_key(0, b"file1.txt");
+        let old_entry_key = KeyCodec::new(true).dir_entry_key(0, b"file1.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check that file2.txt exists and has file1's content
-        let new_entry_key = KeyCodec::dir_entry_key(0, b"file2.txt");
+        let new_entry_key = KeyCodec::new(true).dir_entry_key(0, b"file2.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -3241,11 +3256,11 @@ mod tests {
         .unwrap();
 
         // Check file removed from dir1
-        let old_entry_key = KeyCodec::dir_entry_key(dir1_id, b"file.txt");
+        let old_entry_key = KeyCodec::new(true).dir_entry_key(dir1_id, b"file.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check file added to dir2
-        let new_entry_key = KeyCodec::dir_entry_key(dir2_id, b"moved.txt");
+        let new_entry_key = KeyCodec::new(true).dir_entry_key(dir2_id, b"moved.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);

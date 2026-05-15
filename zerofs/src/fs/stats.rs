@@ -3,6 +3,7 @@ use super::errors::FsError;
 use super::inode::InodeId;
 use super::key_codec::KeyCodec;
 use bytes::Bytes;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
@@ -20,6 +21,7 @@ pub struct StatsShard {
 
 pub struct FileSystemGlobalStats {
     pub shards: Vec<StatsShard>,
+    key_codec: Arc<KeyCodec>,
 }
 
 pub struct StatsUpdate<'a> {
@@ -29,14 +31,8 @@ pub struct StatsUpdate<'a> {
     pub _guard: tokio::sync::RwLockWriteGuard<'a, ()>,
 }
 
-impl Default for FileSystemGlobalStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FileSystemGlobalStats {
-    pub fn new() -> Self {
+    pub fn new(key_codec: Arc<KeyCodec>) -> Self {
         let shards = (0..STATS_SHARDS)
             .map(|_| StatsShard {
                 used_bytes: AtomicU64::new(0),
@@ -44,7 +40,7 @@ impl FileSystemGlobalStats {
                 lock: RwLock::new(()),
             })
             .collect();
-        Self { shards }
+        Self { shards, key_codec }
     }
 
     pub fn get_totals(&self) -> (u64, u64) {
@@ -72,7 +68,7 @@ impl FileSystemGlobalStats {
 
         StatsUpdate {
             shard_id,
-            shard_key: KeyCodec::stats_shard_key(shard_id),
+            shard_key: self.key_codec.stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         }
@@ -101,7 +97,7 @@ impl FileSystemGlobalStats {
 
         StatsUpdate {
             shard_id,
-            shard_key: KeyCodec::stats_shard_key(shard_id),
+            shard_key: self.key_codec.stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         }
@@ -136,7 +132,7 @@ impl FileSystemGlobalStats {
 
         Some(StatsUpdate {
             shard_id,
-            shard_key: KeyCodec::stats_shard_key(shard_id),
+            shard_key: self.key_codec.stats_shard_key(shard_id),
             shard_data,
             _guard: guard,
         })
@@ -506,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_sharding_distribution() {
-        let stats = FileSystemGlobalStats::new();
+        let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new(true)));
 
         // Create inodes and verify they're distributed across shards
         let mut shard_counts = vec![0u32; STATS_SHARDS];
