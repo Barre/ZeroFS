@@ -66,10 +66,19 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
 
     info!("Max concurrent compactions: {}", max_concurrent_compactions);
 
+    let scheduler_options: std::collections::HashMap<String, String> =
+        slatedb::config::SizeTieredCompactionSchedulerOptions {
+            min_compaction_sources: 2,
+            max_compaction_sources: 16,
+            ..Default::default()
+        }
+        .into();
     let compactor_options = CompactorOptions {
+        poll_interval: std::time::Duration::from_secs(1),
         max_concurrent_compactions,
         max_sst_size: 256 * 1024 * 1024,
         max_fetch_tasks: 8,
+        scheduler_options,
         ..Default::default()
     };
 
