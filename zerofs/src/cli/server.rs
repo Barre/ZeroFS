@@ -527,15 +527,23 @@ pub async fn build_slatedb(
             }
 
             if !disable_compactor {
+                let scheduler_options: std::collections::HashMap<String, String> =
+                    slatedb::config::SizeTieredCompactionSchedulerOptions {
+                        max_compaction_sources: 16,
+                        ..Default::default()
+                    }
+                    .into();
                 let compactor = CompactorBuilder::new(db_path, object_store)
                     .with_runtime(tokio::runtime::Handle::current())
                     .with_filter_policies(crate::fs::filter_policy::filter_policies(
                         segments_enabled,
                     ))
                     .with_options(slatedb::config::CompactorOptions {
+                        poll_interval: std::time::Duration::from_secs(1),
                         max_concurrent_compactions,
                         max_sst_size: 256 * 1024 * 1024,
-                        max_fetch_tasks: 4,
+                        max_fetch_tasks: 8,
+                        scheduler_options,
                         ..Default::default()
                     });
 
