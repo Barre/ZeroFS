@@ -14,15 +14,16 @@ const ZERO_CHUNK: &[u8] = &[0u8; CHUNK_SIZE];
 #[derive(Clone)]
 pub struct ChunkStore {
     db: Arc<Db>,
+    key_codec: Arc<KeyCodec>,
 }
 
 impl ChunkStore {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+        Self { db, key_codec }
     }
 
     pub async fn get(&self, id: InodeId, chunk_idx: u64) -> Result<Option<Bytes>, FsError> {
-        let key = KeyCodec::chunk_key(id, chunk_idx);
+        let key = self.key_codec.chunk_key(id, chunk_idx);
         match self.db.get_bytes(&key).await {
             Ok(result) => Ok(result),
             Err(e) => {
@@ -36,12 +37,12 @@ impl ChunkStore {
     }
 
     fn save(&self, txn: &mut Transaction, id: InodeId, chunk_idx: u64, data: Bytes) {
-        let key = KeyCodec::chunk_key(id, chunk_idx);
+        let key = self.key_codec.chunk_key(id, chunk_idx);
         txn.put_bytes(&key, data);
     }
 
     pub fn delete(&self, txn: &mut Transaction, id: InodeId, chunk_idx: u64) {
-        let key = KeyCodec::chunk_key(id, chunk_idx);
+        let key = self.key_codec.chunk_key(id, chunk_idx);
         txn.delete_bytes(&key);
     }
 
@@ -70,8 +71,8 @@ impl ChunkStore {
             });
         }
 
-        let start_key = KeyCodec::chunk_key(id, start_chunk);
-        let end_key = KeyCodec::chunk_key(id, end_chunk + 1);
+        let start_key = self.key_codec.chunk_key(id, start_chunk);
+        let end_key = self.key_codec.chunk_key(id, end_chunk + 1);
 
         let mut chunk_map: HashMap<u64, Bytes> = HashMap::new();
         let mut stream = self.db.scan(start_key..end_key).await.map_err(|e| {
@@ -84,7 +85,7 @@ impl ChunkStore {
                 error!("Failed to read chunk during scan (inode={}): {}", id, e);
                 FsError::IoError
             })?;
-            if let Some(chunk_idx) = KeyCodec::parse_chunk_key(&key) {
+            if let Some(chunk_idx) = self.key_codec.parse_chunk_key(&key) {
                 chunk_map.insert(chunk_idx, value);
             }
         }

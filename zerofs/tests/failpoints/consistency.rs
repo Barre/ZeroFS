@@ -1,17 +1,37 @@
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::mem::size_of;
 use zerofs::fs::CHUNK_SIZE;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::errors::FsError;
 use zerofs::fs::inode::{Inode, InodeAttrs, InodeId};
-use zerofs::fs::key_codec::{KeyCodec, KeyPrefix, ParsedKey};
+use zerofs::fs::key_codec::{CHUNK_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use zerofs::fs::store::directory::DirScanValue;
 
 const ROOT_INODE_ID: InodeId = 0;
 const DIR_BASE_NLINK: u32 = 2;
-const KEY_PREFIX_SIZE: usize = size_of::<u8>();
-const KEY_INODE_SIZE: usize = KEY_PREFIX_SIZE + size_of::<InodeId>();
+const ID_SIZE: usize = std::mem::size_of::<InodeId>();
+
+/// Extract the 8-byte big-endian id that follows the kind byte in a
+/// `prefix`-kind key. Returns `None` if the key is too short, lacks the
+/// expected v2 domain prefix, or the kind byte doesn't match.
+fn parse_id(codec: &KeyCodec, prefix: KeyPrefix, key: &[u8]) -> Option<InodeId> {
+    let expected_domain = if prefix == KeyPrefix::Chunk {
+        CHUNK_DOMAIN
+    } else {
+        META_DOMAIN
+    };
+    if !key.starts_with(expected_domain) {
+        return None;
+    }
+    let kind_off = codec.kind_offset(prefix);
+    if key.get(kind_off).copied() != Some(u8::from(prefix)) {
+        return None;
+    }
+    let id_off = codec.id_offset(prefix);
+    let id_end = id_off + ID_SIZE;
+    let id_bytes: [u8; ID_SIZE] = key.get(id_off..id_end)?.try_into().ok()?;
+    Some(InodeId::from_be_bytes(id_bytes))
+}
 
 #[derive(Debug, Default)]
 pub struct ConsistencyReport {
@@ -318,6 +338,7 @@ impl std::fmt::Display for ConsistencyReport {
 
 pub struct ConsistencyChecker<'a> {
     fs: &'a ZeroFS,
+    codec: KeyCodec,
     report: ConsistencyReport,
     inode_refs: HashMap<InodeId, u32>,
     valid_inodes: HashSet<InodeId>,
@@ -328,8 +349,11 @@ pub struct ConsistencyChecker<'a> {
 
 impl<'a> ConsistencyChecker<'a> {
     pub fn new(fs: &'a ZeroFS) -> Self {
+        // Failpoint test volumes are always created with v2 segmentation
+        // (see `tests/failpoints/mod.rs`).
         Self {
             fs,
+            codec: KeyCodec::new(true),
             report: ConsistencyReport::default(),
             inode_refs: HashMap::new(),
             valid_inodes: HashSet::new(),
@@ -360,7 +384,9 @@ impl<'a> ConsistencyChecker<'a> {
     }
 
     async fn enumerate_inodes(&mut self) -> Result<(), FsError> {
-        let (start, end) = KeyCodec::prefix_range(KeyPrefix::Inode);
+        let codec = &self.codec;
+        let (start, end) = codec.prefix_range(KeyPrefix::Inode);
+        let expected_len = codec.inode_key_size();
 
         let mut stream = self
             .fs
@@ -371,10 +397,9 @@ impl<'a> ConsistencyChecker<'a> {
 
         while let Some(result) = stream.next().await {
             let (key, value) = result.map_err(|_| FsError::IoError)?;
-            if key.len() == KEY_INODE_SIZE {
-                let inode_bytes: [u8; size_of::<InodeId>()] =
-                    key[KEY_PREFIX_SIZE..KEY_INODE_SIZE].try_into().unwrap();
-                let inode_id = InodeId::from_be_bytes(inode_bytes);
+            if key.len() == expected_len
+                && let Some(inode_id) = parse_id(codec, KeyPrefix::Inode, &key)
+            {
                 self.valid_inodes.insert(inode_id);
                 self.report.stats.inodes_checked += 1;
 
@@ -604,8 +629,8 @@ impl<'a> ConsistencyChecker<'a> {
                     continue;
                 }
                 let expected_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
-                let start_key = KeyCodec::chunk_key(inode_id, 0);
-                let end_key = KeyCodec::chunk_key(inode_id, expected_chunks);
+                let start_key = self.codec.chunk_key(inode_id, 0);
+                let end_key = self.codec.chunk_key(inode_id, expected_chunks);
 
                 let mut found_chunks = 0u64;
                 let stream = match self.fs.db.scan(start_key..end_key).await {
@@ -640,7 +665,7 @@ impl<'a> ConsistencyChecker<'a> {
             .copied()
             .max()
             .unwrap_or(ROOT_INODE_ID);
-        let counter_key = KeyCodec::system_counter_key();
+        let counter_key = self.codec.system_counter_key();
         let stored_counter = match self.fs.db.get_bytes(&counter_key).await {
             Ok(Some(data)) => KeyCodec::decode_counter(&data)?,
             Ok(None) if max_inode_id > ROOT_INODE_ID => ROOT_INODE_ID,
@@ -661,7 +686,8 @@ impl<'a> ConsistencyChecker<'a> {
     }
 
     async fn verify_orphaned_chunks(&mut self) -> Result<(), FsError> {
-        let (start, end) = KeyCodec::prefix_range(KeyPrefix::Chunk);
+        let codec = &self.codec;
+        let (start, end) = codec.prefix_range(KeyPrefix::Chunk);
 
         let mut stream = self
             .fs
@@ -674,16 +700,11 @@ impl<'a> ConsistencyChecker<'a> {
 
         while let Some(result) = stream.next().await {
             let (key, _) = result.map_err(|_| FsError::IoError)?;
-            if key.len() >= KEY_INODE_SIZE {
-                let inode_bytes: [u8; size_of::<InodeId>()] =
-                    key[KEY_PREFIX_SIZE..KEY_INODE_SIZE].try_into().unwrap();
-                let inode_id = InodeId::from_be_bytes(inode_bytes);
-
-                if !self.valid_inodes.contains(&inode_id)
-                    && !self.tombstone_inodes.contains(&inode_id)
-                {
-                    *orphaned_by_inode.entry(inode_id).or_insert(0) += 1;
-                }
+            if let Some(inode_id) = parse_id(codec, KeyPrefix::Chunk, &key)
+                && !self.valid_inodes.contains(&inode_id)
+                && !self.tombstone_inodes.contains(&inode_id)
+            {
+                *orphaned_by_inode.entry(inode_id).or_insert(0) += 1;
             }
         }
 
@@ -703,8 +724,10 @@ impl<'a> ConsistencyChecker<'a> {
             let mut dir_scans: HashMap<u64, Vec<u8>> = HashMap::new();
             let mut max_cookie: u64 = 0;
 
-            let entry_prefix = KeyCodec::dir_entry_key(dir_id, b"");
-            let entry_end = KeyCodec::dir_entry_key(dir_id + 1, b"");
+            let codec = &self.codec;
+            let entry_prefix = codec.dir_entry_key(dir_id, b"");
+            let entry_end = codec.dir_entry_key(dir_id + 1, b"");
+            let dir_entry_id_end = codec.id_offset(KeyPrefix::DirEntry) + 8;
 
             let stream = match self.fs.db.scan(entry_prefix..entry_end).await {
                 Ok(s) => s,
@@ -717,12 +740,12 @@ impl<'a> ConsistencyChecker<'a> {
                     Ok(kv) => kv,
                     Err(_) => continue,
                 };
-                let name = key[KEY_INODE_SIZE..].to_vec();
+                let name = key[dir_entry_id_end..].to_vec();
                 if let Ok((inode_id, cookie)) = KeyCodec::decode_dir_entry(&value) {
                     dir_entries.insert(name.clone(), cookie);
 
                     if let Ok(inode) = self.fs.inode_store.get(inode_id).await {
-                        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+                        let scan_key = codec.dir_scan_key(dir_id, cookie);
                         if let Ok(Some(scan_value)) = self.fs.db.get_bytes(&scan_key).await
                             && let Ok((_, dsv)) = Self::decode_dir_scan_value(&scan_value)
                             && let DirScanValue::WithInode {
@@ -742,8 +765,9 @@ impl<'a> ConsistencyChecker<'a> {
                 }
             }
 
-            let scan_start = bytes::Bytes::from(KeyCodec::dir_scan_prefix(dir_id));
-            let scan_end = KeyCodec::dir_scan_end_key(dir_id);
+            let scan_start = bytes::Bytes::from(codec.dir_scan_prefix(dir_id));
+            // End of the dir_id's scan range: the prefix for (dir_id + 1).
+            let scan_end = bytes::Bytes::from(codec.dir_scan_prefix(dir_id + 1));
 
             let stream = match self.fs.db.scan(scan_start..scan_end).await {
                 Ok(s) => s,
@@ -756,7 +780,7 @@ impl<'a> ConsistencyChecker<'a> {
                     Ok(kv) => kv,
                     Err(_) => continue,
                 };
-                if let ParsedKey::DirScan { cookie } = KeyCodec::parse_key(&key) {
+                if let ParsedKey::DirScan { cookie } = codec.parse_key(&key) {
                     max_cookie = max_cookie.max(cookie);
                     if let Ok((name, _)) = Self::decode_dir_scan_value(&value) {
                         dir_scans.insert(cookie, name);
@@ -801,7 +825,7 @@ impl<'a> ConsistencyChecker<'a> {
                 }
             }
 
-            let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
+            let counter_key = codec.dir_cookie_counter_key(dir_id);
             if let Ok(Some(data)) = self.fs.db.get_bytes(&counter_key).await
                 && let Ok(counter) = KeyCodec::decode_counter(&data)
                 && max_cookie > 0
@@ -835,7 +859,9 @@ impl<'a> ConsistencyChecker<'a> {
     }
 
     async fn verify_orphaned_directory_metadata(&mut self) -> Result<(), FsError> {
-        let (start, end) = KeyCodec::prefix_range(KeyPrefix::DirEntry);
+        let codec = &self.codec;
+        let dir_entry_id_end = codec.id_offset(KeyPrefix::DirEntry) + 8;
+        let (start, end) = codec.prefix_range(KeyPrefix::DirEntry);
         let mut stream = self
             .fs
             .db
@@ -845,12 +871,10 @@ impl<'a> ConsistencyChecker<'a> {
 
         while let Some(result) = stream.next().await {
             let (key, _) = result.map_err(|_| FsError::IoError)?;
-            if key.len() > KEY_INODE_SIZE {
-                let dir_bytes: [u8; size_of::<InodeId>()] =
-                    key[KEY_PREFIX_SIZE..KEY_INODE_SIZE].try_into().unwrap();
-                let dir_id = InodeId::from_be_bytes(dir_bytes);
-                let name = key[KEY_INODE_SIZE..].to_vec();
-
+            if key.len() > dir_entry_id_end
+                && let Some(dir_id) = parse_id(codec, KeyPrefix::DirEntry, &key)
+            {
+                let name = key[dir_entry_id_end..].to_vec();
                 if !self.directory_inodes.contains(&dir_id) && dir_id != ROOT_INODE_ID {
                     self.report
                         .errors
@@ -859,7 +883,7 @@ impl<'a> ConsistencyChecker<'a> {
             }
         }
 
-        let (start, end) = KeyCodec::prefix_range(KeyPrefix::DirScan);
+        let (start, end) = codec.prefix_range(KeyPrefix::DirScan);
         let mut stream = self
             .fs
             .db
@@ -869,20 +893,19 @@ impl<'a> ConsistencyChecker<'a> {
 
         while let Some(result) = stream.next().await {
             let (key, _) = result.map_err(|_| FsError::IoError)?;
-            if let ParsedKey::DirScan { cookie } = KeyCodec::parse_key(&key) {
-                let dir_bytes: [u8; size_of::<InodeId>()] =
-                    key[KEY_PREFIX_SIZE..KEY_INODE_SIZE].try_into().unwrap();
-                let dir_id = InodeId::from_be_bytes(dir_bytes);
-
-                if !self.directory_inodes.contains(&dir_id) && dir_id != ROOT_INODE_ID {
-                    self.report
-                        .errors
-                        .push(ConsistencyError::OrphanedDirScan { dir_id, cookie });
-                }
+            if let ParsedKey::DirScan { cookie } = codec.parse_key(&key)
+                && let Some(dir_id) = parse_id(codec, KeyPrefix::DirScan, &key)
+                && !self.directory_inodes.contains(&dir_id)
+                && dir_id != ROOT_INODE_ID
+            {
+                self.report
+                    .errors
+                    .push(ConsistencyError::OrphanedDirScan { dir_id, cookie });
             }
         }
 
-        let (start, end) = KeyCodec::prefix_range(KeyPrefix::DirCookie);
+        let (start, end) = codec.prefix_range(KeyPrefix::DirCookie);
+        let expected_cookie_key_len = codec.id_offset(KeyPrefix::DirCookie) + 8;
         let mut stream = self
             .fs
             .db
@@ -892,16 +915,14 @@ impl<'a> ConsistencyChecker<'a> {
 
         while let Some(result) = stream.next().await {
             let (key, _) = result.map_err(|_| FsError::IoError)?;
-            if key.len() == KEY_INODE_SIZE {
-                let dir_bytes: [u8; size_of::<InodeId>()] =
-                    key[KEY_PREFIX_SIZE..KEY_INODE_SIZE].try_into().unwrap();
-                let dir_id = InodeId::from_be_bytes(dir_bytes);
-
-                if !self.directory_inodes.contains(&dir_id) && dir_id != ROOT_INODE_ID {
-                    self.report
-                        .errors
-                        .push(ConsistencyError::OrphanedDirCookie { dir_id });
-                }
+            if key.len() == expected_cookie_key_len
+                && let Some(dir_id) = parse_id(codec, KeyPrefix::DirCookie, &key)
+                && !self.directory_inodes.contains(&dir_id)
+                && dir_id != ROOT_INODE_ID
+            {
+                self.report
+                    .errors
+                    .push(ConsistencyError::OrphanedDirCookie { dir_id });
             }
         }
 

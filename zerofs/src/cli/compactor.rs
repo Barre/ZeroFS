@@ -51,6 +51,14 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
     let block_transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
+    let segments_enabled =
+        crate::segment_extractor::should_enable_segments(&object_store, &db_path, None).await?;
+    if segments_enabled {
+        info!("Volume uses segment-oriented compaction (RFC-0024)");
+    } else {
+        info!("Volume uses legacy unsegmented layout");
+    }
+
     let max_concurrent_compactions = settings
         .lsm
         .map(|c| c.max_concurrent_compactions())
@@ -76,7 +84,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         CompactorBuilder::new(db_path, object_store)
             .with_options(compactor_options)
             .with_block_transformer(block_transformer)
-            .with_filter_policies(crate::fs::filter_policy::filter_policies())
+            .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
             .build(),
     );
 

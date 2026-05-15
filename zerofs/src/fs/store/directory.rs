@@ -82,15 +82,16 @@ pub struct DirEntryInfo {
 #[derive(Clone)]
 pub struct DirectoryStore {
     db: Arc<Db>,
+    key_codec: Arc<KeyCodec>,
 }
 
 impl DirectoryStore {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+        Self { db, key_codec }
     }
 
     pub async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
 
         let entry_data = self
             .db
@@ -108,7 +109,7 @@ impl DirectoryStore {
         dir_id: InodeId,
         txn: &mut Transaction,
     ) -> Result<u64, FsError> {
-        let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
+        let counter_key = self.key_codec.dir_cookie_counter_key(dir_id);
         let current = match self.db.get_bytes(&counter_key).await {
             Ok(Some(data)) => KeyCodec::decode_counter(&data)?,
             Ok(None) => COOKIE_FIRST_ENTRY,
@@ -122,7 +123,7 @@ impl DirectoryStore {
     }
 
     pub async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
 
         let result = self
             .db
@@ -138,7 +139,8 @@ impl DirectoryStore {
         dir_id: InodeId,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
     {
-        let prefix = Bytes::from(KeyCodec::dir_scan_prefix(dir_id));
+        let prefix = Bytes::from(self.key_codec.dir_scan_prefix(dir_id));
+        let codec = self.key_codec.clone();
 
         let iter = self
             .db
@@ -146,30 +148,33 @@ impl DirectoryStore {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        Ok(Box::pin(futures::stream::unfold(iter, |mut iter| async {
-            match iter.next().await {
-                Some(Ok((key, value))) => {
-                    let cookie = match KeyCodec::parse_key(&key) {
-                        ParsedKey::DirScan { cookie } => cookie,
-                        _ => return Some((Err(FsError::InvalidData), iter)),
-                    };
-                    match decode_dir_scan_value(&value) {
-                        Ok((name, scan_value)) => Some((
-                            Ok(DirEntryInfo {
-                                name,
-                                inode_id: scan_value.inode_id(),
-                                cookie,
-                                inode: scan_value.inode().cloned(),
-                            }),
-                            iter,
-                        )),
-                        Err(e) => Some((Err(e), iter)),
+        Ok(Box::pin(futures::stream::unfold(
+            (iter, codec),
+            |(mut iter, codec)| async move {
+                match iter.next().await {
+                    Some(Ok((key, value))) => {
+                        let cookie = match codec.parse_key(&key) {
+                            ParsedKey::DirScan { cookie } => cookie,
+                            _ => return Some((Err(FsError::InvalidData), (iter, codec))),
+                        };
+                        match decode_dir_scan_value(&value) {
+                            Ok((name, scan_value)) => Some((
+                                Ok(DirEntryInfo {
+                                    name,
+                                    inode_id: scan_value.inode_id(),
+                                    cookie,
+                                    inode: scan_value.inode().cloned(),
+                                }),
+                                (iter, codec),
+                            )),
+                            Err(e) => Some((Err(e), (iter, codec))),
+                        }
                     }
+                    Some(Err(_)) => Some((Err(FsError::IoError), (iter, codec))),
+                    None => None,
                 }
-                Some(Err(_)) => Some((Err(FsError::IoError), iter)),
-                None => None,
-            }
-        })))
+            },
+        )))
     }
 
     pub async fn list_from(
@@ -178,8 +183,11 @@ impl DirectoryStore {
         resume_after_cookie: u64,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
     {
-        let prefix = Bytes::from(KeyCodec::dir_scan_prefix(dir_id));
-        let seek_to = KeyCodec::dir_scan_resume_key(dir_id, resume_after_cookie);
+        let prefix = Bytes::from(self.key_codec.dir_scan_prefix(dir_id));
+        let seek_to = self
+            .key_codec
+            .dir_scan_resume_key(dir_id, resume_after_cookie);
+        let codec = self.key_codec.clone();
 
         let iter = self
             .db
@@ -187,30 +195,33 @@ impl DirectoryStore {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        Ok(Box::pin(futures::stream::unfold(iter, |mut iter| async {
-            match iter.next().await {
-                Some(Ok((key, value))) => {
-                    let cookie = match KeyCodec::parse_key(&key) {
-                        ParsedKey::DirScan { cookie } => cookie,
-                        _ => return Some((Err(FsError::InvalidData), iter)),
-                    };
-                    match decode_dir_scan_value(&value) {
-                        Ok((name, scan_value)) => Some((
-                            Ok(DirEntryInfo {
-                                name,
-                                inode_id: scan_value.inode_id(),
-                                cookie,
-                                inode: scan_value.inode().cloned(),
-                            }),
-                            iter,
-                        )),
-                        Err(e) => Some((Err(e), iter)),
+        Ok(Box::pin(futures::stream::unfold(
+            (iter, codec),
+            |(mut iter, codec)| async move {
+                match iter.next().await {
+                    Some(Ok((key, value))) => {
+                        let cookie = match codec.parse_key(&key) {
+                            ParsedKey::DirScan { cookie } => cookie,
+                            _ => return Some((Err(FsError::InvalidData), (iter, codec))),
+                        };
+                        match decode_dir_scan_value(&value) {
+                            Ok((name, scan_value)) => Some((
+                                Ok(DirEntryInfo {
+                                    name,
+                                    inode_id: scan_value.inode_id(),
+                                    cookie,
+                                    inode: scan_value.inode().cloned(),
+                                }),
+                                (iter, codec),
+                            )),
+                            Err(e) => Some((Err(e), (iter, codec))),
+                        }
                     }
+                    Some(Err(_)) => Some((Err(FsError::IoError), (iter, codec))),
+                    None => None,
                 }
-                Some(Err(_)) => Some((Err(FsError::IoError), iter)),
-                None => None,
-            }
-        })))
+            },
+        )))
     }
 
     /// Add a directory entry.
@@ -225,7 +236,7 @@ impl DirectoryStore {
         cookie: u64,
         inode: Option<&Inode>,
     ) {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
 
         let scan_value = match inode {
@@ -236,20 +247,20 @@ impl DirectoryStore {
             None => DirScanValue::Reference { inode_id: entry_id },
         };
 
-        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+        let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
     }
 
     pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
 
-        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+        let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.delete_bytes(&scan_key);
     }
 
     pub fn delete_directory(&self, txn: &mut Transaction, dir_id: InodeId) {
-        let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
+        let counter_key = self.key_codec.dir_cookie_counter_key(dir_id);
         txn.delete_bytes(&counter_key);
     }
 
@@ -258,7 +269,7 @@ impl DirectoryStore {
         dir_id: InodeId,
         name: &[u8],
     ) -> Result<(InodeId, u64), FsError> {
-        let entry_key = KeyCodec::dir_entry_key(dir_id, name);
+        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
 
         let entry_data = self
             .db
@@ -286,7 +297,7 @@ impl DirectoryStore {
             inode_id,
             inode: inode.clone(),
         };
-        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+        let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
 
         Ok(())
@@ -303,7 +314,7 @@ impl DirectoryStore {
     ) -> Result<(), FsError> {
         let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
         let scan_value = DirScanValue::Reference { inode_id };
-        let scan_key = KeyCodec::dir_scan_key(dir_id, cookie);
+        let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
 
         Ok(())

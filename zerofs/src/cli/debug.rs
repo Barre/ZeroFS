@@ -59,6 +59,13 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             None
         };
 
+    let segments_enabled = crate::segment_extractor::should_enable_segments(
+        &object_store,
+        &db_path,
+        wal_object_store.as_ref(),
+    )
+    .await?;
+
     let (slatedb, _) = super::server::build_slatedb(
         object_store,
         &cache_config,
@@ -68,6 +75,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         false, // don't disable compactor
         block_transformer,
         wal_object_store,
+        segments_enabled,
     )
     .await?;
 
