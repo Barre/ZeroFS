@@ -13,7 +13,8 @@ use ratatui::{
     symbols::Marker,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Chart, Dataset, Gauge, GraphType, LegendPosition, Paragraph, Sparkline,
+        Axis, Block, Chart, Dataset, Gauge, GraphType, LegendPosition, Paragraph, RenderDirection,
+        Sparkline,
     },
 };
 use std::collections::VecDeque;
@@ -348,7 +349,10 @@ fn render_iops_chart(f: &mut Frame, app: &MonitorApp, area: Rect) {
 }
 
 fn render_total_ops_sparkline(f: &mut Frame, app: &MonitorApp, area: Rect) {
-    let data: Vec<u64> = app.total_ops.iter().copied().collect();
+    // Sparkline only renders the first `width` items of the slice. Feed newest-first
+    // and render right-to-left so the rightmost bar is the most recent sample and the
+    // visible window is always the last `width` seconds.
+    let data: Vec<u64> = app.total_ops.iter().rev().copied().collect();
     let title = format!(
         " Total Ops: {}/s ",
         format_ops(app.current_total_ops() as f64)
@@ -360,6 +364,7 @@ fn render_total_ops_sparkline(f: &mut Frame, app: &MonitorApp, area: Rect) {
                 .title_style(Style::default().fg(Color::Yellow).bold()),
         )
         .data(&data)
+        .direction(RenderDirection::RightToLeft)
         .style(Style::default().fg(Color::Magenta));
     f.render_widget(sparkline, area);
 }
