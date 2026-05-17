@@ -46,8 +46,12 @@ slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "97a9f6ec8e7504a
 slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "97a9f6ec8e7504af0ff897db6f0c19e403752c35" }
 fastant = "0.1.11"
 zerofs_nfsserve = "0.19.1"
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = { git = "https://github.com/tikv/jemallocator.git", rev = "c7101ce04fda9652c41a641b35e3f5879751f496", features = [
+    "background_threads",
+] }
+tikv-jemalloc-ctl = { git = "https://github.com/tikv/jemallocator.git", rev = "c7101ce04fda9652c41a641b35e3f5879751f496", version = "0.6", features = [
+    "stats",
+] }
 tokio = { version = "1.49", features = ["full", "tracing"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 async-trait = "0.1"
