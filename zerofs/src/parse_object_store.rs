@@ -16,12 +16,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use object_store::ClientConfigKey;
 use object_store::ClientOptions;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use url::Url;
+
+const DEFAULT_USER_AGENT: &str = concat!(
+    "ZeroFS/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/Barre/ZeroFS)"
+);
+
+fn default_client_options() -> ClientOptions {
+    ClientOptions::default()
+        .with_timeout_disabled()
+        .with_config(ClientConfigKey::UserAgent, DEFAULT_USER_AGENT)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -181,7 +194,7 @@ where
             let builder = options.into_iter().fold(
                 object_store::aws::AmazonS3Builder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -193,7 +206,7 @@ where
             let builder = options.into_iter().fold(
                 object_store::gcp::GoogleCloudStorageBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -205,7 +218,7 @@ where
             let builder = options.into_iter().fold(
                 object_store::azure::MicrosoftAzureBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
