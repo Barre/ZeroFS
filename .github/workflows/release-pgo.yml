@@ -487,9 +487,16 @@ jobs:
         if: matrix.bolt
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18 build-essential libncurses-dev bison flex libssl-dev libelf-dev bc llvm-bolt
-          sudo ln -sf /usr/lib/llvm-18/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a
-          sudo ln -sf /usr/lib/llvm-18/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc lsb-release wget software-properties-common gnupg
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          UBUNTU_CODENAME=$(lsb_release -cs)
+          echo "deb http://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-22 bolt-22
+          echo "/usr/lib/llvm-22/bin" | sudo tee /etc/profile.d/llvm-22.sh > /dev/null
+          echo "/usr/lib/llvm-22/bin" >> $GITHUB_PATH
+          sudo ln -sf /usr/lib/llvm-22/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a
+          sudo ln -sf /usr/lib/llvm-22/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a
 
       - name: Start MinIO for BOLT profiling
         if: matrix.bolt
@@ -589,7 +596,7 @@ jobs:
           llvm-bolt $BINARY -o ${BINARY}.bolt \
             -data=/tmp/bolt.fdata \
             -reorder-blocks=ext-tsp \
-            -reorder-functions=hfsort+ \
+            -reorder-functions=cdsort \
             -split-functions \
             -split-all-cold \
             -dyno-stats
