@@ -210,7 +210,7 @@ encryption_password = "${ZEROFS_PASSWORD}"
 
 [filesystem]
 max_size_gb = 100.0  # Optional: limit filesystem to 100 GB (defaults to 16 EiB)
-compression = "lz4"  # Optional: "lz4" (default) or "zstd-{1-22}"
+compression = "zstd-3"  # Optional: "zstd-{1-22}" (default: "zstd-3") or "lz4"
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]  # Can specify multiple addresses
@@ -349,19 +349,19 @@ When the quota is reached, write operations return `ENOSPC` (No space left on de
 
 ### Compression
 
-ZeroFS compresses file data before encryption. Choose between fast or high-ratio compression:
+ZeroFS compresses file data before encryption. The default is tuned for object storage, where network and storage cost dominate local CPU:
 
 ```toml
 [filesystem]
-compression = "lz4"      # Fast compression (default)
+compression = "zstd-3"   # Zstd at level 3 (default)
 # or
-compression = "zstd-3"   # Zstd with level 1-22
+compression = "lz4"      # Fast compression, lower ratio
 ```
 
-- **`lz4`** (default): Very fast, moderate compression ratio
-- **`zstd-{level}`**: Configurable compression (1=fast, 22=maximum compression)
+- **`zstd-{level}`** (default: `zstd-3`): Configurable compression (1=fast, 22=maximum compression)
+- **`lz4`**: Very fast, moderate compression ratio — prefer for write-throughput-bound workloads
 
-You can change compression at any time without migration.
+You can change compression at any time without migration; existing data is auto-detected on read.
 
 ### Multiple Instances
 
