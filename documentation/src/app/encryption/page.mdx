@@ -26,7 +26,7 @@ ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide
     ### Encryption Algorithm
 
     - **Algorithm**: XChaCha20-Poly1305
-    - **Compression**: LZ4 compression before encryption
+    - **Compression**: Zstd (default) or LZ4 compression before encryption
     - **Key Derivation**: Argon2id
 
   </Col>
@@ -195,7 +195,7 @@ graph TB
     
     subgraph ZEROFS["ZeroFS"]
         ENC[ChaCha20 Poly1305<br/>Encryption Layer]
-        COMP[LZ4<br/>Compression Layer]
+        COMP[Zstd or LZ4<br/>Compression Layer]
         
         ENC --> COMP
     end

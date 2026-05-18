@@ -161,20 +161,20 @@ When the quota is reached, write operations return `ENOSPC` (No space left on de
 
 ## Compression
 
-ZeroFS compresses file data (chunks) before encryption. You can choose between two compression algorithms:
+ZeroFS compresses file data (chunks) before encryption. The default is tuned for object storage, where network and storage cost dominate local CPU:
 
 ```toml
 [filesystem]
-compression = "lz4"      # Fast compression (default)
+compression = "zstd-3"   # Zstd at level 3 (default)
 # or
-compression = "zstd-3"   # Zstd with level 3
+compression = "lz4"      # Fast compression, lower ratio
 ```
 
 ### Algorithms
 
-- **`lz4`** (default): Very fast compression and decompression with moderate compression ratio. Best for workloads where speed is critical.
+- **`zstd-{level}`** (default: `zstd-3`): Zstandard compression with configurable level from 1 to 22. Lower levels (1-5) are faster, higher levels (15-22) achieve better compression but are slower. Level 3 strikes a good balance for object-storage workloads.
 
-- **`zstd-{level}`**: Zstandard compression with configurable level from 1 to 22. Lower levels (1-5) are faster, higher levels (15-22) achieve better compression but are slower.
+- **`lz4`**: Very fast compression and decompression with moderate compression ratio. Prefer for write-throughput-bound workloads where compression CPU is the bottleneck.
 
 ### Changing Compression On-the-fly
 
@@ -343,7 +343,7 @@ encryption_password = "very-secure-password-here"
 
 [filesystem]
 max_size_gb = 500.0            # Optional: limit filesystem size
-compression = "lz4"            # Optional: "lz4" (default) or "zstd-{1-22}"
+compression = "zstd-3"         # Optional: "zstd-{1-22}" (default: "zstd-3") or "lz4"
 
 [lsm]
 l0_max_ssts = 16               
