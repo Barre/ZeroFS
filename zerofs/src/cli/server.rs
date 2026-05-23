@@ -431,12 +431,13 @@ pub async fn build_slatedb(
     let settings = slatedb::config::Settings {
         wal_enabled,
         l0_max_ssts,
+        l0_max_ssts_per_key: l0_max_ssts,
         l0_sst_size_bytes: 128 * 1024 * 1024,
         compactor_options: None,
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
         compression_codec: None, // Disable compression as we handle it in encryption layer
-        l0_flush_parallelism: 4,
+        l0_flush_parallelism: 8,
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
@@ -541,7 +542,7 @@ pub async fn build_slatedb(
                     .with_options(slatedb::config::CompactorOptions {
                         poll_interval: std::time::Duration::from_secs(1),
                         max_concurrent_compactions,
-                        max_sst_size: 256 * 1024 * 1024,
+                        max_sst_size: 1024 * 1024 * 1024,
                         max_fetch_tasks: 8,
                         scheduler_options,
                         ..Default::default()
