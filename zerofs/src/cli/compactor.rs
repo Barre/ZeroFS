@@ -75,7 +75,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
     let compactor_options = CompactorOptions {
         poll_interval: std::time::Duration::from_secs(1),
         max_concurrent_compactions,
-        max_sst_size: 256 * 1024 * 1024,
+        max_sst_size: 1024 * 1024 * 1024,
         max_fetch_tasks: 8,
         scheduler_options,
         ..Default::default()
