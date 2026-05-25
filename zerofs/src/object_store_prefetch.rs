@@ -13,11 +13,94 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Mutex;
 
-pub const DEFAULT_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
+pub const DEFAULT_PART_SIZE_BYTES: usize = 128 * 1024;
 const HEADS_CAPACITY_ENTRIES: usize = 16 * 1024;
+const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
+
+const FETCH_WINDOW_MIN: usize = 128 * 1024;
+const FETCH_WINDOW_MAX: usize = 8 * 1024 * 1024;
+const MAX_STREAMS: usize = 4;
 
 type PartId = usize;
+
+#[derive(Clone, Copy)]
+struct Stream {
+    last_offset: u64,
+    fetch_window: usize,
+}
+
+struct AccessHistory {
+    streams: [Stream; MAX_STREAMS],
+    len: usize,
+    stride_limit: u64,
+}
+
+impl AccessHistory {
+    fn new(part_size: usize) -> Self {
+        Self {
+            streams: [Stream {
+                last_offset: u64::MAX,
+                fetch_window: FETCH_WINDOW_MIN,
+            }; MAX_STREAMS],
+            len: 0,
+            stride_limit: part_size as u64 * 4,
+        }
+    }
+
+    fn record(&mut self, offset: u64) -> usize {
+        if let Some(i) = self.find_stream(offset) {
+            let s = &mut self.streams[i];
+            s.last_offset = offset;
+            s.fetch_window = (s.fetch_window * 2).min(FETCH_WINDOW_MAX);
+            return s.fetch_window;
+        }
+
+        let slot = if self.len < MAX_STREAMS {
+            let s = self.len;
+            self.len += 1;
+            s
+        } else {
+            self.weakest_slot()
+        };
+
+        self.streams[slot] = Stream {
+            last_offset: offset,
+            fetch_window: FETCH_WINDOW_MIN,
+        };
+        FETCH_WINDOW_MIN
+    }
+
+    fn weakest_slot(&self) -> usize {
+        let mut min_idx = 0;
+        let mut min_window = usize::MAX;
+        for i in 0..self.len {
+            if self.streams[i].fetch_window < min_window {
+                min_window = self.streams[i].fetch_window;
+                min_idx = i;
+            }
+        }
+        min_idx
+    }
+
+    fn find_stream(&self, offset: u64) -> Option<usize> {
+        let mut best = None;
+        let mut best_dist = u64::MAX;
+        for i in 0..self.len {
+            let s = &self.streams[i];
+            if offset >= s.last_offset && offset.saturating_sub(s.last_offset) <= self.stride_limit
+            {
+                let dist = offset - s.last_offset;
+                if dist < best_dist {
+                    best = Some(i);
+                    best_dist = dist;
+                }
+            }
+        }
+        best
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PartKey {
@@ -45,6 +128,7 @@ pub struct PrefetchingObjectStore {
     part_size_bytes: usize,
     parts: HybridCache<PartKey, Bytes>,
     heads: Cache<Path, Arc<CachedHead>>,
+    access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
 }
 
 impl PrefetchingObjectStore {
@@ -65,11 +149,16 @@ impl PrefetchingObjectStore {
             .with_name("zerofs-object-prefetch-heads")
             .with_eviction_config(foyer::S3FifoConfig::default())
             .build();
+        let access_tracker = foyer::CacheBuilder::new(ACCESS_TRACKER_CAPACITY)
+            .with_name("zerofs-object-prefetch-access-tracker")
+            .with_eviction_config(foyer::S3FifoConfig::default())
+            .build();
         Self {
             inner,
             part_size_bytes,
             parts,
             heads,
+            access_tracker,
         }
     }
 
@@ -107,6 +196,20 @@ impl PrefetchingObjectStore {
         self.heads.remove(location);
     }
 
+    fn record_access(&self, location: &Path, offset: u64) -> usize {
+        let entry = self
+            .access_tracker
+            .get(location)
+            .map(|e| e.value().clone())
+            .unwrap_or_else(|| {
+                let hist = Arc::new(Mutex::new(AccessHistory::new(self.part_size_bytes)));
+                self.access_tracker.insert(location.clone(), hist.clone());
+                hist
+            });
+        let mut history = entry.lock().unwrap();
+        history.record(offset)
+    }
+
     async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         if let Some((meta, _)) = self.read_head(location) {
             return Ok(meta);
@@ -142,14 +245,19 @@ impl PrefetchingObjectStore {
             return self.inner.get_opts(location, opts).await;
         }
 
-        let (meta, attributes) = self.maybe_prefetch_range(location, opts.clone()).await?;
+        let access_offset = self.range_start_offset(&opts.range);
+        let fetch_window = self.record_access(location, access_offset);
+
+        let (meta, attributes) = self
+            .maybe_prefetch_range(location, opts.clone(), fetch_window)
+            .await?;
         let range = self.canonicalize_range(opts.range.clone(), meta.size)?;
         let parts = self.split_range_into_parts(range.clone());
 
         let futures = parts
             .into_iter()
             .map(|(part_id, range_in_part)| {
-                self.read_part(location.clone(), part_id, range_in_part)
+                self.read_part(location.clone(), part_id, range_in_part, fetch_window)
             })
             .collect::<Vec<_>>();
         let result_stream = stream::iter(futures).then(|fut| fut).boxed();
@@ -166,13 +274,14 @@ impl PrefetchingObjectStore {
         &self,
         location: &Path,
         mut opts: GetOptions,
+        fetch_window: usize,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
         if let Some((meta, attrs)) = self.read_head(location) {
             return Ok((meta, attrs));
         }
 
         if let Some(range) = &opts.range {
-            opts.range = Some(self.align_get_range(range));
+            opts.range = Some(self.align_get_range(range, fetch_window));
         }
 
         let get_result = self.inner.get_opts(location, opts).await?;
@@ -270,6 +379,7 @@ impl PrefetchingObjectStore {
         location: Path,
         part_id: PartId,
         range_in_part: Range<usize>,
+        fetch_window: usize,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
         let inner = self.inner.clone();
         let part_size_bytes = self.part_size_bytes;
@@ -285,22 +395,25 @@ impl PrefetchingObjectStore {
                 parts.remove(&key);
             }
 
-            let part_range = Range {
-                start: (part_id * part_size_bytes) as u64,
-                end: ((part_id + 1) * part_size_bytes) as u64,
+            let extra_parts = fetch_window / part_size_bytes;
+            let fetch_start = part_id;
+            let fetch_end = fetch_start + extra_parts.max(1);
+            let fetch_range = Range {
+                start: (fetch_start * part_size_bytes) as u64,
+                end: (fetch_end * part_size_bytes) as u64,
             };
             let get_result = inner
                 .get_opts(
                     &location,
                     GetOptions {
-                        range: Some(GetRange::Bounded(part_range)),
+                        range: Some(GetRange::Bounded(fetch_range)),
                         ..Default::default()
                     },
                 )
                 .await?;
             let meta = get_result.meta.clone();
             let attrs = get_result.attributes.clone();
-            let bytes = get_result.bytes().await?;
+            let all_bytes = get_result.bytes().await?;
 
             heads.insert(
                 location.clone(),
@@ -309,7 +422,26 @@ impl PrefetchingObjectStore {
                     attributes: attrs,
                 }),
             );
-            parts.insert(key, bytes.clone());
+
+            for i in 0..extra_parts.max(1) {
+                let start = i * part_size_bytes;
+                let end = ((i + 1) * part_size_bytes).min(all_bytes.len());
+                if start >= all_bytes.len() {
+                    break;
+                }
+                parts.insert(
+                    PartKey::new(&location, fetch_start + i),
+                    all_bytes.slice(start..end),
+                );
+            }
+
+            let bytes = parts
+                .get(&key)
+                .await
+                .ok()
+                .flatten()
+                .map(|e| e.value().clone())
+                .unwrap_or_else(|| all_bytes.slice(0..part_size_bytes.min(all_bytes.len())));
 
             let end = range_in_part.end.min(bytes.len());
             let start = range_in_part.start.min(end);
@@ -353,13 +485,34 @@ impl PrefetchingObjectStore {
         Ok(Range { start, end })
     }
 
-    fn align_get_range(&self, range: &GetRange) -> GetRange {
+    fn range_start_offset(&self, range: &Option<GetRange>) -> u64 {
         match range {
-            GetRange::Bounded(r) => GetRange::Bounded(self.align_range(r, self.part_size_bytes)),
-            GetRange::Suffix(s) => {
-                GetRange::Suffix(self.align_range(&(0..*s), self.part_size_bytes).end)
+            None => 0,
+            Some(GetRange::Bounded(r)) => r.start,
+            Some(GetRange::Offset(o)) => *o,
+            Some(GetRange::Suffix(_)) => u64::MAX,
+        }
+    }
+
+    fn align_get_range(&self, range: &GetRange, fetch_window: usize) -> GetRange {
+        let part = self.part_size_bytes;
+        match range {
+            GetRange::Bounded(r) => {
+                let part_aligned = self.align_range(r, part);
+                let expanded = self.align_range(
+                    &Range {
+                        start: part_aligned.start,
+                        end: (r.start + fetch_window as u64).max(part_aligned.end),
+                    },
+                    part,
+                );
+                GetRange::Bounded(expanded)
             }
-            GetRange::Offset(o) => GetRange::Offset(*o - *o % self.part_size_bytes as u64),
+            GetRange::Suffix(s) => {
+                let want = (*s).max(fetch_window as u64);
+                GetRange::Suffix(self.align_range(&(0..want), part).end)
+            }
+            GetRange::Offset(o) => GetRange::Offset(*o - *o % part as u64),
         }
     }
 
@@ -667,5 +820,276 @@ mod tests {
             )
             .await;
         let _ = r;
+    }
+
+    #[test]
+    fn window_ramps_up_on_sequential_access() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+        assert_eq!(h.record(0), FETCH_WINDOW_MIN);
+        assert_eq!(h.record(1024), FETCH_WINDOW_MIN * 2);
+        assert_eq!(h.record(2048), FETCH_WINDOW_MIN * 4);
+        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(4096), FETCH_WINDOW_MIN * 16);
+        assert_eq!(h.record(5120), FETCH_WINDOW_MIN * 32);
+        assert_eq!(h.record(6144), FETCH_WINDOW_MIN * 64);
+        assert_eq!(h.record(7168), FETCH_WINDOW_MAX);
+    }
+
+    #[test]
+    fn random_access_starts_new_stream() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+        h.record(0);
+        h.record(1024);
+        h.record(2048);
+        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(100_000), FETCH_WINDOW_MIN);
+    }
+
+    #[test]
+    fn first_access_uses_min_window() {
+        let mut h = AccessHistory::new(1024);
+        assert_eq!(h.record(5000), FETCH_WINDOW_MIN);
+    }
+
+    #[test]
+    fn interleaved_streams_dont_interfere() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+
+        h.record(0);
+        h.record(1024);
+        assert_eq!(h.record(2048), FETCH_WINDOW_MIN * 4);
+
+        h.record(100_000);
+        h.record(101_024);
+
+        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+    }
+
+    #[test]
+    fn random_burst_does_not_evict_ramped_stream() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+
+        h.record(0);
+        h.record(1024);
+        h.record(2048);
+        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+
+        for i in 0..10 {
+            assert_eq!(h.record((i + 1) * 100_000), FETCH_WINDOW_MIN);
+        }
+
+        assert_eq!(h.record(4096), FETCH_WINDOW_MIN * 16);
+    }
+
+    #[tokio::test]
+    async fn sequential_reads_ramp_up_prefetch() {
+        let part_size = 64 * 1024;
+        let seq_reads = 7;
+        let max_window_parts = FETCH_WINDOW_MAX / part_size;
+        let total_parts = seq_reads + max_window_parts + 4;
+        let (store, inner, _dir) = make_store(part_size, 64 * MEM, 4 * DISK).await;
+        let path = Path::from("seq");
+        let body = vec![0xABu8; part_size * total_parts];
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        for i in 0..seq_reads {
+            store.heads.remove(&path);
+            let start = (i * part_size) as u64;
+            let r = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(start..start + 10)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            r.bytes().await.unwrap();
+        }
+
+        store.heads.remove(&path);
+        let next_start = (seq_reads * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(next_start..next_start + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+
+        let target_part = seq_reads;
+        let last_prefetched_part = target_part + max_window_parts - 1;
+        assert!(
+            store
+                .cached_part(&path, last_prefetched_part)
+                .await
+                .is_some(),
+            "part {last_prefetched_part} should be prefetched at max window"
+        );
+        let beyond_part = last_prefetched_part + 1;
+        assert!(
+            store.cached_part(&path, beyond_part).await.is_none(),
+            "part {beyond_part} should NOT be prefetched (beyond fetch window)"
+        );
+    }
+
+    #[test]
+    fn backward_access_resets_window() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+        h.record(0);
+        h.record(1024);
+        h.record(2048);
+        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(1024), FETCH_WINDOW_MIN);
+    }
+
+    #[tokio::test]
+    async fn read_part_prefetches_window_when_head_cached() {
+        let part_size = 1024;
+        let window_parts = FETCH_WINDOW_MIN / part_size;
+        let total_parts = window_parts * 32;
+        let (store, inner, _dir) = make_store(part_size, 16 * MEM, DISK).await;
+        let path = Path::from("steady");
+        let body: Vec<u8> = (0..part_size * total_parts)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+        assert!(store.read_head(&path).is_some());
+
+        let offset = (window_parts * 4 * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(offset..offset + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[offset as usize..offset as usize + 10]);
+
+        let target_part = offset as usize / part_size;
+        let last_prefetched = target_part + window_parts - 1;
+        assert!(
+            store.cached_part(&path, last_prefetched).await.is_some(),
+            "read_part should prefetch {window_parts} parts when head is cached"
+        );
+        let beyond = last_prefetched + 1;
+        assert!(
+            store.cached_part(&path, beyond).await.is_none(),
+            "read_part should not prefetch beyond the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_part_handles_eof_with_window() {
+        let part_size = 1024;
+        let total_parts = 4;
+        let (store, inner, _dir) = make_store(part_size, MEM, DISK).await;
+        let path = Path::from("eof");
+        let body = vec![0xEFu8; part_size * total_parts];
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+
+        let last_part_offset = ((total_parts - 1) * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(last_part_offset..last_part_offset + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(
+            &got[..],
+            &body[last_part_offset as usize..last_part_offset as usize + 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn random_reads_stay_at_min_window() {
+        let part_size = 1024;
+        let min_fetch_parts = FETCH_WINDOW_MIN / part_size;
+        let total_parts = min_fetch_parts * 64;
+        let (store, inner, _dir) = make_store(part_size, 16 * MEM, DISK).await;
+        let path = Path::from("rnd");
+        let body = vec![0xCDu8; part_size * total_parts];
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        let gap = min_fetch_parts * 4;
+        let random_offsets: Vec<u64> = (0..8).map(|i| (i * gap * part_size) as u64).collect();
+        for off in &random_offsets {
+            let r = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(*off..*off + 10)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            r.bytes().await.unwrap();
+        }
+
+        store.heads.remove(&path);
+        let target_part = total_parts / 2;
+        let target_offset = (target_part * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(target_offset..target_offset + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+
+        assert!(store.cached_part(&path, target_part).await.is_some());
+        let beyond_part = target_part + min_fetch_parts + 1;
+        assert!(
+            store.cached_part(&path, beyond_part).await.is_none(),
+            "part {beyond_part} should not be prefetched under random access"
+        );
     }
 }
