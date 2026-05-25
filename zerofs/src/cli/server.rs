@@ -551,7 +551,12 @@ pub async fn build_slatedb(
                 builder = builder.with_compactor_builder(compactor);
             }
 
-            let slatedb = Arc::new(builder.build().await?);
+            let slatedb = Arc::new(
+                builder
+                    .build()
+                    .await
+                    .context("Failed to build SlateDB instance")?,
+            );
 
             Ok((SlateDbHandle::ReadWrite(slatedb), Some(metrics_recorder)))
         }
@@ -564,7 +569,12 @@ pub async fn build_slatedb(
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
-            let reader = Arc::new(reader_builder.build().await?);
+            let reader = Arc::new(
+                reader_builder
+                    .build()
+                    .await
+                    .context("Failed to open database in read-only mode")?,
+            );
 
             Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
         }
@@ -578,7 +588,12 @@ pub async fn build_slatedb(
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
-            let reader = Arc::new(reader_builder.build().await?);
+            let reader = Arc::new(
+                reader_builder
+                    .build()
+                    .await
+                    .context("Failed to open database from checkpoint")?,
+            );
 
             Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
         }
@@ -608,7 +623,11 @@ async fn initialize_filesystem(
 
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars)?;
+    let (object_store, path_from_url) = parse_url_opts(
+        &url.parse().context("Failed to parse storage URL")?,
+        env_vars,
+    )
+    .context("Failed to connect to storage backend")?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
 
     let actual_db_path = path_from_url.to_string();
@@ -622,8 +641,9 @@ async fn initialize_filesystem(
     info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
 
     info!("Checking bucket identity...");
-    let bucket =
-        bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path).await?;
+    let bucket = bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
+        .await
+        .context("Failed to resolve bucket identity")?;
 
     let cache_config = CacheConfig {
         root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
@@ -643,11 +663,9 @@ async fn initialize_filesystem(
 
     let password = settings.storage.encryption_password.clone();
 
-    super::password::validate_password(&password)
-        .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
+    super::password::validate_password(&password).context("Password validation failed")?;
 
     info!("Loading or initializing encryption key from object store");
-
     let db_path = Path::from(actual_db_path.clone());
     let encryption_key = key_management::load_or_init_encryption_key(
         &object_store,
@@ -655,25 +673,28 @@ async fn initialize_filesystem(
         &password,
         db_mode.is_read_only(),
     )
-    .await?;
+    .await
+    .context("Failed to load or initialize encryption key")?;
 
     let block_transformer: Arc<dyn BlockTransformer> =
         ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
-    let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
-        if let Some(wal_config) = &settings.wal {
-            info!("Using separate WAL object store: {}", wal_config.url);
-            Some(parse_wal_object_store(wal_config)?)
-        } else {
-            None
-        };
+    let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> = if let Some(wal_config) =
+        &settings.wal
+    {
+        info!("Using separate WAL object store: {}", wal_config.url);
+        Some(parse_wal_object_store(wal_config).context("Failed to connect to WAL object store")?)
+    } else {
+        None
+    };
 
     let segments_enabled = crate::segment_extractor::should_enable_segments(
         &object_store,
         &db_path,
         wal_object_store.as_ref(),
     )
-    .await?;
+    .await
+    .context("Failed to determine segment compaction mode")?;
     if segments_enabled {
         info!("Segment-oriented compaction enabled (RFC-0024); using v2 key layout");
     } else {
@@ -691,7 +712,8 @@ async fn initialize_filesystem(
         wal_object_store.clone(),
         segments_enabled,
     )
-    .await?;
+    .await
+    .context("Failed to open database")?;
 
     let db_handle = slatedb.clone();
     let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
@@ -702,7 +724,8 @@ async fn initialize_filesystem(
         sync_writes,
         segments_enabled,
     )
-    .await?;
+    .await
+    .context("Failed to initialize filesystem")?;
 
     Ok(InitResult {
         fs: Arc::new(fs),
@@ -742,6 +765,8 @@ pub async fn run_server(
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+
+    info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
     let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
