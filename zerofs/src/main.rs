@@ -89,7 +89,12 @@ async fn main() -> Result<()> {
             checkpoint,
             no_compactor,
         } => {
-            cli::server::run_server(config, read_only, checkpoint, no_compactor).await?;
+            if let Err(e) =
+                cli::server::run_server(config, read_only, checkpoint, no_compactor).await
+            {
+                eprintln!("✗ {:#}", e);
+                std::process::exit(1);
+            }
         }
         cli::Commands::Debug { subcommand } => match subcommand {
             cli::DebugCommands::ListKeys { config } => {
