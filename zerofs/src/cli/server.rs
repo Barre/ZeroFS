@@ -493,6 +493,7 @@ pub async fn build_slatedb(
     let cache = Arc::new(FoyerHybridCache::new_with_cache(hybrid));
 
     let parts_cache = build_parts_hybrid(&cache_config.root_folder, parts_disk_bytes).await?;
+    let raw_object_store = object_store.clone();
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(PrefetchingObjectStore::new(object_store, parts_cache));
 
@@ -534,7 +535,7 @@ pub async fn build_slatedb(
                         ..Default::default()
                     }
                     .into();
-                let compactor = CompactorBuilder::new(db_path, object_store)
+                let compactor = CompactorBuilder::new(db_path, raw_object_store)
                     .with_runtime(tokio::runtime::Handle::current())
                     .with_filter_policies(crate::fs::filter_policy::filter_policies(
                         segments_enabled,

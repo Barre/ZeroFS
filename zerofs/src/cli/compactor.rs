@@ -1,7 +1,6 @@
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::config::Settings;
 use crate::key_management;
-use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
@@ -80,13 +79,6 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         scheduler_options,
         ..Default::default()
     };
-
-    let total_disk_bytes = (settings.cache.disk_size_gb * 1_000_000_000.0) as usize;
-    let (parts_disk_bytes, _) = super::server::split_disk_budget(total_disk_bytes);
-    let parts_cache =
-        super::server::build_parts_hybrid(&settings.cache.dir, parts_disk_bytes).await?;
-    let object_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(PrefetchingObjectStore::new(object_store, parts_cache));
 
     let compactor = Arc::new(
         CompactorBuilder::new(db_path, object_store)
