@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use foyer::{Cache, HybridCache};
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -29,6 +30,19 @@ type PartId = usize;
 struct Stream {
     last_offset: u64,
     fetch_window: usize,
+    fetched_until: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecordDecision {
+    fetch_window: usize,
+    async_prefetch: Option<AsyncPrefetch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AsyncPrefetch {
+    start: u64,
+    size: usize,
 }
 
 struct AccessHistory {
@@ -43,18 +57,35 @@ impl AccessHistory {
             streams: [Stream {
                 last_offset: u64::MAX,
                 fetch_window: FETCH_WINDOW_MIN,
+                fetched_until: 0,
             }; MAX_STREAMS],
             len: 0,
             stride_limit: part_size as u64 * 4,
         }
     }
 
-    fn record(&mut self, offset: u64) -> usize {
+    fn record(&mut self, offset: u64) -> RecordDecision {
         if let Some(i) = self.find_stream(offset) {
             let s = &mut self.streams[i];
             s.last_offset = offset;
             s.fetch_window = (s.fetch_window * 2).min(FETCH_WINDOW_MAX);
-            return s.fetch_window;
+
+            let async_prefetch = if s.fetch_window > FETCH_WINDOW_MIN
+                && s.fetched_until > offset
+                && offset + (s.fetch_window as u64 / 2) >= s.fetched_until
+            {
+                let start = s.fetched_until;
+                let size = s.fetch_window;
+                s.fetched_until = start + size as u64;
+                Some(AsyncPrefetch { start, size })
+            } else {
+                None
+            };
+
+            return RecordDecision {
+                fetch_window: s.fetch_window,
+                async_prefetch,
+            };
         }
 
         let slot = if self.len < MAX_STREAMS {
@@ -68,8 +99,21 @@ impl AccessHistory {
         self.streams[slot] = Stream {
             last_offset: offset,
             fetch_window: FETCH_WINDOW_MIN,
+            fetched_until: offset,
         };
-        FETCH_WINDOW_MIN
+
+        RecordDecision {
+            fetch_window: FETCH_WINDOW_MIN,
+            async_prefetch: None,
+        }
+    }
+
+    fn note_fetch(&mut self, offset: u64, fetch_end: u64) {
+        if let Some(i) = self.find_stream(offset)
+            && fetch_end > self.streams[i].fetched_until
+        {
+            self.streams[i].fetched_until = fetch_end;
+        }
     }
 
     fn weakest_slot(&self) -> usize {
@@ -129,6 +173,18 @@ pub struct PrefetchingObjectStore {
     parts: HybridCache<PartKey, Bytes>,
     heads: Cache<Path, Arc<CachedHead>>,
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
+    in_flight: Arc<DashMap<PartKey, ()>>,
+}
+
+struct PrefetchGuard {
+    map: Arc<DashMap<PartKey, ()>>,
+    key: PartKey,
+}
+
+impl Drop for PrefetchGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
 }
 
 impl PrefetchingObjectStore {
@@ -145,6 +201,7 @@ impl PrefetchingObjectStore {
             part_size_bytes > 0 && part_size_bytes.is_multiple_of(1024),
             "part_size_bytes must be a positive multiple of 1024"
         );
+
         let heads = foyer::CacheBuilder::new(HEADS_CAPACITY_ENTRIES)
             .with_name("zerofs-object-prefetch-heads")
             .with_eviction_config(foyer::S3FifoConfig::default())
@@ -153,12 +210,14 @@ impl PrefetchingObjectStore {
             .with_name("zerofs-object-prefetch-access-tracker")
             .with_eviction_config(foyer::S3FifoConfig::default())
             .build();
+
         Self {
             inner,
             part_size_bytes,
             parts,
             heads,
             access_tracker,
+            in_flight: Arc::new(DashMap::new()),
         }
     }
 
@@ -178,10 +237,6 @@ impl PrefetchingObjectStore {
             .map(|entry| (entry.value().meta.clone(), entry.value().attributes.clone()))
     }
 
-    fn save_part(&self, location: &Path, part_id: PartId, bytes: Bytes) {
-        self.parts.insert(PartKey::new(location, part_id), bytes);
-    }
-
     #[cfg(test)]
     async fn cached_part(&self, location: &Path, part_id: PartId) -> Option<Bytes> {
         self.parts
@@ -196,7 +251,7 @@ impl PrefetchingObjectStore {
         self.heads.remove(location);
     }
 
-    fn record_access(&self, location: &Path, offset: u64) -> usize {
+    fn record_access(&self, location: &Path, offset: u64) -> RecordDecision {
         let entry = self
             .access_tracker
             .get(location)
@@ -208,6 +263,13 @@ impl PrefetchingObjectStore {
             });
         let mut history = entry.lock().unwrap();
         history.record(offset)
+    }
+
+    fn note_fetch(&self, location: &Path, offset: u64, fetch_end: u64) {
+        if let Some(entry) = self.access_tracker.get(location) {
+            let hist = entry.value().clone();
+            hist.lock().unwrap().note_fetch(offset, fetch_end);
+        }
     }
 
     async fn cached_head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
@@ -246,10 +308,15 @@ impl PrefetchingObjectStore {
         }
 
         let access_offset = self.range_start_offset(&opts.range);
-        let fetch_window = self.record_access(location, access_offset);
+        let decision = self.record_access(location, access_offset);
+        let fetch_window = decision.fetch_window;
+
+        if let Some(prefetch) = decision.async_prefetch {
+            self.spawn_async_prefetch(location.clone(), prefetch);
+        }
 
         let (meta, attributes) = self
-            .maybe_prefetch_range(location, opts.clone(), fetch_window)
+            .maybe_prefetch_range(location, opts.clone(), fetch_window, access_offset)
             .await?;
         let range = self.canonicalize_range(opts.range.clone(), meta.size)?;
         let parts = self.split_range_into_parts(range.clone());
@@ -270,11 +337,81 @@ impl PrefetchingObjectStore {
         })
     }
 
+    fn spawn_async_prefetch(&self, location: Path, prefetch: AsyncPrefetch) {
+        let part_size = self.part_size_bytes;
+        let part_size_u64 = part_size as u64;
+
+        if !prefetch.start.is_multiple_of(part_size_u64) {
+            return;
+        }
+
+        let start_part: PartId = match (prefetch.start / part_size_u64).try_into() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let key = PartKey::new(&location, start_part);
+        if self.in_flight.insert(key.clone(), ()).is_some() {
+            return;
+        }
+
+        let guard = PrefetchGuard {
+            map: self.in_flight.clone(),
+            key,
+        };
+        let inner = self.inner.clone();
+        let parts_cache = self.parts.clone();
+        let access_tracker = self.access_tracker.clone();
+        let access_offset = prefetch.start;
+
+        let range = Range {
+            start: prefetch.start,
+            end: prefetch.start + prefetch.size as u64,
+        };
+
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Ok(Some(_)) = parts_cache.get(&PartKey::new(&location, start_part)).await {
+                return;
+            }
+            let get_result = match inner
+                .get_opts(
+                    &location,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(range.clone())),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let actual_end = get_result.range.end;
+            let stream = get_result.into_stream();
+            if Self::save_parts_stream_static(
+                &parts_cache,
+                part_size,
+                &location,
+                stream,
+                start_part,
+            )
+            .await
+            .is_ok()
+                && let Some(entry) = access_tracker.get(&location)
+            {
+                let hist = entry.value().clone();
+                hist.lock().unwrap().note_fetch(access_offset, actual_end);
+            }
+        });
+    }
+
     async fn maybe_prefetch_range(
         &self,
         location: &Path,
         mut opts: GetOptions,
         fetch_window: usize,
+        access_offset: u64,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
         if let Some((meta, attrs)) = self.read_head(location) {
             return Ok((meta, attrs));
@@ -287,7 +424,9 @@ impl PrefetchingObjectStore {
         let get_result = self.inner.get_opts(location, opts).await?;
         let meta = get_result.meta.clone();
         let attrs = get_result.attributes.clone();
+        let fetch_end = get_result.range.end;
         let _ = self.save_get_result(location, get_result).await;
+        self.note_fetch(location, access_offset, fetch_end);
         Ok((meta, attrs))
     }
 
@@ -317,6 +456,26 @@ impl PrefetchingObjectStore {
     async fn save_parts_stream<S>(
         &self,
         location: &Path,
+        stream: S,
+        start_part_number: PartId,
+    ) -> object_store::Result<()>
+    where
+        S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
+    {
+        Self::save_parts_stream_static(
+            &self.parts,
+            self.part_size_bytes,
+            location,
+            stream,
+            start_part_number,
+        )
+        .await
+    }
+
+    async fn save_parts_stream_static<S>(
+        parts: &HybridCache<PartKey, Bytes>,
+        part_size_bytes: usize,
+        location: &Path,
         mut stream: S,
         start_part_number: PartId,
     ) -> object_store::Result<()>
@@ -329,15 +488,15 @@ impl PrefetchingObjectStore {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             buffer.extend_from_slice(&chunk);
-            while buffer.len() >= self.part_size_bytes {
-                let to_write = buffer.split_to(self.part_size_bytes);
-                self.save_part(location, part_number, to_write.freeze());
+            while buffer.len() >= part_size_bytes {
+                let to_write = buffer.split_to(part_size_bytes);
+                parts.insert(PartKey::new(location, part_number), to_write.freeze());
                 part_number += 1;
             }
         }
 
         if !buffer.is_empty() {
-            self.save_part(location, part_number, buffer.freeze());
+            parts.insert(PartKey::new(location, part_number), buffer.freeze());
         }
         Ok(())
     }
@@ -385,6 +544,7 @@ impl PrefetchingObjectStore {
         let part_size_bytes = self.part_size_bytes;
         let parts = self.parts.clone();
         let heads = self.heads.clone();
+        let access_tracker = self.access_tracker.clone();
         Box::pin(async move {
             let key = PartKey::new(&location, part_id);
             if let Ok(Some(entry)) = parts.get(&key).await {
@@ -402,6 +562,7 @@ impl PrefetchingObjectStore {
                 start: (fetch_start * part_size_bytes) as u64,
                 end: (fetch_end * part_size_bytes) as u64,
             };
+            let access_offset = fetch_range.start + range_in_part.start as u64;
             let get_result = inner
                 .get_opts(
                     &location,
@@ -413,6 +574,7 @@ impl PrefetchingObjectStore {
                 .await?;
             let meta = get_result.meta.clone();
             let attrs = get_result.attributes.clone();
+            let actual_end = get_result.range.end;
             let all_bytes = get_result.bytes().await?;
 
             heads.insert(
@@ -422,6 +584,11 @@ impl PrefetchingObjectStore {
                     attributes: attrs,
                 }),
             );
+
+            if let Some(entry) = access_tracker.get(&location) {
+                let hist = entry.value().clone();
+                hist.lock().unwrap().note_fetch(access_offset, actual_end);
+            }
 
             for i in 0..extra_parts.max(1) {
                 let start = i * part_size_bytes;
@@ -826,14 +993,14 @@ mod tests {
     fn window_ramps_up_on_sequential_access() {
         let part_size = 1024;
         let mut h = AccessHistory::new(part_size);
-        assert_eq!(h.record(0), FETCH_WINDOW_MIN);
-        assert_eq!(h.record(1024), FETCH_WINDOW_MIN * 2);
-        assert_eq!(h.record(2048), FETCH_WINDOW_MIN * 4);
-        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
-        assert_eq!(h.record(4096), FETCH_WINDOW_MIN * 16);
-        assert_eq!(h.record(5120), FETCH_WINDOW_MIN * 32);
-        assert_eq!(h.record(6144), FETCH_WINDOW_MIN * 64);
-        assert_eq!(h.record(7168), FETCH_WINDOW_MAX);
+        assert_eq!(h.record(0).fetch_window, FETCH_WINDOW_MIN);
+        assert_eq!(h.record(1024).fetch_window, FETCH_WINDOW_MIN * 2);
+        assert_eq!(h.record(2048).fetch_window, FETCH_WINDOW_MIN * 4);
+        assert_eq!(h.record(3072).fetch_window, FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(4096).fetch_window, FETCH_WINDOW_MIN * 16);
+        assert_eq!(h.record(5120).fetch_window, FETCH_WINDOW_MIN * 32);
+        assert_eq!(h.record(6144).fetch_window, FETCH_WINDOW_MIN * 64);
+        assert_eq!(h.record(7168).fetch_window, FETCH_WINDOW_MAX);
     }
 
     #[test]
@@ -843,14 +1010,14 @@ mod tests {
         h.record(0);
         h.record(1024);
         h.record(2048);
-        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
-        assert_eq!(h.record(100_000), FETCH_WINDOW_MIN);
+        assert_eq!(h.record(3072).fetch_window, FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(100_000).fetch_window, FETCH_WINDOW_MIN);
     }
 
     #[test]
     fn first_access_uses_min_window() {
         let mut h = AccessHistory::new(1024);
-        assert_eq!(h.record(5000), FETCH_WINDOW_MIN);
+        assert_eq!(h.record(5000).fetch_window, FETCH_WINDOW_MIN);
     }
 
     #[test]
@@ -860,12 +1027,12 @@ mod tests {
 
         h.record(0);
         h.record(1024);
-        assert_eq!(h.record(2048), FETCH_WINDOW_MIN * 4);
+        assert_eq!(h.record(2048).fetch_window, FETCH_WINDOW_MIN * 4);
 
         h.record(100_000);
         h.record(101_024);
 
-        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(3072).fetch_window, FETCH_WINDOW_MIN * 8);
     }
 
     #[test]
@@ -876,13 +1043,13 @@ mod tests {
         h.record(0);
         h.record(1024);
         h.record(2048);
-        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(3072).fetch_window, FETCH_WINDOW_MIN * 8);
 
         for i in 0..10 {
-            assert_eq!(h.record((i + 1) * 100_000), FETCH_WINDOW_MIN);
+            assert_eq!(h.record((i + 1) * 100_000).fetch_window, FETCH_WINDOW_MIN);
         }
 
-        assert_eq!(h.record(4096), FETCH_WINDOW_MIN * 16);
+        assert_eq!(h.record(4096).fetch_window, FETCH_WINDOW_MIN * 16);
     }
 
     #[tokio::test]
@@ -949,8 +1116,8 @@ mod tests {
         h.record(0);
         h.record(1024);
         h.record(2048);
-        assert_eq!(h.record(3072), FETCH_WINDOW_MIN * 8);
-        assert_eq!(h.record(1024), FETCH_WINDOW_MIN);
+        assert_eq!(h.record(3072).fetch_window, FETCH_WINDOW_MIN * 8);
+        assert_eq!(h.record(1024).fetch_window, FETCH_WINDOW_MIN);
     }
 
     #[tokio::test]
@@ -1090,6 +1257,179 @@ mod tests {
         assert!(
             store.cached_part(&path, beyond_part).await.is_none(),
             "part {beyond_part} should not be prefetched under random access"
+        );
+    }
+
+    #[test]
+    fn record_emits_async_prefetch_in_trigger_zone() {
+        let part_size = 64 * 1024;
+        let mut h = AccessHistory::new(part_size);
+
+        let d = h.record(0);
+        assert_eq!(d.fetch_window, FETCH_WINDOW_MIN);
+        assert!(d.async_prefetch.is_none());
+
+        h.note_fetch(0, FETCH_WINDOW_MIN as u64);
+
+        let d = h.record((FETCH_WINDOW_MIN / 2) as u64);
+        assert_eq!(d.fetch_window, FETCH_WINDOW_MIN * 2);
+        let p = d.async_prefetch.expect("should fire in trigger zone");
+        assert_eq!(p.start, FETCH_WINDOW_MIN as u64);
+        assert_eq!(p.size, FETCH_WINDOW_MIN * 2);
+    }
+
+    #[test]
+    fn record_no_async_prefetch_when_far_from_fetched_until() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+
+        h.record(0);
+        h.note_fetch(0, 8 * 1024 * 1024);
+
+        let d = h.record(1024);
+        assert!(
+            d.async_prefetch.is_none(),
+            "should not trigger when fetched_until is far ahead of offset"
+        );
+    }
+
+    #[test]
+    fn record_no_async_prefetch_at_min_window() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+
+        h.record(100_000);
+        let d = h.record(100_000);
+        assert!(d.async_prefetch.is_none());
+    }
+
+    #[test]
+    fn note_fetch_only_advances_fetched_until() {
+        let part_size = 1024;
+        let mut h = AccessHistory::new(part_size);
+
+        h.record(0);
+        h.note_fetch(0, 4096);
+        h.note_fetch(0, 2048);
+        assert_eq!(h.streams[0].fetched_until, 4096);
+    }
+
+    #[tokio::test]
+    async fn async_prefetch_fills_cache_ahead_of_consumer() {
+        let part_size = 64 * 1024;
+        let total_parts = (FETCH_WINDOW_MIN / part_size) * 8;
+        let (store, inner, _dir) = make_store(part_size, 4 * MEM, DISK).await;
+        let path = Path::from("asyncpf");
+        let body: Vec<u8> = (0..part_size * total_parts)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+
+        let mid_offset = (FETCH_WINDOW_MIN / 2) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(mid_offset..mid_offset + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+
+        let next_window_start_part = FETCH_WINDOW_MIN / part_size;
+        for _ in 0..100 {
+            if store
+                .cached_part(&path, next_window_start_part)
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            store
+                .cached_part(&path, next_window_start_part)
+                .await
+                .is_some(),
+            "async prefetch should fill part {next_window_start_part}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_async_prefetch_dedups_via_in_flight() {
+        let part_size = 1024;
+        let (store, inner, _dir) = make_store(part_size, MEM, DISK).await;
+        let path = Path::from("dedup");
+        let body = vec![0xAAu8; part_size * 32];
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        let start_part = 5;
+        let key = PartKey::new(&path, start_part);
+        store.in_flight.insert(key.clone(), ());
+
+        store.spawn_async_prefetch(
+            path.clone(),
+            AsyncPrefetch {
+                start: (start_part * part_size) as u64,
+                size: part_size * 4,
+            },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            store.cached_part(&path, start_part).await.is_none(),
+            "duplicate prefetch should have been skipped"
+        );
+        assert!(store.in_flight.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn prefetch_guard_releases_in_flight_on_drop() {
+        let part_size = 1024;
+        let (store, inner, _dir) = make_store(part_size, MEM, DISK).await;
+        let path = Path::from("guard");
+        let body = vec![0xBBu8; part_size * 16];
+        inner.put(&path, body.clone().into()).await.unwrap();
+
+        let start_part = 2;
+        store.spawn_async_prefetch(
+            path.clone(),
+            AsyncPrefetch {
+                start: (start_part * part_size) as u64,
+                size: part_size * 4,
+            },
+        );
+
+        for _ in 0..100 {
+            if !store
+                .in_flight
+                .contains_key(&PartKey::new(&path, start_part))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !store
+                .in_flight
+                .contains_key(&PartKey::new(&path, start_part)),
+            "in_flight key should be released after prefetch completes"
         );
     }
 }
