@@ -614,7 +614,7 @@ impl Settings {
         }
     }
 
-    pub fn write_default_config(path: impl AsRef<std::path::Path>) -> Result<()> {
+    pub fn render_default_config() -> Result<String> {
         let default = Self::generate_default();
         let mut toml_string = toml::to_string_pretty(&default)?;
 
@@ -749,7 +749,11 @@ impl Settings {
             toml_string
         );
 
-        fs::write(path, commented)?;
+        Ok(commented)
+    }
+
+    pub fn write_default_config(path: impl AsRef<std::path::Path>) -> Result<()> {
+        fs::write(path, Self::render_default_config()?)?;
         Ok(())
     }
 }
