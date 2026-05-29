@@ -46,10 +46,16 @@ async fn main() -> Result<()> {
 
     match cli.command {
         cli::Commands::Init { path } => {
-            println!("Generating configuration file at: {}", path.display());
-            config::Settings::write_default_config(&path)?;
-            println!("Configuration file created successfully!");
-            println!("Edit the file and run: zerofs run -c {}", path.display());
+            if path.to_str() == Some("-") {
+                // Write the config to stdout so it can be piped or redirected, e.g.:
+                //   docker run --rm ghcr.io/barre/zerofs:latest init - > zerofs.toml
+                print!("{}", config::Settings::render_default_config()?);
+            } else {
+                eprintln!("Generating configuration file at: {}", path.display());
+                config::Settings::write_default_config(&path)?;
+                eprintln!("Configuration file created successfully!");
+                eprintln!("Edit the file and run: zerofs run -c {}", path.display());
+            }
         }
         cli::Commands::ChangePassword { config } => {
             let settings = match config::Settings::from_file(&config) {

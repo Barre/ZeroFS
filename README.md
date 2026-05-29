@@ -163,6 +163,14 @@ cargo install zerofs
 #### Via Docker
 ```bash
 docker pull ghcr.io/barre/zerofs:latest
+
+# Generate a starter config on the host (pass "-" to write to stdout)
+docker run --rm ghcr.io/barre/zerofs:latest init - > zerofs.toml
+
+# Edit it, then run ZeroFS with the config mounted in
+$EDITOR zerofs.toml
+docker run --rm -v "$PWD/zerofs.toml:/zerofs.toml" \
+  ghcr.io/barre/zerofs:latest run -c /zerofs.toml
 ```
 
 ### Getting Started

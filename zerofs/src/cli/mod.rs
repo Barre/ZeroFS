@@ -25,6 +25,7 @@ pub struct Cli {
 pub enum Commands {
     /// Generate a default configuration file
     Init {
+        /// Output path for the config file, or "-" to write to stdout
         #[arg(default_value = "zerofs.toml")]
         path: PathBuf,
     },
