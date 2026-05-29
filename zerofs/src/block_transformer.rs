@@ -135,6 +135,7 @@ impl BlockTransformer for ZeroFsBlockTransformer {
             let encrypted = inner.encrypt(&compressed)?;
             Ok(Bytes::from(encrypted))
         })
+        .map_err(|e| slatedb::Error::data(format!("Failed to spawn block-encode task: {}", e)))?
         .await
         .map_err(|e| slatedb::Error::data(format!("Task join error: {}", e)))?
     }
@@ -147,6 +148,7 @@ impl BlockTransformer for ZeroFsBlockTransformer {
             let decompressed = inner.decompress(&decrypted)?;
             Ok(Bytes::from(decompressed))
         })
+        .map_err(|e| slatedb::Error::data(format!("Failed to spawn block-decode task: {}", e)))?
         .await
         .map_err(|e| slatedb::Error::data(format!("Task join error: {}", e)))?
     }

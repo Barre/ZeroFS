@@ -227,6 +227,7 @@ pub async fn load_or_init_encryption_key(
             spawn_blocking_named("argon2-unwrap", move || {
                 key_manager.unwrap_key(&password, &wrapped_key)
             })
+            .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
             .await
             .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
         }
@@ -241,6 +242,7 @@ pub async fn load_or_init_encryption_key(
             let (wrapped_key, dek) = spawn_blocking_named("argon2-generate", move || {
                 key_manager.generate_and_wrap_key(&password)
             })
+            .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
             .await
             .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
@@ -269,6 +271,7 @@ pub async fn change_encryption_password(
     let new_wrapped_key = spawn_blocking_named("argon2-rewrap", move || {
         key_manager.rewrap_key(&old_password, &new_password, &wrapped_key)
     })
+    .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
     .await
     .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
