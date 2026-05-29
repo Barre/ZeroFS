@@ -9,7 +9,7 @@ use slatedb::config::CompactorOptions;
 use slatedb::object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Run standalone compactor for the database.
 ///
@@ -121,6 +121,17 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         .stop()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to stop compactor: {}", e))?;
+
+    // Wait for the run loop to fully exit before returning, so the runtime
+    // isn't torn down while the loop is still winding down.
+    match compactor_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(
+            "Compactor run loop exited with error during shutdown: {}",
+            e
+        ),
+        Err(e) => warn!("Compactor task failed to join during shutdown: {}", e),
+    }
 
     info!("Compactor shutdown complete");
 
