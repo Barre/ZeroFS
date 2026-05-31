@@ -10,6 +10,7 @@ mod db;
 mod deku_bytes;
 mod fs;
 mod key_management;
+mod length_checked_object_store;
 mod nbd;
 mod nfs;
 mod ninep;
