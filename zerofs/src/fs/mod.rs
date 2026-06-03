@@ -360,7 +360,9 @@ impl ZeroFS {
 
                 let mut txn = self.db.new_transaction()?;
 
-                self.chunk_store.write(&mut txn, id, offset, data).await?;
+                self.chunk_store
+                    .write(&mut txn, id, offset, data, old_size)
+                    .await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_CHUNK);
