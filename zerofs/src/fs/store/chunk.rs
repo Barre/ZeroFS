@@ -120,6 +120,7 @@ impl ChunkStore {
         id: InodeId,
         offset: u64,
         data: &[u8],
+        old_size: u64,
     ) -> Result<(), FsError> {
         if data.is_empty() {
             return Ok(());
@@ -135,10 +136,14 @@ impl ChunkStore {
                     let chunk_start = chunk_idx * CHUNK_SIZE as u64;
                     let chunk_end = chunk_start + CHUNK_SIZE as u64;
                     let will_overwrite_fully = offset <= chunk_start && end_offset >= chunk_end;
+                    // Chunks that begin at or beyond the old file size cannot have any
+                    // on-disk data (truncate deletes chunks past EOF), so the partial
+                    // read-modify-write read is a guaranteed miss. Skip it.
+                    let beyond_eof = chunk_start >= old_size;
 
                     let store = self.clone();
                     async move {
-                        let data = if will_overwrite_fully {
+                        let data = if will_overwrite_fully || beyond_eof {
                             Bytes::from_static(ZERO_CHUNK)
                         } else {
                             store
