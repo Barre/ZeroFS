@@ -12,10 +12,12 @@ use crate::ninep::lock_manager::{FileLock, FileLockManager};
 use anyhow::{Context, Result, anyhow, bail};
 use dashmap::DashMap;
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    InitFlags, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, Session, SessionACL, TimeOrNow,
+    AccessFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, MountOption,
+    OpenFlags, PollEvents, PollFlags, PollNotifier, RenameFlags, ReplyAttr, ReplyBmap, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLock,
+    ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
+    SessionACL, TimeOrNow,
 };
 use ninep_client::{ClientError, NinePClient};
 use ninep_proto::{
@@ -57,6 +59,16 @@ struct DirRead {
     /// A different offset means the kernel seeked/rewound, so the buffer is discarded and refetched.
     resume_offset: u64,
     /// The server has no more entries past `fetch_cookie`.
+    eof: bool,
+}
+
+/// Read-ahead state for one open directory handle served via readdirplus
+/// (entries carry their stat). Mirrors [`DirRead`] but buffers `DirEntryPlus`.
+#[derive(Default)]
+struct DirReadPlus {
+    buf: VecDeque<ninep_proto::DirEntryPlus>,
+    fetch_cookie: u64,
+    resume_offset: u64,
     eof: bool,
 }
 
@@ -104,6 +116,8 @@ struct Fuse9P {
     client_id: Arc<Vec<u8>>,
     /// Per-open-directory read-ahead buffers, keyed by directory file handle.
     dir_reads: Arc<DashMap<u64, Arc<AsyncMutex<DirRead>>>>,
+    /// Same, for directories the kernel reads via readdirplus.
+    dir_reads_plus: Arc<DashMap<u64, Arc<AsyncMutex<DirReadPlus>>>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
     /// When true, request the FUSE writeback cache so the kernel buffers writes
@@ -295,24 +309,36 @@ async fn resolve_child(
     name: &[u8],
 ) -> Result<FileAttr, ClientError> {
     let newfid = client.alloc_fid();
-    let qids = match client.walk(parent_fid, newfid, &[name]).await {
-        Ok(q) => q,
-        Err(e) => {
-            client.free_fid(newfid);
-            return Err(e);
+    // With the fast path, walk+getattr is a single round trip; otherwise fall
+    // back to a walk followed by a getattr.
+    let stat = if client.extensions_enabled() {
+        match client.walk_getattr(parent_fid, newfid, &[name]).await {
+            // A successful walk_getattr is always a full walk, so the fid exists.
+            Ok((_, stat)) => stat,
+            Err(e) => {
+                client.free_fid(newfid);
+                return Err(e);
+            }
         }
-    };
-    if qids.is_empty() {
-        client.free_fid(newfid);
-        return Err(ClientError::Errno(libc::ENOENT as u32));
-    }
-
-    let stat = match client.getattr(newfid, GETATTR_ALL).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = client.clunk(newfid).await;
+    } else {
+        let qids = match client.walk(parent_fid, newfid, &[name]).await {
+            Ok(q) => q,
+            Err(e) => {
+                client.free_fid(newfid);
+                return Err(e);
+            }
+        };
+        if qids.is_empty() {
             client.free_fid(newfid);
-            return Err(e);
+            return Err(ClientError::Errno(libc::ENOENT as u32));
+        }
+        match client.getattr(newfid, GETATTR_ALL).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = client.clunk(newfid).await;
+                client.free_fid(newfid);
+                return Err(e);
+            }
         }
     };
 
@@ -345,6 +371,16 @@ impl Filesystem for Fuse9P {
         // Ask the kernel to forward fcntl byte-range locks to us; without this
         // capability it handles POSIX locks locally and never calls getlk/setlk.
         let _ = config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS);
+
+        // When the server speaks the fast path, let the kernel use readdirplus so
+        // a directory listing returns entries with their attributes in one shot
+        // (no lookup/getattr per entry). AUTO lets the kernel pick plain readdir
+        // when it won't stat the entries.
+        if self.client.extensions_enabled() {
+            let _ = config.add_capabilities(
+                InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO,
+            );
+        }
 
         if self.writeback
             && let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
@@ -875,6 +911,7 @@ impl Filesystem for Fuse9P {
         reply: ReplyEmpty,
     ) {
         self.dir_reads.remove(&fh.0);
+        self.dir_reads_plus.remove(&fh.0);
         self.release_inner(fh, reply);
     }
 
@@ -938,6 +975,95 @@ impl Filesystem for Fuse9P {
                         return;
                     }
                     st.resume_offset = e.offset;
+                }
+            }
+            reply.ok();
+        });
+    }
+
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let client = Arc::clone(&self.client);
+        // Capability is only advertised when the server supports it, but guard
+        // anyway: ENOSYS makes the kernel fall back to plain readdir.
+        if !client.extensions_enabled() {
+            reply.error(Errno::ENOSYS);
+            return;
+        }
+        let inodes = Arc::clone(&self.inodes);
+        let ttl = self.ttl;
+        let fid = fh.0 as u32;
+        let state = self
+            .dir_reads_plus
+            .entry(fh.0)
+            .or_insert_with(|| {
+                Arc::new(AsyncMutex::new(DirReadPlus {
+                    fetch_cookie: offset,
+                    resume_offset: offset,
+                    ..Default::default()
+                }))
+            })
+            .clone();
+        let batch = client.max_io().min(READDIR_BATCH);
+        self.rt.spawn(async move {
+            let mut st = state.lock().await;
+            // A FUSE offset that doesn't continue where we left off means the
+            // kernel seeked or rewound; drop the read-ahead and restart there.
+            if offset != st.resume_offset {
+                st.buf.clear();
+                st.fetch_cookie = offset;
+                st.resume_offset = offset;
+                st.eof = false;
+            }
+            loop {
+                if st.buf.is_empty() {
+                    if st.eof {
+                        break;
+                    }
+                    match client.readdirplus(fid, st.fetch_cookie, batch).await {
+                        Ok(entries) if entries.is_empty() => st.eof = true,
+                        Ok(entries) => {
+                            st.fetch_cookie = entries.last().map_or(st.fetch_cookie, |e| e.offset);
+                            st.buf.extend(entries);
+                        }
+                        Err(e) => {
+                            reply.error(errno(&e));
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                while let Some(e) = st.buf.pop_front() {
+                    let child_ino = ino_of(e.stat.qid.path);
+                    let name = OsStr::from_bytes(&e.name.data);
+                    let attr = stat_to_attr(&e.stat);
+                    if reply.add(
+                        INodeNo(child_ino),
+                        e.offset,
+                        name,
+                        &ttl,
+                        &attr,
+                        Generation(0),
+                    ) {
+                        // Didn't fit; keep it for the next call (uncounted).
+                        st.buf.push_front(e);
+                        reply.ok();
+                        return;
+                    }
+                    st.resume_offset = e.offset;
+                    // The kernel takes a lookup reference for every delivered entry
+                    // except "." and ".."; account for it like `resolve_child` so a
+                    // later forget balances. The fid stays unbound (bound lazily by
+                    // `user_fid` via Trebind on the first real op).
+                    if !matches!(e.name.data.as_slice(), b"." | b"..") {
+                        inodes.entry(child_ino).or_default().lookup += 1;
+                    }
                 }
             }
             reply.ok();
@@ -1218,6 +1344,122 @@ impl Filesystem for Fuse9P {
             }
         });
     }
+
+    // Operations we don't support over the 9P backend. Each returns the same
+    // ENOSYS that fuser's default trait method would, but without the per-call
+    // "[Not Implemented]" WARN — callers (cp, xattr tools, etc.) fall back.
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn bmap(&self, _req: &Request, _ino: INodeNo, _blocksize: u32, _idx: u64, reply: ReplyBmap) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: IoctlFlags,
+        _cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: ReplyIoctl,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _ph: PollNotifier,
+        _events: PollEvents,
+        _flags: PollFlags,
+        reply: ReplyPoll,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: u64,
+        _length: u64,
+        _mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: i64,
+        _whence: i32,
+        reply: ReplyLseek,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        _ino_in: INodeNo,
+        _fh_in: FileHandle,
+        _offset_in: u64,
+        _ino_out: INodeNo,
+        _fh_out: FileHandle,
+        _offset_out: u64,
+        _len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
 }
 
 impl Fuse9P {
@@ -1384,12 +1626,12 @@ async fn wait_for_signal() {
 }
 
 pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Result<()> {
-    // Log to stderr (default INFO) so reconnects and errors are visible; tune
-    // with RUST_LOG, e.g. `RUST_LOG=zerofs::ninep::client=debug`.
+    // Silence `fuser::reply` by default.
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,fuser::reply=off")),
         )
         .with_writer(std::io::stderr)
         .try_init();
@@ -1422,6 +1664,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         locks: Arc::new(FileLockManager::new()),
         client_id: Arc::new(node_name()),
         dir_reads: Arc::new(DashMap::new()),
+        dir_reads_plus: Arc::new(DashMap::new()),
         ttl: Duration::from_secs(1),
         writeback: opts.writeback,
     };
@@ -1689,6 +1932,98 @@ mod client_tests {
             client.clunk(dir).await.unwrap();
             client.free_fid(dir);
         }
+
+        shutdown.cancel();
+    }
+
+    /// The fast-path extensions: the real connect path negotiates `9P2000.L.zerofs`,
+    /// `walk_getattr` matches a separate walk+getattr, and `readdirplus` returns
+    /// each entry with its correct stat.
+    #[tokio::test]
+    async fn walk_getattr_and_readdirplus() {
+        let (client, shutdown, _dir, _sock) = setup().await;
+        assert!(
+            client.extensions_enabled(),
+            "server should negotiate the .zerofs extensions"
+        );
+
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        client
+            .mkdir(ROOT_FID_TEST, b"d", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+
+        // Populate d/ with two 2-byte files.
+        let dfid = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, dfid, &[b"d".as_ref()])
+            .await
+            .unwrap();
+        for name in [b"a".as_ref(), b"b".as_ref()] {
+            let cf = client.alloc_fid();
+            client.walk(dfid, cf, &[]).await.unwrap();
+            client
+                .lcreate(
+                    cf,
+                    name,
+                    (libc::O_RDWR | libc::O_CREAT) as u32,
+                    libc::S_IFREG | 0o644,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.write(cf, 0, b"xy").await.unwrap(), 2);
+            client.clunk(cf).await.unwrap();
+            client.free_fid(cf);
+        }
+        client.clunk(dfid).await.unwrap();
+        client.free_fid(dfid);
+
+        // walk_getattr to d must equal a separate walk + getattr.
+        let wf = client.alloc_fid();
+        let (qids, stat) = client
+            .walk_getattr(ROOT_FID_TEST, wf, &[b"d".as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(qids.len(), 1);
+        assert_eq!(stat.qid.path, qids[0].path);
+        assert_eq!(stat.mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
+        let gf = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, gf, &[b"d".as_ref()])
+            .await
+            .unwrap();
+        let stat2 = client.getattr(gf, GETATTR_ALL).await.unwrap();
+        assert_eq!(stat.qid.path, stat2.qid.path);
+        assert_eq!(stat.mode, stat2.mode);
+        assert_eq!(stat.nlink, stat2.nlink);
+        client.clunk(gf).await.unwrap();
+        client.free_fid(gf);
+        client.clunk(wf).await.unwrap();
+        client.free_fid(wf);
+
+        // readdirplus on d/ returns a and b with their real stats.
+        let od = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, od, &[b"d".as_ref()])
+            .await
+            .unwrap();
+        client.lopen(od, libc::O_RDONLY as u32).await.unwrap();
+        let entries = client.readdirplus(od, 0, 64 * 1024).await.unwrap();
+        let byname: std::collections::HashMap<String, Stat> = entries
+            .into_iter()
+            .map(|e| (String::from_utf8_lossy(&e.name.data).to_string(), e.stat))
+            .collect();
+        for name in ["a", "b"] {
+            let st = byname.get(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(st.size, 2, "{name} size");
+            assert_eq!(st.mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+        }
+        client.clunk(od).await.unwrap();
+        client.free_fid(od);
 
         shutdown.cancel();
     }

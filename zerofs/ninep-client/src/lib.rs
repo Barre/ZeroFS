@@ -47,7 +47,7 @@ const NOTAG: u16 = 0xFFFF;
 pub const NOFID: u32 = 0xFFFF_FFFF;
 
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -176,6 +176,9 @@ pub struct NinePClient {
     /// Negotiated message size (the smaller of what we asked for and what the
     /// server can handle).
     msize: AtomicU32,
+    /// True when the server advertised the `9P2000.L.zerofs` fast-path
+    /// extensions (Twalkgetattr/Treaddirattr). Re-negotiated on reconnect.
+    extensions: AtomicBool,
     /// Monotonic fid allocator, with a free list for reuse.
     fid_ctr: AtomicU32,
     fid_free: Mutex<Vec<u32>>,
@@ -203,7 +206,7 @@ impl NinePClient {
 
     async fn connect(target: Target, requested_msize: u32) -> ClientResult<Arc<Self>> {
         let reconnect_notify = Arc::new(Notify::new());
-        let (conn, msize) =
+        let (conn, msize, extensions) =
             Self::connect_once(&target, requested_msize, Arc::clone(&reconnect_notify)).await?;
 
         let client = Arc::new(Self {
@@ -214,6 +217,7 @@ impl NinePClient {
             live_notify: Notify::new(),
             reconnect_notify,
             msize: AtomicU32::new(msize),
+            extensions: AtomicBool::new(extensions),
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
@@ -228,7 +232,7 @@ impl NinePClient {
         target: &Target,
         requested_msize: u32,
         reconnect_notify: Arc<Notify>,
-    ) -> ClientResult<(Arc<Conn>, u32)> {
+    ) -> ClientResult<(Arc<Conn>, u32, bool)> {
         let (read, write) = dial(target).await?;
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(P9_CHANNEL_SIZE);
         let conn = Arc::new(Conn {
@@ -247,8 +251,8 @@ impl NinePClient {
         );
         spawn_reader(read, Arc::clone(&conn), reconnect_notify);
 
-        let msize = negotiate_on(&conn, requested_msize).await?;
-        Ok((conn, msize))
+        let (msize, extensions) = negotiate_on(&conn, requested_msize).await?;
+        Ok((conn, msize, extensions))
     }
 
     /// The reconnect supervisor: waits for the live connection to die, then
@@ -304,13 +308,14 @@ impl NinePClient {
 
     /// One reconnect attempt: dial, replay state, then swap the connection in.
     async fn reconnect_once(&self) -> ClientResult<()> {
-        let (conn, msize) = Self::connect_once(
+        let (conn, msize, extensions) = Self::connect_once(
             &self.target,
             self.requested_msize,
             Arc::clone(&self.reconnect_notify),
         )
         .await?;
         self.msize.store(msize, Ordering::Relaxed);
+        self.extensions.store(extensions, Ordering::Relaxed);
         self.replay(&conn).await?;
         let old = self.conn.swap(conn);
         old.dead.store(true, Ordering::Release);
@@ -390,6 +395,12 @@ impl NinePClient {
     /// The negotiated message size.
     pub fn msize(&self) -> u32 {
         self.msize.load(Ordering::Relaxed)
+    }
+
+    /// Whether the server negotiated the ZeroFS fast-path extensions
+    /// (`walk_getattr`/`readdirplus`). Re-evaluated on each reconnect.
+    pub fn extensions_enabled(&self) -> bool {
+        self.extensions.load(Ordering::Relaxed)
     }
 
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
@@ -636,6 +647,54 @@ impl NinePClient {
         }
     }
 
+    /// Full walk that also returns the final inode's stat in one round trip
+    /// (the server's Twalkgetattr fast path). Records `newfid` exactly like
+    /// `walk`, so reconnect replay via `Trebind` is unchanged. Only valid when
+    /// the server negotiated extensions ([`Self::extensions_enabled`]).
+    pub async fn walk_getattr(
+        &self,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+    ) -> ClientResult<(Vec<Qid>, Stat)> {
+        let wnames = names
+            .iter()
+            .map(|n| P9String::new(n.to_vec()))
+            .collect::<Vec<_>>();
+        let resp = self
+            .rpc(Message::Twalkgetattr(Twalkgetattr {
+                fid,
+                newfid,
+                nwname: wnames.len() as u16,
+                wnames,
+            }))
+            .await?;
+        match resp {
+            Message::Rwalkgetattr(r) => {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    let n_uname = st.fids.get(&fid).map(FidRecord::n_uname);
+                    let inode_id = if names.is_empty() {
+                        st.fids.get(&fid).map(FidRecord::inode_id)
+                    } else {
+                        r.wqids.last().map(|q| q.path)
+                    };
+                    if let (Some(inode_id), Some(n_uname)) = (inode_id, n_uname) {
+                        st.fids.insert(
+                            newfid,
+                            FidRecord {
+                                kind: FidKind::Inode { inode_id, n_uname },
+                                opened: None,
+                            },
+                        );
+                    }
+                }
+                Ok((r.wqids, r.stat))
+            }
+            _ => Err(ClientError::Unexpected("walk_getattr")),
+        }
+    }
+
     pub async fn clunk(&self, fid: u32) -> ClientResult<()> {
         let resp = self.rpc(Message::Tclunk(Tclunk { fid })).await;
         // The fid is gone regardless of the reply, so stop tracking it.
@@ -790,6 +849,24 @@ impl NinePClient {
         match resp {
             Message::Rreaddir(r) => r.to_entries().map_err(ClientError::Codec),
             _ => Err(ClientError::Unexpected("readdir")),
+        }
+    }
+
+    /// Like [`Self::readdir`] but each entry carries its full stat (the server's
+    /// Treaddirattr fast path). Only valid when the server negotiated extensions
+    /// ([`Self::extensions_enabled`]).
+    pub async fn readdirplus(
+        &self,
+        fid: u32,
+        offset: u64,
+        count: u32,
+    ) -> ClientResult<Vec<DirEntryPlus>> {
+        let resp = self
+            .rpc(Message::Treaddirattr(Treaddirattr { fid, offset, count }))
+            .await?;
+        match resp {
+            Message::Rreaddirattr(r) => r.to_entries().map_err(ClientError::Codec),
+            _ => Err(ClientError::Unexpected("readdirplus")),
         }
     }
 
@@ -1060,13 +1137,15 @@ async fn dial(
 
 /// Run the Tversion handshake on a freshly opened connection, returning the
 /// negotiated msize.
-async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
-    // Tversion must carry NOTAG (0xFFFF) per the spec and v9fs.
+async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, bool)> {
+    // Tversion must carry NOTAG (0xFFFF) per the spec and v9fs. Propose the
+    // ZeroFS extension version; a server that doesn't understand it strips the
+    // suffix and replies plain `9P2000.L`, which disables the fast paths.
     let (otx, orx) = oneshot::channel();
     conn.pending.insert(NOTAG, otx);
     let body = Message::Tversion(Tversion {
         msize: requested,
-        version: P9String::new(VERSION_9P2000L.to_vec()),
+        version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
     });
     let bytes = match P9Message::new(NOTAG, body).to_bytes() {
         Ok(b) => b,
@@ -1084,18 +1163,14 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
     match msg.body {
         Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
         Message::Rversion(rv) => {
-            let ok = rv
-                .version
-                .as_str()
-                .map(|s| s.contains("9P2000.L"))
-                .unwrap_or(false);
-            if !ok {
-                warn!(
-                    "server negotiated unsupported version: {:?}",
-                    rv.version.as_str()
-                );
+            let vstr = rv.version.as_str().unwrap_or("");
+            if !vstr.contains("9P2000.L") {
+                warn!("server negotiated unsupported version: {:?}", vstr);
                 return Err(ClientError::Unexpected("version"));
             }
+            // The server only echoes the `.zerofs` suffix if it supports the
+            // extensions; otherwise it replies plain `9P2000.L`.
+            let extensions = vstr.contains(".zerofs");
             // Take the smaller of the two msizes, and reject a degenerate value:
             // v9fs requires msize >= 4096, below which I/O would degrade to tiny
             // per-message transfers.
@@ -1104,8 +1179,8 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
                 warn!("server negotiated msize {negotiated} below minimum 4096");
                 return Err(ClientError::Unexpected("version"));
             }
-            debug!("9P version negotiated, msize={negotiated}");
-            Ok(negotiated)
+            debug!("9P version negotiated, msize={negotiated}, extensions={extensions}");
+            Ok((negotiated, extensions))
         }
         _ => Err(ClientError::Unexpected("version")),
     }

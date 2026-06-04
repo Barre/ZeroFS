@@ -2,6 +2,10 @@ use crate::deku_bytes::DekuBytes;
 use deku::prelude::*;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
+/// Version string a ZeroFS client proposes to opt into the private fast-path
+/// extensions (Twalkgetattr/Treaddirattr). A stock v9fs client never sends this,
+/// so the server falls back to plain `9P2000.L` for it.
+pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.zerofs";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -472,6 +476,86 @@ pub struct Rrebind {
     pub qid: Qid,
 }
 
+// ZeroFS-private fast-path extensions, negotiated via the "9P2000.L.zerofs"
+// version. Twalkgetattr folds walk+getattr into one round trip; Treaddirattr
+// returns each directory entry together with its full stat (readdirplus).
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Twalkgetattr {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub newfid: u32,
+    #[deku(endian = "little", update = "self.wnames.len()")]
+    pub nwname: u16,
+    #[deku(count = "nwname")]
+    pub wnames: Vec<P9String>,
+}
+
+// Returned only on a full walk; on any miss the server replies Rlerror.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rwalkgetattr {
+    #[deku(endian = "little", update = "self.wqids.len()")]
+    pub nwqid: u16,
+    #[deku(count = "nwqid")]
+    pub wqids: Vec<Qid>,
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Treaddirattr {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub offset: u64,
+    #[deku(endian = "little")]
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct DirEntryPlus {
+    pub qid: Qid,
+    #[deku(endian = "little")]
+    pub offset: u64,
+    pub type_: u8,
+    pub name: P9String,
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rreaddirattr {
+    #[deku(endian = "little", update = "self.data.len()")]
+    pub count: u32,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
+}
+
+impl Rreaddirattr {
+    pub fn from_entries(entries: Vec<DirEntryPlus>) -> Result<Self, DekuError> {
+        use deku::DekuContainerWrite;
+        let mut data = Vec::new();
+        for entry in entries {
+            data.extend_from_slice(&entry.to_bytes()?);
+        }
+        Ok(Rreaddirattr {
+            count: data.len() as u32,
+            data: DekuBytes::from(data),
+        })
+    }
+
+    pub fn to_entries(&self) -> Result<Vec<DirEntryPlus>, DekuError> {
+        use deku::DekuContainerRead;
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < self.data.len() {
+            let remaining = &self.data.0[offset..];
+            let (_, entry) = DirEntryPlus::from_bytes((remaining, 0))?;
+            offset += entry.to_bytes()?.len();
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rwalk {
     #[deku(endian = "little", update = "self.wqids.len()")]
@@ -742,6 +826,14 @@ pub enum Message {
     Trebind(Trebind),
     #[deku(id = "251")]
     Rrebind(Rrebind),
+    #[deku(id = "252")]
+    Twalkgetattr(Twalkgetattr),
+    #[deku(id = "253")]
+    Rwalkgetattr(Rwalkgetattr),
+    #[deku(id = "254")]
+    Treaddirattr(Treaddirattr),
+    #[deku(id = "255")]
+    Rreaddirattr(Rreaddirattr),
 }
 
 // Complete 9P message with header
@@ -822,6 +914,10 @@ impl P9Message {
             Message::Rstatfs(_) => 9,
             Message::Trebind(_) => 250,
             Message::Rrebind(_) => 251,
+            Message::Twalkgetattr(_) => 252,
+            Message::Rwalkgetattr(_) => 253,
+            Message::Treaddirattr(_) => 254,
+            Message::Rreaddirattr(_) => 255,
         };
 
         Self {

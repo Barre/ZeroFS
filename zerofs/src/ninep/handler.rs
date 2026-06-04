@@ -203,6 +203,8 @@ impl NinePHandler {
             Message::Tlock(tl) => self.lock(tl).await,
             Message::Tgetlock(tg) => self.getlock(tg).await,
             Message::Trebind(tr) => self.rebind(tr).await,
+            Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
+            Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             _ => Err(P9Error::NotImplemented),
         };
 
@@ -241,9 +243,19 @@ impl NinePHandler {
         let msize = tv.msize.min(P9_MAX_MSIZE);
         self.session.msize.store(msize, AtomicOrdering::Relaxed);
 
+        // Advertise the ZeroFS fast-path extensions only if the client asked for
+        // them (proposed `9P2000.L.zerofs`). v9fs proposes plain `9P2000.L`, so it
+        // gets the plain reply and the extension handlers stay dormant — the
+        // protocol requires us never to upgrade a version the client didn't offer.
+        let version = if version_str.contains(".zerofs") {
+            VERSION_9P2000L_ZEROFS
+        } else {
+            VERSION_9P2000L
+        };
+
         Ok(Message::Rversion(Rversion {
             msize,
-            version: P9String::new(VERSION_9P2000L.to_vec()),
+            version: P9String::new(version.to_vec()),
         }))
     }
 
@@ -424,6 +436,58 @@ impl NinePHandler {
         }))
     }
 
+    // ZeroFS fast path: a full walk that also returns the final inode's stat, so
+    // the client's lookup costs one round trip instead of walk + getattr. Unlike
+    // Twalk there is no partial result — any miss is a hard error.
+    async fn walk_getattr(&self, tw: Twalkgetattr) -> P9Result<Message> {
+        let src_fid = self.get_fid(tw.fid)?;
+
+        let mut current_path = src_fid.path.clone();
+        let mut current_id = src_fid.inode_id;
+        let mut wqids = Vec::new();
+        let mut last_inode = None;
+
+        for wname in tw.wnames.iter() {
+            let name_bytes = Bytes::copy_from_slice(&wname.data);
+            let child_id = self
+                .filesystem
+                .lookup(&src_fid.creds, current_id, &name_bytes)
+                .await?;
+            let child_inode = self.filesystem.inode_store.get(child_id).await?;
+            current_path.push(name_bytes);
+            wqids.push(inode_to_qid(&child_inode, child_id));
+            current_id = child_id;
+            last_inode = Some(child_inode);
+        }
+
+        if tw.newfid != tw.fid && self.session.fids.contains_key(&tw.newfid) {
+            return Err(P9Error::FidInUse);
+        }
+        self.session.fids.insert(
+            tw.newfid,
+            Fid {
+                path: current_path,
+                inode_id: current_id,
+                qid: wqids.last().cloned().unwrap_or_else(|| src_fid.qid.clone()),
+                opened: false,
+                mode: None,
+                creds: src_fid.creds,
+            },
+        );
+
+        // For a named walk the final inode is already in hand; an empty walk
+        // (clone) returns the source inode's stat.
+        let stat_inode = match last_inode {
+            Some(inode) => inode,
+            None => self.filesystem.inode_store.get(current_id).await?,
+        };
+        Ok(Message::Rwalkgetattr(Rwalkgetattr {
+            nwqid: wqids.len() as u16,
+            wqids,
+            stat: inode_to_stat(&stat_inode, current_id),
+        }))
+    }
+
     async fn lopen(&self, tl: Tlopen) -> P9Result<Message> {
         let fid_entry = self.get_fid(tl.fid)?;
 
@@ -508,6 +572,53 @@ impl NinePHandler {
 
         Ok(Message::Rreaddir(
             Rreaddir::from_entries(dir_entries).unwrap_or(Rreaddir {
+                count: 0,
+                data: DekuBytes::default(),
+            }),
+        ))
+    }
+
+    // ZeroFS fast path (readdirplus): like readdir, but each entry carries its
+    // full stat. The attributes come straight from the readdir result, so there
+    // are no extra fetches; it lets the client populate the kernel's attr cache
+    // and skip a getattr/lookup per entry.
+    async fn readdir_attr(&self, tr: Treaddirattr) -> P9Result<Message> {
+        let fid_entry = self.get_fid(tr.fid)?;
+        if !fid_entry.opened {
+            return Err(P9Error::FidNotOpen);
+        }
+
+        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
+        let max_count = msize.saturating_sub(P9_IOHDRSZ);
+        let count = tr.count.min(max_count);
+
+        let auth = AuthContext::from(&fid_entry.creds);
+        let result = self
+            .filesystem
+            .readdir(&auth, fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
+            .await?;
+
+        let mut entries = Vec::new();
+        let mut total_size = 0usize;
+        for entry in result.entries {
+            let plus = DirEntryPlus {
+                qid: attrs_to_qid(&entry.attr, entry.fileid),
+                offset: entry.cookie,
+                type_: filetype_to_dt(entry.attr.file_type),
+                stat: attrs_to_stat(&entry.attr, entry.fileid),
+                name: P9String::new(entry.name),
+            };
+
+            let entry_size = plus.to_bytes().map(|b| b.len()).unwrap_or(0);
+            if total_size + entry_size > count as usize {
+                break;
+            }
+            total_size += entry_size;
+            entries.push(plus);
+        }
+
+        Ok(Message::Rreaddirattr(
+            Rreaddirattr::from_entries(entries).unwrap_or(Rreaddirattr {
                 count: 0,
                 data: DekuBytes::default(),
             }),
@@ -1039,6 +1150,44 @@ pub fn filetype_to_dt(ft: FileType) -> u8 {
     }
 }
 
+// Build a wire Stat from the readdir-supplied attributes (already fetched, so
+// readdirplus costs no extra round trips). Mirrors `inode_to_stat`.
+pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
+    let type_bits = match attrs.file_type {
+        FileType::Regular => S_IFREG,
+        FileType::Directory => S_IFDIR,
+        FileType::Symlink => S_IFLNK,
+        FileType::CharDevice => S_IFCHR,
+        FileType::BlockDevice => S_IFBLK,
+        FileType::Fifo => S_IFIFO,
+        FileType::Socket => S_IFSOCK,
+    };
+    let rdev = attrs
+        .rdev
+        .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64));
+    Stat {
+        qid: attrs_to_qid(attrs, fileid),
+        mode: (attrs.mode & 0o7777) | type_bits,
+        uid: attrs.uid,
+        gid: attrs.gid,
+        nlink: attrs.nlink as u64,
+        rdev,
+        size: attrs.size,
+        blksize: DEFAULT_BLKSIZE,
+        blocks: attrs.size.div_ceil(BLOCK_SIZE),
+        atime_sec: attrs.atime.seconds,
+        atime_nsec: attrs.atime.nanoseconds as u64,
+        mtime_sec: attrs.mtime.seconds,
+        mtime_nsec: attrs.mtime.nanoseconds as u64,
+        ctime_sec: attrs.ctime.seconds,
+        ctime_nsec: attrs.ctime.nanoseconds as u64,
+        btime_sec: 0,
+        btime_nsec: 0,
+        r#gen: 0,
+        data_version: 0,
+    }
+}
+
 pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
     let (type_bits, size, rdev) = match inode {
         Inode::File(f) => (S_IFREG, f.size, 0),
@@ -1092,6 +1241,43 @@ mod tests {
     use crate::fs::types::SetAttributes;
     use libc::O_RDONLY;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn version_negotiation_gates_zerofs_extensions() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+
+        // A stock v9fs client proposes plain 9P2000.L and must get exactly that
+        // back — the server must never upgrade to a version it wasn't offered.
+        let resp = handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        match resp.body {
+            Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L),
+            other => panic!("expected Rversion, got {other:?}"),
+        }
+
+        // A ZeroFS client opts in via the .zerofs suffix and gets it echoed back.
+        let resp = handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+                }),
+            )
+            .await;
+        match resp.body {
+            Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS),
+            other => panic!("expected Rversion, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_statfs() {
