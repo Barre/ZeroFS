@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
   stress-ng-nfs:
     name: Run stress-ng test on NFS
