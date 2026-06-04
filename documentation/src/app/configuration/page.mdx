@@ -191,7 +191,7 @@ ZeroFS uses an LSM (Log-Structured Merge) tree as its underlying storage engine.
 
 ```toml
 [lsm]
-l0_max_ssts = 16                 # Max SST files in L0 before compaction
+l0_max_ssts = 64                 # Max SST files in L0 before compaction
 max_unflushed_gb = 1.0           # Max unflushed data before forcing flush (in GB)
 max_concurrent_compactions = 8   # Max concurrent compaction operations
 flush_interval_secs = 30         # Interval between periodic flushes (in seconds)
@@ -201,7 +201,7 @@ sync_writes = false              # Make every write durable on return (HA mode)
 
 ### Parameters
 
-- **`l0_max_ssts`** (default: 16, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
+- **`l0_max_ssts`** (default: 64, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
 
 - **`max_unflushed_gb`** (default: 1.0, min: 0.1): Maximum amount of unflushed data (in gigabytes) before forcing a flush to storage. Supports fractional values like `0.5` for 500 MB. Larger values improve write batching but increase memory usage.
 
@@ -346,7 +346,7 @@ max_size_gb = 500.0            # Optional: limit filesystem size
 compression = "zstd-3"         # Optional: "zstd-{1-22}" (default: "zstd-3") or "lz4"
 
 [lsm]
-l0_max_ssts = 16               
+l0_max_ssts = 128              
 max_unflushed_gb = 2.0        
 max_concurrent_compactions = 16  
 flush_interval_secs = 60      
