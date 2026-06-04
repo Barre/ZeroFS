@@ -1990,7 +1990,7 @@ mod client_tests {
             .unwrap();
         assert_eq!(qids.len(), 1);
         assert_eq!(stat.qid.path, qids[0].path);
-        assert_eq!(stat.mode & libc::S_IFMT as u32, libc::S_IFDIR as u32);
+        assert_eq!(stat.mode & libc::S_IFMT, libc::S_IFDIR);
         let gf = client.alloc_fid();
         client
             .walk(ROOT_FID_TEST, gf, &[b"d".as_ref()])
@@ -2020,7 +2020,7 @@ mod client_tests {
         for name in ["a", "b"] {
             let st = byname.get(name).unwrap_or_else(|| panic!("missing {name}"));
             assert_eq!(st.size, 2, "{name} size");
-            assert_eq!(st.mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+            assert_eq!(st.mode & libc::S_IFMT, libc::S_IFREG);
         }
         client.clunk(od).await.unwrap();
         client.free_fid(od);
