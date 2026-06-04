@@ -1506,11 +1506,6 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
 #[cfg(test)]
 mod client_tests {
     //! Integration tests for `ninep-client` against the real ZeroFS 9P server.
-    //!
-    //! These live in the `zerofs` crate (not `ninep-client`) because they exercise
-    //! the client against the actual server + filesystem, which `ninep-client`
-    //! cannot depend on without a dependency cycle.
-
     use crate::fs::ZeroFS;
     use crate::ninep::NinePServer;
     use ninep_client::{ClientError, NOFID, NinePClient};
@@ -1597,7 +1592,7 @@ mod client_tests {
         assert_eq!(qids.len(), 1);
         let st = client.getattr(gfid, GETATTR_ALL).await.unwrap();
         assert_eq!(st.size, 11);
-        assert_eq!(st.mode & libc::S_IFMT as u32, libc::S_IFREG as u32);
+        assert_eq!(st.mode & libc::S_IFMT, libc::S_IFREG);
         client.clunk(gfid).await.unwrap();
         client.free_fid(gfid);
 
