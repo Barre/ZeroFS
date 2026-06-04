@@ -48,7 +48,9 @@ impl InodeStore {
                 FsError::IoError
             })?
             .ok_or_else(|| {
-                tracing::warn!(
+                // A missing inode is a normal ENOENT (a stat or deferred flush
+                // racing a removal), not warning-worthy.
+                tracing::debug!(
                     "InodeStore::get({}): inode key not found in database (key={:?}).",
                     id,
                     key

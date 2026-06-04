@@ -1,0 +1,163 @@
+name: pjdfstest-fuse
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  pjdfstest-fuse:
+    name: Run pjdfstest on zerofs mount (FUSE)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool git perl fuse3
+
+      - name: Clone pjdfstest_nfs
+        run: |
+          git clone https://github.com/Barre/pjdfstest_nfs.git /tmp/pjdfstest_nfs
+
+      - name: Build pjdfstest
+        working-directory: /tmp/pjdfstest_nfs
+        run: |
+          autoreconf -fvi
+          ./configure
+          make
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS with 9P support
+        working-directory: zerofs
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 1.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          # Start ZeroFS in the background with 9P enabled
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Wait for ZeroFS to start (9P runs on port 5564)
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 5564 2>/dev/null; then
+            echo "ZeroFS 9P server failed to start"
+            exit 1
+          fi
+
+      - name: Mount with zerofs mount (FUSE)
+        working-directory: zerofs
+        run: |
+          sudo mkdir -p /mnt/zerofs-fuse
+
+          # Mount as root with --access all so the root-run test suite can use the
+          # mount. Write-through (no writeback cache) keeps metadata immediately
+          # consistent for the conformance checks.
+          sudo ./target/ci/zerofs mount --access all --writeback false 127.0.0.1:5564 /mnt/zerofs-fuse &
+
+          echo "Waiting for the FUSE mount..."
+          for i in {1..60}; do
+            mountpoint -q /mnt/zerofs-fuse && break
+            sleep 0.5
+          done
+          mountpoint -q /mnt/zerofs-fuse || { echo "FUSE mount failed"; exit 1; }
+          mount | grep zerofs-fuse
+
+      - name: Run pjdfstest
+        working-directory: /mnt/zerofs-fuse
+        run: |
+          # Create test directory
+          mkdir -p pjdfstest_test
+          cd pjdfstest_test
+
+          # Get list of all test files
+          find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
+
+          # Filter out excluded tests
+          grep -v -f ${{ github.workspace }}/.github/.pjdfstest-fuse-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
+
+          # Run the filtered test suite
+          sudo prove -rv $(cat /tmp/tests_to_run.txt)
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "pjdfstest suite completed for the FUSE client"
+          echo "Excluded tests listed in .pjdfstest-fuse-exclude"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount the FUSE client and stop its process
+          sudo fusermount3 -u /mnt/zerofs-fuse || sudo umount /mnt/zerofs-fuse || true
+          sudo pkill -f "zerofs mount" || true
+
+          # Kill ZeroFS
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

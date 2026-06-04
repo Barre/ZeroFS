@@ -1,0 +1,259 @@
+name: xfstests-fuse
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  xfstests-fuse:
+    name: Run xfstests on zerofs mount (FUSE)
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: df -h
+      - name: "Disk space cleanup"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker builder prune -a
+
+      - run: df -h
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk \
+            gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
+            libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
+            uuid-dev uuid-runtime xfsprogs linux-headers-$(uname -r) sqlite3 \
+            libgdbm-compat-dev fuse3
+          sudo apt-get install -y exfatprogs f2fs-tools ocfs2-tools udftools xfsdump \
+            xfslibs-dev || true
+          sudo apt-get install -y systemd-coredump systemd jq pkg-config
+
+      - name: Clone xfstests
+        run: |
+          git clone https://github.com/Barre/xfstests.git /tmp/xfstests
+
+      - name: Build xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          make
+          sudo make install
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Install the FUSE mount helper
+        run: |
+          # Put the binary on a stable path the helper can find.
+          sudo cp zerofs/target/ci/zerofs /usr/local/bin/zerofs
+
+          # mount(8) invokes this as: mount.fuse.zerofs <target> <mountpoint> [-o ..].
+          # The FUSE client is long-lived, so detach it (setsid) and return once
+          # the mount is live so xfstests' mount/umount cycle works.
+          sudo tee /sbin/mount.fuse.zerofs > /dev/null << 'HELPER'
+          #!/bin/bash
+          DEV="$1"
+          MNT="$2"
+          ZEROFS_BIN="${ZEROFS_BIN:-/usr/local/bin/zerofs}"
+          setsid "$ZEROFS_BIN" mount --access all --writeback false "$DEV" "$MNT" \
+            </dev/null >>/tmp/zerofs-mount.log 2>&1 &
+          for i in $(seq 1 100); do
+            mountpoint -q "$MNT" && exit 0
+            sleep 0.1
+          done
+          echo "mount.fuse.zerofs: $MNT did not become a mountpoint" >&2
+          exit 1
+          HELPER
+          sudo chmod +x /sbin/mount.fuse.zerofs
+
+      - name: Create ZeroFS data directories
+        run: |
+          mkdir -p ${{ github.workspace }}/zerofs-test-data
+          mkdir -p ${{ github.workspace }}/zerofs-scratch-data
+          mkdir -p /tmp/zerofs-cache-test
+          mkdir -p /tmp/zerofs-cache-scratch
+
+      - name: Start ZeroFS (TEST instance)
+        working-directory: zerofs
+        run: |
+          cat > zerofs-test.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache-test"
+          disk_size_gb = 1.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "file://${{ github.workspace }}/zerofs-test-data"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          unix_socket = "/tmp/zerofs-test.9p.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          ./target/ci/zerofs run -c zerofs-test.toml &
+          echo $! > /tmp/zerofs-test.pid
+
+          echo "Waiting for ZeroFS TEST instance to start..."
+          for i in {1..30}; do
+            if [ -S /tmp/zerofs-test.9p.sock ]; then
+              echo "ZeroFS TEST instance is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ ! -S /tmp/zerofs-test.9p.sock ]; then
+            echo "ZeroFS TEST instance failed to start"
+            exit 1
+          fi
+
+      - name: Start ZeroFS (SCRATCH instance)
+        working-directory: zerofs
+        run: |
+          cat > zerofs-scratch.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache-scratch"
+          disk_size_gb = 1.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "file://${{ github.workspace }}/zerofs-scratch-data"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          unix_socket = "/tmp/zerofs-scratch.9p.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          ./target/ci/zerofs run -c zerofs-scratch.toml &
+          echo $! > /tmp/zerofs-scratch.pid
+
+          echo "Waiting for ZeroFS SCRATCH instance to start..."
+          for i in {1..30}; do
+            if [ -S /tmp/zerofs-scratch.9p.sock ]; then
+              echo "ZeroFS SCRATCH instance is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ ! -S /tmp/zerofs-scratch.9p.sock ]; then
+            echo "ZeroFS SCRATCH instance failed to start"
+            exit 1
+          fi
+
+      - name: Create mount points
+        run: |
+          sudo mkdir -p /mnt/test
+          sudo mkdir -p /mnt/scratch
+
+      - name: Mount FUSE filesystems
+        run: |
+          # Mount via the helper so the TEST/SCRATCH mounts use the same path
+          # xfstests will use when it remounts the scratch fs.
+          sudo mount -t fuse.zerofs /tmp/zerofs-test.9p.sock /mnt/test
+          sudo mount -t fuse.zerofs /tmp/zerofs-scratch.9p.sock /mnt/scratch
+
+          mount | grep zerofs
+
+      - name: Configure xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          # FSTYP=fuse is whitelisted in common/config (the device is treated as a
+          # plain string, not a block device); FUSE_SUBTYP makes xfstests mount with
+          # `mount -t fuse.zerofs`, which dispatches to /sbin/mount.fuse.zerofs.
+          cat > local.config << 'EOF'
+          export FSTYP=fuse
+          export FUSE_SUBTYP=.zerofs
+
+          export TEST_DIR=/mnt/test
+          export SCRATCH_MNT=/mnt/scratch
+
+          export TEST_DEV=/tmp/zerofs-test.9p.sock
+          export SCRATCH_DEV=/tmp/zerofs-scratch.9p.sock
+          EOF
+
+          # The -E file is read through `sed s/#.*$//`, so # comments are fine.
+          cat > excludes << 'EOF'
+          # Inherited from the 9P suite (Plan9/protocol quirks).
+          generic/035
+          generic/126
+          generic/394
+          generic/467
+          generic/263
+          generic/736
+          generic/759
+          generic/760
+          generic/477
+          generic/564
+          generic/633
+          generic/696
+          generic/591
+          generic/615
+          generic/525
+          generic/003
+          generic/087
+          generic/258
+          generic/637
+          generic/676
+          # FUSE filesystem limitations (cberner/fuser excludes these too):
+          #  - device nodes don't work on a nodev FUSE mount (184, 434, part of 306)
+          #  - live remount,ro is not enforced (294, 306)
+          #  - open_by_handle_at has no FUSE export support, returns ESTALE
+          #    (426, 756, 777)
+          generic/184
+          generic/294
+          generic/306
+          generic/426
+          generic/434
+          generic/756
+          generic/777
+          # Too slow over FUSE for CI: 068 (freeze + concurrent fsstress) and 069
+          # (~16min observed); the rest run 10min-to-hours on FUSE per fuser.
+          generic/068
+          generic/069
+          generic/074
+          generic/117
+          generic/127
+          generic/339
+          generic/438
+          generic/471
+          # Lock tests unsupported by FUSE (cberner/fuser excludes these):
+          #  - 478: OFD locks; the blocking-lock poll loop spins forever on the
+          #    OFD self-conflict instead of failing cleanly -> hang
+          #  - 504: BSD/flock locks don't appear in /proc/locks on FUSE
+          generic/478
+          generic/504
+          EOF
+
+      - name: Run xfstests
+        working-directory: /tmp/xfstests
+        run: |
+          sudo ./check -g quick -E excludes
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo umount /mnt/test || true
+          sudo umount /mnt/scratch || true
+          sudo pkill -f "zerofs mount" || true
+
+          if [ -f /tmp/zerofs-test.pid ]; then
+            kill $(cat /tmp/zerofs-test.pid) || true
+          fi
+          if [ -f /tmp/zerofs-scratch.pid ]; then
+            kill $(cat /tmp/zerofs-scratch.pid) || true
+          fi
+          pkill -f "zerofs-test.toml" || true
+          pkill -f "zerofs-scratch.toml" || true

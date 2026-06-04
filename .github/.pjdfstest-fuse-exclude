@@ -1,0 +1,8 @@
+# Tests excluded for the FUSE client (zerofs mount).
+# Starts from the 9P exclusions since the client uses the same access=user model;
+# tune as CI surfaces FUSE-specific differences.
+tests/chmod/12.t
+tests/chown/00.t
+tests/chown/05.t
+tests/utimensat/08.t
+tests/ftruncate/00.t

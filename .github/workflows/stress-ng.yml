@@ -262,3 +262,133 @@ jobs:
 
           # Kill ZeroFS
           pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+  stress-ng-fuse:
+    name: Run stress-ng test on zerofs mount (FUSE)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y stress-ng fuse3
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-stress-test || true
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS with 9P support
+        working-directory: zerofs
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 1.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-stress-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          # Start ZeroFS in the background with 9P enabled
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Wait for ZeroFS to start (9P runs on port 5564)
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 5564 2>/dev/null; then
+            echo "ZeroFS 9P server failed to start"
+            exit 1
+          fi
+
+      - name: Mount with zerofs mount (FUSE)
+        working-directory: zerofs
+        run: |
+          sudo mkdir -p /mnt/zerofs-fuse
+
+          # Mount as root with --access all so the root-run stress test can use it.
+          sudo ./target/ci/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs-fuse &
+
+          echo "Waiting for the FUSE mount..."
+          for i in {1..60}; do
+            mountpoint -q /mnt/zerofs-fuse && break
+            sleep 0.5
+          done
+          mountpoint -q /mnt/zerofs-fuse || { echo "FUSE mount failed"; exit 1; }
+          mount | grep zerofs-fuse
+
+      - name: Run stress-ng fstat test
+        run: |
+          cd /mnt/zerofs-fuse
+          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
+            --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
+            --fd-fork 1 --filename 1 --fstat 1 \
+            --getdent 1 --link 1  \
+            --metamix 1 --open 1 --rename 1 --symlink 1  \
+            --touch 1 --utime 1 --timeout 60s
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount the FUSE client and stop its process
+          sudo fusermount3 -u /mnt/zerofs-fuse || sudo umount /mnt/zerofs-fuse || true
+          sudo pkill -f "zerofs mount" || true
+
+          # Kill ZeroFS
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

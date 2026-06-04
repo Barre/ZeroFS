@@ -65,6 +65,30 @@ sudo mount -t 9p -o trans=unix,version=9p2000.L /tmp/zerofs.sock /mnt/zerofs-9p
 sudo umount /mnt/zerofs-9p
 ```
 
+## Mounting with `zerofs mount`
+
+The commands above use the kernel's 9P client. ZeroFS also ships its own client, run as `zerofs mount`, which connects to the same 9P server but runs in userspace over FUSE.
+
+```bash
+# TCP
+zerofs mount 127.0.0.1:5564 /mnt/zerofs-9p
+
+# Unix socket
+zerofs mount /tmp/zerofs.sock /mnt/zerofs-9p
+```
+
+The main difference is what happens when the connection drops. The kernel client leaves the mount wedged after a server restart or a network interruption — it returns errors until you unmount and remount. `zerofs mount` reconnects by itself: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers on its own. A few other practical differences:
+
+- It mounts as a regular user through `fusermount3`, so no `sudo` and no kernel module.
+- It negotiates a larger message size than the kernel client's cap, which helps large reads and writes.
+- Writeback caching is on by default, so writes are buffered and flushed asynchronously (similar to the kernel client's `cache=mmap`); pass `--writeback false` to write through synchronously.
+
+Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions, with no uid to configure. (As with `access=user` over an unauthenticated transport, this trusts the client-supplied uid and assumes a shared uid namespace.) The `--access owner|root|all` option controls who may reach the mount; `root` and `all` require `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
+
+<Note>
+Unmount it like any FUSE mount with `fusermount3 -u /mnt/zerofs-9p`, or stop the `zerofs mount` process. Run `zerofs mount --help` for the full set of options.
+</Note>
+
 ## Mount Options
 
 ### Required Options

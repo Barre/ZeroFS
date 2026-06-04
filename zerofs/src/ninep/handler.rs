@@ -1,8 +1,5 @@
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager};
-use super::protocol::*;
-use super::protocol::{P9_MAX_GROUPS, P9_MAX_NAME_LEN, P9_NOBODY_UID, P9_READDIR_BATCH_SIZE};
-use crate::deku_bytes::DekuBytes;
 use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::Credentials;
@@ -14,6 +11,7 @@ use crate::fs::types::{
 use bytes::Bytes;
 use dashmap::DashMap;
 use deku::DekuContainerWrite;
+use ninep_proto::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use tracing::debug;
@@ -204,6 +202,7 @@ impl NinePHandler {
             Message::Tstatfs(ts) => self.statfs(ts).await,
             Message::Tlock(tl) => self.lock(tl).await,
             Message::Tgetlock(tg) => self.getlock(tg).await,
+            Message::Trebind(tr) => self.rebind(tr).await,
             _ => Err(P9Error::NotImplemented),
         };
 
@@ -248,6 +247,35 @@ impl NinePHandler {
         }))
     }
 
+    /// Build per-fid credentials from a client-supplied `n_uname` (the 9P2000.L
+    /// numeric uid), honoring any credential override. `username` is only
+    /// consulted for the `n_uname == -1` ("unspecified") fallback.
+    fn creds_for(&self, n_uname: u32, username: &str) -> Credentials {
+        let (uid, gid) = if let Some((override_uid, override_gid)) = self.credential_override {
+            (override_uid, override_gid)
+        } else {
+            // In 9P2000.L we trust the client and use UID as GID as a reasonable
+            // default. n_uname = -1 (0xFFFFFFFF) means "unspecified": map by name.
+            let uid = if n_uname == 0xFFFFFFFF {
+                match username {
+                    "root" => 0,
+                    _ => P9_NOBODY_UID,
+                }
+            } else {
+                n_uname
+            };
+            (uid, uid)
+        };
+        let mut groups = [0u32; P9_MAX_GROUPS];
+        groups[0] = gid; // User is always a member of their primary group.
+        Credentials {
+            uid,
+            gid,
+            groups,
+            groups_count: 1,
+        }
+    }
+
     async fn attach(&self, ta: Tattach) -> P9Result<Message> {
         let username = ta.uname.as_str().map_err(|e| {
             debug!("Invalid username encoding: {:?}", e);
@@ -263,43 +291,7 @@ impl NinePHandler {
             ta.n_uname
         );
 
-        let (uid, gid) = if let Some((override_uid, override_gid)) = self.credential_override {
-            debug!(
-                "Using credential override: uid={}, gid={} (client requested uname={}, n_uname={})",
-                override_uid, override_gid, username, ta.n_uname
-            );
-            (override_uid, override_gid)
-        } else {
-            // In 9P2000.L, we trust the client and use UID as GID as a reasonable default
-            // Operations that support it can override the GID
-            // Special case: n_uname=-1 (0xFFFFFFFF) means "unspecified", use mapping based on uname
-            let uid = if ta.n_uname == 0xFFFFFFFF {
-                // When n_uname is -1, map based on the string username
-                match username {
-                    "root" => 0,
-                    _ => {
-                        // For other users, we could look them up, but for now just use nobody
-                        debug!(
-                            "Unknown user '{}' with n_uname=-1, using nobody ({})",
-                            username, P9_NOBODY_UID
-                        );
-                        P9_NOBODY_UID
-                    }
-                }
-            } else {
-                ta.n_uname
-            };
-            (uid, uid)
-        };
-
-        let mut groups = [0u32; P9_MAX_GROUPS];
-        groups[0] = gid; // User is always member of their primary group
-        let creds = Credentials {
-            uid,
-            gid,
-            groups,
-            groups_count: 1,
-        };
+        let creds = self.creds_for(ta.n_uname, username);
 
         let root_inode = self.filesystem.inode_store.get(0).await?;
 
@@ -322,6 +314,41 @@ impl NinePHandler {
         );
 
         Ok(Message::Rattach(Rattach { qid }))
+    }
+
+    /// Bind a fresh fid to an existing inode by id, for a client recovering its
+    /// session after a reconnect. `ENOENT` if the inode is gone (deleted during
+    /// the outage), which the client takes as "this fid is gone".
+    async fn rebind(&self, tr: Trebind) -> P9Result<Message> {
+        // Like attach/walk, refuse to clobber a fid that's already in use.
+        if self.session.fids.contains_key(&tr.fid) {
+            return Err(P9Error::FidInUse);
+        }
+        let inode = self.filesystem.inode_store.get(tr.inode_id).await?;
+        let creds = self.creds_for(tr.n_uname, "");
+        let path = self
+            .filesystem
+            .inode_store
+            .resolve_path_components(tr.inode_id)
+            .await
+            .into_iter()
+            .map(Bytes::from)
+            .collect();
+        let qid = inode_to_qid(&inode, tr.inode_id);
+
+        self.session.fids.insert(
+            tr.fid,
+            Fid {
+                path,
+                inode_id: tr.inode_id,
+                qid: qid.clone(),
+                opened: false,
+                mode: None,
+                creds,
+            },
+        );
+
+        Ok(Message::Rrebind(Rrebind { qid }))
     }
 
     async fn walk(&self, tw: Twalk) -> P9Result<Message> {

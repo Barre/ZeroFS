@@ -90,6 +90,37 @@ pub enum Commands {
         #[arg(long, default_value = "250")]
         interval: u32,
     },
+    /// Mount a ZeroFS 9P export as a local filesystem (FUSE client)
+    ///
+    /// Connects to a running ZeroFS 9P server and exposes it at a local mount
+    /// point. The server may be local or remote. Examples:
+    ///
+    /// zerofs mount 127.0.0.1:5564 /mnt/zerofs
+    ///
+    /// zerofs mount unix:/tmp/zerofs.9p.sock /mnt/zerofs
+    #[cfg(target_os = "linux")]
+    Mount {
+        /// 9P server address: host[:port], tcp://host:port, or unix:/path/to.sock
+        target: String,
+        /// Local directory to mount at
+        mountpoint: PathBuf,
+        /// Mount read-only
+        #[arg(long)]
+        read_only: bool,
+        /// Who may access the mount: `owner` (only the mounting user), `root`
+        /// (owner + root), or `all` (any user). `root`/`all` need
+        /// `user_allow_other` in /etc/fuse.conf unless mounting as root.
+        #[arg(long, value_enum, default_value_t = crate::mount::MountAccess::Owner)]
+        access: crate::mount::MountAccess,
+        /// Maximum 9P message size in bytes
+        #[arg(long, default_value_t = 10 * 1024 * 1024)]
+        msize: u32,
+        /// Use a writeback page cache: writes are buffered and flushed
+        /// asynchronously (higher throughput, looser cross-client coherence).
+        /// Pass `--writeback false` to write through synchronously instead.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        writeback: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -1,16 +1,16 @@
 use super::errors::P9Error;
 pub(crate) use super::handler::NinePHandler;
 pub(crate) use super::lock_manager::FileLockManager;
-use super::protocol::{
-    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
-    P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
-};
 use crate::fs::ZeroFS;
 use crate::task::spawn_named;
 use bytes::Bytes;
 use dashmap::DashMap;
 use deku::prelude::*;
 use futures::StreamExt;
+use ninep_proto::{
+    Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
+    P9_MIN_MESSAGE_SIZE, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;

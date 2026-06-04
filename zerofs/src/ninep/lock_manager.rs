@@ -1,6 +1,6 @@
-use super::protocol::LockType;
 use crate::fs::inode::InodeId;
 use dashmap::DashMap;
+use ninep_proto::LockType;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -90,8 +90,17 @@ impl FileLockManager {
     pub async fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Option<LockId> {
         let _guard = self.lock_mutex.lock().await;
 
-        // First, remove any existing locks from this session that overlap
-        // This implements POSIX lock replacement behavior
+        // Check for conflicts *before* mutating any state. POSIX requires that a
+        // failed lock request leave the caller's existing locks untouched (e.g. a
+        // read->write upgrade that conflicts must not drop the held read lock).
+        // `check_lock_conflict` already skips same-session locks, so checking
+        // first yields the same verdict as checking after replacement would.
+        if self.check_lock_conflict(lock.inode_id, &lock, session_id) {
+            return None;
+        }
+
+        // No conflict: replace any overlapping locks from this session (POSIX
+        // lock replacement) and then insert the new lock.
         let mut to_remove = Vec::new();
         if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
             for lock_id in lock_ids.iter() {
@@ -109,10 +118,6 @@ impl FileLockManager {
 
         for lock_id in to_remove {
             self.remove_lock(session_id, lock_id);
-        }
-
-        if self.check_lock_conflict(lock.inode_id, &lock, session_id) {
-            return None;
         }
 
         Some(self.insert_lock(session_id, lock))
@@ -313,5 +318,67 @@ impl FileLockManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INODE: InodeId = 1;
+
+    fn lock(lock_type: LockType, start: u64, length: u64) -> FileLock {
+        FileLock {
+            lock_type,
+            start,
+            length,
+            proc_id: 0,
+            client_id: Vec::new(),
+            fid: 0,
+            inode_id: INODE,
+        }
+    }
+
+    /// POSIX requires that a lock request which fails leaves the caller's
+    /// existing locks intact. A read->write upgrade that conflicts with another
+    /// owner's read lock must be rejected *without* dropping the caller's own
+    /// read lock.
+    #[tokio::test]
+    async fn failed_upgrade_preserves_existing_lock() {
+        let m = FileLockManager::new();
+
+        // Owners 1 and 2 both hold a read lock over [0, 10) — compatible.
+        assert!(
+            m.try_add_lock(1, lock(LockType::ReadLock, 0, 10))
+                .await
+                .is_some()
+        );
+        assert!(
+            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10))
+                .await
+                .is_some()
+        );
+
+        // Owner 1 tries to upgrade to a write lock; owner 2's read lock conflicts.
+        assert!(
+            m.try_add_lock(1, lock(LockType::WriteLock, 0, 10))
+                .await
+                .is_none(),
+            "conflicting upgrade must be refused"
+        );
+
+        // Drop owner 2's lock so only owner 1's (read) lock could remain.
+        m.unlock_range(INODE, 0, 0, 10, 2).await;
+
+        // A third owner testing a write lock must still see owner 1's surviving
+        // read lock. With the pre-fix behaviour, owner 1's read lock would have
+        // been destroyed by the failed upgrade and this would find no conflict.
+        let conflict = m
+            .check_would_block(INODE, &lock(LockType::WriteLock, 0, 10), 3)
+            .await;
+        assert!(
+            conflict.is_some(),
+            "owner 1's read lock must survive the failed upgrade"
+        );
     }
 }

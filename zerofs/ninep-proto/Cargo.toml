@@ -1,0 +1,11 @@
+[package]
+name = "ninep-proto"
+version = "0.1.0"
+edition = "2024"
+description = "9P2000.L wire protocol types (shared by the ZeroFS 9P server and client)"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+
+[dependencies]
+deku = "0.20"
+bytes = "1.10"

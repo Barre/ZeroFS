@@ -1,0 +1,169 @@
+name: kernel-compile-fuse
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  kernel-compile-fuse:
+    name: Compile Linux Kernel on zerofs mount (FUSE)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc fuse3
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS with 9P support
+        working-directory: zerofs
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+
+          # Start ZeroFS in the background with 9P enabled
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Save PID for stats collection
+          echo $! > /tmp/zerofs.pid
+
+          # Wait for ZeroFS 9P server to start
+          echo "Waiting for ZeroFS 9P server to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 5564 2>/dev/null; then
+            echo "ZeroFS 9P server failed to start"
+            exit 1
+          fi
+
+      - name: Mount with zerofs mount (FUSE)
+        working-directory: zerofs
+        run: |
+          sudo mkdir -p /mnt/zerofs
+
+          # The FUSE client is a long-lived userspace process; mount as root with
+          # --access all so any uid (the non-root runner here) can use the mount,
+          # then leave it running in the background.
+          sudo ./target/ci/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs &
+
+          echo "Waiting for the FUSE mount..."
+          for i in {1..60}; do
+            mountpoint -q /mnt/zerofs && break
+            sleep 0.5
+          done
+          mountpoint -q /mnt/zerofs || { echo "FUSE mount failed"; exit 1; }
+          mount | grep zerofs
+
+          # Test write access
+          touch /mnt/zerofs/test_file && rm /mnt/zerofs/test_file
+
+      - name: Check disk space
+        run: df -h
+
+      - name: Download Linux kernel
+        run: |
+          cd /mnt/zerofs
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+          tar -xf linux-6.11.tar.xz
+          rm linux-6.11.tar.xz
+
+      - name: Compile kernel
+        run: |
+          cd /mnt/zerofs/linux-6.11
+
+          # Configure with tinyconfig for minimal build
+          make tinyconfig
+
+          # Show config size
+          echo "Config size: $(wc -l < .config) lines"
+
+          # Time the compilation
+          echo "Starting kernel compilation with $(nproc) cores..."
+          time make -j$(nproc) 2>&1 | tee /tmp/kernel-build.log
+
+          # Check if vmlinux was created
+          if [ -f vmlinux ]; then
+            echo "Kernel compilation successful!"
+            ls -lh vmlinux
+          else
+            echo "Kernel compilation failed!"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount the FUSE client and stop its process
+          sudo fusermount3 -u /mnt/zerofs || sudo umount /mnt/zerofs || true
+          sudo pkill -f "zerofs mount" || true
+
+          # Kill ZeroFS
+          if [ -f /tmp/zerofs.pid ]; then
+            kill $(cat /tmp/zerofs.pid) || true
+          fi
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

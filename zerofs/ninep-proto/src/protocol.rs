@@ -33,8 +33,11 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-/// Maximum message size we accept. Used for codec frame limit.
-pub const P9_MAX_MSIZE: u32 = 1024 * 1024;
+/// Maximum 9P message size. This bounds the negotiated msize: the server clamps
+/// every client's requested msize to this value, and both the server and client
+/// reader codecs reject frames larger than it. Shared by the 9P server and the
+/// `zerofs mount` client.
+pub const P9_MAX_MSIZE: u32 = 10 * 1024 * 1024;
 
 pub const P9_CHANNEL_SIZE: usize = 1000;
 pub const P9_SIZE_FIELD_LEN: usize = std::mem::size_of::<u32>();
@@ -46,6 +49,10 @@ pub const P9_HEADER_SIZE: usize = P9_SIZE_FIELD_LEN + P9_TYPE_FIELD_LEN + P9_TAG
 pub const P9_MIN_MESSAGE_SIZE: u32 = P9_HEADER_SIZE as u32;
 /// IO header overhead for Rread/Rreaddir: header + count[4]
 pub const P9_IOHDRSZ: u32 = (P9_HEADER_SIZE + P9_COUNT_FIELD_LEN) as u32;
+/// Wire overhead of a Twrite request preceding its data payload:
+/// header + fid[4] + offset[8] + count[4]. A Twrite carrying `count` bytes is
+/// `P9_TWRITE_HDR + count` bytes on the wire and must not exceed the msize.
+pub const P9_TWRITE_HDR: u32 = (P9_HEADER_SIZE + 4 + 8 + P9_COUNT_FIELD_LEN) as u32;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
 pub const P9_MAX_GROUPS: usize = 16;
@@ -447,6 +454,24 @@ pub struct Rattach {
     pub qid: Qid,
 }
 
+// ZeroFS-private reconnect extension: binds a fresh fid to an existing inode by
+// id (not by re-walking a path), so reconnection survives renames/hardlinks.
+// Only our own client sends it.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Trebind {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub inode_id: u64,
+    #[deku(endian = "little")]
+    pub n_uname: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rrebind {
+    pub qid: Qid,
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rwalk {
     #[deku(endian = "little", update = "self.wqids.len()")]
@@ -712,6 +737,11 @@ pub enum Message {
     Tstatfs(Tstatfs),
     #[deku(id = "9")]
     Rstatfs(Rstatfs),
+    // ZeroFS-private reconnect extension (ids outside the standard 9P range).
+    #[deku(id = "250")]
+    Trebind(Trebind),
+    #[deku(id = "251")]
+    Rrebind(Rrebind),
 }
 
 // Complete 9P message with header
@@ -790,6 +820,8 @@ impl P9Message {
             Message::Rxattrwalk(_) => 31,
             Message::Tstatfs(_) => 8,
             Message::Rstatfs(_) => 9,
+            Message::Trebind(_) => 250,
+            Message::Rrebind(_) => 251,
         };
 
         Self {
