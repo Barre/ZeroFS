@@ -216,8 +216,8 @@ pub struct LsmConfig {
 }
 
 impl LsmConfig {
-    /// Default l0_max_ssts: 32.
-    pub const DEFAULT_L0_MAX_SSTS: usize = 32;
+    /// Default l0_max_ssts: 64.
+    pub const DEFAULT_L0_MAX_SSTS: usize = 64;
     /// Default max_unflushed_gb: 1.0 GiB
     pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;
     /// Default max_concurrent_compactions: 8
@@ -651,7 +651,7 @@ impl Settings {
             .push_str("# Advanced performance tuning for the underlying LSM tree storage engine\n");
         toml_string.push_str("# Only modify these if you understand LSM tree behavior\n");
         toml_string.push_str("\n# [lsm]\n");
-        toml_string.push_str("# l0_max_ssts = 32                 # Max SST files in L0 before compaction (default: 32, min: 4)\n");
+        toml_string.push_str("# l0_max_ssts = 64                 # Max SST files in L0 before compaction (default: 64, min: 4)\n");
         toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
