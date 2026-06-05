@@ -8,13 +8,13 @@ repository = "https://github.com/Barre/ZeroFS"
 
 [dependencies]
 ninep-proto = { path = "../ninep-proto" }
-tokio = { version = "1.49", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1.52", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
-dashmap = "6.1"
-arc-swap = "1.7"
+dashmap = "6.2"
+arc-swap = "1.9"
 socket2 = { version = "0.6", features = ["all"] }
 deku = "0.20"
-bytes = "1.10"
+bytes = "1.11"
 libc = "0.2"
 tracing = "0.1"
