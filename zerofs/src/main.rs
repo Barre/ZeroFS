@@ -7,10 +7,11 @@ mod checkpoint_manager;
 mod cli;
 mod config;
 mod db;
-mod deku_bytes;
 mod fs;
 mod key_management;
 mod length_checked_object_store;
+#[cfg(target_os = "linux")]
+mod mount;
 mod nbd;
 mod nfs;
 mod ninep;
@@ -99,7 +100,7 @@ async fn main() -> Result<()> {
             if let Err(e) =
                 cli::server::run_server(config, read_only, checkpoint, no_compactor).await
             {
-                eprintln!("✗ {:#}", e);
+                eprintln!("✗ Error: {:#}", e);
                 std::process::exit(1);
             }
         }
@@ -133,6 +134,26 @@ async fn main() -> Result<()> {
         }
         cli::Commands::Monitor { config, interval } => {
             cli::monitor::run_monitor(config, interval).await?;
+        }
+        #[cfg(target_os = "linux")]
+        cli::Commands::Mount {
+            target,
+            mountpoint,
+            read_only,
+            access,
+            msize,
+            writeback,
+        } => {
+            let opts = mount::MountOptions {
+                msize,
+                read_only,
+                access,
+                writeback,
+            };
+            if let Err(e) = mount::run(target, mountpoint, opts).await {
+                eprintln!("✗ Error: {:#}", e);
+                std::process::exit(1);
+            }
         }
     }
 

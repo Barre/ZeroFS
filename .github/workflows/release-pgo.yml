@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        test: [9p, zfs-on-zerofs, nfs-kernel-compile]
+        test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
 
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +34,8 @@ jobs:
             sudo modprobe 9p
             sudo modprobe 9pnet
             sudo modprobe 9pnet_virtio
+          elif [ "${{ matrix.test }}" = "fuse" ]; then
+            sudo apt-get install -y fuse3
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
             sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
@@ -65,6 +67,8 @@ jobs:
 
           if [ "${{ matrix.test }}" = "9p" ]; then
             ./mc mb myminio/pgo-profile || true
+          elif [ "${{ matrix.test }}" = "fuse" ]; then
+            ./mc mb myminio/pgo-fuse-test || true
           elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
             ./mc mb myminio/pgo-zfs-test || true
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
@@ -131,6 +135,63 @@ jobs:
             dd if=500mb.bin of=/dev/null bs=1M
             cd /
             sudo umount /mnt/zerofs || true
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
+
+          elif [ "${{ matrix.test }}" = "fuse" ]; then
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 0.5
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://pgo-fuse-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+
+          [telemetry]
+          enabled = false
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS 9P server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 5564 2>/dev/null; then
+                echo "ZeroFS 9P server is ready"
+                break
+              fi
+              sleep 1
+            done
+
+            sudo mkdir -p /mnt/zerofs
+            # Drive the workload through the FUSE client. It's the same instrumented
+            # binary, so this profiles both the server and the zerofs mount path.
+            sudo ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs &
+            for i in {1..60}; do
+              mountpoint -q /mnt/zerofs && break
+              sleep 0.5
+            done
+            cd /mnt/zerofs
+            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            tar -xf linux-6.11.tar.xz
+            cd linux-6.11
+            make tinyconfig
+            make -j$(nproc)
+            cd /mnt/zerofs
+            dd if=/dev/urandom of=500mb.bin bs=1M count=500
+            dd if=500mb.bin of=/dev/null bs=1M
+            cd /
+            sudo fusermount3 -u /mnt/zerofs || sudo umount /mnt/zerofs || true
+            sudo pkill -TERM -f "zerofs mount" || true
             kill -TERM $ZEROFS_PID || true
             wait $ZEROFS_PID || true
 

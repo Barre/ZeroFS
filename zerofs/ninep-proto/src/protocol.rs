@@ -2,6 +2,10 @@ use crate::deku_bytes::DekuBytes;
 use deku::prelude::*;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
+/// Version string a ZeroFS client proposes to opt into the private fast-path
+/// extensions (Twalkgetattr/Treaddirattr). A stock v9fs client never sends this,
+/// so the server falls back to plain `9P2000.L` for it.
+pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.zerofs";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -33,8 +37,11 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-/// Maximum message size we accept. Used for codec frame limit.
-pub const P9_MAX_MSIZE: u32 = 1024 * 1024;
+/// Maximum 9P message size. This bounds the negotiated msize: the server clamps
+/// every client's requested msize to this value, and both the server and client
+/// reader codecs reject frames larger than it. Shared by the 9P server and the
+/// `zerofs mount` client.
+pub const P9_MAX_MSIZE: u32 = 10 * 1024 * 1024;
 
 pub const P9_CHANNEL_SIZE: usize = 1000;
 pub const P9_SIZE_FIELD_LEN: usize = std::mem::size_of::<u32>();
@@ -46,6 +53,10 @@ pub const P9_HEADER_SIZE: usize = P9_SIZE_FIELD_LEN + P9_TYPE_FIELD_LEN + P9_TAG
 pub const P9_MIN_MESSAGE_SIZE: u32 = P9_HEADER_SIZE as u32;
 /// IO header overhead for Rread/Rreaddir: header + count[4]
 pub const P9_IOHDRSZ: u32 = (P9_HEADER_SIZE + P9_COUNT_FIELD_LEN) as u32;
+/// Wire overhead of a Twrite request preceding its data payload:
+/// header + fid[4] + offset[8] + count[4]. A Twrite carrying `count` bytes is
+/// `P9_TWRITE_HDR + count` bytes on the wire and must not exceed the msize.
+pub const P9_TWRITE_HDR: u32 = (P9_HEADER_SIZE + 4 + 8 + P9_COUNT_FIELD_LEN) as u32;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
 pub const P9_MAX_GROUPS: usize = 16;
@@ -447,6 +458,104 @@ pub struct Rattach {
     pub qid: Qid,
 }
 
+// ZeroFS-private reconnect extension: binds a fresh fid to an existing inode by
+// id (not by re-walking a path), so reconnection survives renames/hardlinks.
+// Only our own client sends it.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Trebind {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub inode_id: u64,
+    #[deku(endian = "little")]
+    pub n_uname: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rrebind {
+    pub qid: Qid,
+}
+
+// ZeroFS-private fast-path extensions, negotiated via the "9P2000.L.zerofs"
+// version. Twalkgetattr folds walk+getattr into one round trip; Treaddirattr
+// returns each directory entry together with its full stat (readdirplus).
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Twalkgetattr {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub newfid: u32,
+    #[deku(endian = "little", update = "self.wnames.len()")]
+    pub nwname: u16,
+    #[deku(count = "nwname")]
+    pub wnames: Vec<P9String>,
+}
+
+// Returned only on a full walk; on any miss the server replies Rlerror.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rwalkgetattr {
+    #[deku(endian = "little", update = "self.wqids.len()")]
+    pub nwqid: u16,
+    #[deku(count = "nwqid")]
+    pub wqids: Vec<Qid>,
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Treaddirattr {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub offset: u64,
+    #[deku(endian = "little")]
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct DirEntryPlus {
+    pub qid: Qid,
+    #[deku(endian = "little")]
+    pub offset: u64,
+    pub type_: u8,
+    pub name: P9String,
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rreaddirattr {
+    #[deku(endian = "little", update = "self.data.len()")]
+    pub count: u32,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
+}
+
+impl Rreaddirattr {
+    pub fn from_entries(entries: Vec<DirEntryPlus>) -> Result<Self, DekuError> {
+        use deku::DekuContainerWrite;
+        let mut data = Vec::new();
+        for entry in entries {
+            data.extend_from_slice(&entry.to_bytes()?);
+        }
+        Ok(Rreaddirattr {
+            count: data.len() as u32,
+            data: DekuBytes::from(data),
+        })
+    }
+
+    pub fn to_entries(&self) -> Result<Vec<DirEntryPlus>, DekuError> {
+        use deku::DekuContainerRead;
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < self.data.len() {
+            let remaining = &self.data.0[offset..];
+            let (_, entry) = DirEntryPlus::from_bytes((remaining, 0))?;
+            offset += entry.to_bytes()?.len();
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rwalk {
     #[deku(endian = "little", update = "self.wqids.len()")]
@@ -712,6 +821,19 @@ pub enum Message {
     Tstatfs(Tstatfs),
     #[deku(id = "9")]
     Rstatfs(Rstatfs),
+    // ZeroFS-private reconnect extension (ids outside the standard 9P range).
+    #[deku(id = "250")]
+    Trebind(Trebind),
+    #[deku(id = "251")]
+    Rrebind(Rrebind),
+    #[deku(id = "252")]
+    Twalkgetattr(Twalkgetattr),
+    #[deku(id = "253")]
+    Rwalkgetattr(Rwalkgetattr),
+    #[deku(id = "254")]
+    Treaddirattr(Treaddirattr),
+    #[deku(id = "255")]
+    Rreaddirattr(Rreaddirattr),
 }
 
 // Complete 9P message with header
@@ -790,6 +912,12 @@ impl P9Message {
             Message::Rxattrwalk(_) => 31,
             Message::Tstatfs(_) => 8,
             Message::Rstatfs(_) => 9,
+            Message::Trebind(_) => 250,
+            Message::Rrebind(_) => 251,
+            Message::Twalkgetattr(_) => 252,
+            Message::Rwalkgetattr(_) => 253,
+            Message::Treaddirattr(_) => 254,
+            Message::Rreaddirattr(_) => 255,
         };
 
         Self {

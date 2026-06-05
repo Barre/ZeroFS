@@ -557,6 +557,24 @@ mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs.9p
 
 Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.
 
+#### Mounting with `zerofs mount`
+
+The commands above use the Linux kernel's 9P client. ZeroFS also ships its own client, `zerofs mount`, which talks to the same server but runs in userspace over FUSE:
+
+```bash
+# TCP
+zerofs mount 127.0.0.1:5564 /mnt/zerofs
+
+# Unix socket
+zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
+```
+
+`zerofs mount` reconnects on its own: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers without anyone touching it. It also mounts as a regular user through `fusermount3` (no root, no kernel module) and negotiates a larger message size than the kernel client's cap. They also speaks a private fast path: folding each lookup into a single round trip and returning directory entries with their attributes inline which speeds up metadata-heavy work.
+
+Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it — so there's no uid to configure: files are owned by whoever created them and the server enforces each user's own permissions. (This assumes the client and server share a uid namespace, and the server trusts the uid it's told, the same as 9P's `access=user` over an unauthenticated transport.) Use `--access owner|root|all` to choose who may reach the mount in the first place; `root`/`all` need `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
+
+Writeback caching is on by default — writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only and message size).
+
 ### NFS
 
 #### macOS
