@@ -81,6 +81,7 @@ The main difference is what happens when the connection drops. The kernel client
 
 - It mounts as a regular user through `fusermount3`, so no `sudo` and no kernel module.
 - It negotiates a larger message size than the kernel client's cap, which helps large reads and writes.
+- Because the client and server ship together, they negotiate a private fast path the kernel client doesn't have: a path lookup is a single round trip (a combined walk + getattr), and directory listings return each entry's attributes inline (readdirplus) instead of a stat per entry. That cuts the round trips on metadata-heavy work.
 - Writeback caching is on by default, so writes are buffered and flushed asynchronously (similar to the kernel client's `cache=mmap`); pass `--writeback false` to write through synchronously.
 
 Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions, with no uid to configure. (As with `access=user` over an unauthenticated transport, this trusts the client-supplied uid and assumes a shared uid namespace.) The `--access owner|root|all` option controls who may reach the mount; `root` and `all` require `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
