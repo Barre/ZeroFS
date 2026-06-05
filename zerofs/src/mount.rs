@@ -9,7 +9,7 @@
 //! over the multiplexed 9P connection.
 
 use crate::ninep::lock_manager::{FileLock, FileLockManager};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use fuser::{
     AccessFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -1636,13 +1636,6 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         .with_writer(std::io::stderr)
         .try_init();
 
-    if !mountpoint.is_dir() {
-        bail!(
-            "mount point {} does not exist or is not a directory",
-            mountpoint.display()
-        );
-    }
-
     let client = connect(&target, opts.msize).await?;
     let msize = client.msize();
 
@@ -1705,7 +1698,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
 
     let session = Session::new(fs, &mountpoint, &config).map_err(|e| {
         let mut err = anyhow!(
-            "failed to mount FUSE filesystem at {}: {e}",
+            "failed to mount filesystem at {}: {e}",
             mountpoint.display()
         );
         // `--access root`/`all` map to the `allow_other` mount option, which an

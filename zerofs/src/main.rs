@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
             if let Err(e) =
                 cli::server::run_server(config, read_only, checkpoint, no_compactor).await
             {
-                eprintln!("✗ {:#}", e);
+                eprintln!("✗ Error: {:#}", e);
                 std::process::exit(1);
             }
         }
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
                 writeback,
             };
             if let Err(e) = mount::run(target, mountpoint, opts).await {
-                eprintln!("✗ {:#}", e);
+                eprintln!("✗ Error: {:#}", e);
                 std::process::exit(1);
             }
         }
