@@ -94,7 +94,7 @@ enum Target {
 }
 
 /// A single live transport (one socket + its reader/writer tasks). Replaced
-/// wholesale on reconnect; requests load the current one through the `ArcSwap`.
+/// wholesale on reconnect. Requests load the current one through the `ArcSwap`.
 struct Conn {
     writer_tx: mpsc::Sender<Vec<u8>>,
     pending: DashMap<u16, oneshot::Sender<Bytes>>,
@@ -227,7 +227,7 @@ impl NinePClient {
     }
 
     /// Open a fresh socket, spawn its reader/writer tasks and negotiate the
-    /// version. Does not touch any session state.
+    /// version.
     async fn connect_once(
         target: &Target,
         requested_msize: u32,
@@ -314,12 +314,14 @@ impl NinePClient {
             Arc::clone(&self.reconnect_notify),
         )
         .await?;
+
         self.msize.store(msize, Ordering::Relaxed);
         self.extensions.store(extensions, Ordering::Relaxed);
         self.replay(&conn).await?;
         let old = self.conn.swap(conn);
         old.dead.store(true, Ordering::Release);
         old.writer_shutdown.notify_one();
+
         Ok(())
     }
 
@@ -398,7 +400,7 @@ impl NinePClient {
     }
 
     /// Whether the server negotiated the ZeroFS fast-path extensions
-    /// (`walk_getattr`/`readdirplus`). Re-evaluated on each reconnect.
+    /// (`walk_getattr`/`readdirplus`).
     pub fn extensions_enabled(&self) -> bool {
         self.extensions.load(Ordering::Relaxed)
     }
