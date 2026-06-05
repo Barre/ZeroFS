@@ -245,8 +245,7 @@ impl NinePHandler {
 
         // Advertise the ZeroFS fast-path extensions only if the client asked for
         // them (proposed `9P2000.L.zerofs`). v9fs proposes plain `9P2000.L`, so it
-        // gets the plain reply and the extension handlers stay dormant — the
-        // protocol requires us never to upgrade a version the client didn't offer.
+        // gets the plain reply and the extension handlers are not used.
         let version = if version_str.contains(".zerofs") {
             VERSION_9P2000L_ZEROFS
         } else {
@@ -438,7 +437,7 @@ impl NinePHandler {
 
     // ZeroFS fast path: a full walk that also returns the final inode's stat, so
     // the client's lookup costs one round trip instead of walk + getattr. Unlike
-    // Twalk there is no partial result — any miss is a hard error.
+    // Twalk there is no partial result. Any miss is a hard error.
     async fn walk_getattr(&self, tw: Twalkgetattr) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
