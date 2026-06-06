@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
 };
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
@@ -14,6 +14,7 @@ use crate::config::CompressionConfig;
 use crate::task::spawn_blocking_named;
 
 const NONCE_SIZE: usize = 24;
+const TAG_SIZE: usize = 16;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Block transformer that handles compression and encryption for SlateDB.
@@ -97,15 +98,15 @@ impl TransformerInner {
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self
-            .cipher
-            .encrypt(nonce, data)
-            .map_err(|e| slatedb::Error::data(format!("Encryption failed: {}", e)))?;
-
-        // Format: [nonce][ciphertext]
-        let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        // Format: [nonce][ciphertext][tag]
+        let mut result = Vec::with_capacity(NONCE_SIZE + data.len() + TAG_SIZE);
         result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&ciphertext);
+        result.extend_from_slice(data);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(nonce, b"", &mut result[NONCE_SIZE..])
+            .map_err(|e| slatedb::Error::data(format!("Encryption failed: {}", e)))?;
+        result.extend_from_slice(tag.as_slice());
         Ok(result)
     }
 
