@@ -602,17 +602,10 @@ impl PrefetchingObjectStore {
                 );
             }
 
-            let bytes = parts
-                .get(&key)
-                .await
-                .ok()
-                .flatten()
-                .map(|e| e.value().clone())
-                .unwrap_or_else(|| all_bytes.slice(0..part_size_bytes.min(all_bytes.len())));
-
-            let end = range_in_part.end.min(bytes.len());
+            let part_end = part_size_bytes.min(all_bytes.len());
+            let end = range_in_part.end.min(part_end);
             let start = range_in_part.start.min(end);
-            Ok(bytes.slice(start..end))
+            Ok(all_bytes.slice(start..end))
         })
     }
 
