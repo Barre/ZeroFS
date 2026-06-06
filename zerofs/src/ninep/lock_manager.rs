@@ -56,6 +56,15 @@ impl FileLockManager {
         }
     }
 
+    /// Cheap, mutex-free check for whether a session holds any byte-range locks.
+    /// Lets hot close/flush paths skip the global `lock_mutex` (and a task spawn)
+    /// in the common case where the session never took a POSIX lock.
+    pub fn session_has_locks(&self, session_id: u64) -> bool {
+        self.locks_by_session
+            .get(&session_id)
+            .is_some_and(|v| !v.is_empty())
+    }
+
     /// Inserts a lock into all tracking structures and returns the new lock ID.
     /// Must be called while holding the lock_mutex.
     fn insert_lock(&self, session_id: u64, lock: FileLock) -> LockId {
