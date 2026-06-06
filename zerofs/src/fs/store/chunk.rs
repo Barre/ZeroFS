@@ -177,15 +177,20 @@ impl ChunkStore {
             };
 
             let write_len = write_end - write_start;
-            let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
-            chunk[write_start..write_end]
-                .copy_from_slice(&data[data_offset..data_offset + write_len]);
+            let chunk: Bytes = if write_start == 0 && write_end == CHUNK_SIZE {
+                Bytes::copy_from_slice(&data[data_offset..data_offset + write_len])
+            } else {
+                let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
+                chunk[write_start..write_end]
+                    .copy_from_slice(&data[data_offset..data_offset + write_len]);
+                chunk.freeze()
+            };
             data_offset += write_len;
 
             if chunk.as_ref() == ZERO_CHUNK {
                 self.delete(txn, id, chunk_idx);
             } else {
-                self.save(txn, id, chunk_idx, chunk.freeze());
+                self.save(txn, id, chunk_idx, chunk);
             }
         }
 
