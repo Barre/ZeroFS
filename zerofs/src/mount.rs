@@ -858,9 +858,15 @@ impl Filesystem for Fuse9P {
         // dropped when the handle's fid is clunked in `release` (like v9fs, which
         // sends no explicit unlock on close).
         let _ = fh;
+        let owner = lock_owner.0;
+        // Common case: the session never took a byte-range lock, so a close has
+        // nothing to release.
+        if !self.locks.session_has_locks(owner) {
+            reply.ok();
+            return;
+        }
         let locks = Arc::clone(&self.locks);
         let ino = ino.0;
-        let owner = lock_owner.0;
         self.rt.spawn(async move {
             locks.unlock_range(ino, LOCAL_LOCK_FID, 0, 0, owner).await;
             reply.ok();
