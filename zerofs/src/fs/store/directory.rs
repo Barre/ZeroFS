@@ -36,7 +36,7 @@ impl DirScanValue {
         }
     }
 
-    pub fn inode(&self) -> Option<&Inode> {
+    pub fn into_inode(self) -> Option<Inode> {
         match self {
             DirScanValue::WithInode { inode, .. } => Some(inode),
             DirScanValue::Reference { .. } => None,
@@ -158,15 +158,18 @@ impl DirectoryStore {
                             _ => return Some((Err(FsError::InvalidData), (iter, codec))),
                         };
                         match decode_dir_scan_value(&value) {
-                            Ok((name, scan_value)) => Some((
-                                Ok(DirEntryInfo {
-                                    name,
-                                    inode_id: scan_value.inode_id(),
-                                    cookie,
-                                    inode: scan_value.inode().cloned(),
-                                }),
-                                (iter, codec),
-                            )),
+                            Ok((name, scan_value)) => {
+                                let inode_id = scan_value.inode_id();
+                                Some((
+                                    Ok(DirEntryInfo {
+                                        name,
+                                        inode_id,
+                                        cookie,
+                                        inode: scan_value.into_inode(),
+                                    }),
+                                    (iter, codec),
+                                ))
+                            }
                             Err(e) => Some((Err(e), (iter, codec))),
                         }
                     }
@@ -205,15 +208,18 @@ impl DirectoryStore {
                             _ => return Some((Err(FsError::InvalidData), (iter, codec))),
                         };
                         match decode_dir_scan_value(&value) {
-                            Ok((name, scan_value)) => Some((
-                                Ok(DirEntryInfo {
-                                    name,
-                                    inode_id: scan_value.inode_id(),
-                                    cookie,
-                                    inode: scan_value.inode().cloned(),
-                                }),
-                                (iter, codec),
-                            )),
+                            Ok((name, scan_value)) => {
+                                let inode_id = scan_value.inode_id();
+                                Some((
+                                    Ok(DirEntryInfo {
+                                        name,
+                                        inode_id,
+                                        cookie,
+                                        inode: scan_value.into_inode(),
+                                    }),
+                                    (iter, codec),
+                                ))
+                            }
                             Err(e) => Some((Err(e), (iter, codec))),
                         }
                     }
