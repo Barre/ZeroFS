@@ -433,12 +433,13 @@ pub async fn build_slatedb(
         wal_enabled,
         l0_max_ssts,
         l0_max_ssts_per_key: l0_max_ssts,
-        l0_sst_size_bytes: 128 * 1024 * 1024,
+        l0_sst_size_bytes: 32 * 1024 * 1024,
         compactor_options: None,
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
         compression_codec: None, // Disable compression as we handle it in encryption layer
-        l0_flush_parallelism: 8,
+        l0_flush_parallelism: 16,
+        min_filter_keys: 10,
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
