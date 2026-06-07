@@ -80,6 +80,9 @@ access_key_id = "your-access-key"
 secret_access_key = "your-secret-key"
 region = "us-east-1"
 
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]
 ```
@@ -97,6 +100,9 @@ encryption_password = "your-secure-password"
 [azure]
 storage_account_name = "your-account"
 storage_account_key = "your-key"
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]
@@ -134,6 +140,9 @@ access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
 endpoint = "https://minio.example.com"
 allow_http = "true"    # For HTTP endpoints
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
 
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]
@@ -223,9 +232,22 @@ docker run -d \
 
 ## Mount the Filesystem
 
-With ZeroFS running, mount it using standard NFS tools. Linux users can also use 9P for better performance:
+With ZeroFS running, the recommended way to mount it (on Linux) is with ZeroFS's own client, `zerofs mount`. It connects to the 9P server, mounting as a regular user with no root or kernel module, and reconnecting on its own if the server restarts or is temporarily unavailable. You can also mount with NFS or the Linux kernel 9P client on Linux:
 
 <CodeGroup>
+
+```bash {{ title: 'zerofs mount (Recommended)' }}
+# Linux: ZeroFS's own client. Requires [servers.ninep] in your config.
+
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Connect to the 9P server and mount via FUSE (runs as a regular user)
+zerofs mount 127.0.0.1:5564 /mnt/zerofs
+
+# Or over a Unix socket for lower-latency local mounts:
+# zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
+```
 
 ```bash {{ title: 'macOS' }}
 # Create mount point
@@ -243,27 +265,18 @@ sudo mkdir -p /mnt/zerofs
 sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
 ```
 
-```bash {{ title: 'Linux (9P)' }}
-# Make sure 9P is configured in your TOML file:
+```bash {{ title: 'Linux (kernel 9P)' }}
+# The Linux kernel's own 9P client. Make sure 9P is configured in your TOML file:
 # [servers.ninep]
 # addresses = ["127.0.0.1:5564"]
 
 # Create mount point
 sudo mkdir -p /mnt/9p
 
-# Mount ZeroFS via 9P (better performance on Linux)
+# Mount ZeroFS via the kernel 9P client
 sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
 
-```bash {{ title: 'Persistent Mount (NFS)' }}
-# Add to /etc/fstab for automatic mounting
-echo "127.0.0.1:/ /mnt/zerofs nfs vers=3,async,nolock,tcp,port=2049,mountport=2049,_netdev 0 0" | sudo tee -a /etc/fstab
-```
-
-```bash {{ title: 'Persistent Mount (9P)' }}
-# Add to /etc/fstab for automatic mounting (Linux only)
-echo "127.0.0.1 /mnt/9p 9p trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user,_netdev 0 0" | sudo tee -a /etc/fstab
-```
 
 </CodeGroup>
 
