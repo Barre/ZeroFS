@@ -5,6 +5,7 @@ use crate::fs::CacheConfig;
 use crate::fs::key_codec::KeyPrefix;
 use crate::key_management;
 use crate::parse_object_store::parse_url_opts;
+use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
 use slatedb::config::{DurabilityLevel, ScanOptions};
@@ -26,7 +27,11 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
 
     let env_vars = settings.cloud_provider_env_vars();
     let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars)?;
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+
+    let object_store = with_storage_class(
+        Arc::from(object_store),
+        settings.storage.storage_class.as_deref(),
+    );
 
     let actual_db_path = path_from_url.to_string();
 

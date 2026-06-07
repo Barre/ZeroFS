@@ -43,6 +43,7 @@ encryption_password = "your-secure-password"  # Encryption password
 [storage]
 url = "s3://my-bucket/zerofs-data"
 encryption_password = "secure-password-here"
+# storage_class = "..."          # Optional, provider-specific; see Storage Class below
 
 [aws]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
@@ -122,6 +123,26 @@ encryption_password = "secure-password-here"
 
 # No additional backend configuration needed
 ```
+
+### Storage Class
+
+The optional `storage_class` field under `[storage]` sets the object storage class/tier for every write. The value is passed through verbatim.
+
+```toml
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "secure-password-here"
+storage_class = "..."  # provider-specific value, e.g. a single-zone hot class
+```
+
+Because the value is verbatim, it must be valid for your backend. Omit the field to use the account/bucket default. The typical use is selecting a cheaper single-zone / reduced-redundancy **hot** or higher performance class where your provider offers one.
+
+<Warning>
+ZeroFS reads SSTs and the manifest continuously, so `storage_class` must be a hot, instant-access tier:
+
+- **Infrequent-access** tiers work but charge a per-GB retrieval fee on every read, so for ZeroFS's constant reads they usually cost **more**, not less.
+</Warning>
+
 
 ## Network Services
 
@@ -233,9 +254,10 @@ By default the WAL is written to the same object store as everything else. You c
 ```toml
 [wal]
 url = "file:///mnt/nvme/zerofs-wal"
+# storage_class = "..."  # Optional, independent from [storage]
 ```
 
-The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials.
+The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. It also has its own optional `storage_class` (see [Storage Class](#storage-class)); it does not inherit the one from `[storage]`. Since the WAL is hot, frequently-rewritten data, it is normally left on the default tier.
 
 <Note>
 Whether you use a separate WAL store is decided at filesystem creation time and cannot be changed later.

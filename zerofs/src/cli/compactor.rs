@@ -3,6 +3,7 @@ use crate::config::Settings;
 use crate::key_management;
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::parse_object_store::parse_url_opts;
+use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
 use slatedb::CompactorBuilder;
@@ -33,8 +34,12 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
 
     let env_vars = settings.cloud_provider_env_vars();
     let (object_store, path_from_url) = parse_url_opts(&settings.storage.url.parse()?, env_vars)?;
+    let object_store = with_storage_class(
+        Arc::from(object_store),
+        settings.storage.storage_class.as_deref(),
+    );
     let object_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(LengthCheckedObjectStore::new(Arc::from(object_store)));
+        Arc::new(LengthCheckedObjectStore::new(object_store));
     let db_path = Path::from(path_from_url.to_string());
 
     info!("Storage URL: {}", settings.storage.url);

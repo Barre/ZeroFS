@@ -5,6 +5,7 @@ pub mod fs;
 pub mod length_checked_object_store;
 pub mod object_store_prefetch;
 pub mod segment_extractor;
+pub mod storage_class_object_store;
 pub mod task;
 
 #[cfg(feature = "failpoints")]

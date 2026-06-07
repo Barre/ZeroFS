@@ -13,6 +13,7 @@ use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::NBDServer;
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::parse_url_opts;
+use crate::storage_class_object_store::with_storage_class;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -41,13 +42,15 @@ pub(crate) fn parse_wal_object_store(
     let env_vars = wal_config.cloud_provider_env_vars();
     let (store, path) = parse_url_opts(&wal_config.url.parse()?, env_vars)?;
     let path_str: &str = path.as_ref();
-    if path_str.is_empty() {
-        Ok(Arc::from(store))
+    let store: Arc<dyn object_store::ObjectStore> = if path_str.is_empty() {
+        Arc::from(store)
     } else {
-        Ok(Arc::new(object_store::prefix::PrefixStore::new(
-            store, path,
-        )))
-    }
+        Arc::new(object_store::prefix::PrefixStore::new(store, path))
+    };
+    Ok(with_storage_class(
+        store,
+        wal_config.storage_class.as_deref(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +69,10 @@ impl DatabaseMode {
 async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid::Uuid> {
     let env_vars = settings.cloud_provider_env_vars();
     let (object_store, path_from_url) = parse_url_opts(&settings.storage.url.parse()?, env_vars)?;
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let object_store = with_storage_class(
+        Arc::from(object_store),
+        settings.storage.storage_class.as_deref(),
+    );
     let db_path = Path::from(path_from_url.to_string());
 
     let mut admin_builder = AdminBuilder::new(db_path, object_store);
@@ -636,7 +642,10 @@ async fn initialize_filesystem(
         env_vars,
     )
     .context("Failed to connect to storage backend")?;
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let object_store = with_storage_class(
+        Arc::from(object_store),
+        settings.storage.storage_class.as_deref(),
+    );
 
     let actual_db_path = path_from_url.to_string();
 

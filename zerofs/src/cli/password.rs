@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::key_management;
+use crate::storage_class_object_store::with_storage_class;
 use slatedb::object_store::path::Path;
 use std::sync::Arc;
 
@@ -59,7 +60,10 @@ pub async fn change_password(
     )
     .map_err(|e| PasswordError::Other(e.to_string()))?;
 
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let object_store = with_storage_class(
+        Arc::from(object_store),
+        settings.storage.storage_class.as_deref(),
+    );
     let db_path = Path::from(path_from_url.to_string());
 
     key_management::change_encryption_password(
