@@ -91,6 +91,9 @@ impl<'de> Deserialize<'de> for CompressionConfig {
 pub struct WalConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub url: String,
+    /// Object storage class/tier for WAL writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +165,10 @@ pub struct StorageConfig {
     pub url: String,
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub encryption_password: String,
+    /// Object storage class/tier for data writes, passed through verbatim as the
+    /// per-backend tiering header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -580,6 +587,7 @@ impl Settings {
             storage: StorageConfig {
                 url: "s3://your-bucket/zerofs-data".to_string(),
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
+                storage_class: None,
             },
             servers: ServerConfig {
                 nfs: Some(NfsConfig {
@@ -617,6 +625,15 @@ impl Settings {
     pub fn render_default_config() -> Result<String> {
         let default = Self::generate_default();
         let mut toml_string = toml::to_string_pretty(&default)?;
+
+        // Inject a commented storage_class hint into the [storage] section. It
+        // can't be appended like the others below because [storage] is not the
+        // last table in the serialized output.
+        toml_string = toml_string.replace(
+            "encryption_password = \"${ZEROFS_PASSWORD}\"\n",
+            "encryption_password = \"${ZEROFS_PASSWORD}\"\n\
+             # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n"
+        );
 
         toml_string.push_str("\n# Optional AWS S3 settings (uncomment to use):\n");
         toml_string.push_str(
@@ -669,6 +686,7 @@ impl Settings {
         );
         toml_string.push_str("\n# [wal]\n");
         toml_string.push_str("# url = \"file:///mnt/nvme/zerofs-wal\"\n");
+        toml_string.push_str("# storage_class = \"...\"  # Optional; independent from [storage]. WAL is hot data, normally left on the default.\n");
 
         toml_string.push_str("\n# Optional Prometheus metrics endpoint\n");
         toml_string.push_str("# Exposes filesystem, LSM, and cache metrics in Prometheus format\n");

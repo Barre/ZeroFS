@@ -20,6 +20,7 @@ mod parse_object_store;
 mod prometheus;
 mod rpc;
 mod segment_extractor;
+mod storage_class_object_store;
 mod storage_compatibility;
 mod task;
 mod telemetry;

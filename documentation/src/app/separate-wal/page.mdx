@@ -33,6 +33,8 @@ secret_access_key = "${WAL_AWS_SECRET}"
 endpoint = "https://s3-endpoint.example.com"
 ```
 
+The `[wal]` section also accepts an optional `storage_class` (see [Storage Class](/configuration#storage-class)), independent from the one under `[storage]`.
+
 If no `[wal]` section is present, the WAL is written to the main object store.
 
 ## Important Constraints

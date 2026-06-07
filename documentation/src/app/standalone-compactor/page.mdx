@@ -67,7 +67,7 @@ On a separate instance (or the same machine), run the compactor:
 zerofs compactor -c zerofs.toml
 ```
 
-The compactor reads the same configuration file to access the storage backend and uses the `[lsm]` settings for compaction parameters.
+The compactor reads the same configuration file to access the storage backend and uses the `[lsm]` settings for compaction parameters. It also honors the `[storage]` `storage_class`.
 
 <Note>
   The compactor only needs access to the object storage backend. It doesn't need to run any network servers (NFS, 9P, NBD).

@@ -265,6 +265,7 @@ ZeroFS supports multiple storage backends through the `url` field in `[storage]`
 ```toml
 [storage]
 url = "s3://my-bucket/path"
+# storage_class = "..."  # Optional: provider-specific storage class for all writes; use a HOT/standard-access class
 
 [aws]
 access_key_id = "${AWS_ACCESS_KEY_ID}"
@@ -276,6 +277,14 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 ```
 
 > **Note:** ZeroFS requires conditional write (put-if-not-exists) support for fencing. AWS S3 supports this natively. For S3-compatible object stores that do not support conditional puts, set `conditional_put` to a Redis URL. ZeroFS will use Redis to coordinate conditional write operations.
+
+> **Storage class:** Set `storage_class` under `[storage]` to write all objects with a specific class/tier. The value is passed through verbatim and is honored by all three cloud backends via their own headers: S3 `x-amz-storage-class`, GCS `x-goog-storage-class`, and Azure `x-ms-access-tier`. Because it's verbatim, it must be valid for your backend — an S3 class name on Azure, for example, is rejected on the first write. Omit it to use the account/bucket default (typically `STANDARD`/`Hot`). The typical use is selecting a cheaper single-zone / reduced-redundancy *hot* class where your provider offers one.
+>
+> **Use a hot, standard-access class.** ZeroFS reads SSTs and the manifest continuously, so colder tiers are a poor fit:
+> - **Archive** tiers (S3 `GLACIER`/`DEEP_ARCHIVE`, Azure `Archive`) require a restore before read and will render the volume unusable — never use them.
+> - **Infrequent-access** tiers (S3 `STANDARD_IA`/`ONEZONE_IA`, GCS `NEARLINE`/`COLDLINE`) work but charge a per-GB retrieval fee on every read, so for ZeroFS's constant reads they usually cost *more*, not less.
+>
+> The `[wal]` section has its own `storage_class` (see below); it does not inherit the one from `[storage]`, so WAL writes stay on the default unless you set it explicitly. Server-side copies cannot carry a class and land in the bucket default.
 
 #### Microsoft Azure
 ```toml
@@ -480,7 +489,7 @@ Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL'
 url = "file:///mnt/nvme/zerofs-wal"
 ```
 
-The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. If no `[wal]` section is present, the WAL is written to the main object store.
+The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. It also has its own optional `storage_class` (same values as `[storage]`); since the WAL is hot, frequently-rewritten data, it is usually left on the default `STANDARD` tier. If no `[wal]` section is present, the WAL is written to the main object store.
 
 Whether you use a separate WAL store is decided at filesystem creation time. The underlying storage engine records this in its manifest, so you cannot add or remove a separate WAL store on an existing filesystem.
 
