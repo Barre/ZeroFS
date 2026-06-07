@@ -541,13 +541,34 @@ ZeroFS's on-disk block cache stores **decrypted, decompressed** SST blocks. Encr
 
 ## Mounting the Filesystem
 
-### 9P (Recommended for better performance and FSYNC POSIX semantics)
+The recommended way to mount ZeroFS is with its own client, **`zerofs mount`**. Other NFS and 9P clients also work but where `zerofs mount` is available, it's purpose-built for ZeroFS and is what we recommend.
 
-9P provides better performance and more accurate POSIX semantics, especially for fsync/commit operations. When fsync is called on 9P, ZeroFS receives a proper signal to flush data to stable storage, ensuring strong durability guarantees.
+`zerofs mount` and the kernel 9P client both talk to the 9P server, which gives more accurate POSIX semantics than NFS, especially for fsync/commit: when fsync is called over 9P, ZeroFS receives a proper signal to flush data to stable storage, ensuring strong durability guarantees. If you require strong durability, prefer a 9P-based mount over NFS (see the [durability note](#nfs) below).
 
-**Note on durability:** With NFS, ZeroFS reports writes as "stable" to the client even though they are actually unstable (buffered in memory/cache). This is done to avoid performance degradation, as otherwise each write would translate to an fsync-like operation (COMMIT in NFS terms). During testing, we expected clients to call COMMIT on FSYNC, but tested clients (macOS and Linux) don't follow this pattern. If you require strong durability guarantees, 9P is strongly recommended over NFS.
+### `zerofs mount` (Recommended)
+
+ZeroFS ships its own client, `zerofs mount`, which talks to the 9P server but runs in userspace over FUSE. Point it at a running server, local or remote:
+
+```bash
+# TCP
+zerofs mount 127.0.0.1:5564 /mnt/zerofs
+
+# Unix socket
+zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
+```
+
+`zerofs mount` reconnects on its own: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers without anyone touching it. It also mounts as a regular user through `fusermount3` (no root, no kernel module) and negotiates a larger message size than the kernel client's cap. It also speaks a private fast path.
+
+Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions. (This assumes the client and server share a uid namespace, and the server trusts the uid it's told). Use `--access owner|root|all` to choose who may reach the mount in the first place.
+
+Writeback caching is on by default. Writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only and message size).
+
+### Kernel 9P client
+
+The Linux kernel also ships a 9P client that connects to the same server. It gives the same fsync/commit semantics as `zerofs mount`, but runs in the kernel (needs the `9p`/`9pnet` modules) and caps the message size. Reach for it if you'd rather not go through FUSE.
 
 #### TCP Mount (default)
+
 ```bash
 mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
@@ -566,25 +587,9 @@ mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs.9p
 
 Unix sockets avoid the network stack entirely, making them ideal for local mounts where the client and ZeroFS run on the same machine.
 
-#### Mounting with `zerofs mount`
-
-The commands above use the Linux kernel's 9P client. ZeroFS also ships its own client, `zerofs mount`, which talks to the same server but runs in userspace over FUSE:
-
-```bash
-# TCP
-zerofs mount 127.0.0.1:5564 /mnt/zerofs
-
-# Unix socket
-zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
-```
-
-`zerofs mount` reconnects on its own: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers without anyone touching it. It also mounts as a regular user through `fusermount3` (no root, no kernel module) and negotiates a larger message size than the kernel client's cap. They also speaks a private fast path: folding each lookup into a single round trip and returning directory entries with their attributes inline which speeds up metadata-heavy work.
-
-Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it — so there's no uid to configure: files are owned by whoever created them and the server enforces each user's own permissions. (This assumes the client and server share a uid namespace, and the server trusts the uid it's told, the same as 9P's `access=user` over an unauthenticated transport.) Use `--access owner|root|all` to choose who may reach the mount in the first place; `root`/`all` need `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
-
-Writeback caching is on by default — writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only and message size).
-
 ### NFS
+
+**Note on durability:** With NFS, ZeroFS reports writes as "stable" to the client even though they are actually unstable (buffered in memory/cache). This is done to avoid performance degradation, as otherwise each write would translate to an fsync-like operation (COMMIT in NFS terms). During testing, we expected clients to call COMMIT on FSYNC, but tested clients (macOS and Linux) don't follow this pattern. If you require strong durability guarantees, a 9P-based mount (such as `zerofs mount`) is strongly recommended over NFS.
 
 #### macOS
 ```bash
