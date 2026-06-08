@@ -548,7 +548,7 @@ jobs:
         if: matrix.bolt
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc lsb-release wget software-properties-common gnupg
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc lsb-release wget software-properties-common gnupg fuse3
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           UBUNTU_CODENAME=$(lsb_release -cs)
           echo "deb http://apt.llvm.org/${UBUNTU_CODENAME}/ llvm-toolchain-${UBUNTU_CODENAME}-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
@@ -627,7 +627,12 @@ jobs:
           done
 
           sudo mkdir -p /mnt/zerofs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+
+          sudo ${BINARY}.inst mount --access all 127.0.0.1:5564 /mnt/zerofs &
+          for i in {1..60}; do
+            mountpoint -q /mnt/zerofs && break
+            sleep 0.5
+          done
 
           cd /mnt/zerofs
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
@@ -640,7 +645,8 @@ jobs:
           dd if=500mb.bin of=/dev/null bs=1M
           cd /
 
-          sudo umount /mnt/zerofs || true
+          sudo fusermount3 -u /mnt/zerofs || sudo umount /mnt/zerofs || true
+          sudo pkill -TERM -f "zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo.inst mount" || true
           kill -TERM $ZEROFS_PID || true
           wait $ZEROFS_PID || true
 
