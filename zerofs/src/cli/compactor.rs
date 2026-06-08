@@ -83,6 +83,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         max_concurrent_compactions,
         max_sst_size: 1024 * 1024 * 1024,
         max_fetch_tasks: 8,
+        sst_block_size: slatedb::SstBlockSize::Block32Kib,
         scheduler_options,
         ..Default::default()
     };
