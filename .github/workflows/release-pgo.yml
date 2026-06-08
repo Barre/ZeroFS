@@ -23,12 +23,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-musl
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc musl-tools
+          # Profile a musl build so the PGO data matches the musl release targets.
+          # The C deps (jemalloc, lz4, zstd, ring) need a musl C compiler.
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
 
           if [ "${{ matrix.test }}" = "9p" ]; then
             sudo modprobe 9p
@@ -81,10 +84,19 @@ jobs:
           rm -rf /tmp/pgo-data
 
           RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -Cprofile-generate=/tmp/pgo-data" \
-            cargo build --release --target=x86_64-unknown-linux-gnu
+            cargo build --release --target=x86_64-unknown-linux-musl
 
       - name: Run profiling workloads
+        env:
+          # Per-PID profile files. The fuse test runs two instrumented processes
+          # (the user-owned `zerofs run` server and the root `sudo zerofs mount`
+          # client). Without %p both target the same default profraw path and the
+          # second writer hits "Permission denied", silently dropping a profile.
+          LLVM_PROFILE_FILE: /tmp/pgo-data/zerofs-%p.profraw
         run: |
+          # Pre-create writable by both the user server and the root mount, so
+          # whichever exits first doesn't create it root-owned and lock the other out.
+          mkdir -p /tmp/pgo-data && chmod 777 /tmp/pgo-data
           mkdir -p /tmp/zerofs-cache
 
           # Create ZeroFS configuration based on test type
@@ -111,7 +123,7 @@ jobs:
           [telemetry]
           enabled = false
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ./zerofs/target/x86_64-unknown-linux-musl/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS 9P server to start..."
             for i in {1..30}; do
@@ -161,7 +173,7 @@ jobs:
           [telemetry]
           enabled = false
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ./zerofs/target/x86_64-unknown-linux-musl/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS 9P server to start..."
             for i in {1..30}; do
@@ -175,7 +187,7 @@ jobs:
             sudo mkdir -p /mnt/zerofs
             # Drive the workload through the FUSE client. It's the same instrumented
             # binary, so this profiles both the server and the zerofs mount path.
-            sudo ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs &
+            sudo env LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE" ./zerofs/target/x86_64-unknown-linux-musl/release/zerofs mount --access all 127.0.0.1:5564 /mnt/zerofs &
             for i in {1..60}; do
               mountpoint -q /mnt/zerofs && break
               sleep 0.5
@@ -221,7 +233,7 @@ jobs:
           [telemetry]
           enabled = false
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ./zerofs/target/x86_64-unknown-linux-musl/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NBD server to start..."
             for i in {1..30}; do
@@ -271,7 +283,7 @@ jobs:
           [telemetry]
           enabled = false
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ./zerofs/target/x86_64-unknown-linux-musl/release/zerofs run -c zerofs-pgo.toml &
             ZEROFS_PID=$!
             echo "Waiting for ZeroFS NFS server to start..."
             for i in {1..30}; do
@@ -395,13 +407,16 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             arch: amd64
             os: ubuntu-latest
             platform: linux
             use_cross: false
-            bolt: true
-          - target: aarch64-unknown-linux-gnu
+            # BOLT instrumentation can't dump a profile from a static (no-INTERP)
+            # musl binary, so we ship PGO + target-cpu=v3 without the BOLT pass.
+            bolt: false
+            extra_rustflags: "-C target-cpu=x86-64-v3"
+          - target: aarch64-unknown-linux-musl
             arch: arm64
             os: ubuntu-24.04-arm
             platform: linux
@@ -474,6 +489,18 @@ jobs:
         run: |
           cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Setup musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          TARGET_UNDERSCORE="$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "CC_${TARGET_UNDERSCORE}=musl-gcc" >> "$GITHUB_ENV"
+
+          if [ '${{ matrix.target }}' = 'aarch64-unknown-linux-musl' ]; then
+            echo "CFLAGS_${TARGET_UNDERSCORE}=-mno-outline-atomics" >> "$GITHUB_ENV"
+          fi
+
       - name: Configure jemalloc page size for aarch64
         if: startsWith(matrix.target, 'aarch64-')
         run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
@@ -501,12 +528,12 @@ jobs:
       - name: Build with PGO (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cargo build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --features webui --target ${{ matrix.target }}
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'
