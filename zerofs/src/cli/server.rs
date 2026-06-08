@@ -439,7 +439,7 @@ pub async fn build_slatedb(
         wal_enabled,
         l0_max_ssts,
         l0_max_ssts_per_key: l0_max_ssts,
-        l0_sst_size_bytes: 32 * 1024 * 1024,
+        l0_sst_size_bytes: 64 * 1024 * 1024,
         compactor_options: None,
         flush_interval: Some(std::time::Duration::from_secs(30)),
         max_unflushed_bytes,
@@ -557,7 +557,7 @@ pub async fn build_slatedb(
                         poll_interval: std::time::Duration::from_secs(1),
                         max_concurrent_compactions,
                         max_sst_size: 1024 * 1024 * 1024,
-                        max_fetch_tasks: 8,
+                        max_fetch_tasks: 4,
                         scheduler_options,
                         ..Default::default()
                     });
