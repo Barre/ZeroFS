@@ -32,6 +32,16 @@ pub struct WriteCoordinator {
     sender: mpsc::UnboundedSender<(Transaction, Reply)>,
 }
 
+/// Everything the commit worker needs besides its channel.
+struct WorkerContext {
+    db: Arc<Db>,
+    inode_store: InodeStore,
+    flush_coordinator: FlushCoordinator,
+    key_codec: Arc<KeyCodec>,
+    global_stats: Arc<FileSystemGlobalStats>,
+    sync_writes: bool,
+}
+
 impl WriteCoordinator {
     pub fn new(
         db: Arc<Db>,
@@ -46,19 +56,15 @@ impl WriteCoordinator {
         // task we'd over-shoot and skip the first emit.
         let initial_counter = inode_store.next_id();
         let (sender, receiver) = mpsc::unbounded_channel();
-        spawn_named(
-            "commit-worker",
-            worker_loop(
-                db,
-                inode_store,
-                flush_coordinator,
-                key_codec,
-                global_stats,
-                sync_writes,
-                receiver,
-                initial_counter,
-            ),
-        );
+        let ctx = WorkerContext {
+            db,
+            inode_store,
+            flush_coordinator,
+            key_codec,
+            global_stats,
+            sync_writes,
+        };
+        spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self { sender }
     }
 
@@ -72,12 +78,7 @@ impl WriteCoordinator {
 }
 
 async fn worker_loop(
-    db: Arc<Db>,
-    inode_store: InodeStore,
-    flush_coordinator: FlushCoordinator,
-    key_codec: Arc<KeyCodec>,
-    global_stats: Arc<FileSystemGlobalStats>,
-    sync_writes: bool,
+    ctx: WorkerContext,
     mut rx: mpsc::UnboundedReceiver<(Transaction, Reply)>,
     initial_counter: u64,
 ) {
@@ -97,7 +98,7 @@ async fn worker_loop(
             any_ops |= !txn.is_empty();
             for delta in txn.take_stats_deltas() {
                 let entry = shard_deltas
-                    .entry(global_stats.shard_of(delta.inode_id))
+                    .entry(ctx.global_stats.shard_of(delta.inode_id))
                     .or_default();
                 // Saturating: individual deltas are already clamped to the
                 // i64 range, so a batch of multi-EiB deltas could overflow a
@@ -112,10 +113,10 @@ async fn worker_loop(
         // Emit the inode counter only if `next_id` actually advanced since the
         // last emission. See the module doc for why this value is always a safe
         // upper bound on every inode id in this batch.
-        let current = inode_store.next_id();
+        let current = ctx.inode_store.next_id();
         if current > last_emitted_counter {
             merged.put_bytes(
-                key_codec.system_counter_key(),
+                ctx.key_codec.system_counter_key(),
                 KeyCodec::encode_counter(current),
             );
             last_emitted_counter = current;
@@ -124,7 +125,9 @@ async fn worker_loop(
 
         let staged: Vec<_> = shard_deltas
             .into_iter()
-            .map(|(shard_id, (bytes, inodes))| global_stats.stage_delta(shard_id, bytes, inodes))
+            .map(|(shard_id, (bytes, inodes))| {
+                ctx.global_stats.stage_delta(shard_id, bytes, inodes)
+            })
             .collect();
         for shard in &staged {
             merged.put_bytes(shard.key.clone(), shard.value.clone());
@@ -136,15 +139,16 @@ async fn worker_loop(
         // region produces no chunk writes) and no inode was allocated. Reply
         // Ok without touching the db; there's nothing to make durable either.
         let mut result = if any_ops {
-            db.write_with_options(
-                merged,
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|_| FsError::IoError)
+            ctx.db
+                .write_with_options(
+                    merged,
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_| FsError::IoError)
         } else {
             Ok(())
         };
@@ -154,7 +158,7 @@ async fn worker_loop(
         // indefinitely), not that the batch was lost.
         if result.is_ok() {
             for shard in &staged {
-                global_stats.publish(shard);
+                ctx.global_stats.publish(shard);
             }
         }
 
@@ -162,8 +166,8 @@ async fn worker_loop(
         // every caller in the batch only sees Ok once their data is durable in
         // object storage. FlushCoordinator coalesces concurrent flush requests
         // into a single db.flush()
-        if sync_writes && result.is_ok() && any_ops {
-            result = flush_coordinator.flush().await;
+        if ctx.sync_writes && result.is_ok() && any_ops {
+            result = ctx.flush_coordinator.flush().await;
         }
 
         for reply in replies {
