@@ -186,6 +186,7 @@ impl ZeroFS {
             inode_store.clone(),
             flush_coordinator.clone(),
             key_codec.clone(),
+            global_stats.clone(),
             sync_writes,
         );
 
@@ -392,16 +393,7 @@ impl ZeroFS {
                         .await?;
                 }
 
-                let stats_update = if let Some(update) = self
-                    .global_stats
-                    .prepare_size_change(id, old_size, new_size)
-                    .await
-                {
-                    self.global_stats.add_to_transaction(&update, &mut txn)?;
-                    Some(update)
-                } else {
-                    None
-                };
+                txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                 let db_write_start = std::time::Instant::now();
                 self.write_coordinator.commit(txn).await?;
@@ -409,10 +401,6 @@ impl ZeroFS {
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_COMMIT);
-
-                if let Some(update) = stats_update {
-                    self.global_stats.commit_update(&update);
-                }
 
                 let elapsed = start_time.elapsed();
                 debug!(
@@ -548,9 +536,7 @@ impl ZeroFS {
                         .ok();
                 }
 
-                let stats_update = self.global_stats.prepare_inode_create(file_id).await;
-                self.global_stats
-                    .add_to_transaction(&stats_update, &mut txn)?;
+                txn.add_stats_delta(file_id, 0, 1);
 
                 self.write_coordinator.commit(txn).await.inspect_err(|e| {
                     error!("Failed to write batch: {:?}", e);
@@ -558,8 +544,6 @@ impl ZeroFS {
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_COMMIT);
-
-                self.global_stats.commit_update(&stats_update);
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
@@ -897,16 +881,12 @@ impl ZeroFS {
                         .ok();
                 }
 
-                let stats_update = self.global_stats.prepare_inode_create(new_dir_id).await;
-                self.global_stats
-                    .add_to_transaction(&stats_update, &mut txn)?;
+                txn.add_stats_delta(new_dir_id, 0, 1);
 
                 self.write_coordinator.commit(txn).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKDIR_AFTER_COMMIT);
-
-                self.global_stats.commit_update(&stats_update);
 
                 self.stats
                     .directories_created
@@ -1196,16 +1176,12 @@ impl ZeroFS {
                 .ok();
         }
 
-        let stats_update = self.global_stats.prepare_inode_create(new_id).await;
-        self.global_stats
-            .add_to_transaction(&stats_update, &mut txn)?;
+        txn.add_stats_delta(new_id, 0, 1);
 
         self.write_coordinator.commit(txn).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::SYMLINK_AFTER_COMMIT);
-
-        self.global_stats.commit_update(&stats_update);
 
         self.stats.links_created.fetch_add(1, Ordering::Relaxed);
         self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
@@ -1515,25 +1491,12 @@ impl ZeroFS {
                                 .await?;
                         }
 
-                        let stats_update = if let Some(update) = self
-                            .global_stats
-                            .prepare_size_change(id, old_size, new_size)
-                            .await
-                        {
-                            self.global_stats.add_to_transaction(&update, &mut txn)?;
-                            Some(update)
-                        } else {
-                            None
-                        };
+                        txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                         self.write_coordinator.commit(txn).await?;
 
                         #[cfg(feature = "failpoints")]
                         fail_point!(fp::TRUNCATE_AFTER_COMMIT);
-
-                        if let Some(update) = stats_update {
-                            self.global_stats.commit_update(&update);
-                        }
 
                         self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -1957,16 +1920,12 @@ impl ZeroFS {
                         .ok();
                 }
 
-                let stats_update = self.global_stats.prepare_inode_create(special_id).await;
-                self.global_stats
-                    .add_to_transaction(&stats_update, &mut txn)?;
+                txn.add_stats_delta(special_id, 0, 1);
 
                 self.write_coordinator.commit(txn).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::MKNOD_AFTER_COMMIT);
-
-                self.global_stats.commit_update(&stats_update);
 
                 self.stats.files_created.fetch_add(1, Ordering::Relaxed);
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
@@ -2152,28 +2111,14 @@ impl ZeroFS {
                     _ => (None, false),
                 };
 
-                let stats_update = if should_always_remove_stats || original_nlink <= 1 {
-                    Some(
-                        self.global_stats
-                            .prepare_inode_remove(file_id, file_size)
-                            .await,
-                    )
-                } else {
-                    None
-                };
-
-                if let Some(ref update) = stats_update {
-                    self.global_stats.add_to_transaction(update, &mut txn)?;
+                if should_always_remove_stats || original_nlink <= 1 {
+                    txn.add_stats_delta(file_id, stats::size_delta(file_size.unwrap_or(0), 0), -1);
                 }
 
                 self.write_coordinator.commit(txn).await?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::REMOVE_AFTER_COMMIT);
-
-                if let Some(update) = stats_update {
-                    self.global_stats.commit_update(&update);
-                }
 
                 self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -2351,7 +2296,6 @@ impl ZeroFS {
         let mut txn = self.db.new_transaction()?;
 
         let mut target_was_directory = false;
-        let mut target_stats_update = None;
         if let Some((target_id, existing_inode)) = target {
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
@@ -2437,10 +2381,10 @@ impl ZeroFS {
             // For directories and symlinks: always remove from stats
             // For files and special files: only remove if this is the last link
             if should_always_remove_stats || original_nlink <= 1 {
-                target_stats_update = Some(
-                    self.global_stats
-                        .prepare_inode_remove(target_id, original_file_size)
-                        .await,
+                txn.add_stats_delta(
+                    target_id,
+                    stats::size_delta(original_file_size.unwrap_or(0), 0),
+                    -1,
                 );
             }
 
@@ -2594,18 +2538,10 @@ impl ZeroFS {
             }
         }
 
-        if let Some(ref update) = target_stats_update {
-            self.global_stats.add_to_transaction(update, &mut txn)?;
-        }
-
         self.write_coordinator.commit(txn).await?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);
-
-        if let Some(update) = target_stats_update {
-            self.global_stats.commit_update(&update);
-        }
 
         match source_inode {
             Inode::File(_) => {

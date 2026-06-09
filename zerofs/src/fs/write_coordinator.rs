@@ -5,15 +5,23 @@
 //! ops into a single `WriteBatch`, attaches a `system_counter_key` write if the
 //! inode counter advanced since the last emission, submits one
 //! `db.write_with_options`, and replies to every caller in the batch.
+//!
+//! The worker also materializes usage stats: transactions carry signed
+//! per-inode deltas, the worker aggregates them per shard across the batch,
+//! writes the resulting absolute shard values in the same batch, and publishes
+//! them to the in-memory counters once the write succeeds. Being the single
+//! writer of those counters is what makes this lock-free.
 
 use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
+use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::InodeStore;
 use crate::task::spawn_named;
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -30,6 +38,7 @@ impl WriteCoordinator {
         inode_store: InodeStore,
         flush_coordinator: FlushCoordinator,
         key_codec: Arc<KeyCodec>,
+        global_stats: Arc<FileSystemGlobalStats>,
         sync_writes: bool,
     ) -> Self {
         // Capture synchronously: the spawned task starts later, by which point
@@ -44,6 +53,7 @@ impl WriteCoordinator {
                 inode_store,
                 flush_coordinator,
                 key_codec,
+                global_stats,
                 sync_writes,
                 receiver,
                 initial_counter,
@@ -66,6 +76,7 @@ async fn worker_loop(
     inode_store: InodeStore,
     flush_coordinator: FlushCoordinator,
     key_codec: Arc<KeyCodec>,
+    global_stats: Arc<FileSystemGlobalStats>,
     sync_writes: bool,
     mut rx: mpsc::UnboundedReceiver<(Transaction, Reply)>,
     initial_counter: u64,
@@ -81,8 +92,19 @@ async fn worker_loop(
         let mut merged = WriteBatch::new();
         let mut replies = Vec::with_capacity(batch.len());
         let mut any_ops = false;
-        for (txn, reply) in batch {
+        let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
+        for (mut txn, reply) in batch {
             any_ops |= !txn.is_empty();
+            for delta in txn.take_stats_deltas() {
+                let entry = shard_deltas
+                    .entry(global_stats.shard_of(delta.inode_id))
+                    .or_default();
+                // Saturating: individual deltas are already clamped to the
+                // i64 range, so a batch of multi-EiB deltas could overflow a
+                // plain `+=` and panic the singleton worker.
+                entry.0 = entry.0.saturating_add(delta.bytes);
+                entry.1 = entry.1.saturating_add(delta.inodes);
+            }
             txn.apply_to(&mut merged);
             replies.push(reply);
         }
@@ -97,6 +119,15 @@ async fn worker_loop(
                 KeyCodec::encode_counter(current),
             );
             last_emitted_counter = current;
+            any_ops = true;
+        }
+
+        let staged: Vec<_> = shard_deltas
+            .into_iter()
+            .map(|(shard_id, (bytes, inodes))| global_stats.stage_delta(shard_id, bytes, inodes))
+            .collect();
+        for shard in &staged {
+            merged.put_bytes(shard.key.clone(), shard.value.clone());
             any_ops = true;
         }
 
@@ -117,6 +148,15 @@ async fn worker_loop(
         } else {
             Ok(())
         };
+
+        // Publish on write success without waiting for the sync flush below:
+        // a flush failure means the db is broken (SlateDB retries flushes
+        // indefinitely), not that the batch was lost.
+        if result.is_ok() {
+            for shard in &staged {
+                global_stats.publish(shard);
+            }
+        }
 
         // In sync_writes mode, force a flush after the batch is committed so
         // every caller in the batch only sees Ok once their data is durable in
@@ -253,5 +293,93 @@ mod tests {
             after, after_allocate,
             "counter key should advance after allocate"
         );
+    }
+
+    #[tokio::test]
+    async fn stats_deltas_aggregate_per_shard_across_batches() {
+        use crate::fs::STATS_SHARDS;
+        use crate::fs::stats::StatsShardData;
+
+        let fs = make_fs().await;
+        let coord = fs.write_coordinator.clone();
+        let codec = codec();
+
+        // All inode ids congruent to 5 mod 100 map to stats shard 5.
+        const SHARD: usize = 5;
+        const TASKS: u64 = 32;
+
+        let mut handles = Vec::new();
+        for k in 0..TASKS {
+            let c = coord.clone();
+            let inode_id = SHARD as u64 + 100 * k;
+            let key = codec.chunk_key(inode_id, 0);
+            handles.push(tokio::spawn(async move {
+                let mut txn = Transaction::new();
+                txn.put_bytes(&key, Bytes::from_static(b"x"));
+                txn.add_stats_delta(inode_id, ((k + 1) * 10) as i64, 1);
+                c.commit(txn).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // 10 + 20 + ... + 320 = 5280
+        let expected_bytes: u64 = (1..=TASKS).map(|k| k * 10).sum();
+        assert_eq!(fs.global_stats.get_totals(), (expected_bytes, TASKS));
+
+        let raw = fs
+            .db
+            .get_bytes(&codec.stats_shard_key(SHARD))
+            .await
+            .unwrap()
+            .expect("shard 5 must be persisted");
+        let shard: StatsShardData = bincode::deserialize(&raw).unwrap();
+        assert_eq!(
+            (shard.used_bytes, shard.used_inodes),
+            (expected_bytes, TASKS)
+        );
+
+        // No other shard key may have been written.
+        for i in 0..STATS_SHARDS {
+            if i != SHARD {
+                assert!(
+                    fs.db
+                        .get_bytes(&codec.stats_shard_key(i))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "shard {i} written without any delta for it"
+                );
+            }
+        }
+
+        // Second wave: negative byte deltas must drain the shard back down,
+        // both persisted and in memory.
+        let mut handles = Vec::new();
+        for k in 0..TASKS {
+            let c = coord.clone();
+            let inode_id = SHARD as u64 + 100 * k;
+            let key = codec.chunk_key(inode_id, 1);
+            handles.push(tokio::spawn(async move {
+                let mut txn = Transaction::new();
+                txn.put_bytes(&key, Bytes::from_static(b"y"));
+                txn.add_stats_delta(inode_id, -(((k + 1) * 10) as i64), 0);
+                c.commit(txn).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        assert_eq!(fs.global_stats.get_totals(), (0, TASKS));
+        let raw = fs
+            .db
+            .get_bytes(&codec.stats_shard_key(SHARD))
+            .await
+            .unwrap()
+            .unwrap();
+        let shard: StatsShardData = bincode::deserialize(&raw).unwrap();
+        assert_eq!((shard.used_bytes, shard.used_inodes), (0, TASKS));
     }
 }
