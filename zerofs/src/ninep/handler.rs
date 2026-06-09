@@ -10,7 +10,6 @@ use crate::fs::types::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
-use deku::DekuContainerWrite;
 use ninep_proto::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
@@ -559,7 +558,7 @@ impl NinePHandler {
                 name: P9String::new(entry.name),
             };
 
-            let entry_size = dirent.to_bytes().map(|b| b.len()).unwrap_or(0);
+            let entry_size = dirent.wire_size();
 
             if total_size + entry_size > count as usize {
                 break;
@@ -608,7 +607,7 @@ impl NinePHandler {
                 name: P9String::new(entry.name),
             };
 
-            let entry_size = plus.to_bytes().map(|b| b.len()).unwrap_or(0);
+            let entry_size = plus.wire_size();
             if total_size + entry_size > count as usize {
                 break;
             }
