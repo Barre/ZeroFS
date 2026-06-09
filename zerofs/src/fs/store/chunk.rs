@@ -119,7 +119,7 @@ impl ChunkStore {
         txn: &mut Transaction,
         id: InodeId,
         offset: u64,
-        data: &[u8],
+        data: &Bytes,
         old_size: u64,
     ) -> Result<(), FsError> {
         if data.is_empty() {
@@ -178,7 +178,7 @@ impl ChunkStore {
 
             let write_len = write_end - write_start;
             let chunk: Bytes = if write_start == 0 && write_end == CHUNK_SIZE {
-                Bytes::copy_from_slice(&data[data_offset..data_offset + write_len])
+                data.slice(data_offset..data_offset + write_len)
             } else {
                 let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
                 chunk[write_start..write_end]
