@@ -52,17 +52,30 @@ enum TxOp {
     Delete(Bytes),
 }
 
+/// Usage-stats adjustment riding along with a transaction. Deltas commute, so
+/// the commit worker can aggregate them per shard across a whole batch and
+/// persist one absolute shard value, without any per-operation locking.
+pub struct StatsDelta {
+    pub inode_id: u64,
+    pub bytes: i64,
+    pub inodes: i64,
+}
+
 /// Transaction for batching database writes.
 ///
 /// Ops are recorded as a flat vector so the commit coordinator can replay
 /// several transactions into a single merged `WriteBatch` via [`apply_to`].
 pub struct Transaction {
     ops: Vec<TxOp>,
+    stats_deltas: Vec<StatsDelta>,
 }
 
 impl Transaction {
     pub fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            ops: Vec::new(),
+            stats_deltas: Vec::new(),
+        }
     }
 
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
@@ -71,6 +84,23 @@ impl Transaction {
 
     pub fn delete_bytes(&mut self, key: &Bytes) {
         self.ops.push(TxOp::Delete(key.clone()));
+    }
+
+    /// Record a usage-stats adjustment for `inode_id`'s shard, materialized
+    /// by the commit worker. No-op deltas are dropped so callers can pass
+    /// computed differences unconditionally.
+    pub fn add_stats_delta(&mut self, inode_id: u64, bytes: i64, inodes: i64) {
+        if bytes != 0 || inodes != 0 {
+            self.stats_deltas.push(StatsDelta {
+                inode_id,
+                bytes,
+                inodes,
+            });
+        }
+    }
+
+    pub fn take_stats_deltas(&mut self) -> Vec<StatsDelta> {
+        std::mem::take(&mut self.stats_deltas)
     }
 
     pub fn is_empty(&self) -> bool {

@@ -1,11 +1,9 @@
 use super::STATS_SHARDS;
-use super::errors::FsError;
 use super::inode::InodeId;
 use super::key_codec::KeyCodec;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatsShardData {
@@ -16,7 +14,6 @@ pub struct StatsShardData {
 pub struct StatsShard {
     pub used_bytes: AtomicU64,
     pub used_inodes: AtomicU64,
-    pub lock: RwLock<()>,
 }
 
 pub struct FileSystemGlobalStats {
@@ -24,11 +21,26 @@ pub struct FileSystemGlobalStats {
     key_codec: Arc<KeyCodec>,
 }
 
-pub struct StatsUpdate<'a> {
-    pub shard_id: usize,
-    pub shard_key: Bytes,
-    pub shard_data: StatsShardData,
-    pub _guard: tokio::sync::RwLockWriteGuard<'a, ()>,
+/// Absolute shard values staged by the commit worker for one batch. The
+/// encoded value goes into the batch itself; once the batch is in the
+/// memtable, `publish` makes the same values the visible in-memory counters.
+pub struct StagedShard {
+    shard_id: usize,
+    pub key: Bytes,
+    pub value: Bytes,
+    data: StatsShardData,
+}
+
+/// Signed difference `new_size - old_size`, clamped to ±i64::MAX. The clamp
+/// is symmetric so a clamped grow and the matching shrink cancel exactly.
+pub fn size_delta(old_size: u64, new_size: u64) -> i64 {
+    if new_size >= old_size {
+        i64::try_from(new_size - old_size).unwrap_or(i64::MAX)
+    } else {
+        i64::try_from(old_size - new_size)
+            .map(|d| -d)
+            .unwrap_or(-i64::MAX)
+    }
 }
 
 impl FileSystemGlobalStats {
@@ -37,7 +49,6 @@ impl FileSystemGlobalStats {
             .map(|_| StatsShard {
                 used_bytes: AtomicU64::new(0),
                 used_inodes: AtomicU64::new(0),
-                lock: RwLock::new(()),
             })
             .collect();
         Self { shards, key_codec }
@@ -53,111 +64,48 @@ impl FileSystemGlobalStats {
         (total_bytes, total_inodes)
     }
 
-    /// Prepare a statistics update for a new inode creation
-    pub async fn prepare_inode_create(&self, inode_id: InodeId) -> StatsUpdate<'_> {
-        let shard_id = inode_id as usize % STATS_SHARDS;
+    pub fn shard_of(&self, inode_id: InodeId) -> usize {
+        inode_id as usize % STATS_SHARDS
+    }
+
+    /// Compute the absolute shard value after applying an aggregated delta.
+    /// Only the commit worker may call this and [`publish`]: being the single
+    /// writer of the shard counters is what makes the lock-free
+    /// read-modify-write sound.
+    ///
+    /// [`publish`]: Self::publish
+    pub fn stage_delta(&self, shard_id: usize, bytes: i64, inodes: i64) -> StagedShard {
         let shard = &self.shards[shard_id];
-
-        let guard = shard.lock.write().await;
-
-        let mut shard_data = StatsShardData {
-            used_bytes: shard.used_bytes.load(Ordering::Relaxed),
-            used_inodes: shard.used_inodes.load(Ordering::Relaxed),
+        let data = StatsShardData {
+            used_bytes: shard
+                .used_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add_signed(bytes),
+            used_inodes: shard
+                .used_inodes
+                .load(Ordering::Relaxed)
+                .saturating_add_signed(inodes),
         };
-        shard_data.used_inodes = shard_data.used_inodes.saturating_add(1);
-
-        StatsUpdate {
+        StagedShard {
             shard_id,
-            shard_key: self.key_codec.stats_shard_key(shard_id),
-            shard_data,
-            _guard: guard,
+            key: self.key_codec.stats_shard_key(shard_id),
+            value: Bytes::from(
+                bincode::serialize(&data).expect("StatsShardData serialization cannot fail"),
+            ),
+            data,
         }
     }
 
-    /// Prepare a statistics update for inode removal
-    pub async fn prepare_inode_remove(
-        &self,
-        inode_id: InodeId,
-        file_size: Option<u64>,
-    ) -> StatsUpdate<'_> {
-        let shard_id = inode_id as usize % STATS_SHARDS;
-        let shard = &self.shards[shard_id];
-
-        let guard = shard.lock.write().await;
-
-        let mut shard_data = StatsShardData {
-            used_bytes: shard.used_bytes.load(Ordering::Relaxed),
-            used_inodes: shard.used_inodes.load(Ordering::Relaxed),
-        };
-
-        shard_data.used_inodes = shard_data.used_inodes.saturating_sub(1);
-        if let Some(size) = file_size {
-            shard_data.used_bytes = shard_data.used_bytes.saturating_sub(size);
-        }
-
-        StatsUpdate {
-            shard_id,
-            shard_key: self.key_codec.stats_shard_key(shard_id),
-            shard_data,
-            _guard: guard,
-        }
-    }
-
-    /// Prepare a statistics update for file size change
-    pub async fn prepare_size_change(
-        &self,
-        inode_id: InodeId,
-        old_size: u64,
-        new_size: u64,
-    ) -> Option<StatsUpdate<'_>> {
-        if old_size == new_size {
-            return None;
-        }
-
-        let shard_id = inode_id as usize % STATS_SHARDS;
-        let shard = &self.shards[shard_id];
-
-        let guard = shard.lock.write().await;
-
-        let mut shard_data = StatsShardData {
-            used_bytes: shard.used_bytes.load(Ordering::Relaxed),
-            used_inodes: shard.used_inodes.load(Ordering::Relaxed),
-        };
-
-        if new_size > old_size {
-            shard_data.used_bytes = shard_data.used_bytes.saturating_add(new_size - old_size);
-        } else {
-            shard_data.used_bytes = shard_data.used_bytes.saturating_sub(old_size - new_size);
-        }
-
-        Some(StatsUpdate {
-            shard_id,
-            shard_key: self.key_codec.stats_shard_key(shard_id),
-            shard_data,
-            _guard: guard,
-        })
-    }
-
-    pub fn add_to_transaction(
-        &self,
-        update: &StatsUpdate,
-        txn: &mut crate::db::Transaction,
-    ) -> Result<(), FsError> {
-        let shard_bytes = bincode::serialize(&update.shard_data)?;
-        txn.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
-
-        Ok(())
-    }
-
-    /// Commit the statistics update to memory after successful database write
-    pub fn commit_update(&self, update: &StatsUpdate) {
-        let shard = &self.shards[update.shard_id];
+    /// Make staged values the visible in-memory counters, after the batch
+    /// carrying them was written.
+    pub fn publish(&self, staged: &StagedShard) {
+        let shard = &self.shards[staged.shard_id];
         shard
             .used_bytes
-            .store(update.shard_data.used_bytes, Ordering::Relaxed);
+            .store(staged.data.used_bytes, Ordering::Relaxed);
         shard
             .used_inodes
-            .store(update.shard_data.used_inodes, Ordering::Relaxed);
+            .store(staged.data.used_inodes, Ordering::Relaxed);
     }
 
     /// Load statistics from persistent storage
@@ -195,6 +143,22 @@ mod tests {
             gid: 1000,
             gids: vec![1000],
         }
+    }
+
+    /// Read every stats shard directly from the db, decode it, and sum.
+    /// `new_in_memory` builds v2-segmented volumes, hence `KeyCodec::new(true)`.
+    async fn persisted_shard_totals(fs: &ZeroFS) -> (u64, u64) {
+        let codec = KeyCodec::new(true);
+        let mut bytes = 0u64;
+        let mut inodes = 0u64;
+        for i in 0..STATS_SHARDS {
+            if let Some(raw) = fs.db.get_bytes(&codec.stats_shard_key(i)).await.unwrap() {
+                let shard: StatsShardData = bincode::deserialize(&raw).unwrap();
+                bytes += shard.used_bytes;
+                inodes += shard.used_inodes;
+            }
+        }
+        (bytes, inodes)
     }
 
     #[tokio::test]
@@ -500,25 +464,29 @@ mod tests {
         assert_eq!(inodes, 10); // 10 files
     }
 
-    #[tokio::test]
-    async fn test_stats_sharding_distribution() {
+    #[test]
+    fn test_stage_and_publish_delta() {
         let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new(true)));
+        let shard = stats.shard_of(7);
 
-        // Create inodes and verify they're distributed across shards
-        let mut shard_counts = vec![0u32; STATS_SHARDS];
+        // Staging alone must not change the visible counters.
+        let staged = stats.stage_delta(shard, 1000, 1);
+        assert_eq!(stats.get_totals(), (0, 0));
+        stats.publish(&staged);
+        assert_eq!(stats.get_totals(), (1000, 1));
 
-        for i in 0..1000 {
-            let shard_id = i % STATS_SHARDS;
-            shard_counts[shard_id] += 1;
+        // Negative deltas saturate at zero rather than wrapping.
+        let staged = stats.stage_delta(shard, -2000, -5);
+        stats.publish(&staged);
+        assert_eq!(stats.get_totals(), (0, 0));
+    }
 
-            let update = stats.prepare_inode_create(i as u64).await;
-            assert_eq!(update.shard_id, shard_id);
-        }
-
-        // Verify reasonable distribution (all shards should have some inodes)
-        for count in &shard_counts {
-            assert!(*count > 0);
-        }
+    #[test]
+    fn test_size_delta_clamps() {
+        assert_eq!(size_delta(100, 350), 250);
+        assert_eq!(size_delta(350, 100), -250);
+        assert_eq!(size_delta(0, u64::MAX), i64::MAX);
+        assert_eq!(size_delta(u64::MAX, 0), -i64::MAX);
     }
 
     #[tokio::test]
@@ -838,5 +806,181 @@ mod tests {
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 0);
         assert_eq!(inodes_after, 1); // Only one FIFO remains
+    }
+
+    /// Persisted shard values must equal the result of applying all committed
+    /// operations, and the in-memory totals must match them, across a mix of
+    /// create / write / truncate / remove / rename-with-replacement ops.
+    #[tokio::test]
+    async fn test_stats_persisted_shards_match_totals_after_mixed_ops() {
+        use crate::fs::types::SetSize;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let auth = test_auth();
+
+        // create a (+1 inode), write 1000 bytes
+        let (a_id, _) = fs
+            .create(&creds, 0, b"a.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, a_id, 0, &Bytes::from(vec![0u8; 1000]))
+            .await
+            .unwrap();
+
+        // create b (+1 inode), write 2500 bytes
+        let (b_id, _) = fs
+            .create(&creds, 0, b"b.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, b_id, 0, &Bytes::from(vec![0u8; 2500]))
+            .await
+            .unwrap();
+
+        // truncate a to 300 (-700 bytes)
+        let setattr = SetAttributes {
+            size: SetSize::Set(300),
+            ..Default::default()
+        };
+        fs.setattr(&creds, a_id, &setattr).await.unwrap();
+
+        // create c (+1 inode), write 700 bytes
+        let (c_id, _) = fs
+            .create(&creds, 0, b"c.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, c_id, 0, &Bytes::from(vec![0u8; 700]))
+            .await
+            .unwrap();
+
+        // remove b (-1 inode, -2500 bytes)
+        fs.remove(&auth, 0, b"b.txt").await.unwrap();
+
+        // create d (+1 inode), write 4242 bytes, then rename c over d
+        // (replacement: -1 inode, -4242 bytes)
+        let (d_id, _) = fs
+            .create(&creds, 0, b"d.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, d_id, 0, &Bytes::from(vec![0u8; 4242]))
+            .await
+            .unwrap();
+        fs.rename(&auth, 0, b"c.txt", 0, b"d.txt").await.unwrap();
+
+        // mkdir (+1 inode), symlink (+1 inode); neither adds bytes
+        fs.mkdir(&creds, 0, b"dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.symlink(&creds, 0, b"link", b"/t", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        // a (300) + c-renamed-to-d (700); inodes: a, c, dir, symlink
+        let expected = (1000u64, 4u64);
+        assert_eq!(fs.global_stats.get_totals(), expected);
+        assert_eq!(persisted_shard_totals(&fs).await, expected);
+    }
+
+    /// 64 concurrent tasks create + write deterministic sizes; half remove
+    /// their file again. Both the in-memory totals and the persisted shard
+    /// sum must land on the exact expected values.
+    #[tokio::test]
+    async fn test_stats_concurrent_create_write_remove_persisted() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0u64..64 {
+            let fs = fs.clone();
+            handles.push(tokio::spawn(async move {
+                let name = format!("stress{i}.bin");
+                let creds = test_creds();
+                let auth = test_auth();
+                let (id, _) = fs
+                    .create(&creds, 0, name.as_bytes(), &SetAttributes::default())
+                    .await
+                    .unwrap();
+                let size = (i as usize + 1) * 100;
+                fs.write(&auth, id, 0, &Bytes::from(vec![0u8; size]))
+                    .await
+                    .unwrap();
+                if i % 2 == 0 {
+                    fs.remove(&auth, 0, name.as_bytes()).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Survivors are odd i with size (i+1)*100: 100 * (2+4+...+64) = 105600.
+        let expected = (105_600u64, 32u64);
+        assert_eq!(fs.global_stats.get_totals(), expected);
+        assert_eq!(persisted_shard_totals(&fs).await, expected);
+    }
+
+    /// Totals loaded by a second ZeroFS over the same backing store must match
+    /// what the first instance committed (exercises the startup load_shard
+    /// path against worker-persisted shard values).
+    #[tokio::test]
+    async fn test_stats_totals_survive_reopen() {
+        use crate::block_transformer::ZeroFsBlockTransformer;
+        use crate::config::CompressionConfig;
+        use crate::db::SlateDbHandle;
+        use slatedb::BlockTransformer;
+        use slatedb::DbBuilder;
+        use slatedb::object_store::path::Path;
+
+        let test_key = [0u8; 32];
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let block_transformer: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+
+        // Path must match `new_in_memory_read_only` so the reader finds the db.
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from("test_slatedb"), object_store.clone())
+                .with_block_transformer(block_transformer)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let fs = ZeroFS::new_with_slatedb(
+            SlateDbHandle::ReadWrite(slatedb),
+            u64::MAX,
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let creds = test_creds();
+        let auth = test_auth();
+        let (a_id, _) = fs
+            .create(&creds, 0, b"keep.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, a_id, 0, &Bytes::from(vec![0u8; 1234]))
+            .await
+            .unwrap();
+        let (b_id, _) = fs
+            .create(&creds, 0, b"gone.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.write(&auth, b_id, 0, &Bytes::from(vec![0u8; 4096]))
+            .await
+            .unwrap();
+        fs.remove(&auth, 0, b"gone.txt").await.unwrap();
+
+        let expected = (1234u64, 1u64);
+        assert_eq!(fs.global_stats.get_totals(), expected);
+
+        fs.flush_coordinator.flush().await.unwrap();
+        drop(fs);
+
+        let fs_reopened = ZeroFS::new_in_memory_read_only(object_store).await.unwrap();
+        assert_eq!(fs_reopened.global_stats.get_totals(), expected);
     }
 }
