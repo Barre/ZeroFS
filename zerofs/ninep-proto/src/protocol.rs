@@ -86,6 +86,11 @@ pub struct Qid {
     pub path: u64,
 }
 
+impl Qid {
+    /// Serialized size on the wire: type u8 + version u32 + path u64.
+    pub const WIRE_SIZE: usize = 1 + 4 + 8;
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Stat {
     pub qid: Qid,
@@ -127,6 +132,11 @@ pub struct Stat {
     pub data_version: u64,
 }
 
+impl Stat {
+    /// Serialized size on the wire: qid + three u32s + fifteen u64s.
+    pub const WIRE_SIZE: usize = Qid::WIRE_SIZE + 3 * 4 + 15 * 8;
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct P9String {
     #[deku(endian = "little", update = "self.data.len()")]
@@ -146,6 +156,11 @@ impl P9String {
     pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
         std::str::from_utf8(&self.data)
     }
+
+    /// Serialized size on the wire: u16 length prefix + bytes.
+    pub fn wire_size(&self) -> usize {
+        2 + self.data.len()
+    }
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -155,6 +170,14 @@ pub struct DirEntry {
     pub offset: u64,
     pub type_: u8,
     pub name: P9String,
+}
+
+impl DirEntry {
+    /// Serialized size on the wire, without paying for an encode pass.
+    /// Pinned to the deku layout by `wire_size_matches_serialization`.
+    pub fn wire_size(&self) -> usize {
+        Qid::WIRE_SIZE + 8 + 1 + self.name.wire_size()
+    }
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -521,6 +544,14 @@ pub struct DirEntryPlus {
     pub stat: Stat,
 }
 
+impl DirEntryPlus {
+    /// Serialized size on the wire, without paying for an encode pass.
+    /// Pinned to the deku layout by `wire_size_matches_serialization`.
+    pub fn wire_size(&self) -> usize {
+        Qid::WIRE_SIZE + 8 + 1 + self.name.wire_size() + Stat::WIRE_SIZE
+    }
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rreaddirattr {
     #[deku(endian = "little", update = "self.data.len()")]
@@ -532,7 +563,7 @@ pub struct Rreaddirattr {
 impl Rreaddirattr {
     pub fn from_entries(entries: Vec<DirEntryPlus>) -> Result<Self, DekuError> {
         use deku::DekuContainerWrite;
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(entries.iter().map(DirEntryPlus::wire_size).sum());
         for entry in entries {
             data.extend_from_slice(&entry.to_bytes()?);
         }
@@ -604,7 +635,7 @@ impl Rreaddir {
     pub fn from_entries(entries: Vec<DirEntry>) -> Result<Self, DekuError> {
         use deku::DekuContainerWrite;
 
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(entries.iter().map(DirEntry::wire_size).sum());
         for entry in entries {
             let bytes = entry.to_bytes()?;
             data.extend_from_slice(&bytes);
@@ -925,6 +956,66 @@ impl P9Message {
             type_,
             tag,
             body,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deku::DekuContainerWrite;
+
+    fn qid() -> Qid {
+        Qid {
+            type_: 0x80,
+            version: 7,
+            path: 42,
+        }
+    }
+
+    fn stat() -> Stat {
+        Stat {
+            qid: qid(),
+            mode: 0o755,
+            uid: 1000,
+            gid: 1000,
+            nlink: 2,
+            rdev: 0,
+            size: 4096,
+            blksize: 32768,
+            blocks: 8,
+            atime_sec: 1,
+            atime_nsec: 2,
+            mtime_sec: 3,
+            mtime_nsec: 4,
+            ctime_sec: 5,
+            ctime_nsec: 6,
+            btime_sec: 7,
+            btime_nsec: 8,
+            r#gen: 9,
+            data_version: 10,
+        }
+    }
+
+    #[test]
+    fn wire_size_matches_serialization() {
+        for name in [&b""[..], b"a", "h\u{e9}llo-\u{4e16}\u{754c}.txt".as_bytes()] {
+            let entry = DirEntry {
+                qid: qid(),
+                offset: 99,
+                type_: 4,
+                name: P9String::new(name.to_vec()),
+            };
+            assert_eq!(entry.wire_size(), entry.to_bytes().unwrap().len());
+
+            let plus = DirEntryPlus {
+                qid: qid(),
+                offset: 99,
+                type_: 4,
+                name: P9String::new(name.to_vec()),
+                stat: stat(),
+            };
+            assert_eq!(plus.wire_size(), plus.to_bytes().unwrap().len());
         }
     }
 }
