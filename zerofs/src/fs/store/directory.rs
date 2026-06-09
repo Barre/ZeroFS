@@ -44,8 +44,14 @@ impl DirScanValue {
     }
 }
 
+#[derive(Serialize)]
+enum DirScanValueRef<'a> {
+    WithInode { inode_id: InodeId, inode: &'a Inode },
+    Reference { inode_id: InodeId },
+}
+
 /// Encode directory scan entry value: name + DirScanValue
-fn encode_dir_scan_value(name: &[u8], value: &DirScanValue) -> Bytes {
+fn encode_dir_scan_value(name: &[u8], value: &DirScanValueRef) -> Bytes {
     let value_bytes =
         bincode::serialize(value).expect("DirScanValue serialization should not fail");
     let mut buf = Vec::with_capacity(4 + name.len() + value_bytes.len());
@@ -79,15 +85,34 @@ pub struct DirEntryInfo {
     pub inode: Option<Inode>,
 }
 
+const ENTRY_CACHE_CAPACITY: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub struct DirectoryStore {
     db: Arc<Db>,
     key_codec: Arc<KeyCodec>,
+    /// Cache of (dir_id, name) -> (entry inode id, cookie), sparing
+    /// `update_inode_in_entry` a database point-get on every file write. A
+    /// cookie is immutable for the life of its entry, so coherence only
+    /// requires that inserts and invalidations are ordered against entry
+    /// mutations; both happen exclusively under the entry inode's lock (see
+    /// `update_inode_in_entry`). Unlocked readers (the prelock lookups in
+    /// remove/rename) must never populate this cache: they can read
+    /// pre-commit state and would re-insert a value another task just
+    /// invalidated, defeating the under-lock re-verification.
+    entry_cache: foyer::Cache<(InodeId, Bytes), (InodeId, u64)>,
 }
 
 impl DirectoryStore {
     pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
-        Self { db, key_codec }
+        let entry_cache = foyer::CacheBuilder::new(ENTRY_CACHE_CAPACITY)
+            .with_name("zerofs-dir-entry-cache")
+            .build();
+        Self {
+            db,
+            key_codec,
+            entry_cache,
+        }
     }
 
     pub async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
@@ -242,15 +267,18 @@ impl DirectoryStore {
         cookie: u64,
         inode: Option<&Inode>,
     ) {
+        self.entry_cache
+            .remove(&(dir_id, Bytes::copy_from_slice(name)));
+
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
 
         let scan_value = match inode {
-            Some(inode) => DirScanValue::WithInode {
+            Some(inode) => DirScanValueRef::WithInode {
                 inode_id: entry_id,
-                inode: inode.clone(),
+                inode,
             },
-            None => DirScanValue::Reference { inode_id: entry_id },
+            None => DirScanValueRef::Reference { inode_id: entry_id },
         };
 
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
@@ -258,6 +286,9 @@ impl DirectoryStore {
     }
 
     pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
+        self.entry_cache
+            .remove(&(dir_id, Bytes::copy_from_slice(name)));
+
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
 
@@ -289,7 +320,14 @@ impl DirectoryStore {
 
     /// Update the embedded inode in a directory scan entry.
     /// Used when inode attributes change (write, setattr, etc.).
-    /// Does nothing if the entry doesn't exist (already unlinked).
+    ///
+    /// Every caller holds `inode_id`'s lock, and so does every mutator of the
+    /// entry (remove and rename lock the entry's inode), which is what lets
+    /// the cookie be served from `entry_cache`: inserts here and the
+    /// invalidations in `add`/`unlink_entry` are serialized by that lock. The
+    /// cache is only trusted (and only populated) when the entry actually
+    /// points at `inode_id`; any mismatch falls back to the database read,
+    /// preserving the uncached behavior.
     pub async fn update_inode_in_entry(
         &self,
         txn: &mut Transaction,
@@ -298,11 +336,26 @@ impl DirectoryStore {
         inode_id: InodeId,
         inode: &Inode,
     ) -> Result<(), FsError> {
-        let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
-        let scan_value = DirScanValue::WithInode {
-            inode_id,
-            inode: inode.clone(),
+        let cache_key = (dir_id, Bytes::copy_from_slice(name));
+        let cached_cookie = self
+            .entry_cache
+            .get(&cache_key)
+            .map(|entry| *entry.value())
+            .filter(|&(entry_id, _)| entry_id == inode_id)
+            .map(|(_, cookie)| cookie);
+
+        let cookie = match cached_cookie {
+            Some(cookie) => cookie,
+            None => {
+                let (entry_id, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
+                if entry_id == inode_id {
+                    self.entry_cache.insert(cache_key, (entry_id, cookie));
+                }
+                cookie
+            }
         };
+
+        let scan_value = DirScanValueRef::WithInode { inode_id, inode };
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
 
@@ -319,7 +372,7 @@ impl DirectoryStore {
         inode_id: InodeId,
     ) -> Result<(), FsError> {
         let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
-        let scan_value = DirScanValue::Reference { inode_id };
+        let scan_value = DirScanValueRef::Reference { inode_id };
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
 
