@@ -6,6 +6,13 @@ pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 /// extensions (Twalkgetattr/Treaddirattr). A stock v9fs client never sends this,
 /// so the server falls back to plain `9P2000.L` for it.
 pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.zerofs";
+/// Second-generation extension version: everything in `.zerofs` plus the
+/// compound create/open messages (Tlopenat/Tlcreateattr) and the stat-carrying
+/// replies for mkdir/symlink/mknod/link/setattr. A new client proposes this; an
+/// old server's `.zerofs` substring match makes it reply `9P2000.L.zerofs`, so
+/// the client degrades to the first-generation extensions instead of sending
+/// messages the server cannot parse.
+pub const VERSION_9P2000L_ZEROFS2: &[u8] = b"9P2000.L.zerofs2";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -560,6 +567,82 @@ pub struct Rreaddirattr {
     pub data: DekuBytes,
 }
 
+// ZeroFS-private compound messages, negotiated via "9P2000.L.zerofs2". Each
+// folds a fixed client-side sequence into one round trip:
+//
+//   Tlopenat     = Twalk(clone) + Tlopen — opens `fid`'s inode on a fresh
+//                  `newfid`, leaving `fid` untouched.
+//   Tlcreateattr = Twalk(clone) + Tlcreate + Tgetattr — creates and opens the
+//                  child on `newfid` (the directory fid is NOT mutated, unlike
+//                  Tlcreate) and returns the child's full stat.
+//
+// The remaining *attr variants reuse the standard request layout but reply
+// with the post-operation stat, which the server computes anyway and the
+// standard replies throw away (forcing the client into a follow-up getattr).
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tlopenat {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub newfid: u32,
+    #[deku(endian = "little")]
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rlopenat {
+    pub qid: Qid,
+    #[deku(endian = "little")]
+    pub iounit: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tlcreateattr {
+    #[deku(endian = "little")]
+    pub dfid: u32,
+    #[deku(endian = "little")]
+    pub newfid: u32,
+    pub name: P9String,
+    #[deku(endian = "little")]
+    pub flags: u32,
+    #[deku(endian = "little")]
+    pub mode: u32,
+    #[deku(endian = "little")]
+    pub gid: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rlcreateattr {
+    #[deku(endian = "little")]
+    pub iounit: u32,
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rmkdirattr {
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rsymlinkattr {
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rmknodattr {
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rlinkattr {
+    pub stat: Stat,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rsetattrattr {
+    pub stat: Stat,
+}
+
 impl Rreaddirattr {
     pub fn from_entries(entries: Vec<DirEntryPlus>) -> Result<Self, DekuError> {
         use deku::DekuContainerWrite;
@@ -852,6 +935,37 @@ pub enum Message {
     Tstatfs(Tstatfs),
     #[deku(id = "9")]
     Rstatfs(Rstatfs),
+    // ZeroFS-private compound extensions (ids outside the standard 9P range),
+    // negotiated via "9P2000.L.zerofs2". The *attr requests reuse the standard
+    // request layout; only their replies differ (they carry the post-op stat).
+    #[deku(id = "236")]
+    Tlopenat(Tlopenat),
+    #[deku(id = "237")]
+    Rlopenat(Rlopenat),
+    #[deku(id = "238")]
+    Tlcreateattr(Tlcreateattr),
+    #[deku(id = "239")]
+    Rlcreateattr(Rlcreateattr),
+    #[deku(id = "240")]
+    Tmkdirattr(Tmkdir),
+    #[deku(id = "241")]
+    Rmkdirattr(Rmkdirattr),
+    #[deku(id = "242")]
+    Tsymlinkattr(Tsymlink),
+    #[deku(id = "243")]
+    Rsymlinkattr(Rsymlinkattr),
+    #[deku(id = "244")]
+    Tmknodattr(Tmknod),
+    #[deku(id = "245")]
+    Rmknodattr(Rmknodattr),
+    #[deku(id = "246")]
+    Tlinkattr(Tlink),
+    #[deku(id = "247")]
+    Rlinkattr(Rlinkattr),
+    #[deku(id = "248")]
+    Tsetattrattr(Tsetattr),
+    #[deku(id = "249")]
+    Rsetattrattr(Rsetattrattr),
     // ZeroFS-private reconnect extension (ids outside the standard 9P range).
     #[deku(id = "250")]
     Trebind(Trebind),
@@ -943,6 +1057,20 @@ impl P9Message {
             Message::Rxattrwalk(_) => 31,
             Message::Tstatfs(_) => 8,
             Message::Rstatfs(_) => 9,
+            Message::Tlopenat(_) => 236,
+            Message::Rlopenat(_) => 237,
+            Message::Tlcreateattr(_) => 238,
+            Message::Rlcreateattr(_) => 239,
+            Message::Tmkdirattr(_) => 240,
+            Message::Rmkdirattr(_) => 241,
+            Message::Tsymlinkattr(_) => 242,
+            Message::Rsymlinkattr(_) => 243,
+            Message::Tmknodattr(_) => 244,
+            Message::Rmknodattr(_) => 245,
+            Message::Tlinkattr(_) => 246,
+            Message::Rlinkattr(_) => 247,
+            Message::Tsetattrattr(_) => 248,
+            Message::Rsetattrattr(_) => 249,
             Message::Trebind(_) => 250,
             Message::Rrebind(_) => 251,
             Message::Twalkgetattr(_) => 252,

@@ -298,6 +298,15 @@ fn node_name() -> Vec<u8> {
     b"zerofs-mount".to_vec()
 }
 
+/// Count a kernel lookup reference against `ino` without binding a fid, like
+/// the readdirplus path: the per-user fid is bound lazily by `user_fid` (via
+/// `Trebind`) on the first operation that needs one and never if none does.
+/// Used by the v2 fast paths, where the create-family reply already carries the
+/// child's stat and no walk takes place. Balanced by `forget`.
+fn register_lookup(inodes: &Arc<DashMap<u64, InodeEntry>>, ino: u64) {
+    inodes.entry(ino).or_default().lookup += 1;
+}
+
 /// Walk `parent_fid` to `name`, getattr the result, and register (or reuse) the
 /// inode entry, returning the child's attributes. Shared by lookup and every
 /// operation that has to return a freshly created child's entry.
@@ -544,6 +553,15 @@ impl Filesystem for Fuse9P {
                 None => {}
             }
 
+            // Fast path: the Tsetattrattr reply carries the post-op stat,
+            // replacing the setattr + getattr pair.
+            if client.extensions_v2_enabled() {
+                match client.setattr_attr(ts).await {
+                    Ok(stat) => reply.attr(&ttl, &stat_to_attr(&stat)),
+                    Err(e) => reply.error(errno(&e)),
+                }
+                return;
+            }
             if let Err(e) = client.setattr(ts).await {
                 reply.error(errno(&e));
                 return;
@@ -604,6 +622,18 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
+            // Fast path: the Tmkdirattr reply carries the new directory's stat,
+            // replacing the mkdir + walk/getattr pair (the fid binds lazily).
+            if client.extensions_v2_enabled() {
+                match client.mkdir_attr(parent_fid, &name, mode, gid).await {
+                    Ok(stat) => {
+                        register_lookup(&inodes, ino_of(stat.qid.path));
+                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
+                    }
+                    Err(e) => reply.error(errno(&e)),
+                }
+                return;
+            }
             if let Err(e) = client.mkdir(parent_fid, &name, mode, gid).await {
                 reply.error(errno(&e));
                 return;
@@ -651,6 +681,20 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
+            // Fast path: stat-carrying reply, no follow-up walk/getattr.
+            if client.extensions_v2_enabled() {
+                match client
+                    .mknod_attr(parent_fid, &name, mode, major, minor, gid)
+                    .await
+                {
+                    Ok(stat) => {
+                        register_lookup(&inodes, ino_of(stat.qid.path));
+                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
+                    }
+                    Err(e) => reply.error(errno(&e)),
+                }
+                return;
+            }
             if let Err(e) = client
                 .mknod(parent_fid, &name, mode, major, minor, gid)
                 .await
@@ -693,6 +737,17 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
+            // Fast path: stat-carrying reply, no follow-up walk/getattr.
+            if client.extensions_v2_enabled() {
+                match client.symlink_attr(parent_fid, &name, &target, gid).await {
+                    Ok(stat) => {
+                        register_lookup(&inodes, ino_of(stat.qid.path));
+                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
+                    }
+                    Err(e) => reply.error(errno(&e)),
+                }
+                return;
+            }
             if let Err(e) = client.symlink(parent_fid, &name, &target, gid).await {
                 reply.error(errno(&e));
                 return;
@@ -780,6 +835,18 @@ impl Filesystem for Fuse9P {
                 reply.error(Errno::ESTALE);
                 return;
             };
+            // Fast path: the Tlinkattr reply carries the linked inode's post-op
+            // stat (updated nlink), replacing the link + walk/getattr pair.
+            if client.extensions_v2_enabled() {
+                match client.link_attr(dir_fid, file_fid, &newname).await {
+                    Ok(stat) => {
+                        register_lookup(&inodes, ino_of(stat.qid.path));
+                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
+                    }
+                    Err(e) => reply.error(errno(&e)),
+                }
+                return;
+            }
             if let Err(e) = client.link(dir_fid, file_fid, &newname).await {
                 reply.error(errno(&e));
                 return;
@@ -1120,6 +1187,34 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
+
+            // Fast path: Tlcreateattr creates and opens the child on a fresh
+            // fid and returns its full stat in one round trip instead of the
+            // clone + lcreate + walk/getattr sequence. On error no fid was
+            // created server-side, so there is nothing to clunk.
+            if client.extensions_v2_enabled() {
+                let open_fid = client.alloc_fid();
+                match client
+                    .lcreateattr(parent_fid, open_fid, &name, lflags, mode, gid)
+                    .await
+                {
+                    Ok((stat, _iounit)) => {
+                        register_lookup(&inodes, ino_of(stat.qid.path));
+                        reply.created(
+                            &ttl,
+                            &stat_to_attr(&stat),
+                            Generation(0),
+                            FileHandle(open_fid as u64),
+                            open_flags,
+                        );
+                    }
+                    Err(e) => {
+                        client.free_fid(open_fid);
+                        reply.error(errno(&e));
+                    }
+                }
+                return;
+            }
 
             // Clone the parent fid; lcreate then turns the clone into the open
             // file handle returned to the kernel.
@@ -1511,6 +1606,25 @@ impl Fuse9P {
                     return;
                 }
             };
+            // Fast path: Tlopenat opens the inode on a fresh fid in one round
+            // trip instead of the clone + lopen pair. On error no fid was
+            // created server-side, so there is nothing to clunk.
+            if client.extensions_v2_enabled() {
+                let fid = client.alloc_fid();
+                let mut res = client.lopenat(inode_fid, fid, lflags).await;
+                if res.is_err() && upgrade {
+                    res = client.lopenat(inode_fid, fid, orig).await;
+                }
+                match res {
+                    Ok(_) => reply.opened(FileHandle(fid as u64), open_flags),
+                    Err(e) => {
+                        client.free_fid(fid);
+                        reply.error(errno(&e));
+                    }
+                }
+                return;
+            }
+
             let fid = client.alloc_fid();
             if let Err(e) = client.walk(inode_fid, fid, &[]).await {
                 client.free_fid(fid);
@@ -2025,6 +2139,182 @@ mod client_tests {
         client.free_fid(od);
 
         shutdown.cancel();
+    }
+
+    /// The v2 compound extensions: `lcreateattr` creates+opens+stats in one
+    /// message without consuming the directory fid, `lopenat` opens on a fresh
+    /// fid leaving its source untouched, and the *attr create-family/setattr
+    /// replies carry stats that match a separate walk+getattr.
+    #[tokio::test]
+    async fn compound_create_open_and_attr_replies() {
+        let (client, shutdown, _dir, _sock) = setup().await;
+        assert!(
+            client.extensions_v2_enabled(),
+            "server should negotiate the .zerofs2 extensions"
+        );
+
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        // lcreateattr: the root fid stays usable afterwards (it is not turned
+        // into the open file like Tlcreate would).
+        let f = client.alloc_fid();
+        let (stat, _iounit) = client
+            .lcreateattr(
+                ROOT_FID_TEST,
+                f,
+                b"file.txt",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stat.mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(stat.size, 0);
+        assert_eq!(client.write(f, 0, b"hello").await.unwrap(), 5);
+        assert_eq!(client.read(f, 0, 64).await.unwrap(), b"hello");
+
+        // The returned stat must agree with a fresh walk+getattr.
+        let wf = client.alloc_fid();
+        let (_, wstat) = client
+            .walk_getattr(ROOT_FID_TEST, wf, &[b"file.txt".as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(wstat.qid.path, stat.qid.path);
+        assert_eq!(wstat.size, 5);
+
+        // lopenat: the source fid stays unopened, so it can serve repeatedly.
+        for _ in 0..2 {
+            let of = client.alloc_fid();
+            let (qid, _) = client.lopenat(wf, of, libc::O_RDONLY as u32).await.unwrap();
+            assert_eq!(qid.path, stat.qid.path);
+            assert_eq!(client.read(of, 0, 64).await.unwrap(), b"hello");
+            client.clunk(of).await.unwrap();
+            client.free_fid(of);
+        }
+
+        // setattr_attr returns the post-op stat.
+        let post = client
+            .setattr_attr(Tsetattr {
+                fid: wf,
+                valid: SETATTR_MODE,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                atime_sec: 0,
+                atime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(post.mode & 0o7777, 0o600);
+        assert_eq!(post.qid.path, stat.qid.path);
+
+        // The remaining create-family fast paths reply with full stats.
+        let dstat = client
+            .mkdir_attr(ROOT_FID_TEST, b"dir", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        assert_eq!(dstat.mode & libc::S_IFMT, libc::S_IFDIR);
+
+        let sstat = client
+            .symlink_attr(ROOT_FID_TEST, b"sym", b"file.txt", 0)
+            .await
+            .unwrap();
+        assert_eq!(sstat.mode & libc::S_IFMT, libc::S_IFLNK);
+
+        let nstat = client
+            .mknod_attr(ROOT_FID_TEST, b"fifo", libc::S_IFIFO | 0o644, 0, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(nstat.mode & libc::S_IFMT, libc::S_IFIFO);
+
+        let lstat = client
+            .link_attr(ROOT_FID_TEST, wf, b"hardlink")
+            .await
+            .unwrap();
+        assert_eq!(lstat.qid.path, stat.qid.path);
+        assert_eq!(lstat.nlink, 2);
+
+        client.clunk(wf).await.unwrap();
+        client.free_fid(wf);
+        client.clunk(f).await.unwrap();
+        client.free_fid(f);
+        shutdown.cancel();
+    }
+
+    /// Fids created through the v2 compound messages must be recorded for
+    /// reconnect replay exactly like their multi-message equivalents: both an
+    /// lcreateattr handle and an lopenat handle survive a server restart.
+    #[tokio::test]
+    async fn reconnect_replays_compound_fids() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("compound.9p.sock");
+
+        let shutdown = start_server(Arc::clone(&fs), sock.clone());
+        let client = connect_with_retry(&sock).await;
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        let created = client.alloc_fid();
+        client
+            .lcreateattr(
+                ROOT_FID_TEST,
+                created,
+                b"c.txt",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        client.write(created, 0, b"compound").await.unwrap();
+
+        // A second open handle on the same inode via lopenat from a path fid.
+        let pf = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, pf, &[b"c.txt".as_ref()])
+            .await
+            .unwrap();
+        let opened = client.alloc_fid();
+        client
+            .lopenat(pf, opened, libc::O_RDONLY as u32)
+            .await
+            .unwrap();
+
+        // Drop the server and bring a new one up on the same socket.
+        shutdown.cancel();
+        for _ in 0..200 {
+            if UnixStream::connect(&sock).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_file(&sock);
+        let shutdown2 = start_server(Arc::clone(&fs), sock.clone());
+
+        let data = tokio::time::timeout(Duration::from_secs(10), client.read(created, 0, 64))
+            .await
+            .expect("read timed out waiting for reconnect")
+            .expect("lcreateattr fid lost across reconnect");
+        assert_eq!(data, b"compound");
+        let data = tokio::time::timeout(Duration::from_secs(10), client.read(opened, 0, 64))
+            .await
+            .expect("read timed out waiting for reconnect")
+            .expect("lopenat fid lost across reconnect");
+        assert_eq!(data, b"compound");
+
+        client.clunk(created).await.unwrap();
+        client.clunk(opened).await.unwrap();
+        shutdown2.cancel();
     }
 
     /// Two independent connections (= two server sessions) must see each other's
