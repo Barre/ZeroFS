@@ -344,6 +344,7 @@ fn start_periodic_flush(
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     disk_bytes: usize,
+    foyer_handle: &tokio::runtime::Handle,
 ) -> Result<foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>> {
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
@@ -360,7 +361,7 @@ pub(crate) async fn build_parts_hybrid(
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
-        .with_spawner(Spawner::current())
+        .with_spawner(Spawner::from(foyer_handle.clone()))
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(
             BlockEngineConfig::new(
@@ -404,7 +405,11 @@ pub async fn build_slatedb(
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     segments_enabled: bool,
-) -> Result<(SlateDbHandle, Option<Arc<DefaultMetricsRecorder>>)> {
+) -> Result<(
+    SlateDbHandle,
+    Option<tokio::runtime::Handle>,
+    Option<Arc<DefaultMetricsRecorder>>,
+)> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -468,6 +473,23 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
+    // Dedicated runtime for maintenance work (foyer cache I/O, slatedb GC,
+    // compactions, ZeroFS GC) so it doesn't compete with the serving runtime.
+    // The runtime is moved onto a parked thread and lives for the rest of the
+    // process; dropping it here would panic inside an async context.
+    let maintenance_runtime = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("zerofs-maintenance")
+            .build()
+            .expect("failed to build maintenance runtime");
+        let handle = rt.handle().clone();
+        std::thread::spawn(move || {
+            rt.block_on(std::future::pending::<()>());
+        });
+        handle
+    };
+
     let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
     tokio::fs::create_dir_all(&hybrid_cache_root)
         .await
@@ -484,7 +506,7 @@ pub async fn build_slatedb(
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
         .storage()
-        .with_spawner(Spawner::current())
+        .with_spawner(Spawner::from(maintenance_runtime.clone()))
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(
             BlockEngineConfig::new(
@@ -500,7 +522,12 @@ pub async fn build_slatedb(
         .map_err(|e| anyhow::anyhow!("foyer hybrid build failed: {e}"))?;
     let cache = Arc::new(FoyerHybridCache::new_with_cache(hybrid));
 
-    let parts_cache = build_parts_hybrid(&cache_config.root_folder, parts_disk_bytes).await?;
+    let parts_cache = build_parts_hybrid(
+        &cache_config.root_folder,
+        parts_disk_bytes,
+        &maintenance_runtime,
+    )
+    .await?;
 
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(LengthCheckedObjectStore::new(object_store));
@@ -524,7 +551,7 @@ pub async fn build_slatedb(
 
             let mut builder = DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_settings(settings)
-                .with_gc_runtime(tokio::runtime::Handle::current())
+                .with_gc_runtime(maintenance_runtime.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
@@ -549,7 +576,7 @@ pub async fn build_slatedb(
                     }
                     .into();
                 let compactor = CompactorBuilder::new(db_path, compactor_object_store)
-                    .with_runtime(tokio::runtime::Handle::current())
+                    .with_runtime(maintenance_runtime.clone())
                     .with_filter_policies(crate::fs::filter_policy::filter_policies(
                         segments_enabled,
                     ))
@@ -572,7 +599,11 @@ pub async fn build_slatedb(
                     .context("Failed to build SlateDB instance")?,
             );
 
-            Ok((SlateDbHandle::ReadWrite(slatedb), Some(metrics_recorder)))
+            Ok((
+                SlateDbHandle::ReadWrite(slatedb),
+                Some(maintenance_runtime),
+                Some(metrics_recorder),
+            ))
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
@@ -590,7 +621,7 @@ pub async fn build_slatedb(
                     .context("Failed to open database in read-only mode")?,
             );
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
@@ -609,7 +640,7 @@ pub async fn build_slatedb(
                     .context("Failed to open database from checkpoint")?,
             );
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None))
+            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
         }
     }
 }
@@ -620,6 +651,7 @@ pub struct InitResult {
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
+    pub maintenance_runtime: Option<tokio::runtime::Handle>,
 }
 
 async fn initialize_filesystem(
@@ -718,7 +750,7 @@ async fn initialize_filesystem(
         info!("Segment-oriented compaction disabled; using legacy v1 key layout");
     }
 
-    let (slatedb, metrics_recorder) = build_slatedb(
+    let (slatedb, maintenance_runtime, metrics_recorder) = build_slatedb(
         object_store.clone(),
         &cache_config,
         actual_db_path.clone(),
@@ -750,6 +782,7 @@ async fn initialize_filesystem(
         wal_object_store,
         db_path: actual_db_path.to_string(),
         db_handle,
+        maintenance_runtime,
     })
 }
 
@@ -882,7 +915,7 @@ pub async fn run_server(
             fs.chunk_store.clone(),
             Arc::clone(&fs.stats),
         ));
-        Some(gc.start(shutdown.clone()))
+        Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
     } else {
         None
     };

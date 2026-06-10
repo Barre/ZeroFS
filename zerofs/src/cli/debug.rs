@@ -71,7 +71,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     )
     .await?;
 
-    let (slatedb, _) = super::server::build_slatedb(
+    let (slatedb, _, _) = super::server::build_slatedb(
         object_store,
         &cache_config,
         actual_db_path,
