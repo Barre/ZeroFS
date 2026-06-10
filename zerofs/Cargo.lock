@@ -5546,7 +5546,6 @@ dependencies = [
  "dashmap",
  "deku",
  "fail",
- "fastant",
  "foyer",
  "fuser",
  "futures",

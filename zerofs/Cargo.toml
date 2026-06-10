@@ -48,7 +48,6 @@ slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "118e54490f727bd
     "wal_disable",
 ] }
 slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "118e54490f727bd848d895ec59df4a65ad21b7d9" }
-fastant = "0.1.11"
 zerofs_nfsserve = "0.19.1"
 tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = [
