@@ -204,6 +204,13 @@ impl NinePHandler {
             Message::Trebind(tr) => self.rebind(tr).await,
             Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
+            Message::Tlopenat(tl) => self.lopenat(tl).await,
+            Message::Tlcreateattr(tc) => self.lcreateattr(tc).await,
+            Message::Tmkdirattr(tm) => self.mkdir_attr(tm).await,
+            Message::Tsymlinkattr(ts) => self.symlink_attr(ts).await,
+            Message::Tmknodattr(tm) => self.mknod_attr(tm).await,
+            Message::Tlinkattr(tl) => self.link_attr(tl).await,
+            Message::Tsetattrattr(ts) => self.setattr_attr(ts).await,
             _ => Err(P9Error::NotImplemented),
         };
 
@@ -242,10 +249,14 @@ impl NinePHandler {
         let msize = tv.msize.min(P9_MAX_MSIZE);
         self.session.msize.store(msize, AtomicOrdering::Relaxed);
 
-        // Advertise the ZeroFS fast-path extensions only if the client asked for
-        // them (proposed `9P2000.L.zerofs`). v9fs proposes plain `9P2000.L`, so it
-        // gets the plain reply and the extension handlers are not used.
-        let version = if version_str.contains(".zerofs") {
+        // Advertise the highest ZeroFS extension level the client asked for
+        // v9fs proposes plain `9P2000.L`, so it gets
+        // the plain reply and the extension handlers are not used. An old client
+        // proposing `.zerofs` gets `.zerofs` back and never sends the compound
+        // messages.
+        let version = if version_str.contains(".zerofs2") {
+            VERSION_9P2000L_ZEROFS2
+        } else if version_str.contains(".zerofs") {
             VERSION_9P2000L_ZEROFS
         } else {
             VERSION_9P2000L
@@ -517,6 +528,38 @@ impl NinePHandler {
         }))
     }
 
+    // ZeroFS fast path: open `fid`'s inode on a fresh `newfid`, leaving `fid`
+    // untouched, so the client's open costs one round trip instead of the
+    // Twalk(clone) + Tlopen pair that standard Tlopen's fid-mutating semantics
+    // force on it.
+    async fn lopenat(&self, tl: Tlopenat) -> P9Result<Message> {
+        let src_fid = self.get_fid(tl.fid)?;
+
+        if tl.newfid != tl.fid && self.session.fids.contains_key(&tl.newfid) {
+            return Err(P9Error::FidInUse);
+        }
+
+        let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
+        let qid = inode_to_qid(&inode, src_fid.inode_id);
+
+        self.session.fids.insert(
+            tl.newfid,
+            Fid {
+                path: src_fid.path.clone(),
+                inode_id: src_fid.inode_id,
+                qid: qid.clone(),
+                opened: true,
+                mode: Some(tl.flags),
+                creds: src_fid.creds,
+            },
+        );
+
+        Ok(Message::Rlopenat(Rlopenat {
+            qid,
+            iounit: self.iounit(),
+        }))
+    }
+
     async fn clunk(&self, tc: Tclunk) -> Message {
         if let Some((_, fid_entry)) = self.session.fids.remove(&tc.fid) {
             self.lock_manager
@@ -623,6 +666,32 @@ impl NinePHandler {
         ))
     }
 
+    /// Create a regular file under `parent_fid`, returning the new inode's id
+    /// and post-op attributes. Shared by Tlcreate and Tlcreateattr.
+    async fn create_child(
+        &self,
+        parent_fid: &Fid,
+        name: &[u8],
+        mode: u32,
+        client_gid: u32,
+    ) -> P9Result<(InodeId, FileAttributes)> {
+        let gid = self.effective_gid(client_gid, &parent_fid.creds);
+        Ok(self
+            .filesystem
+            .create(
+                &parent_fid.creds.with_gid(gid),
+                parent_fid.inode_id,
+                name,
+                &SetAttributes {
+                    mode: SetMode::Set(mode),
+                    uid: SetUid::Set(parent_fid.creds.uid),
+                    gid: SetGid::Set(gid),
+                    ..Default::default()
+                },
+            )
+            .await?)
+    }
+
     async fn lcreate(&self, tc: Tlcreate) -> P9Result<Message> {
         let parent_fid = self.get_fid(tc.fid)?;
 
@@ -630,20 +699,8 @@ impl NinePHandler {
             return Err(P9Error::FidAlreadyOpen);
         }
 
-        let gid = self.effective_gid(tc.gid, &parent_fid.creds);
         let (child_id, post_attr) = self
-            .filesystem
-            .create(
-                &parent_fid.creds.with_gid(gid),
-                parent_fid.inode_id,
-                &tc.name.data,
-                &SetAttributes {
-                    mode: SetMode::Set(tc.mode),
-                    uid: SetUid::Set(parent_fid.creds.uid),
-                    gid: SetGid::Set(gid),
-                    ..Default::default()
-                },
-            )
+            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid)
             .await?;
 
         let qid = attrs_to_qid(&post_attr, child_id);
@@ -658,6 +715,40 @@ impl NinePHandler {
         Ok(Message::Rlcreate(Rlcreate {
             qid,
             iounit: self.iounit(),
+        }))
+    }
+
+    // ZeroFS fast path: Tlcreate + the follow-up walk/getattr in one round trip.
+    // Unlike Tlcreate, the directory fid is NOT mutated; the created file is
+    // opened on `newfid` and the reply carries its full post-op stat.
+    async fn lcreateattr(&self, tc: Tlcreateattr) -> P9Result<Message> {
+        let parent_fid = self.get_fid(tc.dfid)?;
+
+        if tc.newfid != tc.dfid && self.session.fids.contains_key(&tc.newfid) {
+            return Err(P9Error::FidInUse);
+        }
+
+        let (child_id, post_attr) = self
+            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid)
+            .await?;
+
+        let mut path = parent_fid.path.clone();
+        path.push(Bytes::from(tc.name.data));
+        self.session.fids.insert(
+            tc.newfid,
+            Fid {
+                path,
+                inode_id: child_id,
+                qid: attrs_to_qid(&post_attr, child_id),
+                opened: true,
+                mode: Some(tc.flags),
+                creds: parent_fid.creds,
+            },
+        );
+
+        Ok(Message::Rlcreateattr(Rlcreateattr {
+            iounit: self.iounit(),
+            stat: attrs_to_stat(&post_attr, child_id),
         }))
     }
 
@@ -741,7 +832,24 @@ impl NinePHandler {
         Ok(Message::Rsetattr(Rsetattr))
     }
 
-    async fn mkdir(&self, tm: Tmkdir) -> P9Result<Message> {
+    // ZeroFS fast path: Tsetattr whose reply carries the post-op stat (which the
+    // filesystem computes anyway), sparing the client its follow-up Tgetattr.
+    async fn setattr_attr(&self, ts: Tsetattr) -> P9Result<Message> {
+        let fid_entry = self.get_fid(ts.fid)?;
+        let attr = SetAttributes::from(&ts);
+
+        let post_attr = self
+            .filesystem
+            .setattr(&fid_entry.creds, fid_entry.inode_id, &attr)
+            .await?;
+        Ok(Message::Rsetattrattr(Rsetattrattr {
+            stat: attrs_to_stat(&post_attr, fid_entry.inode_id),
+        }))
+    }
+
+    /// The body of Tmkdir, returning the new directory's id and post-op
+    /// attributes. Shared by Tmkdir and Tmkdirattr.
+    async fn make_dir(&self, tm: &Tmkdir) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         debug!(
@@ -756,7 +864,7 @@ impl NinePHandler {
         );
 
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
-        let (new_id, post_attr) = self
+        Ok(self
             .filesystem
             .mkdir(
                 &parent_fid.creds.with_gid(gid),
@@ -769,17 +877,30 @@ impl NinePHandler {
                     ..Default::default()
                 },
             )
-            .await?;
-
-        let qid = attrs_to_qid(&post_attr, new_id);
-        Ok(Message::Rmkdir(Rmkdir { qid }))
+            .await?)
     }
 
-    async fn symlink(&self, ts: Tsymlink) -> P9Result<Message> {
+    async fn mkdir(&self, tm: Tmkdir) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_dir(&tm).await?;
+        Ok(Message::Rmkdir(Rmkdir {
+            qid: attrs_to_qid(&post_attr, new_id),
+        }))
+    }
+
+    async fn mkdir_attr(&self, tm: Tmkdir) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_dir(&tm).await?;
+        Ok(Message::Rmkdirattr(Rmkdirattr {
+            stat: attrs_to_stat(&post_attr, new_id),
+        }))
+    }
+
+    /// The body of Tsymlink, returning the new link's id and post-op
+    /// attributes. Shared by Tsymlink and Tsymlinkattr.
+    async fn make_symlink(&self, ts: &Tsymlink) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(ts.dfid)?;
 
         let gid = self.effective_gid(ts.gid, &parent_fid.creds);
-        let (new_id, post_attr) = self
+        Ok(self
             .filesystem
             .symlink(
                 &parent_fid.creds.with_gid(gid),
@@ -793,13 +914,26 @@ impl NinePHandler {
                     ..Default::default()
                 },
             )
-            .await?;
-
-        let qid = attrs_to_qid(&post_attr, new_id);
-        Ok(Message::Rsymlink(Rsymlink { qid }))
+            .await?)
     }
 
-    async fn mknod(&self, tm: Tmknod) -> P9Result<Message> {
+    async fn symlink(&self, ts: Tsymlink) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_symlink(&ts).await?;
+        Ok(Message::Rsymlink(Rsymlink {
+            qid: attrs_to_qid(&post_attr, new_id),
+        }))
+    }
+
+    async fn symlink_attr(&self, ts: Tsymlink) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_symlink(&ts).await?;
+        Ok(Message::Rsymlinkattr(Rsymlinkattr {
+            stat: attrs_to_stat(&post_attr, new_id),
+        }))
+    }
+
+    /// The body of Tmknod, returning the new node's id and post-op attributes.
+    /// Shared by Tmknod and Tmknodattr.
+    async fn make_node(&self, tm: &Tmknod) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         let file_type = tm.mode & 0o170000; // S_IFMT
@@ -812,7 +946,7 @@ impl NinePHandler {
         };
 
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
-        let (child_id, post_attr) = self
+        Ok(self
             .filesystem
             .mknod(
                 &parent_fid.creds.with_gid(gid),
@@ -830,10 +964,20 @@ impl NinePHandler {
                     _ => None,
                 },
             )
-            .await?;
+            .await?)
+    }
 
+    async fn mknod(&self, tm: Tmknod) -> P9Result<Message> {
+        let (child_id, post_attr) = self.make_node(&tm).await?;
         Ok(Message::Rmknod(Rmknod {
             qid: attrs_to_qid(&post_attr, child_id),
+        }))
+    }
+
+    async fn mknod_attr(&self, tm: Tmknod) -> P9Result<Message> {
+        let (child_id, post_attr) = self.make_node(&tm).await?;
+        Ok(Message::Rmknodattr(Rmknodattr {
+            stat: attrs_to_stat(&post_attr, child_id),
         }))
     }
 
@@ -850,7 +994,9 @@ impl NinePHandler {
         }
     }
 
-    async fn link(&self, tl: Tlink) -> P9Result<Message> {
+    /// The body of Tlink, returning the linked inode's id. Shared by Tlink and
+    /// Tlinkattr.
+    async fn make_link(&self, tl: &Tlink) -> P9Result<InodeId> {
         let dir_fid = self.get_fid(tl.dfid)?;
         let file_fid = self.get_fid(tl.fid)?;
 
@@ -870,7 +1016,20 @@ impl NinePHandler {
             .link(&auth, file_id, dir_id, name_bytes)
             .await?;
 
+        Ok(file_id)
+    }
+
+    async fn link(&self, tl: Tlink) -> P9Result<Message> {
+        self.make_link(&tl).await?;
         Ok(Message::Rlink(Rlink))
+    }
+
+    async fn link_attr(&self, tl: Tlink) -> P9Result<Message> {
+        let file_id = self.make_link(&tl).await?;
+        let inode = self.filesystem.inode_store.get(file_id).await?;
+        Ok(Message::Rlinkattr(Rlinkattr {
+            stat: inode_to_stat(&inode, file_id),
+        }))
     }
 
     async fn rename(&self, tr: Trename) -> P9Result<Message> {
@@ -1261,7 +1420,8 @@ mod tests {
             other => panic!("expected Rversion, got {other:?}"),
         }
 
-        // A ZeroFS client opts in via the .zerofs suffix and gets it echoed back.
+        // An older ZeroFS client opts in via the .zerofs suffix and gets exactly
+        // that echoed back not the newer .zerofs2 it doesn't understand.
         let resp = handler
             .handle_message(
                 0,
@@ -1273,6 +1433,21 @@ mod tests {
             .await;
         match resp.body {
             Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS),
+            other => panic!("expected Rversion, got {other:?}"),
+        }
+
+        // A current client proposes .zerofs2 and gets the full extension set.
+        let resp = handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L_ZEROFS2.to_vec()),
+                }),
+            )
+            .await;
+        match resp.body {
+            Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS2),
             other => panic!("expected Rversion, got {other:?}"),
         }
     }

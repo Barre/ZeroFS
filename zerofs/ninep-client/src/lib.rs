@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -176,9 +176,11 @@ pub struct NinePClient {
     /// Negotiated message size (the smaller of what we asked for and what the
     /// server can handle).
     msize: AtomicU32,
-    /// True when the server advertised the `9P2000.L.zerofs` fast-path
-    /// extensions (Twalkgetattr/Treaddirattr). Re-negotiated on reconnect.
-    extensions: AtomicBool,
+    /// Negotiated ZeroFS extension level, re-negotiated on reconnect:
+    /// 0 = plain 9P2000.L, 1 = `.zerofs` (Twalkgetattr/Treaddirattr),
+    /// 2 = `.zerofs2` (additionally the compound create/open messages and the
+    /// stat-carrying create-family/setattr replies).
+    extensions: AtomicU8,
     /// Monotonic fid allocator, with a free list for reuse.
     fid_ctr: AtomicU32,
     fid_free: Mutex<Vec<u32>>,
@@ -217,7 +219,7 @@ impl NinePClient {
             live_notify: Notify::new(),
             reconnect_notify,
             msize: AtomicU32::new(msize),
-            extensions: AtomicBool::new(extensions),
+            extensions: AtomicU8::new(extensions),
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
@@ -232,7 +234,7 @@ impl NinePClient {
         target: &Target,
         requested_msize: u32,
         reconnect_notify: Arc<Notify>,
-    ) -> ClientResult<(Arc<Conn>, u32, bool)> {
+    ) -> ClientResult<(Arc<Conn>, u32, u8)> {
         let (read, write) = dial(target).await?;
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(P9_CHANNEL_SIZE);
         let conn = Arc::new(Conn {
@@ -402,7 +404,15 @@ impl NinePClient {
     /// Whether the server negotiated the ZeroFS fast-path extensions
     /// (`walk_getattr`/`readdirplus`).
     pub fn extensions_enabled(&self) -> bool {
-        self.extensions.load(Ordering::Relaxed)
+        self.extensions.load(Ordering::Relaxed) >= 1
+    }
+
+    /// Whether the server negotiated the second-generation extensions: the
+    /// compound create/open messages (`lopenat`/`lcreateattr`) and the
+    /// stat-carrying replies (`mkdir_attr`/`symlink_attr`/`mknod_attr`/
+    /// `link_attr`/`setattr_attr`).
+    pub fn extensions_v2_enabled(&self) -> bool {
+        self.extensions.load(Ordering::Relaxed) >= 2
     }
 
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
@@ -731,6 +741,16 @@ impl NinePClient {
         }
     }
 
+    /// Like [`Self::setattr`] but the reply carries the post-op stat, sparing
+    /// the follow-up getattr. Only valid when the server negotiated the v2
+    /// extensions ([`Self::extensions_v2_enabled`]).
+    pub async fn setattr_attr(&self, ts: Tsetattr) -> ClientResult<Stat> {
+        match self.rpc(Message::Tsetattrattr(ts)).await? {
+            Message::Rsetattrattr(r) => Ok(r.stat),
+            _ => Err(ClientError::Unexpected("setattr_attr")),
+        }
+    }
+
     pub async fn lopen(&self, fid: u32, flags: u32) -> ClientResult<(Qid, u32)> {
         match self.rpc(Message::Tlopen(Tlopen { fid, flags })).await? {
             Message::Rlopen(r) => {
@@ -740,6 +760,36 @@ impl NinePClient {
                 Ok((r.qid, r.iounit))
             }
             _ => Err(ClientError::Unexpected("lopen")),
+        }
+    }
+
+    /// Open `fid`'s inode on a fresh `newfid` in one round trip (the server's
+    /// Tlopenat fast path), replacing the Twalk(clone) + Tlopen pair. `fid` is
+    /// left untouched. Records `newfid` exactly as that pair would, so reconnect
+    /// replay (rebind + reopen) is unchanged. Only valid when the server
+    /// negotiated the v2 extensions ([`Self::extensions_v2_enabled`]).
+    pub async fn lopenat(&self, fid: u32, newfid: u32, flags: u32) -> ClientResult<(Qid, u32)> {
+        let resp = self
+            .rpc(Message::Tlopenat(Tlopenat { fid, newfid, flags }))
+            .await?;
+        match resp {
+            Message::Rlopenat(r) => {
+                let mut st = self.state.lock().unwrap();
+                if let Some(n_uname) = st.fids.get(&fid).map(FidRecord::n_uname) {
+                    st.fids.insert(
+                        newfid,
+                        FidRecord {
+                            kind: FidKind::Inode {
+                                inode_id: r.qid.path,
+                                n_uname,
+                            },
+                            opened: Some(flags),
+                        },
+                    );
+                }
+                Ok((r.qid, r.iounit))
+            }
+            _ => Err(ClientError::Unexpected("lopenat")),
         }
     }
 
@@ -777,6 +827,55 @@ impl NinePClient {
                 Ok((r.qid, r.iounit))
             }
             _ => Err(ClientError::Unexpected("lcreate")),
+        }
+    }
+
+    /// Create and open `name` under `dfid` and return its full post-op stat, all
+    /// in one round trip (the server's Tlcreateattr fast path), replacing the
+    /// Twalk(clone) + Tlcreate + Tgetattr sequence. Unlike [`Self::lcreate`],
+    /// `dfid` is left untouched: the created file is opened on `newfid`. Only
+    /// valid when the server negotiated the v2 extensions
+    /// ([`Self::extensions_v2_enabled`]).
+    pub async fn lcreateattr(
+        &self,
+        dfid: u32,
+        newfid: u32,
+        name: &[u8],
+        flags: u32,
+        mode: u32,
+        gid: u32,
+    ) -> ClientResult<(Stat, u32)> {
+        let resp = self
+            .rpc(Message::Tlcreateattr(Tlcreateattr {
+                dfid,
+                newfid,
+                name: P9String::new(name.to_vec()),
+                flags,
+                mode,
+                gid,
+            }))
+            .await?;
+        match resp {
+            Message::Rlcreateattr(r) => {
+                // Record `newfid` for replay like `lcreate`: rebind to the new
+                // inode and reopen with the create-only bits stripped.
+                let reopen = flags & !((libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC) as u32);
+                let mut st = self.state.lock().unwrap();
+                if let Some(n_uname) = st.fids.get(&dfid).map(FidRecord::n_uname) {
+                    st.fids.insert(
+                        newfid,
+                        FidRecord {
+                            kind: FidKind::Inode {
+                                inode_id: r.stat.qid.path,
+                                n_uname,
+                            },
+                            opened: Some(reopen),
+                        },
+                    );
+                }
+                Ok((r.stat, r.iounit))
+            }
+            _ => Err(ClientError::Unexpected("lcreateattr")),
         }
     }
 
@@ -887,6 +986,30 @@ impl NinePClient {
         }
     }
 
+    /// Like [`Self::mkdir`] but the reply carries the new directory's full stat,
+    /// sparing the follow-up walk + getattr. Only valid when the server
+    /// negotiated the v2 extensions ([`Self::extensions_v2_enabled`]).
+    pub async fn mkdir_attr(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        gid: u32,
+    ) -> ClientResult<Stat> {
+        let resp = self
+            .rpc(Message::Tmkdirattr(Tmkdir {
+                dfid,
+                name: P9String::new(name.to_vec()),
+                mode,
+                gid,
+            }))
+            .await?;
+        match resp {
+            Message::Rmkdirattr(r) => Ok(r.stat),
+            _ => Err(ClientError::Unexpected("mkdir_attr")),
+        }
+    }
+
     pub async fn symlink(
         &self,
         dfid: u32,
@@ -905,6 +1028,30 @@ impl NinePClient {
         match resp {
             Message::Rsymlink(r) => Ok(r.qid),
             _ => Err(ClientError::Unexpected("symlink")),
+        }
+    }
+
+    /// Like [`Self::symlink`] but the reply carries the new link's full stat.
+    /// Only valid when the server negotiated the v2 extensions
+    /// ([`Self::extensions_v2_enabled`]).
+    pub async fn symlink_attr(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        target: &[u8],
+        gid: u32,
+    ) -> ClientResult<Stat> {
+        let resp = self
+            .rpc(Message::Tsymlinkattr(Tsymlink {
+                dfid,
+                name: P9String::new(name.to_vec()),
+                symtgt: P9String::new(target.to_vec()),
+                gid,
+            }))
+            .await?;
+        match resp {
+            Message::Rsymlinkattr(r) => Ok(r.stat),
+            _ => Err(ClientError::Unexpected("symlink_attr")),
         }
     }
 
@@ -933,6 +1080,34 @@ impl NinePClient {
         }
     }
 
+    /// Like [`Self::mknod`] but the reply carries the new node's full stat.
+    /// Only valid when the server negotiated the v2 extensions
+    /// ([`Self::extensions_v2_enabled`]).
+    pub async fn mknod_attr(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+    ) -> ClientResult<Stat> {
+        let resp = self
+            .rpc(Message::Tmknodattr(Tmknod {
+                dfid,
+                name: P9String::new(name.to_vec()),
+                mode,
+                major,
+                minor,
+                gid,
+            }))
+            .await?;
+        match resp {
+            Message::Rmknodattr(r) => Ok(r.stat),
+            _ => Err(ClientError::Unexpected("mknod_attr")),
+        }
+    }
+
     pub async fn readlink(&self, fid: u32) -> ClientResult<Vec<u8>> {
         match self.rpc(Message::Treadlink(Treadlink { fid })).await? {
             Message::Rreadlink(r) => Ok(r.target.data),
@@ -951,6 +1126,23 @@ impl NinePClient {
         match resp {
             Message::Rlink(_) => Ok(()),
             _ => Err(ClientError::Unexpected("link")),
+        }
+    }
+
+    /// Like [`Self::link`] but the reply carries the linked inode's post-op
+    /// stat (with its updated nlink). Only valid when the server negotiated the
+    /// v2 extensions ([`Self::extensions_v2_enabled`]).
+    pub async fn link_attr(&self, dfid: u32, fid: u32, name: &[u8]) -> ClientResult<Stat> {
+        let resp = self
+            .rpc(Message::Tlinkattr(Tlink {
+                dfid,
+                fid,
+                name: P9String::new(name.to_vec()),
+            }))
+            .await?;
+        match resp {
+            Message::Rlinkattr(r) => Ok(r.stat),
+            _ => Err(ClientError::Unexpected("link_attr")),
         }
     }
 
@@ -1138,16 +1330,18 @@ async fn dial(
 }
 
 /// Run the Tversion handshake on a freshly opened connection, returning the
-/// negotiated msize.
-async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, bool)> {
+/// negotiated msize and extension level.
+async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
     // Tversion must carry NOTAG (0xFFFF) per the spec and v9fs. Propose the
-    // ZeroFS extension version; a server that doesn't understand it strips the
-    // suffix and replies plain `9P2000.L`, which disables the fast paths.
+    // newest ZeroFS extension version; an older ZeroFS server matches the
+    // `.zerofs` substring and replies `9P2000.L.zerofs` (first-generation
+    // extensions only), and a foreign server replies plain `9P2000.L`, which
+    // disables the fast paths entirely.
     let (otx, orx) = oneshot::channel();
     conn.pending.insert(NOTAG, otx);
     let body = Message::Tversion(Tversion {
         msize: requested,
-        version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+        version: P9String::new(VERSION_9P2000L_ZEROFS2.to_vec()),
     });
     let bytes = match P9Message::new(NOTAG, body).to_bytes() {
         Ok(b) => b,
@@ -1170,9 +1364,15 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, bool)> 
                 warn!("server negotiated unsupported version: {:?}", vstr);
                 return Err(ClientError::Unexpected("version"));
             }
-            // The server only echoes the `.zerofs` suffix if it supports the
-            // extensions; otherwise it replies plain `9P2000.L`.
-            let extensions = vstr.contains(".zerofs");
+            // The server echoes the highest extension suffix it supports
+            // (`.zerofs2` ⊃ `.zerofs`); a plain `9P2000.L` reply means none.
+            let extensions = if vstr.contains(".zerofs2") {
+                2
+            } else if vstr.contains(".zerofs") {
+                1
+            } else {
+                0
+            };
             // Take the smaller of the two msizes, and reject a degenerate value:
             // v9fs requires msize >= 4096, below which I/O would degrade to tiny
             // per-message transfers.
