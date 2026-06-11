@@ -208,24 +208,12 @@ nav a.cta:hover {
   pointer-events: none;
   --r0: 310px;
 }
-.hero-particles .mote {
-  position: absolute; left: 0; top: 0;
+.hero-particles canvas {
+  position: absolute;
   opacity: 0;
-  animation: drift var(--t) cubic-bezier(.25,.55,.6,1) var(--dl) infinite;
+  animation: motes-in 1.8s ease 0.8s forwards;
 }
-.hero-particles svg {
-  display: block;
-  width: var(--s); height: var(--s);
-  color: var(--c);
-  filter: drop-shadow(0 0 5px var(--c));
-  animation: tumble var(--t) cubic-bezier(.15,.8,.3,1) var(--dl) infinite;
-}
-@keyframes tumble { from { transform: rotate(0deg); } to { transform: rotate(var(--tu)); } }
-@keyframes drift {
-  0% { transform: rotate(var(--a)) translateX(var(--r0)) scale(1); opacity: 0; }
-  12% { opacity: var(--o); }
-  100% { transform: rotate(calc(var(--a) + 7deg)) translateX(calc(var(--r0) + var(--d))) scale(0.35); opacity: 0; }
-}
+@keyframes motes-in { to { opacity: 1; } }
 @keyframes sweep {
   0%   { --sweep: 155deg; --tail: 0deg; --soft: 85deg; opacity: 0; }
   14%  { opacity: 0.17; }
@@ -1150,30 +1138,172 @@ if (motionOK) {
   addEventListener("scroll", recede, { passive: true });
 }
 
-// ink-dust particles drifting off the hero enso
+// ink-dust particles drifting off the hero enso, trailing smoke (canvas)
 if (motionOK) {
   const field = document.querySelector(".hero-particles");
-  const SVG = "http://www.w3.org/2000/svg";
-  for (let i = 0; i < 26; i++) {
-    const m = document.createElement("i");
-    m.className = "mote";
-    const p = document.createElementNS(SVG, "svg");
-    const u = document.createElementNS(SVG, "use");
-    u.setAttribute("href", "#enso");
-    p.appendChild(u);
-    m.appendChild(p);
-    const s = 9 + Math.random() * 10;
-    m.style.setProperty("--s", `${s.toFixed(1)}px`);
-    m.style.margin = `${(-s / 2).toFixed(1)}px`;
-    m.style.setProperty("--a", `${Math.random() * 360}deg`);
-    m.style.setProperty("--d", `${60 + Math.random() * 130}px`);
-    m.style.setProperty("--t", `${7 + Math.random() * 8}s`);
-    m.style.setProperty("--dl", `${-Math.random() * 15}s`);
-    m.style.setProperty("--o", `${0.45 + Math.random() * 0.4}`);
-    m.style.setProperty("--tu", `${(300 + Math.random() * 420).toFixed(0)}deg`);
-    m.style.setProperty("--c", Math.random() < 0.3 ? "rgba(77,159,255,0.85)" : "rgba(244,243,239,0.8)");
-    field.appendChild(m);
-  }
+  const cv = document.createElement("canvas");
+  field.appendChild(cv);
+  const ctx = cv.getContext("2d");
+  const DPR = Math.min(devicePixelRatio || 1, 2);
+
+  // same CSS cubic-beziers as before, evaluated by Newton on the x polynomial
+  const cubic = (x1, y1, x2, y2) => {
+    const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+    const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+    return x => {
+      x = Math.min(1, Math.max(0, x));
+      let t = x;
+      for (let i = 0; i < 5; i++) {
+        const dd = (3 * ax * t + 2 * bx) * t + cx;
+        if (!dd) break;
+        t -= (((ax * t + bx) * t + cx) * t - x) / dd;
+      }
+      t = Math.min(1, Math.max(0, t));
+      return ((ay * t + by) * t + cy) * t;
+    };
+  };
+  const driftE = cubic(.25, .55, .6, 1);
+  const tumbleE = cubic(.15, .8, .3, 1);
+
+  // rasterize the enso glyph once per color, glow baked in (center half of a 2x box)
+  const sprite = color => {
+    const c = document.createElement("canvas");
+    c.width = c.height = 96;
+    const sym = document.getElementById("enso");
+    const img = new Image();
+    img.onload = () => {
+      const g = c.getContext("2d");
+      g.shadowColor = color;
+      g.shadowBlur = 16;
+      g.drawImage(img, 24, 24, 48, 48);
+      g.shadowBlur = 0; // crisp core pass, glow only once
+      g.drawImage(img, 24, 24, 48, 48);
+    };
+    img.src = "data:image/svg+xml;utf8," + encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="${sym.getAttribute("viewBox")}" style="color:${color}">${sym.innerHTML}</svg>`);
+    return c;
+  };
+  const WHITE = "244,243,239", BLUE = "77,159,255";
+  const sprW = sprite(`rgb(${WHITE})`), sprB = sprite(`rgb(${BLUE})`);
+
+  const ARC = 7 * Math.PI / 180;
+  const parts = Array.from({ length: 26 }, () => ({
+    a: Math.random() * Math.PI * 2,
+    d: 60 + Math.random() * 130,
+    T: 7 + Math.random() * 8,
+    ph: Math.random(),
+    s: 9 + Math.random() * 10,
+    o: 0.45 + Math.random() * 0.4,
+    tu: (300 + Math.random() * 420) * Math.PI / 180,
+    c: Math.random() < 0.3 ? BLUE : WHITE,
+    p0: 0,
+    hist: [],
+  }));
+
+  let R = 0, r0 = 310;
+  const size = () => {
+    r0 = parseFloat(getComputedStyle(field).getPropertyValue("--r0")) || 310;
+    R = r0 + 230;
+    cv.width = cv.height = Math.round(R * 2 * DPR);
+    cv.style.width = cv.style.height = `${R * 2}px`;
+    cv.style.left = cv.style.top = `${-R}px`;
+    for (const m of parts) m.hist.length = 0;
+  };
+  size();
+  addEventListener("resize", size);
+
+  const TRAIL = 2.4; // seconds of smoke kept behind each mote
+  let vis = true, praf = 0;
+  const frame = () => {
+    praf = vis ? requestAnimationFrame(frame) : 0;
+    const now = performance.now() / 1000;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.clearRect(0, 0, R * 2, R * 2);
+    ctx.lineCap = "round";
+
+    for (const m of parts) {
+      const p = (now / m.T + m.ph) % 1;
+      if (p < m.p0) m.hist.length = 0; // wrapped: new life, fresh trail
+      m.p0 = p;
+      const e = driftE(p);
+      const ang = m.a + ARC * e, rad = r0 + m.d * e;
+      const x = R + Math.cos(ang) * rad, y = R + Math.sin(ang) * rad;
+      const al = m.o * (p < 0.12 ? driftE(p / 0.12) : 1 - driftE((p - 0.12) / 0.88));
+      const sc = 1 - 0.65 * e;
+
+      if (!m.hist.length || now - m.hist[m.hist.length - 1].t > 0.09)
+        m.hist.push({ x, y, al, t: now });
+      while (m.hist.length && now - m.hist[0].t > TRAIL) m.hist.shift();
+
+      // smoke ribbon through past positions, drawn as filled variable-width
+      // bands with alpha graded along the chord — one fill per band, so
+      // densely-spaced samples from slow motes cannot stack up opacity
+      const pts = m.hist.concat({ x, y, al, t: now });
+      const n = pts.length;
+      const chx = pts[n - 1].x - pts[0].x, chy = pts[n - 1].y - pts[0].y;
+      const chord = Math.hypot(chx, chy);
+      if (n > 2 && chord > 4) {
+        const ux = chx / chord, uy = chy / chord;
+        const gr = m.s * sc;
+        // smoke, not a comet: each ink parcel drifts sideways at its own
+        // steady pace (tail meanders), the band billows (puffy width), and
+        // everything fades to zero within the glyph radius so the trail
+        // emerges from behind the ring's trailing edge, not its center.
+        // sines are keyed to each parcel's birth time — smooth along the
+        // band, stable across frames.
+        const P = pts.map(q => {
+          const age = Math.min(1, (now - q.t) / TRAIL);
+          const drift = (Math.sin(q.t * 2.1 + m.a * 7) * 0.6 + Math.sin(q.t * 3.7 + m.a * 13) * 0.4)
+            * m.s * 0.9 * Math.pow(age, 1.3);
+          const wx = q.x - uy * drift, wy = q.y + ux * drift;
+          return {
+            x: wx, y: wy, al: q.al, age,
+            puff: 1 + 0.3 * Math.sin(q.t * 3.1 + m.a * 23),
+            hf: Math.min(1, Math.max(0, (Math.hypot(wx - x, wy - y) - gr * 0.45) / (gr * 0.5))),
+          };
+        });
+        const band = (width, alpha) => {
+          const g = ctx.createLinearGradient(P[0].x, P[0].y, P[n - 1].x, P[n - 1].y);
+          ctx.beginPath();
+          const back = [];
+          for (let j = 0; j < n; j++) {
+            const q = P[j];
+            let dx = P[Math.min(n - 1, j + 1)].x - P[Math.max(0, j - 1)].x;
+            let dy = P[Math.min(n - 1, j + 1)].y - P[Math.max(0, j - 1)].y;
+            const dl = Math.hypot(dx, dy) || 1;
+            const hw = width(q) / 2;
+            dx = dx / dl * hw; dy = dy / dl * hw;
+            j ? ctx.lineTo(q.x - dy, q.y + dx) : ctx.moveTo(q.x - dy, q.y + dx);
+            back.push(q.x + dy, q.y - dx);
+            g.addColorStop(
+              Math.min(1, Math.max(0, ((q.x - P[0].x) * ux + (q.y - P[0].y) * uy) / chord)),
+              `rgba(${m.c},${(q.al * q.hf * alpha(1 - q.age)).toFixed(3)})`);
+          }
+          for (let j = back.length - 2; j >= 0; j -= 2) ctx.lineTo(back[j], back[j + 1]);
+          ctx.closePath();
+          ctx.fillStyle = g;
+          ctx.fill();
+        };
+        const wb = m.s * sc;
+        band(q => wb * (0.8 + 2.6 * q.age) * q.puff, f => Math.pow(f, 1.5) * 0.075); // halo: billows, lingers
+        band(q => wb * (0.38 + 0.5 * q.age) * q.puff, f => f * f * 0.24); // core: sharp, dies fast
+      }
+
+      // the mote itself, tumbling
+      const ds = m.s * sc;
+      ctx.globalAlpha = al;
+      ctx.translate(x, y);
+      ctx.rotate(m.tu * tumbleE(p));
+      ctx.drawImage(m.c === BLUE ? sprB : sprW, -ds, -ds, ds * 2, ds * 2);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      ctx.globalAlpha = 1;
+    }
+  };
+  praf = requestAnimationFrame(frame);
+  new IntersectionObserver(([en]) => {
+    vis = en.isIntersecting;
+    if (vis && !praf) praf = requestAnimationFrame(frame);
+  }).observe(cv);
 }
 
 // cursor spotlight
