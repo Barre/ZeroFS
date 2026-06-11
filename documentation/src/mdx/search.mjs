@@ -40,6 +40,10 @@ function extractSections() {
         }
         return SKIP
       }
+      if (node.type === 'code') {
+        sections.at(-1)?.[2].push(node.value)
+        return SKIP
+      }
     })
   }
 }
