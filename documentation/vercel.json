@@ -2,10 +2,11 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
-        "source": "/va/:match*",
-        "destination": "https://www.zerofs.net/_vercel/:match*"
-    },
-    { "source": "/docs", "destination": "/" },
-    { "source": "/docs/:path*", "destination": "/:path*" }
+      "source": "/va/:match*",
+      "destination": "https://www.zerofs.net/_vercel/:match*"
+    }
+  ],
+  "redirects": [
+    { "source": "/docs/:path*", "destination": "/:path*", "permanent": false }
   ]
 }
