@@ -1,11 +1,11 @@
 export const metadata = {
   title: 'NFS File Access',
-  description: 'Mount ZeroFS as a network filesystem using NFS protocol.',
+  description: 'Mount ZeroFS over NFSv3 from macOS, Linux, or Windows.',
 }
 
 # NFS File Access
 
-Network File System (NFS) allows ZeroFS to share directories and files with clients over a network. Users and programs can access files on the ZeroFS mount almost as if they were local files. {{ className: 'lead' }}
+ZeroFS serves its filesystem over NFSv3. macOS, Linux, and Windows mount it with the NFS clients that ship with the operating system. {{ className: 'lead' }}
 
 ## Installation
 
@@ -71,7 +71,7 @@ umount Z:
 
 | Option | Description |
 |--------|-------------|
-| `async` | Asynchronous I/O (better performance) |
+| `async` | Asynchronous I/O |
 | `rsize=1048576` | Read buffer size (1MB) |
 | `wsize=1048576` | Write buffer size (1MB) |
 | `actimeo=120` | Cache attributes for 120 seconds |
@@ -206,11 +206,11 @@ ZeroFS NFS server does not implement authentication or access control. Consider:
 
 Be aware of these NFS characteristics:
 
-- **No File Locking**: ZeroFS doesn't support NFS locking protocols
+- **No File Locking**: ZeroFS doesn't support NFS locking protocols. `fcntl` byte-range locking is available over 9P, from both the kernel client and `zerofs mount`; applications that need locks (SQLite, other embedded databases) should mount that way. See [File Locking](/9p-access#file-locking).
 - **UID/GID Mapping**: NFS uses numeric IDs, not usernames
-- **Stateless Protocol**: No persistent connections
+- **Stateless Protocol**: The server keeps no per-client state
 - **Cache Coherency**: Multiple clients may see stale data briefly
-- **fsync Limitations**: Due to NFS COMMIT semantics, fsync operations may not provide the durability guarantees expected. Applications requiring strict fsync behavior should consider using 9P instead.
+- **fsync**: NFS COMMIT semantics allow fsync to return before data reaches stable storage. Over 9P, fsync returns only after data reaches stable storage.
 
 ---
 
@@ -218,7 +218,7 @@ Be aware of these NFS characteristics:
 
 <div className="not-prose mt-6 flex gap-3">
   <Button href="/9p-access" arrow="right">
-    Try 9P for better Linux performance
+    9P file access
   </Button>
   <Button href="/troubleshooting" variant="outline">
     Troubleshooting guide

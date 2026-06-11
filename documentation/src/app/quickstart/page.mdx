@@ -1,12 +1,12 @@
 export const metadata = {
   title: 'Quickstart',
   description:
-    'Get up and running with ZeroFS in minutes. Learn how to install, configure, and mount your first S3-backed filesystem.',
+    'Install ZeroFS, write a configuration, and mount an S3-backed filesystem over NFS or 9P.',
 }
 
 # Quickstart
 
-This guide will get you up and running with ZeroFS in minutes. We'll cover installation, basic configuration, and mounting your first S3-backed filesystem. By the end, you'll have a fully functional filesystem that stores data in S3 while feeling like local storage. {{ className: 'lead' }}
+This guide covers installing ZeroFS, writing a basic configuration, and mounting an S3-backed filesystem. At the end you have a POSIX filesystem that stores its data in S3. {{ className: 'lead' }}
 
 <Note>
   Before you begin, ensure you have access to an S3-compatible storage service and the necessary credentials (access key ID and secret access key). For quick testing without external storage, you can use `file:///` URLs to store data locally.
@@ -14,17 +14,15 @@ This guide will get you up and running with ZeroFS in minutes. We'll cover insta
 
 ## Installation
 
-ZeroFS is distributed as a single static binary. Choose your installation method:
+ZeroFS is distributed as a single binary. The Linux amd64 and arm64 builds are statically linked against musl; the other Linux builds link glibc dynamically. Choose your installation method:
 
 <CodeGroup>
 
 ```bash {{ title: 'Install script (Recommended)' }}
 curl -sSfL https://sh.zerofs.net | sh
-```
 
-```bash {{ title: 'Via Cargo' }}
-# Install from crates.io
-cargo install zerofs
+# Pin a release and install without root
+curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
 ```
 
 ```bash {{ title: 'Build from Source' }}
@@ -33,6 +31,9 @@ git clone https://github.com/Barre/ZeroFS
 cd ZeroFS/zerofs
 cargo build --release
 sudo mv target/release/zerofs /usr/local/bin/
+
+# This build omits the Web UI.
+# See "Building with the Web UI" below.
 ```
 
 ```bash {{ title: 'Docker' }}
@@ -50,15 +51,80 @@ docker pull ghcr.io/barre/zerofs:latest
 
 </CodeGroup>
 
+### Supported platforms
+
+Each release ships prebuilt binaries for ten targets:
+
+| Target | Platform | Linking |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | Linux amd64 | Static (musl) |
+| `aarch64-unknown-linux-musl` | Linux arm64 | Static (musl) |
+| `armv7-unknown-linux-gnueabihf` | Linux armv7 | Dynamic (glibc) |
+| `i686-unknown-linux-gnu` | Linux i686 | Dynamic (glibc) |
+| `powerpc64le-unknown-linux-gnu` | Linux ppc64le | Dynamic (glibc) |
+| `s390x-unknown-linux-gnu` | Linux s390x | Dynamic (glibc) |
+| `riscv64gc-unknown-linux-gnu` | Linux riscv64 | Dynamic (glibc) |
+| `x86_64-apple-darwin` | macOS x86_64 | Dynamic (system libc) |
+| `aarch64-apple-darwin` | macOS aarch64 | Dynamic (system libc) |
+| `x86_64-unknown-freebsd` | FreeBSD amd64 | Dynamic (system libc) |
+
+The aarch64 binaries are built with jemalloc configured for page sizes up to 64 KiB (`JEMALLOC_SYS_WITH_LG_PAGE=16`). They run on kernels with 4 KiB, 16 KiB, or 64 KiB pages.
+
+The prebuilt Linux amd64 binary is compiled with `-C target-cpu=x86-64-v3` and requires a CPU with AVX2, BMI2, and FMA: Intel Haswell (2013) or later, AMD Excavator (2015) or later. The amd64 Docker image contains the same binary. On older CPUs the binary exits at startup with an illegal-instruction error (SIGILL). Builds from source target baseline x86-64 and run on those CPUs. See [troubleshooting](/troubleshooting).
+
+### Install script options
+
+The install script reads three environment variables. Set them on the right side of the pipe, as in the pinned-release example above.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `VERSION` | `latest` | Release tag to install, for example `v1.2.5` |
+| `INSTALL_DIR` | `/usr/local/bin` | Destination directory. `INSTALL_DIR=$HOME/.local/bin` installs without root. The script uses sudo when the destination is not writable. |
+| `SKIP_CHECKSUM` | `false` | `true` skips SHA-256 verification |
+
+By default the script downloads the multiplatform release tarball and verifies it against the published `.sha256` file before extracting.
+
+### Verifying downloads
+
+Each release binary and the multiplatform tarball carry GitHub build provenance attestations. Verify a downloaded file with the GitHub CLI:
+
+```bash
+gh attestation verify zerofs-pgo-multiplatform.tar.gz -R Barre/ZeroFS
+```
+
+The tarball's SHA-256 digest is published alongside it as `zerofs-pgo-multiplatform.tar.gz.sha256`.
+
+### Building with the Web UI
+
+`cargo build --release` produces a binary without the [Web UI](/web-ui); the `webui` cargo feature is off by default. A binary built without the feature accepts a `[servers.webui]` section in its configuration but starts no web server and logs no warning.
+
+To build with the Web UI, run make from the repository root:
+
+```bash
+make build-release
+```
+
+The target builds the frontend first (npm ci, buf generate, the v86 VM image script, npm run build), then runs `cargo build --profile release --features webui`. Running `cargo build --features webui` on its own fails: the binary embeds `webui/dist` at compile time, and the directory exists only after the frontend build. The frontend build needs Node.js (CI uses Node 22), bsdtar (the `libarchive-tools` package on Debian/Ubuntu), and squashfs-tools. The VM image script downloads an Alpine 3.21 ISO and v86 BIOS files and verifies their SHA-256 checksums.
+
+Prebuilt release binaries and the Docker image are built with the `webui` feature and include the Web UI.
+
+### Docker image
+
+`ghcr.io/barre/zerofs` is published for linux/amd64, linux/arm64, linux/arm/v7, and linux/386, with a provenance attestation and SBOM. Tags: `latest` (newest release), `X.Y.Z`, `X.Y`, and `sha-<commit>`.
+
+The entrypoint is the `zerofs` binary, so arguments after the image name are `zerofs` subcommands. The container runs as user `zerofs` (UID 1001), not root; a bind-mounted cache directory must be writable by UID 1001. The image exposes ports 2049 (NFS), 5564 (9P), and 10809 (NBD). Actual listeners come from the `[servers.*]` sections in the configuration, and each protocol in use needs its own `-p` mapping.
+
 ## Configuration
 
 Create a configuration file for ZeroFS:
 
 ```bash
-# Initialize a config file
+# Write a config template to ./zerofs.toml
+# (overwrites an existing file)
 zerofs init
 
-# This creates a template you can customize
+# Or write the template to stdout
+zerofs init - > /path/to/zerofs.toml
 ```
 
 Edit the configuration file with your settings:
@@ -199,32 +265,29 @@ truncate -s 10G /mnt/zerofs/.nbd/device1
 ```
 
 ```bash {{ title: 'Docker' }}
-# Create config file
-cat > zerofs.toml <<EOF
-[cache]
-dir = "/cache"
-disk_size_gb = 10.0
+# Generate the config template from the image
+docker run --rm ghcr.io/barre/zerofs:latest init - > zerofs.toml
 
-[storage]
-url = "s3://bucket/path"
-encryption_password = "\${ZEROFS_PASSWORD}"
+# Edit zerofs.toml:
+#   - set [storage] url and credentials
+#   - set [cache] dir = "/cache"
+#   - bind server addresses to 0.0.0.0 so the
+#     host can reach them
 
-[aws]
-access_key_id = "\${AWS_ACCESS_KEY_ID}"
-secret_access_key = "\${AWS_SECRET_ACCESS_KEY}"
+# The container runs as UID 1001; the bind-mounted cache
+# directory must be writable by that user
+mkdir -p ./cache && sudo chown 1001 ./cache
 
-[servers.nfs]
-addresses = ["0.0.0.0:2049"]
-EOF
-
-# Run with Docker
+# Run with Docker. Map a port for each enabled server:
+# 2049 (NFS), 5564 (9P), 10809 (NBD)
 docker run -d \
   -e ZEROFS_PASSWORD='your-password' \
   -e AWS_ACCESS_KEY_ID='your-key' \
   -e AWS_SECRET_ACCESS_KEY='your-secret' \
   -v $(pwd)/zerofs.toml:/config/zerofs.toml:ro \
-  -v /tmp/cache:/cache \
+  -v $(pwd)/cache:/cache \
   -p 2049:2049 \
+  -p 5564:5564 \
   ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
 ```
 
@@ -232,7 +295,7 @@ docker run -d \
 
 ## Mount the Filesystem
 
-With ZeroFS running, the recommended way to mount it (on Linux) is with ZeroFS's own client, `zerofs mount`. It connects to the 9P server, mounting as a regular user with no root or kernel module, and reconnecting on its own if the server restarts or is temporarily unavailable. You can also mount with NFS or the Linux kernel 9P client on Linux:
+With ZeroFS running, mount the filesystem. On Linux, the recommended client is ZeroFS's own `zerofs mount`. It connects to the 9P server, mounts as a regular user without root, and reconnects on its own if the server restarts or is temporarily unavailable. NFS and the Linux kernel 9P client also work:
 
 <CodeGroup>
 
@@ -282,7 +345,7 @@ sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 
 
 ## Using NBD Block Devices
 
-If you enabled NBD support, you can create and access block devices dynamically:
+With NBD enabled, block devices are created as files under the `.nbd` directory. New devices are picked up at runtime without a server restart:
 
 <CodeGroup>
 
@@ -371,11 +434,11 @@ ls -la /mnt/zerofs/
   </Button>
 </div>
 
-## What's Next?
+## Next Steps
 
-Congratulations! You now have a fully functional filesystem backed by S3. Here are some next steps:
+The filesystem is mounted and storing its data in S3. From here:
 
 - [Configure NBD block devices](/nbd-devices) for raw block storage
-- [Learn about encryption](/encryption) and how your data is protected
-- [Optimize performance](/caching) with caching configuration
+- [Learn about encryption](/encryption) and how data is encrypted before upload
+- [Configure caching](/caching) to size the memory and disk caches
 - [Explore advanced architectures](/advanced-use-cases) like geo-distributed storage

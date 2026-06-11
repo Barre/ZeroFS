@@ -8,11 +8,11 @@ export const metadata = {
 
 # Standalone Compactor
 
-ZeroFS supports running compaction as a separate process, allowing you to offload this CPU and I/O intensive work from your main server instance. {{ className: 'lead' }}
+ZeroFS can run compaction as a separate process on its own machine. This moves compaction's CPU and I/O load off the main server. {{ className: 'lead' }}
 
 ## Overview
 
-Compaction is an essential background process in ZeroFS's LSM tree storage engine. It merges sorted runs to:
+Compaction is a background process in ZeroFS's LSM tree storage engine. It merges sorted runs to:
 
 - **Reduce storage space** by removing old versions of updated/deleted data
 - **Improve read performance** by reducing the number of files to search
@@ -57,7 +57,7 @@ Start your main ZeroFS server with the `--no-compactor` flag:
 zerofs run -c zerofs.toml --no-compactor
 ```
 
-This disables the built-in compactor, leaving the database in a state where SST files accumulate in level 0 until an external compactor processes them.
+This disables the built-in compactor. SST files accumulate in level 0 until an external compactor processes them.
 
 ### Starting the Standalone Compactor
 
@@ -94,7 +94,7 @@ max_concurrent_compactions = 8  # Number of parallel compaction jobs
 
 Consider separating the compactor when:
 
-- **Reduce egress costs**: Run a small compactor instance in the same region/zone as your S3 bucket. Compaction reads and rewrites large amounts of data during merges - keeping it co-located with the bucket avoids expensive cross-region data transfer fees while your main ZeroFS server can run anywhere.
+- **Egress costs**: Compaction reads and rewrites large amounts of data during merges. A compactor instance in the same region/zone as the S3 bucket avoids cross-region data transfer fees; the main ZeroFS server can run anywhere.
 - **High write throughput**: Compaction competes with reads and writes for CPU and I/O
 - **Latency-sensitive workloads**: Isolate compaction spikes from user requests
 - **Multi-tenant environments**: Prevent compaction from affecting other services

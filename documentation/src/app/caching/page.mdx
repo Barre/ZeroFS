@@ -1,0 +1,79 @@
+export const metadata = {
+  title: 'Caching',
+  description:
+    'ZeroFS runs a decoded-block cache and a raw-parts cache, each with a memory tier and a disk tier, sized by two configuration keys.',
+}
+
+# Caching
+
+ZeroFS runs two caches, each with a memory tier and a disk tier: one for decoded blocks, one for raw object parts. Two configuration keys size them. {{ className: 'lead' }}
+
+## Cache Layers
+
+The **decoded-block cache** holds database blocks after decryption and decompression. Its memory tier is sized by `cache.memory_size_gb` (optional, defaults to 0.25 GB). Its disk tier lives in `hybrid_cache/` and receives what remains of the disk budget after the raw-parts allocation.
+
+The **raw-parts cache** holds 128 KiB parts as fetched from the object store. Its memory tier is fixed at 128 MiB and is not configurable. Its disk tier lives in `parts_cache/` and receives the parts share of the disk budget.
+
+Both disk tiers sit in a per-bucket directory inside `cache.dir`:
+
+```
+/var/cache/zerofs/
+└── bucket_550e8400/
+    ├── hybrid_cache/    decoded blocks
+    └── parts_cache/     raw 128 KiB parts
+```
+
+<Note>
+  The disk cache stores decrypted, decompressed blocks. See [Local Cache
+  Directory](/encryption#local-cache-directory) on the encryption page.
+</Note>
+
+## Configuration
+
+<Row>
+  <Col>
+
+    `disk_size_gb` is the total disk budget for both disk tiers, not the size of either one. `memory_size_gb` sizes only the decoded-block memory tier.
+
+    Sizes parse as decimal GB (10^9 bytes), so `disk_size_gb = 10.0` is a 10,000,000,000-byte budget.
+
+  </Col>
+  <Col>
+
+    ```toml {{ title: 'zerofs.toml' }}
+    [cache]
+    dir = "/var/cache/zerofs"
+    disk_size_gb = 10.0
+    memory_size_gb = 2.0  # optional
+    ```
+
+  </Col>
+</Row>
+
+## Disk Budget Split
+
+The raw-parts disk tier receives 10% of the disk budget, clamped to between 1 GiB and 10 GiB. The decoded-block disk tier receives the remainder. Each tier has a 1 GiB floor, so the decoded-block disk tier ends up at least 1 GiB smaller than `disk_size_gb`. Budgets below roughly 2 GiB cannot satisfy both floors; the decoded-block tier keeps its 1 GiB and the parts tier shrinks.
+
+Startup logs the resolved split:
+
+```
+Cache allocation - Disk: 10.00GB total (8926 MB decoded-blocks + 1073 MB raw-parts), Memory: 2.00GB
+```
+
+With `disk_size_gb = 10.0`, 10% of the budget is 1 GB (below the 1 GiB floor) so the parts tier is raised to 1 GiB (1073 MB) and the decoded-block tier receives the remaining 8926 MB.
+
+## Prefetch
+
+ZeroFS fetches object data in 128 KiB parts. An adaptive readahead layer tracks up to 4 concurrent sequential read streams per object. Each stream's fetch window starts at 128 KiB and doubles on every sequential access, capped at 8 MiB. Once a stream's window has grown past the minimum, the next window is fetched in the background before reads reach it. Fetched parts land in the raw-parts cache.
+
+## Per-Bucket Cache Isolation
+
+On first open, ZeroFS writes a `.zerofs_bucket_id` marker containing a UUID at the database path on the object store; later opens read the same marker. The local cache for that volume lives in `bucket_<8hex>` inside `cache.dir`, named after the first 8 hex characters of the UUID, so several volumes can share one `cache.dir` without mixing entries.
+
+Deleting and recreating a bucket produces a new UUID. The volume starts over with an empty cache directory; the old `bucket_*` directory is orphaned and ZeroFS does not remove it. Delete it manually to reclaim disk space.
+
+<div className="not-prose">
+  <Button href="/configuration" variant="text" arrow="right">
+    See all configuration options
+  </Button>
+</div>

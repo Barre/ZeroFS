@@ -1,22 +1,22 @@
 export const metadata = {
   title: 'NBD Block Devices',
-  description: 'Access ZeroFS as raw block devices through NBD protocol for databases, ZFS, and more.',
+  description: 'Expose ZeroFS storage as raw block devices over NBD for filesystems, ZFS pools, databases, and VM disks.',
 }
 
 # NBD Block Devices
 
-ZeroFS provides Network Block Device (NBD) servers that expose S3 storage as raw block devices. This enables advanced use cases like running ZFS pools, databases, or even entire operating systems directly on S3 storage with full TRIM/discard support. {{ className: 'lead' }}
+ZeroFS runs a Network Block Device (NBD) server that exposes S3 storage as raw block devices. The devices hold ext4 filesystems, ZFS pools, databases, or VM boot disks. TRIM/discard is supported. {{ className: 'lead' }}
 
 ---
 
 ## NBD Features
 
-- **Raw Block Access** - Present S3 storage as standard block devices (/dev/nbd*)
-- **Dynamic Device Management** - Create/delete devices through the filesystem without restart
-- **Multiple Devices** - Single NBD server supports unlimited devices
-- **Unix Socket Support** - Connect via TCP or Unix socket for better performance
-- **TRIM Support** - Full discard/TRIM support for efficient space management
-- **High Performance** - Same caching layers as 9P/NFS
+- **Raw Block Access** - S3 storage appears as standard block devices (/dev/nbd*)
+- **Dynamic Device Management** - Create and delete devices through the filesystem; new devices are picked up at runtime without a server restart
+- **Multiple Devices** - One NBD server exposes every device in the `.nbd/` directory
+- **Unix Socket Support** - Connect over TCP or a Unix socket
+- **TRIM Support** - Discard deletes the corresponding chunks from the LSM tree; compaction then reclaims the space in S3
+- **Shared Caches** - NBD reads and writes go through the same memory and disk caches as NFS and 9P
 - **Any Filesystem** - Format with ext4, XFS, ZFS, or any other filesystem
 
 ## Configuration
@@ -45,7 +45,7 @@ zerofs run --config zerofs.toml
 
 Configuration options:
 - `addresses` - Array of bind addresses for NBD TCP server (default: ["127.0.0.1:10809"])
-- `socket` - Unix socket path for NBD (optional)
+- `unix_socket` - Unix socket path for NBD (optional)
 
 ## Device Management
 
@@ -93,9 +93,28 @@ lsblk | grep nbd
 - **`-unix <path>`** - Use Unix socket instead of TCP
 - **`-persist`** - Automatically reconnect if connection drops (recommended)
 - **`-timeout 600`** - Use high timeout for S3 latency (recommended: 600 seconds)
-- **`-connections 4`** - Use multiple connections for better performance (recommended: 4-8)
+- **`-connections 4`** - Number of parallel connections (recommended: 4-8)
 - **`-readonly`** - Mount device as read-only
 - **`-block-size <size>`** - Block size (512, 1024, 2048, or 4096)
+
+## Durability Semantics
+
+The handshake advertises `NBD_FLAG_SEND_FLUSH`, `NBD_FLAG_SEND_FUA`, and `NBD_FLAG_CAN_MULTI_CONN`. Command behavior:
+
+- **FLUSH** - Flushes the entire filesystem database: memtable to object storage, or a WAL append when the WAL is enabled. The reply is sent only after the flush completes. Concurrent FLUSH and FUA requests coalesce into a single database flush.
+- **FUA** - A WRITE, TRIM, or WRITE_ZEROES with the FUA flag set blocks until the data is durable, through the same flush path as FLUSH.
+- **CACHE** - Accepted as a no-op.
+- **Structured replies** - Not negotiated; clients fall back to simple replies.
+
+See [Durability](/durability) for what durable means under each configuration.
+
+### Multiple Connections
+
+Every connection to the NBD server shares one filesystem instance and one flush path, so a FLUSH on any connection covers writes completed on every connection. This satisfies the `NBD_FLAG_CAN_MULTI_CONN` contract: `-connections 4-8` is safe for ZFS pools and databases that rely on write barriers.
+
+### Write Barriers
+
+Write barriers hold under the default configuration. With `sync_writes = false` (the default), individual writes are buffered, but FLUSH and FUA still force durability at the barrier. ZFS transaction syncs and database WAL fsyncs issue exactly these commands.
 
 ## Using Block Devices
 
@@ -129,7 +148,7 @@ zfs set compression=lz4 mypool
 
 ### TRIM/Discard Support
 
-ZeroFS NBD devices support TRIM operations, which delete corresponding chunks from S3:
+ZeroFS NBD devices accept TRIM from any filesystem or zpool:
 
 ```bash
 # Manual TRIM
@@ -144,9 +163,15 @@ zpool trim mypool
 ```
 
 When blocks are trimmed:
-1. ZeroFS removes chunks from the LSM-tree database
-2. Compaction eventually frees space in S3
-3. Storage costs decrease automatically
+1. ZeroFS deletes the corresponding chunks from the LSM tree
+2. Compaction reclaims the space in S3
+3. Freed blocks come off the bill
+
+See [Garbage Collection](/garbage-collection) for the full reclamation pipeline.
+
+### WRITE_ZEROES vs TRIM
+
+WRITE_ZEROES writes physical zeros in 1 MiB chunks. It overwrites chunks and never deletes them, so `blkdiscard --zeroout` does not free object-store space. TRIM is the only command that deletes chunks and lets compaction reclaim the space. To free space, use plain `blkdiscard`, `fstrim`, or `zpool trim` / `autotrim`.
 
 ## Managing Device Files
 
@@ -159,7 +184,7 @@ ls -lh /mnt/zerofs/.nbd/
 # -rw-r--r--  1 root root 5.0G  storage
 # -rw-r--r--  1 root root 10G   backup
 
-# Add a new device (no restart needed!)
+# Add a new device (picked up at runtime, no restart)
 truncate -s 20G /mnt/zerofs/.nbd/new-device
 
 # Remove a device (disconnect NBD client first)
@@ -182,7 +207,7 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N database -persist -timeout 600 -connecti
 
 ### Geo-Distributed ZFS
 
-Create globally distributed ZFS pools across regions:
+Mirror a ZFS pool across regions:
 
 ```toml
 # Machine 1 - US East (10.0.1.5)
@@ -235,10 +260,7 @@ nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist -timeout 600 -connection
 zpool create global-pool mirror /dev/nbd0 /dev/nbd1
 ```
 
-Benefits:
-- **Disaster Recovery** - Data remains available if any region fails
-- **Geographic Redundancy** - Automatic replication across regions
-- **Infinite Scalability** - Add regions as needed
+ZFS mirrors every block across both regions. The pool stays available if either region fails.
 
 ### ZFS L2ARC Tiering
 
@@ -256,20 +278,20 @@ zpool iostat -v mypool 1
 ```
 
 Storage tiers:
-1. **NVMe L2ARC** - Hot data with SSD performance
-2. **ZeroFS Caches** - Warm data with sub-millisecond latency
-3. **S3 Storage** - Cold data at $0.023/GB/month
+1. **NVMe L2ARC** - Hot data on local flash
+2. **ZeroFS Caches** - Recently used blocks in the configured memory and disk caches
+3. **S3 Storage** - Cold data in the bucket
 
 ### Database Storage
 
 Run databases on NBD devices:
 
 ```bash
-# Create dedicated device for PostgreSQL
+# Connect the database device created in .nbd/
 nbd-client 127.0.0.1 10809 /dev/nbd0 \
-  -N device_10809 \
+  -N database \
   -persist \
-  -timeout 60 \
+  -timeout 600 \
   -connections 4 \
   -block-size 4096
 
@@ -299,19 +321,19 @@ qemu-system-x86_64 \
 ### Network Optimization
 
 ```bash
-# High-performance connection with multiple connections
+# Multiple parallel connections
 nbd-client 127.0.0.1 10809 /dev/nbd0 \
-  -N device_10809 \
+  -N database \
   -persist \
-  -timeout 60 \
+  -timeout 600 \
   -connections 4 \
   -block-size 4096
 
-# For high-latency connections (e.g., cross-region)
-nbd-client 127.0.0.1 10809 /dev/nbd0 \
-  -N device_10809 \
+# For high-latency connections (e.g., a server in another region)
+nbd-client 10.0.2.5 10809 /dev/nbd0 \
+  -N storage \
   -persist \
-  -timeout 120 \
+  -timeout 600 \
   -connections 8
 ```
 
@@ -358,12 +380,12 @@ ps aux | grep zerofs
 # 2. NBD module is loaded
 sudo modprobe nbd
 
-# 3. Export name matches port number
+# 3. Export name matches a file in the .nbd/ directory
 nbd-client -list 127.0.0.1
 
 # 4. Try with explicit parameters
 nbd-client 127.0.0.1 10809 /dev/nbd0 \
-  -N device_10809 \
+  -N database \
   -nofork  # Stay in foreground for debugging
 ```
 
@@ -372,14 +394,14 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 \
 ```bash
 # Use multiple connections for better throughput
 nbd-client 127.0.0.1 10809 /dev/nbd0 \
-  -N device_10809 \
+  -N database \
   -connections 8 \
   -persist \
-  -timeout 60
+  -timeout 600
 
 # For large sequential workloads, increase block size
 nbd-client 127.0.0.1 10809 /dev/nbd0 \
-  -N device_10809 \
+  -N database \
   -block-size 4096 \
   -persist
 ```
@@ -395,7 +417,7 @@ After=network.target
 
 [Service]
 Type=forking
-ExecStart=/usr/sbin/nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4
+ExecStart=/usr/sbin/nbd-client 127.0.0.1 10809 /dev/nbd0 -N database -persist -timeout 600 -block-size 4096 -connections 4
 ExecStop=/usr/sbin/nbd-client -d /dev/nbd0
 Restart=on-failure
 
@@ -412,10 +434,10 @@ systemctl start zerofs-nbd
 ## Next Steps
 
 <div className="not-prose mt-6 flex gap-3">
-  <Button href="/filesystem-operations" arrow="right">
-    Learn about filesystem operations
+  <Button href="/advanced-use-cases" arrow="right">
+    Advanced use cases
   </Button>
-  <Button href="/caching" variant="outline">
-    Understand caching architecture
+  <Button href="/configuration" variant="outline">
+    Configuration reference
   </Button>
 </div>

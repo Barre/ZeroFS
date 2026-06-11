@@ -6,11 +6,11 @@ export const metadata = {
 
 # Separate WAL Object Store
 
-Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL's backing store. You can point the WAL at a separate, lower-latency store to reduce this latency. {{ className: 'lead' }}
+With the WAL enabled, every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL's backing store. You can point the WAL at a separate, lower-latency store. {{ className: 'lead' }}
 
 ## Overview
 
-By default the WAL goes to the same object store as everything else. If fsync latency matters for your workload, you can configure a separate WAL store for example local NVMe, S3 Express One Zone, or a nearby S3-compatible service.
+By default the WAL goes to the same object store as everything else. If fsync latency matters for your workload, you can configure a separate WAL store, such as local NVMe, S3 Express One Zone, or a nearby S3-compatible service.
 
 ## Configuration
 

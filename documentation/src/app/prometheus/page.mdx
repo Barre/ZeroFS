@@ -6,7 +6,7 @@ export const metadata = {
 
 # Prometheus Metrics
 
-ZeroFS can expose metrics in Prometheus format via an HTTP endpoint for operational monitoring and alerting. {{ className: 'lead' }}
+ZeroFS can expose metrics in Prometheus format over an HTTP endpoint. {{ className: 'lead' }}
 
 ## Configuration
 
@@ -30,7 +30,7 @@ Multiple bind addresses are supported, following the same pattern as other ZeroF
 addresses = ["127.0.0.1:9091", "0.0.0.0:9091"]
 ```
 
-When the `[prometheus]` section is absent, no metrics endpoint is started.
+`addresses` defaults to `127.0.0.1:9091`. An empty `[prometheus]` section is valid and starts the endpoint on that address. When the `[prometheus]` section is absent, no metrics endpoint is started.
 
 ## Available Metrics
 
@@ -76,9 +76,23 @@ Counters that track cumulative operations since server start:
 | `zerofs_used_bytes` | gauge | Total bytes stored in the filesystem |
 | `zerofs_used_inodes` | gauge | Total active inodes (files, directories, symlinks) |
 
+### Memory (jemalloc)
+
+Gauges that report the state of the jemalloc allocator:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_jemalloc_allocated_bytes` | gauge | Bytes actively allocated by the application |
+| `zerofs_jemalloc_resident_bytes` | gauge | Bytes in physically resident pages mapped by the allocator |
+| `zerofs_jemalloc_mapped_bytes` | gauge | Bytes in active pages mapped by the allocator |
+| `zerofs_jemalloc_retained_bytes` | gauge | Bytes in virtual memory mappings retained for future reuse |
+| `zerofs_jemalloc_metadata_bytes` | gauge | Bytes dedicated to allocator metadata |
+
+`zerofs_jemalloc_resident_bytes` tracks the allocator's physical memory footprint. `zerofs_jemalloc_retained_bytes` counts virtual address space kept for reuse and does not consume physical memory, so memory alerts should key on resident, not retained or mapped.
+
 ### SlateDB (LSM Engine)
 
-ZeroFS exposes internal metrics from the SlateDB storage engine. These are prefixed with `slatedb_` and include compaction and storage statistics. The exact metrics depend on the SlateDB version and are dynamically discovered at runtime.
+ZeroFS exposes internal metrics from the SlateDB storage engine. These are prefixed with `slatedb_` and include compaction and storage statistics. The exact metrics depend on the SlateDB version and are discovered at runtime.
 
 Common SlateDB metrics include:
 
@@ -103,3 +117,5 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9091']
 ```
+
+A background task collects all metric values every 5 seconds, and the endpoint serves the last collected values. A `scrape_interval` below 5 seconds does not increase resolution.

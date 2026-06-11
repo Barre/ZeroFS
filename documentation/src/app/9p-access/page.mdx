@@ -1,14 +1,14 @@
 export const metadata = {
   title: '9P File Access',
-  description: 'Mount ZeroFS using the 9P protocol for high-performance file access on Linux.',
+  description: 'Mount ZeroFS over the 9P protocol on Linux, with the kernel client or the bundled zerofs mount client.',
 }
 
 # 9P File Access
 
-The 9P protocol provides an alternative way to mount ZeroFS on Linux systems. Originally from Plan 9, the 9P2000.L variant is optimized specifically for Linux and can offer better performance than NFS for certain workloads. {{ className: 'lead' }}
+9P is an alternative to NFS for mounting ZeroFS on Linux. ZeroFS serves 9P2000.L, the Linux dialect of the protocol that originated in Plan 9. {{ className: 'lead' }}
 
 <Note>
-9P provides correct fsync semantics, making it the preferred choice for applications that require durability guarantees (databases, transactional systems). NFS has limitations with fsync due to its COMMIT protocol design.
+Over 9P, fsync returns only after data reaches stable storage. NFS COMMIT semantics allow fsync to return before data reaches stable storage, so applications that depend on fsync durability (databases, transactional systems) should mount over 9P.
 </Note>
 
 ## Installation
@@ -42,7 +42,7 @@ sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs-9
 ### Unix Socket Mount (lower latency)
 
 
-For improved performance when mounting locally, you can use Unix domain sockets:
+For local mounts, a Unix domain socket avoids the TCP stack:
 
 ```toml
 # Configure Unix socket in zerofs.toml
@@ -67,7 +67,7 @@ sudo umount /mnt/zerofs-9p
 
 ## Mounting with `zerofs mount`
 
-The commands above use the kernel's 9P client. ZeroFS also ships its own client, run as `zerofs mount`, which connects to the same 9P server but runs in userspace over FUSE.
+The commands above use the kernel's 9P client. ZeroFS also ships its own client, run as `zerofs mount`, which connects to the same 9P server but runs in userspace over FUSE. The `mount` subcommand is compiled into Linux builds only; on macOS, mount over [NFS](/nfs-access) instead.
 
 ```bash
 # TCP
@@ -77,12 +77,17 @@ zerofs mount 127.0.0.1:5564 /mnt/zerofs-9p
 zerofs mount /tmp/zerofs.sock /mnt/zerofs-9p
 ```
 
-The main difference is what happens when the connection drops. The kernel client leaves the mount wedged after a server restart or a network interruption — it returns errors until you unmount and remount. `zerofs mount` reconnects by itself: it rebuilds the session in the background and holds operations until the server is reachable again, so the mount recovers on its own. A few other practical differences:
+The target is `host` (the port defaults to 5564), `host:port`, `tcp://host:port`, or `unix:/path/to.sock`. A bare path starting with `/` or `.` is treated as a Unix socket; hostnames are resolved through DNS.
+
+The main difference is what happens when the connection drops. The kernel client leaves the mount wedged after a server restart or a network interruption — it returns errors until you unmount and remount. `zerofs mount` reconnects by itself: it retries indefinitely (50–500 ms backoff) and rebuilds the session in the background. Operations issued during the outage block until the server is reachable again — the mount hangs rather than returns errors, which matters for health checks. On the new session, open file handles are rebound to their stable inode ids and byte-range locks are re-acquired, so handles survive a server restart. One caveat: a non-idempotent operation (mkdir, create, rename, unlink) in flight at the instant the connection drops may be applied twice, because the client cannot know whether the server processed it before the disconnect.
+
+A few other practical differences:
 
 - It mounts as a regular user through `fusermount3`, so no `sudo` and no kernel module.
-- It negotiates a larger message size than the kernel client's cap, which helps large reads and writes.
+- `--msize` defaults to 10 MiB, which is also the server's maximum: the server clamps every client's requested msize to 10 MiB, so the default is the effective ceiling and raising it has no effect. The kernel client defaults to 128 KiB (see the options table below).
 - Because the client and server ship together, they negotiate a private fast path the kernel client doesn't have: a path lookup is a single round trip (a combined walk + getattr), and directory listings return each entry's attributes inline (readdirplus) instead of a stat per entry. That cuts the round trips on metadata-heavy work.
 - Writeback caching is on by default, so writes are buffered and flushed asynchronously (similar to the kernel client's `cache=mmap`); pass `--writeback false` to write through synchronously.
+- `--read-only` mounts the filesystem read-only.
 
 Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions, with no uid to configure. (As with `access=user` over an unauthenticated transport, this trusts the client-supplied uid and assumes a shared uid namespace.) The `--access owner|root|all` option controls who may reach the mount; `root` and `all` require `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
 
@@ -113,13 +118,23 @@ Unmount it like any FUSE mount with `fusermount3 -u /mnt/zerofs-9p`, or stop the
 | Mode | Description | Use Case |
 |------|-------------|----------|
 | `none` | No caching, direct I/O | Maximum consistency |
-| `loose` | Relaxed consistency | Best performance |
+| `loose` | Relaxed consistency | Performance over consistency |
 | `fscache` | Persistent cache | Cache survives unmount |
 | `mmap` | Enable mmap support | Required for memory-mapped file access |
 
 <Note>
 The `cache=mmap` option doesn't create a cache - it enables support for memory-mapped files. Use this only if your applications use mmap() system calls. For general performance, use `cache=loose`.
 </Note>
+
+## File Locking
+
+ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`,  over 9P, from both the kernel client and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes.
+
+The server arbitrates locks between clients. Processes sharing one mount are arbitrated locally by that client, since the whole mount is a single 9P session. `F_GETLK` on a range locked by another client reports the holder's pid negated, the v9fs convention for a pid that has no meaning in the local pid namespace.
+
+Blocking acquisition (`F_SETLKW`) through `zerofs mount` is polled: the server answers a contended request immediately instead of queueing the waiter, and the client retries every 50 ms until the lock is grantable.
+
+Locks live in server memory, not in the object store. A client's locks are released when its connection closes. A server restart drops all locks: `zerofs mount` re-acquires the locks it held when it replays its session on reconnect (best-effort); the kernel client does not, since its mount is wedged after a disconnect.
 
 ## Configuration
 
@@ -234,6 +249,15 @@ sudo mount -t 9p -o cache=none,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-consist
 # Performance mount for read-heavy operations  
 sudo mount -t 9p -o cache=loose,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-fast
 ```
+
+## 9P Limitations
+
+Be aware of these 9P characteristics:
+
+- **No Extended Attributes**: The server rejects `Txattrwalk` with `ENOTSUP`, so xattrs — and POSIX ACLs, which are stored as xattrs — are unavailable from any client (`zerofs mount` returns `ENOSYS` for xattr calls without contacting the server). `setfacl` and `getfattr` fail; `rsync -X` and `cp --preserve=xattr` cannot copy xattrs onto the mount.
+- **No Supplementary Groups**: A 9P2000.L attach carries a single numeric uid. ZeroFS uses that uid as the gid and builds a one-entry group list, so the server sees each user as a member of exactly one group, numbered the same as their uid. Access granted only through another group — a mode 070 directory owned by a shared group, for example — fails with `EACCES`. An unspecified uid (`n_uname = -1`) maps to 0 for uname `root` and to 65534 (nobody) otherwise.
+- **Unsupported Operations on `zerofs mount`**: `fallocate`, `copy_file_range`, `lseek` with `SEEK_HOLE`/`SEEK_DATA`, `ioctl`, and `poll` return `ENOSYS`. Where the kernel has a fallback it uses it (`cp` copies with regular reads and writes); where it has none, the call fails (`fallocate -l`).
+- **No rename Flags on `zerofs mount`**: `rename` with flags (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT`) returns `EINVAL` because 9P `renameat` carries no flag field. Plain `rename` works.
 
 ---
 
