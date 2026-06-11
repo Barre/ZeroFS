@@ -19,65 +19,65 @@ export function Mermaid({ chart }: { chart: string }) {
           startOnLoad: true,
           theme: 'base',
           themeVariables: {
-            // Primary colors - neutral grays instead of blue
-            primaryColor: isDark ? 'rgba(255, 255, 255, 0.025)' : '#fafafa',
-            primaryTextColor: isDark ? '#e5e7eb' : '#111827',
-            primaryBorderColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
+            // Primary colors - neutral warm grays instead of blue
+            primaryColor: isDark ? 'rgba(255, 255, 255, 0.035)' : '#faf9f6',
+            primaryTextColor: isDark ? '#f4f3ef' : '#1c1b17',
+            primaryBorderColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
 
             // Lines and connections - match border styles
-            lineColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
+            lineColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
 
             // Background colors - match code block styling
             background: 'transparent',
-            mainBkg: isDark ? '#18181b' : '#ffffff',
-            secondBkg: isDark ? 'rgba(255, 255, 255, 0.025)' : '#f9fafb',
-            tertiaryBkg: isDark ? 'rgba(255, 255, 255, 0.05)' : '#f3f4f6',
+            mainBkg: isDark ? '#111110' : '#ffffff',
+            secondBkg: isDark ? 'rgba(255, 255, 255, 0.035)' : '#faf9f6',
+            tertiaryBkg: isDark ? 'rgba(255, 255, 255, 0.06)' : '#f4f3ef',
 
             // Text colors - match prose
-            textColor: isDark ? '#d1d5db' : '#4b5563',
-            taskTextColor: isDark ? '#e5e7eb' : '#111827',
-            taskTextDarkColor: isDark ? '#e5e7eb' : '#111827',
+            textColor: isDark ? '#d3d0c7' : '#56544d',
+            taskTextColor: isDark ? '#f4f3ef' : '#1c1b17',
+            taskTextDarkColor: isDark ? '#f4f3ef' : '#1c1b17',
 
             // Node colors - clean with subtle backgrounds
-            nodeTextColor: isDark ? '#e5e7eb' : '#111827',
-            defaultLinkColor: isDark ? 'rgba(255, 255, 255, 0.2)' : '#d1d5db',
-            titleColor: isDark ? '#e5e7eb' : '#111827',
-            edgeLabelBackground: isDark ? '#18181b' : '#ffffff',
+            nodeTextColor: isDark ? '#f4f3ef' : '#1c1b17',
+            defaultLinkColor: isDark ? 'rgba(255, 255, 255, 0.22)' : '#d3d0c7',
+            titleColor: isDark ? '#f4f3ef' : '#1c1b17',
+            edgeLabelBackground: isDark ? '#111110' : '#ffffff',
 
             // Borders - match documentation
-            nodeBorder: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
-            clusterBorder: isDark ? 'rgba(255, 255, 255, 0.075)' : '#e5e7eb',
-            defaultBorderColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
+            nodeBorder: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
+            clusterBorder: isDark ? 'rgba(255, 255, 255, 0.075)' : '#e7e5df',
+            defaultBorderColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
 
             // Special elements
-            altBackground: isDark ? 'rgba(255, 255, 255, 0.025)' : '#f9fafb',
+            altBackground: isDark ? 'rgba(255, 255, 255, 0.035)' : '#faf9f6',
             errorBkgColor: isDark ? 'rgba(239, 68, 68, 0.1)' : '#fee2e2',
             errorTextColor: isDark ? '#f87171' : '#dc2626',
 
             // Typography - match documentation
-            fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+            fontFamily: 'var(--font-sans), "Schibsted Grotesk", system-ui, sans-serif',
             fontSize: '14px',
 
             // Graph specific
-            labelColor: isDark ? '#9ca3af' : '#6b7280',
+            labelColor: isDark ? '#a8a69e' : '#6e6c64',
 
             // Flowchart
             flowchartBackground: 'transparent',
 
             // Sequence diagram - match tag styling
-            actorTextColor: isDark ? '#e5e7eb' : '#111827',
-            actorLineColor: isDark ? 'rgba(255, 255, 255, 0.075)' : '#e5e7eb',
-            signalColor: isDark ? '#9ca3af' : '#6b7280',
-            sequenceNumberColor: isDark ? '#e5e7eb' : '#111827',
+            actorTextColor: isDark ? '#f4f3ef' : '#1c1b17',
+            actorLineColor: isDark ? 'rgba(255, 255, 255, 0.075)' : '#e7e5df',
+            signalColor: isDark ? '#a8a69e' : '#6e6c64',
+            sequenceNumberColor: isDark ? '#f4f3ef' : '#1c1b17',
 
             // Additional sequence diagram colors
-            activationBkgColor: isDark ? 'rgba(59, 130, 246, 0.1)' : '#dbeafe',
-            activationBorderColor: isDark ? 'rgba(59, 130, 246, 0.2)' : '#93c5fd',
-            sequenceBoxBkgColor: isDark ? 'rgba(255, 255, 255, 0.025)' : '#f9fafb',
-            sequenceBoxBorderColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
-            labelBoxBkgColor: isDark ? '#18181b' : '#ffffff',
-            labelBoxBorderColor: isDark ? 'rgba(255, 255, 255, 0.1)' : '#e5e7eb',
-            loopTextColor: isDark ? '#60a5fa' : '#3b82f6',
+            activationBkgColor: isDark ? 'rgba(77, 159, 255, 0.1)' : '#e2edfb',
+            activationBorderColor: isDark ? 'rgba(77, 159, 255, 0.2)' : '#a9cdfb',
+            sequenceBoxBkgColor: isDark ? 'rgba(255, 255, 255, 0.035)' : '#faf9f6',
+            sequenceBoxBorderColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
+            labelBoxBkgColor: isDark ? '#111110' : '#ffffff',
+            labelBoxBorderColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
+            loopTextColor: isDark ? '#4d9fff' : '#2e8bff',
           },
           flowchart: {
             curve: 'basis',

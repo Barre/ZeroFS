@@ -1,9 +1,9 @@
 .mermaid-chart {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  --tw-prose-body: #374151;
-  --tw-prose-headings: #111827;
-  --tw-prose-links: #111827;
-  --tw-prose-code: #111827;
+  font-family: var(--font-sans), 'Schibsted Grotesk', system-ui, sans-serif;
+  --tw-prose-body: #56544d;
+  --tw-prose-headings: #1c1b17;
+  --tw-prose-links: #1c1b17;
+  --tw-prose-code: #1c1b17;
 }
 
 .mermaid-chart rect.actor,
@@ -22,7 +22,7 @@
   rx: 12px;
   stroke-dasharray: 2, 2;
   opacity: 0.5;
-  fill: #fafafa !important;
+  fill: #faf9f6 !important;
 }
 
 .dark .mermaid-chart .cluster rect {
@@ -64,7 +64,7 @@
 }
 
 .dark .mermaid-chart .edgeLabel {
-  background: var(--background, #18181b);
+  background: var(--background, #111110);
 }
 
 .mermaid-chart .actor {
@@ -111,11 +111,11 @@
   font-weight: 600;
   text-transform: none;
   letter-spacing: -0.01em;
-  fill: #3b82f6 !important;
+  fill: #2e8bff !important;
 }
 
 .dark .mermaid-chart .loopText {
-  fill: #60a5fa !important;
+  fill: #4d9fff !important;
 }
 
 .mermaid-chart .flowchart-link {
@@ -143,7 +143,7 @@
 }
 
 .dark .mermaid-chart .edgeLabel rect {
-  fill: #18181b !important;
+  fill: #111110 !important;
 }
 
 .mermaid-chart .node rect,

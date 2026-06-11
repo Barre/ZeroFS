@@ -169,7 +169,7 @@ function CodePanel({
     <div className="group dark:bg-white/2.5">
       <CodePanelHeader tag={tag} label={label} />
       <div className="relative">
-        <pre className="overflow-x-auto p-4 text-xs text-white">{child}</pre>
+        <pre className="overflow-x-auto p-4 text-xs text-zinc-100">{child}</pre>
         <CopyButton code={code} />
       </div>
     </div>
@@ -194,7 +194,7 @@ function CodeGroupHeader({
   return (
     <div className="flex min-h-[calc(--spacing(12)+1px)] flex-wrap items-start gap-x-4 border-b border-zinc-700 bg-zinc-800 px-4 dark:border-zinc-800 dark:bg-transparent">
       {title && (
-        <h3 className="mr-auto pt-3 text-xs font-semibold text-white">
+        <h3 className="mr-auto pt-3 text-xs font-semibold text-zinc-100">
           {title}
         </h3>
       )}

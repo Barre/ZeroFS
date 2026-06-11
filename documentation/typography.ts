@@ -7,9 +7,12 @@ export default {
         css: {
           '--tw-prose-body': theme('colors.zinc.700'),
           '--tw-prose-headings': theme('colors.zinc.900'),
-          '--tw-prose-links': theme('colors.blue.500'),
-          '--tw-prose-links-hover': theme('colors.blue.600'),
-          '--tw-prose-links-underline': theme('colors.blue.500 / 0.3'),
+          // Light-mode links: a darker shade of the #4d9fff accent so they
+          // clear WCAG AA (~5:1) as body-size text on the warm light bg #faf9f6
+          // (the lighter blue-500/600 accent reads fine on dark, fails on light).
+          '--tw-prose-links': '#1668d6',
+          '--tw-prose-links-hover': '#0f57bd',
+          '--tw-prose-links-underline': 'rgb(22 104 214 / 0.3)',
           '--tw-prose-bold': theme('colors.zinc.900'),
           '--tw-prose-counters': theme('colors.zinc.500'),
           '--tw-prose-bullets': theme('colors.zinc.300'),
@@ -23,21 +26,25 @@ export default {
           '--tw-prose-th-borders': theme('colors.zinc.300'),
           '--tw-prose-td-borders': theme('colors.zinc.200'),
 
+          // Dark (invert) prose aligned to the landing warm text ramp:
+          // body ~ --text-dim #a8a69e (zinc-400), headings/bold/code ~ --text
+          // #f4f3ef (zinc-100), links ~ --accent #4d9fff (blue-400),
+          // borders to the warm hairline look.
           '--tw-prose-invert-body': theme('colors.zinc.400'),
-          '--tw-prose-invert-headings': theme('colors.white'),
+          '--tw-prose-invert-headings': theme('colors.zinc.100'),
           '--tw-prose-invert-links': theme('colors.blue.400'),
-          '--tw-prose-invert-links-hover': theme('colors.blue.500'),
-          '--tw-prose-invert-links-underline': theme('colors.blue.500 / 0.3'),
-          '--tw-prose-invert-bold': theme('colors.white'),
+          '--tw-prose-invert-links-hover': theme('colors.blue.300'),
+          '--tw-prose-invert-links-underline': theme('colors.blue.400 / 0.3'),
+          '--tw-prose-invert-bold': theme('colors.zinc.100'),
           '--tw-prose-invert-counters': theme('colors.zinc.400'),
           '--tw-prose-invert-bullets': theme('colors.zinc.600'),
-          '--tw-prose-invert-hr': theme('colors.white / 0.05'),
+          '--tw-prose-invert-hr': theme('colors.white / 0.09'),
           '--tw-prose-invert-quotes': theme('colors.zinc.100'),
           '--tw-prose-invert-quote-borders': theme('colors.zinc.700'),
           '--tw-prose-invert-captions': theme('colors.zinc.400'),
-          '--tw-prose-invert-code': theme('colors.white'),
+          '--tw-prose-invert-code': theme('colors.zinc.100'),
           '--tw-prose-invert-code-bg': theme('colors.zinc.700 / 0.15'),
-          '--tw-prose-invert-code-ring': theme('colors.white / 0.1'),
+          '--tw-prose-invert-code-ring': theme('colors.white / 0.09'),
           '--tw-prose-invert-th-borders': theme('colors.zinc.600'),
           '--tw-prose-invert-td-borders': theme('colors.zinc.700'),
 
