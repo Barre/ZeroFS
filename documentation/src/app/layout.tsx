@@ -1,5 +1,6 @@
 import glob from 'fast-glob'
 import { type Metadata } from 'next'
+import { Schibsted_Grotesk, Geist_Mono } from 'next/font/google'
 import { Providers } from '@/app/providers'
 import { Layout } from '@/components/Layout'
 import { type Section } from '@/components/SectionProvider'
@@ -7,6 +8,19 @@ import PlausibleProvider from 'next-plausible'
 import { Analytics } from "@vercel/analytics/next"
 import '@/styles/tailwind.css'
 import '@/styles/mermaid.css'
+
+const schibstedGrotesk = Schibsted_Grotesk({
+  subsets: ['latin'],
+  variable: '--font-schibsted',
+  display: 'swap',
+})
+
+const geistMono = Geist_Mono({
+  subsets: ['latin'],
+  weight: ['400', '500', '600'],
+  variable: '--font-geist-mono',
+  display: 'swap',
+})
 
 export const metadata: Metadata = {
   title: {
@@ -43,7 +57,11 @@ export default async function RootLayout({
   let allSections = Object.fromEntries(allSectionsEntries)
 
   return (
-    <html lang="en" className="h-full" suppressHydrationWarning>
+    <html
+      lang="en"
+      className={`h-full ${schibstedGrotesk.variable} ${geistMono.variable}`}
+      suppressHydrationWarning
+    >
       <head>
         <PlausibleProvider
           domain="zerofs.net"
@@ -51,7 +69,7 @@ export default async function RootLayout({
         />
       </head>
 
-      <body className="flex min-h-full bg-white antialiased dark:bg-zinc-900">
+      <body className="flex min-h-full bg-zinc-50 antialiased dark:bg-zinc-950">
         <Providers>
           <div className="w-full">
             <Layout allSections={allSections}>{children}</Layout>

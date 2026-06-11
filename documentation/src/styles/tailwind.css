@@ -4,6 +4,37 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
+  /* Fonts - match the ZeroFS landing page (self-hosted via next/font) */
+  --font-sans:
+    var(--font-schibsted), 'Schibsted Grotesk', ui-sans-serif, system-ui,
+    sans-serif;
+  --font-mono:
+    var(--font-geist-mono), 'Geist Mono', ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
+
+  /* Warm neutral ramp anchored to the landing palette
+     (zinc-950 #0a0a09 = --bg, zinc-900 #111110 = --bg-raise,
+      zinc-400 #a8a69e = --text-dim, zinc-500 #6e6c64 = --text-faint).
+     Monotonic R >= G >= B keeps a consistent warm hue across both modes. */
+  --color-zinc-50: #faf9f6;
+  --color-zinc-100: #f4f3ef;
+  --color-zinc-200: #e7e5df;
+  --color-zinc-300: #d3d0c7;
+  --color-zinc-400: #a8a69e;
+  --color-zinc-500: #6e6c64;
+  --color-zinc-600: #56544d;
+  --color-zinc-700: #3a3934;
+  --color-zinc-800: #26251f;
+  --color-zinc-900: #111110;
+  --color-zinc-950: #0a0a09;
+
+  /* Accent — match the landing --accent #4d9fff. blue-500 is the light-mode
+     link/accent, blue-400 the dark-mode one; nudge both toward the landing blue
+     while keeping a touch more depth on 500 for light-mode contrast. */
+  --color-blue-400: #4d9fff;
+  --color-blue-500: #2e8bff;
+  --color-blue-600: #1a72e6;
+
   --text-2xs: 0.75rem;
   --text-2xs--line-height: 1.25rem;
   --text-xs: 0.8125rem;
@@ -43,7 +74,7 @@
 
 @layer base {
   :root {
-    --shiki-color-text: var(--color-white);
+    --shiki-color-text: var(--color-zinc-100);
     --shiki-token-constant: var(--color-blue-300);
     --shiki-token-string: var(--color-blue-300);
     --shiki-token-comment: var(--color-zinc-500);

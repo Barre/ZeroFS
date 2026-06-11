@@ -35,7 +35,7 @@ export function Guides() {
       <div className="not-prose mt-4 grid grid-cols-1 gap-8 border-t border-zinc-900/5 pt-10 sm:grid-cols-2 xl:grid-cols-4 dark:border-white/5">
         {guides.map((guide) => (
           <div key={guide.href}>
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">
+            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
               {guide.name}
             </h3>
             <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">

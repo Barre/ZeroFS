@@ -116,7 +116,7 @@ function ResourcePattern({
         />
       </div>
       <motion.div
-        className="absolute inset-0 rounded-2xl bg-linear-to-r from-[#dbeafe] to-[#e0e7ff] opacity-0 transition duration-300 group-hover:opacity-100 dark:from-[#1e293b] dark:to-[#1e3a8a]"
+        className="absolute inset-0 rounded-2xl bg-linear-to-r from-[#e2edfb] to-[#dbeafe] opacity-0 transition duration-300 group-hover:opacity-100 dark:from-[#16181c] dark:to-[#172234]"
         style={style}
       />
       <motion.div
@@ -159,7 +159,7 @@ function Resource({ resource }: { resource: Resource }) {
       <div className="absolute inset-0 rounded-2xl ring-1 ring-zinc-900/7.5 ring-inset group-hover:ring-zinc-900/10 dark:ring-white/10 dark:group-hover:ring-white/20" />
       <div className="relative rounded-2xl px-4 pt-16 pb-4">
         <ResourceIcon icon={resource.icon} />
-        <h3 className="mt-4 text-sm/7 font-semibold text-zinc-900 dark:text-white">
+        <h3 className="mt-4 text-sm/7 font-semibold text-zinc-900 dark:text-zinc-100">
           <Link href={resource.href}>
             <span className="absolute inset-0 rounded-2xl" />
             {resource.name}

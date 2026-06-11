@@ -4,7 +4,7 @@ export function HeroPattern() {
   return (
     <div className="absolute inset-0 -z-10 mx-0 max-w-none overflow-hidden">
       <div className="absolute top-0 left-1/2 ml-[-38rem] h-100 w-325 dark:mask-[linear-gradient(white,transparent)]">
-        <div className="absolute inset-0 bg-linear-to-r from-[#3b82f6] to-[#60a5fa] mask-[radial-gradient(farthest-side_at_top,white,transparent)] opacity-40 dark:from-[#3b82f6]/30 dark:to-[#60a5fa]/30 dark:opacity-100">
+        <div className="absolute inset-0 bg-linear-to-r from-[#2e8bff] to-[#4d9fff] mask-[radial-gradient(farthest-side_at_top,white,transparent)] opacity-40 dark:from-[#2e8bff]/30 dark:to-[#4d9fff]/30 dark:opacity-100">
           <GridPattern
             width={72}
             height={56}
