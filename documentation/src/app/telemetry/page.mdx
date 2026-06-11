@@ -1,12 +1,12 @@
 export const metadata = {
   title: 'Telemetry',
   description:
-    'Learn about the anonymous usage data ZeroFS collects, what is sent, and how to disable it.',
+    'What anonymous usage data ZeroFS collects, where it is sent, and how to disable it.',
 }
 
 # Telemetry
 
-ZeroFS collects anonymous usage data to help improve the project. This page explains exactly what is collected, how it is sent, and how to disable it. {{ className: 'lead' }}
+ZeroFS collects anonymous usage data. This page lists what is collected, how it is sent, and how to disable it. {{ className: 'lead' }}
 
 ## What Is Collected
 
@@ -63,4 +63,4 @@ When the `[telemetry]` section is absent from the config, telemetry is enabled b
 
 ## Implementation
 
-Telemetry is implemented as simple HTTPS POST requests to PostHog's ingestion API. Events are sent asynchronously with a 5 second timeout and never block filesystem operations. All errors are silently ignored. The source code is in [`src/telemetry.rs`](https://github.com/Barre/ZeroFS/blob/main/zerofs/src/telemetry.rs).
+Telemetry is implemented as HTTPS POST requests to PostHog's ingestion API. Events are sent asynchronously with a 5 second timeout and never block filesystem operations. All errors are silently ignored. The source code is in [`src/telemetry.rs`](https://github.com/Barre/ZeroFS/blob/main/zerofs/src/telemetry.rs).

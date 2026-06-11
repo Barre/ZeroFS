@@ -3,12 +3,12 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Encryption & Security',
   description:
-    'Learn how ZeroFS protects your data with XChaCha20-Poly1305 encryption, secure key management, and best practices for production deployments.',
+    'How ZeroFS encryption works: XChaCha20-Poly1305 at the SST block level, Argon2id key derivation, what stays plaintext on the object store, and password handling.',
 }
 
 # Encryption & Security
 
-ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide, we'll explore how encryption works, what's protected, and security best practices for deployments. {{ className: 'lead' }}
+ZeroFS encrypts all data with XChaCha20-Poly1305. There is no unencrypted mode. This page covers the key architecture, what is and is not visible on the object store, and password handling. {{ className: 'lead' }}
 
 ## How Encryption Works
 
@@ -17,16 +17,16 @@ ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide
 
     ### Key Architecture
 
-    1. **Data Encryption Key (DEK)**: A 256-bit key that encrypts your actual data
+    1. **Data Encryption Key (DEK)**: A 256-bit key that encrypts your data
     2. **Key Encryption Key (KEK)**: Derived from your password using Argon2id
-    3. **Encrypted DEK Storage**: The DEK is encrypted with the KEK and stored in the database
+    3. **Encrypted DEK Storage**: The KEK-wrapped DEK is a standalone object, `zerofs.key`, at the database path on the object store — not a record inside the database
 
-    This approach allows you to change your password without re-encrypting all data.
+    The `zerofs.key` object is bincode-serialized and holds the Argon2id salt, a 24-byte nonce, a plaintext version field, and the wrapped DEK. `zerofs change-password` rewrites it in place: the DEK is re-wrapped, the data itself is not re-encrypted.
 
     ### Encryption Algorithm
 
     - **Algorithm**: XChaCha20-Poly1305
-    - **Compression**: Zstd (default) or LZ4 compression before encryption
+    - **Compression**: Zstd (default) or LZ4, applied before encryption
     - **Key Derivation**: Argon2id
 
   </Col>
@@ -40,12 +40,12 @@ ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide
     ```
 
     ```bash {{ title: 'Password Change' }}
-    # Change password without re-encrypting data
-    zerofs change-password --config zerofs.toml
+    # Reads the new password from stdin (one line, no prompt)
+    printf '%s\n' "$NEW_PASSWORD" |
+      zerofs change-password --config zerofs.toml
 
-    # Enter new password when prompted
-    # ZeroFS re-encrypts only the DEK, not all data
-    
+    # ZeroFS re-wraps only the DEK, not all data
+
     # Update config file afterwards:
     # encryption_password = "new-strong-password"
     ```
@@ -55,7 +55,7 @@ ZeroFS encrypts all your data by default using XChaCha20-Poly1305. In this guide
 
 ## What's Encrypted
 
-Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to ZeroFS's block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
+Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 <Row>
   <Col>
@@ -64,13 +64,13 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
 
     <Properties>
       <Property name="File Contents" type="encrypted">
-        All file data is encrypted in 32KB chunks using unique nonces
+        All file data is encrypted in 32 KiB chunks using unique nonces
       </Property>
       <Property name="File Metadata" type="encrypted">
         Permissions, timestamps, ownership, directory-entry payloads, symlink targets, and other inode data
       </Property>
       <Property name="Keys Inside Blocks" type="encrypted">
-        Inode IDs, directory entry names, chunk identifiers, each block is encrypted as a unit, so the keys it indexes are protected
+        Inode IDs, directory entry names, chunk identifiers. Each block is encrypted as a unit, so the keys it indexes are protected.
       </Property>
       <Property name="SST Index & Filter Blocks" type="encrypted">
         Per-block first-key markers and bloom filter contents
@@ -112,9 +112,13 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
     ├── manifest
     │   ├── 00000000000000000001.manifest
     │   └── ...
-    └── wal
-        ├── 00000000000000000001.sst
-        └── ...
+    ├── wal
+    │   ├── 00000000000000000001.sst
+    │   └── ...
+    ├── zerofs.key                # wrapped DEK
+    ├── .zerofs_bucket_id         # cache-namespace UUID
+    └── .zerofs_compatibility_test_<uuid>
+                                  # transient startup probe
     # Inside each SST:
     # - Data blocks: encrypted (keys + values opaque on disk)
     # - Index blocks: encrypted (per-block first-key markers)
@@ -127,14 +131,47 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
   </Col>
 </Row>
 
+## Sidecar Objects
+
+ZeroFS writes three plaintext objects to the database path alongside the SST, manifest, and WAL files.
+
+<Properties>
+  <Property name="zerofs.key" type="plaintext">
+    The wrapped DEK (see Key Architecture above). Written on first read-write startup; `zerofs change-password` rewrites it in place. The salt, nonce, and version are readable; the DEK itself stays encrypted under the password-derived KEK.
+  </Property>
+  <Property name=".zerofs_bucket_id" type="plaintext">
+    A UUID written on first startup. ZeroFS namespaces the [local cache](/caching) with it: the cache lives in a per-bucket directory named after the UUID's first 8 characters. Deleting the object produces a new UUID and a fresh cache directory on the next startup; no filesystem data is lost.
+  </Property>
+  <Property name=".zerofs_compatibility_test_<uuid>" type="plaintext">
+    A transient probe created and deleted at every read-write startup to verify that the store supports conditional puts (`PutMode::Create`), which ZeroFS requires for fencing. Deletion is best-effort; leftovers from a crashed startup are cleaned at the next startup. Read-only mode skips the probe. On versioned buckets the put/delete cycle leaves noncurrent versions and delete markers.
+  </Property>
+</Properties>
+
+<Warning>
+  Backups, replication rules, and lifecycle policies must include `zerofs.key`. Without it the data is unrecoverable even with the correct password. Prefix- or suffix-filtered rules (for example `*.sst` only) silently miss it.
+</Warning>
+
 ## Password Management
 
-Secure password management is critical for ZeroFS deployments:
+The KEK is derived from the encryption password; nothing else can unwrap the DEK.
 
 ### Password Requirements
 
-- **Minimum Length**: No enforced minimum, but use 25+ characters
-- **Complexity**: Use a mix of characters or a passphrase
+ZeroFS validates the password before touching the store: at `zerofs run` startup (the server refuses to start), in `zerofs change-password`, and in the standalone compactor and debug commands.
+
+- **Non-empty**: empty passwords are rejected
+- **Minimum length**: 8 characters, enforced with the error `Password must be at least 8 characters long`. Use 25+ characters in practice.
+- **Not the placeholder**: the literal string `CHANGEME` is rejected with `Please choose a secure password, not 'CHANGEME'`
+
+### Changing the Password
+
+`zerofs change-password` reads exactly one line from stdin and trims surrounding whitespace. There is no interactive prompt, and terminal input is echoed — pipe the password instead of typing it:
+
+```bash
+printf '%s\n' "$NEW_PASSWORD" | zerofs change-password --config zerofs.toml
+```
+
+This form suits feeding from a secret manager. The command re-wraps the DEK inside `zerofs.key`; data is not re-encrypted. If the configured current password is still `CHANGEME`, the command fails with `Current password is still the default. Please update your config file first` — set a real password in the config before changing it. After a successful change, update the config file or environment variable yourself; ZeroFS does not modify the config.
 
 ### Secure Password Practices
 
@@ -164,7 +201,7 @@ zerofs run --config zerofs.toml
 ### Lost Password Recovery
 
 <Warning>
-  If you lose your password, your data is permanently inaccessible. ZeroFS cannot recover encrypted data without the correct password. Always maintain secure backups of your passwords.
+  If the password is lost, the data is permanently inaccessible; ZeroFS has no key material recovery mechanism. Keep a backup of the password.
 </Warning>
 
 ## Security Best Practices
@@ -194,18 +231,18 @@ graph TB
     NFS[NFS]
     
     subgraph ZEROFS["ZeroFS"]
-        ENC[ChaCha20 Poly1305<br/>Encryption Layer]
         COMP[Zstd or LZ4<br/>Compression Layer]
+        ENC[XChaCha20-Poly1305<br/>Encryption Layer]
         
-        ENC --> COMP
+        COMP --> ENC
     end
     
     SLATE[SlateDB<br/>LSM Tree Storage]
     S3[S3 Storage<br/>Object Storage]
     
     APP --> NFS
-    NFS --> ENC
-    COMP --> SLATE
+    NFS --> COMP
+    ENC --> SLATE
     SLATE --> S3
         
     class SLATE,S3 storage

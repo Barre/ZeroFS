@@ -3,20 +3,22 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Architecture',
   description:
-    'Deep dive into ZeroFS architecture, internal components, and the technology stack that enables high-performance S3-backed filesystems.',
+    'How ZeroFS is layered: NFS, 9P, and NBD servers over a shared filesystem core, with SlateDB storing data in S3. Covers protocol choice and filesystem limits.',
 }
 
 export const sections = [
   { title: 'System Overview', id: 'system-overview' },
+  { title: 'Choosing a Protocol', id: 'choosing-a-protocol' },
+  { title: 'Filesystem Limits', id: 'filesystem-limits' },
 ]
 
 # Architecture
 
-ZeroFS is built on a modern, modular architecture. This document provides a deep technical dive into the system's design, components, and implementation details. {{ className: 'lead' }}
+This page describes how ZeroFS is structured: the protocol servers, the shared filesystem core, and the storage backend. {{ className: 'lead' }}
 
 ## System Overview {{ id: 'system-overview' }}
 
-ZeroFS bridges the gap between object storage and POSIX filesystems through a sophisticated layered architecture:
+The NFS, 9P, and NBD servers run in one userspace process and share a single filesystem layer. Data passes through encryption and caching, and SlateDB stores it in S3 as an LSM tree:
 
 <Mermaid chart={`
 graph TB
@@ -56,6 +58,34 @@ graph TB
     NBD --> NBDD
     `} />
 
+## Choosing a Protocol {{ id: 'choosing-a-protocol' }}
+
+Because the servers share one filesystem layer, protocols mix on a single instance: NBD device files in `.nbd/`, for example, are created and resized with regular file operations through an NFS or 9P mount. Which protocol to mount with depends on the client and the workload:
+
+| Mount | Client | Use case |
+|-------|--------|----------|
+| [NFS](/nfs-access) | NFS client that ships with macOS, Linux, and Windows | Mounting from any operating system without installing software |
+| [9P](/9p-access) | Linux kernel `9p` module | fsync-dependent workloads (databases, transactional systems); closer POSIX adherence than NFS |
+| [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) | FUSE client bundled in the `zerofs` binary; speaks 9P to the same server | Linux mounts without root; reconnects on its own after server restarts and network interruptions |
+| [NBD](/nbd-devices) | `nbd-client` | Raw block devices for ext4, XFS, ZFS pools, and VM disks |
+
+The fsync difference is the deciding factor for databases. NFS COMMIT semantics allow fsync to return before data reaches stable storage. Over 9P — kernel client or `zerofs mount` — fsync returns only after data is durable.
+
+## Filesystem Limits {{ id: 'filesystem-limits' }}
+
+The limits below are design constants of the on-disk format:
+
+| Limit | Value | Where it comes from |
+|-------|-------|---------------------|
+| Maximum file size | 16 EiB | File sizes are stored as 64-bit integers |
+| Maximum filesystem size | 16 EiB | Byte counts are stored as 64-bit integers |
+| Files over the filesystem's lifetime | 2^64 | Inode IDs are 64-bit and never reused |
+| Hardlinks per file | 2^32 | Link counts are stored as 32-bit integers |
+| Chunk size | 32 KiB | File data is split into 32 KiB chunks with 64-bit indexing |
+
+In practice, S3 provider limits, performance with billions of objects, and storage cost take effect long before these values.
+
+`df` reports the configured [quota](/configuration#filesystem-quotas) (`max_size_gb`) as the filesystem's total size; without a quota, the total is 16 EiB. The NFS server caps the sizes it reports at 8 EiB because some NFS clients cannot handle larger values, while the 9P server reports the full quota — so `df` can show different totals for the same filesystem depending on the mount protocol.
 
 <div className="not-prose">
   <Button href="/" variant="text" arrow="left">

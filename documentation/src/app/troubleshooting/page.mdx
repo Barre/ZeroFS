@@ -1,12 +1,12 @@
 export const metadata = {
   title: 'Troubleshooting',
   description:
-    'Common issues and solutions for ZeroFS, including mount problems, performance issues, S3 connectivity errors, and debugging techniques.',
+    'Diagnostic steps for common ZeroFS problems: mount failures, startup errors, S3 connectivity errors, cache and configuration issues, encryption passwords, NBD devices, runtime storage errors, and debug logging.',
 }
 
 # Troubleshooting
 
-This guide helps you diagnose and resolve common issues with ZeroFS. From mount failures to performance problems, we'll walk through systematic debugging steps and solutions for the most frequent problems users encounter. {{ className: 'lead' }}
+Diagnostic steps for common ZeroFS problems: mount failures, startup errors, S3 connectivity errors, cache and configuration issues, encryption passwords, NBD devices, runtime storage errors, and debug logging. {{ className: 'lead' }}
 
 <Note>
   Enable debug logging with `export RUST_LOG=zerofs=debug` to get detailed information about what ZeroFS is doing internally.
@@ -162,6 +162,45 @@ touch /var/cache/zerofs/test && rm /var/cache/zerofs/test
 
 </CodeGroup>
 
+## Startup Errors
+
+### Illegal Instruction (SIGILL)
+
+`zerofs` crashes at startup with `Illegal instruction` (SIGILL) before producing any log output.
+
+The prebuilt Linux amd64 binary is compiled with `-C target-cpu=x86-64-v3` and requires AVX2 (Intel Haswell 2013 and later, AMD Excavator 2015 and later). The published amd64 Docker image contains the same binary. On a CPU without AVX2, the process exits at the first unsupported instruction.
+
+```bash
+# Check for AVX2 — no output means the CPU cannot run the prebuilt binary
+grep -o avx2 /proc/cpuinfo | head -1
+
+# Fix: build from source (targets baseline x86-64)
+git clone https://github.com/Barre/ZeroFS
+cd ZeroFS/zerofs
+cargo build --release
+```
+
+See [Installation](/quickstart#installation) in the quickstart for all install methods.
+
+### Conditional Write Check Fails
+
+Startup fails with:
+
+```
+Storage provider does not support conditional writes. PutMode::Create succeeded when it should have failed. This feature is required for fencing in ZeroFS.
+```
+
+Before every read-write open, ZeroFS writes a probe object named `.zerofs_compatibility_test_<uuid>` to the database path and attempts a second, create-only write to the same key. The store must reject the second write with an already-exists error. A store that accepts it lacks put-if-not-exists support, which fencing requires, so ZeroFS refuses to start. A message starting with `Storage provider precondition check failed` means the probe itself returned an unexpected error; the underlying store error follows the colon.
+
+For S3-compatible stores without conditional put support, set `conditional_put` to a Redis URL:
+
+```toml
+[aws]
+conditional_put = "redis://localhost:6379"
+```
+
+See the Conditional Put Support section under [Storage Backends](/configuration#storage-backends) for configuration and [Conditional Writes and Fencing](/durability#conditional-writes-and-fencing) for the fencing model.
+
 ## Configuration Issues
 
 ### Missing Configuration File
@@ -192,7 +231,8 @@ zerofs run -c zerofs.toml
 url = "s3://bucket/path"
 encryption_password = "correct-password"
 
-# For special characters, use single quotes in TOML:
+# Values undergo environment variable expansion.
+# Write a literal $ as $$ — this sets the password to p@$w0rd!
 encryption_password = 'p@$$w0rd!'
 
 # Or use environment variable substitution:
@@ -203,9 +243,9 @@ encryption_password = "${ZEROFS_PASSWORD}"
 
 ```bash
 # Change password using the CLI
-zerofs change-password --config zerofs.toml
+# The new password is read from stdin
+echo "new-password" | zerofs change-password --config zerofs.toml
 
-# You'll be prompted for the new password
 # After changing, update your config file:
 # [storage]
 # encryption_password = "new-password"
@@ -238,6 +278,32 @@ sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
 sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
 ```
 
+## Runtime Errors
+
+### Reads Stall with Repeated Short-Body Warnings
+
+Reads hang while the log repeats:
+
+```
+object store returned a short body; re-fetching
+```
+
+ZeroFS checks the body of every object store read against the length the store reported. When the body comes back shorter, ZeroFS discards it and fetches again rather than return truncated data. There is no retry limit: the read blocks until a full body arrives, with backoff starting at 100 ms, doubling per attempt, and capping at 800 ms. The warning fields report the object `location`, the `expected` and `received` byte counts, and the `attempt` number.
+
+Repeated warnings for the same object mean something between ZeroFS and the storage backend truncates responses — a proxy or the provider itself. Reads recover without intervention once full responses arrive.
+
+### Process Exits with a Fatal Write Error
+
+The process exits with code 1 after logging:
+
+```
+Fatal write error, exiting: <underlying error>
+```
+
+Any failed write to the database terminates the process: after a write failure, the database state is unknown, and a restart rebuilds from the last committed state. Run ZeroFS under a supervisor that restarts it — the systemd unit under [System Integration](/configuration#system-integration) in the configuration guide sets `Restart=always`.
+
+The text after the colon is the underlying storage error. Diagnose that error; the exit is the recovery mechanism, not the fault.
+
 ## Debugging Techniques
 
 ### Enable Detailed Logging
@@ -251,8 +317,14 @@ export RUST_LOG='zerofs=debug'
 zerofs run -c zerofs.toml 2>&1 | tee zerofs.log
 
 # Filter specific components
-export RUST_LOG='zerofs::nfs=trace,zerofs::cache=debug'
+export RUST_LOG='zerofs::nfs=trace,zerofs::nbd=debug'
 ```
+
+### `debug list-keys` Fences a Running Instance
+
+`zerofs debug list-keys --config zerofs.toml` prints every key in the database with a per-type summary. It opens the database in read-write mode, and fencing allows one writer per database. When it opens a database that a running ZeroFS instance is serving, it takes over as the writer: the instance's next write fails and the instance exits with `Fatal write error, exiting`.
+
+Stop the instance before running `debug list-keys` against its database, or accept that a supervisor with `Restart=always` restarts the instance after the exit.
 
 
 <div className="not-prose">

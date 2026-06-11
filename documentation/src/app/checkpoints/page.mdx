@@ -1,16 +1,16 @@
 export const metadata = {
   title: 'Checkpoints',
   description:
-    'Learn how to create point-in-time snapshots of your ZeroFS database for backup and recovery.',
+    'Named checkpoints capture a ZeroFS filesystem at a point in time. Any checkpoint can be opened read-only.',
 }
 
 # Checkpoints
 
-ZeroFS supports creating named checkpoints for point-in-time snapshots. Checkpoints capture the database state at a specific moment, enabling you to open historical views of your data. {{ className: 'lead' }}
+Named checkpoints capture the filesystem at a point in time. Any checkpoint can be opened read-only with a single flag at startup. {{ className: 'lead' }}
 
 ## Overview
 
-Checkpoints are named snapshots of your database state. They're useful for:
+Checkpoints are named snapshots of the filesystem state. They're useful for:
 
 - **Point-in-time recovery**: Access data as it was at a specific moment
 - **Consistent backups**: Create snapshots before risky operations
@@ -21,7 +21,7 @@ Checkpoints are named snapshots of your database state. They're useful for:
 <Row>
   <Col>
 
-    Checkpoints are created via RPC commands while ZeroFS is running. This ensures data consistency by coordinating with the active database.
+    Checkpoints are created via RPC commands sent to the running ZeroFS process, which coordinates the snapshot so it captures a consistent state.
 
     Each checkpoint has:
     - **Name**: A unique identifier you choose
@@ -36,7 +36,7 @@ Checkpoints are named snapshots of your database state. They're useful for:
     zerofs checkpoint create -c zerofs.toml my-snapshot
 
     # Output:
-    # Checkpoint created successfully!
+    # ✓ Checkpoint created successfully!
     #   Name: my-snapshot
     #   ID: 01234567-89ab-cdef-0123-456789abcdef
     #   Created at: 2025-01-15 10:30:00

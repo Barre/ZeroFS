@@ -1,0 +1,124 @@
+export const metadata = {
+  title: 'Garbage Collection',
+  description:
+    'How ZeroFS reclaims space after deletion: tombstone GC, LSM compaction, and SlateDB object garbage collection.',
+}
+
+# Garbage Collection
+
+Deleting a file is immediate at the filesystem level: the unlink transaction commits and the file is gone from the namespace. The bytes in the bucket are reclaimed later, by three background stages that each run on their own schedule. A bucket that shrinks minutes or hours after a deletion is operating normally. {{ className: 'lead' }}
+
+## What Deletion Does
+
+<Row>
+  <Col>
+
+    Unlink removes the inode in a single transaction. What happens to the file's data chunks depends on the file's size:
+
+    - Files of 10 chunks or fewer (320 KiB at the 32 KiB chunk size) have their chunk keys deleted in the same transaction.
+    - Larger files leave a **tombstone**: a record of the file's remaining size. The chunks stay in place until the garbage collector processes the tombstone.
+
+    Renaming over an existing file deletes the replaced file through the same path. In both cases the operation returns before any space is reclaimed.
+
+  </Col>
+  <Col>
+
+    ```text {{ title: 'Deletion decision' }}
+    file size <= 10 chunks (320 KiB)
+      -> chunk keys deleted in the
+         unlink transaction
+
+    file size  > 10 chunks
+      -> tombstone written;
+         chunks remain until GC
+    ```
+
+  </Col>
+</Row>
+
+## The Reclamation Pipeline
+
+Immediate deletion does not mean immediate compaction, and does not mean immediate garbage collection of objects. Space is reclaimed by three stages. Each is eventual, and none is triggered by the deletion itself:
+
+1. **Tombstone GC** deletes the file's chunk keys from the LSM tree. This writes delete markers; the data bytes still sit inside existing immutable SSTs in the bucket.
+2. **Compaction** rewrites those SSTs, merging levels and carrying forward only live entries. This is the point at which deleted blocks are physically removed. Deletion does not schedule or accelerate compaction.
+3. **Object garbage collection** deletes SSTs that compaction has superseded from the bucket. Only at this stage does the bucket's billed size drop.
+
+<Note>
+  A delay between deleting files and the bucket shrinking is normal operation,
+  not a fault. Each stage runs in the background on its own schedule.
+</Note>
+
+## Stage 1: Tombstone GC
+
+<Row>
+  <Col>
+
+    The read-write instance runs a continuous background task that drains the tombstone queue. Each pass processes the queue in rounds of up to 10,000 chunks across up to 10,000 tombstones; rounds repeat back to back until the queue is empty, and the task then sleeps 10 seconds before the next pass.
+
+    Large files are collected tail-first: each round deletes chunks from the end of the file and updates the tombstone's remaining size. A partially collected file is a valid intermediate state, and an interrupted pass resumes from the recorded remaining size.
+
+    After this stage, the chunk keys carry delete markers in the LSM tree. The bucket holds the same bytes it held before.
+
+  </Col>
+  <Col>
+
+    ```text {{ title: 'GC pass' }}
+    loop:
+      round:
+        process up to 10,000 tombstones
+        delete up to 10,000 chunk keys
+        (tail-first per file)
+      if queue not empty: next round
+      else: sleep 10 s, start next pass
+    ```
+
+  </Col>
+</Row>
+
+## Stage 2: Compaction
+
+SSTs are immutable: once written, an SST is never modified in place. Writes and deletes accumulate as new entries in new SSTs, so the LSM tree holds overlapping data across levels — older versions of keys, deleted entries, and the delete markers that shadow them.
+
+Compaction merges a set of SSTs into new SSTs, keeping the live version of each key and dropping deleted and superseded entries. It runs in the background, either inside the writer process or on a [standalone compactor](/standalone-compactor). The compactor polls for eligible work every 1 second; whether a compaction runs is decided by a size-tiered scheduler from the sizes and counts of accumulated SSTs, not by deletions. Until compaction rewrites the SSTs that contain a deleted file's chunks, those bytes remain in the bucket.
+
+## Stage 3: Object Garbage Collection
+
+Compaction writes new objects and leaves the superseded ones in the bucket. SlateDB's object garbage collector, running in the writer process, deletes them. It scans four object directories — WAL, manifest, compacted SSTs, and compaction state — every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old.
+
+This is the only stage that removes objects from the bucket. The bucket's billed size drops here and nowhere earlier.
+
+## Where Reclamation Runs
+
+| Instance | Tombstone GC | Compaction | Object deletion |
+|----------|--------------|------------|-----------------|
+| Read-write | yes | yes | yes |
+| Read-write with `--no-compactor` | yes | no | yes |
+| Standalone compactor | no | yes | no |
+| Read-only mount | no | no | no |
+| Checkpoint mount | no | no | no |
+
+A [standalone compactor](/standalone-compactor) rewrites SSTs but never deletes objects; object deletion stays with the writer. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run none of the three stages. The bucket shrinks only while the read-write instance is running.
+
+## Observability
+
+The [Prometheus endpoint](/prometheus) exports four counters for tombstone GC:
+
+| Metric | Meaning |
+|--------|---------|
+| `zerofs_tombstones_created_total` | Tombstones created by deletions |
+| `zerofs_tombstones_processed_total` | Tombstones fully collected |
+| `zerofs_gc_chunks_deleted_total` | Chunk keys deleted by GC |
+| `zerofs_gc_runs_total` | GC passes started |
+
+`zerofs_tombstones_created_total` minus `zerofs_tombstones_processed_total` is the tombstone backlog; a gap that grows over time means deletions are outpacing collection. Files of 10 chunks or fewer never create tombstones, so a small-file workload shows no tombstone activity. The monitor dashboard (`zerofs monitor`) and the [web UI](/web-ui) display the same counters.
+
+Compaction and object garbage collection have no ZeroFS-level metrics; their effect is visible as the bucket's object count and size.
+
+## NBD TRIM
+
+TRIM on an [NBD device](/nbd-devices) enters the pipeline at stage 2, skipping tombstones: the discard transaction deletes fully covered chunk keys directly and zeroes the covered portion of partially covered chunks (a chunk that becomes all zeroes is also deleted). Compaction and object garbage collection then reclaim the space on their own schedules.
+
+## Configuration
+
+None of the values on this page are configurable. The 10-chunk small-file threshold, the 10,000-chunk and 10,000-tombstone round limits, the 10-second sleep between GC passes, and the 1-minute object GC interval and minimum age are fixed.

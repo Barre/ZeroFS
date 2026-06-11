@@ -7,7 +7,7 @@ export const metadata = {
 
 # ZeroFS vs AWS EFS Benchmarks
 
-Performance comparison conducted on AWS EC2 t3.xlarge (4 vCPUs, 16 GiB RAM) in eu-north-1 region.
+Performance comparison conducted on AWS EC2 t3.xlarge (4 vCPUs, 16 GiB RAM) in eu-north-1 region. Results published August 2025.
 
 ## Test Setup
 
@@ -20,7 +20,7 @@ Performance comparison conducted on AWS EC2 t3.xlarge (4 vCPUs, 16 GiB RAM) in e
 
 ## Architecture Differences
 
-**ZeroFS**: Direct S3-only architecture. No additional infrastructure required. Full POSIX compliance.
+**ZeroFS**: A single userspace process backed by S3. No other infrastructure. POSIX semantics are tested in CI with 8,662 pjdfstest cases per protocol; a few excluded cases per protocol are listed in the repo.
 
 **AWS EFS**: Managed NFS service.
 
@@ -30,36 +30,38 @@ Performance comparison conducted on AWS EC2 t3.xlarge (4 vCPUs, 16 GiB RAM) in e
 
 ### Synthetic Benchmarks
 
-| Test | ZeroFS | AWS EFS | Difference |
+The last column states the ZeroFS figure relative to the EFS figure.
+
+| Test | ZeroFS | AWS EFS | ZeroFS vs EFS |
 | --- | --- | --- | --- |
 | **Sequential Writes** | | | |
-| Operations/sec | 230.71 | 108.13 | 2.1x faster |
-| Mean latency | 4.32ms | 9.22ms | 2.1x slower |
+| Operations/sec | 230.71 | 108.13 | 2.1x higher |
+| Mean latency | 4.32ms | 9.22ms | 2.1x lower |
 | Success rate | 100% | 100% | - |
 | | | | |
 | **Data Modifications** | | | |
-| Operations/sec | 308.60 | 181.52 | 1.7x faster |
-| Mean latency | 3.23ms | 5.50ms | 1.7x slower |
+| Operations/sec | 308.60 | 181.52 | 1.7x higher |
+| Mean latency | 3.23ms | 5.50ms | 1.7x lower |
 | Success rate | 100% | 100% | - |
 | | | | |
 | **Single File Append** | | | |
-| Operations/sec | 300.91 | 91.11 | 3.3x faster |
-| Mean latency | 3.31ms | 10.95ms | 3.3x slower |
+| Operations/sec | 300.91 | 91.11 | 3.3x higher |
+| Mean latency | 3.31ms | 10.95ms | 3.3x lower |
 | Success rate | 100% | 100% | - |
 | | | | |
 | **Empty Files** | | | |
-| Operations/sec | 294.87 | 195.61 | 1.5x faster |
-| Mean latency | 2.74ms | 4.62ms | 1.7x slower |
+| Operations/sec | 294.87 | 195.61 | 1.5x higher |
+| Mean latency | 2.74ms | 4.62ms | 1.7x lower |
 | Success rate | 100% | 100% | - |
 | | | | |
 | **Empty Directories** | | | |
-| Operations/sec | 446.61 | 219.01 | 2.0x faster |
-| Mean latency | 2.23ms | 4.55ms | 2.0x slower |
+| Operations/sec | 446.61 | 219.01 | 2.0x higher |
+| Mean latency | 2.23ms | 4.55ms | 2.0x lower |
 | Success rate | 100% | 100% | - |
 | | | | |
 | **Random Reads** | | | |
-| Operations/sec | 415.68 | 1,242.61 | 3.0x slower |
-| Mean latency | 2.40ms | 0.80ms | 3.0x faster |
+| Operations/sec | 415.68 | 1,242.61 | 3.0x lower |
+| Mean latency | 2.40ms | 0.80ms | 3.0x higher |
 | Success rate | 100% | 100% | - |
 
 ### Real-World Operations
@@ -74,7 +76,7 @@ Performance comparison conducted on AWS EC2 t3.xlarge (4 vCPUs, 16 GiB RAM) in e
 
 ### Storage Cost Comparison
 
-Based on AWS pricing (eu-north-1 region):
+Based on AWS pricing in eu-north-1, as of August 2025:
 
 **AWS EFS Pricing:**
 - Storage: **$0.30/GB-Month** (Standard/SSD storage)
@@ -84,7 +86,7 @@ Based on AWS pricing (eu-north-1 region):
 **AWS S3 Standard Pricing (for ZeroFS):**
 - Storage: **$0.023/GB-Month** (first 50TB)
 - EC2-to-S3 data transfer within same region: **Free**
-- S3 API operations: Minimal
+- S3 API requests: billed per request, not included in the tables below
 
 ### Raw Storage Cost Comparison
 
@@ -97,30 +99,28 @@ Based on AWS pricing (eu-north-1 region):
 
 ### Annual Storage Cost Projection
 
-| Storage Size | ZeroFS (S3) Annual | AWS EFS Annual | Annual Savings with ZeroFS |
+| Storage Size | ZeroFS (S3) Annual | AWS EFS Annual | Annual Difference |
 | --- | --- | --- | --- |
 | **100 GB** | $27.60 | $360.00 | **$332.40** |
 | **1 TB** | $276.00 | $3,600.00 | **$3,324.00** |
 | **10 TB** | $2,760.00 | $36,000.00 | **$33,240.00** |
 | **100 TB** | $27,600.00 | $360,000.00 | **$332,400.00** |
 
-**Important Notes:**
-- **ZeroFS**: Primary cost is S3 storage at $0.023/GB-month. EC2-to-S3 data transfer is free within the same AWS region. S3 API costs are typically negligible.
-- **AWS EFS**: Storage cost is 13x higher at $0.30/GB-month, PLUS additional charges for all data transfers ($0.03/GB for reads, $0.06/GB for writes).
-- The comparison above shows storage costs only. EFS's data transfer charges can significantly increase total costs depending on usage patterns.
+**Notes:**
+- **ZeroFS**: Primary cost is S3 storage at $0.023/GB-month. EC2-to-S3 data transfer is free within the same AWS region. S3 API request charges are not included in the tables above.
+- **AWS EFS**: Storage is $0.30/GB-month, plus $0.03/GB for reads and $0.06/GB for writes.
+- The tables above compare storage costs only. EFS's per-GB read and write charges add to the total, depending on traffic.
 
 ## Key Observations
 
 ### ZeroFS
-- 2-3x faster for write operations
-- 2x faster for directory operations  
-- 13x lower storage costs ($0.023/GB vs $0.30/GB)
-- No data transfer charges within same AWS region
-- Direct S3 architecture
+- 1.5x to 3.3x higher throughput on the write and metadata tests
+- 13x lower storage cost ($0.023/GB-month vs $0.30/GB-month)
+- No EC2-to-S3 data transfer charges within the same AWS region
 
 ### AWS EFS
-- 3x faster for random read operations
-- Additional charges for data transfers ($0.03/GB read, $0.06/GB write)
+- 3.0x higher throughput on random reads
+- Charges $0.03/GB for reads and $0.06/GB for writes
 
 ## Technical Details
 
@@ -180,6 +180,6 @@ Extracting ZFS 2.3.3 source tarball. Tests sequential file creation with varying
 
 ## Summary
 
-In our benchmarks, ZeroFS demonstrated 2-3x faster performance for write operations while using S3 storage that costs 13x less than EFS. AWS EFS showed better random read performance (3x faster) but at significantly higher cost.
+On a t3.xlarge in eu-north-1, with 10,000 operations per test, ZeroFS completed the write and metadata tests 1.5x to 3.3x faster than EFS. EFS served random reads 3.0x faster.
 
-The tests revealed substantial cost differences: EFS charges $0.30/GB-month for storage compared to S3's $0.023/GB-month, plus additional fees for data transfers. For a 10TB deployment, this translates to an annual difference of over $33,000 in storage costs alone.
+S3 Standard storage costs $0.023/GB-month against $0.30/GB-month for EFS, and EFS adds $0.03/GB for reads and $0.06/GB for writes. For 10 TB, the storage difference alone is $33,240 per year.

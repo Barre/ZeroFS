@@ -5,7 +5,7 @@ import { HeroPattern } from '@/components/HeroPattern'
 export const metadata = {
   title: 'ZeroFS Documentation',
   description:
-    'The filesystem that makes S3 your primary storage. Mount S3 buckets as local filesystems with NFS or 9P or use them as block devices with NBD.',
+    'ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as block devices over NBD.',
 }
 
 export const sections = [
@@ -17,7 +17,7 @@ export const sections = [
 
 # ZeroFS Documentation
 
-ZeroFS makes S3 storage feel like a real filesystem. It provides file-level access via NFS and 9P and block-level access via NBD. Fast enough to compile code on, with clients already built into your OS. No FUSE drivers, no kernel modules, just mount and go.
+ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as block devices over NBD. NFS and 9P need nothing installed on the client because the OS already ships support; a bundled FUSE client mounts without root. The server runs in userspace, with no kernel modules. CI compiles the Linux kernel on ZeroFS mounts on every change.
 
 <div className="not-prose mt-6 mb-16 flex gap-3">
   <Button href="/quickstart" arrow="right">
@@ -28,9 +28,9 @@ ZeroFS makes S3 storage feel like a real filesystem. It provides file-level acce
   </Button>
 </div>
 
-## Why ZeroFS? {{ anchor: false }}
+## What ZeroFS does {{ anchor: false }}
 
-Traditional filesystems are limited by local storage capacity and hardware constraints. ZeroFS breaks these limitations by turning S3 into a high-performance filesystem that's always encrypted, globally accessible, and infinitely scalable. Run databases, compile code, or even boot entire operating systems directly from S3 storage. {{ className: 'lead' }}
+ZeroFS keeps primary data in S3 rather than on local disk. Every block is compressed, then encrypted with XChaCha20-Poly1305 before upload; there is no unencrypted mode. The maximum filesystem size is 16 EiB. Databases, code builds, and VM boot disks run directly against the bucket. {{ className: 'lead' }}
 
 <div className="not-prose">
   <Button href="/encryption" variant="text" arrow="right">

@@ -1,0 +1,92 @@
+export const metadata = {
+  title: 'Read Replicas',
+  description:
+    'Run any number of read-only ZeroFS instances against the same object store as one read-write instance.',
+}
+
+# Read Replicas
+
+One read-write instance and any number of read-only instances can run against the same object store. A replica serves the same front ends as the writer and follows its writes with bounded staleness. {{ className: 'lead' }}
+
+## Starting a Replica
+
+<Row>
+  <Col>
+
+    A replica is a normal `zerofs run` process started with the `--read-only` flag. It uses the same `zerofs.toml` as the writer and serves every front end configured there — NFS, 9P, NBD, and the web UI — on its own addresses.
+
+    Replicas need read access to the object store (and to the [separate WAL store](/separate-wal), if one is configured) and the same `encryption_password` as the writer.
+
+  </Col>
+  <Col>
+
+    ```bash {{ title: 'Writer and Replicas' }}
+    # Read-write instance (exactly one)
+    zerofs run -c zerofs.toml
+
+    # Read-only instances (any number)
+    zerofs run -c zerofs.toml --read-only
+    ```
+
+  </Col>
+</Row>
+
+## Freshness
+
+A replica does not open the database for writing. It opens a SlateDB `DbReader`, which polls the object store for new manifest files and WAL entries every 10 seconds and replays new WAL entries. The poll interval is a SlateDB default; `zerofs.toml` has no setting for it.
+
+A write becomes visible on a replica after two delays:
+
+1. The writer persists the write to the object store. Buffered writes get there on client `fsync`, when the periodic flush runs (every 30 seconds by default, `flush_interval_secs` under `[lsm]`), or when buffered data reaches a capacity threshold. See [Durability](/durability).
+2. The replica's next poll picks it up, after at most 10 seconds.
+
+Worst-case staleness is therefore the writer's flush delay plus the 10-second poll interval.
+
+The reader registers its own SlateDB checkpoint with a 10-minute lifetime and renews it from the poll task. SlateDB's garbage collector deletes only files that no active manifest or checkpoint references, so the writer does not delete SSTs a replica is still reading. When a replica stops, its checkpoint expires after at most 10 minutes and the writer's garbage collector removes it. Both the lifetime and the poll interval are SlateDB defaults, not configurable in `zerofs.toml`.
+
+## What a Replica Does Not Run
+
+Maintenance stays on the writer. A read-only instance runs none of the following:
+
+- **SlateDB compaction and garbage collection**: Both attach to the read-write database instance. The writer compacts SSTs and deletes unreferenced files; replicas only read them.
+- **ZeroFS garbage collection**: The background task that reclaims storage from deleted files runs only on the writer.
+- **The periodic flush**: A replica buffers no writes, so the flush task is not started.
+- **Checkpoint creation**: `zerofs checkpoint create` against a replica's RPC server fails with `Cannot create checkpoints in read-only mode. Start the server without --read-only or --checkpoint flags.`
+- **SlateDB metrics**: The `/metrics` endpoint on a replica serves ZeroFS metrics but omits the `slatedb_`-prefixed series, which come from the read-write engine. See [Prometheus Metrics](/prometheus).
+
+## Write Semantics
+
+A replica rejects every mutating operation at the database layer, before it reaches the storage engine. Clients see `EROFS` (`NFS3ERR_ROFS` on NFS) regardless of the options they mounted with. Mounting with `-o ro` is still useful: applications then see the restriction at mount time instead of on their first write.
+
+<Note>
+  A replica skips creating the `.nbd` directory at startup and returns `EROFS` for file creation, so NBD device files must be created through the writer. See [NBD Devices](/nbd-devices).
+</Note>
+
+## Restrictions
+
+### A fresh volume cannot start read-only
+
+The wrapped encryption key is created on first start and stored in the object store. A read-only instance cannot write it, so the first start of a volume must be read-write. Starting with `--read-only` against an uninitialized volume fails with:
+
+```text
+Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first.
+```
+
+### Exactly one writer
+
+Only one read-write instance can run against a volume at a time. ZeroFS depends on conditional writes in the object store to fence writers, and a read-write instance verifies this support at startup by writing a probe object and attempting a conditional overwrite. A read-only instance skips the probe.
+
+## --read-only vs --checkpoint
+
+Both flags open the database through a SlateDB `DbReader`, and both produce a read-only filesystem. They differ in what they track:
+
+- `--read-only` follows the live head. The reader polls the manifest and WAL, and new writes appear within the staleness bound above.
+- `--checkpoint` pins the reader to a named checkpoint. SlateDB does not poll the manifest or WAL in this mode, so the view never advances.
+
+The two flags are mutually exclusive; passing both is a startup error.
+
+<div className="not-prose">
+  <Button href="/checkpoints" variant="text" arrow="right">
+    Learn more about checkpoints
+  </Button>
+</div>

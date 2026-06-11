@@ -1,93 +1,109 @@
 export const metadata = {
   title: 'Advanced Use Cases',
   description:
-    'Explore advanced ZeroFS architectures including geo-distributed storage, tiered storage with ZFS, running databases, and CAP theorem considerations.',
+    'Multi-region ZFS pools mirrored across ZeroFS NBD devices, tiered storage with local L2ARC and SLOG devices, and a PostgreSQL reference architecture built on both.',
 }
 
 # Advanced Use Cases
 
-ZeroFS enables powerful architectures that were previously complex or expensive to implement. From geo-distributed ZFS pools to tiered storage systems, this guide explores advanced use cases that showcase ZeroFS's full potential for enterprise and innovative deployments. {{ className: 'lead' }}
+This guide covers two setups built on ZeroFS block devices, ZFS pools mirrored across regions, and tiered storage that puts local flash in front of an S3-backed pool, then composes them into a PostgreSQL reference architecture. {{ className: 'lead' }}
 
 <Note>
-  These advanced architectures require careful planning and testing. Start with simpler configurations and gradually add complexity as you gain experience with ZeroFS.
+  These setups span multiple machines and failure domains. Test them before relying on them.
+  NBD and NFS carry no authentication; keep the bind addresses below on a private network.
 </Note>
 
 ## Geo-Distributed Storage
 
-Create globally distributed storage systems using ZeroFS instances across multiple regions:
+Run one ZeroFS instance per region and mirror their NBD devices in a single ZFS pool:
 
 <CodeGroup>
 
 ```toml {{ title: 'US East Config' }}
-# zerofs-us-east.toml
+# zerofs-us-east.toml — runs on 10.0.1.5
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 50.0
 
 [storage]
-url = "s3://my-bucket/us-east-db"
+url = "s3://zerofs-us-east/db"
 encryption_password = "shared-key"
 
 [aws]
 region = "us-east-1"
 
+[servers.nfs]
+addresses = ["10.0.1.5:2049"]
+
 [servers.nbd]
-addresses = ["127.0.0.1:10809"]
+addresses = ["10.0.1.5:10809"]
 
 # Start: zerofs run -c zerofs-us-east.toml
 ```
 
 ```toml {{ title: 'EU West Config' }}
-# zerofs-eu-west.toml
+# zerofs-eu-west.toml — runs on 10.0.2.5
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 50.0
 
 [storage]
-url = "s3://my-bucket/eu-west-db"
+url = "s3://zerofs-eu-west/db"
 encryption_password = "shared-key"
 
 [aws]
 region = "eu-west-1"
 
+[servers.nfs]
+addresses = ["10.0.2.5:2049"]
+
 [servers.nbd]
-addresses = ["127.0.0.1:10810"]
+addresses = ["10.0.2.5:10809"]
 
 # Start: zerofs run -c zerofs-eu-west.toml
 ```
 
 ```toml {{ title: 'Asia Pacific Config' }}
-# zerofs-asia.toml
+# zerofs-asia.toml — runs on 10.0.3.5
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 50.0
 
 [storage]
-url = "s3://my-bucket/asia-db"
+url = "s3://zerofs-ap-southeast/db"
 encryption_password = "shared-key"
 
 [aws]
 region = "ap-southeast-1"
 
+[servers.nfs]
+addresses = ["10.0.3.5:2049"]
+
 [servers.nbd]
-addresses = ["127.0.0.1:10811"]
+addresses = ["10.0.3.5:10809"]
 
 # Start: zerofs run -c zerofs-asia.toml
 ```
 
 ```bash {{ title: 'Create Global ZFS Pool' }}
-# Connect to NBD devices from each region with optimal settings
-nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4  # US East
-nbd-client 192.168.1.2 10810 /dev/nbd1 -N device_10810 -persist -timeout 120 -block-size 4096 -connections 8  # EU West (remote)
-nbd-client 192.168.1.3 10811 /dev/nbd2 -N device_10811 -persist -timeout 120 -block-size 4096 -connections 8  # Asia (remote)
+# Create a 100G device file on each instance, over NFS
+for ip in 10.0.1.5 10.0.2.5 10.0.3.5; do
+  mount -t nfs $ip:/ /mnt/zerofs
+  truncate -s 100G /mnt/zerofs/.nbd/storage
+  umount /mnt/zerofs
+done
+
+# Connect to the NBD device in each region
+nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist -timeout 600 -connections 8  # us-east
+nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist -timeout 600 -connections 8  # eu-west
+nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist -timeout 600 -connections 8  # ap-southeast
 
 # Create mirrored pool across continents
 zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2
 
-# Enable auto-trim for efficient space usage
+# Discard from the pool frees the corresponding S3 space
 zpool set autotrim=on global-pool
 
-# Monitor pool status
 zpool status global-pool
 ```
 
@@ -95,14 +111,12 @@ zpool status global-pool
 
 ### Benefits of Geo-Distribution
 
-- **Disaster Recovery**: Data survives regional outages
-- **Geographic Redundancy**: Automatic replication across continents
-- **Read Performance**: Local reads from nearby regions
-- **Compliance**: Data residency requirements met
+- **Redundancy**: ZFS writes every block to all three mirror members, so each region holds a full copy.
+- **Failure handling**: The pool stays online when one member is unreachable, and ZFS resilvers the device when it returns.
 
 ## Tiered Storage Architecture
 
-Combine ZeroFS with ZFS L2ARC for automatic storage tiering:
+Put local devices in front of an S3-backed pool. An L2ARC device caches recently read blocks; a SLOG device absorbs synchronous writes before they flush to S3:
 
 ```bash
 # Create S3-backed main pool
@@ -111,14 +125,59 @@ zpool create datapool /dev/nbd0 /dev/nbd1 /dev/nbd2
 # Add local NVMe as L2ARC cache
 zpool add datapool cache /dev/nvme0n1
 
-# Add local SSD as SLOG for write performance
+# Add local SSD as SLOG for synchronous writes
 zpool add datapool log /dev/ssd0
 
 # Monitor cache effectiveness
 zpool iostat -v datapool 5
 ```
 
+## PostgreSQL
 
+The two setups above compose into a storage layer for PostgreSQL: each database node keeps its data directory on a ZFS pool mirrored across regions, with local flash in front.
+
+### Reference Topology
+
+Clients connect through a proxy (HAProxy or PgBouncer) to a primary/standby pair using PostgreSQL synchronous replication. Each node owns its own pool: a 3-way ZFS mirror of NBD devices, each device served by a ZeroFS instance backed by a different S3 region — six instances and six regions for the pair. The two layers cover different failures: synchronous replication covers node failure, and the proxy redirects connections when the primary fails; the mirror covers region and object-store failure — the pool stays online with one member unreachable and resilvers the device when it returns.
+
+Build one node's pool from the three instances configured above, then add local devices as in the tiered setup:
+
+```bash {{ title: 'Per-Node Pool and Data Directory' }}
+# Devices created and connected as in "Geo-Distributed Storage" above
+nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist -timeout 600 -connections 8
+nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist -timeout 600 -connections 8
+
+zpool create pgpool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2
+zpool set autotrim=on pgpool
+
+# Local flash, as in "Tiered Storage Architecture" above
+zpool add pgpool cache /dev/nvme0n1   # L2ARC: caches reads
+zpool add pgpool log /dev/ssd0        # SLOG: absorbs synchronous writes
+
+zfs create -o mountpoint=/var/lib/postgresql pgpool/pgdata
+sudo -u postgres initdb -D /var/lib/postgresql/16/main
+```
+
+The standby repeats this with three ZeroFS instances in three other regions. Device creation and `nbd-client` flags are covered in [NBD Block Devices](/nbd-devices).
+
+### Durability Path
+
+- **Commit flow**: PostgreSQL fsyncs its write-ahead log on commit. ZFS turns that into a synchronous write absorbed by the SLOG and issues flush commands to the pool's devices.
+- **Flush semantics**: ZeroFS advertises NBD flush and FUA support, and both a flush command and a FUA-flagged write return only after buffered data is durably persisted — the same flush path that serves `fsync` over 9P. See [Durability &amp; Consistency](/durability).
+- **Flush latency**: With `wal_enabled = true`, a flush is a WAL append, so flush latency follows the WAL store's latency. A [separate WAL store](/separate-wal) on lower-latency storage reduces it.
+- **Storage-level read replicas**: A ZeroFS [read replica](/read-replicas) exposes the same filesystem read-only from another instance. It does not replace a PostgreSQL standby, which needs a writable data directory and receives changes through PostgreSQL replication.
+
+### Measured Performance
+
+pgbench 16.9 against PostgreSQL on a ZFS pool of ZeroFS NBD devices with an NVMe L2ARC, on a single 16 GB host — 50 clients, 15 threads, 100,000 transactions per client, scaling factor 50:
+
+| Workload | Throughput | Average latency |
+|----------|-----------|-----------------|
+| TPC-B-style read/write (pgbench default) | 53,041 TPS | 0.943 ms |
+| Select-only | 413,436 TPS | 0.121 ms |
+
+At scaling factor 50 the working set fits in the local cache tiers, so reads come from the L2ARC and the ZeroFS caches; reads that miss both go to S3 at object-store latency. The benchmark host runs a single node without replication; in the topology above, ZFS writes every block to all three mirror members and commits also wait for the standby's acknowledgment.
 
 <div className="not-prose">
   <Button href="/" variant="text" arrow="left">

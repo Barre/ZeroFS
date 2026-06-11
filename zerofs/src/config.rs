@@ -646,7 +646,7 @@ impl Settings {
         toml_string.push_str("\n# Optional filesystem configuration\n");
         toml_string
             .push_str("# Limit the maximum size of the filesystem to prevent unlimited growth\n");
-        toml_string.push_str("# If not specified, defaults to 16 EiB (effectively unlimited)\n");
+        toml_string.push_str("# If not specified, defaults to 16 EiB, the maximum filesystem size\n");
         toml_string.push_str("#\n");
         toml_string.push_str("# Compression algorithm for chunk data:\n");
         toml_string.push_str(
