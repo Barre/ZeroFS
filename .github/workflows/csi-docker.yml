@@ -1,0 +1,138 @@
+name: CSI Docker Build and Push
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/zerofs-csi
+
+jobs:
+  build-binaries:
+    name: Build zerofs-csi ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        working-directory: zerofs
+        run: cross build --profile ci -p zerofs-csi --target ${{ matrix.target }}
+
+      - name: Prepare binary
+        run: |
+          mkdir -p artifacts
+          cp zerofs/target/${{ matrix.target }}/ci/zerofs-csi artifacts/zerofs-csi-linux-${{ matrix.arch }}
+          chmod +x artifacts/zerofs-csi-linux-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-csi-linux-${{ matrix.arch }}
+          path: artifacts/zerofs-csi-linux-${{ matrix.arch }}
+
+  build-and-push:
+    name: Build and push image
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: zerofs-csi-linux-*
+          merge-multiple: true
+          path: image-context
+
+      - name: Prepare build context
+        run: |
+          cp zerofs/zerofs-csi/Dockerfile image-context/
+          ls -la image-context
+
+      # The csi image layers on the zerofs image of the same release. Both
+      # workflows trigger on the same tag push, so wait for docker.yml to
+      # publish the base before building against it. PRs and manual runs
+      # build against :latest.
+      - name: Resolve base image
+        id: base
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            base="${REGISTRY}/${{ github.repository_owner }}/zerofs:${GITHUB_REF_NAME#v}"
+            base=$(echo "$base" | tr '[:upper:]' '[:lower:]')
+            echo "Waiting for base image $base"
+            for i in $(seq 1 60); do
+              if docker manifest inspect "$base" > /dev/null 2>&1; then
+                echo "Base image available"
+                break
+              fi
+              if [ "$i" = "60" ]; then
+                echo "Timed out waiting for $base" && exit 1
+              fi
+              sleep 30
+            done
+          else
+            base="${REGISTRY}/${{ github.repository_owner }}/zerofs:latest"
+            base=$(echo "$base" | tr '[:upper:]' '[:lower:]')
+          fi
+          echo "image=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v5
+        with:
+          context: image-context
+          file: image-context/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            ZEROFS_IMAGE=${{ steps.base.outputs.image }}
+          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
