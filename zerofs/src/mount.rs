@@ -1878,10 +1878,24 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
 
     eprintln!("Unmounting {}...", mountpoint.display());
     let mp = mountpoint.clone();
-    tokio::task::spawn_blocking(move || bg.umount_and_join())
+    match tokio::task::spawn_blocking(move || bg.umount_and_join())
         .await
         .map_err(|e| anyhow!("unmount task panicked: {e}"))?
-        .with_context(|| format!("failed to unmount {} (is it still in use?)", mp.display()))?;
+    {
+        Ok(()) => {}
+        // ENOENT/EINVAL mean there is no mount left to clean up: it was
+        // already unmounted externally (the CSI node plugin unmounts the
+        // target before sending SIGTERM; a user may have run fusermount -u
+        // by hand). That is a clean outcome for a cleanup path, not an error.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::EINVAL)) => {
+            eprintln!("{} was already unmounted.", mp.display());
+        }
+        Err(e) => {
+            return Err(anyhow!(e)).with_context(|| {
+                format!("failed to unmount {} (is it still in use?)", mp.display())
+            });
+        }
+    }
 
     Ok(())
 }
