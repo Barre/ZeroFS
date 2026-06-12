@@ -78,6 +78,9 @@ pub struct MountOptions {
     pub read_only: bool,
     pub access: MountAccess,
     pub writeback: bool,
+    /// Server-side directory the mount is rooted at (9P attach aname). Empty
+    /// (or "/") mounts the whole filesystem.
+    pub aname: String,
 }
 
 /// Who may access the mount.
@@ -97,6 +100,10 @@ struct InodeEntry {
     /// One fid per uid that holds this inode. Every request acts as its caller
     /// (v9fs `access=user` semantics), so each user gets its own server-side fid.
     fids: HashMap<u32, u32>,
+    /// The server inode id behind this FUSE ino when it differs from the
+    /// default `ino - 1` bijection: only the mount root of an `--aname` mount,
+    /// where FUSE ino 1 maps to the attach subtree's root inode.
+    server_inode: Option<u64>,
 }
 
 struct Fuse9P {
@@ -207,19 +214,22 @@ async fn user_fid(
     uid: u32,
     ino: u64,
 ) -> Result<u32, ClientError> {
-    match inodes.get(&ino) {
+    let server_inode = match inodes.get(&ino) {
         Some(e) => {
             if let Some(&fid) = e.fids.get(&uid) {
                 return Ok(fid);
             }
+            // The inverse of `ino_of` (ino - 1), unless the entry pins another
+            // server inode (the mount root of an `--aname` mount).
+            e.server_inode.unwrap_or(ino.wrapping_sub(1))
         }
         // The kernel only operates on inodes it has looked up; an untracked one
         // is stale.
         None => return Err(ClientError::Errno(libc::ESTALE as u32)),
-    }
-    // inode_id is the inverse of `ino_of` (ino - 1); bind a fresh fid as `uid`.
+    };
+    // Bind a fresh fid to the inode as `uid`.
     let newfid = client.alloc_fid();
-    if let Err(e) = client.rebind(newfid, ino.wrapping_sub(1), uid).await {
+    if let Err(e) = client.rebind(newfid, server_inode, uid).await {
         client.free_fid(newfid);
         return Err(e);
     }
@@ -1759,14 +1769,31 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     let client = connect(&target, opts.msize).await?;
     let msize = client.msize();
 
-    // No attach: every request binds its own per-user fid by inode id (the root
-    // is inode 0). Seed the root inode with an empty per-user fid set.
+    // Every request binds its own per-user fid by inode id; without --aname
+    // there is no attach at all and the root is inode 0. With --aname, attach
+    // once to resolve the subtree root (and pin the session to it server-side).
+    // The attach fid is kept for the life of the mount so reconnect replay
+    // re-attaches with the same aname before the per-inode fids are rebound.
+    let root_inode = if opts.aname.is_empty() || opts.aname == "/" {
+        0
+    } else {
+        let afid = client.alloc_fid();
+        let uid = unsafe { libc::geteuid() };
+        let qid = client
+            .attach(afid, ninep_client::NOFID, "", &opts.aname, uid)
+            .await
+            .map_err(|e| anyhow!("attaching to {:?} on {target}: {e}", opts.aname))?;
+        qid.path
+    };
+
+    // Seed the root inode with an empty per-user fid set.
     let inodes: Arc<DashMap<u64, InodeEntry>> = Arc::new(DashMap::new());
     inodes.insert(
         FUSE_ROOT,
         InodeEntry {
             lookup: u64::MAX,
             fids: HashMap::new(),
+            server_inode: Some(root_inode),
         },
     );
 
@@ -2604,6 +2631,568 @@ mod client_tests {
 
         client.clunk(fid).await.unwrap();
         shutdown2.cancel();
+    }
+
+    /// Tattach with an aname roots the session at that directory: the returned
+    /// qid is the subtree root's, a leading slash is optional, and anames that
+    /// don't name an existing directory fail with the matching errno.
+    #[tokio::test]
+    async fn attach_with_aname_roots_session_at_subtree() {
+        let (admin, shutdown, _dir, sock) = setup().await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let vol_qid = admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let vf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, vf, &[b"vol".as_ref()])
+            .await
+            .unwrap();
+        let inner_qid = admin
+            .mkdir(vf, b"inner", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let ff = admin.alloc_fid();
+        admin.walk(vf, ff, &[]).await.unwrap();
+        admin
+            .lcreate(
+                ff,
+                b"f.txt",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let c2 = connect_with_retry(&sock).await;
+        let fid = c2.alloc_fid();
+        let q = c2.attach(fid, NOFID, "root", "vol", 0).await.unwrap();
+        assert_eq!(q.type_, QID_TYPE_DIR);
+        assert_eq!(q.path, vol_qid.path);
+
+        // Leading slash and nesting.
+        let fid2 = c2.alloc_fid();
+        let q2 = c2
+            .attach(fid2, NOFID, "root", "/vol/inner", 0)
+            .await
+            .unwrap();
+        assert_eq!(q2.path, inner_qid.path);
+
+        // "/" keeps the whole-filesystem root.
+        let fid3 = c2.alloc_fid();
+        let q3 = c2.attach(fid3, NOFID, "root", "/", 0).await.unwrap();
+        assert_eq!(q3.path, 0);
+
+        // A missing component fails the attach.
+        let bad = c2.alloc_fid();
+        match c2.attach(bad, NOFID, "root", "/missing", 0).await {
+            Err(ClientError::Errno(e)) => assert_eq!(e, libc::ENOENT as u32),
+            other => panic!("expected ENOENT, got {other:?}"),
+        }
+
+        // A non-directory aname fails the attach.
+        match c2.attach(bad, NOFID, "root", "vol/f.txt", 0).await {
+            Err(ClientError::Errno(e)) => assert_eq!(e, libc::ENOTDIR as u32),
+            other => panic!("expected ENOTDIR, got {other:?}"),
+        }
+
+        shutdown.cancel();
+    }
+
+    /// Walking `..` on an aname-rooted session clamps at the subtree root (it
+    /// resolves to the subtree root itself), mirroring the inode-0 clamp a
+    /// whole-filesystem attach gets, so a fid can never climb out of its
+    /// subtree.
+    #[tokio::test]
+    async fn aname_walk_up_clamps_at_subtree_root() {
+        let (admin, shutdown, _dir, sock) = setup().await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let vol_qid = admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let vf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, vf, &[b"vol".as_ref()])
+            .await
+            .unwrap();
+        let inner_qid = admin
+            .mkdir(vf, b"inner", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+
+        let c2 = connect_with_retry(&sock).await;
+        let afid = c2.alloc_fid();
+        c2.attach(afid, NOFID, "root", "vol", 0).await.unwrap();
+
+        // `..` below the subtree root walks up normally...
+        let f = c2.alloc_fid();
+        let qids = c2.walk(afid, f, &[b"inner".as_ref()]).await.unwrap();
+        assert_eq!(qids[0].path, inner_qid.path);
+        let f2 = c2.alloc_fid();
+        let qids = c2.walk(f, f2, &[b"..".as_ref()]).await.unwrap();
+        assert_eq!(qids[0].path, vol_qid.path);
+
+        // ...and at the subtree root it resolves to the root itself.
+        let f3 = c2.alloc_fid();
+        let qids = c2.walk(f2, f3, &[b"..".as_ref()]).await.unwrap();
+        assert_eq!(qids[0].path, vol_qid.path);
+
+        // A multi-component escape attempt stays clamped the whole way.
+        let f4 = c2.alloc_fid();
+        let qids = c2
+            .walk(afid, f4, &[b"..".as_ref(), b"..".as_ref(), b"..".as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(qids.len(), 3);
+        assert!(qids.iter().all(|q| q.path == vol_qid.path));
+
+        // The whole-filesystem attach clamps `..` at inode 0 the same way.
+        let rf = admin.alloc_fid();
+        let qids = admin
+            .walk(ROOT_FID_TEST, rf, &[b"..".as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(qids[0].path, 0);
+
+        shutdown.cancel();
+    }
+
+    /// `..` stays clamped even when an intermediate ancestor is renamed out
+    /// of the subtree while a fid below it is held: the parent chain no
+    /// longer passes through the attach root, so `..` resolves to the root
+    /// itself instead of following the detached chain to inode 0.
+    #[tokio::test]
+    async fn aname_walk_up_stays_clamped_after_ancestor_renamed_out() {
+        let (admin, shutdown, _dir, sock) = setup().await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let vol_qid = admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        admin
+            .mkdir(ROOT_FID_TEST, b"secret", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let vf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, vf, &[b"vol".as_ref()])
+            .await
+            .unwrap();
+        admin
+            .mkdir(vf, b"a", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let af = admin.alloc_fid();
+        admin.walk(vf, af, &[b"a".as_ref()]).await.unwrap();
+        let b_qid = admin
+            .mkdir(af, b"b", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+
+        // A confined session holds a fid deep inside the subtree.
+        let c2 = connect_with_retry(&sock).await;
+        let afid = c2.alloc_fid();
+        c2.attach(afid, NOFID, "root", "vol", 0).await.unwrap();
+        let bf = c2.alloc_fid();
+        let qids = c2
+            .walk(afid, bf, &[b"a".as_ref(), b"b".as_ref()])
+            .await
+            .unwrap();
+        assert_eq!(qids[1].path, b_qid.path);
+
+        // /vol/a moves to /a: b's parent chain now bypasses /vol entirely.
+        admin.renameat(vf, b"a", ROOT_FID_TEST, b"a").await.unwrap();
+
+        // `..` from the held fid clamps at the subtree root every step...
+        let up = c2.alloc_fid();
+        let qids = c2
+            .walk(bf, up, &[b"..".as_ref(), b"..".as_ref()])
+            .await
+            .unwrap();
+        assert!(
+            qids.iter().all(|q| q.path == vol_qid.path),
+            "`..` escaped the subtree after an ancestor rename: {qids:?}"
+        );
+
+        // ...so the rest of the filesystem stays unreachable.
+        let esc = c2.alloc_fid();
+        match c2.walk(up, esc, &[b"secret".as_ref()]).await {
+            Err(ClientError::Errno(e)) => assert_eq!(e, libc::ENOENT as u32),
+            other => panic!("expected ENOENT walking out of the subtree, got {other:?}"),
+        }
+
+        shutdown.cancel();
+    }
+
+    /// readdir at the attach root of an aname-rooted session reports ".." as
+    /// the root itself (mirroring the inode-0 self-clamp), so the external
+    /// parent's inode id never leaks into the subtree.
+    #[tokio::test]
+    async fn aname_readdir_dotdot_reports_subtree_root() {
+        let (admin, shutdown, _dir, sock) = setup().await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let vf = admin.alloc_fid();
+        admin.walk(ROOT_FID_TEST, vf, &[]).await.unwrap();
+        admin
+            .mkdir(ROOT_FID_TEST, b"parent", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let pf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, pf, &[b"parent".as_ref()])
+            .await
+            .unwrap();
+        let vol_qid = admin
+            .mkdir(pf, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+
+        let c2 = connect_with_retry(&sock).await;
+        let afid = c2.alloc_fid();
+        c2.attach(afid, NOFID, "root", "parent/vol", 0)
+            .await
+            .unwrap();
+        let df = c2.alloc_fid();
+        c2.walk(afid, df, &[]).await.unwrap();
+        c2.lopen(df, libc::O_RDONLY as u32).await.unwrap();
+
+        let entries = c2.readdir(df, 0, 8192).await.unwrap();
+        let dotdot = entries
+            .iter()
+            .find(|e| e.name.data.as_slice() == b"..")
+            .expect("readdir returned no .. entry");
+        assert_eq!(
+            dotdot.qid.path, vol_qid.path,
+            ".. at the attach root leaked the external parent"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// Files created through an aname-rooted session land in (and read back
+    /// from) the subtree the session is rooted at.
+    #[tokio::test]
+    async fn aname_session_creates_and_reads_files() {
+        let (admin, shutdown, _dir, sock) = setup().await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+
+        let c2 = connect_with_retry(&sock).await;
+        let afid = c2.alloc_fid();
+        c2.attach(afid, NOFID, "root", "vol", 0).await.unwrap();
+
+        let f = c2.alloc_fid();
+        c2.walk(afid, f, &[]).await.unwrap();
+        c2.lcreate(
+            f,
+            b"data.txt",
+            (libc::O_RDWR | libc::O_CREAT) as u32,
+            libc::S_IFREG | 0o644,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(c2.write(f, 0, b"via subtree").await.unwrap(), 11);
+        assert_eq!(c2.read(f, 0, 64).await.unwrap(), b"via subtree");
+        c2.clunk(f).await.unwrap();
+
+        // The file is at /vol/data.txt when seen from the filesystem root.
+        let gf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, gf, &[b"vol".as_ref(), b"data.txt".as_ref()])
+            .await
+            .unwrap();
+        let st = admin.getattr(gf, GETATTR_ALL).await.unwrap();
+        assert_eq!(st.size, 11);
+
+        shutdown.cancel();
+    }
+
+    /// Reconnect replay must re-attach with the original aname: open fids keep
+    /// working afterwards, and the restored session is still clamped to its
+    /// subtree (i.e. the aname wasn't lost in the replay).
+    #[tokio::test]
+    async fn reconnect_replays_aname_attach() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("aname.9p.sock");
+
+        let shutdown = start_server(Arc::clone(&fs), sock.clone());
+        let admin = connect_with_retry(&sock).await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let vol_qid = admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        drop(admin);
+
+        let client = connect_with_retry(&sock).await;
+        let afid = client.alloc_fid();
+        client.attach(afid, NOFID, "root", "vol", 0).await.unwrap();
+
+        // An open file handle inside the subtree.
+        let fid = client.alloc_fid();
+        client.walk(afid, fid, &[]).await.unwrap();
+        client
+            .lcreate(
+                fid,
+                b"persist.txt",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        client.write(fid, 0, b"subtree").await.unwrap();
+
+        // Drop the server and bring a new one up on the same socket.
+        shutdown.cancel();
+        for _ in 0..200 {
+            if UnixStream::connect(&sock).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_file(&sock);
+        let shutdown2 = start_server(Arc::clone(&fs), sock.clone());
+
+        // The open fid was rebound + reopened inside the replayed session.
+        let data = tokio::time::timeout(Duration::from_secs(10), client.read(fid, 0, 64))
+            .await
+            .expect("read timed out waiting for reconnect")
+            .expect("open fid lost across reconnect");
+        assert_eq!(data, b"subtree");
+
+        // The re-attached root is still the subtree: `..` clamps at /vol, not
+        // at the filesystem root.
+        let nf = client.alloc_fid();
+        let qids = client.walk(afid, nf, &[b"..".as_ref()]).await.unwrap();
+        assert_eq!(qids[0].path, vol_qid.path);
+
+        client.clunk(fid).await.unwrap();
+        shutdown2.cancel();
+    }
+
+    /// Reconnect replay must fail CLOSED for a confined aname session. If the
+    /// aname directory is renamed away during the outage, the replayed
+    /// `Tattach("vol")` no longer resolves; the client must NOT silently drop
+    /// the attach fid and rebind the held inode fids onto an unconfined
+    /// (whole-filesystem, attach_root=0) session — that would let `..` climb
+    /// past inode 0 into the sibling `/secret`. Instead the reconnect aborts
+    /// and retries, so confinement is never lost; once the aname resolves again
+    /// the session recovers, still clamped to its subtree.
+    #[tokio::test]
+    async fn reconnect_aname_rename_away_stays_confined() {
+        use crate::fs::permissions::Credentials;
+        use crate::fs::types::AuthContext;
+
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("aname-confine.9p.sock");
+        let root_auth = AuthContext {
+            uid: 0,
+            gid: 0,
+            gids: Vec::new(),
+        };
+        let root_creds = Credentials::from_auth_context(&root_auth);
+
+        let shutdown = start_server(Arc::clone(&fs), sock.clone());
+
+        // /vol/inside and a sibling /secret, set up out of band on the fs.
+        let admin = connect_with_retry(&sock).await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let vf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, vf, &[b"vol".as_ref()])
+            .await
+            .unwrap();
+        admin
+            .mkdir(vf, b"inside", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let secret_qid = admin
+            .mkdir(ROOT_FID_TEST, b"secret", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        drop(admin);
+
+        // A session confined to /vol holds a fid deep inside it.
+        let client = connect_with_retry(&sock).await;
+        let afid = client.alloc_fid();
+        client.attach(afid, NOFID, "root", "vol", 0).await.unwrap();
+        let hf = client.alloc_fid();
+        client.walk(afid, hf, &[b"inside".as_ref()]).await.unwrap();
+
+        // Drop the server and, while it is down, rename /vol -> /vol_moved so
+        // the aname "vol" no longer resolves on the fresh session. The inode
+        // keeps its id, only the name changes.
+        shutdown.cancel();
+        for _ in 0..200 {
+            if UnixStream::connect(&sock).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fs.rename(&root_auth, 0, b"vol", 0, b"vol_moved")
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let shutdown2 = start_server(Arc::clone(&fs), sock.clone());
+
+        // The reconnect replay re-attaches with aname "vol", which now fails:
+        // the client must abort and keep retrying rather than rebind onto an
+        // unconfined session. So a request on the held fid must NOT escape to
+        // the sibling /secret (or inode 0). With the aname gone for good the
+        // reconnect can't complete, so the request hangs — which is the
+        // fail-closed outcome; assert it does not return a sibling qid within
+        // a generous window.
+        let escape = tokio::time::timeout(Duration::from_secs(2), async {
+            let up = client.alloc_fid();
+            let r = client
+                .walk(
+                    hf,
+                    up,
+                    &[b"..".as_ref(), b"..".as_ref(), b"secret".as_ref()],
+                )
+                .await;
+            client.free_fid(up);
+            r
+        })
+        .await;
+        if let Ok(Ok(qids)) = &escape {
+            assert!(
+                qids.iter()
+                    .all(|q| q.path != secret_qid.path && q.path != 0),
+                "CONFINEMENT ESCAPE after reconnect+aname-rename: reached {qids:?}"
+            );
+        }
+
+        // Restore the aname: the reconnect can now complete, and the recovered
+        // session is still confined — `..` from the held fid clamps at /vol,
+        // and the sibling /secret stays unreachable.
+        fs.rename(&root_auth, 0, b"vol_moved", 0, b"vol")
+            .await
+            .unwrap();
+        let vol_id = fs.lookup(&root_creds, 0, b"vol").await.unwrap();
+        let up = client.alloc_fid();
+        let qids = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.walk(hf, up, &[b"..".as_ref(), b"..".as_ref()]),
+        )
+        .await
+        .expect("walk timed out waiting for reconnect to recover")
+        .expect("held fid lost after the aname was restored");
+        assert!(
+            qids.iter().all(|q| q.path == vol_id),
+            "`..` escaped the subtree after reconnect recovery: {qids:?}"
+        );
+        let esc = client.alloc_fid();
+        match client.walk(up, esc, &[b"secret".as_ref()]).await {
+            Err(ClientError::Errno(e)) => assert_eq!(e, libc::ENOENT as u32),
+            other => panic!("expected ENOENT walking out of the subtree, got {other:?}"),
+        }
+
+        shutdown2.cancel();
+    }
+
+    /// Trebind on an aname-rooted session only accepts inodes whose parent
+    /// chain passes through the attach root; anything outside the subtree
+    /// (including the filesystem root itself) is refused.
+    #[tokio::test]
+    async fn aname_rebind_rejects_out_of_subtree_inodes() {
+        let (admin, shutdown, _dir, sock) = setup().await;
+        admin
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+        let vol_qid = admin
+            .mkdir(ROOT_FID_TEST, b"vol", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let other_qid = admin
+            .mkdir(ROOT_FID_TEST, b"other", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let vf = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, vf, &[b"vol".as_ref()])
+            .await
+            .unwrap();
+        let sub_qid = admin
+            .mkdir(vf, b"sub", libc::S_IFDIR | 0o755, 0)
+            .await
+            .unwrap();
+        let of = admin.alloc_fid();
+        admin
+            .walk(ROOT_FID_TEST, of, &[b"other".as_ref()])
+            .await
+            .unwrap();
+        let ef = admin.alloc_fid();
+        admin.walk(of, ef, &[]).await.unwrap();
+        let (escapee_qid, _) = admin
+            .lcreate(
+                ef,
+                b"escapee.txt",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let c2 = connect_with_retry(&sock).await;
+        let afid = c2.alloc_fid();
+        c2.attach(afid, NOFID, "root", "vol", 0).await.unwrap();
+
+        // Out of subtree: a sibling directory, a file inside it, and the
+        // filesystem root itself.
+        let rf = c2.alloc_fid();
+        for inode_id in [other_qid.path, escapee_qid.path, 0] {
+            match c2.rebind(rf, inode_id, 0).await {
+                Err(ClientError::Errno(e)) => assert_eq!(e, libc::EACCES as u32),
+                other => panic!("rebind of inode {inode_id} should fail, got {other:?}"),
+            }
+        }
+
+        // Inside the subtree (and the subtree root itself) still rebinds.
+        let q = c2.rebind(rf, sub_qid.path, 0).await.unwrap();
+        assert_eq!(q.path, sub_qid.path);
+        let rf2 = c2.alloc_fid();
+        let q = c2.rebind(rf2, vol_qid.path, 0).await.unwrap();
+        assert_eq!(q.path, vol_qid.path);
+
+        shutdown.cancel();
     }
 
     /// fid 0 is used as the attach root in these tests, mirroring the mount client.

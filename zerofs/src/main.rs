@@ -144,12 +144,14 @@ async fn main() -> Result<()> {
             access,
             msize,
             writeback,
+            aname,
         } => {
             let opts = mount::MountOptions {
                 msize,
                 read_only,
                 access,
                 writeback,
+                aname: aname.unwrap_or_default(),
             };
             if let Err(e) = mount::run(target, mountpoint, opts).await {
                 eprintln!("✗ Error: {:#}", e);
