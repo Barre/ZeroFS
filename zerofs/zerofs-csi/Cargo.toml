@@ -1,6 +1,6 @@
 [package]
 name = "zerofs-csi"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "CSI driver exposing a shared ZeroFS gateway to Kubernetes via 9P FUSE mounts"
 license = "AGPL-3.0"

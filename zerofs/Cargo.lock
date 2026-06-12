@@ -5650,7 +5650,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-csi"
-version = "0.1.0"
+version = "1.2.5"
 dependencies = [
  "anyhow",
  "clap",
