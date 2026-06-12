@@ -80,6 +80,15 @@ spec:
               containerPort: 5564
             - name: admin
               containerPort: 7000
+          # Without this, the pod is Ready as soon as the container starts,
+          # before zerofs has opened the database and bound the 9P port, and
+          # the Service routes reconnecting clients to a gateway that refuses
+          # connections. Gate readiness on 9P actually accepting.
+          readinessProbe:
+            tcpSocket:
+              port: ninep
+            periodSeconds: 2
+            timeoutSeconds: 1
           env:
             - name: ZEROFS_PASSWORD
               valueFrom:

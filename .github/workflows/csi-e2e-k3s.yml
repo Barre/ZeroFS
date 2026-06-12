@@ -95,14 +95,16 @@ jobs:
           kubectl delete -f zerofs/zerofs-csi/e2e/workload.yaml --timeout=120s
           kubectl wait pv "$pv" --for=delete --timeout=120s
 
-      - name: Debug dump on failure
-        if: failure()
+      # Always: component logs with timestamps make slow (not just failed)
+      # runs attributable, e.g. how long a reconnect actually took.
+      - name: Debug dump
+        if: always()
         run: |
           set +e
           kubectl get pods -A -o wide
           kubectl get pv,pvc -A
           kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
           kubectl describe pod writer reader
-          kubectl -n zerofs logs statefulset/zerofs-gateway --tail=100
-          kubectl -n zerofs logs deployment/zerofs-csi-controller --all-containers --tail=100
-          kubectl -n zerofs logs daemonset/zerofs-csi-node --all-containers --tail=100
+          kubectl -n zerofs logs statefulset/zerofs-gateway --timestamps --tail=100
+          kubectl -n zerofs logs deployment/zerofs-csi-controller --all-containers --timestamps --tail=100
+          kubectl -n zerofs logs daemonset/zerofs-csi-node --all-containers --timestamps --tail=100

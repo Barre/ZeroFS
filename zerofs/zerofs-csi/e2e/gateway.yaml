@@ -77,6 +77,13 @@ spec:
               containerPort: 5564
             - name: admin
               containerPort: 7000
+          # Ready only when 9P actually accepts connections, so rollout status
+          # and the Service track a serving gateway, not a starting container.
+          readinessProbe:
+            tcpSocket:
+              port: ninep
+            periodSeconds: 2
+            timeoutSeconds: 1
           volumeMounts:
             - name: config
               mountPath: /etc/zerofs
