@@ -1,12 +1,13 @@
 use super::errors::{P9Error, P9Result};
 use super::lock_manager::{FileLock, FileLockManager};
 use crate::fs::ZeroFS;
+use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
-use crate::fs::permissions::Credentials;
+use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
-    AuthContext, FileAttributes, FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime,
-    SetUid, Timestamp,
+    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize,
+    SetTime, SetUid, Timestamp,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -45,11 +46,24 @@ pub const DEFAULT_BLKSIZE: u64 = 4096;
 // Block size for calculating block count
 pub const BLOCK_SIZE: u64 = 512;
 
+/// Upper bound on the number of parent-pointer hops an aname membership walk
+/// (`..` clamp and `Trebind` confinement check) will follow before giving up.
+/// A single committed snapshot is always acyclic, but these walks read each
+/// ancestor unlocked across separate `get`s, so a pathological concurrent
+/// rename workload could keep re-pointing two ancestors at each other and make
+/// the walk ping-pong forever. Capping it turns that liveness hole into a safe
+/// clamp/deny. The bound is far above any real directory depth.
+const MAX_ANCESTOR_HOPS: u32 = 100_000;
+
 // Represents an open file handle
 #[derive(Debug, Clone)]
 pub struct Fid {
     pub path: Vec<bytes::Bytes>,
     pub inode_id: InodeId,
+    /// The attach root this fid descends from (the inode the originating
+    /// Tattach's aname resolved to; 0 for a whole-filesystem attach). Walking
+    /// `..` clamps here, so the fid can never climb out of its subtree.
+    pub root: InodeId,
     pub qid: Qid,
     pub opened: bool,
     pub mode: Option<u32>,
@@ -60,6 +74,10 @@ pub struct Fid {
 pub struct Session {
     pub msize: AtomicU32,
     pub fids: Arc<DashMap<u32, Fid>>,
+    /// The inode the session's last Tattach aname resolved to (0 when the
+    /// session is rooted at the whole filesystem). Trebind validates rebound
+    /// inodes against this subtree.
+    pub attach_root: AtomicU64,
 }
 
 impl From<&Tsetattr> for SetAttributes {
@@ -126,6 +144,7 @@ impl NinePHandler {
         let session = Arc::new(Session {
             msize: AtomicU32::new(DEFAULT_MSIZE),
             fids: Arc::new(DashMap::new()),
+            attach_root: AtomicU64::new(0),
         });
 
         Self {
@@ -236,6 +255,7 @@ impl NinePHandler {
         // Per 9P spec, Tversion resets all connection state.
         // All fids are implicitly clunked and the session is reset.
         self.session.fids.clear();
+        self.session.attach_root.store(0, AtomicOrdering::Relaxed);
 
         if !version_str.contains("9P2000.L") {
             // We only support 9P2000.L
@@ -314,19 +334,47 @@ impl NinePHandler {
 
         let creds = self.creds_for(ta.n_uname, username);
 
-        let root_inode = self.filesystem.inode_store.get(0).await?;
-
-        let qid = inode_to_qid(&root_inode, 0);
-
         if self.session.fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
         }
 
+        // aname selects the subtree the session is rooted at: a path from the
+        // filesystem root whose components must all be existing directories.
+        // "" and "/" (no components) keep the whole-filesystem root.
+        let aname = ta.aname.as_str().map_err(|e| {
+            debug!("Invalid aname encoding: {:?}", e);
+            P9Error::InvalidEncoding
+        })?;
+        let components: Vec<&str> = aname.split('/').filter(|c| !c.is_empty()).collect();
+
+        let mut root_id: InodeId = 0;
+        for name in &components {
+            root_id = self
+                .filesystem
+                .lookup(&creds, root_id, name.as_bytes())
+                .await?;
+        }
+        let root_inode = self.filesystem.inode_store.get(root_id).await?;
+        if !matches!(root_inode, Inode::Directory(_)) {
+            return Err(P9Error::NotADirectory);
+        }
+
+        let qid = inode_to_qid(&root_inode, root_id);
+
+        self.session
+            .attach_root
+            .store(root_id, AtomicOrdering::Relaxed);
         self.session.fids.insert(
             ta.fid,
             Fid {
-                path: vec![],
-                inode_id: 0,
+                // The fid's path stays absolute (rename resolves it from
+                // inode 0), so it starts at the aname components.
+                path: components
+                    .iter()
+                    .map(|c| Bytes::copy_from_slice(c.as_bytes()))
+                    .collect(),
+                inode_id: root_id,
+                root: root_id,
                 qid: qid.clone(),
                 opened: false,
                 mode: None,
@@ -346,6 +394,37 @@ impl NinePHandler {
             return Err(P9Error::FidInUse);
         }
         let inode = self.filesystem.inode_store.get(tr.inode_id).await?;
+
+        // On an aname-rooted session, only inodes still under the attach
+        // subtree may be rebound: walk the parent chain up to the attach root.
+        // Best-effort hygiene, not a security boundary (aname is client-chosen):
+        // a hardlinked file has no parent chain (`parent()` is `None`) and is
+        // refused here even if one of its links lives inside the subtree.
+        let attach_root = self.session.attach_root.load(AtomicOrdering::Relaxed);
+        if attach_root != 0 {
+            let mut current_id = tr.inode_id;
+            let mut current = inode.clone();
+            let mut hops = 0u32;
+            while current_id != attach_root {
+                if hops >= MAX_ANCESTOR_HOPS {
+                    // The chain is implausibly long or being ping-ponged by a
+                    // concurrent rename workload: deny (the safe direction)
+                    // rather than spin.
+                    return Err(P9Error::Fs(FsError::PermissionDenied));
+                }
+                hops += 1;
+                if current_id == 0 {
+                    // Reached the filesystem root without passing the attach
+                    // root: the inode is outside the subtree.
+                    return Err(P9Error::Fs(FsError::PermissionDenied));
+                }
+                current_id = current
+                    .parent()
+                    .ok_or(P9Error::Fs(FsError::PermissionDenied))?;
+                current = self.filesystem.inode_store.get(current_id).await?;
+            }
+        }
+
         let creds = self.creds_for(tr.n_uname, "");
         let path = self
             .filesystem
@@ -362,6 +441,7 @@ impl NinePHandler {
             Fid {
                 path,
                 inode_id: tr.inode_id,
+                root: attach_root,
                 qid: qid.clone(),
                 opened: false,
                 mode: None,
@@ -370,6 +450,69 @@ impl NinePHandler {
         );
 
         Ok(Message::Rrebind(Rrebind { qid }))
+    }
+
+    /// Resolve one walk component from `current_id`. `..` resolves through the
+    /// directory's parent pointer, clamped at `root_id` (the fid's attach
+    /// root): walking `..` at the subtree root yields the subtree root itself,
+    /// exactly mirroring the inode-0 clamp readdir applies at the filesystem
+    /// root. Everything else is a plain lookup.
+    async fn walk_component(
+        &self,
+        creds: &Credentials,
+        root_id: InodeId,
+        current_id: InodeId,
+        name: &[u8],
+    ) -> P9Result<InodeId> {
+        if name != b".." {
+            return Ok(self.filesystem.lookup(creds, current_id, name).await?);
+        }
+        let inode = self.filesystem.inode_store.get(current_id).await?;
+        let Inode::Directory(dir) = &inode else {
+            return Err(P9Error::NotADirectory);
+        };
+        check_access(&inode, creds, AccessMode::Execute)?;
+        if current_id == root_id {
+            return Ok(current_id);
+        }
+        // On an aname-rooted fid the parent pointer alone is not enough: a
+        // concurrent rename can re-point an ancestor outside the subtree, so
+        // `..` is only honored while the parent chain still passes through
+        // the attach root. A detached chain clamps to the root itself, the
+        // same way `..` at the root does (mirrors the membership walk rebind
+        // performs).
+        if root_id != 0 {
+            let mut ancestor = dir.parent;
+            let mut hops = 0u32;
+            while ancestor != root_id {
+                if ancestor == 0 || hops >= MAX_ANCESTOR_HOPS {
+                    // Reached the filesystem root (or an implausibly long /
+                    // concurrently re-pointed chain) without passing the attach
+                    // root: clamp to the root, the same safe direction as a
+                    // detached chain.
+                    return Ok(root_id);
+                }
+                hops += 1;
+                let Inode::Directory(d) = self.filesystem.inode_store.get(ancestor).await? else {
+                    return Ok(root_id);
+                };
+                ancestor = d.parent;
+            }
+        }
+        Ok(dir.parent)
+    }
+
+    /// Keep a fid's absolute path in step with a walk: `..` pops a component
+    /// (unless clamped at the attach root, where `current_id == root`), any
+    /// other name appends. Shared by `walk` and `walk_getattr`.
+    fn step_path(path: &mut Vec<Bytes>, name: Bytes, current_id: InodeId, root: InodeId) {
+        if name.as_ref() == b".." {
+            if current_id != root {
+                path.pop();
+            }
+        } else {
+            path.push(name);
+        }
     }
 
     async fn walk(&self, tw: Twalk) -> P9Result<Message> {
@@ -384,8 +527,7 @@ impl NinePHandler {
 
             let creds = src_fid.creds;
             let child_id = match self
-                .filesystem
-                .lookup(&creds, current_id, &name_bytes)
+                .walk_component(&creds, src_fid.root, current_id, &name_bytes)
                 .await
             {
                 Ok(id) => id,
@@ -393,7 +535,7 @@ impl NinePHandler {
                     // Per 9P spec: if first element fails, return error.
                     // If later element fails, return partial Rwalk with qids so far.
                     if i == 0 {
-                        return Err(e.into());
+                        return Err(e);
                     }
                     // Partial walk - return what we have so far (newfid is NOT created)
                     return Ok(Message::Rwalk(Rwalk {
@@ -416,7 +558,7 @@ impl NinePHandler {
                 }
             };
 
-            current_path.push(name_bytes);
+            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
             current_id = child_id;
         }
@@ -431,6 +573,7 @@ impl NinePHandler {
             let new_fid = Fid {
                 path: current_path,
                 inode_id: current_id,
+                root: src_fid.root,
                 qid: wqids.last().cloned().unwrap_or(src_fid.qid),
                 opened: false,
                 mode: None,
@@ -459,11 +602,10 @@ impl NinePHandler {
         for wname in tw.wnames.iter() {
             let name_bytes = Bytes::copy_from_slice(&wname.data);
             let child_id = self
-                .filesystem
-                .lookup(&src_fid.creds, current_id, &name_bytes)
+                .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
             let child_inode = self.filesystem.inode_store.get(child_id).await?;
-            current_path.push(name_bytes);
+            Self::step_path(&mut current_path, name_bytes, current_id, src_fid.root);
             wqids.push(inode_to_qid(&child_inode, child_id));
             current_id = child_id;
             last_inode = Some(child_inode);
@@ -477,6 +619,7 @@ impl NinePHandler {
             Fid {
                 path: current_path,
                 inode_id: current_id,
+                root: src_fid.root,
                 qid: wqids.last().cloned().unwrap_or_else(|| src_fid.qid.clone()),
                 opened: false,
                 mode: None,
@@ -547,6 +690,7 @@ impl NinePHandler {
             Fid {
                 path: src_fid.path.clone(),
                 inode_id: src_fid.inode_id,
+                root: src_fid.root,
                 qid: qid.clone(),
                 opened: true,
                 mode: Some(tl.flags),
@@ -569,6 +713,30 @@ impl NinePHandler {
         Message::Rclunk(Rclunk)
     }
 
+    /// At the attach root of an aname-rooted session, rewrite the synthesized
+    /// ".." readdir entry to the root itself, mirroring the self-clamp inode 0
+    /// gets, so the external parent's inode id and attributes don't leak out
+    /// of the subtree.
+    async fn clamp_dotdot_at_attach_root(
+        &self,
+        fid: &Fid,
+        entries: &mut [crate::fs::types::DirEntry],
+    ) -> P9Result<()> {
+        if fid.root == 0 || fid.inode_id != fid.root {
+            return Ok(());
+        }
+        if let Some(entry) = entries.iter_mut().find(|e| e.name == b"..") {
+            let inode = self.filesystem.inode_store.get(fid.inode_id).await?;
+            entry.fileid = fid.inode_id;
+            entry.attr = InodeWithId {
+                inode: &inode,
+                id: fid.inode_id,
+            }
+            .into();
+        }
+        Ok(())
+    }
+
     async fn readdir(&self, tr: Treaddir) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
@@ -585,9 +753,11 @@ impl NinePHandler {
 
         // tr.offset is the cookie from the last entry the client received (0 for first call)
         // Pass it directly to readdir which handles . and .. with cookies 1 and 2
-        let result = self
+        let mut result = self
             .filesystem
             .readdir(&auth, fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
+            .await?;
+        self.clamp_dotdot_at_attach_root(&fid_entry, &mut result.entries)
             .await?;
 
         let mut dir_entries = Vec::new();
@@ -634,9 +804,11 @@ impl NinePHandler {
         let count = tr.count.min(max_count);
 
         let auth = AuthContext::from(&fid_entry.creds);
-        let result = self
+        let mut result = self
             .filesystem
             .readdir(&auth, fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
+            .await?;
+        self.clamp_dotdot_at_attach_root(&fid_entry, &mut result.entries)
             .await?;
 
         let mut entries = Vec::new();
@@ -739,6 +911,7 @@ impl NinePHandler {
             Fid {
                 path,
                 inode_id: child_id,
+                root: parent_fid.root,
                 qid: attrs_to_qid(&post_attr, child_id),
                 opened: true,
                 mode: Some(tc.flags),

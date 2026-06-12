@@ -117,6 +117,10 @@ enum FidKind {
         uname: String,
         aname: String,
         n_uname: u32,
+        /// The inode the attach resolved to (the `Rattach` qid's path): inode 0
+        /// for an empty aname, the subtree root otherwise. Clones of this fid
+        /// are rebound here.
+        root_inode: u64,
     },
     /// A fid bound to a specific inode, re-established with `Trebind` as the
     /// user (`n_uname`) that owns it.
@@ -133,7 +137,7 @@ struct FidRecord {
 impl FidRecord {
     fn inode_id(&self) -> u64 {
         match self.kind {
-            FidKind::Attach { .. } => 0, // the attach root is inode 0
+            FidKind::Attach { root_inode, .. } => root_inode,
             FidKind::Inode { inode_id, .. } => inode_id,
         }
     }
@@ -327,15 +331,21 @@ impl NinePClient {
         Ok(())
     }
 
-    /// Rebuild the recorded session onto `conn`, then re-acquire locks. A flat,
-    /// order-free pass: the attach root is re-attached and every other fid is
-    /// rebound to its inode id (no lineage, no parent ordering). A *transport*
-    /// failure aborts (the caller reconnects afresh); a *server* error for a fid
-    /// means the inode is gone, so that fid is dropped.
+    /// Rebuild the recorded session onto `conn`, then re-acquire locks. Attach
+    /// fids replay first — re-attaching restores the session's aname subtree
+    /// root on the server, which the subsequent `Trebind`s are validated
+    /// against — and every other fid is then rebound to its inode id (no
+    /// lineage, no parent ordering). A *transport* failure aborts (the caller
+    /// reconnects afresh); a *server* error for a fid means the inode is gone
+    /// (or has left the subtree), so that fid is dropped.
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
         let snapshot = self.state.lock().unwrap().clone();
 
-        for (&fid, rec) in &snapshot.fids {
+        let (attaches, rebinds): (Vec<_>, Vec<_>) = snapshot
+            .fids
+            .iter()
+            .partition(|(_, rec)| matches!(rec.kind, FidKind::Attach { .. }));
+        for (&fid, rec) in attaches.into_iter().chain(rebinds) {
             let restored = Self::replay_fid(conn, fid, rec).await?;
             if restored && let Some(flags) = rec.opened {
                 match Self::send_raw_rpc(conn, Message::Tlopen(Tlopen { fid, flags })).await {
@@ -368,13 +378,26 @@ impl NinePClient {
 
     /// Re-establish one fid on `conn`. Returns `Ok(true)` if restored, `Ok(false)`
     /// if the server says it's gone (skip it), `Err` on a transport failure.
+    ///
+    /// An *aname* attach (a confined, subtree-rooted session) that fails to
+    /// re-resolve is treated as a transport-level failure, not a gone fid: the
+    /// attach establishes the server-side confinement root that every subsequent
+    /// `Trebind` is validated against, so dropping it would leave the inode fids
+    /// to rebind onto an unconfined (whole-filesystem) session. Returning `Err`
+    /// aborts the reconnect; the supervisor retries afresh (and surfaces the
+    /// error if the aname is gone for good) rather than silently widening the
+    /// session's reach. A whole-filesystem attach (empty aname) has no
+    /// confinement to lose, so it follows the gone-fid path.
     async fn replay_fid(conn: &Conn, fid: u32, rec: &FidRecord) -> ClientResult<bool> {
+        let confined_attach =
+            matches!(&rec.kind, FidKind::Attach { aname, .. } if !aname.is_empty());
         let body = match &rec.kind {
             FidKind::Attach {
                 afid,
                 uname,
                 aname,
                 n_uname,
+                ..
             } => Message::Tattach(Tattach {
                 fid,
                 afid: *afid,
@@ -391,6 +414,9 @@ impl NinePClient {
         match Self::send_raw_rpc(conn, body).await {
             Ok(Message::Rattach(_)) | Ok(Message::Rrebind(_)) => Ok(true),
             Ok(_) => Err(ClientError::Unexpected("replay fid")),
+            // A confined aname attach that no longer resolves must abort the
+            // whole reconnect (fail closed); a gone inode fid is just dropped.
+            Err(e @ ClientError::Errno(_)) if confined_attach => Err(e),
             Err(ClientError::Errno(_)) => Ok(false), // inode gone -> drop this fid
             Err(e) => Err(e),
         }
@@ -579,6 +605,7 @@ impl NinePClient {
                             uname: uname.to_string(),
                             aname: aname.to_string(),
                             n_uname,
+                            root_inode: r.qid.path,
                         },
                         opened: None,
                     },

@@ -120,6 +120,11 @@ pub enum Commands {
         /// Pass `--writeback false` to write through synchronously instead.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         writeback: bool,
+        /// Root the mount at this server-side directory (a path from the
+        /// filesystem root, e.g. /volumes/pvc-1) instead of the whole
+        /// filesystem. The directory must already exist.
+        #[arg(long)]
+        aname: Option<String>,
     },
 }
 
