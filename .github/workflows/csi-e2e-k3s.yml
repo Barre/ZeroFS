@@ -56,7 +56,10 @@ jobs:
           sed 's|ghcr.io/barre/zerofs-csi:latest|docker.io/library/zerofs-csi:e2e|' deploy/node.yaml | kubectl apply -f -
           kubectl apply -f deploy/storageclass-example.yaml
           kubectl -n zerofs rollout status deployment/zerofs-csi-controller --timeout=180s
-          kubectl -n zerofs rollout status daemonset/zerofs-csi-node --timeout=180s
+          # The node DaemonSet uses OnDelete (so upgrades don't restart every FUSE
+          # mount), which `kubectl rollout status` rejects; wait on readiness instead.
+          kubectl -n zerofs wait --for=jsonpath='{.status.numberReady}'=1 \
+            daemonset/zerofs-csi-node --timeout=180s
 
       - name: Provision and mount (RWX across two pods)
         run: |
