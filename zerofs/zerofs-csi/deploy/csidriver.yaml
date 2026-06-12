@@ -1,0 +1,14 @@
+# CSIDriver object for csi.zerofs.net.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.zerofs.net
+spec:
+  # Volumes are 9P network mounts; there is no attach step.
+  attachRequired: false
+  podInfoOnMount: false
+  # Mounts are world-accessible (--access all); ownership is managed on the
+  # gateway filesystem, not by kubelet.
+  fsGroupPolicy: None
+  volumeLifecycleModes:
+    - Persistent

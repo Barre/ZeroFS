@@ -1,0 +1,92 @@
+# e2e variant of deploy/gateway-example.yaml: same names, labels and ports,
+# so deploy/storageclass-example.yaml applies verbatim. Differences: file://
+# storage on a hostPath (no S3; the data survives gateway pod recreation on
+# the single-node test cluster, which the restart test depends on) and the
+# locally imported image.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerofs
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zerofs-gateway-config
+  namespace: zerofs
+data:
+  zerofs.toml: |
+    [cache]
+    dir = "/data/cache"
+    disk_size_gb = 1.0
+
+    [storage]
+    url = "file:///data/db"
+    encryption_password = "zerofs-e2e-password"
+
+    [lsm]
+    max_unflushed_gb = 0.1
+
+    [servers]
+
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+
+    [telemetry]
+    enabled = false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-gateway
+  namespace: zerofs
+spec:
+  selector:
+    app: zerofs-gateway
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-gateway
+  namespace: zerofs
+spec:
+  serviceName: zerofs-gateway
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-gateway
+  template:
+    metadata:
+      labels:
+        app: zerofs-gateway
+    spec:
+      containers:
+        - name: zerofs
+          image: docker.io/library/zerofs:e2e
+          imagePullPolicy: Never
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: zerofs-gateway-config
+        - name: data
+          hostPath:
+            path: /var/lib/zerofs-e2e
+            type: DirectoryOrCreate

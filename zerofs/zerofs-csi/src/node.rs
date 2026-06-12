@@ -1,0 +1,597 @@
+//! CSI Node service. There is no staging step: NodePublishVolume mounts the
+//! volume's gateway subdirectory directly at the target path by spawning a
+//! `zerofs mount <gateway> <target> --aname <volumesRoot>/<volume_id>` child.
+//! The 9P client inside that child reconnects with fid replay, so a gateway
+//! restart does not break published volumes. The children are however tied to
+//! this process: if the node plugin container restarts, its FUSE mounts die
+//! with it (documented v1 limitation; dedicated mount pods are the v2 plan).
+
+use crate::controller::{
+    PARAM_GATEWAY, PARAM_VOLUMES_ROOT, validate_volume_capability, volume_path,
+};
+use crate::proto::csi::v1::node_server::Node;
+use crate::proto::csi::v1::{
+    NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest,
+    NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse,
+    NodeGetVolumeStatsRequest, NodeGetVolumeStatsResponse, NodePublishVolumeRequest,
+    NodePublishVolumeResponse, NodeServiceCapability, NodeStageVolumeRequest,
+    NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
+    NodeUnstageVolumeRequest, NodeUnstageVolumeResponse, VolumeUsage, node_service_capability,
+    volume_capability, volume_usage,
+};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
+use tokio::process::Command;
+use tonic::{Request, Response, Status};
+use tracing::{info, warn};
+
+/// f_type reported by statfs for a FUSE filesystem (FUSE_SUPER_MAGIC).
+const FUSE_SUPER_MAGIC: i64 = 0x65735546;
+
+/// How long NodePublishVolume waits for the mount to come up before killing
+/// the child and failing.
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a statfs probe may take before the mount is declared
+/// unresponsive. A FUSE mount whose gateway is unreachable blocks every
+/// caller until the 9P client reconnects, so probes must not hang the RPC
+/// (and its tokio worker thread) with it.
+const STATFS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many trailing stderr lines from the mount child are kept for error
+/// reporting.
+const STDERR_KEEP_LINES: usize = 50;
+
+/// Who may access the mounts, passed through as `zerofs mount --access`.
+/// Pods run as arbitrary users, so the production default is `all` (which
+/// needs root or user_allow_other in /etc/fuse.conf).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum MountAccess {
+    Owner,
+    Root,
+    #[default]
+    All,
+}
+
+impl MountAccess {
+    fn as_arg(self) -> &'static str {
+        match self {
+            MountAccess::Owner => "owner",
+            MountAccess::Root => "root",
+            MountAccess::All => "all",
+        }
+    }
+}
+
+pub struct NodeService {
+    node_id: String,
+    /// Binary spawned to mount volumes; "zerofs" from PATH by default.
+    zerofs_bin: String,
+    mount_access: MountAccess,
+    state: Arc<NodeState>,
+}
+
+struct NodeState {
+    /// target path -> pid of the `zerofs mount` child serving it. Entries are
+    /// removed by the per-child reaper task when the child exits.
+    children: StdMutex<HashMap<PathBuf, u32>>,
+    /// Per-target locks serializing publish/unpublish on the same path.
+    target_locks: StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl NodeState {
+    fn target_lock(&self, target: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.target_locks.lock().unwrap();
+        Arc::clone(locks.entry(target.to_path_buf()).or_default())
+    }
+
+    /// Drop the lock entry for `target` when no one else holds it, so the
+    /// map doesn't grow with every pod that ever mounted a volume here.
+    /// Called after unpublish, with the caller's own clone already dropped.
+    fn release_target_lock(&self, target: &Path) {
+        let mut locks = self.target_locks.lock().unwrap();
+        // The map itself holds one reference; with the map locked no one can
+        // clone it concurrently, so a count of 1 means idle.
+        if let Some(entry) = locks.get(target)
+            && Arc::strong_count(entry) == 1
+        {
+            locks.remove(target);
+        }
+    }
+}
+
+/// What statfs says about a publish target.
+enum TargetState {
+    /// The path does not exist yet.
+    Missing,
+    /// A live FUSE mount.
+    FuseMounted,
+    /// A FUSE mount whose server is gone (statfs fails with ENOTCONN);
+    /// needs a lazy unmount before remounting.
+    BrokenFuse,
+    /// A mount that did not answer statfs within [`STATFS_TIMEOUT`]: alive
+    /// but blocked, typically a FUSE mount waiting out a gateway outage
+    /// behind the 9P client's reconnect loop.
+    Unresponsive,
+    /// An existing path that is not a FUSE mountpoint.
+    NotMounted,
+}
+
+fn statfs(path: &Path) -> std::io::Result<libc::statfs> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated string and st is a valid
+    // out-pointer for the call's duration.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// statfs without hanging the caller: the syscall runs on a blocking thread
+/// with a deadline. A FUSE mount whose gateway is unreachable blocks statfs
+/// until the 9P reconnect succeeds; that shows up here as a TimedOut error
+/// (the blocking thread is released back to the pool once the syscall
+/// eventually returns).
+async fn statfs_async(path: &Path) -> std::io::Result<libc::statfs> {
+    let buf = path.to_path_buf();
+    match tokio::time::timeout(
+        STATFS_TIMEOUT,
+        tokio::task::spawn_blocking(move || statfs(&buf)),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_err)) => Err(std::io::Error::other(join_err)),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "statfs {} did not answer within {:?}",
+                path.display(),
+                STATFS_TIMEOUT
+            ),
+        )),
+    }
+}
+
+async fn target_state(target: &Path) -> Result<TargetState, Status> {
+    // f_type's width and signedness vary across libc targets.
+    #[allow(clippy::unnecessary_cast)]
+    match statfs_async(target).await {
+        Ok(st) if st.f_type as i64 == FUSE_SUPER_MAGIC => Ok(TargetState::FuseMounted),
+        Ok(_) => Ok(TargetState::NotMounted),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(TargetState::Missing),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => Ok(TargetState::BrokenFuse),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(TargetState::Unresponsive),
+        Err(e) => Err(Status::internal(format!(
+            "statfs {}: {}",
+            target.display(),
+            e
+        ))),
+    }
+}
+
+/// Unmount a FUSE mountpoint, trying the fusermount helpers first and lazy
+/// umount as the last resort. `lazy` is used for broken mounts where a
+/// regular unmount may block or fail.
+async fn unmount(target: &Path, lazy: bool) -> Result<(), String> {
+    let attempts: &[(&str, &[&str])] = if lazy {
+        &[
+            ("fusermount3", &["-u", "-z"]),
+            ("fusermount", &["-u", "-z"]),
+            ("umount", &["-l"]),
+        ]
+    } else {
+        &[
+            ("fusermount3", &["-u"]),
+            ("fusermount", &["-u"]),
+            ("umount", &["-l"]),
+        ]
+    };
+
+    let mut errors = Vec::new();
+    for (bin, args) in attempts {
+        match Command::new(bin).args(*args).arg(target).output().await {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => errors.push(format!(
+                "{} {} {}: {}",
+                bin,
+                args.join(" "),
+                target.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => errors.push(format!("{}: {}", bin, e)),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+impl NodeService {
+    pub fn new(node_id: String, zerofs_bin: String, mount_access: MountAccess) -> Self {
+        Self {
+            node_id,
+            zerofs_bin,
+            mount_access,
+            state: Arc::new(NodeState {
+                children: StdMutex::new(HashMap::new()),
+                target_locks: StdMutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Spawn the `zerofs mount` child for `target` and wait until the
+    /// mountpoint is live. On failure the child is killed and its stderr is
+    /// surfaced in the returned status.
+    async fn spawn_mount(
+        &self,
+        gateway: &str,
+        target: &Path,
+        aname: &str,
+        read_only: bool,
+    ) -> Result<(), Status> {
+        let mut cmd = Command::new(&self.zerofs_bin);
+        cmd.arg("mount")
+            .arg(gateway)
+            .arg(target)
+            .arg("--aname")
+            .arg(aname)
+            .arg("--access")
+            .arg(self.mount_access.as_arg())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            // A child dropped before it is handed to the reaper task (any
+            // early error return below) must not keep running untracked.
+            .kill_on_drop(true);
+        if read_only {
+            cmd.arg("--read-only");
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            Status::internal(format!("failed to spawn {} mount: {}", self.zerofs_bin, e))
+        })?;
+
+        // Collect the child's stderr: logged live, and the tail is attached
+        // to the gRPC error if the mount fails.
+        let stderr_tail: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let tail = Arc::clone(&stderr_tail);
+            let target_str = target.display().to_string();
+            tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    info!(mount = %target_str, "zerofs mount: {}", line);
+                    let mut tail = tail.lock().unwrap();
+                    if tail.len() >= STDERR_KEEP_LINES {
+                        tail.remove(0);
+                    }
+                    tail.push(line);
+                }
+            });
+        }
+
+        let fail = |reason: String, stderr_tail: &StdMutex<Vec<String>>| {
+            let tail = stderr_tail.lock().unwrap().join("\n");
+            if tail.is_empty() {
+                Status::internal(reason)
+            } else {
+                Status::internal(format!("{}; stderr:\n{}", reason, tail))
+            }
+        };
+
+        let deadline = tokio::time::Instant::now() + MOUNT_TIMEOUT;
+        loop {
+            // A child that exits before the mount is live has failed.
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| Status::internal(format!("waiting on zerofs mount: {}", e)))?
+            {
+                // Give the stderr task a beat to drain the pipe.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Err(fail(
+                    format!(
+                        "zerofs mount exited with {} before the mount came up",
+                        status
+                    ),
+                    &stderr_tail,
+                ));
+            }
+
+            if matches!(target_state(target).await?, TargetState::FuseMounted) {
+                break;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(fail(
+                    format!(
+                        "mount of {} at {} did not come up within {:?}",
+                        gateway,
+                        target.display(),
+                        MOUNT_TIMEOUT
+                    ),
+                    &stderr_tail,
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Mount is live: track the child and reap it in the background so it
+        // never lingers as a zombie.
+        let pid = child.id().ok_or_else(|| {
+            Status::internal("zerofs mount child has no pid after successful mount")
+        })?;
+        self.state
+            .children
+            .lock()
+            .unwrap()
+            .insert(target.to_path_buf(), pid);
+
+        let state = Arc::clone(&self.state);
+        let target_buf = target.to_path_buf();
+        tokio::spawn(async move {
+            match child.wait().await {
+                Ok(status) => {
+                    info!(mount = %target_buf.display(), pid, "zerofs mount exited with {}", status)
+                }
+                Err(e) => {
+                    warn!(mount = %target_buf.display(), pid, "failed to reap zerofs mount: {}", e)
+                }
+            }
+            let mut children = state.children.lock().unwrap();
+            // Only drop the entry if it still belongs to this child; a
+            // remount may have replaced it.
+            if children.get(&target_buf) == Some(&pid) {
+                children.remove(&target_buf);
+            }
+        });
+
+        info!(mount = %target.display(), pid, gateway, aname, read_only, "mounted volume");
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl Node for NodeService {
+    async fn node_publish_volume(
+        &self,
+        request: Request<NodePublishVolumeRequest>,
+    ) -> Result<Response<NodePublishVolumeResponse>, Status> {
+        let req = request.into_inner();
+        if req.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id is required"));
+        }
+        if req.target_path.is_empty() {
+            return Err(Status::invalid_argument("target_path is required"));
+        }
+        let cap = req
+            .volume_capability
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("volume_capability is required"))?;
+        validate_volume_capability(cap).map_err(Status::invalid_argument)?;
+
+        let gateway = req.volume_context.get(PARAM_GATEWAY).ok_or_else(|| {
+            Status::invalid_argument(format!("volume_context is missing {}", PARAM_GATEWAY))
+        })?;
+        let volumes_root = req
+            .volume_context
+            .get(PARAM_VOLUMES_ROOT)
+            .map(String::as_str)
+            .unwrap_or(crate::DEFAULT_VOLUMES_ROOT);
+        let aname = volume_path(volumes_root, &req.volume_id);
+
+        use volume_capability::access_mode::Mode;
+        let mode = cap.access_mode.as_ref().map(|m| m.mode).unwrap_or(0);
+        let read_only = req.readonly
+            || matches!(
+                Mode::try_from(mode),
+                Ok(Mode::SingleNodeReaderOnly | Mode::MultiNodeReaderOnly)
+            );
+
+        let target = PathBuf::from(&req.target_path);
+        let lock = self.state.target_lock(&target);
+        let _guard = lock.lock().await;
+
+        match target_state(&target).await? {
+            // Already a live FUSE mount: assume it is ours and succeed.
+            TargetState::FuseMounted => return Ok(Response::new(NodePublishVolumeResponse {})),
+            // Alive but blocked on its gateway: the 9P client reconnects on
+            // its own, so leave the mount in place and let the CO retry.
+            TargetState::Unresponsive => {
+                return Err(Status::unavailable(format!(
+                    "mount at {} did not answer statfs within {:?} (gateway unreachable?); \
+                     leaving it to reconnect",
+                    target.display(),
+                    STATFS_TIMEOUT
+                )));
+            }
+            TargetState::BrokenFuse => {
+                warn!(mount = %target.display(), "broken FUSE mount, lazily unmounting before remount");
+                unmount(&target, true).await.map_err(|e| {
+                    Status::internal(format!(
+                        "failed to clear broken mount at {}: {}",
+                        target.display(),
+                        e
+                    ))
+                })?;
+            }
+            TargetState::Missing => {
+                tokio::fs::create_dir_all(&target).await.map_err(|e| {
+                    Status::internal(format!("mkdir -p {}: {}", target.display(), e))
+                })?;
+            }
+            TargetState::NotMounted => {}
+        }
+
+        self.spawn_mount(gateway, &target, &aname, read_only)
+            .await?;
+        Ok(Response::new(NodePublishVolumeResponse {}))
+    }
+
+    async fn node_unpublish_volume(
+        &self,
+        request: Request<NodeUnpublishVolumeRequest>,
+    ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
+        let req = request.into_inner();
+        if req.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id is required"));
+        }
+        if req.target_path.is_empty() {
+            return Err(Status::invalid_argument("target_path is required"));
+        }
+
+        let target = PathBuf::from(&req.target_path);
+        let lock = self.state.target_lock(&target);
+        let _guard = lock.lock().await;
+
+        match target_state(&target).await? {
+            TargetState::FuseMounted => {
+                unmount(&target, false).await.map_err(Status::internal)?;
+            }
+            // Broken or blocked on its gateway: the pod is going away either
+            // way, so detach lazily rather than wait for a reconnect.
+            TargetState::BrokenFuse | TargetState::Unresponsive => {
+                unmount(&target, true).await.map_err(Status::internal)?;
+            }
+            TargetState::Missing | TargetState::NotMounted => {}
+        }
+
+        // Unmounting ends the FUSE session and the child exits on its own;
+        // the SIGTERM covers a child that never finished mounting.
+        let pid = self.state.children.lock().unwrap().get(&target).copied();
+        if let Some(pid) = pid {
+            // SAFETY: plain signal send; the worst case is a stale pid that
+            // the reaper has not yet removed, in which case ESRCH is ignored.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+
+        match tokio::fs::remove_dir(&target).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "rmdir {}: {}",
+                    target.display(),
+                    e
+                )));
+            }
+        }
+
+        info!(mount = %target.display(), volume = %req.volume_id, "unpublished volume");
+        drop(_guard);
+        drop(lock);
+        self.state.release_target_lock(&target);
+        Ok(Response::new(NodeUnpublishVolumeResponse {}))
+    }
+
+    async fn node_get_volume_stats(
+        &self,
+        request: Request<NodeGetVolumeStatsRequest>,
+    ) -> Result<Response<NodeGetVolumeStatsResponse>, Status> {
+        let req = request.into_inner();
+        if req.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id is required"));
+        }
+        if req.volume_path.is_empty() {
+            return Err(Status::invalid_argument("volume_path is required"));
+        }
+
+        // Whole-filesystem numbers: the gateway reports one filesystem shared
+        // by every volume.
+        let st = statfs_async(Path::new(&req.volume_path))
+            .await
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    Status::not_found(format!("{}: {}", req.volume_path, e))
+                } else if e.kind() == std::io::ErrorKind::TimedOut {
+                    // A mount blocked on its gateway; fail fast instead of
+                    // hanging kubelet's stats collection.
+                    Status::unavailable(format!("{}", e))
+                } else {
+                    Status::internal(format!("statfs {}: {}", req.volume_path, e))
+                }
+            })?;
+
+        // The gateway advertises an effectively unbounded filesystem, so the
+        // block-count * block-size products can exceed i64; do the math in
+        // i128 and clamp to the proto's int64 fields.
+        let clamp = |v: i128| -> i64 { v.clamp(0, i64::MAX as i128) as i64 };
+        let bsize = st.f_bsize as i128;
+        let usage = vec![
+            VolumeUsage {
+                available: clamp(st.f_bavail as i128 * bsize),
+                total: clamp(st.f_blocks as i128 * bsize),
+                used: clamp((st.f_blocks as i128 - st.f_bfree as i128) * bsize),
+                unit: volume_usage::Unit::Bytes as i32,
+            },
+            VolumeUsage {
+                available: clamp(st.f_ffree as i128),
+                total: clamp(st.f_files as i128),
+                used: clamp(st.f_files as i128 - st.f_ffree as i128),
+                unit: volume_usage::Unit::Inodes as i32,
+            },
+        ];
+
+        Ok(Response::new(NodeGetVolumeStatsResponse {
+            usage,
+            volume_condition: None,
+        }))
+    }
+
+    async fn node_get_capabilities(
+        &self,
+        _request: Request<NodeGetCapabilitiesRequest>,
+    ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
+        let capabilities = vec![NodeServiceCapability {
+            r#type: Some(node_service_capability::Type::Rpc(
+                node_service_capability::Rpc {
+                    r#type: node_service_capability::rpc::Type::GetVolumeStats as i32,
+                },
+            )),
+        }];
+        Ok(Response::new(NodeGetCapabilitiesResponse { capabilities }))
+    }
+
+    async fn node_get_info(
+        &self,
+        _request: Request<NodeGetInfoRequest>,
+    ) -> Result<Response<NodeGetInfoResponse>, Status> {
+        Ok(Response::new(NodeGetInfoResponse {
+            node_id: self.node_id.clone(),
+            max_volumes_per_node: 0,
+            accessible_topology: None,
+        }))
+    }
+
+    async fn node_stage_volume(
+        &self,
+        _request: Request<NodeStageVolumeRequest>,
+    ) -> Result<Response<NodeStageVolumeResponse>, Status> {
+        Err(Status::unimplemented("NodeStageVolume"))
+    }
+
+    async fn node_unstage_volume(
+        &self,
+        _request: Request<NodeUnstageVolumeRequest>,
+    ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
+        Err(Status::unimplemented("NodeUnstageVolume"))
+    }
+
+    async fn node_expand_volume(
+        &self,
+        _request: Request<NodeExpandVolumeRequest>,
+    ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
+        Err(Status::unimplemented("NodeExpandVolume"))
+    }
+}

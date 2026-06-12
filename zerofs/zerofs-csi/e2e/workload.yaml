@@ -1,0 +1,46 @@
+# e2e workload: one RWX claim shared by two pods. Each pod gets its own
+# `zerofs mount` FUSE client attached to the same volume aname.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: e2e-data
+spec:
+  storageClassName: zerofs
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: e2e-data
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reader
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: e2e-data
