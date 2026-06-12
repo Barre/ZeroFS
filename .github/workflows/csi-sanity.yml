@@ -1,0 +1,110 @@
+name: CSI Sanity
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  csi-sanity:
+    name: csi-sanity conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install fuse3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+
+      - name: Build zerofs and zerofs-csi
+        working-directory: zerofs
+        run: cargo build --profile ci -p zerofs -p zerofs-csi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install csi-sanity
+        run: |
+          go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.4.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Start gateway and driver
+        working-directory: zerofs
+        run: |
+          mkdir -p /tmp/sanity
+          cat > /tmp/sanity/zerofs.toml << 'EOF'
+          [cache]
+          dir = "/tmp/sanity/cache"
+          disk_size_gb = 1.0
+
+          [storage]
+          url = "file:///tmp/sanity/data"
+          encryption_password = "csi-sanity-ci"
+
+          [servers]
+
+          [servers.ninep]
+          unix_socket = "/tmp/sanity/9p.sock"
+
+          [servers.rpc]
+          unix_socket = "/tmp/sanity/rpc.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+          target/ci/zerofs run -c /tmp/sanity/zerofs.toml > /tmp/sanity/gateway.log 2>&1 &
+          NODE_ID=ci-node target/ci/zerofs-csi \
+            --endpoint unix:///tmp/sanity/csi.sock \
+            --mode all \
+            --mount-access owner \
+            --zerofs-bin "$PWD/target/ci/zerofs" \
+            > /tmp/sanity/driver.log 2>&1 &
+          for i in $(seq 1 60); do
+            if [ -S /tmp/sanity/csi.sock ] && [ -S /tmp/sanity/9p.sock ] && [ -S /tmp/sanity/rpc.sock ]; then
+              break
+            fi
+            sleep 1
+          done
+          ls -la /tmp/sanity
+
+      - name: Run csi-sanity
+        run: |
+          cat > /tmp/sanity/params.yaml << 'EOF'
+          adminEndpoint: unix:/tmp/sanity/rpc.sock
+          gateway: unix:/tmp/sanity/9p.sock
+          volumesRoot: /volumes
+          EOF
+          cat > /tmp/sanity/secrets.yaml << 'EOF'
+          CreateVolumeSecret:
+            adminEndpoint: unix:/tmp/sanity/rpc.sock
+          DeleteVolumeSecret:
+            adminEndpoint: unix:/tmp/sanity/rpc.sock
+          ControllerValidateVolumeCapabilitiesSecret:
+            adminEndpoint: unix:/tmp/sanity/rpc.sock
+            gateway: unix:/tmp/sanity/9p.sock
+          NodePublishVolumeSecret:
+            adminEndpoint: unix:/tmp/sanity/rpc.sock
+          EOF
+          # The skipped spec needs per-volume capacity tracking; see the
+          # Limitations section of zerofs-csi/README.md.
+          csi-sanity \
+            -csi.endpoint unix:///tmp/sanity/csi.sock \
+            -csi.mountdir /tmp/sanity/mnt \
+            -csi.stagingdir /tmp/sanity/staging \
+            -csi.testvolumeparameters /tmp/sanity/params.yaml \
+            -csi.secrets /tmp/sanity/secrets.yaml \
+            -ginkgo.skip "already existing name and different capacity"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          tail -n 100 /tmp/sanity/gateway.log || true
+          tail -n 100 /tmp/sanity/driver.log || true

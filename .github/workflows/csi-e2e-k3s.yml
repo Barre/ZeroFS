@@ -1,0 +1,96 @@
+name: CSI e2e (k3s)
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: k3s end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build zerofs and zerofs-csi
+        working-directory: zerofs
+        run: cargo build --profile ci -p zerofs -p zerofs-csi
+
+      - name: Build images
+        run: |
+          ctx=$(mktemp -d)
+          cp zerofs/target/ci/zerofs zerofs/target/ci/zerofs-csi zerofs/zerofs-csi/e2e/Dockerfile "$ctx"
+          docker build --target gateway -t zerofs:e2e "$ctx"
+          docker build --target csi -t zerofs-csi:e2e "$ctx"
+
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | sudo sh -s - --write-kubeconfig-mode 644
+          echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
+          sudo k3s kubectl wait node --all --for=condition=Ready --timeout=120s
+
+      - name: Import images into k3s
+        run: |
+          docker save zerofs:e2e | sudo k3s ctr images import -
+          docker save zerofs-csi:e2e | sudo k3s ctr images import -
+
+      - name: Deploy gateway
+        run: |
+          kubectl apply -f zerofs/zerofs-csi/e2e/gateway.yaml
+          kubectl -n zerofs rollout status statefulset/zerofs-gateway --timeout=120s
+
+      # The shipped manifests are applied as-is except for the image, which
+      # points at the locally imported build (`:e2e` defaults to
+      # imagePullPolicy IfNotPresent, so nothing is pulled).
+      - name: Deploy CSI driver
+        working-directory: zerofs/zerofs-csi
+        run: |
+          kubectl apply -f deploy/csidriver.yaml -f deploy/rbac.yaml
+          sed 's|ghcr.io/barre/zerofs-csi:latest|docker.io/library/zerofs-csi:e2e|' deploy/controller.yaml | kubectl apply -f -
+          sed 's|ghcr.io/barre/zerofs-csi:latest|docker.io/library/zerofs-csi:e2e|' deploy/node.yaml | kubectl apply -f -
+          kubectl apply -f deploy/storageclass-example.yaml
+          kubectl -n zerofs rollout status deployment/zerofs-csi-controller --timeout=180s
+          kubectl -n zerofs rollout status daemonset/zerofs-csi-node --timeout=180s
+
+      - name: Provision and mount (RWX across two pods)
+        run: |
+          kubectl apply -f zerofs/zerofs-csi/e2e/workload.yaml
+          kubectl wait --for=condition=Ready pod/writer pod/reader --timeout=180s
+          kubectl exec writer -- sh -c 'echo zerofs-e2e-payload > /data/hello.txt'
+          content=$(kubectl exec reader -- cat /data/hello.txt)
+          test "$content" = "zerofs-e2e-payload"
+
+      # The flagship claim: published FUSE mounts survive a gateway restart
+      # via 9P reconnect + fid replay. I/O blocks during the outage and
+      # resumes on the same mounts; nothing is republished.
+      - name: Gateway restart survives published mounts
+        run: |
+          kubectl -n zerofs delete pod zerofs-gateway-0
+          kubectl -n zerofs rollout status statefulset/zerofs-gateway --timeout=120s
+          timeout 120 kubectl exec writer -- sh -c 'echo after-restart > /data/hello.txt'
+          content=$(timeout 120 kubectl exec reader -- cat /data/hello.txt)
+          test "$content" = "after-restart"
+
+      - name: Delete reclaims the volume
+        run: |
+          pv=$(kubectl get pvc e2e-data -o jsonpath='{.spec.volumeName}')
+          kubectl delete -f zerofs/zerofs-csi/e2e/workload.yaml --timeout=120s
+          kubectl wait pv "$pv" --for=delete --timeout=120s
+
+      - name: Debug dump on failure
+        if: failure()
+        run: |
+          set +e
+          kubectl get pods -A -o wide
+          kubectl get pv,pvc -A
+          kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+          kubectl describe pod writer reader
+          kubectl -n zerofs logs statefulset/zerofs-gateway --tail=100
+          kubectl -n zerofs logs deployment/zerofs-csi-controller --all-containers --tail=100
+          kubectl -n zerofs logs daemonset/zerofs-csi-node --all-containers --tail=100
