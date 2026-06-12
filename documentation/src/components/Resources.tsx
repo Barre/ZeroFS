@@ -14,6 +14,7 @@ import { FolderIcon } from '@/components/icons/FolderIcon'
 import { PackageIcon } from '@/components/icons/PackageIcon'
 import { LinkIcon } from '@/components/icons/LinkIcon'
 import { ShapesIcon } from '@/components/icons/ShapesIcon'
+import { SquaresPlusIcon } from '@/components/icons/SquaresPlusIcon'
 
 interface Resource {
   href: string
@@ -80,6 +81,20 @@ const resources: Array<Resource> = [
       squares: [
         [0, 2],
         [1, 4],
+      ],
+    },
+  },
+  {
+    href: '/kubernetes-csi',
+    name: 'Kubernetes CSI Driver',
+    description:
+      'Dynamically provisioned persistent volumes backed by a shared ZeroFS gateway, mounted over 9P.',
+    icon: SquaresPlusIcon,
+    pattern: {
+      y: 8,
+      squares: [
+        [-1, 1],
+        [1, 2],
       ],
     },
   },
