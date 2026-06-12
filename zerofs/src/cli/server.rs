@@ -3,9 +3,7 @@ use crate::bucket_identity;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
-use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::permissions::Credentials;
-use crate::fs::tracing::AccessTracer;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
@@ -238,15 +236,10 @@ async fn start_nbd_servers(
     handles
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
-    flush_coordinator: FlushCoordinator,
-    tracer: AccessTracer,
-    fs_stats: Arc<crate::fs::metrics::FileSystemStats>,
-    global_stats: Arc<crate::fs::stats::FileSystemGlobalStats>,
-    max_bytes: u64,
+    fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
@@ -254,15 +247,7 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(
-        checkpoint_manager,
-        flush_coordinator,
-        tracer,
-        fs_stats,
-        global_stats,
-        max_bytes,
-        shutdown.clone(),
-    );
+    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, fs, shutdown.clone());
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -899,11 +884,7 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
-        fs.flush_coordinator.clone(),
-        fs.tracer.clone(),
-        Arc::clone(&fs.stats),
-        Arc::clone(&fs.global_stats),
-        fs.max_bytes,
+        Arc::clone(&fs),
         shutdown.clone(),
     )
     .await;
@@ -940,11 +921,7 @@ pub async fn run_server(
     let webui_handles = if let Some(ref webui_config) = settings.servers.webui {
         let webui_rpc_service = crate::rpc::server::AdminRpcServer::new(
             checkpoint_manager_for_webui,
-            fs.flush_coordinator.clone(),
-            fs.tracer.clone(),
-            Arc::clone(&fs.stats),
-            Arc::clone(&fs.global_stats),
-            fs.max_bytes,
+            Arc::clone(&fs),
             shutdown.clone(),
         );
         let webui_lock_manager = Arc::new(crate::ninep::lock_manager::FileLockManager::new());
