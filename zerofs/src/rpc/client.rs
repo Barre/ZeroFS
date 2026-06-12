@@ -189,4 +189,52 @@ impl RpcClient {
 
         Ok(())
     }
+
+    /// Create a directory (and any missing parents) at `path`. Returns true
+    /// when this call created the directory, false when it already existed.
+    /// No in-tree CLI command uses this yet; it exists for external admin
+    /// clients (e.g. the CSI driver) and is exercised by the rpc tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn create_directory(
+        &self,
+        path: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<bool> {
+        let request = proto::CreateDirectoryRequest {
+            path: path.to_string(),
+            mode,
+            uid,
+            gid,
+        };
+
+        let response = self
+            .client
+            .clone()
+            .create_directory(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        Ok(response.created)
+    }
+
+    /// Remove the directory at `path` and everything below it. Idempotent: a
+    /// missing path is a success. Deletion completes in the background on
+    /// the server.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn remove_directory(&self, path: &str) -> Result<()> {
+        let request = proto::RemoveDirectoryRequest {
+            path: path.to_string(),
+        };
+
+        self.client
+            .clone()
+            .remove_directory(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
 }
