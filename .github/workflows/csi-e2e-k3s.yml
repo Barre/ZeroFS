@@ -76,15 +76,18 @@ jobs:
         run: |
           kubectl -n zerofs delete pod zerofs-gateway-0
           kubectl -n zerofs rollout status statefulset/zerofs-gateway --timeout=120s
-          # Each pod writes and reads back through its own mount: this proves both
-          # mounts reconnected and resumed I/O. The check stays within one client
-          # because 9P does not promptly invalidate a peer client's cache, so a
-          # cross-client re-read would be racy; cross-client RWX is already
-          # covered by the provisioning step above.
-          w=$(timeout 120 kubectl exec writer -- sh -c 'echo writer-after > /data/from-writer && cat /data/from-writer')
-          test "$w" = "writer-after"
-          r=$(timeout 120 kubectl exec reader -- sh -c 'echo reader-after > /data/from-reader && cat /data/from-reader')
-          test "$r" = "reader-after"
+          # Writer overwrites the shared file after the restart; the reader (a
+          # separate mount on the same RWX volume) must observe it. RWX volumes
+          # mount write-through, so a peer's write is visible within ~1s (bounded
+          # by the FUSE attribute cache); poll briefly rather than assume it is
+          # instantaneous.
+          timeout 120 kubectl exec writer -- sh -c 'echo after-restart > /data/hello.txt'
+          for i in $(seq 1 30); do
+            content=$(timeout 30 kubectl exec reader -- cat /data/hello.txt 2>/dev/null || true)
+            [ "$content" = "after-restart" ] && break
+            sleep 1
+          done
+          test "$content" = "after-restart"
 
       - name: Delete reclaims the volume
         run: |
