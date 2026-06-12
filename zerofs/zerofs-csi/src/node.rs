@@ -236,6 +236,7 @@ impl NodeService {
         target: &Path,
         aname: &str,
         read_only: bool,
+        writeback: bool,
     ) -> Result<(), Status> {
         let mut cmd = Command::new(&self.zerofs_bin);
         cmd.arg("mount")
@@ -245,6 +246,8 @@ impl NodeService {
             .arg(aname)
             .arg("--access")
             .arg(self.mount_access.as_arg())
+            .arg("--writeback")
+            .arg(if writeback { "true" } else { "false" })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -355,7 +358,7 @@ impl NodeService {
             }
         });
 
-        info!(mount = %target.display(), pid, gateway, aname, read_only, "mounted volume");
+        info!(mount = %target.display(), pid, gateway, aname, read_only, writeback, "mounted volume");
         Ok(())
     }
 }
@@ -396,6 +399,16 @@ impl Node for NodeService {
                 Mode::try_from(mode),
                 Ok(Mode::SingleNodeReaderOnly | Mode::MultiNodeReaderOnly)
             );
+        // A multi-writer volume can be written from another node's client, so
+        // mount it write-through. The writeback cache pins pages across opens
+        // (FOPEN_KEEP_CACHE) and only drops them on explicit invalidation, so a
+        // peer's overwrite is served stale indefinitely. Write-through instead
+        // revalidates against the mount's ~1s attribute TTL, so a peer's writes
+        // become visible within about a second even on an already-open file
+        // (bounded staleness, stronger than close-to-open). Single-writer and
+        // read-only volumes have no peer writer, so they keep the faster
+        // writeback default.
+        let writeback = !matches!(Mode::try_from(mode), Ok(Mode::MultiNodeMultiWriter));
 
         let target = PathBuf::from(&req.target_path);
         let lock = self.state.target_lock(&target);
@@ -432,7 +445,7 @@ impl Node for NodeService {
             TargetState::NotMounted => {}
         }
 
-        self.spawn_mount(gateway, &target, &aname, read_only)
+        self.spawn_mount(gateway, &target, &aname, read_only, writeback)
             .await?;
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
