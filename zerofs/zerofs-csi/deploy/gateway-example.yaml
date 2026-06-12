@@ -1,0 +1,112 @@
+# Example shared ZeroFS gateway: a single-replica StatefulSet (ZeroFS is
+# single-writer per bucket/prefix) serving 9P to the CSI node plugins and the
+# admin RPC to the CSI controller.
+#
+# The 9P port has no authentication and an aname is client-chosen, so
+# restrict access to the CSI node pods with a NetworkPolicy (see README).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerofs
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zerofs-gateway-config
+  namespace: zerofs
+stringData:
+  ZEROFS_PASSWORD: change-me
+  zerofs.toml: |
+    [cache]
+    dir = "/data/cache"
+    disk_size_gb = 10.0
+    memory_size_gb = 1.0
+
+    [storage]
+    url = "s3://your-bucket/zerofs-csi"
+    encryption_password = "${ZEROFS_PASSWORD}"
+
+    [servers]
+
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+
+    # Remove this [aws] section when using IRSA or instance roles: config
+    # parsing fails on unset ${VAR} references, and the AWS SDK picks up
+    # those credential sources on its own.
+    [aws]
+    access_key_id = "${AWS_ACCESS_KEY_ID}"
+    secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-gateway
+  namespace: zerofs
+spec:
+  selector:
+    app: zerofs-gateway
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-gateway
+  namespace: zerofs
+spec:
+  serviceName: zerofs-gateway
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-gateway
+  template:
+    metadata:
+      labels:
+        app: zerofs-gateway
+    spec:
+      containers:
+        - name: zerofs
+          image: ghcr.io/barre/zerofs:latest
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+          env:
+            - name: ZEROFS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zerofs-gateway-config
+                  key: ZEROFS_PASSWORD
+            # Supply AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY here to match
+            # the [aws] section above. With IRSA / instance roles, leave them
+            # out AND remove the [aws] section from zerofs.toml (unset ${VAR}
+            # references fail config parsing).
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: cache
+              mountPath: /data/cache
+      volumes:
+        - name: config
+          secret:
+            secretName: zerofs-gateway-config
+            items:
+              - key: zerofs.toml
+                path: zerofs.toml
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

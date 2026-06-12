@@ -1,0 +1,82 @@
+# RBAC for the controller's external-provisioner sidecar and the node
+# plugin's service account.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zerofs-csi-controller
+  namespace: zerofs
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zerofs-csi-node
+  namespace: zerofs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: zerofs-csi-provisioner
+rules:
+  # "patch" is required by csi-provisioner v6.x: HonorPVReclaimPolicy manages
+  # a finalizer on PV objects via Patch; without it PV deletion gets stuck.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # The provisioner secret referenced by the StorageClass
+  # (csi.storage.k8s.io/provisioner-secret-name) is read for DeleteVolume.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: zerofs-csi-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: zerofs-csi-controller
+    namespace: zerofs
+roleRef:
+  kind: ClusterRole
+  name: zerofs-csi-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+# Leader election for the provisioner sidecar.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: zerofs-csi-provisioner-leader-election
+  namespace: zerofs
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: zerofs-csi-provisioner-leader-election
+  namespace: zerofs
+subjects:
+  - kind: ServiceAccount
+    name: zerofs-csi-controller
+    namespace: zerofs
+roleRef:
+  kind: Role
+  name: zerofs-csi-provisioner-leader-election
+  apiGroup: rbac.authorization.k8s.io

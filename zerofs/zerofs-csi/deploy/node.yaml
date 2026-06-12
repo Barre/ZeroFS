@@ -1,0 +1,98 @@
+# Node plugin DaemonSet. The plugin container spawns `zerofs mount` children
+# (FUSE), so it needs /dev/fuse, privileges to mount, and Bidirectional
+# propagation under /var/lib/kubelet so the mounts reach pods.
+#
+# Known limitation: the FUSE clients are children of this container. If the
+# container restarts, every published mount on the node dies until the volume
+# is republished (pod restart).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zerofs-csi-node
+  namespace: zerofs
+spec:
+  selector:
+    matchLabels:
+      app: zerofs-csi-node
+  # A rolling update restarts the plugin on every node, which kills every
+  # published FUSE mount cluster-wide (see the limitation above). OnDelete
+  # makes upgrades a deliberate per-node operation, coordinated with draining.
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app: zerofs-csi-node
+    spec:
+      serviceAccountName: zerofs-csi-node
+      # Pods with volumes can land on any node a workload tolerates, so the
+      # plugin must run there too.
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      containers:
+        - name: zerofs-csi
+          image: ghcr.io/barre/zerofs-csi:latest
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          ports:
+            - name: healthz
+              containerPort: 9808
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev-fuse
+              mountPath: /dev/fuse
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi.zerofs.net/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: livenessprobe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.19.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --health-port=9808
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        # The kubelet talks to the plugin through this hostPath socket.
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.zerofs.net
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

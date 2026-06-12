@@ -12,7 +12,7 @@ keywords = ["filesystem", "s3", "nfs", "distributed", "storage"]
 categories = ["filesystem", "network-programming"]
 
 [workspace]
-members = ["ninep-proto", "ninep-client"]
+members = ["ninep-proto", "ninep-client", "zerofs-csi"]
 
 [profile.release]
 lto = true

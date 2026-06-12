@@ -1,0 +1,33 @@
+# Example StorageClass for the zerofs gateway deployed by
+# gateway-example.yaml. One StorageClass per gateway.
+#
+# DeleteVolume receives no StorageClass parameters (CSI spec), so the
+# adminEndpoint must also live in a Secret referenced via
+# csi.storage.k8s.io/provisioner-secret-name.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zerofs-csi-admin
+  namespace: zerofs
+stringData:
+  adminEndpoint: http://zerofs-gateway.zerofs.svc:7000
+  # Only needed when it differs from the default /volumes.
+  # volumesRoot: /volumes
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: zerofs
+provisioner: csi.zerofs.net
+parameters:
+  # Gateway admin RPC, used by CreateVolume.
+  adminEndpoint: http://zerofs-gateway.zerofs.svc:7000
+  # 9P address nodes mount from.
+  gateway: zerofs-gateway.zerofs.svc:5564
+  # Directory on the gateway filesystem holding the volume directories.
+  volumesRoot: /volumes
+  csi.storage.k8s.io/provisioner-secret-name: zerofs-csi-admin
+  csi.storage.k8s.io/provisioner-secret-namespace: zerofs
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

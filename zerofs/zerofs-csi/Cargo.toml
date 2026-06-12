@@ -1,0 +1,34 @@
+[package]
+name = "zerofs-csi"
+version = "0.1.0"
+edition = "2024"
+description = "CSI driver exposing a shared ZeroFS gateway to Kubernetes via 9P FUSE mounts"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+
+[features]
+default = ["vendored-protoc"]
+vendored-protoc = ["dep:protobuf-src"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+ninep-client = { path = "../ninep-client" }
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1.49", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protobuf-src = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3.21"

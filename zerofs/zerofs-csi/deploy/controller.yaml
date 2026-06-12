@@ -1,0 +1,39 @@
+# Controller deployment: the zerofs-csi controller service plus the
+# external-provisioner sidecar. One replica is enough; the provisioner uses
+# leader election so more replicas are safe but idle.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zerofs-csi-controller
+  namespace: zerofs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-csi-controller
+  template:
+    metadata:
+      labels:
+        app: zerofs-csi-controller
+    spec:
+      serviceAccountName: zerofs-csi-controller
+      containers:
+        - name: zerofs-csi
+          image: ghcr.io/barre/zerofs-csi:latest
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}

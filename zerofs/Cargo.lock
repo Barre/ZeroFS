@@ -5649,6 +5649,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerofs-csi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hyper-util",
+ "libc",
+ "ninep-client",
+ "prost",
+ "prost-types",
+ "protobuf-src",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.14.6",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "zerofs_nfsserve"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

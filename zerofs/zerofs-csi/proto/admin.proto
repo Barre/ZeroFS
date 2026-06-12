@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+package zerofs.admin;
+
+import "google/protobuf/timestamp.proto";
+
+service AdminService {
+    rpc CreateCheckpoint(CreateCheckpointRequest) returns (CreateCheckpointResponse);
+
+    rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+    rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse);
+
+    rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
+
+    rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
+
+    rpc Flush(FlushRequest) returns (FlushResponse);
+
+    rpc StreamStats(StreamStatsRequest) returns (stream StatsSnapshot);
+
+    rpc CreateDirectory(CreateDirectoryRequest) returns (CreateDirectoryResponse);
+
+    rpc RemoveDirectory(RemoveDirectoryRequest) returns (RemoveDirectoryResponse);
+}
+
+message CreateDirectoryRequest {
+    // Path from the filesystem root, e.g. /volumes/pvc-1234. Missing parent
+    // directories are created (mkdir -p semantics).
+    string path = 1;
+    uint32 mode = 2;
+    uint32 uid = 3;
+    uint32 gid = 4;
+}
+
+message CreateDirectoryResponse {
+    // True when this call created the directory at path, false when it
+    // already existed.
+    bool created = 1;
+}
+
+message RemoveDirectoryRequest {
+    string path = 1;
+}
+
+message RemoveDirectoryResponse {}
+
+message FlushRequest {}
+
+message FlushResponse {}
+
+message CheckpointInfo {
+    // UUID as string
+    string id = 1;
+    string name = 2;
+    google.protobuf.Timestamp created_at = 3;
+}
+
+message CreateCheckpointRequest {
+    string name = 1;
+}
+
+message CreateCheckpointResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message ListCheckpointsRequest {}
+
+message ListCheckpointsResponse {
+    repeated CheckpointInfo checkpoints = 1;
+}
+
+message DeleteCheckpointRequest {
+    string name = 1;
+}
+
+message DeleteCheckpointResponse {}
+
+message GetCheckpointInfoRequest {
+    string name = 1;
+}
+
+message GetCheckpointInfoResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message WatchFileAccessRequest {}
+
+message FileAccessEvent {
+    google.protobuf.Timestamp timestamp = 1;
+    FileOperation operation = 2;
+    string path = 3;
+    OperationParams params = 4;
+}
+
+enum FileOperation {
+    READ = 0;
+    WRITE = 1;
+    CREATE = 2;
+    REMOVE = 3;
+    RENAME = 4;
+    MKDIR = 5;
+    READDIR = 6;
+    LOOKUP = 7;
+    SETATTR = 8;
+    LINK = 9;
+    SYMLINK = 10;
+    MKNOD = 11;
+    TRIM = 12;
+    FSYNC = 13;
+}
+
+message OperationParams {
+    optional uint64 offset = 1;
+    optional uint64 length = 2;
+    optional uint32 mode = 3;
+    optional string new_path = 4;
+    optional string link_target = 5;
+    optional string filename = 6;
+}
+
+message StreamStatsRequest {
+    uint32 interval_ms = 1;
+}
+
+message StatsSnapshot {
+    google.protobuf.Timestamp timestamp = 1;
+    uint64 files_created = 2;
+    uint64 files_deleted = 3;
+    uint64 files_renamed = 4;
+    uint64 directories_created = 5;
+    uint64 directories_deleted = 6;
+    uint64 directories_renamed = 7;
+    uint64 links_created = 8;
+    uint64 links_deleted = 9;
+    uint64 links_renamed = 10;
+    uint64 read_operations = 11;
+    uint64 write_operations = 12;
+    uint64 bytes_read = 13;
+    uint64 bytes_written = 14;
+    uint64 tombstones_created = 15;
+    uint64 tombstones_processed = 16;
+    uint64 gc_chunks_deleted = 17;
+    uint64 gc_runs = 18;
+    uint64 total_operations = 19;
+    uint64 used_bytes = 20;
+    uint64 used_inodes = 21;
+    uint64 max_bytes = 22;
+    // jemalloc memory stats
+    uint64 jemalloc_allocated = 23;
+    uint64 jemalloc_resident = 24;
+    uint64 jemalloc_mapped = 25;
+    uint64 jemalloc_retained = 26;
+    uint64 jemalloc_metadata = 27;
+}
