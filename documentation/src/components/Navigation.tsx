@@ -272,6 +272,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'NFS File Access', href: '/nfs-access' },
       { title: '9P File Access', href: '/9p-access' },
       { title: 'NBD Block Devices', href: '/nbd-devices' },
+      { title: 'Kubernetes CSI Driver', href: '/kubernetes-csi' },
       { title: 'Licensing', href: '/licensing' },
     ],
   },
