@@ -33,6 +33,13 @@ jobs:
         run: |
           curl -sfL https://get.k3s.io | sudo sh -s - --write-kubeconfig-mode 644
           echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
+          # `kubectl wait node --all` errors immediately ("no matching resources
+          # found") if it runs before the node object registers, so wait for the
+          # node to appear first, then wait on its Ready condition.
+          for i in $(seq 1 60); do
+            sudo k3s kubectl get nodes 2>/dev/null | grep -q ' Ready\| NotReady' && break
+            sleep 2
+          done
           sudo k3s kubectl wait node --all --for=condition=Ready --timeout=120s
 
       - name: Import images into k3s
