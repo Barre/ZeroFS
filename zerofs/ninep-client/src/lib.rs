@@ -103,6 +103,26 @@ struct Conn {
     dead: AtomicBool,
     /// Signals the (possibly idle) writer task to stop when the reader exits.
     writer_shutdown: Notify,
+    /// Signals the reader task to stop even while the socket is still healthy.
+    /// The reader otherwise only exits when the socket dies, so a freshly built
+    /// connection that is discarded before being installed (negotiate or replay
+    /// failed) would leak its reader task and socket fd. The reader and writer
+    /// each hold an `Arc<Conn>`, so `Drop` can't break that cycle — teardown
+    /// must be signalled explicitly via [`Conn::shutdown`].
+    reader_shutdown: Notify,
+}
+
+impl Conn {
+    /// Tear down a connection that is being discarded without ever being
+    /// installed (e.g. `connect_once` negotiated but `replay` then failed):
+    /// wake both the reader and the writer so they exit and drop their
+    /// `Arc<Conn>`, releasing the socket fd. A normally-dying connection
+    /// (socket failed) tears itself down; this is only for the discard path.
+    fn shutdown(&self) {
+        self.dead.store(true, Ordering::Release);
+        self.reader_shutdown.notify_one();
+        self.writer_shutdown.notify_one();
+    }
 }
 
 /// How a fid is re-established on a fresh session. There is no path/lineage and
@@ -247,6 +267,7 @@ impl NinePClient {
             tag_ctr: AtomicU16::new(0),
             dead: AtomicBool::new(false),
             writer_shutdown: Notify::new(),
+            reader_shutdown: Notify::new(),
         });
 
         spawn_writer(
@@ -257,8 +278,15 @@ impl NinePClient {
         );
         spawn_reader(read, Arc::clone(&conn), reconnect_notify);
 
-        let (msize, extensions) = negotiate_on(&conn, requested_msize).await?;
-        Ok((conn, msize, extensions))
+        match negotiate_on(&conn, requested_msize).await {
+            Ok((msize, extensions)) => Ok((conn, msize, extensions)),
+            // The socket is healthy but unusable; tear the tasks down so the fd
+            // is not leaked.
+            Err(e) => {
+                conn.shutdown();
+                Err(e)
+            }
+        }
     }
 
     /// The reconnect supervisor: waits for the live connection to die, then
@@ -323,7 +351,12 @@ impl NinePClient {
 
         self.msize.store(msize, Ordering::Relaxed);
         self.extensions.store(extensions, Ordering::Relaxed);
-        self.replay(&conn).await?;
+        // A replay failure discards this freshly built connection (the caller
+        // retries with a new one); tear it down so its fd is not leaked.
+        if let Err(e) = self.replay(&conn).await {
+            conn.shutdown();
+            return Err(e);
+        }
         let old = self.conn.swap(conn);
         old.dead.store(true, Ordering::Release);
         old.writer_shutdown.notify_one();
@@ -1463,13 +1496,22 @@ fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconn
             .max_frame_length(P9_MAX_MSIZE as usize)
             .new_read(read);
 
-        while let Some(frame) = framed.next().await {
-            let frame = match frame {
-                Ok(buf) => buf.freeze(),
-                Err(e) => {
+        loop {
+            let next = tokio::select! {
+                biased;
+                // Discard signal for a connection torn down while its socket is
+                // still healthy (see `Conn::shutdown`). Never fires for a live
+                // connection, so steady-state behavior is unchanged.
+                _ = conn.reader_shutdown.notified() => break,
+                next = framed.next() => next,
+            };
+            let frame = match next {
+                Some(Ok(buf)) => buf.freeze(),
+                Some(Err(e)) => {
                     warn!("9P client read failed: {e}");
                     break;
                 }
+                None => break,
             };
             if frame.len() < P9_HEADER_SIZE {
                 warn!(
