@@ -104,7 +104,12 @@ Requested capacity is recorded on the PV but not enforced — every volume share
 
 ## Security
 
-The 9P attach is namespacing, not authentication: any client that can reach the gateway's 9P port can attach to any directory, including another volume's or the filesystem root. The boundary is network reachability — pods never speak 9P themselves (they see only a kernel mountpoint), so restrict the gateway ports to the CSI components:
+Neither gateway port is authenticated; the trust boundary is network reachability, the same model as NFS with `AUTH_SYS`. Both must be restricted to their CSI clients:
+
+- **9P (5564)** is the data plane. The attach aname is namespacing, not authentication: any client that reaches this port can attach to any directory, including another volume's or the filesystem root. Pods never speak 9P themselves — they see only a kernel mountpoint — so this port is open to the node plugins.
+- **Admin RPC (7000)** is a root-equivalent control plane. It runs every call as uid 0 and can trash any volume (`RemoveDirectory`). Its only client is the controller, so it is locked to the controller pod alone — the tighter of the two rules.
+
+[`networkpolicy-example.yaml`](https://github.com/Barre/ZeroFS/blob/main/zerofs/zerofs-csi/deploy/networkpolicy-example.yaml) ships in the deploy bundle and enforces both. Apply it alongside the gateway (adapt the labels to your manifests):
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -116,20 +121,21 @@ spec:
   podSelector:
     matchLabels:
       app: zerofs-gateway
+  policyTypes: [Ingress]
   ingress:
-    - ports: [{ port: 5564 }]
+    - ports: [{ port: 5564 }] # data plane, from every node plugin
       from:
         - podSelector:
             matchLabels:
               app: zerofs-csi-node
-    - ports: [{ port: 7000 }]
+    - ports: [{ port: 7000 }] # control plane, from the controller only
       from:
         - podSelector:
             matchLabels:
               app: zerofs-csi-controller
 ```
 
-This is the same trust model as NFS with `AUTH_SYS`: the cluster operator trusts the nodes and controls the network. Data is still [encrypted](/encryption) before it reaches the object store; the encryption password is per gateway, i.e. per StorageClass.
+A NetworkPolicy is a no-op on a CNI that does not enforce them (vanilla flannel, default k3s); there, neither port has in-cluster protection, so do not expose the gateway to untrusted pods. Data is still [encrypted](/encryption) before it reaches the object store; the encryption password is per gateway, i.e. per StorageClass.
 
 ## Limitations
 
