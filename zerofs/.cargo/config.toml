@@ -13,3 +13,6 @@ rustflags = [
 
 [env]
 JEMALLOC_SYS_WITH_MALLOC_CONF = "retain:true,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true"
+# tikv-jemalloc-sys checks target-prefixed variables before the generic one.
+AARCH64_APPLE_DARWIN_JEMALLOC_SYS_WITH_MALLOC_CONF = "retain:true,dirty_decay_ms:1000,muzzy_decay_ms:0"
+X86_64_APPLE_DARWIN_JEMALLOC_SYS_WITH_MALLOC_CONF = "retain:true,dirty_decay_ms:1000,muzzy_decay_ms:0"
