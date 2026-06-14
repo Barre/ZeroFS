@@ -558,3 +558,94 @@ async fn node_publish_and_unpublish_fuse_mount() {
         .await
         .unwrap();
 }
+
+/// When the gateway is gone but the mount child is still alive (wedged behind
+/// its 9P reconnect loop), statfs on the mount blocks forever. The node plugin
+/// must detect the dead gateway with its cancellable probe and report the
+/// volume unavailable promptly, never parking on the syscall.
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_and_republish_fail_fast_when_gateway_unreachable() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount not available");
+        return;
+    }
+
+    let mut server = start_zerofs_server().await;
+    let (_identity, mut controller, mut node) = start_csi(&server).await;
+
+    controller
+        .create_volume(create_request(&server, "pvc-wedge"))
+        .await
+        .unwrap();
+
+    let target = server.dir.path().join("publish/wedge");
+    let publish_request = NodePublishVolumeRequest {
+        volume_id: "pvc-wedge".to_string(),
+        target_path: target.display().to_string(),
+        volume_capability: Some(mount_capability(
+            volume_capability::access_mode::Mode::SingleNodeWriter,
+        )),
+        volume_context: HashMap::from([("gateway".to_string(), server.gateway())]),
+        ..Default::default()
+    };
+    node.node_publish_volume(publish_request.clone())
+        .await
+        .unwrap();
+
+    // Kill the gateway, not the mount child: the child stays alive and enters
+    // its 9P reconnect loop, so any statfs on the mount blocks until a
+    // reconnect that never comes. (TestServer::drop kills it again, harmlessly.)
+    unsafe { libc::kill(server.child.id() as i32, libc::SIGKILL) };
+    let _ = server.child.wait();
+    // Wait until the 9P socket stops accepting, so the probe sees it as down.
+    for _ in 0..100 {
+        if tokio::net::UnixStream::connect(&server.ninep_sock)
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Stats must fail fast via the probe, not hang on statfs. A hang would take
+    // the 5s statfs deadline (or longer); the probe answers in well under that.
+    let start = std::time::Instant::now();
+    let err = node
+        .node_get_volume_stats(NodeGetVolumeStatsRequest {
+            volume_id: "pvc-wedge".to_string(),
+            volume_path: target.display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "stats hung for {:?} instead of failing fast",
+        start.elapsed()
+    );
+
+    // Republishing the wedged mount likewise reports Unavailable promptly,
+    // leaving the mount in place to reconnect rather than remounting.
+    let start = std::time::Instant::now();
+    let err = node
+        .node_publish_volume(publish_request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable, "{err}");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "publish hung for {:?} instead of failing fast",
+        start.elapsed()
+    );
+
+    // Unpublish still cleans up the wedged mount (lazy unmount + SIGTERM).
+    node.node_unpublish_volume(NodeUnpublishVolumeRequest {
+        volume_id: "pvc-wedge".to_string(),
+        target_path: target.display().to_string(),
+    })
+    .await
+    .unwrap();
+    assert!(!target.exists());
+}
