@@ -277,7 +277,11 @@ async fn target_state(
     gateway: Option<&str>,
 ) -> Result<TargetState, Status> {
     if !is_fuse_mount(target).map_err(|e| {
-        Status::internal(format!("reading mount table for {}: {}", target.display(), e))
+        Status::internal(format!(
+            "reading mount table for {}: {}",
+            target.display(),
+            e
+        ))
     })? {
         return Ok(TargetState::NotMounted);
     }
@@ -533,7 +537,13 @@ impl Node for NodeService {
         let lock = self.state.target_lock(&target);
         let _guard = lock.lock().await;
 
-        let pid = self.state.children.lock().unwrap().get(&target).map(|c| c.pid);
+        let pid = self
+            .state
+            .children
+            .lock()
+            .unwrap()
+            .get(&target)
+            .map(|c| c.pid);
         match target_state(&target, pid, Some(gateway)).await? {
             // Already a live FUSE mount: assume it is ours and succeed.
             TargetState::FuseMounted => return Ok(Response::new(NodePublishVolumeResponse {})),

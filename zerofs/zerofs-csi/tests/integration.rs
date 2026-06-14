@@ -629,10 +629,7 @@ async fn stats_and_republish_fail_fast_when_gateway_unreachable() {
     // Republishing the wedged mount likewise reports Unavailable promptly,
     // leaving the mount in place to reconnect rather than remounting.
     let start = std::time::Instant::now();
-    let err = node
-        .node_publish_volume(publish_request)
-        .await
-        .unwrap_err();
+    let err = node.node_publish_volume(publish_request).await.unwrap_err();
     assert_eq!(err.code(), Code::Unavailable, "{err}");
     assert!(
         start.elapsed() < Duration::from_secs(4),
