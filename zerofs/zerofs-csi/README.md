@@ -65,6 +65,8 @@ zerofs-csi --mode controller|node|all \
 - `node.yaml` — node DaemonSet (privileged, needs `/dev/fuse`) with
   node-driver-registrar and livenessprobe sidecars
 - `storageclass-example.yaml` — StorageClass plus the provisioner Secret
+- `networkpolicy-example.yaml` — gateway lockdown (9P to node pods, admin RPC
+  to the controller); see the security note under Limitations
 
 ## Limitations (v1)
 
@@ -86,36 +88,20 @@ zerofs-csi --mode controller|node|all \
   children of the node plugin container; if it restarts, published mounts on
   that node break. Restarting the affected pods republishes and remounts
   them. Dedicated per-volume mount pods are the planned v2 fix.
-- **The aname is namespacing, not a security boundary.** Any client that can
-  reach the gateway's 9P port can attach any aname, including another
-  volume's directory or the filesystem root. Restrict the 9P port to the CSI
-  node pods with a NetworkPolicy, e.g.:
+- **The gateway has no authentication; network reachability is the trust
+  boundary.** Both ports must be restricted to their legitimate clients:
+  - 9P (5564) is the data plane. The aname is client-chosen and not a security
+    boundary — anything that can reach it can attach any volume's subtree or
+    the filesystem root — so it is open to every CSI node pod.
+  - The admin RPC (7000) is a root-equivalent control plane that can trash any
+    volume (`RemoveDirectory`). Its only client is the controller, so it is
+    locked to the controller pod alone.
 
-  ```yaml
-  apiVersion: networking.k8s.io/v1
-  kind: NetworkPolicy
-  metadata:
-    name: zerofs-gateway
-    namespace: zerofs
-  spec:
-    podSelector:
-      matchLabels:
-        app: zerofs-gateway
-    ingress:
-      - ports: [{port: 5564}]
-        from:
-          - podSelector:
-              matchLabels:
-                app: zerofs-csi-node
-      - ports: [{port: 7000}]
-        from:
-          - podSelector:
-              matchLabels:
-                app: zerofs-csi-controller
-  ```
-
-  Adjust the policy if your CNI does not enforce policies for pods using the
-  node network.
+  Apply `deploy/networkpolicy-example.yaml` (adapted to your labels) alongside
+  the gateway to enforce both. A NetworkPolicy is a no-op on a CNI that does
+  not enforce them (e.g. vanilla flannel / default k3s); on such a cluster
+  there is no in-cluster protection for either port, so do not expose the
+  gateway to untrusted pods.
 
 ## Tests
 

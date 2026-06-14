@@ -1,0 +1,46 @@
+# Gateway lockdown. The gateway has no authentication on either port, so
+# network reachability is the only trust boundary; apply this (adapted to your
+# labels) alongside the gateway.
+#
+#   - 9P (5564) is the data plane. The aname is client-chosen and not a
+#     security boundary: anything that can reach this port can attach any
+#     volume's subtree or the filesystem root. Restricted to the CSI node pods.
+#   - admin RPC (7000) is a root-equivalent control plane. It runs every
+#     operation as uid 0 and can trash any volume (RemoveDirectory). It has a
+#     single legitimate client, so it is restricted to the CSI controller pod
+#     only — the tightest rule of the two.
+#
+# Selecting the gateway pod with any policy denies all other ingress to it, so
+# these two rules are the whole allow-list.
+#
+# Caveat: a NetworkPolicy is a no-op on a CNI that does not enforce them (e.g.
+# vanilla flannel / default k3s). On such a cluster there is no in-cluster
+# protection for either port; do not expose the gateway to untrusted pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zerofs-gateway
+  namespace: zerofs
+spec:
+  podSelector:
+    matchLabels:
+      app: zerofs-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # Data plane: 9P, from every node plugin.
+    - ports:
+        - port: 5564
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app: zerofs-csi-node
+    # Control plane: admin RPC, from the controller only.
+    - ports:
+        - port: 7000
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app: zerofs-csi-controller
