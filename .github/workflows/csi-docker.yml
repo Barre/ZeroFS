@@ -15,6 +15,9 @@ jobs:
   build-binaries:
     name: Build zerofs-csi ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     strategy:
       matrix:
         include:
