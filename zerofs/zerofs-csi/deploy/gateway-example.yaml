@@ -2,8 +2,9 @@
 # single-writer per bucket/prefix) serving 9P to the CSI node plugins and the
 # admin RPC to the CSI controller.
 #
-# The 9P port has no authentication and an aname is client-chosen, so
-# restrict access to the CSI node pods with a NetworkPolicy (see README).
+# Neither port is authenticated: 9P (aname is client-chosen) and the admin RPC
+# (a root-equivalent control plane) both trust network reachability. Apply
+# networkpolicy-example.yaml alongside this to lock them down.
 apiVersion: v1
 kind: Namespace
 metadata:
