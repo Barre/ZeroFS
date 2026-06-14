@@ -31,17 +31,24 @@ use tokio::process::Command;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-/// f_type reported by statfs for a FUSE filesystem (FUSE_SUPER_MAGIC).
-const FUSE_SUPER_MAGIC: i64 = 0x65735546;
+/// Default 9P port, matching `zerofs mount`'s own default, used when the
+/// gateway address omits one.
+const DEFAULT_9P_PORT: u16 = 5564;
 
 /// How long NodePublishVolume waits for the mount to come up before killing
 /// the child and failing.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long a statfs probe may take before the mount is declared
-/// unresponsive. A FUSE mount whose gateway is unreachable blocks every
-/// caller until the 9P client reconnects, so probes must not hang the RPC
-/// (and its tokio worker thread) with it.
+/// How long the gateway-reachability probe may take. The probe is a
+/// cancellable async connect to the gateway's 9P address; on timeout the
+/// future is dropped without parking any thread.
+const GATEWAY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Deadline for the one statfs the stats path still issues (only after the
+/// gateway probe has confirmed the gateway is reachable, so it should
+/// answer). A pure safety net for the gateway dying between the probe and
+/// the syscall; on timeout the blocking thread is released once statfs
+/// eventually returns.
 const STATFS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many trailing stderr lines from the mount child are kept for error
@@ -77,10 +84,20 @@ pub struct NodeService {
     state: Arc<NodeState>,
 }
 
+/// A `zerofs mount` child the node plugin is serving a target with.
+#[derive(Clone)]
+struct Child {
+    pid: u32,
+    /// The 9P address this mount connects to, kept so unpublish and stats —
+    /// which never see the volume's `volume_context` — can probe whether the
+    /// gateway is reachable without going through the (possibly wedged) mount.
+    gateway: String,
+}
+
 struct NodeState {
-    /// target path -> pid of the `zerofs mount` child serving it. Entries are
-    /// removed by the per-child reaper task when the child exits.
-    children: StdMutex<HashMap<PathBuf, u32>>,
+    /// target path -> the `zerofs mount` child serving it. Entries are removed
+    /// by the per-child reaper task when the child exits.
+    children: StdMutex<HashMap<PathBuf, Child>>,
     /// Per-target locks serializing publish/unpublish on the same path.
     target_locks: StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -106,20 +123,22 @@ impl NodeState {
     }
 }
 
-/// What statfs says about a publish target.
+/// The state of a publish target, determined without a syscall that can hang
+/// on a wedged mount: the mount table says whether it is a FUSE mount, the
+/// serving pid's liveness tells a live mount from a corpse, and a cancellable
+/// gateway probe tells a healthy mount from one blocked on a dead gateway.
 enum TargetState {
-    /// The path does not exist yet.
-    Missing,
-    /// A live FUSE mount.
+    /// A live FUSE mount whose gateway is reachable.
     FuseMounted,
-    /// A FUSE mount whose server is gone (statfs fails with ENOTCONN);
-    /// needs a lazy unmount before remounting.
+    /// A FUSE mount whose serving child is gone; needs a lazy unmount before
+    /// remounting (a statfs here would return ENOTCONN).
     BrokenFuse,
-    /// A mount that did not answer statfs within [`STATFS_TIMEOUT`]: alive
-    /// but blocked, typically a FUSE mount waiting out a gateway outage
-    /// behind the 9P client's reconnect loop.
+    /// A FUSE mount whose child is alive but whose gateway is unreachable, so
+    /// it is blocked behind the 9P client's reconnect loop. Left in place to
+    /// reconnect on its own.
     Unresponsive,
-    /// An existing path that is not a FUSE mountpoint.
+    /// Not a FUSE mount: a plain directory or a path that does not exist yet.
+    /// Publish creates it if needed and mounts fresh.
     NotMounted,
 }
 
@@ -162,20 +181,114 @@ async fn statfs_async(path: &Path) -> std::io::Result<libc::statfs> {
     }
 }
 
-async fn target_state(target: &Path) -> Result<TargetState, Status> {
-    // f_type's width and signedness vary across libc targets.
-    #[allow(clippy::unnecessary_cast)]
-    match statfs_async(target).await {
-        Ok(st) if st.f_type as i64 == FUSE_SUPER_MAGIC => Ok(TargetState::FuseMounted),
-        Ok(_) => Ok(TargetState::NotMounted),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(TargetState::Missing),
-        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => Ok(TargetState::BrokenFuse),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(TargetState::Unresponsive),
-        Err(e) => Err(Status::internal(format!(
-            "statfs {}: {}",
-            target.display(),
-            e
-        ))),
+/// Whether `pid` names a live process. kill(pid, 0) probes existence without
+/// sending a signal: 0 means alive, EPERM means alive but not ours, ESRCH
+/// means gone.
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing; it only reports whether the pid exists.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Octal-unescape a /proc/self/mountinfo field (space, tab, newline and
+/// backslash are encoded as \040 \011 \012 \134). Returns raw bytes for an
+/// exact, encoding-agnostic comparison against a path.
+fn unescape_mountinfo(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The filesystem type of the mount at `target`, or None if `target` is not a
+/// mountpoint. Read from /proc/self/mountinfo, which the kernel renders from
+/// the mount table without ever touching the FUSE daemon, so it cannot hang on
+/// a wedged mount the way statfs would.
+fn mount_fstype(target: &Path) -> std::io::Result<Option<String>> {
+    let want = target.as_os_str().as_bytes();
+    let content = std::fs::read_to_string("/proc/self/mountinfo")?;
+    for line in content.lines() {
+        // Optional fields end at " - "; the mount point is field 4 of the part
+        // before it, the fstype is the first field after.
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let Some(mount_point) = pre.split(' ').nth(4) else {
+            continue;
+        };
+        if unescape_mountinfo(mount_point) == want {
+            return Ok(Some(post.split(' ').next().unwrap_or("").to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `target` is currently a FUSE mountpoint.
+fn is_fuse_mount(target: &Path) -> std::io::Result<bool> {
+    Ok(mount_fstype(target)?.is_some_and(|ft| ft.starts_with("fuse")))
+}
+
+/// Whether the gateway's 9P endpoint accepts a connection within
+/// [`GATEWAY_PROBE_TIMEOUT`]. The connect is cancellable async I/O, so a dead
+/// gateway fails (or times out) here without parking a blocking thread the way
+/// probing a wedged mount with statfs would. Address parsing mirrors
+/// `zerofs mount`'s own.
+async fn gateway_reachable(gateway: &str) -> bool {
+    let connect = async {
+        if let Some(rest) = gateway.strip_prefix("unix:") {
+            let path = rest.strip_prefix("//").unwrap_or(rest);
+            return tokio::net::UnixStream::connect(path).await.map(drop);
+        }
+        let hostport = gateway.strip_prefix("tcp://").unwrap_or(gateway);
+        if hostport.starts_with('/') || hostport.starts_with('.') {
+            return tokio::net::UnixStream::connect(hostport).await.map(drop);
+        }
+        let with_port = if hostport.contains(':') {
+            hostport.to_string()
+        } else {
+            format!("{hostport}:{DEFAULT_9P_PORT}")
+        };
+        tokio::net::TcpStream::connect(with_port).await.map(drop)
+    };
+    matches!(
+        tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, connect).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Classify a publish target without issuing a syscall that can hang on a
+/// wedged mount. `pid` is the serving child's pid (None if none is tracked)
+/// and `gateway` its 9P address.
+async fn target_state(
+    target: &Path,
+    pid: Option<u32>,
+    gateway: Option<&str>,
+) -> Result<TargetState, Status> {
+    if !is_fuse_mount(target).map_err(|e| {
+        Status::internal(format!("reading mount table for {}: {}", target.display(), e))
+    })? {
+        return Ok(TargetState::NotMounted);
+    }
+    // It is a FUSE mount: live, or a corpse left by a dead serving child.
+    if !pid.is_some_and(process_alive) {
+        return Ok(TargetState::BrokenFuse);
+    }
+    // The child is alive: healthy, or blocked behind an unreachable gateway.
+    match gateway {
+        Some(gw) if !gateway_reachable(gw).await => Ok(TargetState::Unresponsive),
+        _ => Ok(TargetState::FuseMounted),
     }
 }
 
@@ -308,7 +421,11 @@ impl NodeService {
                 ));
             }
 
-            if matches!(target_state(target).await?, TargetState::FuseMounted) {
+            // We hold the live child handle (try_wait above), so the mount
+            // table appearing is enough; no need for the full classifier.
+            if is_fuse_mount(target)
+                .map_err(|e| Status::internal(format!("reading mount table: {}", e)))?
+            {
                 break;
             }
 
@@ -333,11 +450,13 @@ impl NodeService {
         let pid = child.id().ok_or_else(|| {
             Status::internal("zerofs mount child has no pid after successful mount")
         })?;
-        self.state
-            .children
-            .lock()
-            .unwrap()
-            .insert(target.to_path_buf(), pid);
+        self.state.children.lock().unwrap().insert(
+            target.to_path_buf(),
+            Child {
+                pid,
+                gateway: gateway.to_string(),
+            },
+        );
 
         let state = Arc::clone(&self.state);
         let target_buf = target.to_path_buf();
@@ -353,7 +472,7 @@ impl NodeService {
             let mut children = state.children.lock().unwrap();
             // Only drop the entry if it still belongs to this child; a
             // remount may have replaced it.
-            if children.get(&target_buf) == Some(&pid) {
+            if children.get(&target_buf).map(|c| c.pid) == Some(pid) {
                 children.remove(&target_buf);
             }
         });
@@ -414,17 +533,18 @@ impl Node for NodeService {
         let lock = self.state.target_lock(&target);
         let _guard = lock.lock().await;
 
-        match target_state(&target).await? {
+        let pid = self.state.children.lock().unwrap().get(&target).map(|c| c.pid);
+        match target_state(&target, pid, Some(gateway)).await? {
             // Already a live FUSE mount: assume it is ours and succeed.
             TargetState::FuseMounted => return Ok(Response::new(NodePublishVolumeResponse {})),
             // Alive but blocked on its gateway: the 9P client reconnects on
             // its own, so leave the mount in place and let the CO retry.
             TargetState::Unresponsive => {
                 return Err(Status::unavailable(format!(
-                    "mount at {} did not answer statfs within {:?} (gateway unreachable?); \
+                    "mount at {} is up but gateway {} is unreachable; \
                      leaving it to reconnect",
                     target.display(),
-                    STATFS_TIMEOUT
+                    gateway
                 )));
             }
             TargetState::BrokenFuse => {
@@ -437,12 +557,13 @@ impl Node for NodeService {
                     ))
                 })?;
             }
-            TargetState::Missing => {
+            // A plain directory or a missing path: create it (idempotent) and
+            // mount fresh.
+            TargetState::NotMounted => {
                 tokio::fs::create_dir_all(&target).await.map_err(|e| {
                     Status::internal(format!("mkdir -p {}: {}", target.display(), e))
                 })?;
             }
-            TargetState::NotMounted => {}
         }
 
         self.spawn_mount(gateway, &target, &aname, read_only, writeback)
@@ -466,7 +587,10 @@ impl Node for NodeService {
         let lock = self.state.target_lock(&target);
         let _guard = lock.lock().await;
 
-        match target_state(&target).await? {
+        let child = self.state.children.lock().unwrap().get(&target).cloned();
+        let pid = child.as_ref().map(|c| c.pid);
+        let gateway = child.as_ref().map(|c| c.gateway.as_str());
+        match target_state(&target, pid, gateway).await? {
             TargetState::FuseMounted => {
                 unmount(&target, false).await.map_err(Status::internal)?;
             }
@@ -475,12 +599,11 @@ impl Node for NodeService {
             TargetState::BrokenFuse | TargetState::Unresponsive => {
                 unmount(&target, true).await.map_err(Status::internal)?;
             }
-            TargetState::Missing | TargetState::NotMounted => {}
+            TargetState::NotMounted => {}
         }
 
         // Unmounting ends the FUSE session and the child exits on its own;
         // the SIGTERM covers a child that never finished mounting.
-        let pid = self.state.children.lock().unwrap().get(&target).copied();
         if let Some(pid) = pid {
             // SAFETY: plain signal send; the worst case is a stale pid that
             // the reaper has not yet removed, in which case ESRCH is ignored.
@@ -520,21 +643,42 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("volume_path is required"));
         }
 
+        let volume_path = Path::new(&req.volume_path);
+
+        // statfs on a FUSE mount blocks until the 9P client answers, which
+        // never happens if the gateway is gone — and the blocking thread it
+        // parks cannot be cancelled. So for a mount we track, probe the gateway
+        // first with a cancellable connect: if it is unreachable, report the
+        // volume unavailable without ever issuing the statfs. Only when the
+        // gateway answers (so statfs will too) do we go through with it.
+        let gateway = self
+            .state
+            .children
+            .lock()
+            .unwrap()
+            .get(volume_path)
+            .map(|c| c.gateway.clone());
+        if let Some(gateway) = &gateway
+            && !gateway_reachable(gateway).await
+        {
+            return Err(Status::unavailable(format!(
+                "gateway {} for {} is unreachable; volume stats unavailable",
+                gateway, req.volume_path
+            )));
+        }
+
         // Whole-filesystem numbers: the gateway reports one filesystem shared
-        // by every volume.
-        let st = statfs_async(Path::new(&req.volume_path))
-            .await
-            .map_err(|e| {
-                if e.raw_os_error() == Some(libc::ENOENT) {
-                    Status::not_found(format!("{}: {}", req.volume_path, e))
-                } else if e.kind() == std::io::ErrorKind::TimedOut {
-                    // A mount blocked on its gateway; fail fast instead of
-                    // hanging kubelet's stats collection.
-                    Status::unavailable(format!("{}", e))
-                } else {
-                    Status::internal(format!("statfs {}: {}", req.volume_path, e))
-                }
-            })?;
+        // by every volume. The STATFS_TIMEOUT is a safety net for the gateway
+        // dying between the probe and the syscall.
+        let st = statfs_async(volume_path).await.map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                Status::not_found(format!("{}: {}", req.volume_path, e))
+            } else if e.kind() == std::io::ErrorKind::TimedOut {
+                Status::unavailable(format!("{}", e))
+            } else {
+                Status::internal(format!("statfs {}: {}", req.volume_path, e))
+            }
+        })?;
 
         // The gateway advertises an effectively unbounded filesystem, so the
         // block-count * block-size products can exceed i64; do the math in
