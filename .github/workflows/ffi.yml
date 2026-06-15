@@ -42,7 +42,7 @@ jobs:
 
           [storage]
           url = "file://$WORK/data"
-          encryption_password = "ci-ffi"
+          encryption_password = "ci-ffi-password"
 
           [servers]
 
@@ -99,7 +99,7 @@ jobs:
 
           [storage]
           url = "file://$WORK/data"
-          encryption_password = "ci-ffi"
+          encryption_password = "ci-ffi-password"
 
           [servers]
 
