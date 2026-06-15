@@ -33,6 +33,9 @@ mod test_helpers;
 #[cfg(test)]
 mod posix_tests;
 
+#[cfg(test)]
+mod zerofs_client_tests;
+
 #[cfg(feature = "failpoints")]
 mod failpoints;
 

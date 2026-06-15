@@ -33,7 +33,7 @@ jobs:
         with:
           components: "clippy"
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     name: Build and Test
@@ -48,5 +48,38 @@ jobs:
         run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose
+      - name: Run zerofs-client crate tests (incl. doctests, all features)
+        run: cargo test -p zerofs-client --all-features --verbose
+      - name: Run the zerofs-client example end-to-end
+        run: |
+          set -euo pipefail
+          cargo build -p zerofs-client --example quickstart
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/data" "$WORK/cache"
+          cat > "$WORK/zerofs.toml" <<EOF
+          [cache]
+          dir = "$WORK/cache"
+          disk_size_gb = 1.0
+
+          [storage]
+          url = "file://$WORK/data"
+          encryption_password = "ci-example"
+
+          [servers]
+
+          [servers.ninep]
+          unix_socket = "$WORK/9p.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+          RUST_LOG=warn ./target/debug/zerofs run -c "$WORK/zerofs.toml" &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            [ -S "$WORK/9p.sock" ] && break
+            sleep 0.5
+          done
+          ./target/debug/examples/quickstart "unix:$WORK/9p.sock"
       - name: Run crash tests
         run: cargo test --features failpoints --test failpoints --verbose

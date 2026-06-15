@@ -5644,8 +5644,23 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zerofs-client",
  "zerofs_nfsserve",
  "zstd",
+]
+
+[[package]]
+name = "zerofs-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "futures-core",
+ "libc",
+ "ninep-client",
+ "ninep-proto",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

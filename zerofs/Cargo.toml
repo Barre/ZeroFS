@@ -12,7 +12,7 @@ keywords = ["filesystem", "s3", "nfs", "distributed", "storage"]
 categories = ["filesystem", "network-programming"]
 
 [workspace]
-members = ["ninep-proto", "ninep-client", "zerofs-csi"]
+members = ["ninep-proto", "ninep-client", "zerofs-csi", "zerofs-client"]
 
 # Single source of truth for the release version. The zerofs-csi image is
 # tagged with the repo release tag and layers on the zerofs image of that
@@ -129,6 +129,7 @@ protobuf-src = { version = "2", optional = true }
 [dev-dependencies]
 tempfile = "3.21"
 futures = "0.3"
+zerofs-client = { path = "zerofs-client" }
 
 [[test]]
 name = "failpoints"
