@@ -32,8 +32,8 @@ import typing
 import weakref
 from typing import Any, AsyncIterable, AsyncIterator, Awaitable, Iterator, Optional, TypeVar, Union
 
-from zerofs_ffi import *  # noqa: F401,F403  (re-export records, enums, errors)
-import zerofs_ffi as _ffi
+from ._zerofs_ffi import *  # noqa: F401,F403  (re-export records, enums, errors)
+from . import _zerofs_ffi as _ffi
 
 if typing.TYPE_CHECKING:
     StrPath = Union[str, "os.PathLike[str]"]
