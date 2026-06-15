@@ -2,8 +2,9 @@
 # Generate foreign-language bindings for zerofs-ffi from the compiled cdylib.
 #
 #   ./bindings/generate.sh <language> <out-dir>
+#   ./bindings/generate.sh version          # print the client-family version
 #
-# Languages: python      (via the built-in uniffi-bindgen)
+# Languages: python      (via uniffi-bindgen, installed separately)
 #            typescript   (via uniffi-bindgen-js, installed separately)
 #            go           (via uniffi-bindgen-go, installed separately)
 #
@@ -11,11 +12,27 @@
 # this script's location).
 set -euo pipefail
 
-lang="${1:?usage: generate.sh <python|typescript|go> <out-dir>}"
-out="${2:?usage: generate.sh <language> <out-dir>}"
+lang="${1:?usage: generate.sh <python|typescript|go|version> <out-dir>}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ws="$(cd "$here/../.." && pwd)"           # the `zerofs` workspace dir
+
+# The "client family" version, single-sourced from zerofs-ffi/Cargo.toml. This
+# is the one value npm package.json, the Go module tag, and the Python wheel all
+# derive from. The grep one-liner is intentionally dependency-free (no toml
+# parser) so CI steps in any language can read it the same way.
+client_version() {
+    grep -m1 '^version = ' "$here/../Cargo.toml" | sed -E 's/.*"(.*)".*/\1/'
+}
+
+# `generate.sh version` prints just the version (for `npm version`, the Go tag,
+# stamping package.json, etc.) and exits before touching the cdylib.
+if [ "$lang" = "version" ]; then
+    client_version
+    exit 0
+fi
+
+out="${2:?usage: generate.sh <language> <out-dir>}"
 
 lib="$ws/target/debug/libzerofs_ffi.so"
 [ -f "$lib" ] || lib="$ws/target/debug/libzerofs_ffi.dylib"
@@ -29,8 +46,8 @@ mkdir -p "$out"
 
 case "$lang" in
     python)
-        ( cd "$ws" && cargo run -q -p zerofs-ffi --bin uniffi-bindgen -- \
-            generate --library "$lib" --language "$lang" --out-dir "$out" )
+        # Requires the standalone CLI: pip install uniffi-bindgen==0.31.0
+        uniffi-bindgen generate --library "$lib" --language "$lang" --out-dir "$out"
         ;;
     typescript | ts)
         # Runnable Node (ESM) bindings via koffi. Requires:

@@ -39,6 +39,13 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
+# Python wheel build (maturin). Release-optimized but NOT stripped: maturin's
+# uniffi-bindgen reads the binding metadata from the cdylib's symbols, which
+# `strip = true` removes. Used by publish-client.yml's PyPI matrix.
+[profile.wheel]
+inherits = "release"
+strip = false
+
 [features]
 default = ["vendored-protoc"]
 tokio-console = ["dep:console-subscriber"]

@@ -6,6 +6,8 @@ rust-version = "1.85"
 description = "Async, path-based client library for ZeroFS over 9P"
 license = "AGPL-3.0"
 repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+documentation = "https://docs.rs/zerofs-client"
 readme = "README.md"
 keywords = ["filesystem", "9p", "client", "s3", "zerofs"]
 categories = ["filesystem", "network-programming"]
@@ -23,8 +25,12 @@ stream = ["dep:futures-core"]
 serde = ["dep:serde"]
 
 [dependencies]
-ninep-client = { path = "../ninep-client" }
-ninep-proto = { path = "../ninep-proto" }
+# Explicit versions alongside the path so crates.io can resolve the published
+# crates (a bare `path` dep is stripped on publish, leaving no version req).
+# The transport crates are independently versioned (their own 0.1.0 line);
+# zerofs-client itself is on the client-family version.
+ninep-client = { path = "../ninep-client", version = "0.1.0" }
+ninep-proto = { path = "../ninep-proto", version = "0.1.0" }
 tokio = { version = "1.52", features = ["rt", "net", "sync", "time"] }
 bytes = "1"
 libc = "0.2"

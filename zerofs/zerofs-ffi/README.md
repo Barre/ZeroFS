@@ -35,8 +35,9 @@ cargo install uniffi-bindgen-go \
 ./zerofs-ffi/bindings/generate.sh go out/go           # generated pkg + facade
 ```
 
-For Python, also copy the cdylib next to the generated module (the wheel builder
-does this for you):
+For Python, also copy the cdylib next to the generated module so the raw
+`generate.sh python` output is runnable (maturin does this itself when it builds
+the wheel):
 
 ```sh
 cp target/debug/libzerofs_ffi.so out/python/
@@ -48,22 +49,24 @@ and Go run end-to-end against a real ZeroFS server.
 ## Packaging
 
 **Python** ships as an installable wheel that bundles the cdylib, the generated
-`zerofs_ffi` module, and the `zerofs` facade:
+`zerofs_ffi` module, and the `zerofs` facade, built with
+[maturin](https://www.maturin.rs) in its uniffi mode:
 
 ```sh
-python3 zerofs-ffi/bindings/python/build_wheel.py   # -> target/wheels/zerofs-*.whl
+pip install "maturin>=1.10,<2.0" "uniffi-bindgen==0.31.0"
+maturin build --profile wheel -m zerofs-ffi/bindings/python/pyproject.toml
 pip install target/wheels/zerofs-*.whl
-python3 -c "import asyncio, zerofs; ..."
 ```
 
-The builder is a stdlib-only script rather than maturin: the FFI crate lives in
-the main Cargo workspace, where maturin's `cargo run --bin uniffi-bindgen`
-cannot resolve the bin (the workspace root *is* the `zerofs` package). The
-script drives generation with an explicit `-p zerofs-ffi`, generates from the
-debug lib (the release profile strips the uniffi metadata symbols bindgen reads)
-and bundles the release lib. The wheel is host-tagged; for PyPI, run it through
-`auditwheel repair` to produce a portable `manylinux` wheel. CI builds the
-wheel, `pip install`s it, and runs the bindings against a real server.
+maturin reads the wheel version straight from `zerofs-ffi/Cargo.toml`, and the
+`zerofs` facade rides along via `python-packages`. Two non-obvious bits: the
+crate deliberately carries **no** `uniffi-bindgen` bin (maturin's default
+`cargo run --bin uniffi-bindgen` can't resolve it from this workspace, whose root
+*is* the `zerofs` server package, so maturin falls back to the external
+`uniffi-bindgen`); and the build uses the `wheel` profile (release without
+`strip`, since stripping drops the uniffi metadata bindgen reads). CI
+(`publish-client.yml`) builds per-platform wheels with `PyO3/maturin-action` and
+publishes to PyPI via Trusted Publishing.
 
 **Node/TypeScript** is itself an npm package: `generate.sh typescript` emits a
 self-contained ESM package (via `uniffi-bindgen-node-js`) that loads the cdylib
@@ -97,7 +100,7 @@ uniffi cannot express. Distribute the facade alongside the generated module.
 
 | Language   | Facade                          | Adds |
 |------------|---------------------------------|------|
-| Python     | `bindings/python/zerofs.py`     | `async with`; `async for entry in dir`; streaming `file.read_chunks()` and `file.write_from(async_iterable, offset=0)`; `PathLike` args; `read_text`/`write_text`; `canonicalize_str`/`read_link_str`; metadata `meta.is_dir()`/`is_file()`/`is_symlink()`/`permissions()`; blocking `connect_sync()`; full type hints + `py.typed` markers in both packages |
+| Python     | `bindings/python/zerofs/__init__.py` | `async with`; `async for entry in dir`; streaming `file.read_chunks()` and `file.write_from(async_iterable, offset=0)`; `PathLike` args; `read_text`/`write_text`; `canonicalize_str`/`read_link_str`; metadata `meta.is_dir()`/`is_file()`/`is_symlink()`/`permissions()`; blocking `connect_sync()`; full type hints + `py.typed` markers in both packages |
 | TypeScript | `bindings/typescript/zerofs.ts` | `await using` (`Symbol.asyncDispose`); `for await (const e of dir)`; Web Streams: `file.readable(chunkSize=1MiB)` (`ReadableStream`) and `file.writable(offset=0)` (`WritableStream`, backpressure-honouring); `camelCase` aliases (`openDir`, `nextBatch`, `readAt`, …) beside the kept `snake_case` names; `canonicalizeStr`/`readLinkStr`; metadata predicate helpers `isDir(m)`/`isFile(m)`/`isSymlink(m)`/`permissions(m)` |
 | Go         | `bindings/go/facade.go`         | `dir.Entries()` as a range-over-func `iter.Seq2[DirEntry, error]` (one batch at a time); `file.Reader()`/`file.ReaderAt(off)` as `io.Reader` (also `io.WriterTo`, so `io.Copy` streams with no extra buffer); `file.Writer()`/`file.WriterAt(off)` as `io.Writer`; `CanonicalizeStr`/`ReadLinkStr`; metadata `meta.IsDir()`/`IsFile()`/`IsSymlink()`/`Permissions()`; `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers around the blocking calls |
 

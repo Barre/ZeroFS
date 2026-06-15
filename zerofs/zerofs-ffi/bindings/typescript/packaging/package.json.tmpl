@@ -1,0 +1,56 @@
+{
+  "name": "zerofs",
+  "version": "__VERSION__",
+  "description": "Programmatic client for ZeroFS: connect to a ZeroFS 9P endpoint and do filesystem operations (read/write/open/dir listing/stat/...) from Node.",
+  "license": "AGPL-3.0",
+  "homepage": "https://github.com/Barre/ZeroFS",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Barre/ZeroFS.git",
+    "directory": "zerofs/zerofs-ffi/bindings/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/Barre/ZeroFS/issues"
+  },
+  "type": "module",
+  "main": "./zerofs.js",
+  "types": "./zerofs.d.ts",
+  "exports": {
+    ".": {
+      "types": "./zerofs.d.ts",
+      "import": "./zerofs.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "zerofs.js",
+    "zerofs.d.ts",
+    "zerofs_ffi.js",
+    "zerofs_ffi.d.ts",
+    "zerofs_ffi-ffi.js",
+    "zerofs_ffi-ffi.d.ts",
+    "runtime/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "koffi": "^2.15.6"
+  },
+  "optionalDependencies": {
+    "@zerofs/ffi-linux-x64-gnu": "__VERSION__",
+    "@zerofs/ffi-linux-arm64-gnu": "__VERSION__",
+    "@zerofs/ffi-darwin-x64": "__VERSION__",
+    "@zerofs/ffi-darwin-arm64": "__VERSION__",
+    "@zerofs/ffi-win32-x64": "__VERSION__"
+  },
+  "keywords": [
+    "zerofs",
+    "filesystem",
+    "9p",
+    "koffi",
+    "ffi"
+  ]
+}

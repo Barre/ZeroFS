@@ -27,8 +27,9 @@ jobs:
         run: cargo build -p zerofs --bin zerofs
       - name: Build and install the wheel
         run: |
-          python3 zerofs-ffi/bindings/python/build_wheel.py target/wheels
-          python3 -m pip install --user target/wheels/zerofs-*.whl
+          pip install "maturin>=1.10,<2.0" "uniffi-bindgen==0.31.0"
+          maturin build -m zerofs-ffi/bindings/python/pyproject.toml --out target/wheels
+          pip install target/wheels/zerofs-*.whl
       - name: Run the installed bindings end-to-end
         run: |
           set -euo pipefail

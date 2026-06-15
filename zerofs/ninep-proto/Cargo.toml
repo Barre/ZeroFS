@@ -5,6 +5,10 @@ edition = "2024"
 description = "9P2000.L wire protocol types (shared by the ZeroFS 9P server and client)"
 license = "AGPL-3.0"
 repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+documentation = "https://docs.rs/ninep-proto"
+keywords = ["9p", "9p2000l", "protocol", "filesystem", "zerofs"]
+categories = ["network-programming", "filesystem", "encoding"]
 
 [dependencies]
 deku = "0.20"

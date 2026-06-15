@@ -6,14 +6,15 @@ rust-version = "1.85"
 description = "Foreign-language bindings (Python/TypeScript) for the ZeroFS client"
 license = "AGPL-3.0"
 repository = "https://github.com/Barre/ZeroFS"
+# Not published to crates.io: this is a cdylib whose only job is to be compiled
+# into the per-language bindings (Python/TypeScript/Go). The publishable Rust
+# surface is zerofs-client. The client-family version lives here regardless (it
+# is the single source of truth the release tooling reads).
+publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "zerofs_ffi"
-
-[[bin]]
-name = "uniffi-bindgen"
-path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
 # The FFI layer needs only the FFI-shaped core surface, not the Rust-only sugar
