@@ -19,13 +19,9 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
     SessionACL, TimeOrNow,
 };
-use ninep_client::{ClientError, NinePClient};
-use ninep_proto::{
-    GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, SETATTR_ATIME, SETATTR_ATIME_SET,
-    SETATTR_GID, SETATTR_MODE, SETATTR_MTIME, SETATTR_MTIME_SET, SETATTR_SIZE, SETATTR_UID, Stat,
-    Tsetattr,
-};
-use std::collections::{HashMap, VecDeque};
+use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime};
+use ninep_proto::{GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -49,28 +45,12 @@ const READDIR_BATCH: u32 = 256 * 1024;
 /// the expected ENAMETOOLONG.
 const NAME_MAX: usize = 255;
 
-/// Read-ahead state for one open directory handle
-#[derive(Default)]
-struct DirRead {
-    buf: VecDeque<ninep_proto::DirEntry>,
-    /// 9P cookie for the next Treaddir
-    fetch_cookie: u64,
-    /// FUSE offset the next `readdir` call must carry to continue sequentially
-    /// A different offset means the kernel seeked/rewound, so the buffer is discarded and refetched.
-    resume_offset: u64,
-    /// The server has no more entries past `fetch_cookie`.
-    eof: bool,
-}
+/// Read-ahead state for one open directory handle.
+type DirRead = ReaddirState<ninep_proto::DirEntry>;
 
 /// Read-ahead state for one open directory handle served via readdirplus
-/// (entries carry their stat). Mirrors [`DirRead`] but buffers `DirEntryPlus`.
-#[derive(Default)]
-struct DirReadPlus {
-    buf: VecDeque<ninep_proto::DirEntryPlus>,
-    fetch_cookie: u64,
-    resume_offset: u64,
-    eof: bool,
-}
+/// (entries carry their stat).
+type DirReadPlus = ReaddirState<ninep_proto::DirEntryPlus>;
 
 /// Options gathered from the CLI.
 pub struct MountOptions {
@@ -174,6 +154,16 @@ fn kind_from_dt(dt: u8) -> FileType {
         libc::DT_FIFO => FileType::NamedPipe,
         libc::DT_SOCK => FileType::Socket,
         _ => FileType::RegularFile,
+    }
+}
+
+fn setattr_time(t: TimeOrNow) -> SetattrTime {
+    match t {
+        TimeOrNow::Now => SetattrTime::Now,
+        TimeOrNow::SpecificTime(t) => {
+            let (sec, nsec) = split_time(t);
+            SetattrTime::At { sec, nsec }
+        }
     }
 }
 
@@ -327,54 +317,44 @@ async fn resolve_child(
     parent_fid: u32,
     name: &[u8],
 ) -> Result<FileAttr, ClientError> {
-    let newfid = client.alloc_fid();
-    // With the fast path, walk+getattr is a single round trip; otherwise fall
-    // back to a walk followed by a getattr.
-    let stat = if client.extensions_enabled() {
-        match client.walk_getattr(parent_fid, newfid, &[name]).await {
-            // A successful walk_getattr is always a full walk, so the fid exists.
-            Ok((_, stat)) => stat,
-            Err(e) => {
-                client.free_fid(newfid);
-                return Err(e);
-            }
-        }
-    } else {
-        let qids = match client.walk(parent_fid, newfid, &[name]).await {
-            Ok(q) => q,
-            Err(e) => {
-                client.free_fid(newfid);
-                return Err(e);
-            }
-        };
-        if qids.is_empty() {
-            client.free_fid(newfid);
-            return Err(ClientError::Errno(libc::ENOENT as u32));
-        }
-        match client.getattr(newfid, GETATTR_ALL).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = client.clunk(newfid).await;
-                client.free_fid(newfid);
-                return Err(e);
-            }
+    let nf = client.alloc_fid();
+    let (newfid, stat) = match client.walk_stat(parent_fid, nf, &[name]).await {
+        Ok(v) => v,
+        Err(e) => {
+            client.free_fid(nf);
+            return Err(e);
         }
     };
+    Ok(register_entry(client, inodes, uid, Some(newfid), &stat).await)
+}
 
+/// Count a kernel lookup reference against `stat`'s inode and, when a freshly
+/// walked fid is supplied, keep it as this user's fid for the inode — unless
+/// the user already has one (hard link, or already looked up), in which case
+/// the new fid is discarded. With `None` (the stat-carrying v2 fast paths,
+/// where no walk took place) the fid binds lazily via `user_fid` later.
+/// Balanced by `forget`.
+async fn register_entry(
+    client: &Arc<NinePClient>,
+    inodes: &Arc<DashMap<u64, InodeEntry>>,
+    uid: u32,
+    walked: Option<u32>,
+    stat: &Stat,
+) -> FileAttr {
     let ino = ino_of(stat.qid.path);
-    // Count this lookup against the inode (forget balances it). Keep the freshly
-    // walked fid only if this user has none for the inode yet; otherwise (hard
-    // link, or already looked up by this user) discard it.
     let redundant = {
         use std::collections::hash_map::Entry;
         let mut entry = inodes.entry(ino).or_default();
         entry.lookup += 1;
-        match entry.fids.entry(uid) {
-            Entry::Occupied(_) => Some(newfid),
-            Entry::Vacant(v) => {
-                v.insert(newfid);
-                None
-            }
+        match walked {
+            Some(newfid) => match entry.fids.entry(uid) {
+                Entry::Occupied(_) => Some(newfid),
+                Entry::Vacant(v) => {
+                    v.insert(newfid);
+                    None
+                }
+            },
+            None => None,
         }
     };
     if let Some(fid) = redundant {
@@ -382,7 +362,7 @@ async fn resolve_child(
         client.free_fid(fid);
     }
 
-    Ok(stat_to_attr(&stat))
+    stat_to_attr(stat)
 }
 
 impl Filesystem for Fuse9P {
@@ -514,69 +494,15 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
-            let mut ts = Tsetattr {
-                fid,
-                valid: 0,
-                mode: 0,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                atime_sec: 0,
-                atime_nsec: 0,
-                mtime_sec: 0,
-                mtime_nsec: 0,
-            };
-            if let Some(m) = mode {
-                ts.valid |= SETATTR_MODE;
-                ts.mode = m;
-            }
-            if let Some(u) = uid {
-                ts.valid |= SETATTR_UID;
-                ts.uid = u;
-            }
-            if let Some(g) = gid {
-                ts.valid |= SETATTR_GID;
-                ts.gid = g;
-            }
-            if let Some(s) = size {
-                ts.valid |= SETATTR_SIZE;
-                ts.size = s;
-            }
-            match atime {
-                Some(TimeOrNow::SpecificTime(t)) => {
-                    let (sec, nsec) = split_time(t);
-                    ts.valid |= SETATTR_ATIME | SETATTR_ATIME_SET;
-                    ts.atime_sec = sec;
-                    ts.atime_nsec = nsec;
-                }
-                Some(TimeOrNow::Now) => ts.valid |= SETATTR_ATIME,
-                None => {}
-            }
-            match mtime {
-                Some(TimeOrNow::SpecificTime(t)) => {
-                    let (sec, nsec) = split_time(t);
-                    ts.valid |= SETATTR_MTIME | SETATTR_MTIME_SET;
-                    ts.mtime_sec = sec;
-                    ts.mtime_nsec = nsec;
-                }
-                Some(TimeOrNow::Now) => ts.valid |= SETATTR_MTIME,
-                None => {}
-            }
-
-            // Fast path: the Tsetattrattr reply carries the post-op stat,
-            // replacing the setattr + getattr pair.
-            if client.extensions_v2_enabled() {
-                match client.setattr_attr(ts).await {
-                    Ok(stat) => reply.attr(&ttl, &stat_to_attr(&stat)),
-                    Err(e) => reply.error(errno(&e)),
-                }
-                return;
-            }
-            if let Err(e) = client.setattr(ts).await {
-                reply.error(errno(&e));
-                return;
-            }
-            match client.getattr(fid, GETATTR_ALL).await {
+            let ts = SetattrBuilder::new(fid)
+                .mode(mode)
+                .uid(uid)
+                .gid(gid)
+                .size(size)
+                .atime(atime.map(setattr_time))
+                .mtime(mtime.map(setattr_time))
+                .build();
+            match client.setattr_stat(ts).await {
                 Ok(stat) => reply.attr(&ttl, &stat_to_attr(&stat)),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -632,24 +558,13 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
-            // Fast path: the Tmkdirattr reply carries the new directory's stat,
-            // replacing the mkdir + walk/getattr pair (the fid binds lazily).
-            if client.extensions_v2_enabled() {
-                match client.mkdir_attr(parent_fid, &name, mode, gid).await {
-                    Ok(stat) => {
-                        register_lookup(&inodes, ino_of(stat.qid.path));
-                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
-                    }
-                    Err(e) => reply.error(errno(&e)),
+            // Stat-carrying create (one round trip on v2); the walked fid is
+            // present only on the fallback path, else it binds lazily.
+            match client.mkdir_stat(parent_fid, None, &name, mode, gid).await {
+                Ok((walked, stat)) => {
+                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+                    reply.entry(&ttl, &attr, Generation(0));
                 }
-                return;
-            }
-            if let Err(e) = client.mkdir(parent_fid, &name, mode, gid).await {
-                reply.error(errno(&e));
-                return;
-            }
-            match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
-                Ok(attr) => reply.entry(&ttl, &attr, Generation(0)),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -691,29 +606,14 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
-            // Fast path: stat-carrying reply, no follow-up walk/getattr.
-            if client.extensions_v2_enabled() {
-                match client
-                    .mknod_attr(parent_fid, &name, mode, major, minor, gid)
-                    .await
-                {
-                    Ok(stat) => {
-                        register_lookup(&inodes, ino_of(stat.qid.path));
-                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
-                    }
-                    Err(e) => reply.error(errno(&e)),
-                }
-                return;
-            }
-            if let Err(e) = client
-                .mknod(parent_fid, &name, mode, major, minor, gid)
+            match client
+                .mknod_stat(parent_fid, None, &name, mode, major, minor, gid)
                 .await
             {
-                reply.error(errno(&e));
-                return;
-            }
-            match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
-                Ok(attr) => reply.entry(&ttl, &attr, Generation(0)),
+                Ok((walked, stat)) => {
+                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+                    reply.entry(&ttl, &attr, Generation(0));
+                }
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -747,23 +647,14 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
-            // Fast path: stat-carrying reply, no follow-up walk/getattr.
-            if client.extensions_v2_enabled() {
-                match client.symlink_attr(parent_fid, &name, &target, gid).await {
-                    Ok(stat) => {
-                        register_lookup(&inodes, ino_of(stat.qid.path));
-                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
-                    }
-                    Err(e) => reply.error(errno(&e)),
+            match client
+                .symlink_stat(parent_fid, None, &name, &target, gid)
+                .await
+            {
+                Ok((walked, stat)) => {
+                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+                    reply.entry(&ttl, &attr, Generation(0));
                 }
-                return;
-            }
-            if let Err(e) = client.symlink(parent_fid, &name, &target, gid).await {
-                reply.error(errno(&e));
-                return;
-            }
-            match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
-                Ok(attr) => reply.entry(&ttl, &attr, Generation(0)),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -845,24 +736,12 @@ impl Filesystem for Fuse9P {
                 reply.error(Errno::ESTALE);
                 return;
             };
-            // Fast path: the Tlinkattr reply carries the linked inode's post-op
-            // stat (updated nlink), replacing the link + walk/getattr pair.
-            if client.extensions_v2_enabled() {
-                match client.link_attr(dir_fid, file_fid, &newname).await {
-                    Ok(stat) => {
-                        register_lookup(&inodes, ino_of(stat.qid.path));
-                        reply.entry(&ttl, &stat_to_attr(&stat), Generation(0));
-                    }
-                    Err(e) => reply.error(errno(&e)),
+            // Stat-carrying link (one round trip on v2, with the updated nlink).
+            match client.link_stat(dir_fid, None, file_fid, &newname).await {
+                Ok((walked, stat)) => {
+                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+                    reply.entry(&ttl, &attr, Generation(0));
                 }
-                return;
-            }
-            if let Err(e) = client.link(dir_fid, file_fid, &newname).await {
-                reply.error(errno(&e));
-                return;
-            }
-            match resolve_child(&client, &inodes, uid, dir_fid, &newname).await {
-                Ok(attr) => reply.entry(&ttl, &attr, Generation(0)),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -916,7 +795,8 @@ impl Filesystem for Fuse9P {
         let data = data.to_vec();
         self.rt.spawn(async move {
             match client.write(fid, offset, &data).await {
-                Ok(n) => reply.written(n),
+                // A single FUSE write is bounded by the kernel's max write, so it fits u32.
+                Ok(n) => reply.written(n as u32),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -1011,36 +891,19 @@ impl Filesystem for Fuse9P {
         let state = self
             .dir_reads
             .entry(fh.0)
-            .or_insert_with(|| {
-                Arc::new(AsyncMutex::new(DirRead {
-                    fetch_cookie: offset,
-                    resume_offset: offset,
-                    ..Default::default()
-                }))
-            })
+            .or_insert_with(|| Arc::new(AsyncMutex::new(DirRead::starting_at(offset))))
             .clone();
         let batch = client.max_io().min(READDIR_BATCH);
         self.rt.spawn(async move {
             let mut st = state.lock().await;
-            // A FUSE offset that doesn't continue where we left off means the
-            // kernel seeked or rewound; drop the read-ahead and restart there.
-            if offset != st.resume_offset {
-                st.buf.clear();
-                st.fetch_cookie = offset;
-                st.resume_offset = offset;
-                st.eof = false;
-            }
+            st.seek(offset);
             loop {
                 if st.buf.is_empty() {
                     if st.eof {
                         break;
                     }
                     match client.readdir(fid, st.fetch_cookie, batch).await {
-                        Ok(entries) if entries.is_empty() => st.eof = true,
-                        Ok(entries) => {
-                            st.fetch_cookie = entries.last().map_or(st.fetch_cookie, |e| e.offset);
-                            st.buf.extend(entries);
-                        }
+                        Ok(entries) => st.absorb(entries),
                         Err(e) => {
                             reply.error(errno(&e));
                             return;
@@ -1085,36 +948,19 @@ impl Filesystem for Fuse9P {
         let state = self
             .dir_reads_plus
             .entry(fh.0)
-            .or_insert_with(|| {
-                Arc::new(AsyncMutex::new(DirReadPlus {
-                    fetch_cookie: offset,
-                    resume_offset: offset,
-                    ..Default::default()
-                }))
-            })
+            .or_insert_with(|| Arc::new(AsyncMutex::new(DirReadPlus::starting_at(offset))))
             .clone();
         let batch = client.max_io().min(READDIR_BATCH);
         self.rt.spawn(async move {
             let mut st = state.lock().await;
-            // A FUSE offset that doesn't continue where we left off means the
-            // kernel seeked or rewound; drop the read-ahead and restart there.
-            if offset != st.resume_offset {
-                st.buf.clear();
-                st.fetch_cookie = offset;
-                st.resume_offset = offset;
-                st.eof = false;
-            }
+            st.seek(offset);
             loop {
                 if st.buf.is_empty() {
                     if st.eof {
                         break;
                     }
                     match client.readdirplus(fid, st.fetch_cookie, batch).await {
-                        Ok(entries) if entries.is_empty() => st.eof = true,
-                        Ok(entries) => {
-                            st.fetch_cookie = entries.last().map_or(st.fetch_cookie, |e| e.offset);
-                            st.buf.extend(entries);
-                        }
+                        Ok(entries) => st.absorb(entries),
                         Err(e) => {
                             reply.error(errno(&e));
                             return;
@@ -1198,51 +1044,35 @@ impl Filesystem for Fuse9P {
                 }
             };
 
-            // Fast path: Tlcreateattr creates and opens the child on a fresh
-            // fid and returns its full stat in one round trip instead of the
-            // clone + lcreate + walk/getattr sequence. On error no fid was
-            // created server-side, so there is nothing to clunk.
-            if client.extensions_v2_enabled() {
-                let open_fid = client.alloc_fid();
-                match client
-                    .lcreateattr(parent_fid, open_fid, &name, lflags, mode, gid)
-                    .await
-                {
-                    Ok((stat, _iounit)) => {
-                        register_lookup(&inodes, ino_of(stat.qid.path));
-                        reply.created(
-                            &ttl,
-                            &stat_to_attr(&stat),
-                            Generation(0),
-                            FileHandle(open_fid as u64),
-                            open_flags,
-                        );
-                    }
-                    Err(e) => {
-                        client.free_fid(open_fid);
-                        reply.error(errno(&e));
-                    }
+            // Create-and-open on a fresh fid (Tlcreateattr on v2, where the
+            // stat comes free; clone + lcreate otherwise).
+            let nf = client.alloc_fid();
+            let open_fid = match client
+                .create_open(parent_fid, nf, &name, lflags, mode, gid)
+                .await
+            {
+                Ok((open_fid, Some(stat), _iounit)) => {
+                    register_lookup(&inodes, ino_of(stat.qid.path));
+                    reply.created(
+                        &ttl,
+                        &stat_to_attr(&stat),
+                        Generation(0),
+                        FileHandle(open_fid as u64),
+                        open_flags,
+                    );
+                    return;
                 }
-                return;
-            }
+                Ok((open_fid, None, _iounit)) => open_fid,
+                Err(e) => {
+                    client.free_fid(nf);
+                    reply.error(errno(&e));
+                    return;
+                }
+            };
 
-            // Clone the parent fid; lcreate then turns the clone into the open
-            // file handle returned to the kernel.
-            let open_fid = client.alloc_fid();
-            if let Err(e) = client.walk(parent_fid, open_fid, &[]).await {
-                client.free_fid(open_fid);
-                reply.error(errno(&e));
-                return;
-            }
-            if let Err(e) = client.lcreate(open_fid, &name, lflags, mode, gid).await {
-                let _ = client.clunk(open_fid).await;
-                client.free_fid(open_fid);
-                reply.error(errno(&e));
-                return;
-            }
-
-            // Register a separate path fid for the inode so future lookups and
-            // getattrs work after this handle is released.
+            // Fallback path carried no stat: register a separate path fid for
+            // the inode so future lookups and getattrs work after this handle
+            // is released.
             match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
                 Ok(attr) => reply.created(
                     &ttl,
@@ -1616,40 +1446,17 @@ impl Fuse9P {
                     return;
                 }
             };
-            // Fast path: Tlopenat opens the inode on a fresh fid in one round
-            // trip instead of the clone + lopen pair. On error no fid was
-            // created server-side, so there is nothing to clunk.
-            if client.extensions_v2_enabled() {
-                let fid = client.alloc_fid();
-                let mut res = client.lopenat(inode_fid, fid, lflags).await;
-                if res.is_err() && upgrade {
-                    res = client.lopenat(inode_fid, fid, orig).await;
-                }
-                match res {
-                    Ok(_) => reply.opened(FileHandle(fid as u64), open_flags),
-                    Err(e) => {
-                        client.free_fid(fid);
-                        reply.error(errno(&e));
-                    }
-                }
-                return;
-            }
-
-            let fid = client.alloc_fid();
-            if let Err(e) = client.walk(inode_fid, fid, &[]).await {
-                client.free_fid(fid);
-                reply.error(errno(&e));
-                return;
-            }
-            let mut res = client.lopen(fid, lflags).await;
-            if res.is_err() && upgrade {
-                res = client.lopen(fid, orig).await;
-            }
-            match res {
-                Ok(_) => reply.opened(FileHandle(fid as u64), open_flags),
+            // Open on a fresh fid, leaving the inode fid untouched (Tlopenat
+            // on v2, clone + lopen otherwise); a refused writeback upgrade is
+            // retried with the original flags.
+            let nf = client.alloc_fid();
+            match client
+                .open_clone(inode_fid, nf, lflags, upgrade.then_some(orig))
+                .await
+            {
+                Ok((fid, _, _)) => reply.opened(FileHandle(fid as u64), open_flags),
                 Err(e) => {
-                    let _ = client.clunk(fid).await;
-                    client.free_fid(fid);
+                    client.free_fid(nf);
                     reply.error(errno(&e));
                 }
             }

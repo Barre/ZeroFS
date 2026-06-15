@@ -22,7 +22,7 @@
 //! (mkdir/create/rename/unlink) could apply it twice.
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use deku::prelude::*;
@@ -85,7 +85,10 @@ impl ClientError {
     }
 }
 
-type ClientResult<T> = Result<T, ClientError>;
+pub type ClientResult<T> = Result<T, ClientError>;
+
+mod ops;
+pub use ops::{DirEntryCookie, ReaddirState, SetattrBuilder, SetattrTime};
 
 #[derive(Clone)]
 enum Target {
@@ -107,7 +110,7 @@ struct Conn {
     /// The reader otherwise only exits when the socket dies, so a freshly built
     /// connection that is discarded before being installed (negotiate or replay
     /// failed) would leak its reader task and socket fd. The reader and writer
-    /// each hold an `Arc<Conn>`, so `Drop` can't break that cycle — teardown
+    /// each hold an `Arc<Conn>`, so `Drop` can't break that cycle; teardown
     /// must be signalled explicitly via [`Conn::shutdown`].
     reader_shutdown: Notify,
 }
@@ -365,9 +368,9 @@ impl NinePClient {
     }
 
     /// Rebuild the recorded session onto `conn`, then re-acquire locks. Attach
-    /// fids replay first — re-attaching restores the session's aname subtree
+    /// fids replay first (re-attaching restores the session's aname subtree
     /// root on the server, which the subsequent `Trebind`s are validated
-    /// against — and every other fid is then rebound to its inode id (no
+    /// against), and every other fid is then rebound to its inode id (no
     /// lineage, no parent ordering). A *transport* failure aborts (the caller
     /// reconnects afresh); a *server* error for a fid means the inode is gone
     /// (or has left the subtree), so that fid is dropped.
@@ -499,6 +502,13 @@ impl NinePClient {
     /// Return a fid to the free list. The caller must have clunked it already.
     pub fn free_fid(&self, fid: u32) {
         self.fid_free.lock().unwrap().push(fid);
+    }
+
+    /// Number of fids currently live server-side for this client: allocated and
+    /// not yet returned to the free list. A diagnostic for leak accounting.
+    pub fn outstanding_fids(&self) -> usize {
+        let allocated = self.fid_ctr.load(Ordering::Relaxed).saturating_sub(1) as usize;
+        allocated.saturating_sub(self.fid_free.lock().unwrap().len())
     }
 
     /// Block until the connection is live (i.e. not mid-reconnect).
@@ -650,7 +660,7 @@ impl NinePClient {
     }
 
     /// Bind `fid` to an existing inode by id, acting as `n_uname`. Obtains a fresh
-    /// fid for an inode without re-walking a path — used for per-user fids and for
+    /// fid for an inode without re-walking a path; used for per-user fids and for
     /// reconnect replay.
     pub async fn rebind(&self, fid: u32, inode_id: u64, n_uname: u32) -> ClientResult<Qid> {
         let resp = self
@@ -942,38 +952,61 @@ impl NinePClient {
     /// Read up to `size` bytes at `offset`, looping over multiple Tread requests
     /// when `size` exceeds the negotiated msize. Stops early on a short read (EOF).
     pub async fn read(&self, fid: u32, offset: u64, size: u32) -> ClientResult<Vec<u8>> {
+        Ok(self.read_bytes(fid, offset, size).await?.into())
+    }
+
+    /// Like [`Self::read`] but returns the payload as [`Bytes`]. The Rread
+    /// payload already arrives as `Bytes`, so a single-round-trip read returns
+    /// it with no copy; only a multi-chunk read concatenates.
+    pub async fn read_bytes(&self, fid: u32, offset: u64, size: u32) -> ClientResult<Bytes> {
+        if size == 0 {
+            return Ok(Bytes::new());
+        }
         let max = self.max_io().max(1);
-        let mut out: Vec<u8> = Vec::with_capacity(size.min(max) as usize);
-        let mut off = offset;
+        let first = self.read_once(fid, offset, size.min(max)).await?;
+        if size <= max || (first.len() as u32) < size.min(max) {
+            return Ok(first);
+        }
+        // Spans multiple chunks. `size` is caller-controlled and may be far
+        // larger than the data, so reserve a bounded amount and grow as it fills.
+        let mut out = BytesMut::with_capacity(size.min(max.saturating_mul(2)) as usize);
+        let mut off = offset + first.len() as u64;
+        out.extend_from_slice(&first);
         while (out.len() as u32) < size {
+            // Re-read the chunk cap each iteration: a reconnect can renegotiate a
+            // smaller msize, and a chunk short of the *current* cap is the only
+            // reliable end-of-file signal.
+            let max = self.max_io().max(1);
             let want = (size - out.len() as u32).min(max);
             let data = self.read_once(fid, off, want).await?;
             let got = data.len() as u32;
             out.extend_from_slice(&data);
             off += got as u64;
             if got < want {
-                break; // short read => EOF
+                break; // short read => end of file
             }
         }
-        Ok(out)
+        Ok(out.freeze())
     }
 
-    async fn read_once(&self, fid: u32, offset: u64, count: u32) -> ClientResult<Vec<u8>> {
+    async fn read_once(&self, fid: u32, offset: u64, count: u32) -> ClientResult<Bytes> {
         let resp = self
             .rpc(Message::Tread(Tread { fid, offset, count }))
             .await?;
         match resp {
-            Message::Rread(r) => Ok(r.data.0.to_vec()),
+            Message::Rread(r) => Ok(r.data.0),
             _ => Err(ClientError::Unexpected("read")),
         }
     }
 
     /// Write all of `data` at `offset`, splitting into multiple Twrite requests
     /// when it exceeds the negotiated msize. Returns the total bytes written.
-    pub async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> ClientResult<u32> {
-        let max = self.max_write_payload().max(1) as usize;
+    pub async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> ClientResult<u64> {
         let mut written = 0usize;
         while written < data.len() {
+            // Re-read the cap each iteration: a reconnect can renegotiate a
+            // smaller msize, and the remaining chunks must respect the new one.
+            let max = self.max_write_payload().max(1) as usize;
             let end = (written + max).min(data.len());
             let chunk = &data[written..end];
             let n = self.write_once(fid, offset + written as u64, chunk).await?;
@@ -985,7 +1018,7 @@ impl NinePClient {
                 break; // short write
             }
         }
-        Ok(written as u32)
+        Ok(written as u64)
     }
 
     async fn write_once(&self, fid: u32, offset: u64, data: &[u8]) -> ClientResult<u32> {
@@ -1337,6 +1370,11 @@ impl NinePClient {
 
 impl Drop for NinePClient {
     fn drop(&mut self) {
+        // Tear down the live connection. The reader and writer each hold an
+        // `Arc<Conn>` (which owns the only `writer_tx`), so that cycle never
+        // breaks on its own; `shutdown` wakes both so they exit and release the
+        // socket fd. Without this, dropping a client leaks the fd + both tasks.
+        self.conn.load().shutdown();
         // Wake the supervisor so it observes the dropped client and exits.
         self.reconnect_notify.notify_waiters();
     }

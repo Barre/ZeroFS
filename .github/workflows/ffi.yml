@@ -1,0 +1,190 @@
+name: FFI bindings
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Python: build the wheel, install it, and run it against a real ZeroFS server.
+  python:
+    name: Python (wheel + run)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the zerofs server
+        run: cargo build -p zerofs --bin zerofs
+      - name: Build and install the wheel
+        run: |
+          pip install "maturin>=1.10,<2.0" "uniffi-bindgen==0.31.0"
+          out="$PWD/target/wheels"
+          ( cd zerofs-ffi/bindings/python && maturin build --out "$out" )
+          pip install "$out"/zerofs_client-*.whl
+      - name: Run the installed bindings end-to-end
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/data" "$WORK/cache"
+          cat > "$WORK/zerofs.toml" <<EOF
+          [cache]
+          dir = "$WORK/cache"
+          disk_size_gb = 1.0
+
+          [storage]
+          url = "file://$WORK/data"
+          encryption_password = "ci-ffi-password"
+
+          [servers]
+
+          [servers.ninep]
+          unix_socket = "$WORK/9p.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+          RUST_LOG=warn ./target/debug/zerofs run -c "$WORK/zerofs.toml" &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            [ -S "$WORK/9p.sock" ] && break
+            sleep 0.5
+          done
+          # Imported from the installed wheel (no PYTHONPATH): low-level + facade.
+          python3 zerofs-ffi/tests/python/test_smoke.py "unix:$WORK/9p.sock"
+          python3 zerofs-ffi/tests/python/test_facade.py "unix:$WORK/9p.sock"
+          python3 zerofs-ffi/tests/python/test_ergonomics.py "unix:$WORK/9p.sock"
+
+  # TypeScript/Node: generate the runnable koffi bindings and run them against a
+  # real server (Node executes the .ts facade directly via type stripping).
+  typescript:
+    name: TypeScript (Node, generate + run)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build cdylib + zerofs server
+        run: cargo build -p zerofs-ffi -p zerofs --bin zerofs
+      - name: Install the Node bindings generator
+        run: cargo install uniffi-bindgen-node-js --version 0.0.14 --locked
+      - name: Generate the Node package (bundles lib + facade)
+        run: |
+          ./zerofs-ffi/bindings/generate.sh typescript out/ts
+          cp zerofs-ffi/tests/node/test_facade.ts out/ts/
+          (cd out/ts && npm install --no-audit --no-fund)
+      - name: Run the Node bindings end-to-end
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/data" "$WORK/cache"
+          cat > "$WORK/zerofs.toml" <<EOF
+          [cache]
+          dir = "$WORK/cache"
+          disk_size_gb = 1.0
+
+          [storage]
+          url = "file://$WORK/data"
+          encryption_password = "ci-ffi-password"
+
+          [servers]
+
+          [servers.ninep]
+          unix_socket = "$WORK/9p.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+          RUST_LOG=warn ./target/debug/zerofs run -c "$WORK/zerofs.toml" &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            [ -S "$WORK/9p.sock" ] && break
+            sleep 0.5
+          done
+          node out/ts/test_facade.ts "unix:$WORK/9p.sock"
+
+  # Go: generate the runnable cgo bindings and run them against a real server.
+  go:
+    name: Go (cgo, generate + run)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Build cdylib + zerofs server
+        run: cargo build -p zerofs-ffi -p zerofs --bin zerofs
+      - name: Install the Go bindings generator
+        run: cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.7.0+v0.31.0
+      - name: Generate the Go package (copies the facade beside it)
+        run: |
+          set -euo pipefail
+          ./zerofs-ffi/bindings/generate.sh go out/go
+          mkdir -p out/go/cmd/e2e
+          cp zerofs-ffi/tests/go/main.go out/go/cmd/e2e/main.go
+          cat > out/go/go.mod <<'EOF'
+          module zerofs.example/binding
+
+          go 1.26
+          EOF
+      - name: Build the Go bindings with cgo
+        run: |
+          set -euo pipefail
+          export CGO_ENABLED=1
+          export CGO_CFLAGS="-I$PWD/out/go/zerofs_ffi"
+          export CGO_LDFLAGS="-L$PWD/target/debug -lzerofs_ffi"
+          (cd out/go && go build -o e2e ./cmd/e2e)
+      - name: Run the Go bindings end-to-end
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/data" "$WORK/cache"
+          cat > "$WORK/zerofs.toml" <<EOF
+          [cache]
+          dir = "$WORK/cache"
+          disk_size_gb = 1.0
+
+          [storage]
+          url = "file://$WORK/data"
+          encryption_password = "ci-ffi-password"
+
+          [servers]
+
+          [servers.ninep]
+          unix_socket = "$WORK/9p.sock"
+
+          [telemetry]
+          enabled = false
+          EOF
+          RUST_LOG=warn ./target/debug/zerofs run -c "$WORK/zerofs.toml" &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            [ -S "$WORK/9p.sock" ] && break
+            sleep 0.5
+          done
+          export LD_LIBRARY_PATH="$PWD/target/debug"
+          out/go/e2e "unix:$WORK/9p.sock"

@@ -1,0 +1,44 @@
+[package]
+name = "zerofs-client"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Async, path-based client library for ZeroFS over 9P"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+documentation = "https://docs.rs/zerofs-client"
+readme = "README.md"
+keywords = ["filesystem", "9p", "client", "s3", "zerofs"]
+categories = ["filesystem", "network-programming"]
+
+[features]
+# On by default for Rust consumers; the FFI layer sets `default-features = false`
+# since these are Rust-only and never cross the FFI boundary.
+default = ["tokio-io", "stream", "serde"]
+# Rust-only positioned-I/O adapter (`File::cursor` → `io::FileCursor`,
+# AsyncRead + AsyncWrite + AsyncSeek).
+tokio-io = ["tokio/io-util"]
+# Rust-only `Dir::entries` -> `DirStream` (futures::Stream over readdir).
+stream = ["dep:futures-core"]
+# Serialize/Deserialize for the plain data records (Metadata, DirEntry, ...).
+serde = ["dep:serde"]
+
+[dependencies]
+# Explicit versions alongside the path so crates.io can resolve the published
+# crates (a bare `path` dep is stripped on publish, leaving no version req).
+# The transport crates are independently versioned (their own 0.1.0 line);
+# zerofs-client itself is on the client-family version.
+ninep-client = { path = "../ninep-client", version = "0.1.0" }
+ninep-proto = { path = "../ninep-proto", version = "0.1.0" }
+tokio = { version = "1.52", features = ["rt", "net", "sync", "time"] }
+bytes = "1"
+libc = "0.2"
+futures-core = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+# Only for examples (and any future in-crate tests): the multi-threaded runtime
+# and `#[tokio::main]` macro, plus `StreamExt` for the listing example.
+[dev-dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"

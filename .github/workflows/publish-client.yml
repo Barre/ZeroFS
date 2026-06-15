@@ -1,0 +1,457 @@
+name: Publish client (crates.io / PyPI / npm / Go)
+
+# Releases the ZeroFS programmatic client family. One version covers
+# zerofs-client + zerofs-ffi and all three bindings (Python wheel, npm package,
+# Go module); zerofs/zerofs-ffi/Cargo.toml::version is the single source of
+# truth. Triggered by a dedicated tag (client-vX.Y.Z) so it never collides with
+# the server's v* release tags; workflow_dispatch runs the version gate as a dry
+# run (only a client-v* tag push publishes).
+on:
+  push:
+    tags: ["client-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Client-family version to publish (X.Y.Z). Must equal zerofs-ffi/Cargo.toml::version."
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Drift gate: fail before anything publishes unless the release version (from
+  # the client-v* tag or dispatch input) equals zerofs-ffi/Cargo.toml. Downstream
+  # jobs read the agreed version from this job's `version` output.
+  verify-version:
+    name: Verify version (tag == zerofs-ffi/Cargo.toml)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract and compare versions
+        id: check
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/client-v* ]]; then
+            release_version="${GITHUB_REF_NAME#client-v}"
+          else
+            release_version="${{ github.event.inputs.version }}"
+          fi
+          cargo_version="$(grep -m1 '^version = ' zerofs/zerofs-ffi/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "release (tag/input): $release_version"
+          echo "zerofs-ffi/Cargo.toml: $cargo_version"
+          if [ "$release_version" != "$cargo_version" ]; then
+            echo "::error::version drift: release '$release_version' != zerofs-ffi/Cargo.toml '$cargo_version'. Run scripts/release-client.sh $release_version and retag." >&2
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  # Publish zerofs-client to crates.io. The transport crates (ninep-proto,
+  # ninep-client) are independently versioned and already on crates.io; this job
+  # does not republish them, since crates.io rejects re-uploading an existing
+  # version (there is no skip-existing flag). Bump and publish a transport by hand
+  # when it changes, before the dependent client release. zerofs-ffi is
+  # `publish = false`; zerofs-client rides the client-family version.
+  publish-crates:
+    name: Publish crates.io
+    needs: verify-version
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      CLIENT_VERSION: ${{ needs.verify-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Sanity-check zerofs-client version == client-family version
+        run: |
+          set -euo pipefail
+          zc_version="$(grep -m1 '^version = ' zerofs/zerofs-client/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "zerofs-client/Cargo.toml: $zc_version"
+          echo "client-family (verify-version): $CLIENT_VERSION"
+          if [ "$zc_version" != "$CLIENT_VERSION" ]; then
+            echo "::error::zerofs-client version '$zc_version' != client-family '$CLIENT_VERSION'. Run scripts/release-client.sh $CLIENT_VERSION and retag." >&2
+            exit 1
+          fi
+
+      - name: Publish zerofs-client
+        working-directory: zerofs
+        run: |
+          set -euo pipefail
+          # Idempotent: skip if this version is already on crates.io (e.g. a
+          # re-run after another job failed). crates.io has no skip-existing flag
+          # and rejects a duplicate upload, so check first. Mirrors the npm job's
+          # `npm view` guard.
+          if curl -sf -A "zerofs-release" "https://crates.io/api/v1/crates/zerofs-client/$CLIENT_VERSION" >/dev/null; then
+            echo "zerofs-client@$CLIENT_VERSION already on crates.io; skipping"
+          else
+            cargo publish -p zerofs-client
+          fi
+
+  # PyPI: build a per-target wheel on each native runner (each wheel bundles its
+  # cdylib) plus one sdist, upload them as artifacts, then publish them all from a
+  # single Linux job. pypa/gh-action-pypi-publish is a Docker container action, so
+  # it runs only on a Linux amd64 runner; gathering the artifacts and publishing
+  # once keeps the arm64/macOS wheels (built on their own runners) clear of it.
+  # maturin (uniffi mode) builds under the non-stripped `wheel` profile because
+  # release strips the metadata uniffi-bindgen reads, and uses the external
+  # uniffi-bindgen since the crate ships no bindgen bin.
+  build-pypi-wheels:
+    name: Build PyPI wheel (${{ matrix.name }})
+    needs: verify-version
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - name: linux-aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS builds natively, so put the external uniffi-bindgen on the host PATH
+      # for maturin; Linux legs install it via before-script-linux (musllinux has
+      # no uniffi-bindgen wheel, so pip compiles it from sdist).
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.12"
+      - name: Install uniffi-bindgen (macOS host)
+        if: runner.os != 'Linux'
+        run: pip install "uniffi-bindgen==0.31.0"
+
+      - name: Build wheel (${{ matrix.name }})
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: zerofs/zerofs-ffi/bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --profile wheel --out dist --find-interpreter
+          before-script-linux: pip install "uniffi-bindgen==0.31.0"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheel-${{ matrix.name }}
+          path: zerofs/zerofs-ffi/bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  # sdist in its own Linux job: building it inside a wheel leg failed because the
+  # manylinux container creates a root-owned dist/ the host sdist step can't write.
+  build-pypi-sdist:
+    name: Build PyPI sdist
+    needs: verify-version
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: zerofs/zerofs-ffi/bindings/python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-sdist
+          path: zerofs/zerofs-ffi/bindings/python/dist/*.tar.gz
+          if-no-files-found: error
+
+  # Gather every wheel + the sdist and publish once from a Linux amd64 runner (the
+  # only place the Docker-based publish action runs). Trusted Publishing (OIDC, no
+  # token); skip-existing keeps a re-run idempotent.
+  publish-pypi:
+    name: Publish PyPI
+    needs: [build-pypi-wheels, build-pypi-sdist]
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC for PyPI Trusted Publishing (no API token)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pypi-*
+          merge-multiple: true
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+          print-hash: true
+
+  # Native-addon distribution: a thin main package `zerofs-client` (facade +
+  # generated JS, no cdylib) plus four `@zerofs/ffi-<target>` packages each
+  # shipping one prebuilt cdylib, wired via optionalDependencies; the loader
+  # (packaging/index.js) resolves the matching one at runtime for koffi.
+  #
+  # Split into two jobs: a matrix builds and publishes the four platform packages,
+  # then `publish-npm-main` (gated on all of them via `needs:`) generates the JS,
+  # compiles the facade, and publishes the main package. Gating on the platform
+  # jobs instead of polling npm means a slow leg (a from-scratch macOS release
+  # build) just makes the main job wait, rather than timing the poll out.
+  publish-npm-platforms:
+    name: Publish npm platform (${{ matrix.target }})
+    needs: verify-version
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-gnu
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            cdylib: target/release/libzerofs_ffi.so
+          - target: linux-arm64-gnu
+            os: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            cdylib: target/release/libzerofs_ffi.so
+          - target: darwin-x64
+            os: macos-13
+            rust_target: x86_64-apple-darwin
+            cdylib: target/release/libzerofs_ffi.dylib
+          - target: darwin-arm64
+            os: macos-14
+            rust_target: aarch64-apple-darwin
+            cdylib: target/release/libzerofs_ffi.dylib
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # bash on every runner so assemble.sh and the shell steps below behave
+        # identically across the matrix.
+        shell: bash
+        working-directory: zerofs
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # Each package bundles the RELEASE cdylib (stripped, ~1.7 MB vs ~62 MB
+      # debug); it loads fine with the JS generated from the debug lib.
+      - name: Build release cdylib
+        run: cargo build --release -p zerofs-ffi --target ${{ matrix.rust_target }}
+
+      # Normalize target/<triple>/release/ to the plain target/release/ that
+      # matrix.cdylib and assemble.sh expect.
+      - name: Stage cdylib at target/release
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          src="target/${{ matrix.rust_target }}/release/$(basename "${{ matrix.cdylib }}")"
+          cp "$src" "${{ matrix.cdylib }}"
+
+      - name: Assemble and publish platform package @zerofs/ffi-${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/pkg-${{ matrix.target }}"
+          zerofs-ffi/bindings/typescript/packaging/assemble.sh \
+            platform "${{ matrix.target }}" "${{ matrix.cdylib }}" "$out"
+          if npm view "@zerofs/ffi-${{ matrix.target }}@$VERSION" version >/dev/null 2>&1; then
+            echo "@zerofs/ffi-${{ matrix.target }}@$VERSION already published; skipping"
+          else
+            ( cd "$out" && npm publish --access public )
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # The main package. Runs only after every platform package is published (via
+  # `needs:`), so its pinned optionalDependencies resolve with no polling. The JS
+  # is generated from the DEBUG cdylib (the release lib strips the bindgen
+  # metadata the generator reads).
+  publish-npm-main:
+    name: Publish npm (main package)
+    needs: [verify-version, publish-npm-platforms]
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: zerofs
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install the Node bindings generator
+        run: cargo install uniffi-bindgen-node-js --version 0.0.14 --locked
+
+      # Generate the platform-independent JS surface from the DEBUG cdylib.
+      # generate.sh also copies in the zerofs.ts facade and applies its patches.
+      - name: Generate Node bindings (debug lib)
+        run: |
+          set -euo pipefail
+          cargo build -p zerofs-ffi
+          zerofs-ffi/bindings/generate.sh typescript "$RUNNER_TEMP/gen"
+
+      # Compile the .ts facade to .js + .d.ts next to the generated index.js
+      # (Node runs .ts directly in CI, but the published package ships JS).
+      - name: Compile the facade
+        working-directory: ${{ runner.temp }}/gen
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund --save-dev typescript@5
+          cat > tsconfig.facade.json <<'JSON'
+          {
+            "compilerOptions": {
+              "target": "ES2022",
+              "module": "NodeNext",
+              "moduleResolution": "NodeNext",
+              "lib": ["ESNext", "DOM", "DOM.AsyncIterable", "ESNext.Disposable"],
+              "declaration": true,
+              "strict": true,
+              "skipLibCheck": true,
+              "noEmitOnError": true
+            },
+            "files": ["zerofs.ts"]
+          }
+          JSON
+          npx tsc -p tsconfig.facade.json
+
+      - name: Assemble and publish main package zerofs-client
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/pkg-main"
+          zerofs-ffi/bindings/typescript/packaging/assemble.sh main "$RUNNER_TEMP/gen" "$out"
+          if npm view "zerofs-client@$VERSION" version >/dev/null 2>&1; then
+            echo "zerofs-client@$VERSION already published; skipping"
+          else
+            ( cd "$out" && npm publish --access public )
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Commit the regenerated Go binding and push the Go-convention subdir tag.
+  # Nothing is uploaded: the Go binding ships no prebuilt native library.
+  # Committing per-platform .so/.dylib/.dll is unacceptable, and building from
+  # source is the precedent for comparable cgo bindings; consumers build the
+  # zerofs-ffi cdylib themselves and point cgo at it (see bindings/go/README.md).
+  # Generation runs here on Linux from the DEBUG cdylib (the release build strips
+  # the uniffi metadata the generator reads).
+  publish-go:
+    name: Publish Go
+    needs: verify-version
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    permissions:
+      contents: write   # push the release commit + the subdir tag
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+      GODIR: zerofs/zerofs-ffi/bindings/go
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Writable checkout with full history to commit + push the tag.
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Install the Go bindings generator
+        run: |
+          cargo install uniffi-bindgen-go \
+            --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.7.0+v0.31.0
+      - name: Build the debug cdylib
+        working-directory: zerofs
+        run: cargo build -p zerofs-ffi
+      - name: Generate the Go binding
+        working-directory: zerofs
+        run: ./zerofs-ffi/bindings/generate.sh go out/go
+      # The generator emits out/go/zerofs_ffi/{zerofs_ffi.go,zerofs_ffi.h} and
+      # copies facade.go beside them. Flatten ONLY the generated artifacts into
+      # the in-repo module dir (go.mod, facade.go, README.md already live there
+      # and stay as-is). go fmt ran in generate.sh; assert the result is clean.
+      - name: Stage the generated binding into the module
+        run: |
+          set -euo pipefail
+          cp zerofs/out/go/zerofs_ffi/zerofs_ffi.go "$GODIR/zerofs_ffi.go"
+          cp zerofs/out/go/zerofs_ffi/zerofs_ffi.h  "$GODIR/zerofs_ffi.h"
+          test -f "$GODIR/facade.go"   # invariant: hand-written facade present
+          test -f "$GODIR/go.mod"      # invariant: module manifest present
+          unformatted="$(gofmt -l "$GODIR")"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files: $unformatted"; exit 1
+          fi
+      # Smoke-test that the committed sources compile and link, using the debug
+      # cdylib already built above (consumers build their own release lib).
+      - name: Verify the module builds against the debug cdylib
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          libdir="$PWD/zerofs/target/debug"
+          export CGO_CFLAGS="-I$PWD/$GODIR"
+          export CGO_LDFLAGS="-L$libdir -lzerofs_ffi"
+          ( cd "$GODIR" && go vet ./... && go build ./... )
+      # Commit the generated sources onto the default branch (the tag is the
+      # release trigger, not a branch, so HEAD is detached; target main
+      # explicitly). The subdir tag is then cut from this commit below.
+      - name: Commit the generated binding
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          branch="${{ github.event.repository.default_branch }}"
+          git add "$GODIR/zerofs_ffi.go" "$GODIR/zerofs_ffi.h"
+          if git diff --cached --quiet; then
+            echo "Generated Go binding unchanged; tagging the current commit as-is."
+          else
+            git commit -m "Release Go bindings ${VERSION}: regenerate zerofs_ffi.go/.h"
+            git push origin "HEAD:refs/heads/${branch}"
+          fi
+      # Go subdir-tag convention: <module-subdir>/vX.Y.Z. The version is the one
+      # verify-version already asserted == the client-v* tag.
+      - name: Create and push the Go subdir tag
+        run: |
+          set -euo pipefail
+          gotag="zerofs/zerofs-ffi/bindings/go/v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${gotag}" >/dev/null 2>&1; then
+            echo "::error::tag ${gotag} already exists on origin"; exit 1
+          fi
+          git tag -a "${gotag}" -m "ZeroFS Go bindings v${VERSION}"
+          git push origin "refs/tags/${gotag}"

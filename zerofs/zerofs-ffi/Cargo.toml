@@ -1,0 +1,26 @@
+[package]
+name = "zerofs-ffi"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Foreign-language bindings (Python/TypeScript) for the ZeroFS client"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+# Not published to crates.io: this is a cdylib whose only job is to be compiled
+# into the per-language bindings (Python/TypeScript/Go). The publishable Rust
+# surface is zerofs-client. The client-family version lives here regardless (it
+# is the single source of truth the release tooling reads).
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "zerofs_ffi"
+
+[dependencies]
+# The FFI layer needs only the FFI-shaped core surface, not the Rust-only sugar
+# (tokio-io cursor, Stream, serde), so it opts out of the default features.
+zerofs-client = { path = "../zerofs-client", version = "=0.1.1", default-features = false }
+uniffi = { version = "0.31", features = ["tokio", "cli"] }
+tokio = { version = "1.52", features = ["rt-multi-thread"] }
+thiserror = "2"
+libc = "0.2"

@@ -1,0 +1,329 @@
+export const metadata = {
+  title: 'Client Libraries',
+  description: 'Official Python, TypeScript, and Go client libraries for ZeroFS: path-based filesystem calls over 9P, without a mount.',
+}
+
+# Client Libraries
+
+ZeroFS ships official client libraries for Python, TypeScript/Node, and Go. They are a programmatic alternative to mounting: your process speaks 9P2000.L straight to the server and gets path-based filesystem calls (`read`, `write`, `stat`, `readdir`, `open`) with no kernel mount in between. {{ className: 'lead' }}
+
+All three wrap one Rust core ([`zerofs-client`](https://crates.io/crates/zerofs-client)) compiled to a native library, so they share its behavior exactly: the same connection targets, the same fast-path extensions, the same reconnect and cancellation semantics. They connect to the same `[servers.ninep]` endpoint a [9P mount](/9p-access) uses, with the same trusted-network model: a client asserts its uid at connect time and the server trusts it.
+
+<Note>
+The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`) returns only after data reaches stable storage. Use them when you want filesystem operations from an application without a mount point. Like `zerofs mount`.
+</Note>
+
+## Installation
+
+### Python
+
+```bash
+pip install zerofs-client
+```
+
+The wheel bundles the native library (manylinux and musllinux on Linux, plus macOS), so the install is self-contained (no Rust toolchain, no build step). Import `zerofs_client` for the idiomatic facade; the low-level uniffi module is also importable as `zerofs_ffi`.
+
+```python
+import zerofs_client
+
+async with await zerofs_client.Client.connect("unix:/run/zerofs/9p.sock") as fs:
+    await fs.create_dir_all("/demo", 0o755)
+    await fs.write("/demo/notes.txt", b"hello from zerofs")
+
+    data = await fs.read("/demo/notes.txt")
+    meta = await fs.metadata("/demo/notes.txt")
+    print(len(data), meta.size, meta.is_file())
+
+    # A File handle for positioned I/O.
+    async with await fs.open("/demo/data.bin", zerofs_client.OpenOptions(write=True, create=True)) as f:
+        await f.write_at(0, b"\x00" * 4096)
+        await f.sync_all()
+
+    # Stream the directory entry by entry.
+    async with await fs.open_dir("/demo") as d:
+        async for entry in d:
+            print(entry.name)
+
+    await fs.rename("/demo/notes.txt", "/demo/notes.md")
+    await fs.remove_file("/demo/notes.md")
+    await fs.remove_dir_all("/demo")
+```
+
+### TypeScript / Node
+
+```bash
+npm install zerofs-client
+```
+
+The matching `@zerofs/ffi-<platform>` native package installs as an optional dependency and is selected at load time. The bindings call the library through [koffi](https://koffi.dev) rather than WASM, so sockets work.
+
+```typescript
+import { Client, openOptions, isFile } from "zerofs-client";
+
+await using fs = await Client.connect("unix:/run/zerofs/9p.sock");
+
+await fs.createDirAll("/demo", 0o755);
+await fs.write("/demo/notes.txt", new TextEncoder().encode("hello from zerofs"));
+
+const data = await fs.read("/demo/notes.txt");
+const meta = await fs.metadata("/demo/notes.txt");
+console.log(data.length, meta.size, isFile(meta));
+
+// A File handle for positioned I/O.
+await using f = await fs.open("/demo/data.bin", openOptions({ write: true, create: true }));
+await f.writeAt(0n, new Uint8Array(4096));
+await f.syncAll();
+
+// Stream the directory entry by entry.
+await using dir = await fs.openDir("/demo");
+for await (const entry of dir) console.log(entry.name);
+
+await fs.rename("/demo/notes.txt", "/demo/notes.md");
+await fs.removeFile("/demo/notes.md");
+await fs.removeDirAll("/demo");
+```
+
+### Go
+
+```bash
+go get github.com/Barre/ZeroFS/zerofs/zerofs-ffi/bindings/go
+```
+
+The module ships the generated cgo sources and a C header, but **not** the native library: Go has no package registry that carries binaries. You build the `zerofs-ffi` cdylib from the ZeroFS source and point cgo at it; the [module README](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-ffi/bindings/go) covers the `CGO_CFLAGS`/`CGO_LDFLAGS` setup. This path needs a Rust toolchain and a C toolchain.
+
+```go
+import (
+	"log"
+
+	zerofs "github.com/Barre/ZeroFS/zerofs/zerofs-ffi/bindings/go"
+)
+
+fs, err := zerofs.ClientConnect("unix:/run/zerofs/9p.sock")
+if err != nil {
+	log.Fatal(err)
+}
+defer fs.Close()
+
+must := func(err error) { if err != nil { log.Fatal(err) } }
+
+must(fs.CreateDirAll("/demo", 0o755))
+must(fs.Write("/demo/notes.txt", []byte("hello from zerofs")))
+
+data, err := fs.Read("/demo/notes.txt")
+must(err)
+meta, err := fs.Metadata("/demo/notes.txt")
+must(err)
+log.Printf("%d bytes, size=%d, isFile=%v", len(data), meta.Size, meta.IsFile())
+
+// Stream the directory with a range-over-func iterator.
+dir, err := fs.OpenDir("/demo")
+must(err)
+defer dir.Close()
+for entry, err := range dir.Entries() {
+	must(err)
+	log.Println(entry.Name)
+}
+```
+
+## Connecting
+
+`Client.connect(target)` takes the same target forms as `zerofs mount` and the kernel client:
+
+| Target | Transport |
+|--------|-----------|
+| `unix:/path/to.sock` | Unix socket |
+| `tcp://host:port` | TCP |
+| `host:port` / `host` | TCP (port defaults to 5564) |
+| `/path` or `./path` | Unix socket (bare path) |
+
+For an explicit identity (`uid`/`gid`/`uname`), an attach subtree (`aname`), a custom `msize`, or a connect timeout, connect with a `ConnectOptions` (`connect_with` in Python/Go, `connectWith` in Node). The server clamps `msize` to 10 MiB, so requesting more has no effect (the same ceiling a 9P mount hits).
+
+## API reference
+
+The full surface is the [`zerofs-client`](https://crates.io/crates/zerofs-client) core projected mechanically by uniffi, plus a thin per-language facade. The tables below are the canonical, language-neutral reference for every operation and type; the projection rules turn each into a concrete per-language signature.
+
+<Note>
+For exact per-language signatures, see the generated docs: [docs.rs](https://docs.rs/zerofs-client) (the Rust core), [pkg.go.dev](https://pkg.go.dev/github.com/Barre/ZeroFS/zerofs/zerofs-ffi/bindings/go) (Go), and [tsdocs.dev](https://tsdocs.dev/docs/zerofs-client) (TypeScript, from the shipped `.d.ts`). PyPI has no documentation host, so this page is the complete Python reference.
+</Note>
+
+### Projection rules
+
+Every operation maps to each language by the same rules, so a single canonical signature is unambiguous in all three.
+
+| Concept | Python | TypeScript | Go |
+|---------|--------|------------|----|
+| Method name | `snake_case` | `snake_case`, `camelCase` alias | `PascalCase` |
+| Async call | `await` (plus a blocking `connect_sync()`) | returns a `Promise` | blocking; returns `(value, error)` |
+| Byte payload | `bytes` | `Uint8Array` | `[]byte` |
+| Path argument | `str` or `os.PathLike` | `string` | `string` |
+| Child name (`*_at`) | `bytes` | `Uint8Array` | `[]byte` |
+| Optional value | `None` | `undefined` | `*T` (nil) |
+| Timestamp | `datetime` | `Date` | `time.Time` |
+| Options record | `OpenOptions(write=True)` | `openOptions({ write: true })` | `OpenOptions{Write: true}` |
+| Error | raises `ZeroFsError.NotFound` | throws `ZeroFsErrorNotFound` | `errors.Is(err, ErrZeroFsErrorNotFound)` |
+| Handle cleanup | `async with` / `await close()` | `await using` / `await close()` | `defer Close()` |
+
+### Client operations
+
+One identity, one session, safe to share across tasks. Path arguments are strings; returns are shown in canonical form (`-> Type`; no arrow means the call returns nothing).
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `connect` | `(target) -> Client` | Constructor. Target forms above. |
+| `connect_with` | `(target, ConnectOptions) -> Client` | Constructor with identity and tuning. |
+| `capabilities` | `() -> Capabilities` | Negotiated session properties. Synchronous. |
+| `read` | `(path) -> bytes` | Whole file into memory. |
+| `read_range` | `(path, offset, len) -> bytes` | Up to `len` bytes at `offset`; a short result is EOF. |
+| `write` | `(path, data)` | Create or truncate, then write all of `data`. |
+| `append` | `(path, data) -> offset` | Append at end of file; returns where it landed. |
+| `stat` | `(path) -> Metadata` | Does not follow symlinks. |
+| `metadata` | `(path) -> Metadata` | Follows symlinks (40-hop cap). |
+| `canonicalize` | `(path) -> bytes` | Resolve every symlink; canonical path bytes. |
+| `exists` | `(path) -> bool` | Any file type, no symlink follow. |
+| `set_attr` | `(path, SetAttrs) -> Metadata` | Any combination of metadata changes. |
+| `chmod` | `(path, mode) -> Metadata` | Permission bits. |
+| `chown` | `(path, uid?, gid?) -> Metadata` | A null field is left unchanged. |
+| `truncate` | `(path, size) -> Metadata` | Truncate or extend. |
+| `set_times` | `(path, atime?, mtime?) -> Metadata` | Each is a `SetTime` or null. |
+| `statfs` | `() -> StatFs` | Filesystem usage and limits. |
+| `sync` | `()` | Flush to durable storage (filesystem-global on ZeroFS). |
+| `create_dir` | `(path, mode) -> Metadata` | Parent must exist. |
+| `create_dir_all` | `(path, mode)` | Create missing ancestors too. |
+| `remove_file` | `(path)` | File, symlink, or device node. |
+| `remove_dir` | `(path)` | Must be empty. |
+| `remove_dir_all` | `(path)` | Recursive; not atomic. |
+| `rename` | `(from, to)` | Atomic; replaces an existing target. |
+| `hard_link` | `(original, link) -> Metadata` | New name for an existing inode. |
+| `symlink` | `(target, link_path) -> Metadata` | `target` is stored verbatim. |
+| `read_link` | `(path) -> bytes` | Raw symlink target (lossless). |
+| `mknod` | `(path, NodeKind, mode) -> Metadata` | Fifo, socket, or device node. |
+| `read_dir` | `(path) -> [DirEntry]` | Whole directory; `.` and `..` excluded. |
+| `open_dir` | `(path) -> Dir` | Cursor listing plus child operations. |
+| `open` | `(path, OpenOptions) -> File` | Positioned I/O. |
+| `create` | `(path) -> File` | Read-write, create, truncate, mode 0o644. |
+| `close` | `()` | Mark closed and release the session. |
+
+### File operations
+
+An open file; all I/O is positioned (there is no implicit cursor), usable from many tasks at once.
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `read_at` | `(offset, len) -> bytes` | A short result is EOF. |
+| `write_at` | `(offset, data)` | Any size; chunked internally. |
+| `metadata` | `() -> Metadata` | fstat of this handle. |
+| `set_len` | `(size)` | Truncate or extend. |
+| `set_attr` | `(SetAttrs) -> Metadata` | Metadata changes through the handle. |
+| `sync_all` | `()` | Data and metadata to durable storage. |
+| `sync_data` | `()` | Data only. |
+| `close` | `()` | Idempotent; never hangs. |
+
+### Directory operations
+
+A pull-based listing cursor plus `openat`-style child operations. **Child names cross as bytes**, not strings, so non-UTF-8 entries need no separate API: feed `DirEntry.name_bytes` back in verbatim.
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `next_batch` | `(max?) -> [DirEntry]` | Directory order; an empty list means end. A null `max` returns one server batch. |
+| `rewind` | `()` | Restart from the first entry. |
+| `metadata` | `() -> Metadata` | Of the directory itself. |
+| `set_attr` | `(SetAttrs) -> Metadata` | Of the directory itself. |
+| `open_at` | `(name, OpenOptions) -> File` | openat(2). |
+| `open_dir_at` | `(name) -> Dir` | Descend without decoding the name. |
+| `metadata_at` | `(name) -> Metadata` | fstatat(2); never follows symlinks. |
+| `set_attr_at` | `(name, SetAttrs) -> Metadata` | Change a child without opening it. |
+| `create_dir_at` | `(name, mode) -> Metadata` | mkdirat(2). |
+| `symlink_at` | `(name, target) -> Metadata` | symlinkat(2); `target` is raw bytes, verbatim. |
+| `link_at` | `(original_dir, original_name, new_name) -> Metadata` | linkat(2); `original_dir` is another open `Dir`. |
+| `mknod_at` | `(name, NodeKind, mode) -> Metadata` | mknodat(2). |
+| `remove_file_at` | `(name)` | unlinkat(2). |
+| `remove_dir_at` | `(name)` | unlinkat(2) with `AT_REMOVEDIR`. |
+| `rename_at` | `(old_name, new_dir, new_name)` | renameat(2); `new_dir` may be the same directory. |
+| `read_link_at` | `(name) -> bytes` | readlinkat(2). |
+| `close` | `()` | Idempotent; never hangs. |
+
+### Types
+
+**`OpenOptions`** — `read` (false), `write` (false), `create` (false), `create_new` (false), `truncate` (false), `mode` (0o644). `create_new` is the atomic exclusive create: it fails unless this call creates the file. In TypeScript, build it with the `openOptions(...)` helper so the defaults apply.
+
+**`ConnectOptions`** — `uid` (process euid), `gid` (process egid), `uname` (`$USER`, informational), `aname` (`""`, the default export), `msize` (1 MiB; the server clamps to 10 MiB), `connect_timeout_ms` (30000; null waits indefinitely).
+
+**`SetAttrs`** — optional `mode`, `uid`, `gid`, `size`, `atime`, `mtime`. An all-empty `SetAttrs` is a no-op; `atime`/`mtime` are `SetTime`.
+
+**`SetTime`** — `Now` (the server clock) or `At { time }` (an explicit timestamp).
+
+**`NodeKind`** — `Fifo`, `Socket`, `BlockDevice { major, minor }`, or `CharDevice { major, minor }`.
+
+**`FileType`** — `File`, `Dir`, `Symlink`, `Fifo`, `Socket`, `CharDevice`, `BlockDevice`, `Unknown`.
+
+**`Metadata`** — `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, and `atime`/`mtime`/`ctime` timestamps. `btime` and `data_version` are reserved (servers currently report 0).
+
+**`DirEntry`** — `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (present only when readdirplus is negotiated; null otherwise).
+
+**`StatFs`** — `block_size`, `blocks`, `blocks_free`, `blocks_available`, `files`, `files_free`, `filesystem_id`, `max_name_len`.
+
+**`Capabilities`** — `extensions_v1`, `extensions_v2`, `msize`, `max_read_chunk`, `max_write_chunk`. A live snapshot that can change across reconnects.
+
+## Idiomatic additions
+
+uniffi generates a faithful but mechanical surface (async methods, raw handle objects). Each library layers a hand-written facade on top with the conveniences uniffi cannot express:
+
+| Library | Package | Adds |
+|---------|---------|------|
+| Python | `zerofs-client` (PyPI) | `async with` on handles; `async for entry in dir`; streaming `file.read_chunks()` / `file.write_from()`; `os.PathLike` arguments; `read_text`/`write_text`; metadata predicates (`meta.is_dir()`); a blocking `connect_sync()` for non-async code; inline type hints (`py.typed`) |
+| TypeScript | `zerofs-client` (npm) | `await using` (`Symbol.asyncDispose`); `for await (const e of dir)`; Web Streams (`file.readable()` / `file.writable()`, backpressure-aware); `camelCase` aliases beside the generated `snake_case` names |
+| Go | `bindings/go` module | `dir.Entries()` as a range-over-func `iter.Seq2[DirEntry, error]`; `io.Reader`/`io.Writer` over a `File` (so `io.Copy` streams); `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers |
+
+## Connection loss and cancellation
+
+**Reconnection.** The underlying session reconnects forever with backoff and replays its state. While the server is unreachable, calls block rather than fail, the same behavior as `zerofs mount`. One caveat: an operation in flight at the instant the connection drops is resent, so a non-idempotent operation (`create`, `rename`, `unlink`) can apply twice across a reconnect.
+
+**Cancellation.** The libraries do not cancel server-side work; uniffi does not propagate host-side cancellation into Rust. Bound your own wait with the host's facilities: `asyncio.wait_for` (Python), `Promise.race` (TypeScript), or the `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers (Go). These *abandon the wait*: they return as soon as your timeout fires while the in-flight operation keeps running until the server answers, then discards its result and self-cleans. Pass a deadline to bound how long you wait, not how long the server works.
+
+**Closing.** `close()` marks a handle closed immediately, is idempotent, and never hangs. The server-side fid is released and its number recycled when the handle is dropped (or right after `close()` for scope-bound use), so a long-running client never exhausts fids.
+
+## Errors
+
+Every fallible call surfaces one flat, exhaustive `ZeroFsError`. Exhaustive is deliberate: a new server-side variant fails the binding's build rather than silently degrading to a catch-all. The variant-to-errno mapping is 1:1, and `error_to_errno(err)` returns the Linux errno for any error (the `Io` variant carries its own).
+
+| Variant | errno | Meaning |
+|---------|-------|---------|
+| `NotFound` | `ENOENT` | No entry at the path. |
+| `PermissionDenied` | `EACCES` | Denied by permission bits. |
+| `NotPermitted` | `EPERM` | Requires ownership or privilege. |
+| `AlreadyExists` | `EEXIST` | The target already exists. |
+| `NotADirectory` | `ENOTDIR` | A path component is not a directory. |
+| `IsADirectory` | `EISDIR` | A directory where a non-directory was required. |
+| `DirectoryNotEmpty` | `ENOTEMPTY` | Removing a non-empty directory. |
+| `NameTooLong` | `ENAMETOOLONG` | A name exceeds 255 bytes. |
+| `InvalidArgument` | `EINVAL` | Bad input, client-side or from the server. |
+| `TooManySymlinks` | `ELOOP` | Resolution exceeded the 40-hop cap. |
+| `Closed` | `EBADF` | A handle or client was used after `close()`. |
+| `ConnectFailed` | `EIO` | The initial connection or attach failed. |
+| `Io` | (its own) | Any other server errno, preserved verbatim. |
+| `Protocol` | `EIO` | Wire-level failure: codec, unexpected reply, or negotiation. |
+
+Each language matches it idiomatically:
+
+- **Python** raises typed exceptions: `except zerofs_client.ZeroFsError.NotFound`.
+- **TypeScript** throws subclasses: `err instanceof ZeroFsErrorNotFound`.
+- **Go** exposes sentinels for `errors.Is(err, zerofs_ffi.ErrZeroFsErrorNotFound)`.
+
+## Security
+
+<Warning>
+Like the NFS and 9P servers, the endpoint the libraries connect to has no authentication: a client asserts its uid at connect time and the server trusts it. Bind the 9P server to localhost (the default), use firewall rules or an SSH tunnel for remote access, and treat the transport as unencrypted.
+</Warning>
+
+---
+
+## Next Steps
+
+<div className="not-prose mt-6 flex gap-3">
+  <Button href="/9p-access" arrow="right">
+    How the 9P server works
+  </Button>
+  <Button href="/quickstart" variant="outline">
+    Run a ZeroFS server
+  </Button>
+</div>
