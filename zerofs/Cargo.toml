@@ -12,7 +12,7 @@ keywords = ["filesystem", "s3", "nfs", "distributed", "storage"]
 categories = ["filesystem", "network-programming"]
 
 [workspace]
-members = ["ninep-proto", "ninep-client", "zerofs-csi", "zerofs-client"]
+members = ["ninep-proto", "ninep-client", "zerofs-csi", "zerofs-client", "zerofs-ffi"]
 
 # Single source of truth for the release version. The zerofs-csi image is
 # tagged with the repo release tag and layers on the zerofs image of that
