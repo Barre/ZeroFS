@@ -7,10 +7,10 @@ export const metadata = {
 
 ZeroFS ships official client libraries for Python, TypeScript/Node, and Go. They are a programmatic alternative to mounting: your process speaks 9P2000.L straight to the server and gets path-based filesystem calls (`read`, `write`, `stat`, `readdir`, `open`) with no kernel mount in between. {{ className: 'lead' }}
 
-All three wrap one Rust core ([`zerofs-client`](https://crates.io/crates/zerofs-client)) compiled to a native library, so they share its behavior exactly: the same connection targets, the same fast-path extensions, the same reconnect and cancellation semantics. They connect to the same `[servers.ninep]` endpoint a [9P mount](/9p-access) uses, with the same trusted-network model — a client asserts its uid at connect time and the server trusts it.
+All three wrap one Rust core ([`zerofs-client`](https://crates.io/crates/zerofs-client)) compiled to a native library, so they share its behavior exactly: the same connection targets, the same fast-path extensions, the same reconnect and cancellation semantics. They connect to the same `[servers.ninep]` endpoint a [9P mount](/9p-access) uses, with the same trusted-network model: a client asserts its uid at connect time and the server trusts it.
 
 <Note>
-The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`) returns only after data reaches stable storage. Use them when you want filesystem operations from an application without a mount point. Like `zerofs mount`, the session reconnects on its own across a server restart or network blip, where the kernel 9P client wedges.
+The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`) returns only after data reaches stable storage. Use them when you want filesystem operations from an application without a mount point. Like `zerofs mount`.
 </Note>
 
 ## Installation
@@ -21,7 +21,7 @@ The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`)
 pip install zerofs
 ```
 
-The wheel bundles the native library (manylinux and musllinux on Linux, plus macOS and Windows), so the install is self-contained — no Rust toolchain, no build step. Import `zerofs` for the idiomatic facade; the low-level uniffi module is also importable as `zerofs_ffi`.
+The wheel bundles the native library (manylinux and musllinux on Linux, plus macOS and Windows), so the install is self-contained (no Rust toolchain, no build step). Import `zerofs` for the idiomatic facade; the low-level uniffi module is also importable as `zerofs_ffi`.
 
 ```python
 import zerofs
@@ -55,7 +55,7 @@ async with await zerofs.Client.connect("unix:/run/zerofs/9p.sock") as fs:
 npm install zerofs
 ```
 
-The matching `@zerofs/ffi-<platform>` native package installs as an optional dependency and is selected at load time; nothing to compile. The bindings call the library through [koffi](https://koffi.dev) rather than WASM, so sockets work.
+The matching `@zerofs/ffi-<platform>` native package installs as an optional dependency and is selected at load time. The bindings call the library through [koffi](https://koffi.dev) rather than WASM, so sockets work.
 
 ```typescript
 import { Client, openOptions, isFile } from "zerofs";
@@ -89,7 +89,7 @@ await fs.removeDirAll("/demo");
 go get github.com/Barre/ZeroFS/zerofs/zerofs-ffi/bindings/go
 ```
 
-The module ships the generated cgo sources and a C header, but **not** the native library — Go has no package registry that carries binaries. You build the `zerofs-ffi` cdylib from the ZeroFS source and point cgo at it; the [module README](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-ffi/bindings/go) covers the `CGO_CFLAGS`/`CGO_LDFLAGS` setup. This path needs a Rust toolchain and a C toolchain.
+The module ships the generated cgo sources and a C header, but **not** the native library: Go has no package registry that carries binaries. You build the `zerofs-ffi` cdylib from the ZeroFS source and point cgo at it; the [module README](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-ffi/bindings/go) covers the `CGO_CFLAGS`/`CGO_LDFLAGS` setup. This path needs a Rust toolchain and a C toolchain.
 
 ```go
 import (
@@ -136,11 +136,11 @@ for entry, err := range dir.Entries() {
 | `host:port` / `host` | TCP (port defaults to 5564) |
 | `/path` or `./path` | Unix socket (bare path) |
 
-For an explicit identity (`uid`/`gid`/`uname`), an attach subtree (`aname`), a custom `msize`, or a connect timeout, connect with a `ConnectOptions` (`connect_with` in Python/Go, `connectWith` in Node). The server clamps `msize` to 10 MiB, so requesting more has no effect — the same ceiling a 9P mount hits.
+For an explicit identity (`uid`/`gid`/`uname`), an attach subtree (`aname`), a custom `msize`, or a connect timeout, connect with a `ConnectOptions` (`connect_with` in Python/Go, `connectWith` in Node). The server clamps `msize` to 10 MiB, so requesting more has no effect (the same ceiling a 9P mount hits).
 
 ## The API surface
 
-The primary surface is one-shot path operations on a shared `Client`: `read`, `write`, `stat`, `metadata`, `exists`, `create_dir`/`create_dir_all`, `remove_file`/`remove_dir`, `rename`, `symlink`, `hard_link`, `read_dir`. `File` and `Dir` handles cover the stateful cases — positioned `read_at`/`write_at`, `truncate`, and `sync_all` on a file; incremental, cursor-based listing on a directory.
+The primary surface is one-shot path operations on a shared `Client`: `read`, `write`, `stat`, `metadata`, `exists`, `create_dir`/`create_dir_all`, `remove_file`/`remove_dir`, `rename`, `symlink`, `hard_link`, `read_dir`. `File` and `Dir` handles cover the stateful cases: positioned `read_at`/`write_at`, `truncate`, and `sync_all` on a file; incremental, cursor-based listing on a directory.
 
 Every method is async and maps to the host language's native async: `await` in Python, a `Promise` in TypeScript. In Go the async calls cross as ordinary blocking calls that return `(value, error)`. Reads come back as `bytes` (Python), `Uint8Array` (TypeScript), or `[]byte` (Go).
 
@@ -158,15 +158,15 @@ uniffi generates a faithful but mechanical surface (async methods, raw handle ob
 
 ## Connection loss and cancellation
 
-**Reconnection.** The underlying session reconnects forever with backoff and replays its state. While the server is unreachable, calls block rather than fail — the same behavior as `zerofs mount`. One caveat: an operation in flight at the instant the connection drops is resent, so a non-idempotent operation (`create`, `rename`, `unlink`) can apply twice across a reconnect.
+**Reconnection.** The underlying session reconnects forever with backoff and replays its state. While the server is unreachable, calls block rather than fail, the same behavior as `zerofs mount`. One caveat: an operation in flight at the instant the connection drops is resent, so a non-idempotent operation (`create`, `rename`, `unlink`) can apply twice across a reconnect.
 
-**Cancellation.** The libraries do not cancel server-side work; uniffi does not propagate host-side cancellation into Rust. Bound your own wait with the host's facilities — `asyncio.wait_for` (Python), `Promise.race` (TypeScript), or the `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers (Go). These *abandon the wait*: they return as soon as your timeout fires while the in-flight operation keeps running until the server answers, then discards its result and self-cleans. Pass a deadline to bound how long you wait, not how long the server works.
+**Cancellation.** The libraries do not cancel server-side work; uniffi does not propagate host-side cancellation into Rust. Bound your own wait with the host's facilities: `asyncio.wait_for` (Python), `Promise.race` (TypeScript), or the `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers (Go). These *abandon the wait*: they return as soon as your timeout fires while the in-flight operation keeps running until the server answers, then discards its result and self-cleans. Pass a deadline to bound how long you wait, not how long the server works.
 
 **Closing.** `close()` marks a handle closed immediately, is idempotent, and never hangs. The server-side fid is released and its number recycled when the handle is dropped (or right after `close()` for scope-bound use), so a long-running client never exhausts fids.
 
 ## Errors
 
-Errors surface as a single, exhaustive `ZeroFsError`. It is intentionally exhaustive — a new server-side variant fails the binding's build rather than silently degrading — and each language matches it idiomatically:
+Errors surface as a single, exhaustive `ZeroFsError`. It is intentionally exhaustive: a new server-side variant fails the binding's build rather than silently degrading. Each language matches it idiomatically:
 
 - **Python** raises typed exceptions: `except zerofs.ZeroFsError.NotFound`.
 - **TypeScript** throws subclasses: `err instanceof ZeroFsErrorNotFound`.
@@ -175,7 +175,7 @@ Errors surface as a single, exhaustive `ZeroFsError`. It is intentionally exhaus
 ## Security
 
 <Warning>
-Like the NFS and 9P servers, the endpoint the libraries connect to has no authentication. A client asserts its uid at connect time and the server trusts it — the same model as an unauthenticated NFS or 9P mount. Bind the 9P server to localhost (the default), use firewall rules or an SSH tunnel for remote access, and treat the transport as unencrypted.
+Like the NFS and 9P servers, the endpoint the libraries connect to has no authentication: a client asserts its uid at connect time and the server trusts it. Bind the 9P server to localhost (the default), use firewall rules or an SSH tunnel for remote access, and treat the transport as unencrypted.
 </Warning>
 
 ---
