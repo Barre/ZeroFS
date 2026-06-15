@@ -10,6 +10,7 @@ import Link from 'next/link'
 
 import { GridPattern } from '@/components/GridPattern'
 import { Heading } from '@/components/Heading'
+import { ChevronRightLeftIcon } from '@/components/icons/ChevronRightLeftIcon'
 import { FolderIcon } from '@/components/icons/FolderIcon'
 import { PackageIcon } from '@/components/icons/PackageIcon'
 import { LinkIcon } from '@/components/icons/LinkIcon'
@@ -66,6 +67,20 @@ const resources: Array<Resource> = [
       y: -6,
       squares: [
         [-1, 2],
+        [1, 3],
+      ],
+    },
+  },
+  {
+    href: '/client-libraries',
+    name: 'Client Libraries',
+    description:
+      'Access ZeroFS from Python, TypeScript, or Go. Path-based filesystem operations over 9P, no mount required.',
+    icon: ChevronRightLeftIcon,
+    pattern: {
+      y: 14,
+      squares: [
+        [0, 1],
         [1, 3],
       ],
     },

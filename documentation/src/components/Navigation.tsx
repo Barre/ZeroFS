@@ -271,6 +271,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'PostgreSQL in the Browser', href: '/postgresql-in-the-browser' },
       { title: 'NFS File Access', href: '/nfs-access' },
       { title: '9P File Access', href: '/9p-access' },
+      { title: 'Client Libraries', href: '/client-libraries' },
       { title: 'NBD Block Devices', href: '/nbd-devices' },
       { title: 'Kubernetes CSI Driver', href: '/kubernetes-csi' },
       { title: 'Licensing', href: '/licensing' },
