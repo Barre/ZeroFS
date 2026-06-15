@@ -33,7 +33,7 @@ jobs:
           pip install "maturin>=1.10,<2.0" "uniffi-bindgen==0.31.0"
           out="$PWD/target/wheels"
           ( cd zerofs-ffi/bindings/python && maturin build --out "$out" )
-          pip install "$out"/zerofs-*.whl
+          pip install "$out"/zerofs_client-*.whl
       - name: Run the installed bindings end-to-end
         run: |
           set -euo pipefail
