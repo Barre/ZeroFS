@@ -138,13 +138,131 @@ for entry, err := range dir.Entries() {
 
 For an explicit identity (`uid`/`gid`/`uname`), an attach subtree (`aname`), a custom `msize`, or a connect timeout, connect with a `ConnectOptions` (`connect_with` in Python/Go, `connectWith` in Node). The server clamps `msize` to 10 MiB, so requesting more has no effect (the same ceiling a 9P mount hits).
 
-## The API surface
+## API reference
 
-The primary surface is one-shot path operations on a shared `Client`: `read`, `write`, `stat`, `metadata`, `exists`, `create_dir`/`create_dir_all`, `remove_file`/`remove_dir`, `rename`, `symlink`, `hard_link`, `read_dir`. `File` and `Dir` handles cover the stateful cases: positioned `read_at`/`write_at`, `truncate`, and `sync_all` on a file; incremental, cursor-based listing on a directory.
+The full surface is the [`zerofs-client`](https://crates.io/crates/zerofs-client) core projected mechanically by uniffi, plus a thin per-language facade. The tables below are the canonical, language-neutral reference for every operation and type; the projection rules turn each into a concrete per-language signature.
 
-Every method is async and maps to the host language's native async: `await` in Python, a `Promise` in TypeScript. In Go the async calls cross as ordinary blocking calls that return `(value, error)`. Reads come back as `bytes` (Python), `Uint8Array` (TypeScript), or `[]byte` (Go).
+<Note>
+For exact per-language signatures, see the generated docs: [docs.rs](https://docs.rs/zerofs-client) (the Rust core), [pkg.go.dev](https://pkg.go.dev/github.com/Barre/ZeroFS/zerofs/zerofs-ffi/bindings/go) (Go), and [tsdocs.dev](https://tsdocs.dev/docs/zerofs-client) (TypeScript, from the shipped `.d.ts`). PyPI has no documentation host, so this page is the complete Python reference.
+</Note>
 
-Paths cross as strings. The byte-exact `Dir` `*_at` operations take child names as `bytes`/`Uint8Array`/`[]byte`, so non-UTF-8 names work with no separate API.
+### Projection rules
+
+Every operation maps to each language by the same rules, so a single canonical signature is unambiguous in all three.
+
+| Concept | Python | TypeScript | Go |
+|---------|--------|------------|----|
+| Method name | `snake_case` | `snake_case`, `camelCase` alias | `PascalCase` |
+| Async call | `await` (plus a blocking `connect_sync()`) | returns a `Promise` | blocking; returns `(value, error)` |
+| Byte payload | `bytes` | `Uint8Array` | `[]byte` |
+| Path argument | `str` or `os.PathLike` | `string` | `string` |
+| Child name (`*_at`) | `bytes` | `Uint8Array` | `[]byte` |
+| Optional value | `None` | `undefined` | `*T` (nil) |
+| Timestamp | `datetime` | `Date` | `time.Time` |
+| Options record | `OpenOptions(write=True)` | `openOptions({ write: true })` | `OpenOptions{Write: true}` |
+| Error | raises `ZeroFsError.NotFound` | throws `ZeroFsErrorNotFound` | `errors.Is(err, ErrZeroFsErrorNotFound)` |
+| Handle cleanup | `async with` / `await close()` | `await using` / `await close()` | `defer Close()` |
+
+### Client operations
+
+One identity, one session, safe to share across tasks. Path arguments are strings; returns are shown in canonical form (`-> Type`; no arrow means the call returns nothing).
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `connect` | `(target) -> Client` | Constructor. Target forms above. |
+| `connect_with` | `(target, ConnectOptions) -> Client` | Constructor with identity and tuning. |
+| `capabilities` | `() -> Capabilities` | Negotiated session properties. Synchronous. |
+| `read` | `(path) -> bytes` | Whole file into memory. |
+| `read_range` | `(path, offset, len) -> bytes` | Up to `len` bytes at `offset`; a short result is EOF. |
+| `write` | `(path, data)` | Create or truncate, then write all of `data`. |
+| `append` | `(path, data) -> offset` | Append at end of file; returns where it landed. |
+| `stat` | `(path) -> Metadata` | Does not follow symlinks. |
+| `metadata` | `(path) -> Metadata` | Follows symlinks (40-hop cap). |
+| `canonicalize` | `(path) -> bytes` | Resolve every symlink; canonical path bytes. |
+| `exists` | `(path) -> bool` | Any file type, no symlink follow. |
+| `set_attr` | `(path, SetAttrs) -> Metadata` | Any combination of metadata changes. |
+| `chmod` | `(path, mode) -> Metadata` | Permission bits. |
+| `chown` | `(path, uid?, gid?) -> Metadata` | A null field is left unchanged. |
+| `truncate` | `(path, size) -> Metadata` | Truncate or extend. |
+| `set_times` | `(path, atime?, mtime?) -> Metadata` | Each is a `SetTime` or null. |
+| `statfs` | `() -> StatFs` | Filesystem usage and limits. |
+| `sync` | `()` | Flush to durable storage (filesystem-global on ZeroFS). |
+| `create_dir` | `(path, mode) -> Metadata` | Parent must exist. |
+| `create_dir_all` | `(path, mode)` | Create missing ancestors too. |
+| `remove_file` | `(path)` | File, symlink, or device node. |
+| `remove_dir` | `(path)` | Must be empty. |
+| `remove_dir_all` | `(path)` | Recursive; not atomic. |
+| `rename` | `(from, to)` | Atomic; replaces an existing target. |
+| `hard_link` | `(original, link) -> Metadata` | New name for an existing inode. |
+| `symlink` | `(target, link_path) -> Metadata` | `target` is stored verbatim. |
+| `read_link` | `(path) -> bytes` | Raw symlink target (lossless). |
+| `mknod` | `(path, NodeKind, mode) -> Metadata` | Fifo, socket, or device node. |
+| `read_dir` | `(path) -> [DirEntry]` | Whole directory; `.` and `..` excluded. |
+| `open_dir` | `(path) -> Dir` | Cursor listing plus child operations. |
+| `open` | `(path, OpenOptions) -> File` | Positioned I/O. |
+| `create` | `(path) -> File` | Read-write, create, truncate, mode 0o644. |
+| `close` | `()` | Mark closed and release the session. |
+
+### File operations
+
+An open file; all I/O is positioned (there is no implicit cursor), usable from many tasks at once.
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `read_at` | `(offset, len) -> bytes` | A short result is EOF. |
+| `write_at` | `(offset, data)` | Any size; chunked internally. |
+| `metadata` | `() -> Metadata` | fstat of this handle. |
+| `set_len` | `(size)` | Truncate or extend. |
+| `set_attr` | `(SetAttrs) -> Metadata` | Metadata changes through the handle. |
+| `sync_all` | `()` | Data and metadata to durable storage. |
+| `sync_data` | `()` | Data only. |
+| `close` | `()` | Idempotent; never hangs. |
+
+### Directory operations
+
+A pull-based listing cursor plus `openat`-style child operations. **Child names cross as bytes**, not strings, so non-UTF-8 entries need no separate API: feed `DirEntry.name_bytes` back in verbatim.
+
+| Operation | Signature | Notes |
+|-----------|-----------|-------|
+| `next_batch` | `(max?) -> [DirEntry]` | Directory order; an empty list means end. A null `max` returns one server batch. |
+| `rewind` | `()` | Restart from the first entry. |
+| `metadata` | `() -> Metadata` | Of the directory itself. |
+| `set_attr` | `(SetAttrs) -> Metadata` | Of the directory itself. |
+| `open_at` | `(name, OpenOptions) -> File` | openat(2). |
+| `open_dir_at` | `(name) -> Dir` | Descend without decoding the name. |
+| `metadata_at` | `(name) -> Metadata` | fstatat(2); never follows symlinks. |
+| `set_attr_at` | `(name, SetAttrs) -> Metadata` | Change a child without opening it. |
+| `create_dir_at` | `(name, mode) -> Metadata` | mkdirat(2). |
+| `symlink_at` | `(name, target) -> Metadata` | symlinkat(2); `target` is raw bytes, verbatim. |
+| `link_at` | `(original_dir, original_name, new_name) -> Metadata` | linkat(2); `original_dir` is another open `Dir`. |
+| `mknod_at` | `(name, NodeKind, mode) -> Metadata` | mknodat(2). |
+| `remove_file_at` | `(name)` | unlinkat(2). |
+| `remove_dir_at` | `(name)` | unlinkat(2) with `AT_REMOVEDIR`. |
+| `rename_at` | `(old_name, new_dir, new_name)` | renameat(2); `new_dir` may be the same directory. |
+| `read_link_at` | `(name) -> bytes` | readlinkat(2). |
+| `close` | `()` | Idempotent; never hangs. |
+
+### Types
+
+**`OpenOptions`** — `read` (false), `write` (false), `create` (false), `create_new` (false), `truncate` (false), `mode` (0o644). `create_new` is the atomic exclusive create: it fails unless this call creates the file. In TypeScript, build it with the `openOptions(...)` helper so the defaults apply.
+
+**`ConnectOptions`** — `uid` (process euid), `gid` (process egid), `uname` (`$USER`, informational), `aname` (`""`, the default export), `msize` (1 MiB; the server clamps to 10 MiB), `connect_timeout_ms` (30000; null waits indefinitely).
+
+**`SetAttrs`** — optional `mode`, `uid`, `gid`, `size`, `atime`, `mtime`. An all-empty `SetAttrs` is a no-op; `atime`/`mtime` are `SetTime`.
+
+**`SetTime`** — `Now` (the server clock) or `At { time }` (an explicit timestamp).
+
+**`NodeKind`** — `Fifo`, `Socket`, `BlockDevice { major, minor }`, or `CharDevice { major, minor }`.
+
+**`FileType`** — `File`, `Dir`, `Symlink`, `Fifo`, `Socket`, `CharDevice`, `BlockDevice`, `Unknown`.
+
+**`Metadata`** — `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, and `atime`/`mtime`/`ctime` timestamps. `btime` and `data_version` are reserved (servers currently report 0).
+
+**`DirEntry`** — `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (present only when readdirplus is negotiated; null otherwise).
+
+**`StatFs`** — `block_size`, `blocks`, `blocks_free`, `blocks_available`, `files`, `files_free`, `filesystem_id`, `max_name_len`.
+
+**`Capabilities`** — `extensions_v1`, `extensions_v2`, `msize`, `max_read_chunk`, `max_write_chunk`. A live snapshot that can change across reconnects.
 
 ## Idiomatic additions
 
@@ -166,7 +284,26 @@ uniffi generates a faithful but mechanical surface (async methods, raw handle ob
 
 ## Errors
 
-Errors surface as a single, exhaustive `ZeroFsError`. It is intentionally exhaustive: a new server-side variant fails the binding's build rather than silently degrading. Each language matches it idiomatically:
+Every fallible call surfaces one flat, exhaustive `ZeroFsError`. Exhaustive is deliberate: a new server-side variant fails the binding's build rather than silently degrading to a catch-all. The variant-to-errno mapping is 1:1, and `error_to_errno(err)` returns the Linux errno for any error (the `Io` variant carries its own).
+
+| Variant | errno | Meaning |
+|---------|-------|---------|
+| `NotFound` | `ENOENT` | No entry at the path. |
+| `PermissionDenied` | `EACCES` | Denied by permission bits. |
+| `NotPermitted` | `EPERM` | Requires ownership or privilege. |
+| `AlreadyExists` | `EEXIST` | The target already exists. |
+| `NotADirectory` | `ENOTDIR` | A path component is not a directory. |
+| `IsADirectory` | `EISDIR` | A directory where a non-directory was required. |
+| `DirectoryNotEmpty` | `ENOTEMPTY` | Removing a non-empty directory. |
+| `NameTooLong` | `ENAMETOOLONG` | A name exceeds 255 bytes. |
+| `InvalidArgument` | `EINVAL` | Bad input, client-side or from the server. |
+| `TooManySymlinks` | `ELOOP` | Resolution exceeded the 40-hop cap. |
+| `Closed` | `EBADF` | A handle or client was used after `close()`. |
+| `ConnectFailed` | `EIO` | The initial connection or attach failed. |
+| `Io` | (its own) | Any other server errno, preserved verbatim. |
+| `Protocol` | `EIO` | Wire-level failure: codec, unexpected reply, or negotiation. |
+
+Each language matches it idiomatically:
 
 - **Python** raises typed exceptions: `except zerofs_client.ZeroFsError.NotFound`.
 - **TypeScript** throws subclasses: `err instanceof ZeroFsErrorNotFound`.
