@@ -1370,6 +1370,11 @@ impl NinePClient {
 
 impl Drop for NinePClient {
     fn drop(&mut self) {
+        // Tear down the live connection. The reader and writer each hold an
+        // `Arc<Conn>` (which owns the only `writer_tx`), so that cycle never
+        // breaks on its own; `shutdown` wakes both so they exit and release the
+        // socket fd. Without this, dropping a client leaks the fd + both tasks.
+        self.conn.load().shutdown();
         // Wake the supervisor so it observes the dropped client and exits.
         self.reconnect_notify.notify_waiters();
     }
