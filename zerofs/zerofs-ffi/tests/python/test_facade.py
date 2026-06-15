@@ -7,19 +7,19 @@ generated bindings and bindings/python/).
 import asyncio
 import sys
 
-import zerofs
+import zerofs_client
 
 
 async def main(target: str) -> None:
     # Client as an async context manager; closed on block exit.
-    async with await zerofs.Client.connect(target) as fs:
+    async with await zerofs_client.Client.connect(target) as fs:
         await fs.create_dir_all("/facade", 0o755)
         for i in range(5):
             await fs.write(f"/facade/f{i}", b"x")
 
         # File as an async context manager.
         async with await fs.open(
-            "/facade/handle", zerofs.OpenOptions(write=True, create=True)
+            "/facade/handle", zerofs_client.OpenOptions(write=True, create=True)
         ) as f:
             await f.write_at(0, b"via context manager")
 
@@ -36,7 +36,7 @@ async def main(target: str) -> None:
     try:
         await fs.read("/facade/f0")
         raise SystemExit("expected Closed after context exit")
-    except zerofs.ZeroFsError.Closed:
+    except zerofs_client.ZeroFsError.Closed:
         pass
 
     print("FACADE PYTHON CHECKS PASSED")

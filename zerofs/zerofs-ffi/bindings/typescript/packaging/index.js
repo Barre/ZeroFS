@@ -1,4 +1,4 @@
-// Native-addon loader for the `zerofs` npm package.
+// Native-addon loader for the `zerofs-client` npm package.
 //
 // This file REPLACES the generator's auto-loading `index.js` at publish time.
 // The generated `index.js` is just:
@@ -62,7 +62,7 @@ async function resolveLibraryPath() {
   const pkg = platformPackageFor(target);
   if (pkg == null) {
     throw new Error(
-      `zerofs: unsupported platform target ${JSON.stringify(target)} ` +
+      `zerofs-client: unsupported platform target ${JSON.stringify(target)} ` +
         `(${process.platform}/${process.arch}). Supported: linux-x64-gnu, ` +
         `linux-arm64-gnu, darwin-x64, darwin-arm64, win32-x64.`,
     );
@@ -77,7 +77,7 @@ async function resolveLibraryPath() {
     return libraryPath;
   } catch (cause) {
     throw new Error(
-      `zerofs: the prebuilt native library for ${target} is not installed. ` +
+      `zerofs-client: the prebuilt native library for ${target} is not installed. ` +
         `It ships as the optional dependency ${pkg}. If your installer skipped ` +
         `optional dependencies (e.g. \`npm install --no-optional\`), reinstall ` +
         `without that flag.`,

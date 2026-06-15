@@ -178,7 +178,7 @@ jobs:
           skip-existing: true
           print-hash: true
 
-  # Native-addon distribution: a thin main package `zerofs` (facade + generated
+  # Native-addon distribution: a thin main package `zerofs-client` (facade + generated
   # JS, no cdylib) plus five `@zerofs/ffi-<target>` packages each shipping one
   # prebuilt cdylib, wired via optionalDependencies; the loader (packaging/
   # index.js) resolves the matching one at runtime for koffi. One job, matrix
@@ -307,14 +307,14 @@ jobs:
           JSON
           npx tsc -p tsconfig.facade.json
 
-      - name: Assemble and publish main package zerofs
+      - name: Assemble and publish main package zerofs-client
         if: matrix.is_main
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/pkg-main"
           zerofs-ffi/bindings/typescript/packaging/assemble.sh main "$RUNNER_TEMP/gen" "$out"
           # The main package's optionalDependencies pin the exact platform
-          # versions; wait until all five are live so a fresh `npm install zerofs`
+          # versions; wait until all five are live so a fresh `npm install zerofs-client`
           # resolves a cdylib. Mirrors csi-docker.yml waiting on its base image.
           targets="linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64 win32-x64"
           for t in $targets; do
@@ -327,8 +327,8 @@ jobs:
               sleep 15
             done
           done
-          if npm view "zerofs@$VERSION" version >/dev/null 2>&1; then
-            echo "zerofs@$VERSION already published; skipping"
+          if npm view "zerofs-client@$VERSION" version >/dev/null 2>&1; then
+            echo "zerofs-client@$VERSION already published; skipping"
           else
             ( cd "$out" && npm publish --access public )
           fi

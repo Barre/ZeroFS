@@ -10,25 +10,25 @@ import pathlib
 import sys
 import typing
 
-import zerofs
+import zerofs_client
 
 
 def typing_part() -> None:
     # The facade imports cleanly with the new annotations (deferred via
     # `from __future__ import annotations`, so they never run at import time).
-    assert hasattr(zerofs.File, "write_from"), "write_from not installed on File"
-    assert hasattr(zerofs.File, "read_chunks")
+    assert hasattr(zerofs_client.File, "write_from"), "write_from not installed on File"
+    assert hasattr(zerofs_client.File, "read_chunks")
 
     # get_type_hints resolves the deferred annotations against the generated
     # types, proving they are valid type objects, not unresolved strings.
-    hints = typing.get_type_hints(zerofs.File.write_from)
+    hints = typing.get_type_hints(zerofs_client.File.write_from)
     assert hints["return"] is int, hints
     assert hints["offset"] is int, hints
 
     # PEP 561: the installed package ships a py.typed marker so checkers honor
     # the inline annotations.
-    pkg_dir = os.path.dirname(zerofs.__file__)
-    assert os.path.exists(os.path.join(pkg_dir, "py.typed")), "missing zerofs/py.typed"
+    pkg_dir = os.path.dirname(zerofs_client.__file__)
+    assert os.path.exists(os.path.join(pkg_dir, "py.typed")), "missing zerofs_client/py.typed"
 
     # The generated low-level module is also marked typed.
     spec = importlib.util.find_spec("zerofs_ffi")
@@ -38,7 +38,7 @@ def typing_part() -> None:
 
 
 async def async_part(target: str) -> None:
-    fs = await zerofs.Client.connect(target)
+    fs = await zerofs_client.Client.connect(target)
 
     # PathLike: pathlib.Path works anywhere a path is taken.
     await fs.create_dir_all(pathlib.Path("/erg/a/b"), 0o755)
@@ -47,7 +47,7 @@ async def async_part(target: str) -> None:
     # Streaming reads in chunks.
     big = bytes((i % 251) for i in range(250_000))
     await fs.write("/erg/big.bin", big)
-    f = await fs.open("/erg/big.bin", zerofs.OpenOptions(read=True))
+    f = await fs.open("/erg/big.bin", zerofs_client.OpenOptions(read=True))
     chunks = [chunk async for chunk in f.read_chunks(64 * 1024)]
     await f.close()
     assert b"".join(chunks) == big
@@ -63,7 +63,7 @@ async def async_part(target: str) -> None:
         yield b""  # empty chunks are skipped, not written
 
     async with await fs.open(
-        "/erg/written.bin", zerofs.OpenOptions(write=True, create=True, truncate=True)
+        "/erg/written.bin", zerofs_client.OpenOptions(write=True, create=True, truncate=True)
     ) as wf:
         total = await wf.write_from(gen())
     assert total == len(expected), (total, len(expected))
@@ -74,7 +74,7 @@ async def async_part(target: str) -> None:
         yield b"tail"
 
     async with await fs.open(
-        "/erg/offset.bin", zerofs.OpenOptions(write=True, create=True, truncate=True)
+        "/erg/offset.bin", zerofs_client.OpenOptions(write=True, create=True, truncate=True)
     ) as of:
         await of.write_at(0, b"head_")
         n = await of.write_from(one(), offset=5)
@@ -105,7 +105,7 @@ async def async_part(target: str) -> None:
 
 def sync_part(target: str) -> None:
     # Blocking API for non-async code; `with` closes it (and stops the loop).
-    with zerofs.connect_sync(target) as fs:
+    with zerofs_client.connect_sync(target) as fs:
         fs.create_dir_all("/sync", 0o755)
         fs.write("/sync/a.txt", b"sync hello")
         assert fs.read("/sync/a.txt") == b"sync hello"

@@ -18,15 +18,15 @@ The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`)
 ### Python
 
 ```bash
-pip install zerofs
+pip install zerofs-client
 ```
 
-The wheel bundles the native library (manylinux and musllinux on Linux, plus macOS and Windows), so the install is self-contained (no Rust toolchain, no build step). Import `zerofs` for the idiomatic facade; the low-level uniffi module is also importable as `zerofs_ffi`.
+The wheel bundles the native library (manylinux and musllinux on Linux, plus macOS and Windows), so the install is self-contained (no Rust toolchain, no build step). Import `zerofs_client` for the idiomatic facade; the low-level uniffi module is also importable as `zerofs_ffi`.
 
 ```python
-import zerofs
+import zerofs_client
 
-async with await zerofs.Client.connect("unix:/run/zerofs/9p.sock") as fs:
+async with await zerofs_client.Client.connect("unix:/run/zerofs/9p.sock") as fs:
     await fs.create_dir_all("/demo", 0o755)
     await fs.write("/demo/notes.txt", b"hello from zerofs")
 
@@ -35,7 +35,7 @@ async with await zerofs.Client.connect("unix:/run/zerofs/9p.sock") as fs:
     print(len(data), meta.size, meta.is_file())
 
     # A File handle for positioned I/O.
-    async with await fs.open("/demo/data.bin", zerofs.OpenOptions(write=True, create=True)) as f:
+    async with await fs.open("/demo/data.bin", zerofs_client.OpenOptions(write=True, create=True)) as f:
         await f.write_at(0, b"\x00" * 4096)
         await f.sync_all()
 
@@ -52,13 +52,13 @@ async with await zerofs.Client.connect("unix:/run/zerofs/9p.sock") as fs:
 ### TypeScript / Node
 
 ```bash
-npm install zerofs
+npm install zerofs-client
 ```
 
 The matching `@zerofs/ffi-<platform>` native package installs as an optional dependency and is selected at load time. The bindings call the library through [koffi](https://koffi.dev) rather than WASM, so sockets work.
 
 ```typescript
-import { Client, openOptions, isFile } from "zerofs";
+import { Client, openOptions, isFile } from "zerofs-client";
 
 await using fs = await Client.connect("unix:/run/zerofs/9p.sock");
 
@@ -152,8 +152,8 @@ uniffi generates a faithful but mechanical surface (async methods, raw handle ob
 
 | Library | Package | Adds |
 |---------|---------|------|
-| Python | `zerofs` (PyPI) | `async with` on handles; `async for entry in dir`; streaming `file.read_chunks()` / `file.write_from()`; `os.PathLike` arguments; `read_text`/`write_text`; metadata predicates (`meta.is_dir()`); a blocking `connect_sync()` for non-async code; inline type hints (`py.typed`) |
-| TypeScript | `zerofs` (npm) | `await using` (`Symbol.asyncDispose`); `for await (const e of dir)`; Web Streams (`file.readable()` / `file.writable()`, backpressure-aware); `camelCase` aliases beside the generated `snake_case` names |
+| Python | `zerofs-client` (PyPI) | `async with` on handles; `async for entry in dir`; streaming `file.read_chunks()` / `file.write_from()`; `os.PathLike` arguments; `read_text`/`write_text`; metadata predicates (`meta.is_dir()`); a blocking `connect_sync()` for non-async code; inline type hints (`py.typed`) |
+| TypeScript | `zerofs-client` (npm) | `await using` (`Symbol.asyncDispose`); `for await (const e of dir)`; Web Streams (`file.readable()` / `file.writable()`, backpressure-aware); `camelCase` aliases beside the generated `snake_case` names |
 | Go | `bindings/go` module | `dir.Entries()` as a range-over-func `iter.Seq2[DirEntry, error]`; `io.Reader`/`io.Writer` over a `File` (so `io.Copy` streams); `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers |
 
 ## Connection loss and cancellation
@@ -168,7 +168,7 @@ uniffi generates a faithful but mechanical surface (async methods, raw handle ob
 
 Errors surface as a single, exhaustive `ZeroFsError`. It is intentionally exhaustive: a new server-side variant fails the binding's build rather than silently degrading. Each language matches it idiomatically:
 
-- **Python** raises typed exceptions: `except zerofs.ZeroFsError.NotFound`.
+- **Python** raises typed exceptions: `except zerofs_client.ZeroFsError.NotFound`.
 - **TypeScript** throws subclasses: `err instanceof ZeroFsErrorNotFound`.
 - **Go** exposes sentinels for `errors.Is(err, zerofs_ffi.ErrZeroFsErrorNotFound)`.
 

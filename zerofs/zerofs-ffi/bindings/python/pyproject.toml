@@ -3,7 +3,7 @@ requires = ["maturin>=1.10,<2.0", "uniffi-bindgen==0.31.0"]
 build-backend = "maturin"
 
 [project]
-name = "zerofs"
+name = "zerofs-client"
 description = "Async, path-based client for ZeroFS over 9P, with idiomatic Python ergonomics"
 readme = "README.md"
 license = { text = "AGPL-3.0" }
@@ -13,8 +13,8 @@ dynamic = ["version"]
 [tool.maturin]
 bindings = "uniffi"
 manifest-path = "../../Cargo.toml"
-# The generated module lives inside the `zerofs` package (as zerofs._zerofs_ffi)
-# so the facade's py.typed covers it; the top-level `zerofs_ffi` shim re-exports
-# it (for `import zerofs_ffi`) and carries its own py.typed.
-module-name = "zerofs._zerofs_ffi"
-python-packages = ["zerofs", "zerofs_ffi"]
+# The generated module lives inside the `zerofs_client` package (as
+# zerofs_client._zerofs_ffi) so the facade's py.typed covers it; the top-level
+# `zerofs_ffi` shim re-exports it (for `import zerofs_ffi`) and carries py.typed.
+module-name = "zerofs_client._zerofs_ffi"
+python-packages = ["zerofs_client", "zerofs_ffi"]

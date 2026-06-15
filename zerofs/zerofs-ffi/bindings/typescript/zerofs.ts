@@ -3,7 +3,7 @@
 // niceties uniffi cannot generate: explicit resource management (`await using`)
 // and async iteration. Ship it next to the generated `index.js`.
 //
-//   import { Client } from "./zerofs.js";
+//   import { Client } from "zerofs-client";
 //
 //   await using fs = await Client.connect("unix:/run/zerofs/9p.sock");
 //   await fs.write("/hello.txt", new TextEncoder().encode("hi"));
@@ -12,7 +12,7 @@
 //   // fs and dir are disposed (closed) automatically at scope exit.
 //
 // `File` shadows the DOM `File`; alias on import if you need both:
-//   import { File as ZfsFile } from "./zerofs.js";
+//   import { File as ZfsFile } from "zerofs-client";
 
 import {
   Client,

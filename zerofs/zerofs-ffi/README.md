@@ -49,17 +49,17 @@ and Go run end-to-end against a real ZeroFS server.
 ## Packaging
 
 **Python** ships as an installable wheel that bundles the cdylib, the generated
-`zerofs_ffi` module, and the `zerofs` facade, built with
+`zerofs_ffi` module, and the `zerofs_client` facade, built with
 [maturin](https://www.maturin.rs) in its uniffi mode:
 
 ```sh
 pip install "maturin>=1.10,<2.0" "uniffi-bindgen==0.31.0"
-maturin build --profile wheel -m zerofs-ffi/bindings/python/pyproject.toml
-pip install target/wheels/zerofs-*.whl
+(cd zerofs-ffi/bindings/python && maturin build --profile wheel)
+pip install target/wheels/zerofs_client-*.whl
 ```
 
 maturin reads the wheel version straight from `zerofs-ffi/Cargo.toml`, and the
-`zerofs` facade rides along via `python-packages`. Two non-obvious bits: the
+`zerofs_client` facade rides along via `python-packages`. Two non-obvious bits: the
 crate deliberately carries **no** `uniffi-bindgen` bin (maturin's default
 `cargo run --bin uniffi-bindgen` can't resolve it from this workspace, whose root
 *is* the `zerofs` server package, so maturin falls back to the external
@@ -100,19 +100,19 @@ uniffi cannot express. Distribute the facade alongside the generated module.
 
 | Language   | Facade                          | Adds |
 |------------|---------------------------------|------|
-| Python     | `bindings/python/zerofs/__init__.py` | `async with`; `async for entry in dir`; streaming `file.read_chunks()` and `file.write_from(async_iterable, offset=0)`; `PathLike` args; `read_text`/`write_text`; `canonicalize_str`/`read_link_str`; metadata `meta.is_dir()`/`is_file()`/`is_symlink()`/`permissions()`; blocking `connect_sync()`; full type hints + `py.typed` markers in both packages |
+| Python     | `bindings/python/zerofs_client/__init__.py` | `async with`; `async for entry in dir`; streaming `file.read_chunks()` and `file.write_from(async_iterable, offset=0)`; `PathLike` args; `read_text`/`write_text`; `canonicalize_str`/`read_link_str`; metadata `meta.is_dir()`/`is_file()`/`is_symlink()`/`permissions()`; blocking `connect_sync()`; full type hints + `py.typed` markers in both packages |
 | TypeScript | `bindings/typescript/zerofs.ts` | `await using` (`Symbol.asyncDispose`); `for await (const e of dir)`; Web Streams: `file.readable(chunkSize=1MiB)` (`ReadableStream`) and `file.writable(offset=0)` (`WritableStream`, backpressure-honouring); `camelCase` aliases (`openDir`, `nextBatch`, `readAt`, …) beside the kept `snake_case` names; `canonicalizeStr`/`readLinkStr`; metadata predicate helpers `isDir(m)`/`isFile(m)`/`isSymlink(m)`/`permissions(m)` |
 | Go         | `bindings/go/facade.go`         | `dir.Entries()` as a range-over-func `iter.Seq2[DirEntry, error]` (one batch at a time); `file.Reader()`/`file.ReaderAt(off)` as `io.Reader` (also `io.WriterTo`, so `io.Copy` streams with no extra buffer); `file.Writer()`/`file.WriterAt(off)` as `io.Writer`; `CanonicalizeStr`/`ReadLinkStr`; metadata `meta.IsDir()`/`IsFile()`/`IsSymlink()`/`Permissions()`; `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers around the blocking calls |
 
 ```python
-import zerofs
-async with await zerofs.Client.connect(target) as fs:
+import zerofs_client
+async with await zerofs_client.Client.connect(target) as fs:
     async with await fs.open_dir("/") as d:
         async for entry in d:
             print(entry.name)
 
 # ...or from synchronous code:
-with zerofs.connect_sync(target) as fs:
+with zerofs_client.connect_sync(target) as fs:
     print(fs.read("/hello.txt"))
     for entry in fs.open_dir("/"):
         print(entry.name)
@@ -144,7 +144,7 @@ defaults (the Node generator doesn't apply uniffi record defaults).
 - **Exhaustive errors.** `ZeroFsError` is intentionally exhaustive: a new
   upstream variant fails this crate's build rather than silently degrading.
 - **Matching errors idiomatically.** Python raises typed exceptions
-  (`except zerofs.ZeroFsError.NotFound`); Go exposes sentinels for
+  (`except zerofs_client.ZeroFsError.NotFound`); Go exposes sentinels for
   `errors.Is(err, zerofs_ffi.ErrZeroFsErrorNotFound)`; TypeScript throws
   subclasses of `ZeroFsError` for `instanceof ZeroFsErrorNotFound`.
 

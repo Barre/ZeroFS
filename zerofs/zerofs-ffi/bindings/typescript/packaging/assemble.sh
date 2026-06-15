@@ -9,7 +9,7 @@
 #       one cdylib. Run once per matrix leg; upload <out-dir> as an artifact.
 #
 #   assemble.sh main <generated-dir> <out-dir>
-#       Build the thin main `zerofs` package from generated bindings (produced
+#       Build the thin main `zerofs-client` package from generated bindings (produced
 #       by `generate.sh typescript`). Run once on the publish host. Drops the
 #       generator's auto-loading index.js and the bundled .so, swaps in the
 #       optionalDependency loader.
@@ -72,7 +72,7 @@ case "$cmd" in
 # $pkgname
 
 Prebuilt ZeroFS native library for \`$target\`. Installed automatically as an
-optional dependency of the [\`zerofs\`](https://www.npmjs.com/package/zerofs)
+optional dependency of the [\`zerofs-client\`](https://www.npmjs.com/package/zerofs-client)
 package. You should not depend on this package directly.
 EOF
     echo "assembled platform package $pkgname@$version -> $out"
@@ -105,12 +105,12 @@ EOF
       cp "$ts_dir/README.md" "$out/README.md"
     else
       cat > "$out/README.md" <<EOF
-# zerofs
+# zerofs-client
 
 Programmatic client for [ZeroFS](https://github.com/Barre/ZeroFS) from Node.
 
 \`\`\`js
-import { Client } from "zerofs";
+import { Client } from "zerofs-client";
 
 await using fs = await Client.connect("unix:/run/zerofs/9p.sock");
 await fs.write("/hello.txt", new TextEncoder().encode("hi"));
@@ -121,7 +121,7 @@ The prebuilt native library is delivered per-platform via the
 and load time automatically.
 EOF
     fi
-    echo "assembled main package zerofs@$version -> $out"
+    echo "assembled main package zerofs-client@$version -> $out"
     ;;
 
   *)

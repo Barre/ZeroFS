@@ -9,13 +9,13 @@ the two never collide.
 
 A single "client-family" version covers everything in this family:
 
-| Artifact                          | Registry  | Version source                          |
-| --------------------------------- | --------- | --------------------------------------- |
-| `zerofs-client` (Rust crate)      | crates.io | client-family version                   |
-| `zerofs-ffi` (cdylib)             | _not published_ | client-family version (`publish = false`) |
-| `zerofs` (Python wheel + sdist)   | PyPI      | client-family version                   |
-| `zerofs` (+ `@zerofs/ffi-*`) npm  | npm       | client-family version                   |
-| Go module (subdir tag)            | git tag   | client-family version                   |
+| Artifact                                | Registry        | Version source                            |
+| --------------------------------------- | --------------- | ----------------------------------------- |
+| `zerofs-client` (Rust crate)            | crates.io       | client-family version                     |
+| `zerofs-ffi` (cdylib)                   | _not published_ | client-family version (`publish = false`) |
+| `zerofs-client` (Python wheel + sdist)  | PyPI            | client-family version                     |
+| `zerofs-client` (+ `@zerofs/ffi-*`) npm | npm             | client-family version                     |
+| Go module (subdir tag)                  | git tag         | client-family version                     |
 
 The **single source of truth** for that version is the `version` field of
 `zerofs/zerofs-ffi/Cargo.toml`. Everything else derives from it:
@@ -100,7 +100,7 @@ survive generation). `generate.sh` auto-detects `.so`/`.dylib`.
   macOS and Windows. The linux-x86_64 leg also builds the sdist. Auth: **GitHub
   OIDC Trusted Publishing** (no token).
 - **`publish-npm`**: per-platform matrix building five `@zerofs/ffi-<target>`
-  packages (each one cdylib) plus a thin main `zerofs` package (facade + generated
+  packages (each one cdylib) plus a thin main `zerofs-client` package (facade + generated
   JS, no cdylib) wired via `optionalDependencies`. The loader resolves the matching
   platform package at runtime. The main package is published last, after the leg
   polls npm until all five platform packages are live. Auth: `NPM_TOKEN`.
@@ -141,10 +141,10 @@ real release:
 
 ### PyPI
 
-- Register a **Trusted Publisher** on the `zerofs` PyPI project pointing at
+- Register a **Trusted Publisher** on the `zerofs-client` PyPI project pointing at
   owner `Barre` / repo `ZeroFS` / workflow `publish-client.yml`. Use a *pending
   publisher* for the very first release if the project does not exist yet.
-- Confirm the **`zerofs`** distribution name is available/owned on PyPI. If a
+- Confirm the **`zerofs-client`** distribution name is available/owned on PyPI. If a
   different name is needed, change `name` in `bindings/python/pyproject.toml`.
 - No token is used (OIDC); the job has `permissions: id-token: write`. Add an
   `environment:` to the job if you want a protected GitHub environment gating the
@@ -153,9 +153,9 @@ real release:
 ### npm
 
 - Add repository secret **`NPM_TOKEN`** (an automation token).
-- Own the unscoped **`zerofs`** package name, **and** create the **`@zerofs`**
+- Own the unscoped **`zerofs-client`** package name, **and** create the **`@zerofs`**
   org/scope (for the five `@zerofs/ffi-*` packages) configured to allow public
-  publishing. If `zerofs` is taken, switch the main package name to
+  publishing. If `zerofs-client` is taken, switch the main package name to
   `@zerofs/client` in `bindings/typescript/packaging/package.json.tmpl`.
 
 ### GitHub (Go)

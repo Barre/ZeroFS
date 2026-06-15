@@ -1,5 +1,5 @@
 // Per-platform native package: ships exactly one prebuilt cdylib and exports
-// the absolute path to it. The main `zerofs` package's loader `require()`s this
+// the absolute path to it. The main `zerofs-client` package's loader `require()`s this
 // and hands `libraryPath` to the generator's `load(libraryPath)`.
 //
 // assemble.sh substitutes the cdylib filename below at publish time:
