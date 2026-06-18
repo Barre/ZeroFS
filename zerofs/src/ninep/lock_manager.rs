@@ -41,8 +41,10 @@ pub struct FileLockManager {
     locks: Arc<DashMap<LockId, FileLock>>,
     // Counter for generating unique lock IDs
     next_lock_id: Arc<AtomicU64>,
-    // Mutex for atomic lock operations
-    lock_mutex: Arc<tokio::sync::Mutex<()>>,
+    // Serializes lock operations. A std (not tokio) mutex: every critical
+    // section below is await-free DashMap work, and being sync lets LockGuard
+    // release locks from its (sync) Drop.
+    lock_mutex: Arc<std::sync::Mutex<()>>,
 }
 
 impl FileLockManager {
@@ -52,7 +54,7 @@ impl FileLockManager {
             locks_by_session: Arc::new(DashMap::new()),
             locks: Arc::new(DashMap::new()),
             next_lock_id: Arc::new(AtomicU64::new(1)),
-            lock_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            lock_mutex: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -96,8 +98,8 @@ impl FileLockManager {
     }
 
     /// Attempts to add a lock, returning the lock ID on success or `None` on conflict.
-    pub async fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Option<LockId> {
-        let _guard = self.lock_mutex.lock().await;
+    pub fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Option<LockId> {
+        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check for conflicts *before* mutating any state. POSIX requires that a
         // failed lock request leave the caller's existing locks untouched (e.g. a
@@ -132,7 +134,7 @@ impl FileLockManager {
         Some(self.insert_lock(session_id, lock))
     }
 
-    pub async fn unlock_range(
+    pub fn unlock_range(
         &self,
         inode_id: InodeId,
         fid: u32,
@@ -140,7 +142,7 @@ impl FileLockManager {
         length: u64,
         session_id: u64,
     ) -> bool {
-        let _guard = self.lock_mutex.lock().await;
+        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
         let unlock_end = if length == 0 {
             u64::MAX
@@ -275,13 +277,13 @@ impl FileLockManager {
         false
     }
 
-    pub async fn check_would_block(
+    pub fn check_would_block(
         &self,
         inode_id: InodeId,
         test_lock: &FileLock,
         session_id: u64,
     ) -> Option<FileLock> {
-        let _guard = self.lock_mutex.lock().await;
+        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lock_ids) = self.locks_by_inode.get(&inode_id) {
             for lock_id in lock_ids.iter() {
                 if let Some(existing_lock) = self.locks.get(lock_id) {
@@ -314,8 +316,8 @@ impl FileLockManager {
         None
     }
 
-    pub async fn release_session_locks(&self, session_id: u64) {
-        let _guard = self.lock_mutex.lock().await;
+    pub fn release_session_locks(&self, session_id: u64) {
+        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some((_, lock_ids)) = self.locks_by_session.remove(&session_id) {
             for lock_id in lock_ids {
@@ -327,6 +329,55 @@ impl FileLockManager {
                 }
             }
         }
+    }
+
+    /// Release every lock `fid` holds in `session_id`, on any inode; returns
+    /// whether anything was released. Backs `LockGuard::drop` — keyed by
+    /// (session, fid), not inode, so it covers a fid that was walked to another
+    /// inode while holding locks.
+    pub fn release_fid_locks(&self, session_id: u64, fid: u32) -> bool {
+        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+        let to_remove: Vec<LockId> = match self.locks_by_session.get(&session_id) {
+            Some(lock_ids) => lock_ids
+                .iter()
+                .filter(|id| self.locks.get(id).is_some_and(|l| l.fid == fid))
+                .copied()
+                .collect(),
+            None => return false,
+        };
+
+        for lock_id in &to_remove {
+            self.remove_lock(session_id, *lock_id);
+        }
+        !to_remove.is_empty()
+    }
+}
+
+/// Releases all of a fid's byte-range locks on drop. Created on the fid's first
+/// `Tlock` and stored in its session slot, so dropping or overwriting the slot
+/// frees the locks exactly once — the lock counterpart of `OpenHandle`.
+#[derive(Debug)]
+pub struct LockGuard {
+    lock_manager: Arc<FileLockManager>,
+    session_id: u64,
+    fid: u32,
+}
+
+impl LockGuard {
+    pub fn new(lock_manager: Arc<FileLockManager>, session_id: u64, fid: u32) -> Self {
+        Self {
+            lock_manager,
+            session_id,
+            fid,
+        }
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        self.lock_manager
+            .release_fid_locks(self.session_id, self.fid);
     }
 }
 
@@ -357,34 +408,23 @@ mod tests {
         let m = FileLockManager::new();
 
         // Owners 1 and 2 both hold a read lock over [0, 10) — compatible.
-        assert!(
-            m.try_add_lock(1, lock(LockType::ReadLock, 0, 10))
-                .await
-                .is_some()
-        );
-        assert!(
-            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10))
-                .await
-                .is_some()
-        );
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).is_some());
+        assert!(m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)).is_some());
 
         // Owner 1 tries to upgrade to a write lock; owner 2's read lock conflicts.
         assert!(
             m.try_add_lock(1, lock(LockType::WriteLock, 0, 10))
-                .await
                 .is_none(),
             "conflicting upgrade must be refused"
         );
 
         // Drop owner 2's lock so only owner 1's (read) lock could remain.
-        m.unlock_range(INODE, 0, 0, 10, 2).await;
+        m.unlock_range(INODE, 0, 0, 10, 2);
 
         // A third owner testing a write lock must still see owner 1's surviving
         // read lock. With the pre-fix behaviour, owner 1's read lock would have
         // been destroyed by the failed upgrade and this would find no conflict.
-        let conflict = m
-            .check_would_block(INODE, &lock(LockType::WriteLock, 0, 10), 3)
-            .await;
+        let conflict = m.check_would_block(INODE, &lock(LockType::WriteLock, 0, 10), 3);
         assert!(
             conflict.is_some(),
             "owner 1's read lock must survive the failed upgrade"

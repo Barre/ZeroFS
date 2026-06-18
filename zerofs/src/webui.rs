@@ -89,7 +89,11 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState) {
 
     drop(tx);
     let _ = writer.await;
-    state.lock_manager.release_session_locks(handler_id).await;
+    // Same teardown as the TCP/Unix path: release this session's handle counts
+    // and byte-range locks (rather than wait for the last in-flight task to drop
+    // its handler Arc).
+    handler.close_all_open_handles();
+    state.lock_manager.release_session_locks(handler_id);
 }
 
 fn content_type(path: &str) -> &'static str {

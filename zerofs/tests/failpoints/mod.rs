@@ -2753,3 +2753,239 @@ async fn test_crash_hardlink_unlink_after_commit() {
         _ => unreachable!(),
     }
 }
+
+async fn orphan_set_empty(fs: &ZeroFS) -> bool {
+    use futures::StreamExt;
+    let stream = fs.orphan_store.list().await.unwrap();
+    futures::pin_mut!(stream);
+    stream.next().await.is_none()
+}
+
+/// The consistency checker, run against a LIVE (non-drained) filesystem, must
+/// exempt a legitimate open-unlinked orphan (nlink==0, in the orphan set) yet
+/// still flag a genuine leak (nlink==0, unreachable, NOT in the set). Every
+/// other consistency assertion runs post-restart, after the orphan set is
+/// already drained, so without this the exemption branch is never exercised.
+#[tokio::test]
+async fn test_consistency_live_orphan_exempt_but_leak_flagged() {
+    let (
+        _scenario,
+        TestSetup {
+            fs, creds, auth, ..
+        },
+    ) = TestSetup::new().await;
+
+    // Legitimate live orphan: open-unlinked, kept in the orphan set.
+    let (good_id, _) = fs
+        .create(&creds, 0, b"good", &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.open_handle_inc(good_id);
+    fs.remove(&auth, 0, b"good").await.unwrap();
+
+    // The find_orphaned_inodes exemption must skip the live orphan: no
+    // OrphanedInode error for it. (verify_consistency as a whole is a
+    // post-restart check -- it additionally reports LeakedOrphan + a stats
+    // mismatch for a still-deferred orphan; those are expected online and are
+    // not what this test guards.)
+    let report = verify_consistency(&fs).await.unwrap();
+    assert!(
+        !report.errors.iter().any(|e| matches!(
+            e,
+            consistency::ConsistencyError::OrphanedInode { inode_id } if *inode_id == good_id
+        )),
+        "live open-unlinked orphan wrongly flagged as OrphanedInode: {:?}",
+        report.errors
+    );
+
+    // Genuine leak: defer an inode, then drop its orphan key WITHOUT reclaiming,
+    // leaving nlink==0 + unreachable + not in the orphan set.
+    let (leak_id, _) = fs
+        .create(&creds, 0, b"leak", &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.open_handle_inc(leak_id);
+    fs.remove(&auth, 0, b"leak").await.unwrap();
+    {
+        let mut txn = fs.db.new_transaction().unwrap();
+        fs.orphan_store.remove(&mut txn, leak_id);
+        fs.write_coordinator.commit(txn).await.unwrap();
+    }
+
+    let report = verify_consistency(&fs).await.unwrap();
+    assert!(
+        report.errors.iter().any(|e| matches!(
+            e,
+            consistency::ConsistencyError::OrphanedInode { inode_id } if *inode_id == leak_id
+        )),
+        "genuine orphan leak must be flagged; errors: {:?}",
+        report.errors
+    );
+}
+
+/// A panic at REMOVE_AFTER_ORPHAN_ADD is pre-commit: the orphan-add, nlink=0,
+/// and dir-entry removal all live in the not-yet-committed txn, so a crash
+/// there loses the whole unlink. After restart the file is fully present and
+/// reachable, and the orphan set is empty.
+#[tokio::test]
+async fn test_crash_open_unlink_after_orphan_add() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"victim.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![7u8; 5000]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    // Pin the inode open so remove() takes the defer branch.
+    fs.open_handle_inc(file_id);
+
+    fail::cfg(fp::REMOVE_AFTER_ORPHAN_ADD, "panic").unwrap();
+    let fs_clone = Arc::clone(&fs);
+    let auth_clone = auth.clone();
+    let handle =
+        tokio::task::spawn(async move { fs_clone.remove(&auth_clone, 0, b"victim.txt").await });
+    let _ = handle.await;
+    fail::cfg(fp::REMOVE_AFTER_ORPHAN_ADD, "off").unwrap();
+    drop(fs);
+
+    let fs_after = ctx.restart_fs().await;
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(
+        report.is_consistent(),
+        "Inconsistent after crash at remove_after_orphan_add: {:?}",
+        report.errors
+    );
+    assert!(
+        orphan_set_empty(&fs_after).await,
+        "orphan set must be empty"
+    );
+
+    // Unlink never committed: the file is still present and reachable.
+    let creds = test_creds();
+    let id = fs_after
+        .lookup(&creds, 0, b"victim.txt")
+        .await
+        .expect("file should still exist");
+    match fs_after.inode_store.get(id).await.unwrap() {
+        Inode::File(f) => assert_eq!(f.size, 5000),
+        _ => unreachable!(),
+    }
+}
+
+/// Defer commits cleanly, then the process crashes before the open fid is
+/// clunked. The startup drain reclaims the orphan: inode + chunks gone, orphan
+/// set empty, namespace effect (name absent) preserved.
+#[tokio::test]
+async fn test_crash_open_unlink_committed_then_crash_drains() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"victim.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![9u8; 5000]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    fs.open_handle_inc(file_id);
+    // Defer commits (no failpoint armed).
+    fs.remove(&auth, 0, b"victim.txt").await.unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+    drop(fs); // crash before the clunk that would have reclaimed it
+
+    let fs_after = ctx.restart_fs().await; // drain runs in new_with_slatedb
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(
+        report.is_consistent(),
+        "Inconsistent after open-unlink+crash drain: {:?}",
+        report.errors
+    );
+    assert!(
+        orphan_set_empty(&fs_after).await,
+        "startup drain must empty the orphan set"
+    );
+    // Namespace effect preserved and inode reclaimed.
+    assert!(matches!(
+        fs_after.lookup(&test_creds(), 0, b"victim.txt").await,
+        Err(zerofs::fs::errors::FsError::NotFound)
+    ));
+    assert!(matches!(
+        fs_after.inode_store.get(file_id).await,
+        Err(zerofs::fs::errors::FsError::NotFound)
+    ));
+}
+
+/// A panic at CLUNK_AFTER_RECLAIM_INODE_DELETE is pre-commit: the reclaim txn
+/// (inode delete + chunk delete + stats delta + orphan-remove) never lands, so
+/// the orphan key survives. The next startup drain re-runs reclaim exactly
+/// once (idempotent), leaving a consistent, drained filesystem.
+#[tokio::test]
+async fn test_crash_reclaim_after_inode_delete_redrains() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"victim.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![3u8; 5000]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    fs.open_handle_inc(file_id);
+    fs.remove(&auth, 0, b"victim.txt").await.unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    // Last clunk triggers reclaim; panic mid-reclaim before commit.
+    fail::cfg(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE, "panic").unwrap();
+    let fs_clone = Arc::clone(&fs);
+    let handle = tokio::task::spawn(async move { fs_clone.handle_closed(file_id).await });
+    let _ = handle.await;
+    fail::cfg(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE, "off").unwrap();
+    drop(fs);
+
+    let fs_after = ctx.restart_fs().await; // drain re-runs reclaim
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(
+        report.is_consistent(),
+        "Inconsistent after crash mid-reclaim: {:?}",
+        report.errors
+    );
+    assert!(
+        orphan_set_empty(&fs_after).await,
+        "drain must reclaim the orphan after the lost reclaim txn"
+    );
+    assert!(matches!(
+        fs_after.inode_store.get(file_id).await,
+        Err(zerofs::fs::errors::FsError::NotFound)
+    ));
+}

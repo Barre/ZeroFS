@@ -176,9 +176,32 @@ where
         }
     });
 
+    // Release every still-open fid's open-handle count on session teardown.
+    struct HandleReleaseGuard(Option<Arc<NinePHandler>>);
+    impl HandleReleaseGuard {
+        fn disarm(&mut self) -> Option<Arc<NinePHandler>> {
+            self.0.take()
+        }
+    }
+    impl Drop for HandleReleaseGuard {
+        fn drop(&mut self) {
+            if let Some(handler) = self.0.take() {
+                // Backstop for an abnormal exit (the normal path disarms us and
+                // does this itself). Just a synchronous table clear — the slot
+                // guards do the rest on drop.
+                handler.close_all_open_handles();
+            }
+        }
+    }
+    let mut release_guard = HandleReleaseGuard(Some(Arc::clone(&handler)));
+
     let result = handle_client_loop(handler, read_stream, tx, shutdown).await;
 
-    lock_manager.release_session_locks(handler_id).await;
+    if let Some(handler) = release_guard.disarm() {
+        handler.close_all_open_handles();
+    }
+
+    lock_manager.release_session_locks(handler_id);
 
     let _ = writer_task.await;
 

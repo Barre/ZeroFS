@@ -133,6 +133,12 @@ pub enum ConsistencyError {
         stored_counter: u64,
         max_cookie: u64,
     },
+    /// An open-unlink orphan-set entry survived a clean restart. The startup
+    /// drain reclaims every orphan (no open handle survives a crash), so after
+    /// a restart the set must be empty; a leftover means the drain failed.
+    LeakedOrphan {
+        inode_id: InodeId,
+    },
 }
 
 impl ConsistencyReport {
@@ -303,6 +309,11 @@ impl std::fmt::Display for ConsistencyError {
                 "DIR_COOKIE counter {} for dir {} is not greater than max used cookie {}",
                 stored_counter, dir_id, max_cookie
             ),
+            Self::LeakedOrphan { inode_id } => write!(
+                f,
+                "Orphan-set entry for inode {} survived restart (startup drain did not reclaim it)",
+                inode_id
+            ),
         }
     }
 }
@@ -345,6 +356,11 @@ pub struct ConsistencyChecker<'a> {
     subdir_counts: HashMap<InodeId, u32>,
     tombstone_inodes: HashSet<InodeId>,
     directory_inodes: HashSet<InodeId>,
+    /// Inodes recorded in the durable open-unlink orphan set. After a clean
+    /// restart this is always empty (the startup drain reclaims them), but the
+    /// online state, an inode with nlink==0, no directory entry, present in
+    /// this set is legal and must not be flagged as an orphaned inode.
+    orphan_inodes: HashSet<InodeId>,
 }
 
 impl<'a> ConsistencyChecker<'a> {
@@ -360,17 +376,20 @@ impl<'a> ConsistencyChecker<'a> {
             subdir_counts: HashMap::new(),
             tombstone_inodes: HashSet::new(),
             directory_inodes: HashSet::new(),
+            orphan_inodes: HashSet::new(),
         }
     }
 
     pub async fn verify_all(mut self) -> Result<ConsistencyReport, FsError> {
         self.enumerate_inodes().await?;
         self.enumerate_tombstones().await?;
+        self.enumerate_orphans().await?;
         self.walk_directory_tree(0).await?;
         self.verify_directory_counts().await?;
         self.verify_nlink_counts().await?;
         self.verify_directory_nlinks().await?;
         self.find_orphaned_inodes()?;
+        self.verify_orphan_set_drained();
         self.verify_stats_counters().await?;
         self.verify_tombstones().await?;
         self.verify_file_chunks().await?;
@@ -424,6 +443,22 @@ impl<'a> ConsistencyChecker<'a> {
         while let Some(result) = tombstones.next().await {
             if let Ok(entry) = result {
                 self.tombstone_inodes.insert(entry.inode_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn enumerate_orphans(&mut self) -> Result<(), FsError> {
+        let orphans = match self.fs.orphan_store.list().await {
+            Ok(o) => o,
+            Err(_) => return Ok(()),
+        };
+        futures::pin_mut!(orphans);
+
+        while let Some(result) = orphans.next().await {
+            if let Ok(inode_id) = result {
+                self.orphan_inodes.insert(inode_id);
             }
         }
 
@@ -525,6 +560,11 @@ impl<'a> ConsistencyChecker<'a> {
             if inode_id == ROOT_INODE_ID {
                 continue;
             }
+            // An open-unlink orphan (nlink==0, present in the orphan set, no
+            // directory entry) is legal while online
+            if self.orphan_inodes.contains(&inode_id) {
+                continue;
+            }
             if !self.inode_refs.contains_key(&inode_id) {
                 self.report
                     .errors
@@ -533,6 +573,17 @@ impl<'a> ConsistencyChecker<'a> {
             }
         }
         Ok(())
+    }
+
+    fn verify_orphan_set_drained(&mut self) {
+        // The checker runs after a clean restart, by which point the startup
+        // drain must have reclaimed every orphan. A surviving entry means the
+        // drain failed to make progress.
+        for &inode_id in &self.orphan_inodes {
+            self.report
+                .errors
+                .push(ConsistencyError::LeakedOrphan { inode_id });
+        }
     }
 
     async fn verify_stats_counters(&mut self) -> Result<(), FsError> {

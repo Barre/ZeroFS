@@ -43,12 +43,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool git perl fuse3
 
-      - name: Clone pjdfstest_nfs
+      - name: Clone pjdfstest
         run: |
-          git clone https://github.com/Barre/pjdfstest_nfs.git /tmp/pjdfstest_nfs
+          # The FUSE mount rides the same 9P server, so it supports open-unlink,
+          # open-time permission checks, and 64-bit timestamps: run the full
+          # upstream suite, not the NFS fork's carved-down set.
+          git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
 
       - name: Build pjdfstest
-        working-directory: /tmp/pjdfstest_nfs
+        working-directory: /tmp/pjdfstest
         run: |
           autoreconf -fvi
           ./configure
@@ -141,7 +144,7 @@ jobs:
           cd pjdfstest_test
 
           # Get list of all test files
-          find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
+          find /tmp/pjdfstest/tests -name "*.t" -type f > /tmp/all_tests.txt
 
           # Filter out excluded tests
           grep -v -f ${{ github.workspace }}/.github/.pjdfstest-fuse-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true

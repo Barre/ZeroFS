@@ -825,7 +825,7 @@ impl Filesystem for Fuse9P {
         let locks = Arc::clone(&self.locks);
         let ino = ino.0;
         self.rt.spawn(async move {
-            locks.unlock_range(ino, LOCAL_LOCK_FID, 0, 0, owner).await;
+            locks.unlock_range(ino, LOCAL_LOCK_FID, 0, 0, owner);
             reply.ok();
         });
     }
@@ -1152,7 +1152,7 @@ impl Filesystem for Fuse9P {
                 fid: LOCAL_LOCK_FID,
                 inode_id: ino,
             };
-            if let Some(conflict) = locks.check_would_block(ino, &test, owner).await {
+            if let Some(conflict) = locks.check_would_block(ino, &test, owner) {
                 let (cs, ce) = from_9p_range(conflict.start, conflict.length);
                 reply.locked(
                     cs,
@@ -1208,9 +1208,7 @@ impl Filesystem for Fuse9P {
         let (s9, len9) = to_9p_range(start, end);
         self.rt.spawn(async move {
             if matches!(lt, LockType::Unlock) {
-                locks
-                    .unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner)
-                    .await;
+                locks.unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner);
                 let _ = client
                     .lock(server_fid, LockType::Unlock, 0, s9, len9, pid, &client_id)
                     .await;
@@ -1231,7 +1229,7 @@ impl Filesystem for Fuse9P {
                     fid: LOCAL_LOCK_FID,
                     inode_id: ino,
                 };
-                if locks.try_add_lock(owner, new_lock).await.is_none() {
+                if locks.try_add_lock(owner, new_lock).is_none() {
                     if sleep {
                         tokio::time::sleep(LOCK_POLL).await;
                         continue;
@@ -1256,16 +1254,12 @@ impl Filesystem for Fuse9P {
                     // Grace period and lock errors are not retryable (v9fs maps
                     // both to ENOLCK); roll back the local grant and fail.
                     Ok(LockStatus::Grace) | Ok(LockStatus::LockError) => {
-                        locks
-                            .unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner)
-                            .await;
+                        locks.unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner);
                         reply.error(Errno::ENOLCK);
                         return;
                     }
                     Err(e) => {
-                        locks
-                            .unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner)
-                            .await;
+                        locks.unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner);
                         reply.error(errno(&e));
                         return;
                     }
@@ -1273,9 +1267,7 @@ impl Filesystem for Fuse9P {
 
                 // The server reports a conflict with another client. Undo the
                 // local grant, then wait and retry (blocking) or report EAGAIN.
-                locks
-                    .unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner)
-                    .await;
+                locks.unlock_range(ino, LOCAL_LOCK_FID, s9, len9, owner);
                 if sleep {
                     tokio::time::sleep(LOCK_POLL).await;
                     continue;

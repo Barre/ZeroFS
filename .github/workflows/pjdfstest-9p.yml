@@ -48,12 +48,16 @@ jobs:
           # List loaded 9p modules
           lsmod | grep 9p || echo "No 9p modules loaded yet"
 
-      - name: Clone pjdfstest_nfs
+      - name: Clone pjdfstest
         run: |
-          git clone https://github.com/Barre/pjdfstest_nfs.git /tmp/pjdfstest_nfs
+          # Upstream pjdfstest (not the NFS fork): 9P supports open-unlink,
+          # open-time permission checks, and 64-bit timestamps, so it runs the
+          # full POSIX suite. The fork's nfs-incompatible carve-out is for the
+          # NFS workflow only.
+          git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
 
       - name: Build pjdfstest
-        working-directory: /tmp/pjdfstest_nfs
+        working-directory: /tmp/pjdfstest
         run: |
           autoreconf -fvi
           ./configure
@@ -139,7 +143,7 @@ jobs:
           cd pjdfstest_test
 
           # Get list of all test files
-          find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
+          find /tmp/pjdfstest/tests -name "*.t" -type f > /tmp/all_tests.txt
 
           # Filter out excluded tests
           grep -v -f ${{ github.workspace }}/.github/.pjdfstest-9p-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
