@@ -761,8 +761,12 @@ async fn initialize_filesystem(
     .await
     .context("Failed to initialize filesystem")?;
 
+    let fs = Arc::new(fs);
+    // Reclaims open-unlinked inodes once their last open handle is dropped.
+    fs.start_reclaim_drainer();
+
     Ok(InitResult {
-        fs: Arc::new(fs),
+        fs,
         object_store,
         wal_object_store,
         db_path: actual_db_path.to_string(),

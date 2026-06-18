@@ -30,6 +30,7 @@ use bytes::Bytes;
 //   0x05 STATS         shard-keyed fs-wide counters
 //   0x06 SYSTEM        rare config (e.g. next-inode counter)
 //   0x07 TOMBSTONE     deferred-deletion entries, scanned only by GC
+//   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
 //   0xFE CHUNK         bulk file data — the only kind in the chunk segment
 //
 // V1 keeps the same kind bytes but no domain prefix, so every kind shares
@@ -44,6 +45,7 @@ const PREFIX_DIR_COOKIE: u8 = 0x04;
 const PREFIX_STATS: u8 = 0x05;
 const PREFIX_SYSTEM: u8 = 0x06;
 const PREFIX_TOMBSTONE: u8 = 0x07;
+const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_CHUNK: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
@@ -62,6 +64,7 @@ pub enum KeyPrefix {
     DirEntry,
     DirScan,
     Tombstone,
+    Orphan,
     Stats,
     System,
     DirCookie,
@@ -77,6 +80,7 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_DIR_ENTRY => Ok(Self::DirEntry),
             PREFIX_DIR_SCAN => Ok(Self::DirScan),
             PREFIX_TOMBSTONE => Ok(Self::Tombstone),
+            PREFIX_ORPHAN => Ok(Self::Orphan),
             PREFIX_STATS => Ok(Self::Stats),
             PREFIX_SYSTEM => Ok(Self::System),
             PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
@@ -93,6 +97,7 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::DirEntry => PREFIX_DIR_ENTRY,
             KeyPrefix::DirScan => PREFIX_DIR_SCAN,
             KeyPrefix::Tombstone => PREFIX_TOMBSTONE,
+            KeyPrefix::Orphan => PREFIX_ORPHAN,
             KeyPrefix::Stats => PREFIX_STATS,
             KeyPrefix::System => PREFIX_SYSTEM,
             KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
@@ -108,6 +113,7 @@ impl KeyPrefix {
             Self::DirEntry => "DIR_ENTRY",
             Self::DirScan => "DIR_SCAN",
             Self::Tombstone => "TOMBSTONE",
+            Self::Orphan => "ORPHAN",
             Self::Stats => "STATS",
             Self::System => "SYSTEM",
             Self::DirCookie => "DIR_COOKIE",
@@ -126,6 +132,7 @@ impl KeyPrefix {
 pub enum ParsedKey {
     DirScan { cookie: u64 },
     Tombstone { inode_id: InodeId },
+    Orphan { inode_id: InodeId },
     Unknown,
 }
 
@@ -185,6 +192,11 @@ impl KeyCodec {
     /// Total bytes in a complete tombstone key.
     pub fn tombstone_key_size(&self) -> usize {
         self.id_offset(KeyPrefix::Tombstone) + U64_SIZE * 2
+    }
+
+    /// Total bytes in a complete orphan key.
+    pub fn orphan_key_size(&self) -> usize {
+        self.id_offset(KeyPrefix::Orphan) + U64_SIZE
     }
 
     pub fn inode_key(&self, inode_id: InodeId) -> Bytes {
@@ -266,6 +278,16 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
+    /// Key for an orphan-set entry. The inode_id alone keys the entry (no
+    /// timestamp, unlike tombstones): presence signals "open-unlinked, pending
+    /// reclaim", so it must be a point key the reclaim path can delete by id.
+    pub fn orphan_key(&self, inode_id: InodeId) -> Bytes {
+        let mut key = Vec::with_capacity(self.orphan_key_size());
+        self.push_prefix(&mut key, KeyPrefix::Orphan);
+        key.extend_from_slice(&inode_id.to_be_bytes());
+        Bytes::from(key)
+    }
+
     pub fn stats_shard_key(&self, shard_id: usize) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::Stats) + U64_SIZE);
         self.push_prefix(&mut key, KeyPrefix::Stats);
@@ -307,6 +329,19 @@ impl KeyCodec {
                 }
                 if let Ok(id_bytes) = key[id_off + U64_SIZE..expected].try_into() {
                     ParsedKey::Tombstone {
+                        inode_id: u64::from_be_bytes(id_bytes),
+                    }
+                } else {
+                    ParsedKey::Unknown
+                }
+            }
+            KeyPrefix::Orphan => {
+                let expected = self.orphan_key_size();
+                if key.len() != expected {
+                    return ParsedKey::Unknown;
+                }
+                if let Ok(id_bytes) = key[id_off..expected].try_into() {
+                    ParsedKey::Orphan {
                         inode_id: u64::from_be_bytes(id_bytes),
                     }
                 } else {

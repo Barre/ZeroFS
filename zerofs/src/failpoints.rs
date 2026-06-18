@@ -12,6 +12,21 @@ pub const REMOVE_AFTER_INODE_DELETE: &str = "remove_after_inode_delete";
 pub const REMOVE_AFTER_TOMBSTONE: &str = "remove_after_tombstone";
 pub const REMOVE_AFTER_DIR_UNLINK: &str = "remove_after_dir_unlink";
 pub const REMOVE_AFTER_COMMIT: &str = "remove_after_commit";
+pub const REMOVE_AFTER_ORPHAN_ADD: &str = "remove_after_orphan_add";
+
+pub const CLUNK_AFTER_RECLAIM_INODE_DELETE: &str = "clunk_after_reclaim_inode_delete";
+
+/// `lock()`, between registering the lock and installing its guard. Pausing
+/// here drives the Tlock-vs-Tversion/clunk race in tests.
+pub const LOCK_AFTER_REGISTER_BEFORE_GUARD: &str = "lock_after_register_before_guard";
+
+/// `reclaim_if_unreferenced`, before taking the inode lock. Lets a reopen win
+/// the lock first, so reclaim's recheck must abort.
+pub const RECLAIM_BEFORE_LOCK: &str = "reclaim_before_lock";
+
+/// `reclaim_if_unreferenced`, after the recheck and holding the inode lock,
+/// before the delete. A reopen racing in here blocks, then sees the inode gone.
+pub const RECLAIM_HOLDING_LOCK_BEFORE_DELETE: &str = "reclaim_holding_lock_before_delete";
 
 pub const RENAME_AFTER_TARGET_DELETE: &str = "rename_after_target_delete";
 pub const RENAME_AFTER_SOURCE_UNLINK: &str = "rename_after_source_unlink";

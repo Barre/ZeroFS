@@ -1,6 +1,7 @@
 use super::errors::{P9Error, P9Result};
-use super::lock_manager::{FileLock, FileLockManager};
-use crate::fs::ZeroFS;
+use super::lock_manager::{FileLock, FileLockManager, LockGuard};
+#[cfg(feature = "failpoints")]
+use crate::failpoints as fp;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
@@ -9,8 +10,12 @@ use crate::fs::types::{
     AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize,
     SetTime, SetUid, Timestamp,
 };
+use crate::fs::{OpenHandle, ZeroFS};
 use bytes::Bytes;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+#[cfg(feature = "failpoints")]
+use fp::fail_point;
 use ninep_proto::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
@@ -70,10 +75,35 @@ pub struct Fid {
     pub creds: Credentials, // Store credentials per fid/session
 }
 
+/// A session fid-table entry: the cloneable `Fid` data, plus the guards that
+/// tie its open-handle count and byte-range locks to the entry's lifetime.
+/// `get_fid` clones out `.fid` only, so the guards stay in the table — meaning
+/// the resources are released exactly once, whenever and however the entry is
+/// dropped (clunk, close_all, an overwriting walk/open, teardown).
+#[derive(Debug)]
+pub struct FidSlot {
+    pub fid: Fid,
+    /// Present once the fid is opened; pins the inode's open-handle count.
+    pub handle: Option<OpenHandle>,
+    /// Present once the fid takes its first byte-range lock; releases the fid's
+    /// locks on drop.
+    pub lock_guard: Option<LockGuard>,
+}
+
+impl FidSlot {
+    fn unopened(fid: Fid) -> Self {
+        Self {
+            fid,
+            handle: None,
+            lock_guard: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub msize: AtomicU32,
-    pub fids: Arc<DashMap<u32, Fid>>,
+    pub fids: Arc<DashMap<u32, FidSlot>>,
     /// The inode the session's last Tattach aname resolved to (0 when the
     /// session is rooted at the whole filesystem). Trebind validates rebound
     /// inodes against this subtree.
@@ -190,7 +220,7 @@ impl NinePHandler {
             .fids
             .get(&fid)
             .ok_or(P9Error::BadFid)
-            .map(|f| f.clone())
+            .map(|s| s.fid.clone())
     }
 
     pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
@@ -252,9 +282,12 @@ impl NinePHandler {
 
         debug!("Client requested version: {}", version_str);
 
-        // Per 9P spec, Tversion resets all connection state.
-        // All fids are implicitly clunked and the session is reset.
-        self.session.fids.clear();
+        // Tversion implicitly clunks every fid and resets the session. Dropping
+        // the fids releases their handle counts (reclaiming any now-last
+        // open-unlinked inode) and their locks; the explicit lock sweep is a
+        // safety net in case some path ever leaves a lock without a guard.
+        self.close_all_open_handles();
+        self.lock_manager.release_session_locks(self.handler_id);
         self.session.attach_root.store(0, AtomicOrdering::Relaxed);
 
         if !version_str.contains("9P2000.L") {
@@ -366,7 +399,7 @@ impl NinePHandler {
             .store(root_id, AtomicOrdering::Relaxed);
         self.session.fids.insert(
             ta.fid,
-            Fid {
+            FidSlot::unopened(Fid {
                 // The fid's path stays absolute (rename resolves it from
                 // inode 0), so it starts at the aname components.
                 path: components
@@ -379,7 +412,7 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds,
-            },
+            }),
         );
 
         Ok(Message::Rattach(Rattach { qid }))
@@ -438,7 +471,7 @@ impl NinePHandler {
 
         self.session.fids.insert(
             tr.fid,
-            Fid {
+            FidSlot::unopened(Fid {
                 path,
                 inode_id: tr.inode_id,
                 root: attach_root,
@@ -446,7 +479,7 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds,
-            },
+            }),
         );
 
         Ok(Message::Rrebind(Rrebind { qid }))
@@ -579,7 +612,11 @@ impl NinePHandler {
                 mode: None,
                 creds: src_fid.creds, // Inherit credentials from source fid
             };
-            self.session.fids.insert(tw.newfid, new_fid);
+            // An in-place walk (newfid == fid) overwrites the slot; if it held an
+            // open handle, the old guard drops here and releases the count.
+            self.session
+                .fids
+                .insert(tw.newfid, FidSlot::unopened(new_fid));
         }
 
         Ok(Message::Rwalk(Rwalk {
@@ -616,7 +653,7 @@ impl NinePHandler {
         }
         self.session.fids.insert(
             tw.newfid,
-            Fid {
+            FidSlot::unopened(Fid {
                 path: current_path,
                 inode_id: current_id,
                 root: src_fid.root,
@@ -624,7 +661,7 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds: src_fid.creds,
-            },
+            }),
         );
 
         // For a named walk the final inode is already in hand; an empty walk
@@ -655,15 +692,36 @@ impl NinePHandler {
             tl.fid, inode_id, creds.uid, creds.gid, tl.flags
         );
 
-        let inode = self.filesystem.inode_store.get(inode_id).await?;
+        // Liveness check + open + handle-guard install, all under the inode lock
+        // so the increment is ordered against remove/rename's defer decision.
+        let inode = {
+            let _guard = self.filesystem.lock_manager.acquire(inode_id).await;
+            let inode = self.filesystem.inode_store.get(inode_id).await?;
+            let qid = inode_to_qid(&inode, inode_id);
+            match self.session.fids.get_mut(&tl.fid) {
+                Some(mut slot) => {
+                    // The opened check at the top read a clone, so two concurrent
+                    // Tlopen on this fid can both reach here; re-check under the
+                    // shard lock or both install a guard and the lone clunk
+                    // under-counts.
+                    if slot.fid.opened {
+                        return Err(P9Error::FidAlreadyOpen);
+                    }
+                    slot.fid.qid = qid;
+                    slot.fid.opened = true;
+                    slot.fid.mode = Some(tl.flags);
+                    // Install the guard while still holding the shard (via `slot`)
+                    // so the count and the opened flag land together: a clunk or
+                    // close_all blocks on the shard and never sees an opened fid
+                    // that isn't yet counted.
+                    slot.handle = Some(self.filesystem.new_open_handle(inode_id));
+                }
+                None => return Err(P9Error::BadFid),
+            }
+            inode
+        };
 
         let qid = inode_to_qid(&inode, inode_id);
-
-        if let Some(mut fid_entry) = self.session.fids.get_mut(&tl.fid) {
-            fid_entry.qid = qid.clone();
-            fid_entry.opened = true;
-            fid_entry.mode = Some(tl.flags);
-        }
 
         Ok(Message::Rlopen(Rlopen {
             qid,
@@ -682,21 +740,54 @@ impl NinePHandler {
             return Err(P9Error::FidInUse);
         }
 
-        let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
-        let qid = inode_to_qid(&inode, src_fid.inode_id);
-
-        self.session.fids.insert(
-            tl.newfid,
-            Fid {
+        // Liveness check + handle increment under the inode lock (see lopen).
+        // The new fid is inserted as opened in the same critical section so the
+        // count and the opened fid become visible together.
+        let inode = {
+            let _guard = self.filesystem.lock_manager.acquire(src_fid.inode_id).await;
+            let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
+            let qid = inode_to_qid(&inode, src_fid.inode_id);
+            let new_fid = Fid {
                 path: src_fid.path.clone(),
                 inode_id: src_fid.inode_id,
                 root: src_fid.root,
-                qid: qid.clone(),
+                qid,
                 opened: true,
                 mode: Some(tl.flags),
                 creds: src_fid.creds,
-            },
-        );
+            };
+            // Install the guard under the entry's shard lock (atomic vs clunk,
+            // as in lopen), and only after the error checks so a rejected open
+            // doesn't transiently bump the count.
+            match self.session.fids.entry(tl.newfid) {
+                Entry::Vacant(v) => {
+                    let handle = self.filesystem.new_open_handle(src_fid.inode_id);
+                    v.insert(FidSlot {
+                        fid: new_fid,
+                        handle: Some(handle),
+                        lock_guard: None,
+                    });
+                }
+                Entry::Occupied(mut o) => {
+                    if tl.newfid != tl.fid {
+                        return Err(P9Error::FidInUse);
+                    }
+                    if o.get().fid.opened {
+                        return Err(P9Error::FidAlreadyOpen);
+                    }
+                    // In-place open: replace the fid data and add the handle
+                    // guard, but keep any lock_guard — a lock taken while the fid
+                    // was unopened must survive being opened.
+                    let handle = self.filesystem.new_open_handle(src_fid.inode_id);
+                    let slot = o.get_mut();
+                    slot.fid = new_fid;
+                    slot.handle = Some(handle);
+                }
+            }
+            inode
+        };
+
+        let qid = inode_to_qid(&inode, src_fid.inode_id);
 
         Ok(Message::Rlopenat(Rlopenat {
             qid,
@@ -705,12 +796,22 @@ impl NinePHandler {
     }
 
     async fn clunk(&self, tc: Tclunk) -> Message {
-        if let Some((_, fid_entry)) = self.session.fids.remove(&tc.fid) {
-            self.lock_manager
-                .unlock_range(fid_entry.inode_id, tc.fid, 0, 0, self.handler_id)
-                .await;
+        if let Some((_, slot)) = self.session.fids.remove(&tc.fid) {
+            // Dropping the slot releases its handle count (enqueuing reclaim if it
+            // was the last) and its byte-range locks. `remove` returns the slot to
+            // exactly one caller, so a racing clunk/close_all can't double-release.
+            drop(slot);
         }
         Message::Rclunk(Rclunk)
+    }
+
+    /// Drop every fid in the session, releasing their handle counts and locks.
+    /// Used by Tversion (which implicitly clunks all fids) and by teardown.
+    pub fn close_all_open_handles(&self) {
+        // Each cleared slot's guards release on drop; `remove` vs this `clear` is
+        // still single-winner per fid, so no double-release. A fid an in-flight
+        // open inserts after the clear is released when the table itself drops.
+        self.session.fids.clear();
     }
 
     /// At the attach root of an aname-rooted session, rewrite the synthesized
@@ -877,12 +978,27 @@ impl NinePHandler {
 
         let qid = attrs_to_qid(&post_attr, child_id);
 
-        let mut fid_entry = self.session.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
-        fid_entry.path.push(Bytes::from(tc.name.data));
-        fid_entry.inode_id = child_id;
-        fid_entry.qid = qid.clone();
-        fid_entry.opened = true;
-        fid_entry.mode = Some(tc.flags);
+        // Move the parent fid onto the new child and install its handle guard,
+        // under the child inode lock so the increment is ordered against a
+        // concurrent remove/rename of the just-created file (as in lopen).
+        {
+            let _guard = self.filesystem.lock_manager.acquire(child_id).await;
+            let mut slot = self.session.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
+            // Re-check opened (the check above read a clone): a concurrent Tlcreate
+            // on this fid must not also install a guard. A child created by a loser
+            // is harmless — it has a name and nlink 1, like any other file.
+            if slot.fid.opened {
+                return Err(P9Error::FidAlreadyOpen);
+            }
+            slot.fid.path.push(Bytes::from(tc.name.data));
+            slot.fid.inode_id = child_id;
+            slot.fid.qid = qid.clone();
+            slot.fid.opened = true;
+            slot.fid.mode = Some(tc.flags);
+            // Install the guard while `slot` (the shard lock) is still held, so
+            // the count and the opened fid are visible atomically (see lopen).
+            slot.handle = Some(self.filesystem.new_open_handle(child_id));
+        }
 
         Ok(Message::Rlcreate(Rlcreate {
             qid,
@@ -906,9 +1022,11 @@ impl NinePHandler {
 
         let mut path = parent_fid.path.clone();
         path.push(Bytes::from(tc.name.data));
-        self.session.fids.insert(
-            tc.newfid,
-            Fid {
+        // Insert the opened newfid and bump the child's open-handle count under
+        // the child inode lock (uniform with lopen/lopenat).
+        {
+            let _guard = self.filesystem.lock_manager.acquire(child_id).await;
+            let new_fid = Fid {
                 path,
                 inode_id: child_id,
                 root: parent_fid.root,
@@ -916,8 +1034,35 @@ impl NinePHandler {
                 opened: true,
                 mode: Some(tc.flags),
                 creds: parent_fid.creds,
-            },
-        );
+            };
+            // Atomic check-and-insert (see lopenat): single-winner so concurrent
+            // Tlcreateattr with the same newfid cannot double-count the handle.
+            // Install the guard under the entry's shard lock (see lopen).
+            match self.session.fids.entry(tc.newfid) {
+                Entry::Vacant(v) => {
+                    let handle = self.filesystem.new_open_handle(child_id);
+                    v.insert(FidSlot {
+                        fid: new_fid,
+                        handle: Some(handle),
+                        lock_guard: None,
+                    });
+                }
+                Entry::Occupied(mut o) => {
+                    if tc.newfid != tc.dfid {
+                        return Err(P9Error::FidInUse);
+                    }
+                    if o.get().fid.opened {
+                        return Err(P9Error::FidAlreadyOpen);
+                    }
+                    // In-place: update fid data + install the handle guard, but
+                    // PRESERVE any lock_guard (see lopenat).
+                    let handle = self.filesystem.new_open_handle(child_id);
+                    let slot = o.get_mut();
+                    slot.fid = new_fid;
+                    slot.handle = Some(handle);
+                }
+            }
+        }
 
         Ok(Message::Rlcreateattr(Rlcreateattr {
             iounit: self.iounit(),
@@ -1363,14 +1508,28 @@ impl NinePHandler {
         let fid = self.get_fid(tl.fid)?;
 
         if matches!(tl.lock_type, LockType::Unlock) {
-            self.lock_manager
-                .unlock_range(fid.inode_id, tl.fid, tl.start, tl.length, self.handler_id)
-                .await;
+            self.lock_manager.unlock_range(
+                fid.inode_id,
+                tl.fid,
+                tl.start,
+                tl.length,
+                self.handler_id,
+            );
 
             return Ok(Message::Rlock(Rlock {
                 status: LockStatus::Success,
             }));
         }
+
+        // Register the lock and install its guard while holding the fid's shard
+        // lock, so a concurrent clunk/close_all/Tversion can't drop the slot in
+        // between and strand a registered-but-unguarded lock — which, since
+        // Tversion doesn't sweep the manager, would leak for the whole connection.
+        // (Same atomic-install discipline as lopen's handle guard.)
+        let mut slot = match self.session.fids.get_mut(&tl.fid) {
+            Some(slot) => slot,
+            None => return Err(P9Error::BadFid),
+        };
 
         let new_lock = FileLock {
             lock_type: tl.lock_type,
@@ -1379,16 +1538,15 @@ impl NinePHandler {
             proc_id: tl.proc_id,
             client_id: tl.client_id.data.clone(),
             fid: tl.fid,
-            inode_id: fid.inode_id,
+            inode_id: slot.fid.inode_id,
         };
 
         if self
             .lock_manager
             .try_add_lock(self.handler_id, new_lock)
-            .await
             .is_none()
         {
-            debug!("Lock conflict on inode {}", fid.inode_id);
+            debug!("Lock conflict on inode {}", slot.fid.inode_id);
             if (tl.flags & P9_LOCK_FLAGS_BLOCK) != 0 {
                 return Ok(Message::Rlock(Rlock {
                     status: LockStatus::Blocked,
@@ -1396,6 +1554,19 @@ impl NinePHandler {
             } else {
                 return Err(P9Error::LockConflict);
             }
+        }
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD);
+
+        // Still under the shard lock. The guard releases by (session, fid) on any
+        // inode, so one per fid is enough.
+        if slot.lock_guard.is_none() {
+            slot.lock_guard = Some(LockGuard::new(
+                self.lock_manager.clone(),
+                self.handler_id,
+                tl.fid,
+            ));
         }
 
         Ok(Message::Rlock(Rlock {
@@ -1416,10 +1587,9 @@ impl NinePHandler {
             inode_id: fid.inode_id,
         };
 
-        if let Some(conflicting_lock) = self
-            .lock_manager
-            .check_would_block(fid.inode_id, &test_lock, self.handler_id)
-            .await
+        if let Some(conflicting_lock) =
+            self.lock_manager
+                .check_would_block(fid.inode_id, &test_lock, self.handler_id)
         {
             Ok(Message::Rgetlock(Rgetlock {
                 lock_type: conflicting_lock.lock_type,
@@ -2185,5 +2355,1182 @@ mod tests {
             }
             _ => panic!("Expected Rreaddir"),
         };
+    }
+
+    #[tokio::test]
+    async fn test_open_unlink_read_after_unlink_via_9p() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = NinePHandler::new(fs.clone(), lock_manager);
+
+        // Tversion + Tattach (root fid 1).
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+
+        // Clone root onto fid 2 and create + open file "a" (fid 2 is now open).
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        let create_resp = handler
+            .handle_message(
+                3,
+                Message::Tlcreate(Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"a".to_vec()),
+                    flags: 0x8002, // O_RDWR | O_CREAT
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(create_resp.body, Message::Rlcreate(_)));
+
+        let data = b"open-unlink via 9p";
+        handler
+            .handle_message(
+                4,
+                Message::Twrite(Twrite {
+                    fid: 2,
+                    offset: 0,
+                    count: data.len() as u32,
+                    data: DekuBytes::from(data.to_vec()),
+                }),
+            )
+            .await;
+
+        // The created file is now open on fid 2, holding an open handle.
+        let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
+        assert_eq!(fs.open_handle_count(file_id), 1);
+
+        // `rm a`: Tunlinkat from the root fid. Defers because fid 2 is open.
+        let unlink_resp = handler
+            .handle_message(
+                5,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"a".to_vec()),
+                    flags: 0,
+                }),
+            )
+            .await;
+        assert!(matches!(unlink_resp.body, Message::Runlinkat(_)));
+        // Name is gone; inode is kept alive for the open fid.
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"a").await,
+            Err(FsError::NotFound)
+        ));
+        assert!(fs.inode_store.get(file_id).await.is_ok());
+
+        // `cat <&3`: Tread on the still-open fid 2 must succeed (the bug).
+        let read_resp = handler
+            .handle_message(
+                6,
+                Message::Tread(Tread {
+                    fid: 2,
+                    offset: 0,
+                    count: data.len() as u32,
+                }),
+            )
+            .await;
+        match read_resp.body {
+            Message::Rread(r) => assert_eq!(r.data.as_ref(), data),
+            other => panic!("expected Rread with data, got {other:?}"),
+        }
+
+        // Closing fd 3 (Tclunk fid 2) is the last handle: reclaim now.
+        let clunk_resp = handler
+            .handle_message(7, Message::Tclunk(Tclunk { fid: 2 }))
+            .await;
+        assert!(matches!(clunk_resp.body, Message::Rclunk(_)));
+        // The clunk dropped the fid slot, whose RAII guard released the last
+        // handle (count 0) and enqueued the inode for the reclaim drainer. This
+        // fs has no drainer running, so drive the same reclaim path the drainer
+        // would (lock + recheck count==0 + reclaim) and confirm the inode is gone.
+        assert_eq!(fs.open_handle_count(file_id), 0);
+        fs.reclaim_if_unreferenced(file_id).await;
+        assert!(matches!(
+            fs.inode_store.get(file_id).await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    // With the drainer running, the last clunk of an open-unlinked inode must
+    // reclaim it asynchronously, with no explicit reclaim call — exercising the
+    // whole guard-drop → enqueue → drainer path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_reclaim_drainer_reclaims_after_last_clunk() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_reclaim_drainer();
+        let handler = Arc::new(NinePHandler::new(
+            fs.clone(),
+            Arc::new(FileLockManager::new()),
+        ));
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        // create + open "a" on fid 2
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                3,
+                Message::Tlcreate(Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"a".to_vec()),
+                    flags: 0x8002,
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
+        // unlink (defers: fid 2 holds it open)
+        handler
+            .handle_message(
+                4,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"a".to_vec()),
+                    flags: 0,
+                }),
+            )
+            .await;
+        assert!(fs.inode_store.get(file_id).await.is_ok());
+
+        // Last clunk: the guard drop enqueues the inode; the drainer reclaims it.
+        handler
+            .handle_message(5, Message::Tclunk(Tclunk { fid: 2 }))
+            .await;
+
+        let mut gone = false;
+        for _ in 0..250 {
+            if fs.inode_store.get(file_id).await.is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "reclaim drainer did not reclaim the open-unlinked inode after the last clunk"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_lopen_same_fid_counts_once() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager));
+
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        // Create "a" (fid 2 via lcreate), then clunk so it exists with 0 handles.
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                3,
+                Message::Tlcreate(Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"a".to_vec()),
+                    flags: 0x8002,
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        handler
+            .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
+            .await;
+        let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
+        assert_eq!(fs.open_handle_count(file_id), 0);
+
+        for round in 0..200u32 {
+            // Walk a fresh, unopened fid 3 to "a".
+            handler
+                .handle_message(
+                    10,
+                    Message::Twalk(Twalk {
+                        fid: 1,
+                        newfid: 3,
+                        nwname: 1,
+                        wnames: vec![P9String::new(b"a".to_vec())],
+                    }),
+                )
+                .await;
+
+            let h1 = handler.clone();
+            let h2 = handler.clone();
+            let t1 = tokio::spawn(async move {
+                h1.handle_message(11, Message::Tlopen(Tlopen { fid: 3, flags: 0 }))
+                    .await
+            });
+            let t2 = tokio::spawn(async move {
+                h2.handle_message(12, Message::Tlopen(Tlopen { fid: 3, flags: 0 }))
+                    .await
+            });
+            let r1 = t1.await.unwrap();
+            let r2 = t2.await.unwrap();
+
+            let successes = matches!(r1.body, Message::Rlopen(_)) as u8
+                + matches!(r2.body, Message::Rlopen(_)) as u8;
+            assert_eq!(
+                successes, 1,
+                "round {round}: exactly one Tlopen should win, got {:?} / {:?}",
+                r1.body, r2.body
+            );
+            assert_eq!(
+                fs.open_handle_count(file_id),
+                1,
+                "round {round}: handle was double-counted"
+            );
+
+            handler
+                .handle_message(13, Message::Tclunk(Tclunk { fid: 3 }))
+                .await;
+            assert_eq!(
+                fs.open_handle_count(file_id),
+                0,
+                "round {round}: handle not released"
+            );
+        }
+    }
+
+    // Teardown (close_all) racing a Tclunk of the same fid must release its
+    // handle exactly once. A double release would drop the count below the true
+    // live count and reclaim an inode another session still holds open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_teardown_vs_clunk_releases_handle_once() {
+        for round in 0..300u32 {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let lock_manager = Arc::new(FileLockManager::new());
+            let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager));
+
+            handler
+                .handle_message(
+                    0,
+                    Message::Tversion(Tversion {
+                        msize: DEFAULT_MSIZE,
+                        version: P9String::new(VERSION_9P2000L.to_vec()),
+                    }),
+                )
+                .await;
+            handler
+                .handle_message(
+                    1,
+                    Message::Tattach(Tattach {
+                        fid: 1,
+                        afid: u32::MAX,
+                        uname: P9String::new(b"test".to_vec()),
+                        aname: P9String::new(Vec::new()),
+                        n_uname: 1000,
+                    }),
+                )
+                .await;
+            // Create + open "a" on fid 2 (this session's handle) -> count 1.
+            handler
+                .handle_message(
+                    2,
+                    Message::Twalk(Twalk {
+                        fid: 1,
+                        newfid: 2,
+                        nwname: 0,
+                        wnames: vec![],
+                    }),
+                )
+                .await;
+            handler
+                .handle_message(
+                    3,
+                    Message::Tlcreate(Tlcreate {
+                        fid: 2,
+                        name: P9String::new(b"a".to_vec()),
+                        flags: 0x8002,
+                        mode: 0o644,
+                        gid: 1000,
+                    }),
+                )
+                .await;
+            let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
+
+            // Simulate a SECOND session also holding "a" open (not torn down here).
+            fs.open_handle_inc(file_id);
+
+            // `rm a` while open -> deferred (orphan); count still 2.
+            handler
+                .handle_message(
+                    4,
+                    Message::Tunlinkat(Tunlinkat {
+                        dirfid: 1,
+                        name: P9String::new(b"a".to_vec()),
+                        flags: 0,
+                    }),
+                )
+                .await;
+            assert_eq!(fs.open_handle_count(file_id), 2);
+
+            // RACE: this session disconnects (close_all) while a Tclunk of fid 2 is
+            // in flight on the same session.
+            let h1 = handler.clone();
+            let h2 = handler.clone();
+            let t1 = tokio::spawn(async move { h1.close_all_open_handles() });
+            let t2 = tokio::spawn(async move {
+                h2.handle_message(5, Message::Tclunk(Tclunk { fid: 2 }))
+                    .await
+            });
+            t1.await.unwrap();
+            t2.await.unwrap();
+
+            // This session's single handle was released exactly once (2 -> 1); the
+            // other session's handle must keep "a" alive (NOT reclaimed).
+            assert_eq!(
+                fs.open_handle_count(file_id),
+                1,
+                "round {round}: fid double-released, count dropped below live"
+            );
+            assert!(
+                fs.inode_store.get(file_id).await.is_ok(),
+                "round {round}: inode reclaimed while another session still holds it"
+            );
+
+            // The other session finally closes -> reclaim.
+            fs.handle_closed(file_id).await;
+            assert!(matches!(
+                fs.inode_store.get(file_id).await,
+                Err(FsError::NotFound)
+            ));
+        }
+    }
+
+    // Walking a fid in place (newfid == fid, non-empty wnames) overwrites its
+    // slot; if the fid was an opened directory, the overwrite must still release
+    // its handle count. Note a pure clone (empty wnames) is a no-op, so the walk
+    // target has to be a real child.
+    #[tokio::test]
+    async fn test_walk_in_place_over_open_dir_leaks_handle() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager));
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        // Create a child "x" so the in-place walk has a target.
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                3,
+                Message::Tlcreate(Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"x".to_vec()),
+                    flags: 0x8002,
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        handler
+            .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
+            .await;
+
+        // Open a *directory* fid on the root (fid 10).
+        handler
+            .handle_message(
+                5,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 10,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(6, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
+            .await;
+        assert_eq!(
+            fs.open_handle_count(0),
+            1,
+            "root dir should be open on fid 10"
+        );
+
+        // Walk fid 10 in place to child "x": overwrites the opened dir fid.
+        let resp = handler
+            .handle_message(
+                7,
+                Message::Twalk(Twalk {
+                    fid: 10,
+                    newfid: 10,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"x".to_vec())],
+                }),
+            )
+            .await;
+        assert!(
+            matches!(resp.body, Message::Rwalk(_)),
+            "in-place walk must succeed to exercise the overwrite, got {:?}",
+            resp.body
+        );
+
+        // Clunk the (now opened:false) fid 10.
+        handler
+            .handle_message(8, Message::Tclunk(Tclunk { fid: 10 }))
+            .await;
+
+        assert_eq!(
+            fs.open_handle_count(0),
+            0,
+            "N2: walk-in-place over an open dir fid stranded the open-handle count"
+        );
+    }
+
+    // A fid holding a POSIX lock, then walked in place (overwriting its slot),
+    // must have its lock released. ZeroFS doesn't enforce 9P's "don't walk an
+    // open fid" rule, so this is reachable.
+    #[tokio::test]
+    async fn test_walk_in_place_over_locked_dir_releases_lock() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        // child "x" for the in-place walk target
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                3,
+                Message::Tlcreate(Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"x".to_vec()),
+                    flags: 0x8002,
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        handler
+            .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
+            .await;
+        // open root dir on fid 10, then write-lock it
+        handler
+            .handle_message(
+                5,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 10,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(6, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
+            .await;
+        handler
+            .handle_message(
+                7,
+                Message::Tlock(Tlock {
+                    fid: 10,
+                    lock_type: LockType::WriteLock,
+                    flags: 0,
+                    start: 0,
+                    length: 0,
+                    proc_id: 1,
+                    client_id: P9String::new(b"c".to_vec()),
+                }),
+            )
+            .await;
+        assert!(
+            lock_manager.session_has_locks(handler.handler_id),
+            "write lock should be held on fid 10"
+        );
+
+        // Walk fid 10 in place to "x": overwrites the locked dir fid's slot.
+        let resp = handler
+            .handle_message(
+                8,
+                Message::Twalk(Twalk {
+                    fid: 10,
+                    newfid: 10,
+                    nwname: 1,
+                    wnames: vec![P9String::new(b"x".to_vec())],
+                }),
+            )
+            .await;
+        assert!(matches!(resp.body, Message::Rwalk(_)));
+
+        assert!(
+            !lock_manager.session_has_locks(handler.handler_id),
+            "walk-in-place over a locked fid leaked the byte-range lock"
+        );
+    }
+
+    // Tversion resets the session, so it must release the session's byte-range
+    // locks along with its fids.
+    #[tokio::test]
+    async fn test_tversion_releases_byte_range_locks() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 10,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(3, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
+            .await;
+        handler
+            .handle_message(
+                4,
+                Message::Tlock(Tlock {
+                    fid: 10,
+                    lock_type: LockType::WriteLock,
+                    flags: 0,
+                    start: 0,
+                    length: 0,
+                    proc_id: 1,
+                    client_id: P9String::new(b"c".to_vec()),
+                }),
+            )
+            .await;
+        assert!(lock_manager.session_has_locks(handler.handler_id));
+
+        // Tversion resets the session.
+        handler
+            .handle_message(
+                5,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+
+        assert!(
+            !lock_manager.session_has_locks(handler.handler_id),
+            "Tversion left the session's byte-range locks dangling"
+        );
+    }
+
+    // A failpoint pauses lock() after it registers the lock but before the guard
+    // is installed, then a concurrent Tversion clears the fid table. Unless the
+    // register and guard install are atomic (the slot held across both), Tversion
+    // drops the guardless slot and strands the lock — which, with no in-session
+    // backstop, leaks for the whole connection. Run with `--features failpoints`.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_lock_register_guard_atomic_vs_tversion() {
+        let _scenario = fail::FailScenario::setup();
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+        let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
+        handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"t".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        handler
+            .handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 10,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+        handler
+            .handle_message(3, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
+            .await;
+
+        // Pause lock() after it registers the lock, before installing the guard.
+        fail::cfg(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD, "pause").unwrap();
+
+        let h1 = handler.clone();
+        let lock_task = tokio::spawn(async move {
+            h1.handle_message(
+                4,
+                Message::Tlock(Tlock {
+                    fid: 10,
+                    lock_type: LockType::WriteLock,
+                    flags: 0,
+                    start: 0,
+                    length: 0,
+                    proc_id: 1,
+                    client_id: P9String::new(b"c".to_vec()),
+                }),
+            )
+            .await
+        });
+
+        // Wait until the lock registers; the lock task is now paused at the
+        // failpoint, holding the fid shard if the install is atomic.
+        let mut registered = false;
+        for _ in 0..400 {
+            if lock_manager.session_has_locks(handler.handler_id()) {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(registered, "lock task did not register/pause in time");
+
+        // Concurrent Tversion reset. Atomic fix: blocks on the held shard.
+        // Buggy: clears the guardless slot freely.
+        let h2 = handler.clone();
+        let version_task = tokio::spawn(async move {
+            h2.handle_message(
+                5,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await
+        });
+
+        // Let Tversion run (buggy: clears; atomic: blocks on the shard).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Resume lock(): install the guard (atomic) or find the slot gone (buggy).
+        fail::cfg(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD, "off").unwrap();
+
+        let _ = lock_task.await;
+        let _ = version_task.await;
+
+        assert!(
+            !lock_manager.session_has_locks(handler.handler_id()),
+            "Tlock racing Tversion stranded a phantom byte-range lock (register+guard not atomic)"
+        );
+    }
+
+    // Teardown (close_all) racing an in-flight open that inserts a fresh fid
+    // (lopenat). The late fid's handle guard must still be released — if not at
+    // the clear, then when the session table drops. 300 rounds on a shared fs;
+    // any stranded count survives to the final assert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_close_all_vs_inflight_open_no_leak() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let lock_manager = Arc::new(FileLockManager::new());
+
+        // Create "a" once (persists on the shared fs across rounds).
+        {
+            let h = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
+            h.handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(VERSION_9P2000L.to_vec()),
+                }),
+            )
+            .await;
+            h.handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"t".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+            h.handle_message(
+                2,
+                Message::Twalk(Twalk {
+                    fid: 1,
+                    newfid: 2,
+                    nwname: 0,
+                    wnames: vec![],
+                }),
+            )
+            .await;
+            h.handle_message(
+                3,
+                Message::Tlcreate(Tlcreate {
+                    fid: 2,
+                    name: P9String::new(b"a".to_vec()),
+                    flags: 0x8002,
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await;
+            h.handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
+                .await;
+        }
+
+        for round in 0..300u16 {
+            let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
+            handler
+                .handle_message(
+                    0,
+                    Message::Tversion(Tversion {
+                        msize: DEFAULT_MSIZE,
+                        version: P9String::new(VERSION_9P2000L.to_vec()),
+                    }),
+                )
+                .await;
+            handler
+                .handle_message(
+                    1,
+                    Message::Tattach(Tattach {
+                        fid: 1,
+                        afid: u32::MAX,
+                        uname: P9String::new(b"t".to_vec()),
+                        aname: P9String::new(Vec::new()),
+                        n_uname: 1000,
+                    }),
+                )
+                .await;
+            // fid 5 -> "a" (unopened): the source for the in-flight open.
+            handler
+                .handle_message(
+                    2,
+                    Message::Twalk(Twalk {
+                        fid: 1,
+                        newfid: 5,
+                        nwname: 1,
+                        wnames: vec![P9String::new(b"a".to_vec())],
+                    }),
+                )
+                .await;
+
+            let h1 = handler.clone();
+            let h2 = handler.clone();
+            // RACE: teardown vs an in-flight lopenat that inserts fid 6 (opened).
+            let t1 = tokio::spawn(async move { h1.close_all_open_handles() });
+            let t2 = tokio::spawn(async move {
+                h2.handle_message(
+                    round,
+                    Message::Tlopenat(Tlopenat {
+                        fid: 5,
+                        newfid: 6,
+                        flags: 0,
+                    }),
+                )
+                .await
+            });
+            let _ = t1.await;
+            let _ = t2.await;
+            // Dropping the last handler ref drops the session table; a fid the
+            // open inserted after the clear releases its guard here.
+            drop(handler);
+        }
+
+        let leaked: Vec<(u64, u64)> = fs
+            .open_handles
+            .iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "close_all vs in-flight open stranded handle counts: {leaked:?}"
+        );
+    }
+
+    // Many concurrent sessions, each with several worker tasks, thrash the
+    // fid/handle lifecycle over a tiny shared namespace. Invariant: once every
+    // session has torn down, no open-handle count may remain — a leftover entry
+    // is a leak, whatever path caused it. The seed is in the failure message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_handle_lifecycle_no_leak() {
+        fn xs(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+        const SESSIONS: u64 = 4;
+        const TASKS: u64 = 3;
+        const ITERS: u64 = 120;
+        let names: [&[u8]; 3] = [b"a", b"b", b"c"];
+
+        for seed in 1..=8u64 {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let lock_manager = Arc::new(FileLockManager::new());
+
+            let mut sessions = Vec::new();
+            for s in 0..SESSIONS {
+                let fs = fs.clone();
+                let lm = lock_manager.clone();
+                sessions.push(tokio::spawn(async move {
+                    let handler = Arc::new(NinePHandler::new(fs, lm));
+                    handler
+                        .handle_message(
+                            0,
+                            Message::Tversion(Tversion {
+                                msize: DEFAULT_MSIZE,
+                                version: P9String::new(VERSION_9P2000L.to_vec()),
+                            }),
+                        )
+                        .await;
+                    handler
+                        .handle_message(
+                            1,
+                            Message::Tattach(Tattach {
+                                fid: 1,
+                                afid: u32::MAX,
+                                uname: P9String::new(b"t".to_vec()),
+                                aname: P9String::new(Vec::new()),
+                                n_uname: 1000,
+                            }),
+                        )
+                        .await;
+
+                    let mut workers = Vec::new();
+                    for t in 0..TASKS {
+                        let handler = handler.clone();
+                        let mut rng = (seed ^ (s << 8) ^ (t << 4)) | 1;
+                        let base_fid = 10 + (t as u32) * 10;
+                        workers.push(tokio::spawn(async move {
+                            for i in 0..ITERS {
+                                let r = xs(&mut rng);
+                                let fid = base_fid + ((r >> 3) as u32) % 4;
+                                let name = names[(r >> 20) as usize % names.len()].to_vec();
+                                let tag = (2000 + i) as u16;
+                                match r % 8 {
+                                    0 => {
+                                        // create + open on `fid`
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Twalk(Twalk {
+                                                    fid: 1,
+                                                    newfid: fid,
+                                                    nwname: 0,
+                                                    wnames: vec![],
+                                                }),
+                                            )
+                                            .await;
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Tlcreate(Tlcreate {
+                                                    fid,
+                                                    name: P9String::new(name),
+                                                    flags: 0x8002,
+                                                    mode: 0o644,
+                                                    gid: 1000,
+                                                }),
+                                            )
+                                            .await;
+                                    }
+                                    1 => {
+                                        // walk to name, then open
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Twalk(Twalk {
+                                                    fid: 1,
+                                                    newfid: fid,
+                                                    nwname: 1,
+                                                    wnames: vec![P9String::new(name)],
+                                                }),
+                                            )
+                                            .await;
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Tlopen(Tlopen { fid, flags: 0 }),
+                                            )
+                                            .await;
+                                    }
+                                    2 => {
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Tread(Tread {
+                                                    fid,
+                                                    offset: 0,
+                                                    count: 32,
+                                                }),
+                                            )
+                                            .await;
+                                    }
+                                    3 => {
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Twrite(Twrite {
+                                                    fid,
+                                                    offset: 0,
+                                                    count: 2,
+                                                    data: DekuBytes::from(vec![1u8, 2u8]),
+                                                }),
+                                            )
+                                            .await;
+                                    }
+                                    4 => {
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Tunlinkat(Tunlinkat {
+                                                    dirfid: 1,
+                                                    name: P9String::new(name),
+                                                    flags: 0,
+                                                }),
+                                            )
+                                            .await;
+                                    }
+                                    5 => {
+                                        // open a directory fid (clone root, then open) so
+                                        // op 6's in-place walk has an opened dir to overwrite
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Twalk(Twalk {
+                                                    fid: 1,
+                                                    newfid: fid,
+                                                    nwname: 0,
+                                                    wnames: vec![],
+                                                }),
+                                            )
+                                            .await;
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Tlopen(Tlopen { fid, flags: 0 }),
+                                            )
+                                            .await;
+                                    }
+                                    6 => {
+                                        // walk `fid` in place to a child: if it's an opened
+                                        // dir this overwrites the slot, which must release
+                                        // the handle (empty wnames would be a no-op)
+                                        handler
+                                            .handle_message(
+                                                tag,
+                                                Message::Twalk(Twalk {
+                                                    fid,
+                                                    newfid: fid,
+                                                    nwname: 1,
+                                                    wnames: vec![P9String::new(name)],
+                                                }),
+                                            )
+                                            .await;
+                                    }
+                                    _ => {
+                                        handler
+                                            .handle_message(tag, Message::Tclunk(Tclunk { fid }))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }));
+                    }
+                    for w in workers {
+                        let _ = w.await;
+                    }
+                    handler.close_all_open_handles();
+                }));
+            }
+            for sh in sessions {
+                sh.await.unwrap();
+            }
+
+            let leaked: Vec<(u64, u64)> = fs
+                .open_handles
+                .iter()
+                .map(|e| (*e.key(), *e.value()))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "seed {seed}: leaked open-handle counts after all sessions closed: {leaked:?}"
+            );
+        }
+    }
+
+    fn test_creds() -> Credentials {
+        Credentials {
+            uid: 1000,
+            gid: 1000,
+            groups: [1000; 16],
+            groups_count: 1,
+        }
     }
 }

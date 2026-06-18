@@ -692,6 +692,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        fs.start_reclaim_drainer();
         let checkpoint_manager = Arc::new(CheckpointManager::new(
             db_handle,
             db_path,
