@@ -1,5 +1,5 @@
 diff --git a/src/jepsen/local_fs.clj b/src/jepsen/local_fs.clj
-index 4835127..6cf7f94 100644
+index 4835127..d4de489 100644
 --- a/src/jepsen/local_fs.clj
 +++ b/src/jepsen/local_fs.clj
 @@ -15,7 +15,8 @@
@@ -22,7 +22,7 @@ index 4835127..6cf7f94 100644
  
  (defn stats-checker
    "A stats checker that never fails"
-@@ -150,7 +152,26 @@
+@@ -150,7 +152,31 @@
      :parse-fn parse-long
      :validate [pos? "Must be positive"]]
  
@@ -46,11 +46,16 @@ index 4835127..6cf7f94 100644
 +   [nil "--quickcheck-tests N" "How many random histories quickcheck should generate. Each runs a full DB setup/teardown, so lower this for faster CI runs."
 +    :default 200
 +    :parse-fn parse-long
++    :validate [pos? "Must be positive"]]
++
++   [nil "--history-scale N" "Multiplier for generated history length. 1000 suits deep conformance runs; lower it for crash runs, where each operation may trigger a server restart and long histories become intractable."
++    :default 1000
++    :parse-fn parse-long
 +    :validate [pos? "Must be positive"]]])
  
  (defn quickcheck-trials
    "Runs trials of a history for quickcheck. Returns the first failing test run,
-@@ -196,16 +217,22 @@
+@@ -196,16 +222,22 @@
                           {:workload (:workload (:results test))
                            :dir (.getCanonicalPath (store/path test))}))))
              ; Great, now run quickcheck
@@ -146,7 +151,7 @@ index d708d90..719154c 100644
  (defn simple-trace
    "Takes a collection of ops from a history and strips them down to just [type
 diff --git a/src/jepsen/local_fs/shell/workload.clj b/src/jepsen/local_fs/shell/workload.clj
-index 5a35407..1b05348 100644
+index 5a35407..2019a91 100644
 --- a/src/jepsen/local_fs/shell/workload.clj
 +++ b/src/jepsen/local_fs/shell/workload.clj
 @@ -76,7 +76,10 @@
@@ -161,3 +166,19 @@ index 5a35407..1b05348 100644
          fs (remove dont fs)
          fs (if lose-unfsynced-writes
               (conj fs :lose-unfsynced-writes)
+@@ -87,9 +90,12 @@
+         (g/frequency gens)))
+ 
+ (defn fs-history-gen
+-  "Generates a whole history"
+-  [opts]
+-  (g/scale (partial * 1000)
++  "Generates a whole history. The size multiplier sets how long histories get;
++  upstream's 1000 is good for deep conformance runs, but it makes crash runs
++  intractable (every few ops triggers a server kill and recovery), so it's
++  tunable via --history-scale."
++  [{:keys [history-scale] :as opts}]
++  (g/scale (partial * (or history-scale 1000))
+     (g/vector (fs-op-gen opts))))
+ 
+ (defn workload

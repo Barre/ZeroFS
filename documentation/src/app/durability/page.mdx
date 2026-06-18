@@ -336,7 +336,7 @@ This verifies that the atomicity and ordering guarantees hold at each injected c
 
 ## Continuous Integration Testing
 
-In addition to crash simulation, CI runs pjdfstest, xfstests, stress-ng, Linux kernel builds, and a ZFS integration test on every commit.
+In addition to crash simulation, CI runs pjdfstest, xfstests, stress-ng, Linux kernel builds, Jepsen's local-fs suite, and a ZFS integration test on every commit.
 
 <Row>
   <Col>
@@ -359,6 +359,10 @@ In addition to crash simulation, CI runs pjdfstest, xfstests, stress-ng, Linux k
   </Col>
 </Row>
 
+### Model-Based Testing
+
+**Jepsen (local-fs)**: Generates random sequences of filesystem operations and checks each result against a reference model, shrinking any divergence to a minimal failing case. It runs over a 9P mount. A crash mode injects the loss of un-fsynced writes: it kills the server mid-run, dropping the in-memory memtable, then recovers from the object store and verifies the surviving state is consistent with the last fsync.
+
 ### Layered Filesystem Testing
 
 The CI suite includes a test that creates a ZFS pool on a ZeroFS NBD block device:
@@ -378,6 +382,7 @@ This test validates data integrity through multiple filesystem layers and across
 |------------|----------|----------|
 | Unit tests | — | Core filesystem logic |
 | Failpoint crash tests | — | Crash consistency at each operation stage |
+| Jepsen (local-fs) | 9P | Model-based correctness, crash consistency |
 | pjdfstest | NFS, 9P, FUSE | POSIX compliance |
 | xfstests | NFS, 9P, FUSE | Linux filesystem semantics |
 | stress-ng | NFS, 9P, FUSE | Concurrent operations under load |
