@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
   pjdfstest-9p:
     name: Run pjdfstest 9P Test Suite
