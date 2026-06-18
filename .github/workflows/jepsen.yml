@@ -1,0 +1,67 @@
+name: jepsen
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  jepsen:
+    name: Run jepsen local-fs suite (9P)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Leiningen + FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+          curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
+            -o /usr/local/bin/lein
+          sudo chmod +x /usr/local/bin/lein
+          lein version
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Assemble local-fs (upstream @ pin + ZeroFS glue)
+        run: |
+          # Upstream is not vendored: clone it at the pinned commit and lay the
+          # ZeroFS glue on top (jepsen/README.md explains the pieces).
+          PIN=0921306efc27d89a72b9041daaf9f854c57ac980
+          git clone https://github.com/jepsen-io/local-fs.git /tmp/local-fs
+          git -C /tmp/local-fs -c advice.detachedHead=false checkout "$PIN"
+          cp jepsen/zerofs.clj /tmp/local-fs/src/jepsen/local_fs/db/zerofs.clj
+          git -C /tmp/local-fs apply "$GITHUB_WORKSPACE/jepsen/local-fs.patch"
+          cp jepsen/run.sh /tmp/local-fs/run.sh
+          chmod +x /tmp/local-fs/run.sh
+
+      - name: Run quickcheck
+        working-directory: /tmp/local-fs
+        run: |
+          # The ZeroFS backend self-manages the server (local file:// store) and
+          # the 9P FUSE mount, so no MinIO/mount step is needed here. Each trial
+          # is a full setup/teardown; --quickcheck-tests bounds CI time.
+          ./run.sh quickcheck \
+            --db zerofs \
+            --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --quickcheck-tests 25 \
+            --time-limit 30
+
+      - name: Upload jepsen store on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-store
+          path: /tmp/local-fs/store
+          if-no-files-found: ignore

@@ -1,0 +1,99 @@
+diff --git a/src/jepsen/local_fs.clj b/src/jepsen/local_fs.clj
+index 4835127..6cf7f94 100644
+--- a/src/jepsen/local_fs.clj
++++ b/src/jepsen/local_fs.clj
+@@ -15,7 +15,8 @@
+             [jepsen.local-fs [util :as util]]
+             [jepsen.local-fs.shell.workload :as shell]
+             [jepsen.local-fs.db [dir :as db.dir]
+-                                [lazyfs :as db.lazyfs]]
++                                [lazyfs :as db.lazyfs]
++                                [zerofs :as db.zerofs]]
+             [clojure.test.check :as tc]
+             [clojure.test.check [generators :as tc.gen]
+                                 [properties :as prop]
+@@ -27,7 +28,8 @@
+ (def dbs
+   "A map of DB names to functions that take CLI options and build DBs."
+   {:dir    db.dir/db
+-   :lazyfs db.lazyfs/db})
++   :lazyfs db.lazyfs/db
++   :zerofs db.zerofs/db})
+ 
+ (defn stats-checker
+   "A stats checker that never fails"
+@@ -150,7 +152,26 @@
+     :parse-fn parse-long
+     :validate [pos? "Must be positive"]]
+ 
+-   ["-v" "--version VERSION" "A version string, passed to the DB. For lazyfs, this controls the git commit we check out."]])
++   ["-v" "--version VERSION" "A version string, passed to the DB. For lazyfs, this controls the git commit we check out."]
++
++   [nil "--zerofs-bin PATH" "Path to the zerofs binary (for --db zerofs)."
++    :default "../zerofs/target/debug/zerofs"]
++
++   [nil "--zerofs-port PORT" "TCP port for the ZeroFS 9P server (for --db zerofs)."
++    :default 5564
++    :parse-fn parse-long
++    :validate [pos? "Must be positive"]]
++
++   [nil "--zerofs-password PASSWORD" "Encryption password for the ZeroFS store (for --db zerofs)."
++    :default "jepsen-test-password"]
++
++   [nil "--zerofs-writeback" "Mount ZeroFS with the FUSE writeback cache instead of write-through. Off by default so the client holds no un-fsynced page cache."
++    :default false]
++
++   [nil "--quickcheck-tests N" "How many random histories quickcheck should generate. Each runs a full DB setup/teardown, so lower this for faster CI runs."
++    :default 200
++    :parse-fn parse-long
++    :validate [pos? "Must be positive"]]])
+ 
+ (defn quickcheck-trials
+   "Runs trials of a history for quickcheck. Returns the first failing test run,
+@@ -196,16 +217,22 @@
+                          {:workload (:workload (:results test))
+                           :dir (.getCanonicalPath (store/path test))}))))
+             ; Great, now run quickcheck
+-            checked (tc/quick-check 200 prop)]
++            checked (tc/quick-check (:quickcheck-tests options) prop)]
+         ;(pprint checked)
+         (println)
+-        (let [dir (-> checked :shrunk :result-data :dir)
+-              [name time] (take-last 2 (str/split dir #"/"))
+-              url (str "http://localhost:8080/files/"
+-                       (URLEncoder/encode name) "/"
+-                       (URLEncoder/encode time))]
+-          (println "Shrunk test:" dir)
+-          (println (str "             " url)))))}})
++        ; On a pass there is no shrunk case, so only print the failing-case
++        ; pointer when one exists, and exit non-zero on failure so CI can gate.
++        (when (:shrunk checked)
++          (let [dir (-> checked :shrunk :result-data :dir)
++                [name time] (take-last 2 (str/split dir #"/"))
++                url (str "http://localhost:8080/files/"
++                         (URLEncoder/encode name) "/"
++                         (URLEncoder/encode time))]
++            (println "Shrunk test:" dir)
++            (println (str "             " url))))
++        (if (true? (:result checked))
++          (println "quickcheck passed")
++          (System/exit 1))))}})
+ 
+ (defn -main
+   "Handles command line arguments. Can run a test, or a web server for browsing
+diff --git a/src/jepsen/local_fs/shell/workload.clj b/src/jepsen/local_fs/shell/workload.clj
+index 5a35407..1b05348 100644
+--- a/src/jepsen/local_fs/shell/workload.clj
++++ b/src/jepsen/local_fs/shell/workload.clj
+@@ -76,7 +76,10 @@
+     :lose-unfsynced-writes    If set, emits operations to lose un-fsynced
+                               writes"
+   [{:keys [dont lose-unfsynced-writes]}]
+-  (let [fs (keys funs)
++  (let [; :lose-unfsynced-writes is a fault, not an ordinary op: only emit it
++        ; when explicitly requested, so plain conformance runs (and backends
++        ; that don't implement the fault) never see it.
++        fs (remove #{:lose-unfsynced-writes} (keys funs))
+         fs (remove dont fs)
+         fs (if lose-unfsynced-writes
+              (conj fs :lose-unfsynced-writes)
