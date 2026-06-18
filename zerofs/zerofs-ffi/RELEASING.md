@@ -77,8 +77,8 @@ see below). The default matrix is:
 | --------------- | ----------------- | --------------------- |
 | linux x86_64    | `ubuntu-latest`   | `libzerofs_ffi.so`    |
 | linux aarch64   | `ubuntu-24.04-arm` | `libzerofs_ffi.so`   |
-| macOS x86_64    | `macos-13`        | `libzerofs_ffi.dylib` |
-| macOS arm64     | `macos-14`        | `libzerofs_ffi.dylib` |
+| macOS x86_64    | `macos-latest`    | `libzerofs_ffi.dylib` |
+| macOS arm64     | `macos-latest`    | `libzerofs_ffi.dylib` |
 
 For npm and Go, `generate.sh` generates bindings **from the debug cdylib** (the
 release build strips the uniffi metadata the generators read) and the package

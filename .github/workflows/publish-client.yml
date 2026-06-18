@@ -131,10 +131,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             manylinux: musllinux_1_2
           - name: macos-x86_64
-            os: macos-13
+            os: macos-latest
             target: x86_64-apple-darwin
           - name: macos-arm64
-            os: macos-14
+            os: macos-latest
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
@@ -236,11 +236,11 @@ jobs:
             rust_target: aarch64-unknown-linux-gnu
             cdylib: target/release/libzerofs_ffi.so
           - target: darwin-x64
-            os: macos-13
+            os: macos-latest
             rust_target: x86_64-apple-darwin
             cdylib: target/release/libzerofs_ffi.dylib
           - target: darwin-arm64
-            os: macos-14
+            os: macos-latest
             rust_target: aarch64-apple-darwin
             cdylib: target/release/libzerofs_ffi.dylib
     runs-on: ${{ matrix.os }}
