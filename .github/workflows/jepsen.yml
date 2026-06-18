@@ -24,7 +24,10 @@ jobs:
       - name: Install Leiningen + FUSE
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3
+          # gnuplot: jepsen's default perf-graph checker shells out to it to
+          # render latency/rate PNGs; without it that checker throws and the
+          # verdict drops to :unknown.
+          sudo apt-get install -y fuse3 gnuplot
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
@@ -46,15 +49,29 @@ jobs:
           cp jepsen/run.sh /tmp/local-fs/run.sh
           chmod +x /tmp/local-fs/run.sh
 
-      - name: Run quickcheck
+      - name: POSIX conformance (quickcheck)
         working-directory: /tmp/local-fs
         run: |
           # The ZeroFS backend self-manages the server (local file:// store) and
           # the 9P FUSE mount, so no MinIO/mount step is needed here. Each trial
           # is a full setup/teardown; --quickcheck-tests bounds CI time.
-          ./run.sh quickcheck \
+          ./run.sh run quickcheck \
             --db zerofs \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --quickcheck-tests 25 \
+            --time-limit 30
+
+      - name: Crash consistency (lose-unfsynced-writes)
+        working-directory: /tmp/local-fs
+        run: |
+          # Same run with the crash fault: the backend SIGKILLs the server
+          # (dropping the un-fsynced memtable) and recovers from the on-disk
+          # store. The [lsm] config in zerofs.clj makes an explicit fsync the
+          # only durability point, so the recovered state is deterministic.
+          ./run.sh run quickcheck \
+            --db zerofs \
+            --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --lose-unfsynced-writes \
             --quickcheck-tests 25 \
             --time-limit 30
 

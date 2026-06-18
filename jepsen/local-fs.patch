@@ -81,6 +81,70 @@ index 4835127..6cf7f94 100644
  
  (defn -main
    "Handles command line arguments. Can run a test, or a web server for browsing
+diff --git a/src/jepsen/local_fs/shell/checker.clj b/src/jepsen/local_fs/shell/checker.clj
+index d708d90..719154c 100644
+--- a/src/jepsen/local_fs/shell/checker.clj
++++ b/src/jepsen/local_fs/shell/checker.clj
+@@ -265,6 +265,14 @@
+        (->> (map key)
+             (reduce fsync-path* fs)))))
+ 
++(defn fsync-everything
++  "ZeroFS's fsync is a global db.flush() barrier: it makes every pending write
++  durable (data and metadata alike), not just the fsync'd inode. Moves the whole
++  cache, every entry and every inode, to disk."
++  [fs]
++  (let [fs (reduce fsync-path* fs (keys (get-in fs [:cache :entries])))]
++    (reduce fsync-inode fs (keys (get-in fs [:cache :inodes])))))
++
+ (defn inodes-in-disk-entries
+   "Returns a collection (including duplicates) of every inode referenced on
+   disk in a filesystem."
+@@ -419,7 +427,10 @@
+     (persistent!
+       (reduce (fn [paths [path cache-entry]]
+                 (if (tombstone? cache-entry)
+-                  (dissoc! paths path)
++                  ; disk-paths is a set, so remove with disj! (dissoc! is for
++                  ; maps). This path is only reached once the cache can hold a
++                  ; tombstone, i.e. once metadata isn't written through.
++                  (disj! paths path)
+                   (conj! paths path)))
+               (transient disk-paths)
+               (-> fs :cache :entries (children path))))))
+@@ -634,11 +645,9 @@
+ 
+       :fsync
+       (let [entry (get-path fs value)]
+-        ;(prn :entry entry)
+-        [(cond (link? entry) (fsync-inode fs (:inode entry))
+-
+-               ; Right now directories are synced automatically.
+-               (dir? entry) fs
++        ; ZeroFS: any fsync is a global db.flush(), so flush the whole
++        ; filesystem regardless of which path's fd was fsynced.
++        [(cond (or (link? entry) (dir? entry)) (fsync-everything fs)
+ 
+                :else (throw+ {:type  ::can't-fsync
+                               :path  value
+@@ -816,12 +825,12 @@
+   Returns a pair of [fs', op']: the resulting state, and the completion
+   operation.
+ 
+-  Every operation fsyncs the root metadata--though not the data. This is how
+-  lazyfs works right now--it writes metadata directly through and doesn't cache
+-  it."
++  Unlike lazyfs, ZeroFS does NOT write metadata through on every op: data and
++  metadata alike sit in the memtable (the model's :cache) until a flush, so a
++  crash can lose un-fsynced metadata too. Nothing is moved to disk here; only an
++  explicit fsync (a global flush) or recovery does that."
+   [fs op]
+-  (let [[fs' op'] (fs-op* fs op)]
+-    [(fsync-path-recursively* fs') op']))
++  (fs-op* fs op))
+ 
+ (defn simple-trace
+   "Takes a collection of ops from a history and strips them down to just [type
 diff --git a/src/jepsen/local_fs/shell/workload.clj b/src/jepsen/local_fs/shell/workload.clj
 index 5a35407..1b05348 100644
 --- a/src/jepsen/local_fs/shell/workload.clj
