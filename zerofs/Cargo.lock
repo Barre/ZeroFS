@@ -5949,7 +5949,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "futures",
@@ -5986,7 +5986,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
