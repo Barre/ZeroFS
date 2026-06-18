@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   collect-pgo-profile:
     name: Collect PGO Profile Data - ${{ matrix.test }}
