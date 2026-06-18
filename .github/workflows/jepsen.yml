@@ -7,6 +7,9 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   jepsen:
     name: Run jepsen local-fs suite (9P)
@@ -64,15 +67,12 @@ jobs:
       - name: Crash consistency (lose-unfsynced-writes)
         working-directory: /tmp/local-fs
         run: |
-          # Same run with the crash fault: the backend SIGKILLs the server
-          # (dropping the un-fsynced memtable) and recovers from the on-disk
-          # store. The [lsm] config in zerofs.clj makes an explicit fsync the
-          # only durability point, so the recovered state is deterministic.
           ./run.sh run quickcheck \
             --db zerofs \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --lose-unfsynced-writes \
-            --quickcheck-tests 25 \
+            --history-scale 8 \
+            --quickcheck-tests 20 \
             --time-limit 30
 
       - name: Upload jepsen store on failure
