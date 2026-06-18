@@ -43,7 +43,17 @@
        "encryption_password = \"" password "\"\n"
        "\n"
        "[servers.ninep]\n"
-       "addresses = [\"127.0.0.1:" port "\"]\n"))
+       "addresses = [\"127.0.0.1:" port "\"]\n"
+       "\n"
+       ; Crash-fault determinism: make an explicit fsync the only thing that
+       ; flushes the memtable to the store. Otherwise the periodic flush or the
+       ; unflushed-size threshold would persist un-fsynced writes on their own,
+       ; so a SIGKILL would keep more than the model (which reverts to the last
+       ; fsync) expects. The workload writes tiny data, so the high cap is safe.
+       ; sync_writes stays at its default (false) so un-fsynced writes are lost.
+       "[lsm]\n"
+       "flush_interval_secs = 86400\n"
+       "max_unflushed_gb = 100.0\n"))
 
 (defn daemon-start!
   "Daemonizes a zerofs invocation via start-stop-daemon, writing its pid to
@@ -179,7 +189,7 @@
       (throw+ {:type ::no-binary
                :bin  bin
                :msg  (str "zerofs binary not found at " bin
-                          " -- build it (cargo build) or pass --zerofs-bin")}))
+                          "; build it (cargo build) or pass --zerofs-bin")}))
     (map->DB (merge (paths dir)
                     {:bin       bin
                      :port      zerofs-port
