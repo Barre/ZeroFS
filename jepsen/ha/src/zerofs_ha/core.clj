@@ -402,67 +402,71 @@
     (dotimes [i ndirs] (.mkdirs (io/file dir (str "d" i))))
     (.createNewFile (io/file dir ".sync")))
   (invoke! [_ _test op]
-    ;; Bound every op: during a full outage a FUSE op blocks until recovery and
-    ;; would wedge the run. Timeout -> :info (indeterminate, never counted lost).
-    (util/timeout 30000 (assoc op :type :info :error :timeout)
-      (case (:f op)
-        ;; Assign a unique value, record it under this worker, then create it.
-        :add (let [v (swap! counter inc)
-                   f (io/file (subdir dir v) (str v))]
-               (swap! live update (:process op) (fnil conj #{}) v)
-               (try
-                 (add-file! dir v)
-                 (when fsync? (fsync-sentinel! dir))
-                 ;; Re-verify on the CURRENT node by READING v back: the add is
-                 ;; multi-step (write tmp, rename, fsync) and over the failover mount a
-                 ;; reroute can land those steps on different nodes, so :ok must mean
-                 ;; v's CONTENT is durably here. Presence alone isn't enough: a reroute
-                 ;; can land the dentry/rename without the (un-fsynced) data write,
-                 ;; leaving an empty file. If the content isn't "v\n" here, durability
-                 ;; is indeterminate -> :info (checker skips it), not a false :ok.
-                 (if (= (str v "\n") (slurp f))
-                   (assoc op :type :ok :value v)
-                   (assoc op :type :info :value v :error :content-not-durable-here))
-                 (catch java.io.IOException e
-                   (let [msg (str (.getMessage e))]
-                     (cond
-                       (re-find #"(?i)file exists" msg)
-                       (assoc op :type :info :value v :error :retried-create)
-                       (re-find #"(?i)no such file|not found" msg)
-                       (assoc op :type :info :value v :error :not-durable-here)
-                       :else (assoc op :type :fail :value v :error msg))))))
-        ;; Remove one of THIS worker's live values (none queued -> nothing to do).
-        :remove (if-let [v (first (get @live (:process op)))]
-                  (let [f (io/file (subdir dir v) (str v))]
-                    (swap! live update (:process op) disj v)
-                    (try
-                      (remove-file! dir v)
-                      (when fsync? (fsync-sentinel! dir))
-                      ;; Re-verify absence on the CURRENT node (a reroute can split
-                      ;; the delete and the fsync): :ok must mean v is really gone
-                      ;; here. If a fresh open still finds it, the delete's durability
-                      ;; is indeterminate -> :info, not a false :ok-removed.
-                      (let [present? (try (.close (java.io.FileInputStream. f)) true
-                                          (catch java.io.FileNotFoundException _ false))]
-                        (if present?
-                          (assoc op :type :info :value v :error :still-present-here)
-                          (assoc op :type :ok :value v)))
-                      (catch java.io.IOException e
-                        (assoc op :type :info :value v :error (.getMessage e)))))
-                  (assoc op :type :fail :error :nothing-to-remove))
-        ;; read carries three signals on one op so the set checker only sees :add/
-        ;; :remove/:read: :value = the live name set; :used-inodes = statfs
-        ;; accounting; :corrupt = files whose content != name.
-        :read (try (assoc op :type :ok
-                          :value (read-set dir)
-                          :used-inodes (statfs-used-inodes dir)
-                          :corrupt (corrupt-files dir))
+    ;; Reads happen only at the baseline (empty fs) and the final read, both outside
+    ;; any fault window, so they get NO timeout: the final read must enumerate the
+    ;; whole set, however large it grew. A hang here means a genuinely wedged fs
+    ;; (caught by the outer job timeout), not data loss. Writes stay bounded: during
+    ;; an outage a FUSE op blocks until recovery and would wedge the run -> :info.
+    (if (= :read (:f op))
+      ;; read carries three signals on one op so the set checker only sees :add/
+      ;; :remove/:read: :value = the live name set; :used-inodes = statfs accounting;
+      ;; :corrupt = files whose content != name.
+      (try (assoc op :type :ok
+                  :value (read-set dir)
+                  :used-inodes (statfs-used-inodes dir)
+                  :corrupt (corrupt-files dir))
+           (catch java.io.IOException e
+             (assoc op :type :fail :error (.getMessage e))))
+      (util/timeout 30000 (assoc op :type :info :error :timeout)
+        (case (:f op)
+          ;; Assign a unique value, record it under this worker, then create it.
+          :add (let [v (swap! counter inc)
+                     f (io/file (subdir dir v) (str v))]
+                 (swap! live update (:process op) (fnil conj #{}) v)
+                 (try
+                   (add-file! dir v)
+                   (when fsync? (fsync-sentinel! dir))
+                   ;; Re-verify on the CURRENT node by READING v back: the add is
+                   ;; multi-step (write tmp, rename, fsync) and over the failover mount a
+                   ;; reroute can land those steps on different nodes, so :ok must mean
+                   ;; v's CONTENT is durably here. Presence alone isn't enough: a reroute
+                   ;; can land the dentry/rename without the (un-fsynced) data write,
+                   ;; leaving an empty file. If the content isn't "v\n" here, durability
+                   ;; is indeterminate -> :info (checker skips it), not a false :ok.
+                   (if (= (str v "\n") (slurp f))
+                     (assoc op :type :ok :value v)
+                     (assoc op :type :info :value v :error :content-not-durable-here))
                    (catch java.io.IOException e
-                     (assoc op :type :fail :error (.getMessage e))))
-        ;; Drop leftover temps (interrupted renames) before the final read/statfs.
-        :cleanup (try (cleanup-temps! dir) (assoc op :type :ok)
-                      (catch java.io.IOException e
-                        (assoc op :type :fail :error (.getMessage e)))))))
+                     (let [msg (str (.getMessage e))]
+                       (cond
+                         (re-find #"(?i)file exists" msg)
+                         (assoc op :type :info :value v :error :retried-create)
+                         (re-find #"(?i)no such file|not found" msg)
+                         (assoc op :type :info :value v :error :not-durable-here)
+                         :else (assoc op :type :fail :value v :error msg))))))
+          ;; Remove one of THIS worker's live values (none queued -> nothing to do).
+          :remove (if-let [v (first (get @live (:process op)))]
+                    (let [f (io/file (subdir dir v) (str v))]
+                      (swap! live update (:process op) disj v)
+                      (try
+                        (remove-file! dir v)
+                        (when fsync? (fsync-sentinel! dir))
+                        ;; Re-verify absence on the CURRENT node (a reroute can split
+                        ;; the delete and the fsync): :ok must mean v is really gone
+                        ;; here. If a fresh open still finds it, the delete's durability
+                        ;; is indeterminate -> :info, not a false :ok-removed.
+                        (let [present? (try (.close (java.io.FileInputStream. f)) true
+                                            (catch java.io.FileNotFoundException _ false))]
+                          (if present?
+                            (assoc op :type :info :value v :error :still-present-here)
+                            (assoc op :type :ok :value v)))
+                        (catch java.io.IOException e
+                          (assoc op :type :info :value v :error (.getMessage e)))))
+                    (assoc op :type :fail :error :nothing-to-remove))
+          ;; Drop leftover temps (interrupted renames) before the final read/statfs.
+          :cleanup (try (cleanup-temps! dir) (assoc op :type :ok)
+                        (catch java.io.IOException e
+                          (assoc op :type :fail :error (.getMessage e))))))))
   (teardown! [_ _test])
   (close! [_ _test]))
 
