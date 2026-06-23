@@ -78,6 +78,19 @@ jobs:
             --work-dir "$RUNNER_TEMP/zerofs-ha-nofsync" 2>&1 | tee nofsync.log
           grep -q "Everything looks good" nofsync.log
 
+      # Node logs (a.log/b.log/minio.log/mount.log) live in the work-dir, not the
+      # jepsen store; copy them in so the uploaded artifact captures them.
+      - name: Collect node logs on failure
+        if: failure()
+        run: |
+          mkdir -p jepsen/ha/store/node-logs
+          for wd in zerofs-ha-fsync zerofs-ha-nofsync; do
+            for f in "$RUNNER_TEMP/$wd"/*.log; do
+              [ -e "$f" ] || continue
+              cp "$f" "jepsen/ha/store/node-logs/$wd.$(basename "$f")"
+            done
+          done
+
       - name: Upload jepsen store on failure
         if: failure()
         uses: actions/upload-artifact@v4
