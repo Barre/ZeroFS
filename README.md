@@ -28,6 +28,7 @@ ZeroFS serves S3-compatible buckets as **POSIX filesystems over NFS and 9P**, an
 - **Web UI** - File manager, real-time monitoring, and in-browser terminal
 - **Always Encrypted** - Data is compressed (zstd or LZ4), then encrypted with XChaCha20-Poly1305 before upload; there is no unencrypted mode
 - **Local Cache** - Warm cached random reads in 1.6 µs (SQLite bench); a raw S3 round trip is 50–300 ms
+- **High Availability** - Optional leader/standby replication with automatic failover; a connected standby preserves writes that were acknowledged but not yet flushed to object storage
 - **Backends** - AWS S3, Google Cloud Storage, Azure Blob, any S3-compatible store, or local disk
 
 ## Testing
@@ -35,6 +36,8 @@ ZeroFS serves S3-compatible buckets as **POSIX filesystems over NFS and 9P**, an
 ZeroFS runs the [pjdfstest_nfs](https://github.com/Barre/pjdfstest_nfs) suite in CI on every change — 8,662 tests covering POSIX filesystem operations including file operations, permissions, and ownership — once per protocol: [NFS](https://github.com/Barre/ZeroFS/actions/workflows/pjdfstest.yml), [9P](https://github.com/Barre/ZeroFS/actions/workflows/pjdfstest-9p.yml), and [FUSE](https://github.com/Barre/ZeroFS/actions/workflows/pjdfstest-fuse.yml). A few cases per protocol are excluded; the lists are published in [`.github/`](https://github.com/Barre/ZeroFS/tree/main/.github).
 
 CI also runs Jepsen's [local-fs](https://github.com/jepsen-io/local-fs) suite against a 9P mount, via [a workflow](https://github.com/Barre/ZeroFS/actions/workflows/jepsen.yml) that assembles it. It generates random filesystem-operation histories and checks each against a reference model, shrinking any divergence to a minimal failing case. A second mode injects a crash: it kills the server mid-run, dropping the un-fsynced memtable, and verifies the state recovered from the object store is consistent with the last fsync.
+
+CI also exercises HA: the same local-fs model-checker runs with leader-to-standby failovers injected, and a separate [classic-Jepsen suite](https://github.com/Barre/ZeroFS/actions/workflows/jepsen-ha.yml) runs a leader/standby pair over MinIO under a nemesis that kills the leader, the standby, or both, or pauses MinIO, checking that no acknowledged write is lost, resurrected, or corrupted across a failover.
 
 We use ZFS as an end-to-end test in our CI. [We create ZFS pools on ZeroFS](https://github.com/Barre/ZeroFS/actions/workflows/zfs-test.yml), extract the Linux kernel source tree, and run scrub operations to verify data integrity. The scrub reports no checksum errors.
 
@@ -151,6 +154,10 @@ graph TB
     NBD --> NBDD
     WEB --> WEBUI
 ```
+
+## High Availability
+
+A `[replication]` section runs a leader and a standby backed by the same object store, so there is no second copy of the data to provision. The standby semi-synchronously replicates the leader's not-yet-flushed writes and takes over automatically, in seconds, if the leader fails, keeping the filesystem available through a node failure. A connected standby holds every acknowledged write, so failover preserves data that was acknowledged but not yet flushed, not only what has been `fsync`'d. SlateDB's writer-epoch fencing prevents split-brain: a deposed leader cannot commit. The [high availability documentation](https://www.zerofs.net/high-availability) covers the design, guarantees, and configuration.
 
 ## Quick Start
 
