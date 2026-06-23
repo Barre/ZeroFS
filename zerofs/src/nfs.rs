@@ -347,7 +347,7 @@ impl NFSFileSystem for NFSAdapter {
             count
         );
 
-        match self.fs.flush_coordinator.flush().await {
+        match self.fs.client_fsync().await {
             Ok(_) => {
                 debug!("commit successful for file {}", fileid);
                 self.fs

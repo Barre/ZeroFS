@@ -386,8 +386,7 @@ impl NBDHandler {
 
     pub async fn flush(&self, inode: u64) -> CommandResult<()> {
         self.filesystem
-            .flush_coordinator
-            .flush()
+            .client_fsync()
             .await
             .map_err(|_| CommandError::IoError)?;
 
