@@ -1,25 +1,16 @@
 //! Asynchronous 9P2000.L client.
 //!
-//! This is the network counterpart to the ZeroFS 9P server: it speaks the exact
-//! same wire protocol but from the client side.
-//!
 //! # Reconnection
 //!
-//! 9P sessions are stateful: every fid (the attach root, the per-inode "path"
-//! fids and open file handles) and every byte-range lock lives on the
-//! connection. A dropped socket therefore invalidates all of it, which is why
-//! the in-kernel v9fs client simply wedges the mount on disconnect.
-//!
-//! Instead, this client records, per fid, the stable **inode id** it points at
-//! (plus open flags) and which locks it holds, in [`SessionState`]. When the
-//! connection drops, a supervisor task reconnects (retrying indefinitely with
-//! backoff) and *replays* that state onto the fresh session.
-//!
-//! While a reconnect is in progress every request blocks (the mount "hangs"
-//! rather than failing) and is resent once the session is restored. The one
-//! caveat is a request in flight at the instant of the drop: we can't know
-//! whether the server applied it, so resending a non-idempotent op
-//! (mkdir/create/rename/unlink) could apply it twice.
+//! 9P sessions are stateful: every fid and byte-range lock lives on the
+//! connection, so a dropped socket invalidates all of it. This client records,
+//! per fid, the stable inode id it points at (plus open flags) and which locks
+//! it holds, in [`SessionState`]; a supervisor task reconnects (indefinite
+//! backoff) and replays that state onto the fresh session. Requests block
+//! through the reconnect and are resent. A request in flight at the drop is
+//! ambiguous; under `.zerofs3` every non-idempotent mutation carries a stable
+//! op-id (including the fid-opening create, Tlcreate), so the server deduplicates
+//! the resend instead of double-applying it.
 
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
@@ -27,6 +18,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use deku::prelude::*;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use ninep_proto::*;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -46,8 +38,28 @@ const NOTAG: u16 = 0xFFFF;
 /// The 9P "no fid" sentinel, used as the `afid` in attach when not authenticating.
 pub const NOFID: u32 = 0xFFFF_FFFF;
 
+/// A fresh random idempotency op-id, stamped on each plain mutating call so a
+/// resend-on-reply-loss is deduplicated rather than double-applied. A higher
+/// layer retrying the same logical op across a failover passes its own stable id
+/// via the `_op_id` methods.
+fn new_op_id() -> [u8; 16] {
+    use rand::RngCore;
+    let mut id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut id);
+    id
+}
+
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
+/// Per-target probe budget (dial + negotiate, or the lease check). Bounds the
+/// probe race so a partitioned node can neither stall the winner nor linger.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Cap on awaiting one reply before treating the leader as hung (frozen or wedged
+/// with its connection still open, so a clean-crash reconnect never fires): tear
+/// it down, reprobe, and resend. The stable op-id makes the resend exactly-once.
+/// Exceeds the leader's 5s ship timeout so a healthy write awaiting a slow ship is
+/// not falsely re-routed.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -90,8 +102,11 @@ pub type ClientResult<T> = Result<T, ClientError>;
 mod ops;
 pub use ops::{DirEntryCookie, ReaddirState, SetattrBuilder, SetattrTime};
 
+/// A 9P endpoint to dial. A client may hold several (an HA node set) and probes
+/// for whichever is the serving leader, re-probing on reconnect to follow a
+/// failover.
 #[derive(Clone)]
-enum Target {
+pub enum Target {
     Tcp(SocketAddr),
     Unix(PathBuf),
 }
@@ -106,21 +121,18 @@ struct Conn {
     dead: AtomicBool,
     /// Signals the (possibly idle) writer task to stop when the reader exits.
     writer_shutdown: Notify,
-    /// Signals the reader task to stop even while the socket is still healthy.
-    /// The reader otherwise only exits when the socket dies, so a freshly built
-    /// connection that is discarded before being installed (negotiate or replay
-    /// failed) would leak its reader task and socket fd. The reader and writer
-    /// each hold an `Arc<Conn>`, so `Drop` can't break that cycle; teardown
-    /// must be signalled explicitly via [`Conn::shutdown`].
+    /// Signals the reader to stop while the socket is still healthy: it otherwise
+    /// only exits on socket death, so a connection discarded before install
+    /// (negotiate/replay failed) would leak its reader + fd. Reader and writer
+    /// each hold an `Arc<Conn>`, so the cycle never breaks on Drop; teardown is
+    /// explicit via [`Conn::shutdown`].
     reader_shutdown: Notify,
 }
 
 impl Conn {
-    /// Tear down a connection that is being discarded without ever being
-    /// installed (e.g. `connect_once` negotiated but `replay` then failed):
-    /// wake both the reader and the writer so they exit and drop their
-    /// `Arc<Conn>`, releasing the socket fd. A normally-dying connection
-    /// (socket failed) tears itself down; this is only for the discard path.
+    /// Tear down a connection discarded before install (negotiate/replay failed):
+    /// wake reader and writer so they exit, drop their `Arc<Conn>` and release the
+    /// fd. A socket-failed connection tears itself down; this is the discard path.
     fn shutdown(&self) {
         self.dead.store(true, Ordering::Release);
         self.reader_shutdown.notify_one();
@@ -128,32 +140,27 @@ impl Conn {
     }
 }
 
-/// How a fid is re-established on a fresh session. There is no path/lineage and
-/// no inter-fid dependency: the attach root is re-attached, and every other fid
-/// is rebound directly to its (stable, never-reused) inode id. Rename, unlink of
-/// another hard link, etc. are irrelevant because the id never changes.
+/// How a fid is re-established on a fresh session. No path/lineage: the attach
+/// root is re-attached and every other fid is rebound directly to its (stable,
+/// never-reused) inode id, so renames/unlinks are irrelevant.
 #[derive(Clone)]
 enum FidKind {
-    /// The attach root, re-established with `Tattach`.
     Attach {
         afid: u32,
         uname: String,
         aname: String,
         n_uname: u32,
-        /// The inode the attach resolved to (the `Rattach` qid's path): inode 0
-        /// for an empty aname, the subtree root otherwise. Clones of this fid
-        /// are rebound here.
+        /// Inode the attach resolved to (the `Rattach` qid path); clones rebind here.
         root_inode: u64,
     },
-    /// A fid bound to a specific inode, re-established with `Trebind` as the
-    /// user (`n_uname`) that owns it.
+    /// Bound to an inode via `Trebind`, acting as `n_uname`.
     Inode { inode_id: u64, n_uname: u32 },
 }
 
 #[derive(Clone)]
 struct FidRecord {
     kind: FidKind,
-    /// `Some(flags)` if the fid is open; replayed with a `Tlopen`.
+    /// `Some(flags)` if open; replayed with a `Tlopen`.
     opened: Option<u32>,
 }
 
@@ -165,7 +172,6 @@ impl FidRecord {
         }
     }
 
-    /// The uid this fid acts as, replayed via `Tattach`/`Trebind`.
     fn n_uname(&self) -> u32 {
         match self.kind {
             FidKind::Attach { n_uname, .. } | FidKind::Inode { n_uname, .. } => n_uname,
@@ -191,24 +197,20 @@ struct SessionState {
 }
 
 pub struct NinePClient {
-    target: Target,
+    /// HA node set to dial; single-element for a plain connection. The supervisor
+    /// probes the whole list to find the serving leader.
+    targets: Vec<Target>,
     requested_msize: u32,
-    /// The current transport. Swapped atomically by the reconnect supervisor.
+    /// Current transport, swapped atomically by the reconnect supervisor.
     conn: ArcSwap<Conn>,
     /// False while a reconnect+replay is in progress; requests block until true.
     live: AtomicBool,
     live_notify: Notify,
-    /// Pinged by a connection's reader/writer when the socket dies.
     reconnect_notify: Arc<Notify>,
-    /// Negotiated message size (the smaller of what we asked for and what the
-    /// server can handle).
     msize: AtomicU32,
-    /// Negotiated ZeroFS extension level, re-negotiated on reconnect:
-    /// 0 = plain 9P2000.L, 1 = `.zerofs` (Twalkgetattr/Treaddirattr),
-    /// 2 = `.zerofs2` (additionally the compound create/open messages and the
-    /// stat-carrying create-family/setattr replies).
+    /// Negotiated extension level, re-negotiated on reconnect: 0 = plain
+    /// 9P2000.L, 1 = `.zerofs`, 2 = `.zerofs2`, 3 = `.zerofs3` (op-id).
     extensions: AtomicU8,
-    /// Monotonic fid allocator, with a free list for reuse.
     fid_ctr: AtomicU32,
     fid_free: Mutex<Vec<u32>>,
     /// Recorded fids (by inode id) and held locks, replayed on reconnect.
@@ -218,7 +220,7 @@ pub struct NinePClient {
 impl NinePClient {
     /// Connect to a 9P server over TCP and negotiate the protocol version.
     pub async fn connect_tcp(addr: SocketAddr, requested_msize: u32) -> std::io::Result<Arc<Self>> {
-        Self::connect(Target::Tcp(addr), requested_msize)
+        Self::connect(vec![Target::Tcp(addr)], requested_msize)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
@@ -228,18 +230,33 @@ impl NinePClient {
         path: impl AsRef<Path>,
         requested_msize: u32,
     ) -> std::io::Result<Arc<Self>> {
-        Self::connect(Target::Unix(path.as_ref().to_path_buf()), requested_msize)
+        Self::connect(
+            vec![Target::Unix(path.as_ref().to_path_buf())],
+            requested_msize,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// Connect across an HA node set: dials the serving leader and re-probes the
+    /// set on reconnect to follow a failover. A single target is exactly
+    /// [`Self::connect_tcp`]/[`Self::connect_unix`].
+    pub async fn connect_multi(
+        targets: Vec<Target>,
+        requested_msize: u32,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::connect(targets, requested_msize)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    async fn connect(target: Target, requested_msize: u32) -> ClientResult<Arc<Self>> {
+    async fn connect(targets: Vec<Target>, requested_msize: u32) -> ClientResult<Arc<Self>> {
         let reconnect_notify = Arc::new(Notify::new());
         let (conn, msize, extensions) =
-            Self::connect_once(&target, requested_msize, Arc::clone(&reconnect_notify)).await?;
+            Self::probe(&targets, requested_msize, Arc::clone(&reconnect_notify)).await?;
 
         let client = Arc::new(Self {
-            target,
+            targets,
             requested_msize,
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
@@ -255,8 +272,7 @@ impl NinePClient {
         Ok(client)
     }
 
-    /// Open a fresh socket, spawn its reader/writer tasks and negotiate the
-    /// version.
+    /// Open a fresh socket, spawn its reader/writer tasks and negotiate.
     async fn connect_once(
         target: &Target,
         requested_msize: u32,
@@ -281,14 +297,113 @@ impl NinePClient {
         );
         spawn_reader(read, Arc::clone(&conn), reconnect_notify);
 
-        match negotiate_on(&conn, requested_msize).await {
-            Ok((msize, extensions)) => Ok((conn, msize, extensions)),
-            // The socket is healthy but unusable; tear the tasks down so the fd
-            // is not leaked.
-            Err(e) => {
+        match tokio::time::timeout(PROBE_TIMEOUT, negotiate_on(&conn, requested_msize)).await {
+            Ok(Ok((msize, extensions))) => Ok((conn, msize, extensions)),
+            // Healthy socket but the handshake failed/stalled; tear down so the fd is not leaked.
+            Ok(Err(e)) => {
                 conn.shutdown();
                 Err(e)
             }
+            Err(_) => {
+                conn.shutdown();
+                Err(ClientError::Disconnected)
+            }
+        }
+    }
+
+    /// Race all targets concurrently to find the serving leader: the first to
+    /// pass the lease-gated [`Self::leader_check`] wins, the rest are torn down.
+    /// A standby is not listening and a deposed leader fails the check, so only
+    /// the real leader is adopted; concurrency stops a partitioned node stalling.
+    async fn probe(
+        targets: &[Target],
+        requested_msize: u32,
+        reconnect_notify: Arc<Notify>,
+    ) -> ClientResult<(Arc<Conn>, u32, u8)> {
+        let mut probes = FuturesUnordered::new();
+        for target in targets {
+            let target = target.clone();
+            let notify = Arc::clone(&reconnect_notify);
+            probes.push(async move {
+                let (conn, msize, extensions) =
+                    Self::connect_once(&target, requested_msize, notify).await?;
+                // A fenced/lapsed leader still accepts connections; confirm the lease before adopting.
+                match tokio::time::timeout(PROBE_TIMEOUT, Self::leader_check(&conn)).await {
+                    Ok(Ok(())) => Ok((conn, msize, extensions)),
+                    Ok(Err(e)) => {
+                        conn.shutdown();
+                        Err(e)
+                    }
+                    Err(_) => {
+                        conn.shutdown();
+                        Err(ClientError::Disconnected)
+                    }
+                }
+            });
+        }
+
+        let mut last_err = None;
+        let mut winner = None;
+        while let Some(res) = probes.next().await {
+            match res {
+                Ok(triple) => {
+                    winner = Some(triple);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        // Tear down the still-running losers (each bounded by PROBE_TIMEOUT) so their tasks don't leak.
+        if !probes.is_empty() {
+            tokio::spawn(async move {
+                while let Some(res) = probes.next().await {
+                    if let Ok((conn, _, _)) = res {
+                        conn.shutdown();
+                    }
+                }
+            });
+        }
+
+        winner.ok_or_else(|| last_err.unwrap_or(ClientError::Disconnected))
+    }
+
+    /// Throwaway lease-gated round trip confirming a node is the serving leader:
+    /// attach the root, stat it (a lease-gated read), clunk. Any error means it
+    /// is not serving. Uses a reserved fid the session never allocates.
+    async fn leader_check(conn: &Conn) -> ClientResult<()> {
+        const PROBE_FID: u32 = 0xFFFF_FFFE;
+        let n_uname = unsafe { libc::geteuid() };
+        match Self::send_raw_rpc(
+            conn,
+            Message::Tattach(Tattach {
+                fid: PROBE_FID,
+                afid: NOFID,
+                uname: P9String::new(Vec::new()),
+                aname: P9String::new(Vec::new()),
+                n_uname,
+            }),
+        )
+        .await
+        {
+            Ok(Message::Rattach(_)) => {}
+            Ok(_) => return Err(ClientError::Unexpected("probe attach")),
+            Err(e) => return Err(e),
+        }
+        let stat = Self::send_raw_rpc(
+            conn,
+            Message::Tgetattr(Tgetattr {
+                fid: PROBE_FID,
+                request_mask: GETATTR_ALL,
+            }),
+        )
+        .await;
+        // Best-effort release: keeps a winning connection clean; a loser is torn down anyway.
+        let _ = Self::send_raw_rpc(conn, Message::Tclunk(Tclunk { fid: PROBE_FID })).await;
+        match stat {
+            Ok(Message::Rgetattr(_)) => Ok(()),
+            Ok(_) => Err(ClientError::Unexpected("probe getattr")),
+            Err(e) => Err(e),
         }
     }
 
@@ -299,8 +414,7 @@ impl NinePClient {
         let notify = Arc::clone(&self.reconnect_notify);
         tokio::spawn(async move {
             loop {
-                // Enable the waiter before reading `dead`, so a set-dead-then-notify
-                // can't be lost; re-reading the current conn ignores stale notifies.
+                // Enable the waiter before reading `dead` so a set-dead-then-notify isn't lost.
                 loop {
                     let notified = notify.notified();
                     tokio::pin!(notified);
@@ -345,8 +459,8 @@ impl NinePClient {
 
     /// One reconnect attempt: dial, replay state, then swap the connection in.
     async fn reconnect_once(&self) -> ClientResult<()> {
-        let (conn, msize, extensions) = Self::connect_once(
-            &self.target,
+        let (conn, msize, extensions) = Self::probe(
+            &self.targets,
             self.requested_msize,
             Arc::clone(&self.reconnect_notify),
         )
@@ -354,8 +468,7 @@ impl NinePClient {
 
         self.msize.store(msize, Ordering::Relaxed);
         self.extensions.store(extensions, Ordering::Relaxed);
-        // A replay failure discards this freshly built connection (the caller
-        // retries with a new one); tear it down so its fd is not leaked.
+        // Replay failure discards this connection; tear it down so its fd is not leaked.
         if let Err(e) = self.replay(&conn).await {
             conn.shutdown();
             return Err(e);
@@ -368,12 +481,10 @@ impl NinePClient {
     }
 
     /// Rebuild the recorded session onto `conn`, then re-acquire locks. Attach
-    /// fids replay first (re-attaching restores the session's aname subtree
-    /// root on the server, which the subsequent `Trebind`s are validated
-    /// against), and every other fid is then rebound to its inode id (no
-    /// lineage, no parent ordering). A *transport* failure aborts (the caller
-    /// reconnects afresh); a *server* error for a fid means the inode is gone
-    /// (or has left the subtree), so that fid is dropped.
+    /// fids must replay first: re-attaching restores the aname subtree root the
+    /// subsequent `Trebind`s validate against. A transport failure aborts (caller
+    /// reconnects afresh); a server error for a fid means its inode is gone, so it
+    /// is dropped.
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
         let snapshot = self.state.lock().unwrap().clone();
 
@@ -412,18 +523,14 @@ impl NinePClient {
         Ok(())
     }
 
-    /// Re-establish one fid on `conn`. Returns `Ok(true)` if restored, `Ok(false)`
-    /// if the server says it's gone (skip it), `Err` on a transport failure.
+    /// Re-establish one fid on `conn`: `Ok(true)` restored, `Ok(false)` gone
+    /// (skip it), `Err` on transport failure.
     ///
-    /// An *aname* attach (a confined, subtree-rooted session) that fails to
-    /// re-resolve is treated as a transport-level failure, not a gone fid: the
-    /// attach establishes the server-side confinement root that every subsequent
-    /// `Trebind` is validated against, so dropping it would leave the inode fids
-    /// to rebind onto an unconfined (whole-filesystem) session. Returning `Err`
-    /// aborts the reconnect; the supervisor retries afresh (and surfaces the
-    /// error if the aname is gone for good) rather than silently widening the
-    /// session's reach. A whole-filesystem attach (empty aname) has no
-    /// confinement to lose, so it follows the gone-fid path.
+    /// A confined (non-empty aname) attach that fails to re-resolve is a hard
+    /// error, not a gone fid: it establishes the confinement root the `Trebind`s
+    /// validate against, so dropping it would silently widen the session to the
+    /// whole filesystem. An empty-aname attach has no confinement, so it follows
+    /// the gone-fid path.
     async fn replay_fid(conn: &Conn, fid: u32, rec: &FidRecord) -> ClientResult<bool> {
         let confined_attach =
             matches!(&rec.kind, FidKind::Attach { aname, .. } if !aname.is_empty());
@@ -450,8 +557,6 @@ impl NinePClient {
         match Self::send_raw_rpc(conn, body).await {
             Ok(Message::Rattach(_)) | Ok(Message::Rrebind(_)) => Ok(true),
             Ok(_) => Err(ClientError::Unexpected("replay fid")),
-            // A confined aname attach that no longer resolves must abort the
-            // whole reconnect (fail closed); a gone inode fid is just dropped.
             Err(e @ ClientError::Errno(_)) if confined_attach => Err(e),
             Err(ClientError::Errno(_)) => Ok(false), // inode gone -> drop this fid
             Err(e) => Err(e),
@@ -463,18 +568,19 @@ impl NinePClient {
         self.msize.load(Ordering::Relaxed)
     }
 
-    /// Whether the server negotiated the ZeroFS fast-path extensions
-    /// (`walk_getattr`/`readdirplus`).
+    /// `.zerofs` fast paths (`walk_getattr`/`readdirplus`) negotiated.
     pub fn extensions_enabled(&self) -> bool {
         self.extensions.load(Ordering::Relaxed) >= 1
     }
 
-    /// Whether the server negotiated the second-generation extensions: the
-    /// compound create/open messages (`lopenat`/`lcreateattr`) and the
-    /// stat-carrying replies (`mkdir_attr`/`symlink_attr`/`mknod_attr`/
-    /// `link_attr`/`setattr_attr`).
+    /// `.zerofs2` negotiated: compound create/open and stat-carrying replies.
     pub fn extensions_v2_enabled(&self) -> bool {
         self.extensions.load(Ordering::Relaxed) >= 2
+    }
+
+    /// `.zerofs3` negotiated: covered requests carry a frame op-id for dedup.
+    fn op_id_enabled(&self) -> bool {
+        self.extensions.load(Ordering::Relaxed) >= 3
     }
 
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
@@ -504,8 +610,7 @@ impl NinePClient {
         self.fid_free.lock().unwrap().push(fid);
     }
 
-    /// Number of fids currently live server-side for this client: allocated and
-    /// not yet returned to the free list. A diagnostic for leak accounting.
+    /// Allocated fids not yet returned to the free list. Leak-accounting diagnostic.
     pub fn outstanding_fids(&self) -> usize {
         let allocated = self.fid_ctr.load(Ordering::Relaxed).saturating_sub(1) as usize;
         allocated.saturating_sub(self.fid_free.lock().unwrap().len())
@@ -543,16 +648,32 @@ impl NinePClient {
         }
     }
 
-    /// Send a request, blocking through any in-progress reconnect and resending
-    /// across one (see the module docs for the in-flight double-apply caveat).
-    async fn send_request(&self, body: Message) -> ClientResult<Message> {
+    /// Send a request, blocking through any reconnect and resending across one
+    /// (see the module docs for the in-flight double-apply caveat).
+    async fn send_request(&self, op_id: [u8; 16], body: Message) -> ClientResult<Message> {
         loop {
             self.wait_until_live().await;
             let conn = self.conn.load_full();
 
             let (otx, orx) = oneshot::channel();
             let tag = Self::alloc_tag(&conn, otx);
-            let bytes = match P9Message::new(tag, body.clone()).to_bytes() {
+
+            // `live` can briefly lag a conn's death, so we may have loaded the dead
+            // one. The reader sets `dead` BEFORE it drains `pending` on exit, so a
+            // slot registered after we observe `dead` here would never complete
+            // (hanging `orx.await` forever). Drop it, nudge the supervisor, retry.
+            if conn.dead.load(Ordering::Acquire) {
+                conn.pending.remove(&tag);
+                self.reconnect_notify.notify_waiters();
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            // The op-id is stable across this loop's resends, so the
+            // resend-on-reply-loss below is deduplicated rather than double-applied.
+            let bytes = match P9Message::new_with_op_id(tag, op_id, body.clone())
+                .to_bytes_ctx(self.op_id_enabled())
+            {
                 Ok(b) => b,
                 Err(e) => {
                     conn.pending.remove(&tag);
@@ -566,20 +687,46 @@ impl NinePClient {
                 continue;
             }
             // Parse here, not on the reader task, to keep the reader unblocked.
-            match orx.await {
-                Ok(frame) => {
+            match tokio::time::timeout(REQUEST_TIMEOUT, orx).await {
+                Ok(Ok(frame)) => {
                     let (_, msg) =
                         P9Message::from_bytes((&frame, 0)).map_err(ClientError::Codec)?;
+                    // Bound node is no longer the leader (lease lapsed or fenced):
+                    // re-probe and resend. The stable op-id keeps the resend
+                    // exactly-once even if leadership moves again before it lands.
+                    if let Message::Rlerror(ref e) = msg.body
+                        && e.ecode == P9_ENOTLEADER
+                    {
+                        self.force_reprobe(&conn);
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     return Ok(msg.body);
                 }
-                Err(_) => {
+                Ok(Err(_)) => {
                     // Lost the reply to a drop: wait for reconnect and resend.
                     conn.pending.remove(&tag);
                     tokio::task::yield_now().await;
                     continue;
                 }
+                Err(_) => {
+                    // No reply within REQUEST_TIMEOUT: the leader is hung but its
+                    // connection is still open (a clean crash would have dropped it
+                    // and reconnected on its own). Tear it down, reprobe, resend.
+                    conn.pending.remove(&tag);
+                    self.force_reprobe(&conn);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
             }
         }
+    }
+
+    /// Tear down `conn` and wake the supervisor to re-probe. Used on
+    /// [`P9_ENOTLEADER`]: the socket is still up, so nothing else would reconnect.
+    fn force_reprobe(&self, conn: &Arc<Conn>) {
+        conn.shutdown();
+        self.reconnect_notify.notify_waiters();
     }
 
     /// A one-shot send on a specific connection, bypassing the live-gate and
@@ -614,7 +761,13 @@ impl NinePClient {
 
     /// Issue a request, turning a returned `Rlerror` into [`ClientError::Errno`].
     async fn rpc(&self, body: Message) -> ClientResult<Message> {
-        match self.send_request(body).await? {
+        self.rpc_with_op_id([0u8; 16], body).await
+    }
+
+    /// Like [`Self::rpc`] but tags the request with an idempotency op-id (on the
+    /// wire only for the protocol's `carries_op_id` types).
+    async fn rpc_with_op_id(&self, op_id: [u8; 16], body: Message) -> ClientResult<Message> {
+        match self.send_request(op_id, body).await? {
             Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
             other => Ok(other),
         }
@@ -659,9 +812,8 @@ impl NinePClient {
         }
     }
 
-    /// Bind `fid` to an existing inode by id, acting as `n_uname`. Obtains a fresh
-    /// fid for an inode without re-walking a path; used for per-user fids and for
-    /// reconnect replay.
+    /// Bind `fid` to an inode by id (no path walk), acting as `n_uname`. Used for
+    /// per-user fids and reconnect replay.
     pub async fn rebind(&self, fid: u32, inode_id: u64, n_uname: u32) -> ClientResult<Qid> {
         let resp = self
             .rpc(Message::Trebind(Trebind {
@@ -700,13 +852,9 @@ impl NinePClient {
             .await?;
         match resp {
             Message::Rwalk(r) => {
-                // No await between the reply and this insert, so a reconnect
-                // snapshot can't catch a half-recorded fid. Only a full walk
-                // creates `newfid` (a partial one leaves it unset, per spec).
+                // Only a full walk creates `newfid` (a partial leaves it unset).
                 if names.is_empty() || r.wqids.len() == names.len() {
                     let mut st = self.state.lock().unwrap();
-                    // The new fid is reachable from `fid`, so it acts as the same
-                    // user; a clone (empty names) also shares its inode.
                     let n_uname = st.fids.get(&fid).map(FidRecord::n_uname);
                     let inode_id = if names.is_empty() {
                         st.fids.get(&fid).map(FidRecord::inode_id)
@@ -729,10 +877,8 @@ impl NinePClient {
         }
     }
 
-    /// Full walk that also returns the final inode's stat in one round trip
-    /// (the server's Twalkgetattr fast path). Records `newfid` exactly like
-    /// `walk`, so reconnect replay via `Trebind` is unchanged. Only valid when
-    /// the server negotiated extensions ([`Self::extensions_enabled`]).
+    /// Full walk plus the final stat in one round trip (Twalkgetattr fast path).
+    /// Records `newfid` like `walk`. Only valid with [`Self::extensions_enabled`].
     pub async fn walk_getattr(
         &self,
         fid: u32,
@@ -779,7 +925,7 @@ impl NinePClient {
 
     pub async fn clunk(&self, fid: u32) -> ClientResult<()> {
         let resp = self.rpc(Message::Tclunk(Tclunk { fid })).await;
-        // The fid is gone regardless of the reply, so stop tracking it.
+        // The fid is gone regardless of the reply.
         {
             let mut st = self.state.lock().unwrap();
             st.fids.remove(&fid);
@@ -811,9 +957,8 @@ impl NinePClient {
         }
     }
 
-    /// Like [`Self::setattr`] but the reply carries the post-op stat, sparing
-    /// the follow-up getattr. Only valid when the server negotiated the v2
-    /// extensions ([`Self::extensions_v2_enabled`]).
+    /// Like [`Self::setattr`] but the reply carries the post-op stat. Only valid
+    /// with [`Self::extensions_v2_enabled`].
     pub async fn setattr_attr(&self, ts: Tsetattr) -> ClientResult<Stat> {
         match self.rpc(Message::Tsetattrattr(ts)).await? {
             Message::Rsetattrattr(r) => Ok(r.stat),
@@ -833,11 +978,9 @@ impl NinePClient {
         }
     }
 
-    /// Open `fid`'s inode on a fresh `newfid` in one round trip (the server's
-    /// Tlopenat fast path), replacing the Twalk(clone) + Tlopen pair. `fid` is
-    /// left untouched. Records `newfid` exactly as that pair would, so reconnect
-    /// replay (rebind + reopen) is unchanged. Only valid when the server
-    /// negotiated the v2 extensions ([`Self::extensions_v2_enabled`]).
+    /// Open `fid`'s inode on a fresh `newfid` in one round trip (Tlopenat fast
+    /// path = Twalk(clone) + Tlopen); `fid` untouched. Only valid with
+    /// [`Self::extensions_v2_enabled`].
     pub async fn lopenat(&self, fid: u32, newfid: u32, flags: u32) -> ClientResult<(Qid, u32)> {
         let resp = self
             .rpc(Message::Tlopenat(Tlopenat { fid, newfid, flags }))
@@ -871,19 +1014,36 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<(Qid, u32)> {
+        self.lcreate_op_id(fid, name, flags, mode, gid, new_op_id())
+            .await
+    }
+
+    /// [`Self::lcreate`] with an idempotency op-id (all-zero to opt out).
+    pub async fn lcreate_op_id(
+        &self,
+        fid: u32,
+        name: &[u8],
+        flags: u32,
+        mode: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<(Qid, u32)> {
         let resp = self
-            .rpc(Message::Tlcreate(Tlcreate {
-                fid,
-                name: P9String::new(name.to_vec()),
-                flags,
-                mode,
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tlcreate(Tlcreate {
+                    fid,
+                    name: P9String::new(name.to_vec()),
+                    flags,
+                    mode,
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rlcreate(r) => {
-                // `fid` now names the created file: record its inode and the open
-                // flags (minus create-only) so replay rebinds and reopens it.
+                // `fid` now names the created file: record its inode and the reopen
+                // flags (create-only bits stripped) so replay rebinds and reopens it.
                 let reopen = flags & !((libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC) as u32);
                 let mut st = self.state.lock().unwrap();
                 if let Some(rec) = st.fids.get_mut(&fid) {
@@ -900,12 +1060,10 @@ impl NinePClient {
         }
     }
 
-    /// Create and open `name` under `dfid` and return its full post-op stat, all
-    /// in one round trip (the server's Tlcreateattr fast path), replacing the
-    /// Twalk(clone) + Tlcreate + Tgetattr sequence. Unlike [`Self::lcreate`],
-    /// `dfid` is left untouched: the created file is opened on `newfid`. Only
-    /// valid when the server negotiated the v2 extensions
-    /// ([`Self::extensions_v2_enabled`]).
+    /// Create and open `name` under `dfid`, returning the post-op stat in one
+    /// round trip (Tlcreateattr fast path = Twalk(clone) + Tlcreate + Tgetattr).
+    /// Unlike [`Self::lcreate`], `dfid` is left untouched (the file opens on
+    /// `newfid`). Only valid with [`Self::extensions_v2_enabled`].
     pub async fn lcreateattr(
         &self,
         dfid: u32,
@@ -915,20 +1073,37 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<(Stat, u32)> {
+        self.lcreateattr_op_id(dfid, newfid, name, flags, mode, gid, new_op_id())
+            .await
+    }
+
+    /// [`Self::lcreateattr`] with an idempotency op-id (all-zero to opt out).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn lcreateattr_op_id(
+        &self,
+        dfid: u32,
+        newfid: u32,
+        name: &[u8],
+        flags: u32,
+        mode: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<(Stat, u32)> {
         let resp = self
-            .rpc(Message::Tlcreateattr(Tlcreateattr {
-                dfid,
-                newfid,
-                name: P9String::new(name.to_vec()),
-                flags,
-                mode,
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tlcreateattr(Tlcreateattr {
+                    dfid,
+                    newfid,
+                    name: P9String::new(name.to_vec()),
+                    flags,
+                    mode,
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rlcreateattr(r) => {
-                // Record `newfid` for replay like `lcreate`: rebind to the new
-                // inode and reopen with the create-only bits stripped.
                 let reopen = flags & !((libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC) as u32);
                 let mut st = self.state.lock().unwrap();
                 if let Some(n_uname) = st.fids.get(&dfid).map(FidRecord::n_uname) {
@@ -1046,9 +1221,8 @@ impl NinePClient {
         }
     }
 
-    /// Like [`Self::readdir`] but each entry carries its full stat (the server's
-    /// Treaddirattr fast path). Only valid when the server negotiated extensions
-    /// ([`Self::extensions_enabled`]).
+    /// Like [`Self::readdir`] but each entry carries its full stat (Treaddirattr
+    /// fast path). Only valid with [`Self::extensions_enabled`].
     pub async fn readdirplus(
         &self,
         fid: u32,
@@ -1065,13 +1239,28 @@ impl NinePClient {
     }
 
     pub async fn mkdir(&self, dfid: u32, name: &[u8], mode: u32, gid: u32) -> ClientResult<Qid> {
+        self.mkdir_op_id(dfid, name, mode, gid, new_op_id()).await
+    }
+
+    /// [`Self::mkdir`] with an idempotency op-id (all-zero to opt out).
+    pub async fn mkdir_op_id(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<Qid> {
         let resp = self
-            .rpc(Message::Tmkdir(Tmkdir {
-                dfid,
-                name: P9String::new(name.to_vec()),
-                mode,
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tmkdir(Tmkdir {
+                    dfid,
+                    name: P9String::new(name.to_vec()),
+                    mode,
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rmkdir(r) => Ok(r.qid),
@@ -1079,9 +1268,8 @@ impl NinePClient {
         }
     }
 
-    /// Like [`Self::mkdir`] but the reply carries the new directory's full stat,
-    /// sparing the follow-up walk + getattr. Only valid when the server
-    /// negotiated the v2 extensions ([`Self::extensions_v2_enabled`]).
+    /// Like [`Self::mkdir`] but the reply carries the new directory's full stat.
+    /// Only valid with [`Self::extensions_v2_enabled`].
     pub async fn mkdir_attr(
         &self,
         dfid: u32,
@@ -1089,13 +1277,29 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<Stat> {
+        self.mkdir_attr_op_id(dfid, name, mode, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::mkdir_attr`] with an idempotency op-id (all-zero to opt out).
+    pub async fn mkdir_attr_op_id(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<Stat> {
         let resp = self
-            .rpc(Message::Tmkdirattr(Tmkdir {
-                dfid,
-                name: P9String::new(name.to_vec()),
-                mode,
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tmkdirattr(Tmkdir {
+                    dfid,
+                    name: P9String::new(name.to_vec()),
+                    mode,
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rmkdirattr(r) => Ok(r.stat),
@@ -1110,13 +1314,29 @@ impl NinePClient {
         target: &[u8],
         gid: u32,
     ) -> ClientResult<Qid> {
+        self.symlink_op_id(dfid, name, target, gid, new_op_id())
+            .await
+    }
+
+    /// [`Self::symlink`] with an idempotency op-id (all-zero to opt out).
+    pub async fn symlink_op_id(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        target: &[u8],
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<Qid> {
         let resp = self
-            .rpc(Message::Tsymlink(Tsymlink {
-                dfid,
-                name: P9String::new(name.to_vec()),
-                symtgt: P9String::new(target.to_vec()),
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tsymlink(Tsymlink {
+                    dfid,
+                    name: P9String::new(name.to_vec()),
+                    symtgt: P9String::new(target.to_vec()),
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rsymlink(r) => Ok(r.qid),
@@ -1125,8 +1345,7 @@ impl NinePClient {
     }
 
     /// Like [`Self::symlink`] but the reply carries the new link's full stat.
-    /// Only valid when the server negotiated the v2 extensions
-    /// ([`Self::extensions_v2_enabled`]).
+    /// Only valid with [`Self::extensions_v2_enabled`].
     pub async fn symlink_attr(
         &self,
         dfid: u32,
@@ -1134,13 +1353,29 @@ impl NinePClient {
         target: &[u8],
         gid: u32,
     ) -> ClientResult<Stat> {
+        self.symlink_attr_op_id(dfid, name, target, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::symlink_attr`] with an idempotency op-id (all-zero to opt out).
+    pub async fn symlink_attr_op_id(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        target: &[u8],
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<Stat> {
         let resp = self
-            .rpc(Message::Tsymlinkattr(Tsymlink {
-                dfid,
-                name: P9String::new(name.to_vec()),
-                symtgt: P9String::new(target.to_vec()),
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tsymlinkattr(Tsymlink {
+                    dfid,
+                    name: P9String::new(name.to_vec()),
+                    symtgt: P9String::new(target.to_vec()),
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rsymlinkattr(r) => Ok(r.stat),
@@ -1157,15 +1392,34 @@ impl NinePClient {
         minor: u32,
         gid: u32,
     ) -> ClientResult<Qid> {
+        self.mknod_op_id(dfid, name, mode, major, minor, gid, new_op_id())
+            .await
+    }
+
+    /// [`Self::mknod`] with an idempotency op-id (all-zero to opt out).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mknod_op_id(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<Qid> {
         let resp = self
-            .rpc(Message::Tmknod(Tmknod {
-                dfid,
-                name: P9String::new(name.to_vec()),
-                mode,
-                major,
-                minor,
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tmknod(Tmknod {
+                    dfid,
+                    name: P9String::new(name.to_vec()),
+                    mode,
+                    major,
+                    minor,
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rmknod(r) => Ok(r.qid),
@@ -1174,8 +1428,7 @@ impl NinePClient {
     }
 
     /// Like [`Self::mknod`] but the reply carries the new node's full stat.
-    /// Only valid when the server negotiated the v2 extensions
-    /// ([`Self::extensions_v2_enabled`]).
+    /// Only valid with [`Self::extensions_v2_enabled`].
     pub async fn mknod_attr(
         &self,
         dfid: u32,
@@ -1185,15 +1438,34 @@ impl NinePClient {
         minor: u32,
         gid: u32,
     ) -> ClientResult<Stat> {
+        self.mknod_attr_op_id(dfid, name, mode, major, minor, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::mknod_attr`] with an idempotency op-id (all-zero to opt out).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mknod_attr_op_id(
+        &self,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<Stat> {
         let resp = self
-            .rpc(Message::Tmknodattr(Tmknod {
-                dfid,
-                name: P9String::new(name.to_vec()),
-                mode,
-                major,
-                minor,
-                gid,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tmknodattr(Tmknod {
+                    dfid,
+                    name: P9String::new(name.to_vec()),
+                    mode,
+                    major,
+                    minor,
+                    gid,
+                }),
+            )
             .await?;
         match resp {
             Message::Rmknodattr(r) => Ok(r.stat),
@@ -1209,12 +1481,26 @@ impl NinePClient {
     }
 
     pub async fn link(&self, dfid: u32, fid: u32, name: &[u8]) -> ClientResult<()> {
+        self.link_op_id(dfid, fid, name, new_op_id()).await
+    }
+
+    /// [`Self::link`] with an idempotency op-id (all-zero to opt out).
+    pub async fn link_op_id(
+        &self,
+        dfid: u32,
+        fid: u32,
+        name: &[u8],
+        op_id: [u8; 16],
+    ) -> ClientResult<()> {
         let resp = self
-            .rpc(Message::Tlink(Tlink {
-                dfid,
-                fid,
-                name: P9String::new(name.to_vec()),
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tlink(Tlink {
+                    dfid,
+                    fid,
+                    name: P9String::new(name.to_vec()),
+                }),
+            )
             .await?;
         match resp {
             Message::Rlink(_) => Ok(()),
@@ -1222,16 +1508,29 @@ impl NinePClient {
         }
     }
 
-    /// Like [`Self::link`] but the reply carries the linked inode's post-op
-    /// stat (with its updated nlink). Only valid when the server negotiated the
-    /// v2 extensions ([`Self::extensions_v2_enabled`]).
+    /// Like [`Self::link`] but the reply carries the linked inode's post-op stat
+    /// (updated nlink). Only valid with [`Self::extensions_v2_enabled`].
     pub async fn link_attr(&self, dfid: u32, fid: u32, name: &[u8]) -> ClientResult<Stat> {
+        self.link_attr_op_id(dfid, fid, name, [0u8; 16]).await
+    }
+
+    /// [`Self::link_attr`] with an idempotency op-id (all-zero to opt out).
+    pub async fn link_attr_op_id(
+        &self,
+        dfid: u32,
+        fid: u32,
+        name: &[u8],
+        op_id: [u8; 16],
+    ) -> ClientResult<Stat> {
         let resp = self
-            .rpc(Message::Tlinkattr(Tlink {
-                dfid,
-                fid,
-                name: P9String::new(name.to_vec()),
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tlinkattr(Tlink {
+                    dfid,
+                    fid,
+                    name: P9String::new(name.to_vec()),
+                }),
+            )
             .await?;
         match resp {
             Message::Rlinkattr(r) => Ok(r.stat),
@@ -1246,13 +1545,29 @@ impl NinePClient {
         newdirfid: u32,
         newname: &[u8],
     ) -> ClientResult<()> {
+        self.renameat_op_id(olddirfid, oldname, newdirfid, newname, new_op_id())
+            .await
+    }
+
+    /// [`Self::renameat`] with an idempotency op-id (all-zero to opt out).
+    pub async fn renameat_op_id(
+        &self,
+        olddirfid: u32,
+        oldname: &[u8],
+        newdirfid: u32,
+        newname: &[u8],
+        op_id: [u8; 16],
+    ) -> ClientResult<()> {
         let resp = self
-            .rpc(Message::Trenameat(Trenameat {
-                olddirfid,
-                oldname: P9String::new(oldname.to_vec()),
-                newdirfid,
-                newname: P9String::new(newname.to_vec()),
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Trenameat(Trenameat {
+                    olddirfid,
+                    oldname: P9String::new(oldname.to_vec()),
+                    newdirfid,
+                    newname: P9String::new(newname.to_vec()),
+                }),
+            )
             .await?;
         match resp {
             Message::Rrenameat(_) => Ok(()),
@@ -1261,12 +1576,26 @@ impl NinePClient {
     }
 
     pub async fn unlinkat(&self, dirfid: u32, name: &[u8], flags: u32) -> ClientResult<()> {
+        self.unlinkat_op_id(dirfid, name, flags, new_op_id()).await
+    }
+
+    /// [`Self::unlinkat`] with an idempotency op-id (all-zero to opt out).
+    pub async fn unlinkat_op_id(
+        &self,
+        dirfid: u32,
+        name: &[u8],
+        flags: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<()> {
         let resp = self
-            .rpc(Message::Tunlinkat(Tunlinkat {
-                dirfid,
-                name: P9String::new(name.to_vec()),
-                flags,
-            }))
+            .rpc_with_op_id(
+                op_id,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid,
+                    name: P9String::new(name.to_vec()),
+                    flags,
+                }),
+            )
             .await?;
         match resp {
             Message::Runlinkat(_) => Ok(()),
@@ -1370,12 +1699,10 @@ impl NinePClient {
 
 impl Drop for NinePClient {
     fn drop(&mut self) {
-        // Tear down the live connection. The reader and writer each hold an
-        // `Arc<Conn>` (which owns the only `writer_tx`), so that cycle never
-        // breaks on its own; `shutdown` wakes both so they exit and release the
-        // socket fd. Without this, dropping a client leaks the fd + both tasks.
+        // Reader and writer each hold an `Arc<Conn>`, so the cycle never breaks on
+        // its own; `shutdown` wakes both to release the fd. Otherwise the fd and
+        // both tasks leak.
         self.conn.load().shutdown();
-        // Wake the supervisor so it observes the dropped client and exits.
         self.reconnect_notify.notify_waiters();
     }
 }
@@ -1405,8 +1732,9 @@ async fn dial(
 )> {
     match target {
         Target::Tcp(addr) => {
-            let stream = TcpStream::connect(addr)
+            let stream = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
                 .await
+                .map_err(|_| ClientError::Disconnected)?
                 .map_err(|_| ClientError::Disconnected)?;
             stream.set_nodelay(true).ok();
             let keepalive = socket2::TcpKeepalive::new()
@@ -1418,8 +1746,9 @@ async fn dial(
             Ok((Box::new(r), Box::new(w)))
         }
         Target::Unix(path) => {
-            let stream = UnixStream::connect(path)
+            let stream = tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path))
                 .await
+                .map_err(|_| ClientError::Disconnected)?
                 .map_err(|_| ClientError::Disconnected)?;
             let (r, w) = stream.into_split();
             Ok((Box::new(r), Box::new(w)))
@@ -1430,16 +1759,13 @@ async fn dial(
 /// Run the Tversion handshake on a freshly opened connection, returning the
 /// negotiated msize and extension level.
 async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
-    // Tversion must carry NOTAG (0xFFFF) per the spec and v9fs. Propose the
-    // newest ZeroFS extension version; an older ZeroFS server matches the
-    // `.zerofs` substring and replies `9P2000.L.zerofs` (first-generation
-    // extensions only), and a foreign server replies plain `9P2000.L`, which
-    // disables the fast paths entirely.
+    // Tversion must carry NOTAG per spec. Proposing the newest extension lets an
+    // older/foreign server substring-match down to the highest it supports.
     let (otx, orx) = oneshot::channel();
     conn.pending.insert(NOTAG, otx);
     let body = Message::Tversion(Tversion {
         msize: requested,
-        version: P9String::new(VERSION_9P2000L_ZEROFS2.to_vec()),
+        version: P9String::new(VERSION_9P2000L_ZEROFS3.to_vec()),
     });
     let bytes = match P9Message::new(NOTAG, body).to_bytes() {
         Ok(b) => b,
@@ -1462,18 +1788,17 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
                 warn!("server negotiated unsupported version: {:?}", vstr);
                 return Err(ClientError::Unexpected("version"));
             }
-            // The server echoes the highest extension suffix it supports
-            // (`.zerofs2` ⊃ `.zerofs`); a plain `9P2000.L` reply means none.
-            let extensions = if vstr.contains(".zerofs2") {
+            // The server echoes the highest suffix it supports; plain `9P2000.L` means none.
+            let extensions = if vstr.contains(".zerofs3") {
+                3
+            } else if vstr.contains(".zerofs2") {
                 2
             } else if vstr.contains(".zerofs") {
                 1
             } else {
                 0
             };
-            // Take the smaller of the two msizes, and reject a degenerate value:
-            // v9fs requires msize >= 4096, below which I/O would degrade to tiny
-            // per-message transfers.
+            // v9fs requires msize >= 4096; reject a degenerate value.
             let negotiated = rv.msize.min(requested);
             if negotiated < 4096 {
                 warn!("server negotiated msize {negotiated} below minimum 4096");
@@ -1537,9 +1862,7 @@ fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconn
         loop {
             let next = tokio::select! {
                 biased;
-                // Discard signal for a connection torn down while its socket is
-                // still healthy (see `Conn::shutdown`). Never fires for a live
-                // connection, so steady-state behavior is unchanged.
+                // Discard signal for a connection torn down while healthy (see `Conn::shutdown`).
                 _ = conn.reader_shutdown.notified() => break,
                 next = framed.next() => next,
             };

@@ -70,6 +70,7 @@
 mod client;
 mod dir;
 mod error;
+pub mod failover;
 mod file;
 #[cfg(feature = "tokio-io")]
 pub mod io;
@@ -82,6 +83,7 @@ mod types;
 pub use client::Client;
 pub use dir::Dir;
 pub use error::ZeroFsError;
+pub use failover::FailoverClient;
 pub use file::File;
 #[cfg(feature = "stream")]
 pub use stream::DirStream;
