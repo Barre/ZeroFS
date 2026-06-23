@@ -245,6 +245,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'Caching', href: '/caching' },
       { title: 'Checkpoints', href: '/checkpoints' },
       { title: 'Read Replicas', href: '/read-replicas' },
+      { title: 'High Availability', href: '/high-availability' },
       { title: 'Standalone Compactor', href: '/standalone-compactor' },
       { title: 'Separate WAL Store', href: '/separate-wal' },
       { title: 'Garbage Collection', href: '/garbage-collection' },
