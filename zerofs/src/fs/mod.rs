@@ -108,8 +108,15 @@ pub struct ZeroFS {
     pub global_stats: Arc<FileSystemGlobalStats>,
     pub flush_coordinator: FlushCoordinator,
     pub write_coordinator: WriteCoordinator,
+    /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
+    /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
+    pub ignore_fsync: bool,
     pub max_bytes: u64,
     pub tracer: AccessTracer,
+    /// Idempotency cache for retried non-idempotent ops. Shared across all
+    /// connections (a retry may arrive on a new one); on a standby it is also fed
+    /// by the replication stream.
+    pub dedup: Arc<crate::dedup::DedupCache>,
 }
 
 #[derive(Clone)]
@@ -164,6 +171,9 @@ impl Drop for OpenHandle {
 }
 
 impl ZeroFS {
+    // Thin no-lease wrapper retained for the single-node constructors and tests;
+    // the replication-aware server path calls `new_with_slatedb_and_lease`.
+    #[allow(dead_code)]
     pub async fn new_with_slatedb(
         slatedb: SlateDbHandle,
         max_bytes: u64,
@@ -171,11 +181,46 @@ impl ZeroFS {
         sync_writes: bool,
         use_segment_layout: bool,
     ) -> anyhow::Result<Self> {
+        Self::new_with_slatedb_and_lease(
+            slatedb,
+            max_bytes,
+            metrics_recorder,
+            sync_writes,
+            false,
+            use_segment_layout,
+            None,
+            None,
+            Arc::new(crate::dedup::DedupCache::new(65_536)),
+        )
+        .await
+    }
+
+    /// Like [`new_with_slatedb`](Self::new_with_slatedb) but attaches an HA leader
+    /// `lease`: the data `Db` refuses reads/writes while the lease is invalid (not
+    /// the confirmed leader). Single-node callers pass no lease.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_slatedb_and_lease(
+        slatedb: SlateDbHandle,
+        max_bytes: u64,
+        metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+        sync_writes: bool,
+        ignore_fsync: bool,
+        use_segment_layout: bool,
+        lease: Option<Arc<crate::replication::Lease>>,
+        replicator: Option<Arc<crate::replication::Replicator>>,
+        dedup: Arc<crate::dedup::DedupCache>,
+    ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
         let key_codec = Arc::new(KeyCodec::new(use_segment_layout));
 
         let db = Arc::new(match slatedb {
-            SlateDbHandle::ReadWrite(db) => Db::new(db, metrics_recorder),
+            SlateDbHandle::ReadWrite(db) => {
+                let db = Db::new(db, metrics_recorder);
+                match lease {
+                    Some(lease) => db.with_lease(lease),
+                    None => db,
+                }
+            }
             SlateDbHandle::ReadOnly(reader) => Db::new_read_only(reader),
         });
 
@@ -248,6 +293,8 @@ impl ZeroFS {
             key_codec.clone(),
             global_stats.clone(),
             sync_writes,
+            replicator,
+            dedup.clone(),
         );
 
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -267,8 +314,10 @@ impl ZeroFS {
             global_stats,
             flush_coordinator,
             write_coordinator,
+            ignore_fsync,
             max_bytes,
             tracer: AccessTracer::new(),
+            dedup,
         };
 
         // Drain the durable orphan set left by any prior life: open-unlinked
@@ -279,6 +328,15 @@ impl ZeroFS {
         }
 
         Ok(fs)
+    }
+
+    /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
+    /// `ignore_fsync` is set.
+    pub async fn client_fsync(&self) -> Result<(), crate::fs::errors::FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
+        self.flush_coordinator.flush().await
     }
 
     #[cfg(test)]
@@ -703,6 +761,24 @@ impl ZeroFS {
         name: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        self.create_idempotent(creds, dirid, name, attr, [0u8; 16])
+            .await
+    }
+
+    /// `create` tagged with an idempotency op-id. A retry carrying an op-id this
+    /// node already applied returns the existing file instead of EEXIST (the
+    /// handler then opens it on the fid). The op-id is recorded atomically with
+    /// the commit and shipped to the standby, so dedup also holds across a
+    /// failover. All-zero opts out (the pattern is identical for the other
+    /// `*_idempotent` ops below).
+    pub async fn create_idempotent(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(name)?;
 
         debug!(
@@ -723,6 +799,10 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 if exists {
+                    // Applied retry of our own create: return the existing file.
+                    if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+                        return self.existing_child_result(dirid, name).await;
+                    }
                     return Err(FsError::Exists);
                 }
 
@@ -763,6 +843,7 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
+                txn.set_op_id(op_id);
                 let cookie = self
                     .directory_store
                     .allocate_cookie(dirid, &mut txn)
@@ -1016,12 +1097,38 @@ impl ZeroFS {
         }
     }
 
+    /// Reconstruct the `(id, attrs)` reply for an existing child of `dirid`, for
+    /// the create ops' idempotency path (return the entry instead of EEXIST).
+    async fn existing_child_result(
+        &self,
+        dirid: InodeId,
+        name: &[u8],
+    ) -> Result<(InodeId, FileAttributes), FsError> {
+        let id = self.directory_store.get(dirid, name).await?;
+        let inode = self.inode_store.get(id).await?;
+        Ok((id, InodeWithId { inode: &inode, id }.into()))
+    }
+
     pub async fn mkdir(
         &self,
         creds: &Credentials,
         dirid: InodeId,
         name: &[u8],
         attr: &SetAttributes,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
+        self.mkdir_idempotent(creds, dirid, name, attr, [0u8; 16])
+            .await
+    }
+
+    /// `mkdir` tagged with an idempotency op-id: an applied retry returns the
+    /// existing directory instead of EEXIST. See [`Self::create_idempotent`].
+    pub async fn mkdir_idempotent(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(name)?;
 
@@ -1043,6 +1150,17 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 if exists {
+                    // Applied retry of our own op: return the existing directory.
+                    if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+                        let existing_id = self.directory_store.get(dirid, name).await?;
+                        let existing = self.inode_store.get(existing_id).await?;
+                        let attrs = InodeWithId {
+                            inode: &existing,
+                            id: existing_id,
+                        }
+                        .into();
+                        return Ok((existing_id, attrs));
+                    }
                     return Err(FsError::Exists);
                 }
 
@@ -1103,6 +1221,7 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
+                txn.set_op_id(op_id);
                 let cookie = self
                     .directory_store
                     .allocate_cookie(dirid, &mut txn)
@@ -1342,6 +1461,21 @@ impl ZeroFS {
         target: &[u8],
         attr: &SetAttributes,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        self.symlink_idempotent(creds, dirid, linkname, target, attr, [0u8; 16])
+            .await
+    }
+
+    /// `symlink` tagged with an idempotency op-id: an applied retry returns the
+    /// existing link instead of EEXIST. See [`Self::create_idempotent`].
+    pub async fn symlink_idempotent(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        linkname: &[u8],
+        target: &[u8],
+        attr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(linkname)?;
 
         debug!(
@@ -1366,6 +1500,10 @@ impl ZeroFS {
         };
 
         if exists {
+            // Applied retry of our own op: return the existing link.
+            if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+                return self.existing_child_result(dirid, linkname).await;
+            }
             return Err(FsError::Exists);
         }
 
@@ -1404,6 +1542,7 @@ impl ZeroFS {
         });
 
         let mut txn = self.db.new_transaction()?;
+        txn.set_op_id(op_id);
         let cookie = self
             .directory_store
             .allocate_cookie(dirid, &mut txn)
@@ -1479,6 +1618,20 @@ impl ZeroFS {
         linkdirid: InodeId,
         linkname: &[u8],
     ) -> Result<(), FsError> {
+        self.link_idempotent(auth, fileid, linkdirid, linkname, [0u8; 16])
+            .await
+    }
+
+    /// `link` tagged with an idempotency op-id: an applied retry returns success
+    /// instead of EEXIST. See [`Self::create_idempotent`].
+    pub async fn link_idempotent(
+        &self,
+        auth: &AuthContext,
+        fileid: InodeId,
+        linkdirid: InodeId,
+        linkname: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
         validate_filename(linkname)?;
 
         let linkname_str = String::from_utf8_lossy(linkname);
@@ -1517,6 +1670,10 @@ impl ZeroFS {
         }
 
         if exists {
+            // Applied retry of our own op: the link is present, report success.
+            if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+                return Ok(());
+            }
             return Err(FsError::Exists);
         }
 
@@ -1525,6 +1682,7 @@ impl ZeroFS {
             .zip(file_inode.name().map(|n| n.to_vec()));
 
         let mut txn = self.db.new_transaction()?;
+        txn.set_op_id(op_id);
         let cookie = self
             .directory_store
             .allocate_cookie(linkdirid, &mut txn)
@@ -2093,6 +2251,23 @@ impl ZeroFS {
         attr: &SetAttributes,
         rdev: Option<(u32, u32)>,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        self.mknod_idempotent(creds, dirid, name, ftype, attr, rdev, [0u8; 16])
+            .await
+    }
+
+    /// `mknod` tagged with an idempotency op-id: an applied retry returns the
+    /// existing node instead of EEXIST. See [`Self::create_idempotent`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mknod_idempotent(
+        &self,
+        creds: &Credentials,
+        dirid: InodeId,
+        name: &[u8],
+        ftype: FileType,
+        attr: &SetAttributes,
+        rdev: Option<(u32, u32)>,
+        op_id: crate::dedup::OpId,
+    ) -> Result<(InodeId, FileAttributes), FsError> {
         validate_filename(name)?;
 
         debug!(
@@ -2114,6 +2289,10 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 if exists {
+                    // Applied retry of our own op: return the existing node.
+                    if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+                        return self.existing_child_result(dirid, name).await;
+                    }
                     debug!("File already exists");
                     return Err(FsError::Exists);
                 }
@@ -2165,6 +2344,7 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
+                txn.set_op_id(op_id);
                 let cookie = self
                     .directory_store
                     .allocate_cookie(dirid, &mut txn)
@@ -2234,7 +2414,24 @@ impl ZeroFS {
         dirid: InodeId,
         name: &[u8],
     ) -> Result<(), FsError> {
+        self.remove_idempotent(auth, dirid, name, [0u8; 16]).await
+    }
+
+    /// `remove` tagged with an idempotency op-id: an applied retry is a no-op
+    /// success instead of NotFound. See [`Self::create_idempotent`].
+    pub async fn remove_idempotent(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        name: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
         validate_filename(name)?;
+
+        // Applied retry of our own op: the entry is gone, report success.
+        if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+            return Ok(());
+        }
 
         let creds = Credentials::from_auth_context(auth);
 
@@ -2285,6 +2482,7 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 let mut txn = self.db.new_transaction()?;
+                txn.set_op_id(op_id);
                 let (now_sec, now_nsec) = get_current_time();
 
                 // Set when the last link is dropped but a 9P fid still holds
@@ -2473,12 +2671,33 @@ impl ZeroFS {
         to_dirid: u64,
         to_name: &[u8],
     ) -> Result<(), FsError> {
+        self.rename_idempotent(auth, from_dirid, from_name, to_dirid, to_name, [0u8; 16])
+            .await
+    }
+
+    /// `rename` tagged with an idempotency op-id: an applied retry is a no-op
+    /// success instead of failing on the now-missing source. See
+    /// [`Self::create_idempotent`].
+    pub async fn rename_idempotent(
+        &self,
+        auth: &AuthContext,
+        from_dirid: u64,
+        from_name: &[u8],
+        to_dirid: u64,
+        to_name: &[u8],
+        op_id: crate::dedup::OpId,
+    ) -> Result<(), FsError> {
         if from_name.is_empty() || to_name.is_empty() {
             return Err(FsError::InvalidArgument);
         }
 
         validate_filename(from_name)?;
         validate_filename(to_name)?;
+
+        // Applied retry of our own op: the move already happened, report success.
+        if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+            return Ok(());
+        }
 
         if from_name == b"." || from_name == b".." {
             return Err(FsError::InvalidArgument);
@@ -2626,6 +2845,7 @@ impl ZeroFS {
         };
 
         let mut txn = self.db.new_transaction()?;
+        txn.set_op_id(op_id);
 
         let mut target_was_directory = false;
         if let Some((target_id, existing_inode)) = target {

@@ -40,9 +40,17 @@ struct WorkerContext {
     key_codec: Arc<KeyCodec>,
     global_stats: Arc<FileSystemGlobalStats>,
     sync_writes: bool,
+    /// Present on a leader with a standby: each batch is shipped and durably
+    /// acked here BEFORE it is applied (commit-then-apply). `None` for a
+    /// single-node or a solo (post-failover) node, which applies directly.
+    replicator: Option<Arc<crate::replication::Replicator>>,
+    /// Idempotency cache: applied op-ids are recorded here atomically with the
+    /// commit, so a retry of the same op is recognized as already done.
+    dedup: Arc<crate::dedup::DedupCache>,
 }
 
 impl WriteCoordinator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<Db>,
         inode_store: InodeStore,
@@ -50,6 +58,8 @@ impl WriteCoordinator {
         key_codec: Arc<KeyCodec>,
         global_stats: Arc<FileSystemGlobalStats>,
         sync_writes: bool,
+        replicator: Option<Arc<crate::replication::Replicator>>,
+        dedup: Arc<crate::dedup::DedupCache>,
     ) -> Self {
         // Capture synchronously: the spawned task starts later, by which point
         // callers may already have bumped `next_id`. If we captured inside the
@@ -63,6 +73,8 @@ impl WriteCoordinator {
             key_codec,
             global_stats,
             sync_writes,
+            replicator,
+            dedup,
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self { sender }
@@ -90,12 +102,21 @@ async fn worker_loop(
             batch.push(msg);
         }
 
+        let replicating = ctx.replicator.is_some();
         let mut merged = WriteBatch::new();
+        // Collected only when replicating, to ship the batch to the standby.
+        let mut repl_ops: Vec<crate::replication::ReplOp> = Vec::new();
         let mut replies = Vec::with_capacity(batch.len());
         let mut any_ops = false;
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
+        // Op-ids carried by this batch's transactions, recorded on apply.
+        let mut batch_op_ids: Vec<crate::dedup::OpId> = Vec::new();
         for (mut txn, reply) in batch {
             any_ops |= !txn.is_empty();
+            let oid = txn.op_id();
+            if crate::dedup::has_op_id(&oid) {
+                batch_op_ids.push(oid);
+            }
             for delta in txn.take_stats_deltas() {
                 let entry = shard_deltas
                     .entry(ctx.global_stats.shard_of(delta.inode_id))
@@ -106,7 +127,11 @@ async fn worker_loop(
                 entry.0 = entry.0.saturating_add(delta.bytes);
                 entry.1 = entry.1.saturating_add(delta.inodes);
             }
-            txn.apply_to(&mut merged);
+            if replicating {
+                repl_ops.extend(txn.apply_to_collecting(&mut merged));
+            } else {
+                txn.apply_to(&mut merged);
+            }
             replies.push(reply);
         }
 
@@ -115,10 +140,15 @@ async fn worker_loop(
         // upper bound on every inode id in this batch.
         let current = ctx.inode_store.next_id();
         if current > last_emitted_counter {
-            merged.put_bytes(
-                ctx.key_codec.system_counter_key(),
-                KeyCodec::encode_counter(current),
-            );
+            let counter_key = ctx.key_codec.system_counter_key();
+            let counter_value = KeyCodec::encode_counter(current);
+            if replicating {
+                repl_ops.push(crate::replication::ReplOp::Put(
+                    counter_key.clone(),
+                    counter_value.clone(),
+                ));
+            }
+            merged.put_bytes(counter_key, counter_value);
             last_emitted_counter = current;
             any_ops = true;
         }
@@ -130,16 +160,50 @@ async fn worker_loop(
             })
             .collect();
         for shard in &staged {
+            if replicating {
+                repl_ops.push(crate::replication::ReplOp::Put(
+                    shard.key.clone(),
+                    shard.value.clone(),
+                ));
+            }
             merged.put_bytes(shard.key.clone(), shard.value.clone());
             any_ops = true;
+        }
+
+        // Commit-then-apply: ship and await the standby's durable ack BEFORE
+        // applying, so a visible write is always replicated. `ship` returns None
+        // when solo (no standby, or just downgraded); a solo write is still valid,
+        // just single-node durable until the standby returns.
+        let shipped_seqno = if any_ops {
+            match ctx.replicator.as_ref() {
+                Some(repl) => repl.ship(&repl_ops, &batch_op_ids).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // HA: stamp this data db with the highest shipped batch seqno, flushed
+        // ATOMICALLY with the batch. On takeover a promoted standby prunes its
+        // buffered tail to this watermark, so a batch already flushed here is
+        // never replayed (replaying a stale batch would regress monotonic
+        // counters and double-count stats against the newer db state). Local
+        // only (not in repl_ops); the standby keys its tail by its own seqnos.
+        if let (Some(repl), Some(seqno)) = (ctx.replicator.as_ref(), shipped_seqno) {
+            merged.put_bytes(
+                ctx.key_codec.ha_seqno_key(),
+                KeyCodec::encode_ha_seqno(repl.writer_epoch(), seqno),
+            );
         }
 
         // SlateDB rejects empty WriteBatches. A batch can be empty when every
         // queued txn was a no-op (e.g. a sub-chunk trim against a fully sparse
         // region produces no chunk writes) and no inode was allocated. Reply
         // Ok without touching the db; there's nothing to make durable either.
-        let mut result = if any_ops {
-            ctx.db
+        let mut result: Result<(), FsError> = Ok(());
+        if any_ops {
+            match ctx
+                .db
                 .write_with_options(
                     merged,
                     &WriteOptions {
@@ -148,10 +212,21 @@ async fn worker_loop(
                     },
                 )
                 .await
-                .map_err(|_| FsError::IoError)
-        } else {
-            Ok(())
-        };
+            {
+                Ok(slatedb_seq) => {
+                    // Op-ids recorded atomically with the commit (dedup invariant).
+                    for oid in &batch_op_ids {
+                        ctx.dedup.record(*oid, bytes::Bytes::new());
+                    }
+                    if let (Some(repl), Some(batch_seqno)) =
+                        (ctx.replicator.as_ref(), shipped_seqno)
+                    {
+                        repl.mark_applied(batch_seqno, slatedb_seq);
+                    }
+                }
+                Err(_) => result = Err(FsError::IoError),
+            }
+        }
 
         // Publish on write success without waiting for the sync flush below:
         // a flush failure means the db is broken (SlateDB retries flushes

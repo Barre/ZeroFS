@@ -5,7 +5,6 @@ use crate::fs::ZeroFS;
 use crate::task::spawn_named;
 use bytes::Bytes;
 use dashmap::DashMap;
-use deku::prelude::*;
 use futures::StreamExt;
 use ninep_proto::{
     Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
@@ -267,14 +266,19 @@ pub(crate) fn dispatch_9p_frame(
     spawn_named("9p-request", async move {
         // Parse off the reader task. On parse failure we still need to honour
         // the inflight/flush bookkeeping installed above, so we synthesise an
-        // Rlerror response rather than bailing early.
-        let response = match P9Message::from_bytes((&frame, 0)) {
-            Ok((_, parsed)) => {
+        // Rlerror response rather than bailing early. Decode with the negotiated
+        // framing: under `.zerofs3` a request carries a frame op-id, threaded into
+        // the op for dedup.
+        let response_bytes = match P9Message::from_bytes_ctx(&frame, handler.op_id_enabled()) {
+            Ok(parsed) => {
                 debug!(
                     "Received message type {} tag {}: {:?}",
                     parsed.type_, parsed.tag, parsed.body
                 );
-                Box::pin(handler.handle_message(tag, parsed.body)).await
+                Box::pin(handler.handle_message_with_op_id(tag, parsed.op_id, parsed.body))
+                    .await
+                    .to_bytes()
+                    .ok()
             }
             Err(e) => {
                 debug!(
@@ -293,6 +297,8 @@ pub(crate) fn dispatch_9p_frame(
                         ecode: P9Error::NotImplemented.to_errno(),
                     }),
                 )
+                .to_bytes()
+                .ok()
             }
         };
 
@@ -337,14 +343,14 @@ pub(crate) fn dispatch_9p_frame(
             pending_flushes.remove(&oldtag);
         }
 
-        match response.to_bytes() {
-            Ok(response_bytes) => {
+        match response_bytes {
+            Some(response_bytes) => {
                 if let Err(e) = tx.send((tag, response_bytes)).await {
                     warn!("Failed to send response for tag {}: {}", tag, e);
                 }
             }
-            Err(e) => {
-                error!("Failed to serialize response for tag {}: {:?}", tag, e);
+            None => {
+                error!("Failed to serialize response for tag {}", tag);
             }
         }
 

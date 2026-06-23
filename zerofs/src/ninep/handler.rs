@@ -18,7 +18,7 @@ use dashmap::mapref::entry::Entry;
 use fp::fail_point;
 use ninep_proto::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use tracing::debug;
 
 pub const DEFAULT_MSIZE: u32 = 256 * 1024;
@@ -108,6 +108,8 @@ pub struct Session {
     /// session is rooted at the whole filesystem). Trebind validates rebound
     /// inodes against this subtree.
     pub attach_root: AtomicU64,
+    /// Set once `.zerofs3` is negotiated: requests carry a frame op-id.
+    pub op_id_enabled: AtomicBool,
 }
 
 impl From<&Tsetattr> for SetAttributes {
@@ -175,6 +177,7 @@ impl NinePHandler {
             msize: AtomicU32::new(DEFAULT_MSIZE),
             fids: Arc::new(DashMap::new()),
             attach_root: AtomicU64::new(0),
+            op_id_enabled: AtomicBool::new(false),
         });
 
         Self {
@@ -196,6 +199,11 @@ impl NinePHandler {
 
     pub fn handler_id(&self) -> u64 {
         self.handler_id
+    }
+
+    /// Whether this connection negotiated `.zerofs3`.
+    pub fn op_id_enabled(&self) -> bool {
+        self.session.op_id_enabled.load(AtomicOrdering::Relaxed)
     }
 
     /// Returns the effective GID for a create-type operation. When a credential
@@ -223,27 +231,55 @@ impl NinePHandler {
             .map(|s| s.fid.clone())
     }
 
+    /// Op-id-less dispatch for the unit tests; production passes the frame op-id.
+    #[cfg(test)]
     pub async fn handle_message(&self, tag: u16, msg: Message) -> P9Message {
+        self.handle_message_with_op_id(tag, [0u8; 16], msg).await
+    }
+
+    /// Dispatch a request, threading a client idempotency op-id (all-zero = none)
+    /// into the op so a non-idempotent mutation is deduplicated on retry.
+    pub async fn handle_message_with_op_id(
+        &self,
+        tag: u16,
+        op_id: crate::dedup::OpId,
+        msg: Message,
+    ) -> P9Message {
+        // Leader gate: a fenced/lapsed leader answers every op (bar Tversion) with
+        // the distinct P9_ENOTLEADER signal so the client re-routes. Checked here
+        // because the per-op db gate's error is flattened to EIO; that gate stays
+        // the safety net for a lapse racing an already-dispatched op.
+        if !matches!(msg, Message::Tversion(_)) && !self.filesystem.db.lease_is_valid() {
+            return P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: ninep_proto::P9_ENOTLEADER,
+                }),
+            );
+        }
+        // Single-flight: holding the op-id's slot makes a concurrent retry wait
+        // then dedup instead of applying twice. No-op for an absent op-id.
+        let _single_flight = self.filesystem.dedup.begin(op_id).await;
         let result = match msg {
             Message::Tversion(tv) => self.version(tv).await,
             Message::Tattach(ta) => self.attach(ta).await,
             Message::Twalk(tw) => self.walk(tw).await,
             Message::Tlopen(tl) => self.lopen(tl).await,
-            Message::Tlcreate(tc) => self.lcreate(tc).await,
+            Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
             Message::Twrite(tw) => self.write(tw).await,
             Message::Tclunk(tc) => Ok(self.clunk(tc).await),
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
             Message::Tsetattr(ts) => self.setattr(ts).await,
-            Message::Tmkdir(tm) => self.mkdir(tm).await,
-            Message::Tsymlink(ts) => self.symlink(ts).await,
-            Message::Tmknod(tm) => self.mknod(tm).await,
+            Message::Tmkdir(tm) => self.mkdir(tm, op_id).await,
+            Message::Tsymlink(ts) => self.symlink(ts, op_id).await,
+            Message::Tmknod(tm) => self.mknod(tm, op_id).await,
             Message::Treadlink(tr) => self.readlink(tr).await,
-            Message::Tlink(tl) => self.link(tl).await,
-            Message::Trename(tr) => self.rename(tr).await,
-            Message::Trenameat(tr) => self.renameat(tr).await,
-            Message::Tunlinkat(tu) => self.unlinkat(tu).await,
+            Message::Tlink(tl) => self.link(tl, op_id).await,
+            Message::Trename(tr) => self.rename(tr, op_id).await,
+            Message::Trenameat(tr) => self.renameat(tr, op_id).await,
+            Message::Tunlinkat(tu) => self.unlinkat(tu, op_id).await,
             Message::Tfsync(tf) => self.fsync(tf).await,
             Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
             Message::Txattrwalk(_) => Err(P9Error::NotSupported),
@@ -254,23 +290,29 @@ impl NinePHandler {
             Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             Message::Tlopenat(tl) => self.lopenat(tl).await,
-            Message::Tlcreateattr(tc) => self.lcreateattr(tc).await,
-            Message::Tmkdirattr(tm) => self.mkdir_attr(tm).await,
-            Message::Tsymlinkattr(ts) => self.symlink_attr(ts).await,
-            Message::Tmknodattr(tm) => self.mknod_attr(tm).await,
-            Message::Tlinkattr(tl) => self.link_attr(tl).await,
+            Message::Tlcreateattr(tc) => self.lcreateattr(tc, op_id).await,
+            Message::Tmkdirattr(tm) => self.mkdir_attr(tm, op_id).await,
+            Message::Tsymlinkattr(ts) => self.symlink_attr(ts, op_id).await,
+            Message::Tmknodattr(tm) => self.mknod_attr(tm, op_id).await,
+            Message::Tlinkattr(tl) => self.link_attr(tl, op_id).await,
             Message::Tsetattrattr(ts) => self.setattr_attr(ts).await,
             _ => Err(P9Error::NotImplemented),
         };
 
         match result {
             Ok(body) => P9Message::new(tag, body),
-            Err(e) => P9Message::new(
-                tag,
-                Message::Rlerror(Rlerror {
-                    ecode: e.to_errno(),
-                }),
-            ),
+            Err(e) => {
+                // Deposed mid-dispatch (db closed under an in-flight op = flattened
+                // EIO): re-label as P9_ENOTLEADER so the client re-routes. Catches a
+                // close that races an op past the pre-dispatch gate; the original
+                // errno is kept for a still-valid leader.
+                let ecode = if self.filesystem.db.lease_is_valid() {
+                    e.to_errno()
+                } else {
+                    ninep_proto::P9_ENOTLEADER
+                };
+                P9Message::new(tag, Message::Rlerror(Rlerror { ecode }))
+            }
         }
     }
 
@@ -302,18 +344,24 @@ impl NinePHandler {
         let msize = tv.msize.min(P9_MAX_MSIZE);
         self.session.msize.store(msize, AtomicOrdering::Relaxed);
 
-        // Advertise the highest ZeroFS extension level the client asked for
-        // v9fs proposes plain `9P2000.L`, so it gets
-        // the plain reply and the extension handlers are not used. An old client
-        // proposing `.zerofs` gets `.zerofs` back and never sends the compound
-        // messages.
-        let version = if version_str.contains(".zerofs2") {
+        // Advertise the highest ZeroFS extension level the client asked for.
+        // v9fs proposes plain `9P2000.L`, so it gets the plain reply and the
+        // extension handlers are not used. An old client proposing `.zerofs` gets
+        // `.zerofs` back and never sends the compound messages.
+        let version = if version_str.contains(".zerofs3") {
+            VERSION_9P2000L_ZEROFS3
+        } else if version_str.contains(".zerofs2") {
             VERSION_9P2000L_ZEROFS2
         } else if version_str.contains(".zerofs") {
             VERSION_9P2000L_ZEROFS
         } else {
             VERSION_9P2000L
         };
+
+        // Remember whether `.zerofs3` (per-request frame op-id) was negotiated.
+        self.session
+            .op_id_enabled
+            .store(version == VERSION_9P2000L_ZEROFS3, AtomicOrdering::Relaxed);
 
         Ok(Message::Rversion(Rversion {
             msize,
@@ -947,11 +995,12 @@ impl NinePHandler {
         name: &[u8],
         mode: u32,
         client_gid: u32,
+        op_id: crate::dedup::OpId,
     ) -> P9Result<(InodeId, FileAttributes)> {
         let gid = self.effective_gid(client_gid, &parent_fid.creds);
         Ok(self
             .filesystem
-            .create(
+            .create_idempotent(
                 &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 name,
@@ -961,11 +1010,12 @@ impl NinePHandler {
                     gid: SetGid::Set(gid),
                     ..Default::default()
                 },
+                op_id,
             )
             .await?)
     }
 
-    async fn lcreate(&self, tc: Tlcreate) -> P9Result<Message> {
+    async fn lcreate(&self, tc: Tlcreate, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let parent_fid = self.get_fid(tc.fid)?;
 
         if parent_fid.opened {
@@ -973,7 +1023,7 @@ impl NinePHandler {
         }
 
         let (child_id, post_attr) = self
-            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid)
+            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
             .await?;
 
         let qid = attrs_to_qid(&post_attr, child_id);
@@ -1009,7 +1059,7 @@ impl NinePHandler {
     // ZeroFS fast path: Tlcreate + the follow-up walk/getattr in one round trip.
     // Unlike Tlcreate, the directory fid is NOT mutated; the created file is
     // opened on `newfid` and the reply carries its full post-op stat.
-    async fn lcreateattr(&self, tc: Tlcreateattr) -> P9Result<Message> {
+    async fn lcreateattr(&self, tc: Tlcreateattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let parent_fid = self.get_fid(tc.dfid)?;
 
         if tc.newfid != tc.dfid && self.session.fids.contains_key(&tc.newfid) {
@@ -1017,7 +1067,7 @@ impl NinePHandler {
         }
 
         let (child_id, post_attr) = self
-            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid)
+            .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
             .await?;
 
         let mut path = parent_fid.path.clone();
@@ -1167,7 +1217,11 @@ impl NinePHandler {
 
     /// The body of Tmkdir, returning the new directory's id and post-op
     /// attributes. Shared by Tmkdir and Tmkdirattr.
-    async fn make_dir(&self, tm: &Tmkdir) -> P9Result<(InodeId, FileAttributes)> {
+    async fn make_dir(
+        &self,
+        tm: &Tmkdir,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         debug!(
@@ -1184,7 +1238,7 @@ impl NinePHandler {
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
         Ok(self
             .filesystem
-            .mkdir(
+            .mkdir_idempotent(
                 &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &tm.name.data,
@@ -1194,19 +1248,20 @@ impl NinePHandler {
                     gid: SetGid::Set(gid),
                     ..Default::default()
                 },
+                op_id,
             )
             .await?)
     }
 
-    async fn mkdir(&self, tm: Tmkdir) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_dir(&tm).await?;
+    async fn mkdir(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
         Ok(Message::Rmkdir(Rmkdir {
             qid: attrs_to_qid(&post_attr, new_id),
         }))
     }
 
-    async fn mkdir_attr(&self, tm: Tmkdir) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_dir(&tm).await?;
+    async fn mkdir_attr(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
         Ok(Message::Rmkdirattr(Rmkdirattr {
             stat: attrs_to_stat(&post_attr, new_id),
         }))
@@ -1214,13 +1269,17 @@ impl NinePHandler {
 
     /// The body of Tsymlink, returning the new link's id and post-op
     /// attributes. Shared by Tsymlink and Tsymlinkattr.
-    async fn make_symlink(&self, ts: &Tsymlink) -> P9Result<(InodeId, FileAttributes)> {
+    async fn make_symlink(
+        &self,
+        ts: &Tsymlink,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(ts.dfid)?;
 
         let gid = self.effective_gid(ts.gid, &parent_fid.creds);
         Ok(self
             .filesystem
-            .symlink(
+            .symlink_idempotent(
                 &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &ts.name.data,
@@ -1231,19 +1290,20 @@ impl NinePHandler {
                     gid: SetGid::Set(gid),
                     ..Default::default()
                 },
+                op_id,
             )
             .await?)
     }
 
-    async fn symlink(&self, ts: Tsymlink) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_symlink(&ts).await?;
+    async fn symlink(&self, ts: Tsymlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_symlink(&ts, op_id).await?;
         Ok(Message::Rsymlink(Rsymlink {
             qid: attrs_to_qid(&post_attr, new_id),
         }))
     }
 
-    async fn symlink_attr(&self, ts: Tsymlink) -> P9Result<Message> {
-        let (new_id, post_attr) = self.make_symlink(&ts).await?;
+    async fn symlink_attr(&self, ts: Tsymlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let (new_id, post_attr) = self.make_symlink(&ts, op_id).await?;
         Ok(Message::Rsymlinkattr(Rsymlinkattr {
             stat: attrs_to_stat(&post_attr, new_id),
         }))
@@ -1251,7 +1311,11 @@ impl NinePHandler {
 
     /// The body of Tmknod, returning the new node's id and post-op attributes.
     /// Shared by Tmknod and Tmknodattr.
-    async fn make_node(&self, tm: &Tmknod) -> P9Result<(InodeId, FileAttributes)> {
+    async fn make_node(
+        &self,
+        tm: &Tmknod,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<(InodeId, FileAttributes)> {
         let parent_fid = self.get_fid(tm.dfid)?;
 
         let file_type = tm.mode & 0o170000; // S_IFMT
@@ -1266,7 +1330,7 @@ impl NinePHandler {
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
         Ok(self
             .filesystem
-            .mknod(
+            .mknod_idempotent(
                 &parent_fid.creds.with_gid(gid),
                 parent_fid.inode_id,
                 &tm.name.data,
@@ -1281,19 +1345,20 @@ impl NinePHandler {
                     FileType::CharDevice | FileType::BlockDevice => Some((tm.major, tm.minor)),
                     _ => None,
                 },
+                op_id,
             )
             .await?)
     }
 
-    async fn mknod(&self, tm: Tmknod) -> P9Result<Message> {
-        let (child_id, post_attr) = self.make_node(&tm).await?;
+    async fn mknod(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
         Ok(Message::Rmknod(Rmknod {
             qid: attrs_to_qid(&post_attr, child_id),
         }))
     }
 
-    async fn mknod_attr(&self, tm: Tmknod) -> P9Result<Message> {
-        let (child_id, post_attr) = self.make_node(&tm).await?;
+    async fn mknod_attr(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
         Ok(Message::Rmknodattr(Rmknodattr {
             stat: attrs_to_stat(&post_attr, child_id),
         }))
@@ -1314,7 +1379,7 @@ impl NinePHandler {
 
     /// The body of Tlink, returning the linked inode's id. Shared by Tlink and
     /// Tlinkattr.
-    async fn make_link(&self, tl: &Tlink) -> P9Result<InodeId> {
+    async fn make_link(&self, tl: &Tlink, op_id: crate::dedup::OpId) -> P9Result<InodeId> {
         let dir_fid = self.get_fid(tl.dfid)?;
         let file_fid = self.get_fid(tl.fid)?;
 
@@ -1331,26 +1396,26 @@ impl NinePHandler {
         let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .link(&auth, file_id, dir_id, name_bytes)
+            .link_idempotent(&auth, file_id, dir_id, name_bytes, op_id)
             .await?;
 
         Ok(file_id)
     }
 
-    async fn link(&self, tl: Tlink) -> P9Result<Message> {
-        self.make_link(&tl).await?;
+    async fn link(&self, tl: Tlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        self.make_link(&tl, op_id).await?;
         Ok(Message::Rlink(Rlink))
     }
 
-    async fn link_attr(&self, tl: Tlink) -> P9Result<Message> {
-        let file_id = self.make_link(&tl).await?;
+    async fn link_attr(&self, tl: Tlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        let file_id = self.make_link(&tl, op_id).await?;
         let inode = self.filesystem.inode_store.get(file_id).await?;
         Ok(Message::Rlinkattr(Rlinkattr {
             stat: inode_to_stat(&inode, file_id),
         }))
     }
 
-    async fn rename(&self, tr: Trename) -> P9Result<Message> {
+    async fn rename(&self, tr: Trename, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let source_fid = self.get_fid(tr.fid)?;
         let dest_fid = self.get_fid(tr.dfid)?;
 
@@ -1376,42 +1441,50 @@ impl NinePHandler {
         let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .rename(
+            .rename_idempotent(
                 &auth,
                 source_parent_id,
                 source_name,
                 dest_parent_id,
                 &new_name_bytes,
+                op_id,
             )
             .await?;
 
         Ok(Message::Rrename(Rrename))
     }
 
-    async fn renameat(&self, tr: Trenameat) -> P9Result<Message> {
+    async fn renameat(&self, tr: Trenameat, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let old_dir_fid = self.get_fid(tr.olddirfid)?;
         let new_dir_fid = self.get_fid(tr.newdirfid)?;
 
         let auth = AuthContext::from(&old_dir_fid.creds);
 
         self.filesystem
-            .rename(
+            .rename_idempotent(
                 &auth,
                 old_dir_fid.inode_id,
                 &tr.oldname.data,
                 new_dir_fid.inode_id,
                 &tr.newname.data,
+                op_id,
             )
             .await?;
 
         Ok(Message::Rrenameat(Rrenameat))
     }
 
-    async fn unlinkat(&self, tu: Tunlinkat) -> P9Result<Message> {
+    async fn unlinkat(&self, tu: Tunlinkat, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let dir_fid = self.get_fid(tu.dirfid)?;
 
         let parent_id = dir_fid.inode_id;
         let creds = dir_fid.creds;
+
+        // Own dedup check: unlike the create ops, this resolves the child before
+        // the fs's own check, and the lookup below would ENOENT on an applied retry.
+        if crate::dedup::has_op_id(&op_id) && self.filesystem.dedup.get(&op_id).is_some() {
+            return Ok(Message::Runlinkat(Runlinkat));
+        }
 
         let child_id = self
             .filesystem
@@ -1435,7 +1508,7 @@ impl NinePHandler {
         let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .remove(&auth, parent_id, &tu.name.data)
+            .remove_idempotent(&auth, parent_id, &tu.name.data, op_id)
             .await?;
 
         Ok(Message::Runlinkat(Runlinkat))
@@ -1445,7 +1518,7 @@ impl NinePHandler {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
 
-        self.filesystem.flush_coordinator.flush().await?;
+        self.filesystem.client_fsync().await?;
 
         {
             let path = if fid_path.is_empty() {

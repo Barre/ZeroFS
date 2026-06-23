@@ -71,7 +71,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     )
     .await?;
 
-    let (slatedb, _, _) = super::server::build_slatedb(
+    let opened = super::server::build_slatedb(
         object_store,
         &cache_config,
         actual_db_path,
@@ -81,10 +81,11 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         block_transformer,
         wal_object_store,
         segments_enabled,
+        None, // debug command never participates in replication
     )
     .await?;
 
-    let db = match slatedb {
+    let db = match opened.data {
         SlateDbHandle::ReadWrite(db) => db,
         SlateDbHandle::ReadOnly(_) => {
             return Err(anyhow::anyhow!(

@@ -49,6 +49,11 @@ const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_CHUNK: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
+// HA: the highest shipped replication batch seqno (with its writer epoch) that
+// has been flushed into this data db. Written atomically with each shipped
+// batch so a promoted standby can prune its tail to exactly what the db already
+// holds (see write_coordinator + takeover replay).
+const SYSTEM_HA_SEQNO_SUBTYPE: u8 = 0x02;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -302,6 +307,32 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
+    /// Key for the HA tail watermark: the highest shipped replication batch seqno
+    /// (and the writer epoch that shipped it) flushed into this data db.
+    pub fn ha_seqno_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_HA_SEQNO_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    pub fn encode_ha_seqno(writer_epoch: u64, seqno: u64) -> Bytes {
+        let mut v = Vec::with_capacity(U64_SIZE * 2);
+        v.extend_from_slice(&writer_epoch.to_le_bytes());
+        v.extend_from_slice(&seqno.to_le_bytes());
+        Bytes::from(v)
+    }
+
+    /// Returns `(writer_epoch, seqno)`.
+    pub fn decode_ha_seqno(data: &[u8]) -> Option<(u64, u64)> {
+        if data.len() != U64_SIZE * 2 {
+            return None;
+        }
+        let epoch = u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?);
+        let seqno = u64::from_le_bytes(data[U64_SIZE..].try_into().ok()?);
+        Some((epoch, seqno))
+    }
+
     pub fn parse_key(&self, key: &[u8]) -> ParsedKey {
         let kind = match self.peek_kind(key) {
             Some(k) => k,
@@ -535,6 +566,22 @@ mod tests {
         let encoded = KeyCodec::encode_tombstone_size(size);
         let decoded = KeyCodec::decode_tombstone_size(&encoded).unwrap();
         assert_eq!(decoded, size);
+    }
+
+    #[test]
+    fn test_ha_seqno_encoding() {
+        let (epoch, seqno) = (7u64, 123456u64);
+        let encoded = KeyCodec::encode_ha_seqno(epoch, seqno);
+        assert_eq!(KeyCodec::decode_ha_seqno(&encoded), Some((epoch, seqno)));
+        // Wrong length is rejected, not silently misread.
+        assert_eq!(KeyCodec::decode_ha_seqno(&encoded[..8]), None);
+        assert_eq!(KeyCodec::decode_ha_seqno(&[]), None);
+
+        // The HA-seqno key is distinct from the inode counter (both System-prefixed).
+        for v2 in [false, true] {
+            let codec = KeyCodec::new(v2);
+            assert_ne!(codec.ha_seqno_key(), codec.system_counter_key());
+        }
     }
 
     #[test]
