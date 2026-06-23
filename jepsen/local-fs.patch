@@ -1,28 +1,41 @@
 diff --git a/src/jepsen/local_fs.clj b/src/jepsen/local_fs.clj
-index 4835127..d4de489 100644
+index 4835127..f326319 100644
 --- a/src/jepsen/local_fs.clj
 +++ b/src/jepsen/local_fs.clj
-@@ -15,7 +15,8 @@
+@@ -15,7 +15,9 @@
              [jepsen.local-fs [util :as util]]
              [jepsen.local-fs.shell.workload :as shell]
              [jepsen.local-fs.db [dir :as db.dir]
 -                                [lazyfs :as db.lazyfs]]
 +                                [lazyfs :as db.lazyfs]
-+                                [zerofs :as db.zerofs]]
++                                [zerofs :as db.zerofs]
++                                [zerofs-ha :as db.zerofs-ha]]
              [clojure.test.check :as tc]
              [clojure.test.check [generators :as tc.gen]
                                  [properties :as prop]
-@@ -27,7 +28,8 @@
+@@ -26,8 +28,10 @@
+ 
  (def dbs
    "A map of DB names to functions that take CLI options and build DBs."
-   {:dir    db.dir/db
+-  {:dir    db.dir/db
 -   :lazyfs db.lazyfs/db})
-+   :lazyfs db.lazyfs/db
-+   :zerofs db.zerofs/db})
++  {:dir       db.dir/db
++   :lazyfs    db.lazyfs/db
++   :zerofs    db.zerofs/db
++   :zerofs-ha db.zerofs-ha/db})
  
  (defn stats-checker
    "A stats checker that never fails"
-@@ -150,7 +152,31 @@
+@@ -139,6 +143,8 @@
+ 
+    [nil "--lose-unfsynced-writes" "Generates special operations in the test which trigger the loss of un-fsynced writes. Probably only useful for lazyfs or other filesystems which support this type of fault injection."]
+ 
++   [nil "--failover" "Generates HA leader-failover operations (only useful with --db zerofs-ha). A failover loses no acknowledged write, so the model treats it as a global flush rather than a crash."]
++
+    [nil "--quickcheck-scour TRIAL-COUNT" "For nondeterministic tests, try running every single history this many times before declaring it passes. Helpful for shrinking when you have a lot of time to burn, and a bug that only manifests sometimes."
+     :default  1
+     :parse-fn parse-long
+@@ -150,7 +156,31 @@
      :parse-fn parse-long
      :validate [pos? "Must be positive"]]
  
@@ -55,7 +68,7 @@ index 4835127..d4de489 100644
  
  (defn quickcheck-trials
    "Runs trials of a history for quickcheck. Returns the first failing test run,
-@@ -196,16 +222,22 @@
+@@ -196,16 +226,22 @@
                           {:workload (:workload (:results test))
                            :dir (.getCanonicalPath (store/path test))}))))
              ; Great, now run quickcheck
@@ -86,8 +99,20 @@ index 4835127..d4de489 100644
  
  (defn -main
    "Handles command line arguments. Can run a test, or a web server for browsing
+diff --git a/src/jepsen/local_fs/db/core.clj b/src/jepsen/local_fs/db/core.clj
+index f57508f..e59c895 100644
+--- a/src/jepsen/local_fs/db/core.clj
++++ b/src/jepsen/local_fs/db/core.clj
+@@ -3,3 +3,7 @@
+ 
+ (defprotocol LoseUnfsyncedWrites
+   (lose-unfsynced-writes! [db] "Causes this filesystem to lose un-fsynced writes."))
++
++(defprotocol Failover
++  (failover! [db] "Fails the current leader over to the standby (HA clusters).
++  Acknowledged writes survive (semi-sync); only leadership moves."))
 diff --git a/src/jepsen/local_fs/shell/checker.clj b/src/jepsen/local_fs/shell/checker.clj
-index d708d90..719154c 100644
+index d708d90..1e813ba 100644
 --- a/src/jepsen/local_fs/shell/checker.clj
 +++ b/src/jepsen/local_fs/shell/checker.clj
 @@ -265,6 +265,14 @@
@@ -132,7 +157,20 @@ index d708d90..719154c 100644
  
                 :else (throw+ {:type  ::can't-fsync
                                :path  value
-@@ -816,12 +825,12 @@
+@@ -669,6 +678,12 @@
+       [(lose-unfsynced-writes fs)
+        (assoc op :type :ok)]
+ 
++      ; HA failover loses no acked write (semi-sync replays + flushes the tail on
++      ; takeover), so model it as a global flush, not a crash.
++      :failover
++      [(fsync-everything fs)
++       (assoc op :type :ok)]
++
+       :mkdir
+       [(update-path* fs value
+                      (fn [path]
+@@ -816,12 +831,12 @@
    Returns a pair of [fs', op']: the resulting state, and the completion
    operation.
  
@@ -150,23 +188,85 @@ index d708d90..719154c 100644
  
  (defn simple-trace
    "Takes a collection of ops from a history and strips them down to just [type
+diff --git a/src/jepsen/local_fs/shell/client.clj b/src/jepsen/local_fs/shell/client.clj
+index c517def..999faee 100644
+--- a/src/jepsen/local_fs/shell/client.clj
++++ b/src/jepsen/local_fs/shell/client.clj
+@@ -15,7 +15,7 @@
+                                            hex->bytes
+                                            sh
+                                            *sh-trace*]]]
+-            [jepsen.local-fs.db.core :refer [lose-unfsynced-writes!]]
++            [jepsen.local-fs.db.core :refer [lose-unfsynced-writes! failover!]]
+             [knossos.op :as op]
+             [slingshot.slingshot :refer [try+ throw+]])
+   (:import (java.lang Process
+@@ -91,6 +91,10 @@
+     (do (lose-unfsynced-writes! db)
+         (assoc op :type :ok))
+ 
++    :failover
++    (do (failover! db)
++        (assoc op :type :ok))
++
+     :mkdir
+     (try+ (sh :mkdir (join-path value) {:dir dir})
+           (assoc op :type :ok)
+@@ -225,8 +229,13 @@
+     this)
+ 
+   (invoke! [this test op]
+-    (timeout 10000 (assoc op :type :info, :error :timeout)
+-             (fs-op! dir db op)))
++    ; Fault ops are slow (a failover waits out takeover_ttl + a ~20s restart),
++    ; so give them a generous timeout; a real hang still surfaces as :info-timeout.
++    (let [ms (case (:f op)
++               (:failover :lose-unfsynced-writes) 120000
++               10000)]
++      (timeout ms (assoc op :type :info, :error :timeout)
++               (fs-op! dir db op))))
+ 
+   (teardown! [this test])
+ 
 diff --git a/src/jepsen/local_fs/shell/workload.clj b/src/jepsen/local_fs/shell/workload.clj
-index 5a35407..2019a91 100644
+index 5a35407..f726915 100644
 --- a/src/jepsen/local_fs/shell/workload.clj
 +++ b/src/jepsen/local_fs/shell/workload.clj
-@@ -76,7 +76,10 @@
-     :lose-unfsynced-writes    If set, emits operations to lose un-fsynced
-                               writes"
-   [{:keys [dont lose-unfsynced-writes]}]
+@@ -66,30 +66,38 @@
+                                      (g/scale (partial * 0.01)))]
+                      {:f :truncate, :value [path size]})}
+    :lose-unfsynced-writes {:weight 1
+-                           :gen (g/return {:f :lose-unfsynced-writes})}})
++                           :gen (g/return {:f :lose-unfsynced-writes})}
++   :failover {:weight 1
++              :gen (g/return {:f :failover})}})
+ 
+ (defn fs-op-gen
+   "test.check generator for fs test ops. Generates append, write, mkdir, mv,
+   read, etc. Options are:
+ 
+     :dont                     A set of fs to skip
+-    :lose-unfsynced-writes    If set, emits operations to lose un-fsynced
+-                              writes"
+-  [{:keys [dont lose-unfsynced-writes]}]
 -  (let [fs (keys funs)
-+  (let [; :lose-unfsynced-writes is a fault, not an ordinary op: only emit it
-+        ; when explicitly requested, so plain conformance runs (and backends
-+        ; that don't implement the fault) never see it.
-+        fs (remove #{:lose-unfsynced-writes} (keys funs))
++    :lose-unfsynced-writes    If set, emits operations to lose un-fsynced writes
++    :failover                 If set, emits HA leader-failover operations"
++  [{:keys [dont lose-unfsynced-writes failover]}]
++  (let [; faults are not ordinary ops: only emit each when explicitly requested,
++        ; so plain conformance runs (and backends that don't implement a fault)
++        ; never see it.
++        faults #{:lose-unfsynced-writes :failover}
++        fs (remove faults (keys funs))
          fs (remove dont fs)
-         fs (if lose-unfsynced-writes
-              (conj fs :lose-unfsynced-writes)
-@@ -87,9 +90,12 @@
+-        fs (if lose-unfsynced-writes
+-             (conj fs :lose-unfsynced-writes)
+-             fs)
++        fs (if lose-unfsynced-writes (conj fs :lose-unfsynced-writes) fs)
++        fs (if failover (conj fs :failover) fs)
+         gens (->> fs
+                   (map funs)
+                   (mapv (juxt :weight :gen)))]
          (g/frequency gens)))
  
  (defn fs-history-gen
