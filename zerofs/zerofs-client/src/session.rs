@@ -309,6 +309,19 @@ impl Session {
         opts: &OpenOptions,
         display: &str,
     ) -> Result<FidGuard, ZeroFsError> {
+        self.open_relative_op_id(dfid, name, opts, display, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::open_relative`] with an op-id (all-zero to opt out), threaded to the create step.
+    pub(crate) async fn open_relative_op_id(
+        self: &Arc<Self>,
+        dfid: u32,
+        name: &[u8],
+        opts: &OpenOptions,
+        display: &str,
+        op_id: [u8; 16],
+    ) -> Result<FidGuard, ZeroFsError> {
         let acc = match (opts.read, opts.write) {
             (true, true) => libc::O_RDWR,
             (false, true) => libc::O_WRONLY,
@@ -357,7 +370,7 @@ impl Session {
             let guard = self.alloc_guard();
             match self
                 .client
-                .create_open(dfid, guard.fid(), name, flags, mode, self.gid)
+                .create_open_op_id(dfid, guard.fid(), name, flags, mode, self.gid, op_id)
                 .await
             {
                 Ok((_fid, _stat, _iounit)) => return Ok(guard),
@@ -418,11 +431,24 @@ impl Session {
         mode: u32,
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
+        self.mkdir_at_op_id(dfid, name, mode, display, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::mkdir_at`] with an idempotency op-id (all-zero to opt out).
+    pub(crate) async fn mkdir_at_op_id(
+        self: &Arc<Self>,
+        dfid: u32,
+        name: &[u8],
+        mode: u32,
+        display: &str,
+        op_id: [u8; 16],
+    ) -> Result<Metadata, ZeroFsError> {
         let mode = libc::S_IFDIR as u32 | (mode & 0o7777);
         let guard = self.alloc_guard();
         let res = self
             .client
-            .mkdir_stat(dfid, Some(guard.fid()), name, mode, self.gid)
+            .mkdir_stat_op_id(dfid, Some(guard.fid()), name, mode, self.gid, op_id)
             .await;
         self.finish_create(guard, res, display)
     }
@@ -435,10 +461,23 @@ impl Session {
         target: &[u8],
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
+        self.symlink_at_op_id(dfid, name, target, display, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::symlink_at`] with an idempotency op-id (all-zero to opt out).
+    pub(crate) async fn symlink_at_op_id(
+        self: &Arc<Self>,
+        dfid: u32,
+        name: &[u8],
+        target: &[u8],
+        display: &str,
+        op_id: [u8; 16],
+    ) -> Result<Metadata, ZeroFsError> {
         let guard = self.alloc_guard();
         let res = self
             .client
-            .symlink_stat(dfid, Some(guard.fid()), name, target, self.gid)
+            .symlink_stat_op_id(dfid, Some(guard.fid()), name, target, self.gid, op_id)
             .await;
         self.finish_create(guard, res, display)
     }
@@ -452,6 +491,20 @@ impl Session {
         mode: u32,
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
+        self.mknod_at_op_id(dfid, name, kind, mode, display, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::mknod_at`] with an idempotency op-id (all-zero to opt out).
+    pub(crate) async fn mknod_at_op_id(
+        self: &Arc<Self>,
+        dfid: u32,
+        name: &[u8],
+        kind: NodeKind,
+        mode: u32,
+        display: &str,
+        op_id: [u8; 16],
+    ) -> Result<Metadata, ZeroFsError> {
         let (type_bits, major, minor) = match kind {
             NodeKind::Fifo => (libc::S_IFIFO, 0, 0),
             NodeKind::Socket => (libc::S_IFSOCK, 0, 0),
@@ -462,7 +515,16 @@ impl Session {
         let guard = self.alloc_guard();
         let res = self
             .client
-            .mknod_stat(dfid, Some(guard.fid()), name, mode, major, minor, self.gid)
+            .mknod_stat_op_id(
+                dfid,
+                Some(guard.fid()),
+                name,
+                mode,
+                major,
+                minor,
+                self.gid,
+                op_id,
+            )
             .await;
         self.finish_create(guard, res, display)
     }
@@ -476,10 +538,23 @@ impl Session {
         name: &[u8],
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
+        self.link_at_op_id(dfid, target_fid, name, display, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::link_at`] with an idempotency op-id (all-zero to opt out).
+    pub(crate) async fn link_at_op_id(
+        self: &Arc<Self>,
+        dfid: u32,
+        target_fid: u32,
+        name: &[u8],
+        display: &str,
+        op_id: [u8; 16],
+    ) -> Result<Metadata, ZeroFsError> {
         let guard = self.alloc_guard();
         let res = self
             .client
-            .link_stat(dfid, Some(guard.fid()), target_fid, name)
+            .link_stat_op_id(dfid, Some(guard.fid()), target_fid, name, op_id)
             .await;
         self.finish_create(guard, res, display)
     }

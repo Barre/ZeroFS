@@ -1,9 +1,8 @@
 //! Compound operations shared by the FUSE mount and `zerofs-client`.
 //!
-//! Each helper picks the negotiated ZeroFS fast path when available, else the
-//! vanilla 9P2000.L sequence, and owns any fid it allocates: on success the
-//! returned fid is the caller's to clunk, on error nothing is left behind.
-//! Centralizing the dispatch means a new fast path is added once.
+//! Each helper picks the negotiated fast path when available, else the vanilla
+//! 9P2000.L sequence. Fid ownership: on success the returned fid is the caller's
+//! to clunk; on error nothing is left server-side.
 
 use crate::{ClientError, ClientResult, NinePClient};
 use ninep_proto::{
@@ -119,12 +118,9 @@ impl NinePClient {
         self.getattr(fid, GETATTR_ALL).await
     }
 
-    /// Walk `names` from `from` and stat the destination on the caller-supplied
-    /// `newfid`: one round trip via `Twalkgetattr` when the v1 fast path is
-    /// negotiated, else walk + getattr. The caller owns `newfid` (it is returned
-    /// for convenience); on error nothing is left server-side and the caller
-    /// returns the number to the allocator. A partial walk (the server's way of
-    /// reporting a missing intermediate) surfaces as `ENOENT`.
+    /// Walk `names` from `from` and stat the destination on `newfid`: one round
+    /// trip via `Twalkgetattr` on v1, else walk + getattr. Caller owns `newfid`.
+    /// A partial walk (missing intermediate) surfaces as `ENOENT`.
     pub async fn walk_stat(
         &self,
         from: u32,
@@ -156,11 +152,9 @@ impl NinePClient {
         }
     }
 
-    /// Open `from`'s inode on the caller-supplied `newfid`, leaving `from`
-    /// untouched: `Tlopenat` when the v2 fast path is negotiated, else clone +
-    /// lopen. If `fallback_flags` is given, a refused open is retried once with
-    /// them (the writeback O_WRONLY→O_RDWR upgrade dance). The caller owns
-    /// `newfid`; on error nothing is left server-side.
+    /// Open `from`'s inode on `newfid`, leaving `from` untouched: `Tlopenat` on
+    /// v2, else clone + lopen. `fallback_flags`, if given, retries a refused open
+    /// once (the writeback O_WRONLY->O_RDWR upgrade). Caller owns `newfid`.
     pub async fn open_clone(
         &self,
         from: u32,
@@ -195,10 +189,9 @@ impl NinePClient {
         }
     }
 
-    /// Create and open `name` under `dfid` on the caller-supplied `newfid`,
-    /// leaving `dfid` untouched: `Tlcreateattr` when the v2 fast path is
-    /// negotiated (the stat comes free), else clone + lcreate (no stat). The
-    /// caller owns `newfid`; on error nothing is left server-side.
+    /// Create and open `name` under `dfid` on `newfid`, leaving `dfid` untouched:
+    /// `Tlcreateattr` on v2 (stat free), else clone + lcreate (no stat). Caller
+    /// owns `newfid`.
     pub async fn create_open(
         &self,
         dfid: u32,
@@ -208,15 +201,34 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<(u32, Option<Stat>, u32)> {
+        self.create_open_op_id(dfid, newfid, name, flags, mode, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::create_open`] with an idempotency op-id (all-zero to opt out).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_open_op_id(
+        &self,
+        dfid: u32,
+        newfid: u32,
+        name: &[u8],
+        flags: u32,
+        mode: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<(u32, Option<Stat>, u32)> {
         if self.extensions_v2_enabled() {
             // On error no fid was created server-side.
             return self
-                .lcreateattr(dfid, newfid, name, flags, mode, gid)
+                .lcreateattr_op_id(dfid, newfid, name, flags, mode, gid, op_id)
                 .await
                 .map(|(stat, iounit)| (newfid, Some(stat), iounit));
         }
         self.walk(dfid, newfid, &[]).await?;
-        match self.lcreate(newfid, name, flags, mode, gid).await {
+        match self
+            .lcreate_op_id(newfid, name, flags, mode, gid, op_id)
+            .await
+        {
             Ok((_qid, iounit)) => Ok((newfid, None, iounit)),
             // Clone created the fid; clunk it so nothing is left server-side.
             Err(e) => {
@@ -227,10 +239,8 @@ impl NinePClient {
     }
 
     /// Walk to `name` under `dfid` for its stat on the create-family fallback
-    /// path (vanilla 9P2000.L, whose create messages carry no stat). A
-    /// caller-supplied `newfid` is guarded by the caller, which then owns
-    /// reclamation if this future errors or is cancelled; `None` self-manages
-    /// (alloc + free on error), for callers that run to completion.
+    /// (vanilla create messages carry no stat). `Some(newfid)`: caller owns
+    /// reclamation on error/cancel. `None`: self-manages (alloc + free on error).
     async fn walk_stat_surplus(
         &self,
         dfid: u32,
@@ -255,11 +265,9 @@ impl NinePClient {
         }
     }
 
-    /// mkdir returning the new directory's stat: `Tmkdirattr` when v2 (no fid
-    /// bound), else mkdir + walk_stat. On the fallback the caller may pass a
-    /// guarded `newfid` (it then owns reclamation on error/cancel) or `None` to
-    /// self-manage; the walked fid, when used, is returned for the caller to
-    /// keep or clunk.
+    /// mkdir returning the new directory's stat: `Tmkdirattr` on v2 (no fid
+    /// bound), else mkdir + walk_stat. On the fallback, `Some(newfid)` lets the
+    /// caller own reclamation, `None` self-manages; the walked fid is returned.
     pub async fn mkdir_stat(
         &self,
         dfid: u32,
@@ -268,13 +276,27 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<(Option<u32>, Stat)> {
+        self.mkdir_stat_op_id(dfid, newfid, name, mode, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::mkdir_stat`] with an idempotency op-id (all-zero to opt out).
+    pub async fn mkdir_stat_op_id(
+        &self,
+        dfid: u32,
+        newfid: Option<u32>,
+        name: &[u8],
+        mode: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<(Option<u32>, Stat)> {
         if self.extensions_v2_enabled() {
             return self
-                .mkdir_attr(dfid, name, mode, gid)
+                .mkdir_attr_op_id(dfid, name, mode, gid, op_id)
                 .await
                 .map(|s| (None, s));
         }
-        self.mkdir(dfid, name, mode, gid).await?;
+        self.mkdir_op_id(dfid, name, mode, gid, op_id).await?;
         self.walk_stat_surplus(dfid, newfid, name).await
     }
 
@@ -287,13 +309,28 @@ impl NinePClient {
         target: &[u8],
         gid: u32,
     ) -> ClientResult<(Option<u32>, Stat)> {
+        self.symlink_stat_op_id(dfid, newfid, name, target, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::symlink_stat`] with an idempotency op-id (all-zero to opt out).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn symlink_stat_op_id(
+        &self,
+        dfid: u32,
+        newfid: Option<u32>,
+        name: &[u8],
+        target: &[u8],
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<(Option<u32>, Stat)> {
         if self.extensions_v2_enabled() {
             return self
-                .symlink_attr(dfid, name, target, gid)
+                .symlink_attr_op_id(dfid, name, target, gid, op_id)
                 .await
                 .map(|s| (None, s));
         }
-        self.symlink(dfid, name, target, gid).await?;
+        self.symlink_op_id(dfid, name, target, gid, op_id).await?;
         self.walk_stat_surplus(dfid, newfid, name).await
     }
 
@@ -309,13 +346,31 @@ impl NinePClient {
         minor: u32,
         gid: u32,
     ) -> ClientResult<(Option<u32>, Stat)> {
+        self.mknod_stat_op_id(dfid, newfid, name, mode, major, minor, gid, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::mknod_stat`] with an idempotency op-id (all-zero to opt out).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mknod_stat_op_id(
+        &self,
+        dfid: u32,
+        newfid: Option<u32>,
+        name: &[u8],
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+        op_id: [u8; 16],
+    ) -> ClientResult<(Option<u32>, Stat)> {
         if self.extensions_v2_enabled() {
             return self
-                .mknod_attr(dfid, name, mode, major, minor, gid)
+                .mknod_attr_op_id(dfid, name, mode, major, minor, gid, op_id)
                 .await
                 .map(|s| (None, s));
         }
-        self.mknod(dfid, name, mode, major, minor, gid).await?;
+        self.mknod_op_id(dfid, name, mode, major, minor, gid, op_id)
+            .await?;
         self.walk_stat_surplus(dfid, newfid, name).await
     }
 
@@ -328,10 +383,26 @@ impl NinePClient {
         fid: u32,
         name: &[u8],
     ) -> ClientResult<(Option<u32>, Stat)> {
+        self.link_stat_op_id(dfid, newfid, fid, name, [0u8; 16])
+            .await
+    }
+
+    /// [`Self::link_stat`] with an idempotency op-id (all-zero to opt out).
+    pub async fn link_stat_op_id(
+        &self,
+        dfid: u32,
+        newfid: Option<u32>,
+        fid: u32,
+        name: &[u8],
+        op_id: [u8; 16],
+    ) -> ClientResult<(Option<u32>, Stat)> {
         if self.extensions_v2_enabled() {
-            return self.link_attr(dfid, fid, name).await.map(|s| (None, s));
+            return self
+                .link_attr_op_id(dfid, fid, name, op_id)
+                .await
+                .map(|s| (None, s));
         }
-        self.link(dfid, fid, name).await?;
+        self.link_op_id(dfid, fid, name, op_id).await?;
         self.walk_stat_surplus(dfid, newfid, name).await
     }
 }

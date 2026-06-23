@@ -19,7 +19,7 @@ use fuser::{
     ReplyLseek, ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, Session,
     SessionACL, TimeOrNow,
 };
-use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime};
+use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
 use ninep_proto::{GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -1502,26 +1502,32 @@ impl Fuse9P {
 }
 
 async fn connect(target: &str, msize: u32) -> Result<Arc<NinePClient>> {
-    if let Some(rest) = target.strip_prefix("unix:") {
-        let path = rest.strip_prefix("//").unwrap_or(rest);
-        return NinePClient::connect_unix(path, msize)
-            .await
-            .with_context(|| format!("connecting to 9P unix socket {path}"));
+    // A comma-separated list is an HA node set (dials the leader, re-routes on failover).
+    let mut targets = Vec::new();
+    for spec in target.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        targets.push(parse_target(spec).await?);
     }
+    if targets.is_empty() {
+        anyhow::bail!("no 9P target given");
+    }
+    NinePClient::connect_multi(targets, msize)
+        .await
+        .with_context(|| format!("connecting to 9P server(s) {target}"))
+}
 
-    let hostport = target.strip_prefix("tcp://").unwrap_or(target);
-
+/// Parse one 9P target spec into a dial [`Target`]: `unix:/path`,
+/// `tcp://host:port`, a bare `host:port`, or a path-like value (a Unix socket).
+async fn parse_target(spec: &str) -> Result<Target> {
+    if let Some(rest) = spec.strip_prefix("unix:") {
+        let path = rest.strip_prefix("//").unwrap_or(rest);
+        return Ok(Target::Unix(path.into()));
+    }
+    let hostport = spec.strip_prefix("tcp://").unwrap_or(spec);
     // A path-like target without a scheme is treated as a Unix socket.
     if hostport.starts_with('/') || hostport.starts_with('.') {
-        return NinePClient::connect_unix(hostport, msize)
-            .await
-            .with_context(|| format!("connecting to 9P unix socket {hostport}"));
+        return Ok(Target::Unix(hostport.into()));
     }
-
-    let addr = resolve_addr(hostport).await?;
-    NinePClient::connect_tcp(addr, msize)
-        .await
-        .with_context(|| format!("connecting to 9P server {addr}"))
+    Ok(Target::Tcp(resolve_addr(hostport).await?))
 }
 
 async fn resolve_addr(s: &str) -> Result<std::net::SocketAddr> {
@@ -1608,13 +1614,20 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         writeback: opts.writeback,
     };
 
+    // Device string = connection target, so device-matching tools (xfstests'
+    // _check_mounted_on) line up. FUSE options are comma-separated, so for an HA
+    // node set we use the first spec; the "zerofs" subtype identifies the fs.
+    let device = target
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("zerofs")
+        .to_string();
+
     let mut config = Config::default();
     let mut mount_options = vec![
-        // The device string is the connection target verbatim (like 9p/NFS show
-        // the host/socket), so tools that match a mount by its device — e.g.
-        // xfstests' _check_mounted_on — line up. The "zerofs" subtype identifies
-        // the filesystem instead.
-        MountOption::FSName(target.clone()),
+        MountOption::FSName(device),
         MountOption::Subtype("zerofs".to_string()),
         // Have the kernel enforce permissions against the attributes we report,
         // so path-prefix search bits and O_TRUNC write checks are applied per

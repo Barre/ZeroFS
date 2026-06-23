@@ -1,4 +1,5 @@
 use ninep_client::ClientError;
+use ninep_proto::P9_ENOTLEADER;
 
 /// The single error type: flat and exhaustive (deliberately NOT
 /// `#[non_exhaustive]`, so `zerofs-ffi` can apply uniffi remote derives and
@@ -74,6 +75,13 @@ pub enum ZeroFsError {
         /// What failed during connect/attach.
         message: String,
     },
+    /// The node served the op but is no longer the HA leader (P9_ENOTLEADER): its
+    /// lease has lapsed or it was fenced by a takeover. Re-routing to the current
+    /// leader and retrying is safe; a [`crate::FailoverClient`] does so transparently.
+    NotLeader {
+        /// The path the operation targeted (lossy display).
+        path: String,
+    },
     /// Any other server errno, preserved verbatim.
     Io {
         /// The Linux errno the server returned.
@@ -107,6 +115,7 @@ impl std::fmt::Display for ZeroFsError {
             }
             Self::Closed => write!(f, "handle is closed"),
             Self::ConnectFailed { message } => write!(f, "connection failed: {message}"),
+            Self::NotLeader { path } => write!(f, "not the leader (re-route): {path}"),
             Self::Io {
                 errno,
                 path,
@@ -145,6 +154,7 @@ impl ZeroFsError {
             Self::TooManySymlinks { .. } => libc::ELOOP,
             Self::Closed => libc::EBADF,
             Self::ConnectFailed { .. } => libc::EIO,
+            Self::NotLeader { .. } => P9_ENOTLEADER as i32,
             Self::Io { errno, .. } => *errno,
             Self::Protocol { .. } => libc::EIO,
         }
@@ -166,6 +176,7 @@ impl ZeroFsError {
                 message: format!("{path}: invalid argument"),
             },
             libc::ELOOP => Self::TooManySymlinks { path },
+            c if c == P9_ENOTLEADER as i32 => Self::NotLeader { path },
             errno => Self::Io {
                 message: std::io::Error::from_raw_os_error(errno).to_string(),
                 errno,

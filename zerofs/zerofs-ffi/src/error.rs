@@ -78,6 +78,13 @@ pub enum ZeroFsError {
         /// What failed during connect/attach.
         message: String,
     },
+    /// The node is no longer the HA leader (P9_ENOTLEADER); a re-route + retry is
+    /// safe, which a failover client does transparently.
+    #[error("not the leader (re-route): {path}")]
+    NotLeader {
+        /// The path the operation targeted (lossy display).
+        path: String,
+    },
     /// Any other server errno, preserved verbatim.
     #[error("i/o error (errno {errno}): {path}: {message}")]
     Io {
@@ -120,6 +127,8 @@ impl ZeroFsError {
             Self::TooManySymlinks { .. } => libc::ELOOP,
             Self::Closed => libc::EBADF,
             Self::ConnectFailed { .. } => libc::EIO,
+            // P9_ENOTLEADER; the test below enforces parity with the client's value.
+            Self::NotLeader { .. } => 108,
             Self::Io { errno, .. } => *errno,
             Self::Protocol { .. } => libc::EIO,
         }
@@ -143,6 +152,7 @@ impl From<zerofs_client::ZeroFsError> for ZeroFsError {
             E::TooManySymlinks { path } => Self::TooManySymlinks { path },
             E::Closed => Self::Closed,
             E::ConnectFailed { message } => Self::ConnectFailed { message },
+            E::NotLeader { path } => Self::NotLeader { path },
             E::Io {
                 errno,
                 path,
@@ -181,6 +191,7 @@ mod tests {
             C::TooManySymlinks { path: p() },
             C::Closed,
             C::ConnectFailed { message: m() },
+            C::NotLeader { path: p() },
             // A distinct errno checks the `Io` passthrough, not a fixed mapping.
             C::Io {
                 errno: libc::EXDEV,
