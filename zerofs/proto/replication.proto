@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package zerofs.replication;
+
+// Semi-synchronous leader-to-standby replication. The leader ships each
+// committed batch and waits for the standby to buffer it BEFORE making it
+// visible in the data db, so an acked write survives the loss of either node; on
+// failover the standby replays its buffered tail into the shared data db.
+service ReplicationService {
+    rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+    // Liveness without a coordination db: the streamed beats give near-instant
+    // crash detection (stream breaks) plus cover an idle leader. The standby
+    // takes over on a gap longer than the takeover TTL.
+    rpc Heartbeat(stream HeartbeatRequest) returns (HeartbeatResponse);
+    // A (re)starting node asks the peer whether it should defer instead of opening
+    // as writer. Prevents a bounced leader from re-taking and dropping the standby
+    // tail (which holds un-flushed acked writes the bounced leader itself lost).
+    rpc Hello(HelloRequest) returns (HelloResponse);
+}
+
+message ReplOp {
+    bytes key = 1;
+    bytes value = 2; // ignored when delete is true
+    bool delete = 3;
+}
+
+message ReplicateRequest {
+    uint64 seqno = 1;
+    // Deduped mutations (last-write-wins per key), in apply order.
+    repeated ReplOp ops = 2;
+    // Standby may drop buffered batches with seqno <= this. Conservative: 0 prunes nothing.
+    uint64 prune_watermark = 3;
+    // Leader's data-db writer epoch. The standby rejects a ship below the highest
+    // epoch it has seen, so a deposed leader cannot pollute the tail.
+    uint64 writer_epoch = 4;
+    // Op-ids applied in this batch (16 bytes each), recorded by the standby
+    // atomically with the data so a retry survives a failover. Empty if none.
+    repeated bytes op_ids = 5;
+}
+
+message ReplicateResponse {
+    // True once buffered on the standby; false if rejected (e.g. stale epoch).
+    bool accepted = 1;
+}
+
+message HeartbeatRequest {
+    // Leader's data-db writer epoch; a beat below the highest seen (a deposed
+    // leader) is ignored so a zombie cannot block a takeover.
+    uint64 writer_epoch = 1;
+    // Leader's latest committed SlateDB seq, for lag visibility.
+    uint64 seq = 2;
+}
+
+message HeartbeatResponse {}
+
+message HelloRequest {}
+
+message HelloResponse {
+    // True if the peer is leading or holds an un-replayed tail: the caller must
+    // NOT open as writer; it should defer and follow.
+    bool peer_active = 1;
+}
