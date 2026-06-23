@@ -2,17 +2,18 @@ use crate::deku_bytes::DekuBytes;
 use deku::prelude::*;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
-/// Version string a ZeroFS client proposes to opt into the private fast-path
-/// extensions (Twalkgetattr/Treaddirattr). A stock v9fs client never sends this,
-/// so the server falls back to plain `9P2000.L` for it.
+/// `.zerofs` fast paths (Twalkgetattr/Treaddirattr). A stock v9fs client never
+/// proposes this, so the server falls back to plain `9P2000.L`.
 pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.zerofs";
-/// Second-generation extension version: everything in `.zerofs` plus the
-/// compound create/open messages (Tlopenat/Tlcreateattr) and the stat-carrying
-/// replies for mkdir/symlink/mknod/link/setattr. A new client proposes this; an
-/// old server's `.zerofs` substring match makes it reply `9P2000.L.zerofs`, so
-/// the client degrades to the first-generation extensions instead of sending
-/// messages the server cannot parse.
+/// `.zerofs2`: adds the compound create/open messages and the stat-carrying
+/// mkdir/symlink/mknod/link/setattr replies. Substring matching lets an old
+/// server reply `.zerofs` so a new client degrades instead of sending unparseable
+/// messages.
 pub const VERSION_9P2000L_ZEROFS2: &[u8] = b"9P2000.L.zerofs2";
+/// `.zerofs3`: adds a per-request idempotency op-id in the frame (after the tag)
+/// for safe retry across a reconnect/failover. Gated by negotiation, so an older
+/// peer never sees the extra field and standard framing is unchanged for it.
+pub const VERSION_9P2000L_ZEROFS3: &[u8] = b"9P2000.L.zerofs3";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -43,6 +44,13 @@ pub enum LockType {
 }
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
+
+/// `Rlerror` ecode an HA node returns when it is no longer the serving leader
+/// (lease lapsed or fenced). A distinct signal, not generic `EIO`, so a
+/// failover-aware client re-probes and resends rather than failing. The value is
+/// `ESHUTDOWN`, which no filesystem op otherwise produces and degrades sensibly
+/// for clients that don't special-case it.
+pub const P9_ENOTLEADER: u32 = 108;
 
 /// Maximum 9P message size. This bounds the negotiated msize: the server clamps
 /// every client's requested msize to this value, and both the server and client
@@ -829,6 +837,26 @@ pub struct Rstatfs {
     pub namelen: u32, // maximum length of filenames
 }
 
+// The 9P2000.L request types that carry an op-id under `.zerofs3`. Named because
+// each is referenced in three places that must agree, the variant `deku(id)`
+// below, the type byte in `P9Message::new`, and `carries_op_id`, so a single
+// const is the source of truth. The first group is the base non-idempotent
+// mutations; the second is their `.zerofs2` compound (create-and-return-stat)
+// forms. The remaining message types are single-use and stay as literal ids.
+pub const T_LCREATE: u8 = 14;
+pub const T_SYMLINK: u8 = 16;
+pub const T_MKNOD: u8 = 18;
+pub const T_RENAME: u8 = 20;
+pub const T_LINK: u8 = 70;
+pub const T_MKDIR: u8 = 72;
+pub const T_RENAMEAT: u8 = 74;
+pub const T_UNLINKAT: u8 = 76;
+pub const T_LCREATEATTR: u8 = 238;
+pub const T_MKDIRATTR: u8 = 240;
+pub const T_SYMLINKATTR: u8 = 242;
+pub const T_MKNODATTR: u8 = 244;
+pub const T_LINKATTR: u8 = 246;
+
 // Main message enum
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(ctx = "_type: u8", id = "_type")]
@@ -849,7 +877,7 @@ pub enum Message {
     Tlopen(Tlopen),
     #[deku(id = "13")]
     Rlopen(Rlopen),
-    #[deku(id = "14")]
+    #[deku(id = "T_LCREATE")]
     Tlcreate(Tlcreate),
     #[deku(id = "15")]
     Rlcreate(Rlcreate),
@@ -877,15 +905,15 @@ pub enum Message {
     Tsetattr(Tsetattr),
     #[deku(id = "27")]
     Rsetattr(Rsetattr),
-    #[deku(id = "72")]
+    #[deku(id = "T_MKDIR")]
     Tmkdir(Tmkdir),
     #[deku(id = "73")]
     Rmkdir(Rmkdir),
-    #[deku(id = "16")]
+    #[deku(id = "T_SYMLINK")]
     Tsymlink(Tsymlink),
     #[deku(id = "17")]
     Rsymlink(Rsymlink),
-    #[deku(id = "18")]
+    #[deku(id = "T_MKNOD")]
     Tmknod(Tmknod),
     #[deku(id = "19")]
     Rmknod(Rmknod),
@@ -893,19 +921,19 @@ pub enum Message {
     Treadlink(Treadlink),
     #[deku(id = "23")]
     Rreadlink(Rreadlink),
-    #[deku(id = "70")]
+    #[deku(id = "T_LINK")]
     Tlink(Tlink),
     #[deku(id = "71")]
     Rlink(Rlink),
-    #[deku(id = "20")]
+    #[deku(id = "T_RENAME")]
     Trename(Trename),
     #[deku(id = "21")]
     Rrename(Rrename),
-    #[deku(id = "74")]
+    #[deku(id = "T_RENAMEAT")]
     Trenameat(Trenameat),
     #[deku(id = "75")]
     Rrenameat(Rrenameat),
-    #[deku(id = "76")]
+    #[deku(id = "T_UNLINKAT")]
     Tunlinkat(Tunlinkat),
     #[deku(id = "77")]
     Runlinkat(Runlinkat),
@@ -942,23 +970,23 @@ pub enum Message {
     Tlopenat(Tlopenat),
     #[deku(id = "237")]
     Rlopenat(Rlopenat),
-    #[deku(id = "238")]
+    #[deku(id = "T_LCREATEATTR")]
     Tlcreateattr(Tlcreateattr),
     #[deku(id = "239")]
     Rlcreateattr(Rlcreateattr),
-    #[deku(id = "240")]
+    #[deku(id = "T_MKDIRATTR")]
     Tmkdirattr(Tmkdir),
     #[deku(id = "241")]
     Rmkdirattr(Rmkdirattr),
-    #[deku(id = "242")]
+    #[deku(id = "T_SYMLINKATTR")]
     Tsymlinkattr(Tsymlink),
     #[deku(id = "243")]
     Rsymlinkattr(Rsymlinkattr),
-    #[deku(id = "244")]
+    #[deku(id = "T_MKNODATTR")]
     Tmknodattr(Tmknod),
     #[deku(id = "245")]
     Rmknodattr(Rmknodattr),
-    #[deku(id = "246")]
+    #[deku(id = "T_LINKATTR")]
     Tlinkattr(Tlink),
     #[deku(id = "247")]
     Rlinkattr(Rlinkattr),
@@ -981,7 +1009,16 @@ pub enum Message {
     Rreaddirattr(Rreaddirattr),
 }
 
-// Complete 9P message with header
+/// Byte offset of the `type` field within a 9P frame (after the u32 size).
+pub const P9_TYPE_OFFSET: usize = 4;
+/// Length of the standard 9P frame header: size(u32) + type(u8) + tag(u16).
+pub const P9_FRAME_HEADER_LEN: usize = 7;
+/// Length of the idempotency op-id spliced into the frame under `.zerofs3`.
+pub const P9_OP_ID_LEN: usize = 16;
+
+// Standard 9P framing is size+type+tag+body; the op-id is deliberately NOT part
+// of the deku layout. Under `.zerofs3` it is spliced in after the tag (requests
+// only), so existing call sites keep producing/parsing standard frames.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct P9Message {
     #[deku(endian = "little")]
@@ -989,19 +1026,76 @@ pub struct P9Message {
     pub type_: u8,
     #[deku(endian = "little")]
     pub tag: u16,
+    #[deku(skip, default = "[0u8; 16]")]
+    pub op_id: [u8; 16],
     #[deku(ctx = "*type_")]
     pub body: Message,
 }
 
 impl P9Message {
     pub fn to_bytes(&self) -> Result<Vec<u8>, DekuError> {
-        let mut bytes = DekuContainerWrite::to_bytes(self)?;
+        self.to_bytes_ctx(false)
+    }
 
-        // Update the size field with the actual size
+    /// Encode. Under `.zerofs3` the op-id is spliced in after the tag (requests
+    /// only); otherwise this is standard 9P framing.
+    pub fn to_bytes_ctx(&self, op_id_enabled: bool) -> Result<Vec<u8>, DekuError> {
+        // deku produces the standard frame (op_id is #[deku(skip)]).
+        let mut bytes = DekuContainerWrite::to_bytes(self)?;
+        if op_id_enabled && Self::carries_op_id(self.type_) {
+            bytes.splice(
+                P9_FRAME_HEADER_LEN..P9_FRAME_HEADER_LEN,
+                self.op_id.iter().copied(),
+            );
+        }
         let size = bytes.len() as u32;
         bytes[0..4].copy_from_slice(&size.to_le_bytes());
-
         Ok(bytes)
+    }
+
+    /// Decode. Under `.zerofs3` the op-id is read from the frame (requests only)
+    /// and stripped before the body is parsed; otherwise standard 9P framing.
+    pub fn from_bytes_ctx(input: &[u8], op_id_enabled: bool) -> Result<P9Message, DekuError> {
+        if op_id_enabled
+            && input.len() > P9_FRAME_HEADER_LEN
+            && Self::carries_op_id(input[P9_TYPE_OFFSET])
+        {
+            if input.len() < P9_FRAME_HEADER_LEN + P9_OP_ID_LEN {
+                return Err(DekuError::Parse(
+                    "frame too short to contain an op-id".into(),
+                ));
+            }
+            let mut op_id = [0u8; 16];
+            op_id.copy_from_slice(&input[P9_FRAME_HEADER_LEN..P9_FRAME_HEADER_LEN + P9_OP_ID_LEN]);
+            // Rebuild the standard frame (without the op-id) to parse the body.
+            let mut standard = Vec::with_capacity(input.len() - P9_OP_ID_LEN);
+            standard.extend_from_slice(&input[..P9_FRAME_HEADER_LEN]);
+            standard.extend_from_slice(&input[P9_FRAME_HEADER_LEN + P9_OP_ID_LEN..]);
+            let (_, mut msg) = P9Message::from_bytes((&standard, 0))?;
+            msg.op_id = op_id;
+            Ok(msg)
+        } else {
+            let (_, msg) = P9Message::from_bytes((input, 0))?;
+            Ok(msg)
+        }
+    }
+
+    /// Whether a request of this 9P type carries an op-id under `.zerofs3`. The
+    /// single source of truth shared by encode and decode, so the two always
+    /// agree and a missed type is only a coverage gap, never a framing break.
+    /// Covers the non-idempotent mutations (create family, rename, unlink);
+    /// idempotent ops (reads/walks/attach/clunk/write/setattr/Tlopenat) are out.
+    /// The second group is those same mutations in their `.zerofs2` compound
+    /// (create-and-return-stat) form; the op-id is a `.zerofs3` feature applied to
+    /// both groups, not something `.zerofs2` carried.
+    fn carries_op_id(type_: u8) -> bool {
+        matches!(
+            type_,
+            // base 9P2000.L mutations
+            T_LCREATE | T_SYMLINK | T_MKNOD | T_RENAME | T_LINK | T_MKDIR | T_RENAMEAT | T_UNLINKAT
+            // their .zerofs2 compound (create-and-return-stat) forms
+            | T_LCREATEATTR | T_MKDIRATTR | T_SYMLINKATTR | T_MKNODATTR | T_LINKATTR
+        )
     }
 
     pub fn new(tag: u16, body: Message) -> Self {
@@ -1014,7 +1108,7 @@ impl P9Message {
             Message::Rwalk(_) => 111,
             Message::Tlopen(_) => 12,
             Message::Rlopen(_) => 13,
-            Message::Tlcreate(_) => 14,
+            Message::Tlcreate(_) => T_LCREATE,
             Message::Rlcreate(_) => 15,
             Message::Tread(_) => 116,
             Message::Rread(_) => 117,
@@ -1028,21 +1122,21 @@ impl P9Message {
             Message::Rgetattr(_) => 25,
             Message::Tsetattr(_) => 26,
             Message::Rsetattr(_) => 27,
-            Message::Tmkdir(_) => 72,
+            Message::Tmkdir(_) => T_MKDIR,
             Message::Rmkdir(_) => 73,
-            Message::Tsymlink(_) => 16,
+            Message::Tsymlink(_) => T_SYMLINK,
             Message::Rsymlink(_) => 17,
-            Message::Tmknod(_) => 18,
+            Message::Tmknod(_) => T_MKNOD,
             Message::Rmknod(_) => 19,
             Message::Treadlink(_) => 22,
             Message::Rreadlink(_) => 23,
-            Message::Tlink(_) => 70,
+            Message::Tlink(_) => T_LINK,
             Message::Rlink(_) => 71,
-            Message::Trename(_) => 20,
+            Message::Trename(_) => T_RENAME,
             Message::Rrename(_) => 21,
-            Message::Trenameat(_) => 74,
+            Message::Trenameat(_) => T_RENAMEAT,
             Message::Rrenameat(_) => 75,
-            Message::Tunlinkat(_) => 76,
+            Message::Tunlinkat(_) => T_UNLINKAT,
             Message::Runlinkat(_) => 77,
             Message::Tfsync(_) => 50,
             Message::Rfsync(_) => 51,
@@ -1059,15 +1153,15 @@ impl P9Message {
             Message::Rstatfs(_) => 9,
             Message::Tlopenat(_) => 236,
             Message::Rlopenat(_) => 237,
-            Message::Tlcreateattr(_) => 238,
+            Message::Tlcreateattr(_) => T_LCREATEATTR,
             Message::Rlcreateattr(_) => 239,
-            Message::Tmkdirattr(_) => 240,
+            Message::Tmkdirattr(_) => T_MKDIRATTR,
             Message::Rmkdirattr(_) => 241,
-            Message::Tsymlinkattr(_) => 242,
+            Message::Tsymlinkattr(_) => T_SYMLINKATTR,
             Message::Rsymlinkattr(_) => 243,
-            Message::Tmknodattr(_) => 244,
+            Message::Tmknodattr(_) => T_MKNODATTR,
             Message::Rmknodattr(_) => 245,
-            Message::Tlinkattr(_) => 246,
+            Message::Tlinkattr(_) => T_LINKATTR,
             Message::Rlinkattr(_) => 247,
             Message::Tsetattrattr(_) => 248,
             Message::Rsetattrattr(_) => 249,
@@ -1083,8 +1177,16 @@ impl P9Message {
             size: 0, // Will be calculated during serialization
             type_,
             tag,
+            op_id: [0u8; 16],
             body,
         }
+    }
+
+    /// Construct a request carrying an idempotency op-id (encode with `to_bytes_ctx(true)`).
+    pub fn new_with_op_id(tag: u16, op_id: [u8; 16], body: Message) -> Self {
+        let mut msg = Self::new(tag, body);
+        msg.op_id = op_id;
+        msg
     }
 }
 
@@ -1092,6 +1194,62 @@ impl P9Message {
 mod tests {
     use super::*;
     use deku::DekuContainerWrite;
+
+    fn tmkdir() -> Message {
+        Message::Tmkdir(Tmkdir {
+            dfid: 1,
+            name: P9String::new(b"d".to_vec()),
+            mode: 0o755,
+            gid: 0,
+        })
+    }
+
+    #[test]
+    fn op_id_round_trips_on_a_request_under_zerofs3() {
+        // Tmkdir is a covered (non-idempotent) request, so it carries the op-id.
+        let op_id = [7u8; 16];
+        let msg = P9Message::new_with_op_id(5, op_id, tmkdir());
+        let bytes = msg.to_bytes_ctx(true).unwrap();
+        let decoded = P9Message::from_bytes_ctx(&bytes, true).unwrap();
+        assert_eq!(
+            decoded.op_id, op_id,
+            "the op-id must round-trip under .zerofs3"
+        );
+        assert_eq!(decoded.tag, 5);
+        assert!(matches!(decoded.body, Message::Tmkdir(_)));
+    }
+
+    #[test]
+    fn op_id_is_absent_in_standard_framing() {
+        let op_id = [7u8; 16];
+        let msg = P9Message::new_with_op_id(5, op_id, tmkdir());
+        let with = msg.to_bytes_ctx(true).unwrap();
+        let without = msg.to_bytes_ctx(false).unwrap();
+        assert_eq!(
+            with.len(),
+            without.len() + 16,
+            "the op-id adds exactly 16 bytes on the wire, and nothing without .zerofs3"
+        );
+        // Standard 9P framing (no extension) carries no op-id.
+        let decoded = P9Message::from_bytes_ctx(&without, false).unwrap();
+        assert_eq!(
+            decoded.op_id, [0u8; 16],
+            "standard framing carries no op-id"
+        );
+        // And a stock decoder (default ctx) reads the standard frame unchanged.
+        let (_, plain) = P9Message::from_bytes((&without, 0)).unwrap();
+        assert_eq!(plain.tag, 5);
+    }
+
+    #[test]
+    fn idempotent_requests_carry_no_op_id() {
+        // A read-side request (Tclunk) is not covered, so even under .zerofs3 it
+        // is framed exactly as standard 9P (no op-id bytes).
+        let msg = P9Message::new_with_op_id(5, [7u8; 16], Message::Tclunk(Tclunk { fid: 9 }));
+        let with = msg.to_bytes_ctx(true).unwrap();
+        let without = msg.to_bytes_ctx(false).unwrap();
+        assert_eq!(with, without, "an uncovered op must not carry an op-id");
+    }
 
     fn qid() -> Qid {
         Qid {
