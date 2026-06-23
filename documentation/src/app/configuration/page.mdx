@@ -365,6 +365,28 @@ Whether you use a separate WAL store is decided at filesystem creation time and 
 
 One read-write instance and any number of read-only instances can run on the same storage backend, all using the same configuration file. See [Read Replicas](/read-replicas) for startup, freshness, and restrictions.
 
+## High Availability
+
+A `[replication]` section runs the node as one half of a leader/standby pair over a single object store, with automatic failover that loses no `fsync`'d data. Each node has its own config file. See [High Availability](/high-availability) for the design, guarantees, and a full two-node example.
+
+```toml
+[replication]
+node_id = "node-a"
+role = "leader"                       # initial role: "leader" or "standby"
+replication_listen = "10.0.0.1:9000"  # this node receives ships and heartbeats here
+peers = ["10.0.0.2:9000"]             # the other node's replication_listen
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `node_id` | yes | Stable identity of this node within the pair. |
+| `role` | yes | `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
+| `replication_listen` | standby; both recommended | `host:port` this node receives the leader's ships and heartbeats on. |
+| `peers` | both recommended | The other node's `replication_listen`. |
+| `tail_buffer_dir` | no | Directory for the replication tail buffer. |
+
+Set both `replication_listen` and `peers` on every node so either can lead after a role swap; ZeroFS warns at startup on an asymmetric config. The data-database WAL (`[lsm] wal_enabled`) is allowed under replication and makes `fsync` cheaper. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
+
 ## Complete Examples
 
 ### Basic S3 Configuration

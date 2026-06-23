@@ -128,7 +128,7 @@ The `cache=mmap` option doesn't create a cache - it enables support for memory-m
 
 ## File Locking
 
-ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`,  over 9P, from both the kernel client and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes.
+ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`,  over 9P, from both the kernel client and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes. Under [high availability](/high-availability) they are not preserved across a failover, so an application needing mutual exclusion across a failover should fence at the resource it protects (see the HA limits).
 
 The server arbitrates locks between clients. Processes sharing one mount are arbitrated locally by that client, since the whole mount is a single 9P session. `F_GETLK` on a range locked by another client reports the holder's pid negated, the v9fs convention for a pid that has no meaning in the local pid namespace.
 
