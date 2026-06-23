@@ -9,6 +9,7 @@ pub mod compactor;
 pub mod debug;
 pub mod fatrace;
 pub mod flush;
+mod init;
 pub mod monitor;
 pub mod password;
 pub mod server;
