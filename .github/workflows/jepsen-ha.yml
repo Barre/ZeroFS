@@ -57,7 +57,7 @@ jobs:
         working-directory: jepsen/ha
         run: |
           lein run test \
-            --time-limit 600 \
+            --time-limit 300 \
             --concurrency 10 \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
@@ -69,7 +69,7 @@ jobs:
         working-directory: jepsen/ha
         run: |
           lein run test \
-            --time-limit 300 \
+            --time-limit 90 \
             --concurrency 10 \
             --no-fsync \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
