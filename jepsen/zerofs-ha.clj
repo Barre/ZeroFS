@@ -40,8 +40,8 @@
 (defn peer-key   [node-key]      (case node-key :a :b :b :a))
 
 (defn node-config-str
-  "One HA node's TOML. Symmetric replication (own listen port + peer's), short HA
-  timeouts for quick failover, fsync-is-the-only-flush LSM config."
+  "One HA node's TOML. Symmetric replication (own listen port + peer's),
+  fsync-is-the-only-flush LSM config."
   [{:keys [store password port] :as db} node-key role]
   (let [n (get-in db [:nodes node-key])]
     (str "[cache]\n"
@@ -57,10 +57,7 @@
          "node_id = \"" (name node-key) "\"\n"
          "role = \"" role "\"\n"
          "replication_listen = \"127.0.0.1:" (repl-port port node-key) "\"\n"
-         "peers = [\"127.0.0.1:" (repl-port port (peer-key node-key)) "\"]\n"
-         "heartbeat_interval_secs = 1\n"
-         "lease_ttl_secs = 3\n"
-         "takeover_ttl_secs = 8\n\n"
+         "peers = [\"127.0.0.1:" (repl-port port (peer-key node-key)) "\"]\n\n"
          "[lsm]\n"
          "flush_interval_secs = 86400\n"
          "max_unflushed_gb = 100.0\n")))
