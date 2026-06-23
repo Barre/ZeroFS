@@ -76,6 +76,10 @@ pub const CHUNK_SIZE: usize = 32 * 1024;
 pub const STATS_SHARDS: usize = 100;
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 pub const NAME_MAX: usize = 255;
+/// Total inode capacity reported by statfs. A fixed, signed-safe value (< 2^63):
+/// statfs must not report a u64 >= 2^63, because GNU `stat`/`df` render such a
+/// count as a negative signed value and miscompute inode usage on the mount.
+pub const TOTAL_INODES: u64 = 1 << 48;
 
 pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
     if filename.len() > NAME_MAX {

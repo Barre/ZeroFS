@@ -410,9 +410,10 @@ impl NFSFileSystem for NFSAdapter {
 
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
 
-        let next_inode_id = self.fs.inode_store.next_id();
-        let available_inodes = u64::MAX.saturating_sub(next_inode_id);
-        let total_inodes = used_inodes + available_inodes;
+        // Fixed, signed-safe inode capacity (see fs::TOTAL_INODES): a u64::MAX-based
+        // count renders negative under GNU `stat`/`df`. `available` = capacity - in-use.
+        let total_inodes = crate::fs::TOTAL_INODES;
+        let available_inodes = total_inodes.saturating_sub(used_inodes);
 
         // Use configured max_bytes from filesystem config, capped at 8 EiB
         // to avoid breaking NFS clients that can't handle larger values

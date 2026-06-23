@@ -1556,11 +1556,11 @@ impl NinePHandler {
         let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
-        let next_inode_id = self.filesystem.inode_store.next_id();
-
-        let available_inodes = u64::MAX.saturating_sub(next_inode_id);
-
-        let total_inodes = used_inodes + available_inodes;
+        // Fixed, signed-safe inode capacity. A u64::MAX-based count renders as a
+        // negative value under GNU `stat`/`df` (signed %d) and breaks their inode
+        // accounting; `available` = capacity - in-use.
+        let total_inodes = crate::fs::TOTAL_INODES;
+        let available_inodes = total_inodes.saturating_sub(used_inodes);
 
         let statfs = Rstatfs {
             r#type: 0x5a45524f,
@@ -1997,10 +1997,9 @@ mod tests {
 
         match &after_resp.body {
             Message::Rstatfs(rstatfs) => {
-                // Should have fewer available inodes since we allocated one for the file
-                // Note: Available inodes are based on next_inode_id, not currently used inodes
-                let next_inode_id = handler.filesystem.inode_store.next_id();
-                assert_eq!(rstatfs.ffree, u64::MAX - next_inode_id);
+                // Available inodes = capacity - in-use; creating the file consumed one.
+                let (_, used_inodes) = handler.filesystem.global_stats.get_totals();
+                assert_eq!(rstatfs.ffree, crate::fs::TOTAL_INODES - used_inodes);
 
                 // Should have fewer free blocks (10KB written = 3 blocks of 4KB)
                 let expected_blocks_used = 10240_u64.div_ceil(4096); // Round up
