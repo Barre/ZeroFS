@@ -1,12 +1,9 @@
-use crate::block_transformer::ZeroFsBlockTransformer;
-use crate::bucket_identity;
 use crate::checkpoint_manager::CheckpointManager;
 use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
-use crate::key_management;
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::nbd::NBDServer;
 use crate::object_store_prefetch::PrefetchingObjectStore;
@@ -379,6 +376,13 @@ pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
     (parts, decoded)
 }
 
+/// Result of opening the ZeroFS database.
+pub struct SlateDbOpen {
+    pub data: SlateDbHandle,
+    pub maintenance_runtime: Option<tokio::runtime::Handle>,
+    pub metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -390,11 +394,8 @@ pub async fn build_slatedb(
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     segments_enabled: bool,
-) -> Result<(
-    SlateDbHandle,
-    Option<tokio::runtime::Handle>,
-    Option<Arc<DefaultMetricsRecorder>>,
-)> {
+    replication: Option<&crate::replication::ReplicationParams>,
+) -> Result<SlateDbOpen> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
     let total_memory_cache_gb = cache_config.memory_cache_size_gb.unwrap_or(0.25);
 
@@ -422,6 +423,26 @@ pub async fn build_slatedb(
     let max_concurrent_compactions = lsm_config
         .map(|c| c.max_concurrent_compactions())
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
+
+    // Replication needs the writer path: reject read-only / checkpoint, and
+    // reject reaching here as a standby (a standby opens the data db as writer
+    // only on promotion; doing so here would fence the live leader).
+    if let Some(repl) = replication {
+        if db_mode.is_read_only() {
+            anyhow::bail!(
+                "[replication] is incompatible with read-only / checkpoint database modes; \
+                 node {} must open the data database as a writer",
+                repl.node_id
+            );
+        }
+        if !repl.is_leader() {
+            anyhow::bail!(
+                "internal error: build_slatedb reached as a standby (node {}); a standby must \
+                 complete failover and be promoted to leader before opening the data database",
+                repl.node_id
+            );
+        }
+    }
 
     let wal_enabled = lsm_config.map(|c| c.wal_enabled()).unwrap_or(false);
 
@@ -514,6 +535,8 @@ pub async fn build_slatedb(
     )
     .await?;
 
+    // Length-check the store before the data-db prefetch wrapper is layered on;
+    // the compactor uses the length-checked store directly (no prefetch cache).
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(LengthCheckedObjectStore::new(object_store));
     let compactor_object_store = object_store.clone();
@@ -584,11 +607,11 @@ pub async fn build_slatedb(
                     .context("Failed to build SlateDB instance")?,
             );
 
-            Ok((
-                SlateDbHandle::ReadWrite(slatedb),
-                Some(maintenance_runtime),
-                Some(metrics_recorder),
-            ))
+            Ok(SlateDbOpen {
+                data: SlateDbHandle::ReadWrite(slatedb),
+                maintenance_runtime: Some(maintenance_runtime),
+                metrics_recorder: Some(metrics_recorder),
+            })
         }
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
@@ -606,7 +629,11 @@ pub async fn build_slatedb(
                     .context("Failed to open database in read-only mode")?,
             );
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
+            Ok(SlateDbOpen {
+                data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+                maintenance_runtime: None,
+                metrics_recorder: None,
+            })
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
@@ -625,7 +652,11 @@ pub async fn build_slatedb(
                     .context("Failed to open database from checkpoint")?,
             );
 
-            Ok((SlateDbHandle::ReadOnly(ArcSwap::new(reader)), None, None))
+            Ok(SlateDbOpen {
+                data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+                maintenance_runtime: None,
+                metrics_recorder: None,
+            })
         }
     }
 }
@@ -637,142 +668,9 @@ pub struct InitResult {
     pub db_path: String,
     pub db_handle: SlateDbHandle,
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
-}
-
-async fn initialize_filesystem(
-    settings: &Settings,
-    db_mode: DatabaseMode,
-    disable_compactor: bool,
-) -> Result<InitResult> {
-    let url = settings.storage.url.clone();
-
-    let cache_config = CacheConfig {
-        root_folder: settings.cache.dir.clone(),
-        max_cache_size_gb: settings.cache.disk_size_gb,
-        memory_cache_size_gb: settings.cache.memory_size_gb,
-    };
-
-    let env_vars = settings.cloud_provider_env_vars();
-
-    let (object_store, path_from_url) = parse_url_opts(
-        &url.parse().context("Failed to parse storage URL")?,
-        env_vars,
-    )
-    .context("Failed to connect to storage backend")?;
-    let object_store = with_storage_class(
-        Arc::from(object_store),
-        settings.storage.storage_class.as_deref(),
-    );
-
-    let actual_db_path = path_from_url.to_string();
-
-    info!("Starting ZeroFS server with {} backend", object_store);
-    info!("DB Path: {}", actual_db_path);
-    info!(
-        "Base Cache Directory: {}",
-        cache_config.root_folder.display()
-    );
-    info!("Cache Size: {} GB", cache_config.max_cache_size_gb);
-
-    info!("Checking bucket identity...");
-    let bucket = bucket_identity::BucketIdentity::get_or_create(&object_store, &actual_db_path)
-        .await
-        .context("Failed to resolve bucket identity")?;
-
-    let cache_config = CacheConfig {
-        root_folder: cache_config.root_folder.join(bucket.cache_directory_name()),
-        ..cache_config
-    };
-
-    info!(
-        "Bucket ID: {}, Cache directory: {}",
-        bucket.id(),
-        cache_config.root_folder.display()
-    );
-
-    if !db_mode.is_read_only() {
-        crate::storage_compatibility::check_if_match_support(&object_store, &actual_db_path)
-            .await?;
-    }
-
-    let password = settings.storage.encryption_password.clone();
-
-    super::password::validate_password(&password).context("Password validation failed")?;
-
-    info!("Loading or initializing encryption key from object store");
-    let db_path = Path::from(actual_db_path.clone());
-    let encryption_key = key_management::load_or_init_encryption_key(
-        &object_store,
-        &db_path,
-        &password,
-        db_mode.is_read_only(),
-    )
-    .await
-    .context("Failed to load or initialize encryption key")?;
-
-    let block_transformer: Arc<dyn BlockTransformer> =
-        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
-
-    let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> = if let Some(wal_config) =
-        &settings.wal
-    {
-        info!("Using separate WAL object store: {}", wal_config.url);
-        Some(parse_wal_object_store(wal_config).context("Failed to connect to WAL object store")?)
-    } else {
-        None
-    };
-
-    let segments_enabled = crate::segment_extractor::should_enable_segments(
-        &object_store,
-        &db_path,
-        wal_object_store.as_ref(),
-    )
-    .await
-    .context("Failed to determine segment compaction mode")?;
-    if segments_enabled {
-        info!("Segment-oriented compaction enabled (RFC-0024); using v2 key layout");
-    } else {
-        info!("Segment-oriented compaction disabled; using legacy v1 key layout");
-    }
-
-    let (slatedb, maintenance_runtime, metrics_recorder) = build_slatedb(
-        object_store.clone(),
-        &cache_config,
-        actual_db_path.clone(),
-        db_mode,
-        settings.lsm,
-        disable_compactor,
-        block_transformer.clone(),
-        wal_object_store.clone(),
-        segments_enabled,
-    )
-    .await
-    .context("Failed to open database")?;
-
-    let db_handle = slatedb.clone();
-    let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
-    let fs = ZeroFS::new_with_slatedb(
-        slatedb,
-        settings.max_bytes(),
-        metrics_recorder.clone(),
-        sync_writes,
-        segments_enabled,
-    )
-    .await
-    .context("Failed to initialize filesystem")?;
-
-    let fs = Arc::new(fs);
-    // Reclaims open-unlinked inodes once their last open handle is dropped.
-    fs.start_reclaim_drainer();
-
-    Ok(InitResult {
-        fs,
-        object_store,
-        wal_object_store,
-        db_path: actual_db_path.to_string(),
-        db_handle,
-        maintenance_runtime,
-    })
+    /// Keeps the HA heartbeat loop alive; dropping it (or sending `true`) stops
+    /// the loop. `None` in single-node mode.
+    pub heartbeat_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 pub async fn run_server(
@@ -828,14 +726,26 @@ pub async fn run_server(
 
     crate::telemetry::send_startup_event(&settings);
 
-    let init_result = initialize_filesystem(&settings, db_mode, no_compactor).await?;
+    let init_result =
+        crate::cli::init::initialize_filesystem(&settings, db_mode, no_compactor).await?;
     let fs = init_result.fs;
+    let heartbeat_shutdown = init_result.heartbeat_shutdown;
 
     if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
     }
 
     let shutdown = CancellationToken::new();
+
+    // Graceful shutdown stops the heartbeat loop so the lease lapses and a
+    // standby can take over promptly.
+    if let Some(hb_shutdown) = heartbeat_shutdown {
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_clone.cancelled().await;
+            let _ = hb_shutdown.send(true);
+        });
+    }
 
     let telemetry_handle = crate::telemetry::start_periodic_reporting(
         &settings,
