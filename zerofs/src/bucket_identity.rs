@@ -1,4 +1,4 @@
-use slatedb::object_store::{ObjectStore, path::Path};
+use slatedb::object_store::{ObjectStore, PutMode, PutOptions, path::Path};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -33,14 +33,34 @@ impl BucketIdentity {
             Err(slatedb::object_store::Error::NotFound { .. }) => {
                 tracing::debug!("Bucket ID marker not found, creating new one");
                 let new_id = Uuid::new_v4();
-                tracing::info!("Creating new bucket ID: {}", new_id);
 
-                object_store
-                    .put(&marker_path, new_id.to_string().into())
+                // Conditional create: if another node created the marker concurrently,
+                // adopt ITS id so both nodes share one bucket identity (and thus one
+                // cache namespace) instead of each keeping a different one.
+                match object_store
+                    .put_opts(
+                        &marker_path,
+                        new_id.to_string().into(),
+                        PutOptions::from(PutMode::Create),
+                    )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to write bucket ID marker: {e:#?}"))?;
-
-                new_id
+                {
+                    Ok(_) => {
+                        tracing::info!("Creating new bucket ID: {}", new_id);
+                        new_id
+                    }
+                    Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                        let bytes = object_store.get(&marker_path).await?.bytes().await?;
+                        let id_str = String::from_utf8(bytes.to_vec())?;
+                        let uuid = Uuid::parse_str(id_str.trim())
+                            .map_err(|e| anyhow::anyhow!("Invalid bucket ID format: {e:#?}"))?;
+                        tracing::info!("Adopted concurrently-created bucket ID: {}", uuid);
+                        uuid
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to write bucket ID marker: {e:#?}"));
+                    }
+                }
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("Failed to read bucket ID marker: {e:#?}"));
@@ -84,5 +104,17 @@ mod tests {
         assert_eq!(cache_name.len(), 15);
         let expected = format!("bucket_{}", &uuid.to_string()[..8]);
         assert_eq!(cache_name, expected);
+    }
+
+    /// Two nodes initializing the same bucket concurrently must converge on ONE id
+    /// (else they'd use different cache namespaces).
+    #[tokio::test]
+    async fn concurrent_get_or_create_converges() {
+        let store: Arc<dyn ObjectStore> = Arc::new(slatedb::object_store::memory::InMemory::new());
+        let (a, b) = tokio::join!(
+            BucketIdentity::get_or_create(&store, "data"),
+            BucketIdentity::get_or_create(&store, "data"),
+        );
+        assert_eq!(a.unwrap().id(), b.unwrap().id(), "bucket ids must converge");
     }
 }
