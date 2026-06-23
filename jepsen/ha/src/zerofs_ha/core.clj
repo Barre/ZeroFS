@@ -371,8 +371,13 @@
   (let [{:keys [out exit]} (sh! :stat :-f "--format=%c %d" (str dir))]
     (when-not (zero? exit)
       (throw (java.io.IOException. (str "statfs failed (" exit "): " out))))
-    (let [[total free] (->> (str/split (str/trim out) #"\s+") (mapv bigint))]
-      (long (- total free)))))
+    ;; `stat` may render a free-inode count >= 2^63 as a signed-negative string
+    ;; (GNU coreutils does; uutils prints it unsigned). Parsing is to bigint, so the
+    ;; text reads fine either way; mask both fields back to unsigned before
+    ;; subtracting so the result is the true (small) used-inode count and fits a long.
+    (let [u64 (fn [x] (if (neg? x) (+ x 18446744073709551616N) x))
+          [total free] (->> (str/split (str/trim out) #"\s+") (mapv bigint))]
+      (long (- (u64 total) (u64 free))))))
 
 (defn corrupt-files
   "Integer-named files whose content isn't \"<name>\\n\", e.g. two names that
