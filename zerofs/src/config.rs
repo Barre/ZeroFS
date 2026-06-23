@@ -146,6 +146,142 @@ pub struct Settings {
     pub telemetry: Option<TelemetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub prometheus: Option<PrometheusConfig>,
+    /// HA replication. Absent means single-node (non-replicated behavior).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub replication: Option<ReplicationConfig>,
+}
+
+/// Node role within an HA pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationRole {
+    /// Bootstraps as the active leader, opening the data db as writer.
+    Leader,
+    /// Watches the leader's heartbeats; takes over (opens the data db as writer)
+    /// when they stop.
+    Standby,
+}
+
+impl Serialize for ReplicationRole {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            ReplicationRole::Leader => "leader",
+            ReplicationRole::Standby => "standby",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ReplicationRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "leader" => Ok(ReplicationRole::Leader),
+            "standby" => Ok(ReplicationRole::Standby),
+            other => Err(de::Error::invalid_value(
+                de::Unexpected::Str(other),
+                &"\"leader\" or \"standby\"",
+            )),
+        }
+    }
+}
+
+/// HA replication: one node of a leader/standby pair over a single object-store
+/// endpoint. Leadership is the data db's writer epoch; the standby takes over
+/// when heartbeats stop. Read-only / checkpoint modes are rejected (a node must
+/// open the data db as a writer).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationConfig {
+    /// This node's stable identity within the pair.
+    pub node_id: String,
+    /// Role: "leader" or "standby".
+    pub role: ReplicationRole,
+    /// Peer address(es). On a leader, the standby's `replication_listen`.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Address this node listens on for the replication stream (a standby
+    /// receives the leader's ships here).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub replication_listen: Option<String>,
+    /// Directory for the replication tail buffer.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_path",
+        default
+    )]
+    pub tail_buffer_dir: Option<PathBuf>,
+}
+
+impl ReplicationConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.node_id.trim().is_empty() {
+            anyhow::bail!("[replication] node_id must not be empty");
+        }
+
+        // A standby must be reachable to receive the leader's ships and to watch
+        // its heartbeats; with no listen it can do neither (it would fail at startup
+        // with "standby has no replication_listen; cannot watch heartbeats").
+        if self.role == ReplicationRole::Standby && self.replication_listen.is_none() {
+            anyhow::bail!(
+                "[replication] role = \"standby\" requires replication_listen (the address it \
+                 receives the leader's ships on)"
+            );
+        }
+
+        // The receiver binds replication_listen verbatim, so it must be a socket
+        // address (host:port); catch a typo here rather than at bind time.
+        if let Some(listen) = &self.replication_listen {
+            listen.parse::<SocketAddr>().with_context(|| {
+                format!(
+                    "[replication] replication_listen {listen:?} is not a valid socket address \
+                     (expected host:port)"
+                )
+            })?;
+        }
+
+        for peer in &self.peers {
+            if peer.trim().is_empty() {
+                anyhow::bail!("[replication] peers must not contain an empty entry");
+            }
+            // A node replicating to its own listen address is always a mistake.
+            if let Some(listen) = &self.replication_listen {
+                let bare = peer
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://");
+                if bare == listen {
+                    anyhow::bail!(
+                        "[replication] peer {peer:?} is this node's own replication_listen; a \
+                         node must not replicate to itself"
+                    );
+                }
+            }
+        }
+
+        // Asymmetric HA (only one of peers/listen set) works for the initial roles
+        // but not a role swap: dynamic election and a promoted standby both need
+        // peers AND a listen. Warn rather than fail: a deliberately one-directional
+        // setup is still usable, and a solo node (neither set) is fine.
+        let (has_peers, has_listen) = (!self.peers.is_empty(), self.replication_listen.is_some());
+        if has_peers != has_listen {
+            let detail = if has_peers {
+                "has peers but no replication_listen, so it cannot receive ships if demoted to a follower"
+            } else {
+                "has replication_listen but no peers, so if promoted to leader it has nowhere to ship"
+            };
+            tracing::warn!(
+                "[replication] node {:?} {detail}; HA will be degraded across a role swap \
+                 (configure both peers and replication_listen for a balanced pair)",
+                self.node_id
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -179,6 +315,13 @@ pub struct FilesystemConfig {
     /// Compression algorithm for chunk data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
     #[serde(default)]
     pub compression: CompressionConfig,
+    /// Treat `fsync` as a no-op: a client fsync/COMMIT returns without forcing a
+    /// flush to object storage. Intended for HA, where semi-sync replication
+    /// already holds the write on the standby, making the per-fsync flush
+    /// redundant. Trades object-store durability for latency: un-flushed writes are
+    /// lost if both nodes (or a standalone node) die before a background flush.
+    #[serde(default)]
+    pub ignore_fsync: bool,
 }
 
 impl FilesystemConfig {
@@ -544,7 +687,29 @@ impl Settings {
         let settings: Settings = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
+        settings.validate()?;
+
         Ok(settings)
+    }
+
+    /// Cross-section validation applied after deserialization.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(replication) = &self.replication {
+            replication
+                .validate()
+                .context("Invalid [replication] configuration")?;
+        }
+
+        if let Some(fs) = &self.filesystem
+            && fs.ignore_fsync
+            && self.lsm.as_ref().map(|l| l.sync_writes()).unwrap_or(false)
+        {
+            anyhow::bail!(
+                "[filesystem] ignore_fsync and [lsm] sync_writes are contradictory: \
+                 sync_writes flushes after every write, ignore_fsync skips the fsync flush"
+            );
+        }
+        Ok(())
     }
 
     pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
@@ -619,6 +784,7 @@ impl Settings {
             wal: None,
             telemetry: None,
             prometheus: None,
+            replication: None,
         }
     }
 
@@ -663,6 +829,7 @@ impl Settings {
         toml_string.push_str("\n# [filesystem]\n");
         toml_string.push_str("# max_size_gb = 100.0     # Limit filesystem to 100 GB\n");
         toml_string.push_str("# compression = \"zstd-3\"  # or \"lz4\", \"zstd-19\", etc.\n");
+        toml_string.push_str("# ignore_fsync = false    # HA: make fsync a no-op, relying on the standby for durability (see [replication])\n");
 
         toml_string.push_str("\n# Optional LSM tree tuning parameters\n");
         toml_string
@@ -688,6 +855,22 @@ impl Settings {
         toml_string.push_str("\n# [wal]\n");
         toml_string.push_str("# url = \"file:///mnt/nvme/zerofs-wal\"\n");
         toml_string.push_str("# storage_class = \"...\"  # Optional; independent from [storage]. WAL is hot data, normally left on the default.\n");
+
+        toml_string.push_str(
+            "\n# Optional HA replication: a leader + standby pair over one object store, with\n",
+        );
+        toml_string
+            .push_str("# automatic failover. Each node has its OWN config (node_id, role,\n");
+        toml_string.push_str(
+            "# replication_listen, and peers differ per node). See the High Availability docs.\n",
+        );
+        toml_string.push_str("\n# [replication]\n");
+        toml_string.push_str("# node_id = \"node-a\"\n");
+        toml_string.push_str("# role = \"leader\"                       # or \"standby\"\n");
+        toml_string.push_str("# replication_listen = \"10.0.0.1:9000\"  # this node receives ships + heartbeats here\n");
+        toml_string.push_str(
+            "# peers = [\"10.0.0.2:9000\"]             # the other node's replication_listen\n",
+        );
 
         toml_string.push_str("\n# Optional Prometheus metrics endpoint\n");
         toml_string.push_str("# Exposes filesystem, LSM, and cache metrics in Prometheus format\n");
@@ -990,5 +1173,181 @@ allow_http = "true"
         assert!(result.is_ok());
         let settings = result.unwrap();
         assert_eq!(settings.aws.unwrap().0.get("allow_http").unwrap(), "true");
+    }
+
+    fn base_config_with_replication(replication: &str) -> String {
+        format!(
+            r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers]
+
+{replication}
+"#
+        )
+    }
+
+    fn write_and_load(content: &str) -> Result<Settings> {
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), content).unwrap();
+        Settings::from_file(temp_file.path().to_str().unwrap())
+    }
+
+    #[test]
+    fn test_no_replication_is_single_node() {
+        let content = base_config_with_replication("");
+        let settings = write_and_load(&content).unwrap();
+        assert!(settings.replication.is_none());
+    }
+
+    #[test]
+    fn test_replication_defaults_validate() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader""#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        let repl = settings.replication.unwrap();
+        assert_eq!(repl.node_id, "n1");
+        assert_eq!(repl.role, ReplicationRole::Leader);
+    }
+
+    #[test]
+    fn test_replication_standby_role() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n2"
+role = "standby"
+replication_listen = "127.0.0.1:5599""#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        assert_eq!(settings.replication.unwrap().role, ReplicationRole::Standby);
+    }
+
+    #[test]
+    fn test_replication_standby_without_listen_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n2"
+role = "standby""#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("replication_listen"), "got: {err}");
+    }
+
+    #[test]
+    fn test_replication_invalid_listen_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "standby"
+replication_listen = "not-an-address""#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("socket address"), "got: {err}");
+    }
+
+    #[test]
+    fn test_replication_self_peer_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+replication_listen = "127.0.0.1:5599"
+peers = ["127.0.0.1:5599"]"#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("must not replicate to itself"), "got: {err}");
+    }
+
+    #[test]
+    fn test_replication_balanced_pair_validates() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+replication_listen = "127.0.0.1:5599"
+peers = ["127.0.0.1:5600"]"#,
+        );
+        let repl = write_and_load(&content).unwrap().replication.unwrap();
+        assert_eq!(repl.peers, vec!["127.0.0.1:5600".to_string()]);
+    }
+
+    #[test]
+    fn test_replication_bad_role_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "witness""#,
+        );
+        assert!(write_and_load(&content).is_err());
+    }
+
+    #[test]
+    fn test_replication_allows_data_wal_enabled() {
+        // The WAL is permitted under HA: SlateDB fences WAL writes too, so the
+        // fenced manifest is not the only path that contains a deposed leader.
+        let content = base_config_with_replication(
+            r#"[lsm]
+wal_enabled = true
+
+[replication]
+node_id = "n1"
+role = "leader""#,
+        );
+        assert!(write_and_load(&content).is_ok());
+    }
+
+    #[test]
+    fn test_replication_allows_data_wal_disabled() {
+        let content = base_config_with_replication(
+            r#"[lsm]
+wal_enabled = false
+
+[replication]
+node_id = "n1"
+role = "leader""#,
+        );
+        assert!(write_and_load(&content).is_ok());
+    }
+
+    #[test]
+    fn test_replication_empty_node_id_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = ""
+role = "leader""#,
+        );
+        assert!(write_and_load(&content).is_err());
+    }
+
+    #[test]
+    fn test_ignore_fsync_parses() {
+        let content = base_config_with_replication(
+            r#"[filesystem]
+ignore_fsync = true"#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        assert!(settings.filesystem.unwrap().ignore_fsync);
+    }
+
+    #[test]
+    fn test_ignore_fsync_with_sync_writes_rejected() {
+        let content = base_config_with_replication(
+            r#"[filesystem]
+ignore_fsync = true
+
+[lsm]
+sync_writes = true"#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("contradictory"), "got: {err}");
     }
 }

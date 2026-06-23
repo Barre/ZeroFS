@@ -68,6 +68,7 @@ pub struct StatsDelta {
 pub struct Transaction {
     ops: Vec<TxOp>,
     stats_deltas: Vec<StatsDelta>,
+    op_id: crate::dedup::OpId,
 }
 
 impl Transaction {
@@ -75,7 +76,19 @@ impl Transaction {
         Self {
             ops: Vec::new(),
             stats_deltas: Vec::new(),
+            op_id: [0u8; 16],
         }
+    }
+
+    /// Tag with a client idempotency op-id (all-zero = none). The commit worker
+    /// records it in the dedup cache and ships it to the standby atomically with
+    /// the data, so a retry (here or after failover) is recognized as applied.
+    pub fn set_op_id(&mut self, op_id: crate::dedup::OpId) {
+        self.op_id = op_id;
+    }
+
+    pub fn op_id(&self) -> crate::dedup::OpId {
+        self.op_id
     }
 
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
@@ -119,6 +132,27 @@ impl Transaction {
         }
     }
 
+    /// Like [`apply_to`](Self::apply_to) but also returns the ops as `ReplOp`s
+    /// for shipping. In apply order; replaying in seqno-then-op order on the
+    /// standby reproduces the merged batch's last-write-wins result.
+    pub fn apply_to_collecting(self, target: &mut WriteBatch) -> Vec<crate::replication::ReplOp> {
+        use crate::replication::ReplOp;
+        let mut ops = Vec::with_capacity(self.ops.len());
+        for op in self.ops {
+            match op {
+                TxOp::Put(k, v) => {
+                    target.put_bytes(k.clone(), v.clone());
+                    ops.push(ReplOp::Put(k, v));
+                }
+                TxOp::Delete(k) => {
+                    target.delete(k.clone());
+                    ops.push(ReplOp::Delete(k));
+                }
+            }
+        }
+        ops
+    }
+
     pub fn into_inner(self) -> WriteBatch {
         let mut batch = WriteBatch::new();
         self.apply_to(&mut batch);
@@ -139,6 +173,15 @@ impl Default for Transaction {
 pub struct Db {
     inner: SlateDbHandle,
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    /// HA leader lease. `Some` only under replication; reads/writes are refused
+    /// while invalid so a deposed node never serves stale data. `None` (ungated)
+    /// in single-node mode.
+    lease: Option<Arc<crate::replication::Lease>>,
+    /// Data db status, read directly on the gate path (not a lagging watcher) so a
+    /// deposition is seen with no lag: SlateDB closes the db (`CloseReason::Fenced`)
+    /// the instant its manifest poll sees a newer writer, and a closed db must
+    /// reject ops with the "not leader" signal a failover client re-routes on.
+    status: Option<tokio::sync::watch::Receiver<slatedb::DbStatus>>,
 }
 
 impl Db {
@@ -146,9 +189,12 @@ impl Db {
         db: Arc<slatedb::Db>,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Self {
+        let status = Some(db.subscribe());
         Self {
             inner: SlateDbHandle::ReadWrite(db),
             metrics_recorder,
+            lease: None,
+            status,
         }
     }
 
@@ -156,7 +202,50 @@ impl Db {
         Self {
             inner: SlateDbHandle::ReadOnly(db_reader),
             metrics_recorder: None,
+            lease: None,
+            status: None,
         }
+    }
+
+    /// Attach the HA leader lease; reads/writes are then refused while it is
+    /// invalid. Single-node `Db`s have no lease and are never gated.
+    pub fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// Error if a lease is attached and currently invalid.
+    #[inline]
+    fn check_lease(&self) -> Result<()> {
+        if self.is_deposed() {
+            return Err(FsError::LeaderLeaseExpired.into());
+        }
+        Ok(())
+    }
+
+    /// Whether this node may serve as leader right now (always true in single-node
+    /// mode). The 9P layer checks this before dispatch so a deposed leader answers
+    /// with the "not leader" signal a failover client re-routes on, not EIO.
+    #[inline]
+    pub fn lease_is_valid(&self) -> bool {
+        !self.is_deposed()
+    }
+
+    /// True once no longer the serving leader: the lease is invalid, or the data
+    /// db has been closed (fenced by a takeover).
+    #[inline]
+    fn is_deposed(&self) -> bool {
+        if let Some(lease) = &self.lease
+            && !lease.is_valid()
+        {
+            return true;
+        }
+        if let Some(status) = &self.status
+            && status.borrow().close_reason.is_some()
+        {
+            return true;
+        }
+        false
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -164,6 +253,7 @@ impl Db {
     }
 
     pub async fn get_bytes(&self, key: &Bytes) -> Result<Option<Bytes>> {
+        self.check_lease()?;
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
             cache_blocks: true,
@@ -185,6 +275,7 @@ impl Db {
         &self,
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        self.check_lease()?;
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
             read_ahead_bytes: 4 * 1024 * 1024,
@@ -226,6 +317,7 @@ impl Db {
         seek_to: Option<Bytes>,
         read_ahead_bytes: usize,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send>>> {
+        self.check_lease()?;
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
             read_ahead_bytes,
@@ -262,25 +354,25 @@ impl Db {
         )))
     }
 
+    /// Returns the committed batch's SlateDB seqnum, mapped to `durable_seq` to
+    /// advance the standby's prune watermark.
     pub async fn write_with_options(
         &self,
         batch: WriteBatch,
         options: &WriteOptions,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
+        self.check_lease()?;
 
         match &self.inner {
-            SlateDbHandle::ReadWrite(db) => {
-                if let Err(e) = db.write_with_options(batch, options).await {
-                    exit_on_write_error(e);
-                }
-            }
+            SlateDbHandle::ReadWrite(db) => match db.write_with_options(batch, options).await {
+                Ok(handle) => Ok(handle.seqnum()),
+                Err(e) => exit_on_write_error(e),
+            },
             SlateDbHandle::ReadOnly(_) => unreachable!(),
         }
-
-        Ok(())
     }
 
     pub fn new_transaction(&self) -> Result<Transaction, FsError> {
@@ -349,5 +441,57 @@ impl Db {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lease_gate_tests {
+    use super::*;
+    use crate::replication::Lease;
+    use std::time::Duration;
+
+    async fn open_inner() -> Arc<slatedb::Db> {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        Arc::new(
+            slatedb::DbBuilder::new(slatedb::object_store::path::Path::from("data"), store)
+                .build()
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lease_gates_reads_and_writes() {
+        let lease = Lease::new();
+        let db = Db::new(open_inner().await, None).with_lease(lease.clone());
+        let key = Bytes::from_static(b"k");
+
+        // Invalid lease (never renewed): reads are refused.
+        assert!(
+            db.get_bytes(&key).await.is_err(),
+            "read must be refused while the lease is invalid"
+        );
+
+        // Refused by the gate before reaching the db, so no write is attempted.
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(key.clone(), Bytes::from_static(b"v"));
+        assert!(
+            db.write_with_options(batch, &WriteOptions::default())
+                .await
+                .is_err(),
+            "write must be refused while the lease is invalid"
+        );
+
+        // Valid lease: reads serve (the key is absent, so None).
+        lease.renew(Duration::from_millis(500));
+        assert!(db.get_bytes(&key).await.unwrap().is_none());
+
+        // Revoked: refused again.
+        lease.invalidate();
+        assert!(
+            db.get_bytes(&key).await.is_err(),
+            "read must be refused after the lease is revoked"
+        );
     }
 }
