@@ -48,6 +48,7 @@ jobs:
           git clone https://github.com/jepsen-io/local-fs.git /tmp/local-fs
           git -C /tmp/local-fs -c advice.detachedHead=false checkout "$PIN"
           cp jepsen/zerofs.clj /tmp/local-fs/src/jepsen/local_fs/db/zerofs.clj
+          cp jepsen/zerofs-ha.clj /tmp/local-fs/src/jepsen/local_fs/db/zerofs_ha.clj
           git -C /tmp/local-fs apply "$GITHUB_WORKSPACE/jepsen/local-fs.patch"
           cp jepsen/run.sh /tmp/local-fs/run.sh
           chmod +x /tmp/local-fs/run.sh
@@ -74,6 +75,21 @@ jobs:
             --history-scale 8 \
             --quickcheck-tests 20 \
             --time-limit 30
+
+      - name: HA failover consistency (--db zerofs-ha --failover)
+        working-directory: /tmp/local-fs
+        run: |
+          # A leader + standby cluster where the fault fails the leader over to the
+          # standby; the same fs model-checker verifies no write is lost,
+          # resurrected, or botched across the failover. A failover is slow (~20s
+          # incl restart), so use fewer trials and shorter histories.
+          ./run.sh run quickcheck \
+            --db zerofs-ha \
+            --failover \
+            --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --history-scale 20 \
+            --quickcheck-tests 8 \
+            --time-limit 60
 
       - name: Upload jepsen store on failure
         if: failure()

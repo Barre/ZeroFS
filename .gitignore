@@ -5,3 +5,5 @@ bench/bench_workspace
 zerofs.toml
 TODO.md
 __pycache__
+jepsen/ha/store
+jepsen/ha/.lein-failures
