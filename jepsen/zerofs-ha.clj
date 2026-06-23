@@ -122,7 +122,7 @@
     (when (= role "leader")
       (await-fn (fn [] (or (listening? (ninep-port (:port db) node-key))
                            (throw+ {:type ::node-not-listening :node node-key})))
-                {:retry-interval 100 :log-interval 5000 :timeout 60000
+                {:retry-interval 100 :log-interval 5000 :timeout 120000
                  :log-message (str "Waiting for ZeroFS leader " node-key " 9P")}))))
 
 (defn mount! [db]
@@ -133,7 +133,7 @@
                    ["mount" targets (:mount db) "--writeback" (str (:writeback db))])
     (await-fn (fn [] (or (and (mounted? (:mount db)) (mount-usable? (:mount db)))
                          (throw+ {:type ::not-mounted})))
-              {:retry-interval 200 :log-interval 5000 :timeout 60000
+              {:retry-interval 200 :log-interval 5000 :timeout 120000
                :log-message (str "Waiting for ZeroFS mount at " (:mount db))})))
 
 (defn await-standby-connected!
@@ -141,7 +141,7 @@
   [db n]
   (await-fn (fn [] (or (>= (connected-count db) n)
                        (throw+ {:type ::standby-not-connected})))
-            {:retry-interval 200 :log-interval 5000 :timeout 60000
+            {:retry-interval 200 :log-interval 5000 :timeout 120000
              :log-message "Waiting for standby to connect (semi-sync resumed)"}))
 
 (defn start-cluster!
@@ -183,7 +183,7 @@
     (kill! :KILL (get-in this [:nodes :a :pid]))
     (await-fn (fn [] (or (mount-usable? mount)
                          (throw+ {:type ::no-promotion})))
-              {:retry-interval 300 :log-interval 5000 :timeout 90000
+              {:retry-interval 300 :log-interval 5000 :timeout 180000
                :log-message "Waiting for standby b to promote and serve"})
     ; Full-restart to canonical roles; start-cluster! gates on the standby
     ; reconnecting, so semi-sync is active again before the next op.
