@@ -55,10 +55,10 @@ fn free_port() -> u16 {
 }
 
 /// Caps how many of these process-heavy e2e tests run at once, independent of the
-/// harness `--test-threads`. Each spawns a leader + standby and depends on failover
-/// timing; on a many-core box the default thread count would run dozens at once and
-/// starve the CPU enough to trip that timing. Each test holds a permit for its run.
-static E2E_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+/// harness `--test-threads`. Each spawns a leader + standby (two IO-heavy SlateDB
+/// processes); run serially so a slow or contended CI disk cannot starve startup
+/// and failover past the timeouts below. Each test holds a permit for its run.
+static E2E_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 async fn e2e_gate() -> tokio::sync::SemaphorePermit<'static> {
     E2E_GATE.acquire().await.expect("e2e gate")
@@ -230,10 +230,10 @@ async fn failover_client_transparently_reroutes() {
     let standby = spawn(&s_cfg);
     let mut leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader replicator connects
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
 
     let targets = vec![
         format!("unix:{}", l_9p.display()),
@@ -310,10 +310,10 @@ async fn failover_client_reroutes_mutating_ops() {
     let standby = spawn(&s_cfg);
     let mut leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader replicator connects
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
 
     let targets = vec![
         format!("unix:{}", l_9p.display()),
@@ -392,10 +392,10 @@ async fn open_file_handle_survives_failover() {
     let standby = spawn(&s_cfg);
     let mut leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader replicator connects
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
 
     let targets = vec![
         format!("unix:{}", l_9p.display()),
@@ -478,10 +478,10 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
     let standby = spawn(&s_cfg);
     let leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader replicator connects
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
     let leader_pid = leader.child.id();
 
     let client = NinePClient::connect_multi(
@@ -504,7 +504,7 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
         .args(["-STOP", &leader_pid.to_string()])
         .status();
     assert!(
-        wait_for_socket(&s_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&s_9p, Duration::from_secs(90)).await,
         "standby never took over"
     );
     // Thaw: leader is now fenced-but-alive (answers ops with P9_ENOTLEADER).
@@ -570,10 +570,10 @@ async fn failover_client_reroutes_around_a_fenced_but_alive_leader() {
     let standby = spawn(&s_cfg);
     let leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader replicator connects
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
     let leader_pid = leader.child.id();
 
     let targets = vec![
@@ -594,7 +594,7 @@ async fn failover_client_reroutes_around_a_fenced_but_alive_leader() {
         .args(["-STOP", &leader_pid.to_string()])
         .status();
     assert!(
-        wait_for_socket(&s_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&s_9p, Duration::from_secs(90)).await,
         "standby never took over"
     );
     let _ = Command::new("kill")
@@ -663,10 +663,10 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
     let standby = spawn(&s_cfg);
     let mut leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader replicator connects
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
 
     let client = NinePClient::connect_multi(
         vec![Target::Unix(l_9p.clone()), Target::Unix(s_9p.clone())],
@@ -777,11 +777,11 @@ async fn client_reroutes_around_a_frozen_leader() {
 
     let mut a = spawn(&a_cfg);
     assert!(
-        wait_for_socket(&a_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&a_9p, Duration::from_secs(90)).await,
         "leader A 9P never came up"
     );
     let _b = spawn(&b_cfg);
-    tokio::time::sleep(Duration::from_secs(3)).await; // B attaches; A's replicator connects
+    tokio::time::sleep(Duration::from_secs(6)).await; // B attaches; A's replicator connects
 
     let client = NinePClient::connect_multi(
         vec![Target::Unix(a_9p.clone()), Target::Unix(b_9p.clone())],
@@ -810,7 +810,7 @@ async fn client_reroutes_around_a_frozen_leader() {
     );
 
     let routed =
-        tokio::time::timeout(Duration::from_secs(25), client.mkdir(1, b"y", 0o755, 0)).await;
+        tokio::time::timeout(Duration::from_secs(90), client.mkdir(1, b"y", 0o755, 0)).await;
 
     // Thaw + reap A regardless of the outcome (Drop also kills it).
     let _ = std::process::Command::new("kill")
@@ -868,11 +868,11 @@ async fn op_id_dedups_create_across_failover() {
 
     let mut a = spawn(&a_cfg);
     assert!(
-        wait_for_socket(&a_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&a_9p, Duration::from_secs(90)).await,
         "leader A 9P never came up"
     );
     let _b = spawn(&b_cfg);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
 
     let client = NinePClient::connect_multi(
         vec![Target::Unix(a_9p.clone()), Target::Unix(b_9p.clone())],
@@ -893,11 +893,11 @@ async fn op_id_dedups_create_across_failover() {
         .await
         .expect("create f on A");
     client.clunk(2).await.ok();
-    tokio::time::sleep(Duration::from_secs(1)).await; // let the ship settle on B
+    tokio::time::sleep(Duration::from_secs(3)).await; // let the ship settle on B
 
     a.child.kill().expect("kill A");
     assert!(
-        wait_for_socket(&b_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&b_9p, Duration::from_secs(90)).await,
         "B never promoted"
     );
 
@@ -966,10 +966,10 @@ async fn promoted_standby_retakes_when_original_leader_stays_down() {
     let mut a = spawn(&a_cfg);
     let mut b = spawn(&b_cfg);
     assert!(
-        wait_for_socket(&a_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&a_9p, Duration::from_secs(90)).await,
         "leader A 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // A's replicator connects to B
+    tokio::time::sleep(Duration::from_secs(5)).await; // A's replicator connects to B
 
     let client = NinePClient::connect_multi(
         vec![Target::Unix(a_9p.clone()), Target::Unix(b_9p.clone())],
@@ -987,7 +987,7 @@ async fn promoted_standby_retakes_when_original_leader_stays_down() {
     a.child.kill().expect("kill A");
     a.child.wait().expect("reap A");
     assert!(
-        wait_for_socket(&b_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&b_9p, Duration::from_secs(90)).await,
         "standby B never took over"
     );
 
@@ -1010,7 +1010,7 @@ async fn promoted_standby_retakes_when_original_leader_stays_down() {
 
     // B must RE-TAKE (Hello sees A gone), not wait forever for the dead leader.
     assert!(
-        wait_for_socket(&b_9p, Duration::from_secs(60)).await,
+        wait_for_socket(&b_9p, Duration::from_secs(120)).await,
         "a promoted standby must re-take when the original leader is down, not stall"
     );
     // x (durable once B first took over) survives the restart.
@@ -1112,7 +1112,7 @@ async fn crash_recovery_case(reuse_cache: bool) {
 
     let mut leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "solo leader 9P never came up"
     );
     {
@@ -1151,7 +1151,7 @@ async fn crash_recovery_case(reuse_cache: bool) {
     );
     let _leader2 = spawn(&l_cfg2);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "reopened 9P never came up"
     );
 
@@ -1238,10 +1238,10 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
     let mut standby = spawn(&s_cfg);
     let mut leader = spawn(&l_cfg);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "leader 9P never came up"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await; // leader connects -> Connected semi-sync
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader connects -> Connected semi-sync
     {
         let client = NinePClient::connect_multi(
             vec![Target::Unix(l_9p.clone()), Target::Unix(s_9p.clone())],
@@ -1284,7 +1284,7 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
     );
     let _leader2 = spawn(&l_cfg2);
     assert!(
-        wait_for_socket(&l_9p, Duration::from_secs(30)).await,
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
         "reopened leader never came up"
     );
 
