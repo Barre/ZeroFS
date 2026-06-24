@@ -1,8 +1,11 @@
-# Example StorageClass for the zerofs gateway deployed by
-# gateway-example.yaml. One StorageClass per gateway.
+# Example StorageClass for the gateway pair deployed by gateway-example.yaml.
+# The gateway and adminEndpoint parameters carry BOTH node addresses,
+# comma-separated. The data-plane 9P client probes them and follows the serving
+# leader (re-routing on failover); the controller tries each admin endpoint and
+# provisions against whichever node leads. Order does not matter.
 #
-# DeleteVolume receives no StorageClass parameters (CSI spec), so the
-# adminEndpoint must also live in a Secret referenced via
+# DeleteVolume receives no StorageClass parameters (CSI spec), so adminEndpoint
+# must also live in a Secret referenced via
 # csi.storage.k8s.io/provisioner-secret-name.
 apiVersion: v1
 kind: Secret
@@ -10,7 +13,7 @@ metadata:
   name: zerofs-csi-admin
   namespace: zerofs
 stringData:
-  adminEndpoint: http://zerofs-gateway.zerofs.svc:7000
+  adminEndpoint: http://zerofs-gateway-a.zerofs.svc:7000,http://zerofs-gateway-b.zerofs.svc:7000
   # Only needed when it differs from the default /volumes.
   # volumesRoot: /volumes
 ---
@@ -20,10 +23,11 @@ metadata:
   name: zerofs
 provisioner: csi.zerofs.net
 parameters:
-  # Gateway admin RPC, used by CreateVolume.
-  adminEndpoint: http://zerofs-gateway.zerofs.svc:7000
-  # 9P address nodes mount from.
-  gateway: zerofs-gateway.zerofs.svc:5564
+  # Both gateway admin RPCs, used by CreateVolume. The controller uses the one
+  # that answers as the leader.
+  adminEndpoint: http://zerofs-gateway-a.zerofs.svc:7000,http://zerofs-gateway-b.zerofs.svc:7000
+  # Both 9P addresses nodes mount from. The mount follows the serving leader.
+  gateway: zerofs-gateway-a.zerofs.svc:5564,zerofs-gateway-b.zerofs.svc:5564
   # Directory on the gateway filesystem holding the volume directories.
   volumesRoot: /volumes
   csi.storage.k8s.io/provisioner-secret-name: zerofs-csi-admin

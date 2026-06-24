@@ -240,12 +240,42 @@ fn is_fuse_mount(target: &Path) -> std::io::Result<bool> {
     Ok(mount_fstype(target)?.is_some_and(|ft| ft.starts_with("fuse")))
 }
 
-/// Whether the gateway's 9P endpoint accepts a connection within
-/// [`GATEWAY_PROBE_TIMEOUT`]. The connect is cancellable async I/O, so a dead
-/// gateway fails (or times out) here without parking a blocking thread the way
-/// probing a wedged mount with statfs would. Address parsing mirrors
-/// `zerofs mount`'s own.
+/// Whether the gateway is reachable within [`GATEWAY_PROBE_TIMEOUT`]. `gateway`
+/// may be an HA node set (comma-separated): the standby is not listening before
+/// it takes over, so the serving leader being up is enough — the segments are
+/// probed concurrently and the first to connect wins. The connect is
+/// cancellable async I/O, so a dead gateway fails (or times out) here without
+/// parking a blocking thread the way probing a wedged mount with statfs would.
 async fn gateway_reachable(gateway: &str) -> bool {
+    let segments: Vec<String> = crate::targets::split(gateway)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if segments.is_empty() {
+        return false;
+    }
+    let probe = async move {
+        let mut set = tokio::task::JoinSet::new();
+        for seg in segments {
+            set.spawn(async move { segment_reachable(&seg).await });
+        }
+        while let Some(res) = set.join_next().await {
+            if matches!(res, Ok(true)) {
+                return true;
+            }
+        }
+        false
+    };
+    matches!(
+        tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, probe).await,
+        Ok(true)
+    )
+}
+
+/// Whether one 9P address accepts a connection. No timeout of its own;
+/// [`gateway_reachable`] bounds the whole probe. Address parsing mirrors
+/// `zerofs mount`'s own.
+async fn segment_reachable(gateway: &str) -> bool {
     let connect = async {
         if let Some(rest) = gateway.strip_prefix("unix:") {
             let path = rest.strip_prefix("//").unwrap_or(rest);
@@ -262,10 +292,7 @@ async fn gateway_reachable(gateway: &str) -> bool {
         };
         tokio::net::TcpStream::connect(with_port).await.map(drop)
     };
-    matches!(
-        tokio::time::timeout(GATEWAY_PROBE_TIMEOUT, connect).await,
-        Ok(Ok(()))
-    )
+    connect.await.is_ok()
 }
 
 /// Classify a publish target without issuing a syscall that can hang on a
@@ -760,5 +787,31 @@ impl Node for NodeService {
         _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
         Err(Status::unimplemented("NodeExpandVolume"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn gateway_reachable_handles_ha_lists() {
+        // A live listener stands in for the serving leader; a freed port for a
+        // down standby (connecting refuses immediately).
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+
+        assert!(gateway_reachable(&live_addr.to_string()).await);
+        assert!(!gateway_reachable(&dead_addr.to_string()).await);
+        // An HA pair is reachable as long as one node (the leader) answers,
+        // in either order.
+        assert!(gateway_reachable(&format!("{live_addr},{dead_addr}")).await);
+        assert!(gateway_reachable(&format!("{dead_addr},{live_addr}")).await);
+        // Both down, or no address at all, is unreachable.
+        assert!(!gateway_reachable(&format!("{dead_addr},{dead_addr}")).await);
+        assert!(!gateway_reachable("").await);
     }
 }

@@ -1,26 +1,31 @@
-# e2e variant of deploy/gateway-example.yaml: same names, labels and ports,
-# so deploy/storageclass-example.yaml applies verbatim. Differences: file://
-# storage on a hostPath (no S3; the data survives gateway pod recreation on
-# the single-node test cluster, which the restart test depends on) and the
-# locally imported image.
+# e2e variant of deploy/gateway-example.yaml: same names, labels and ports, so
+# deploy/storageclass-example.yaml applies verbatim. Differences from the deploy
+# manifest:
+#   - file:// storage on a hostPath shared by both nodes (no S3). The two nodes
+#     replicate over ONE store; on a single-node test cluster both pods mount
+#     the same hostPath, and the data survives a leader pod deletion (which the
+#     failover test depends on).
+#   - cache is a per-pod emptyDir (the store is shared, the cache must not be).
+#   - the locally imported image.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: zerofs
 ---
+# ----- node A (config role: leader) -----
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: zerofs-gateway-config
+  name: zerofs-gateway-a-config
   namespace: zerofs
 data:
   zerofs.toml: |
     [cache]
-    dir = "/data/cache"
+    dir = "/cache"
     disk_size_gb = 1.0
 
     [storage]
-    url = "file:///data/db"
+    url = "file:///store/db"
     encryption_password = "zerofs-e2e-password"
 
     [lsm]
@@ -34,38 +39,49 @@ data:
     [servers.rpc]
     addresses = ["0.0.0.0:7000"]
 
+    [replication]
+    node_id = "node-a"
+    role = "leader"
+    replication_listen = "0.0.0.0:9000"
+    peers = ["zerofs-gateway-b.zerofs.svc:9000"]
+
     [telemetry]
     enabled = false
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: zerofs-gateway
+  name: zerofs-gateway-a
   namespace: zerofs
 spec:
   selector:
     app: zerofs-gateway
+    node: node-a
   ports:
     - name: ninep
       port: 5564
     - name: admin
       port: 7000
+    - name: repl
+      port: 9000
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: zerofs-gateway
+  name: zerofs-gateway-a
   namespace: zerofs
 spec:
-  serviceName: zerofs-gateway
+  serviceName: zerofs-gateway-a
   replicas: 1
   selector:
     matchLabels:
       app: zerofs-gateway
+      node: node-a
   template:
     metadata:
       labels:
         app: zerofs-gateway
+        node: node-a
     spec:
       containers:
         - name: zerofs
@@ -77,23 +93,136 @@ spec:
               containerPort: 5564
             - name: admin
               containerPort: 7000
-          # Ready only when 9P actually accepts connections, so rollout status
-          # and the Service track a serving gateway, not a starting container.
+            - name: repl
+              containerPort: 9000
+          # Ready when the replication port accepts, which both roles bind early
+          # (the standby binds 9P only after it takes over). Gating on 9P would
+          # drop the standby from its Service and cut off the leader's ships.
           readinessProbe:
             tcpSocket:
-              port: ninep
+              port: repl
             periodSeconds: 2
             timeoutSeconds: 1
           volumeMounts:
             - name: config
               mountPath: /etc/zerofs
-            - name: data
-              mountPath: /data
+            - name: store
+              mountPath: /store
+            - name: cache
+              mountPath: /cache
       volumes:
         - name: config
           configMap:
-            name: zerofs-gateway-config
-        - name: data
+            name: zerofs-gateway-a-config
+        - name: store
           hostPath:
-            path: /var/lib/zerofs-e2e
+            path: /var/lib/zerofs-e2e-ha
             type: DirectoryOrCreate
+        - name: cache
+          emptyDir: {}
+---
+# ----- node B (config role: standby) -----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zerofs-gateway-b-config
+  namespace: zerofs
+data:
+  zerofs.toml: |
+    [cache]
+    dir = "/cache"
+    disk_size_gb = 1.0
+
+    [storage]
+    url = "file:///store/db"
+    encryption_password = "zerofs-e2e-password"
+
+    [lsm]
+    max_unflushed_gb = 0.1
+
+    [servers]
+
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+
+    [replication]
+    node_id = "node-b"
+    role = "standby"
+    replication_listen = "0.0.0.0:9000"
+    peers = ["zerofs-gateway-a.zerofs.svc:9000"]
+
+    [telemetry]
+    enabled = false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-gateway-b
+  namespace: zerofs
+spec:
+  selector:
+    app: zerofs-gateway
+    node: node-b
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+    - name: repl
+      port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-gateway-b
+  namespace: zerofs
+spec:
+  serviceName: zerofs-gateway-b
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-gateway
+      node: node-b
+  template:
+    metadata:
+      labels:
+        app: zerofs-gateway
+        node: node-b
+    spec:
+      containers:
+        - name: zerofs
+          image: docker.io/library/zerofs:e2e
+          imagePullPolicy: Never
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+            - name: repl
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: repl
+            periodSeconds: 2
+            timeoutSeconds: 1
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: store
+              mountPath: /store
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: config
+          configMap:
+            name: zerofs-gateway-b-config
+        - name: store
+          hostPath:
+            path: /var/lib/zerofs-e2e-ha
+            type: DirectoryOrCreate
+        - name: cache
+          emptyDir: {}

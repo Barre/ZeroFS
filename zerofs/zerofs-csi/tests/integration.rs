@@ -150,16 +150,16 @@ enabled = false
     server
 }
 
-/// Serve the real CSI services on a unix socket inside the server's temp dir
-/// and return connected gRPC clients.
+/// Serve the real CSI services on a unix socket inside `dir` and return
+/// connected gRPC clients.
 async fn start_csi(
-    server: &TestServer,
+    dir: &Path,
 ) -> (
     IdentityClient<Channel>,
     ControllerClient<Channel>,
     NodeClient<Channel>,
 ) {
-    let csi_sock = server.dir.path().join("csi.sock");
+    let csi_sock = dir.join("csi.sock");
     let endpoint = format!("unix://{}", csi_sock.display());
     let identity = IdentityService::new(true);
     let controller = ControllerService::new();
@@ -281,7 +281,7 @@ async fn attach_aname(
 #[tokio::test(flavor = "multi_thread")]
 async fn create_and_delete_volume_against_real_gateway() {
     let server = start_zerofs_server().await;
-    let (mut identity, mut controller, _node) = start_csi(&server).await;
+    let (mut identity, mut controller, _node) = start_csi(server.dir.path()).await;
 
     // Identity sanity.
     let info = identity
@@ -455,7 +455,7 @@ async fn node_publish_and_unpublish_fuse_mount() {
     }
 
     let server = start_zerofs_server().await;
-    let (_identity, mut controller, mut node) = start_csi(&server).await;
+    let (_identity, mut controller, mut node) = start_csi(server.dir.path()).await;
 
     controller
         .create_volume(create_request(&server, "pvc-fuse"))
@@ -571,7 +571,7 @@ async fn stats_and_republish_fail_fast_when_gateway_unreachable() {
     }
 
     let mut server = start_zerofs_server().await;
-    let (_identity, mut controller, mut node) = start_csi(&server).await;
+    let (_identity, mut controller, mut node) = start_csi(server.dir.path()).await;
 
     controller
         .create_volume(create_request(&server, "pvc-wedge"))
@@ -645,4 +645,382 @@ async fn stats_and_republish_fail_fast_when_gateway_unreachable() {
     .await
     .unwrap();
     assert!(!target.exists());
+}
+
+// HA (leader/standby) end-to-end: a real leader + standby pair over ONE
+// file:// store, with the CSI driver pointed at BOTH nodes (comma-separated
+// gateway / adminEndpoint). Proves the control plane reaches whichever node
+// leads and the data-plane mount follows the leader across a failover. These
+// spawn two processes and depend on failover timing, so they are #[ignore]'d
+// like the core failover_e2e suite and run explicitly with --ignored.
+
+/// Reserve a currently-free localhost TCP port for the replication endpoint.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ha_config(
+    path: &Path,
+    data_dir: &Path,
+    cache_dir: &Path,
+    node_id: &str,
+    role: &str,
+    ninep_sock: &Path,
+    rpc_sock: &Path,
+    peers: Option<&str>,
+    replication_listen: Option<&str>,
+) {
+    let peers_line = match peers {
+        Some(p) => format!("peers = [\"{p}\"]\n"),
+        None => String::new(),
+    };
+    let listen_line = match replication_listen {
+        Some(l) => format!("replication_listen = \"{l}\"\n"),
+        None => String::new(),
+    };
+    let cfg = format!(
+        r#"
+[cache]
+dir = "{cache}"
+disk_size_gb = 1.0
+
+[storage]
+url = "file://{data}"
+encryption_password = "csi-ha-integration-test"
+
+[servers]
+
+[servers.ninep]
+unix_socket = "{ninep}"
+
+[servers.rpc]
+unix_socket = "{rpc}"
+
+[replication]
+node_id = "{node_id}"
+role = "{role}"
+{peers_line}{listen_line}
+[telemetry]
+enabled = false
+"#,
+        cache = cache_dir.display(),
+        data = data_dir.display(),
+        ninep = ninep_sock.display(),
+        rpc = rpc_sock.display(),
+    );
+    std::fs::write(path, cfg).unwrap();
+}
+
+fn spawn_node(config_path: &Path) -> Child {
+    // Silence the spawned servers by default (their stderr bypasses cargo's
+    // capture and SlateDB logs expected fencing errors on failover). Set
+    // ZEROFS_TEST_LOG to a RUST_LOG filter to surface them for debugging.
+    let log = std::env::var("ZEROFS_TEST_LOG").ok();
+    Command::new(zerofs_binary())
+        .args(["run", "-c"])
+        .arg(config_path)
+        .env("RUST_LOG", log.as_deref().unwrap_or("off"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if log.is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .spawn()
+        .expect("failed to spawn zerofs run")
+}
+
+async fn wait_for_unix_socket(sock: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if tokio::net::UnixStream::connect(sock).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// A real leader + standby pair over one file:// store. The leader ships to the
+/// standby's replication endpoint; the standby serves 9P/admin only after it
+/// takes over (so its unix sockets appear on failover). Both child processes
+/// are killed on drop.
+struct HaPair {
+    dir: tempfile::TempDir,
+    leader: Option<Child>,
+    standby: Child,
+    l_9p: PathBuf,
+    l_rpc: PathBuf,
+    s_9p: PathBuf,
+    s_rpc: PathBuf,
+}
+
+impl Drop for HaPair {
+    fn drop(&mut self) {
+        if let Some(mut l) = self.leader.take() {
+            let _ = l.kill();
+            let _ = l.wait();
+        }
+        let _ = self.standby.kill();
+        let _ = self.standby.wait();
+    }
+}
+
+impl HaPair {
+    async fn start() -> HaPair {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let l_9p = dir.path().join("leader-9p.sock");
+        let l_rpc = dir.path().join("leader-rpc.sock");
+        let s_9p = dir.path().join("standby-9p.sock");
+        let s_rpc = dir.path().join("standby-rpc.sock");
+        let l_cfg = dir.path().join("leader.toml");
+        let s_cfg = dir.path().join("standby.toml");
+
+        // Leader ships to the standby's replication endpoint; standby receives
+        // there. Asymmetric (matching failover_e2e) is enough for one failover.
+        let standby_repl = format!("127.0.0.1:{}", free_port());
+        write_ha_config(
+            &l_cfg,
+            &data_dir,
+            &dir.path().join("cache-l"),
+            "node-leader",
+            "leader",
+            &l_9p,
+            &l_rpc,
+            Some(&standby_repl),
+            None,
+        );
+        write_ha_config(
+            &s_cfg,
+            &data_dir,
+            &dir.path().join("cache-s"),
+            "node-standby",
+            "standby",
+            &s_9p,
+            &s_rpc,
+            None,
+            Some(&standby_repl),
+        );
+
+        // Standby first so the leader's Hello finds it and shipping connects.
+        let standby = spawn_node(&s_cfg);
+        let leader = spawn_node(&l_cfg);
+        assert!(
+            wait_for_unix_socket(&l_9p, Duration::from_secs(90)).await,
+            "leader 9P never came up"
+        );
+        // Let the leader's replicator connect and the standby begin watching
+        // heartbeats before any test kills the leader.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        HaPair {
+            dir,
+            leader: Some(leader),
+            standby,
+            l_9p,
+            l_rpc,
+            s_9p,
+            s_rpc,
+        }
+    }
+
+    /// Both nodes' 9P addresses, the comma-separated form the node service and
+    /// `zerofs mount` accept.
+    fn gateways(&self) -> String {
+        format!("unix:{},unix:{}", self.l_9p.display(), self.s_9p.display())
+    }
+
+    /// Both nodes' admin endpoints, comma-separated for the controller.
+    fn admin_endpoints(&self) -> String {
+        format!(
+            "unix://{},unix://{}",
+            self.l_rpc.display(),
+            self.s_rpc.display()
+        )
+    }
+
+    fn kill_leader(&mut self) {
+        if let Some(mut l) = self.leader.take() {
+            l.kill().expect("kill leader");
+            l.wait().expect("reap leader");
+        }
+    }
+
+    /// Wait for the standby to take over: it binds its 9P (and admin) sockets
+    /// only once promoted.
+    async fn await_takeover(&self) {
+        assert!(
+            wait_for_unix_socket(&self.s_9p, Duration::from_secs(60)).await,
+            "standby never took over (9P socket never came up)"
+        );
+    }
+
+    fn create_request(&self, name: &str) -> CreateVolumeRequest {
+        CreateVolumeRequest {
+            name: name.to_string(),
+            volume_capabilities: vec![mount_capability(
+                volume_capability::access_mode::Mode::SingleNodeWriter,
+            )],
+            parameters: HashMap::from([
+                ("adminEndpoint".to_string(), self.admin_endpoints()),
+                ("gateway".to_string(), self.gateways()),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    fn delete_request(&self, volume_id: &str) -> DeleteVolumeRequest {
+        DeleteVolumeRequest {
+            volume_id: volume_id.to_string(),
+            secrets: HashMap::from([("adminEndpoint".to_string(), self.admin_endpoints())]),
+        }
+    }
+}
+
+/// The controller provisions against whichever node leads: create against the
+/// leader, then after a failover create+delete must reach the promoted standby
+/// (the dead leader's admin endpoint is skipped). Exercises the admin
+/// multi-endpoint selection and the connect_multi existence probe; no FUSE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-process HA e2e: spawns two nodes and depends on failover timing; run with --ignored"]
+async fn ha_controller_provisions_against_the_leader_across_failover() {
+    let mut ha = HaPair::start().await;
+    let (_identity, mut controller, _node) = start_csi(ha.dir.path()).await;
+
+    // Create against the pair: the admin call reaches the leader.
+    controller
+        .create_volume(ha.create_request("pvc-ha"))
+        .await
+        .unwrap();
+
+    // The existence probe follows the leader via connect_multi.
+    let confirmed = controller
+        .validate_volume_capabilities(ValidateVolumeCapabilitiesRequest {
+            volume_id: "pvc-ha".to_string(),
+            volume_capabilities: vec![mount_capability(
+                volume_capability::access_mode::Mode::SingleNodeWriter,
+            )],
+            volume_context: HashMap::from([("gateway".to_string(), ha.gateways())]),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(confirmed.confirmed.is_some());
+
+    // Fail the leader over; the standby promotes and starts serving admin/9P.
+    ha.kill_leader();
+    ha.await_takeover().await;
+    assert!(
+        wait_for_unix_socket(&ha.s_rpc, Duration::from_secs(60)).await,
+        "promoted node never opened its admin RPC"
+    );
+
+    // The controller skips the dead leader's admin endpoint and provisions
+    // against the promoted standby, for both create and delete.
+    controller
+        .create_volume(ha.create_request("pvc-ha-after"))
+        .await
+        .unwrap();
+    controller
+        .delete_volume(ha.delete_request("pvc-ha"))
+        .await
+        .unwrap();
+}
+
+/// A published FUSE mount points at both nodes and survives a leader failover
+/// with no remount: the file written (and fsync'd) before the failover is
+/// served by the promoted standby, and NodeGetVolumeStats sees the standby as
+/// the reachable gateway. Exercises the multi-target mount and gateway probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-process HA e2e: spawns two nodes and depends on failover timing; run with --ignored"]
+async fn ha_published_mount_survives_failover() {
+    if !fuse_available() {
+        eprintln!("skipping: /dev/fuse or fusermount not available");
+        return;
+    }
+
+    let mut ha = HaPair::start().await;
+    let (_identity, mut controller, mut node) = start_csi(ha.dir.path()).await;
+
+    controller
+        .create_volume(ha.create_request("pvc-ha-fuse"))
+        .await
+        .unwrap();
+
+    let target = ha.dir.path().join("publish/ha");
+    let publish_request = NodePublishVolumeRequest {
+        volume_id: "pvc-ha-fuse".to_string(),
+        target_path: target.display().to_string(),
+        volume_capability: Some(mount_capability(
+            volume_capability::access_mode::Mode::SingleNodeWriter,
+        )),
+        volume_context: HashMap::from([("gateway".to_string(), ha.gateways())]),
+        ..Default::default()
+    };
+    node.node_publish_volume(publish_request).await.unwrap();
+
+    // Write and fsync through the mount so the payload is durable on the shared
+    // store before the failover.
+    tokio::task::block_in_place(|| {
+        use std::io::Write;
+        let mut f = std::fs::File::create(target.join("ha.txt")).unwrap();
+        f.write_all(b"survives failover").unwrap();
+        f.sync_all().unwrap();
+    });
+
+    // Fail the leader over. The mount's 9P client re-probes both targets and
+    // follows the promoted standby; the read blocks through the gap and then
+    // returns the committed payload.
+    ha.kill_leader();
+    ha.await_takeover().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut recovered = None;
+    while std::time::Instant::now() < deadline {
+        match tokio::task::block_in_place(|| std::fs::read(target.join("ha.txt"))) {
+            Ok(data) => {
+                recovered = Some(data);
+                break;
+            }
+            // The mount is mid-reconnect: retry until it follows the new leader.
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    assert_eq!(
+        recovered.as_deref(),
+        Some(&b"survives failover"[..]),
+        "the pre-failover write must be served by the promoted standby"
+    );
+
+    // Stats: the tracked gateway list now has the standby reachable, so the
+    // probe passes and statfs answers (proves multi-target gateway_reachable).
+    let stats = node
+        .node_get_volume_stats(NodeGetVolumeStatsRequest {
+            volume_id: "pvc-ha-fuse".to_string(),
+            volume_path: target.display().to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stats.usage.is_empty());
+
+    node.node_unpublish_volume(NodeUnpublishVolumeRequest {
+        volume_id: "pvc-ha-fuse".to_string(),
+        target_path: target.display().to_string(),
+    })
+    .await
+    .unwrap();
+    controller
+        .delete_volume(ha.delete_request("pvc-ha-fuse"))
+        .await
+        .unwrap();
 }

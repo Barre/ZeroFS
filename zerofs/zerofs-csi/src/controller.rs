@@ -103,36 +103,151 @@ fn validate_volume_id(volume_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Connect to the gateway admin endpoint, mapping connection failures to
-/// UNAVAILABLE so the CO retries.
-async fn connect_admin(endpoint: &str) -> Result<AdminClient, Status> {
-    AdminClient::connect(endpoint)
-        .await
-        .map_err(|e| Status::unavailable(format!("{:#}", e)))
+/// Whether an admin RPC failure from one endpoint means "not the leader / not
+/// reachable" and we should try the next endpoint, rather than surface it. A
+/// fresh standby is not listening (connect refused, surfaced before the op); a
+/// deposed-but-alive old leader returns its `LeaderLeaseExpired` as `Internal`.
+/// An authoritative status (the leader rejecting the request on its merits,
+/// e.g. a non-directory in the way) is returned as-is.
+fn admin_error_is_retriable(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable
+            | Code::Internal
+            | Code::Unknown
+            | Code::DeadlineExceeded
+            | Code::Cancelled
+    )
+}
+
+/// `adminEndpoint` may be a comma-separated HA node set. Only the leader can
+/// write, so create the directory against the first endpoint that answers as
+/// the leader: connect failures and not-leader/opaque errors fall through to
+/// the next endpoint (CreateDirectory is idempotent and a non-leader never
+/// applies it, so retrying is safe); an authoritative status returns
+/// immediately. If no endpoint serves (both down, or a failover gap) the last
+/// error is returned as UNAVAILABLE so the CO retries.
+async fn create_dir_on_leader(
+    endpoints: &str,
+    path: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<bool, Status> {
+    let segments = crate::targets::split(endpoints);
+    if segments.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "empty {}",
+            PARAM_ADMIN_ENDPOINT
+        )));
+    }
+    let mut last = None;
+    for ep in segments {
+        let client = match AdminClient::connect(ep).await {
+            Ok(c) => c,
+            Err(e) => {
+                last = Some(Status::unavailable(format!("admin {}: {:#}", ep, e)));
+                continue;
+            }
+        };
+        match client.create_directory(path, mode, uid, gid).await {
+            Ok(created) => return Ok(created),
+            Err(s) if admin_error_is_retriable(s.code()) => {
+                last = Some(Status::unavailable(format!(
+                    "admin {}: {}",
+                    ep,
+                    s.message()
+                )));
+            }
+            // A non-directory in the way: same name, incompatible volume.
+            Err(s) if s.code() == Code::FailedPrecondition => {
+                return Err(Status::already_exists(format!(
+                    "CreateDirectory {}: {}",
+                    path,
+                    s.message()
+                )));
+            }
+            Err(s) if s.code() == Code::InvalidArgument => {
+                return Err(Status::invalid_argument(format!(
+                    "CreateDirectory {}: {}",
+                    path,
+                    s.message()
+                )));
+            }
+            Err(s) => {
+                return Err(Status::internal(format!(
+                    "CreateDirectory {}: {}",
+                    path,
+                    s.message()
+                )));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        Status::unavailable(format!("no admin endpoint among {} answered", endpoints))
+    }))
+}
+
+/// Remove the directory against the leader among the comma-separated
+/// `adminEndpoint` set. Idempotent on the gateway side, so the same
+/// fall-through-on-transport-error rule as [`create_dir_on_leader`] applies.
+async fn remove_dir_on_leader(endpoints: &str, path: &str) -> Result<(), Status> {
+    let segments = crate::targets::split(endpoints);
+    if segments.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "empty {}",
+            PARAM_ADMIN_ENDPOINT
+        )));
+    }
+    let mut last = None;
+    for ep in segments {
+        let client = match AdminClient::connect(ep).await {
+            Ok(c) => c,
+            Err(e) => {
+                last = Some(Status::unavailable(format!("admin {}: {:#}", ep, e)));
+                continue;
+            }
+        };
+        match client.remove_directory(path).await {
+            Ok(()) => return Ok(()),
+            Err(s) if admin_error_is_retriable(s.code()) => {
+                last = Some(Status::unavailable(format!(
+                    "admin {}: {}",
+                    ep,
+                    s.message()
+                )));
+            }
+            Err(s) => {
+                return Err(Status::internal(format!(
+                    "RemoveDirectory {}: {}",
+                    path,
+                    s.message()
+                )));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        Status::unavailable(format!("no admin endpoint among {} answered", endpoints))
+    }))
 }
 
 /// Check whether a volume directory exists on the gateway by performing a 9P
 /// attach with the volume's aname — the same operation nodes perform to mount
-/// it, and side-effect free. ENOENT/ENOTDIR mean the volume does not exist;
-/// connect failures and timeouts map to UNAVAILABLE so the CO retries (the 9P
-/// client blocks requests while reconnecting, hence the timeout).
+/// it, and side-effect free. `gateway` may be an HA node set: `connect_multi`
+/// probes the targets and follows the serving leader. ENOENT/ENOTDIR mean the
+/// volume does not exist; connect failures and timeouts map to UNAVAILABLE so
+/// the CO retries (the 9P client blocks requests while reconnecting, hence the
+/// timeout).
 async fn volume_exists_on_gateway(gateway: &str, aname: &str) -> Result<bool, Status> {
     const MSIZE: u32 = 64 * 1024;
     const ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let client = if let Some(path) = gateway.strip_prefix("unix:") {
-        ninep_client::NinePClient::connect_unix(path, MSIZE).await
-    } else {
-        let addr = tokio::net::lookup_host(gateway)
-            .await
-            .map_err(|e| Status::unavailable(format!("resolving gateway {}: {}", gateway, e)))?
-            .next()
-            .ok_or_else(|| {
-                Status::unavailable(format!("gateway {} resolved to no addresses", gateway))
-            })?;
-        ninep_client::NinePClient::connect_tcp(addr, MSIZE).await
-    }
-    .map_err(|e| Status::unavailable(format!("connecting to gateway {}: {}", gateway, e)))?;
+    let targets = crate::targets::parse_9p_targets(gateway)
+        .await
+        .map_err(|e| Status::unavailable(format!("gateway {}: {}", gateway, e)))?;
+    let client = ninep_client::NinePClient::connect_multi(targets, MSIZE)
+        .await
+        .map_err(|e| Status::unavailable(format!("connecting to gateway {}: {}", gateway, e)))?;
 
     let attach = client.attach(0, ninep_client::NOFID, "root", aname, 0);
     match tokio::time::timeout(ATTACH_TIMEOUT, attach).await {
@@ -196,22 +311,9 @@ impl Controller for ControllerService {
         let volumes_root = lookup(PARAM_VOLUMES_ROOT).unwrap_or(crate::DEFAULT_VOLUMES_ROOT);
 
         let path = volume_path(volumes_root, &req.name);
-        let admin = connect_admin(admin_endpoint).await?;
         // Permissions are wide open: aname is namespacing, not a security
         // boundary, and pods of any uid must be able to use the volume.
-        let created = admin
-            .create_directory(&path, 0o777, 0, 0)
-            .await
-            .map_err(|s| match s.code() {
-                // A non-directory in the way: same name, incompatible volume.
-                Code::FailedPrecondition => {
-                    Status::already_exists(format!("CreateDirectory {}: {}", path, s.message()))
-                }
-                Code::InvalidArgument => {
-                    Status::invalid_argument(format!("CreateDirectory {}: {}", path, s.message()))
-                }
-                _ => Status::internal(format!("CreateDirectory {}: {}", path, s.message())),
-            })?;
+        let created = create_dir_on_leader(admin_endpoint, &path, 0o777, 0, 0).await?;
         info!(volume = %req.name, %path, created, "CreateVolume");
 
         // Capacity is recorded but not enforced; the gateway filesystem is
@@ -261,12 +363,8 @@ impl Controller for ControllerService {
             .unwrap_or(crate::DEFAULT_VOLUMES_ROOT);
 
         let path = volume_path(volumes_root, &req.volume_id);
-        let admin = connect_admin(admin_endpoint).await?;
         // Idempotent on the gateway side: a missing directory is a success.
-        admin
-            .remove_directory(&path)
-            .await
-            .map_err(|s| Status::internal(format!("RemoveDirectory {}: {}", path, s.message())))?;
+        remove_dir_on_leader(admin_endpoint, &path).await?;
         info!(volume = %req.volume_id, %path, "DeleteVolume");
 
         Ok(Response::new(DeleteVolumeResponse {}))
@@ -423,5 +521,37 @@ impl Controller for ControllerService {
         _request: Request<ControllerModifyVolumeRequest>,
     ) -> Result<Response<ControllerModifyVolumeResponse>, Status> {
         Err(Status::unimplemented("ControllerModifyVolume"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retriable_admin_codes_fall_through_authoritative_ones_surface() {
+        // Transport / not-leader: try the next endpoint.
+        for c in [
+            Code::Unavailable,
+            Code::Internal,
+            Code::Unknown,
+            Code::DeadlineExceeded,
+            Code::Cancelled,
+        ] {
+            assert!(admin_error_is_retriable(c), "{c:?} should be retriable");
+        }
+        // The leader rejecting the request on its merits: surface it.
+        for c in [
+            Code::FailedPrecondition,
+            Code::InvalidArgument,
+            Code::AlreadyExists,
+            Code::NotFound,
+            Code::PermissionDenied,
+        ] {
+            assert!(
+                !admin_error_is_retriable(c),
+                "{c:?} should be authoritative"
+            );
+        }
     }
 }
