@@ -1,9 +1,10 @@
 .mermaid-chart {
   font-family: var(--font-sans), 'Schibsted Grotesk', system-ui, sans-serif;
-  --tw-prose-body: #56544d;
-  --tw-prose-headings: #1c1b17;
-  --tw-prose-links: #1c1b17;
-  --tw-prose-code: #1c1b17;
+  color: #1c1b17;
+}
+
+.dark .mermaid-chart {
+  color: #f4f3ef;
 }
 
 .mermaid-chart rect.actor,
@@ -55,12 +56,14 @@
   letter-spacing: -0.01em;
 }
 
+/* No padding/border here: mermaid sizes the label's foreignObject to the text
+   it measured in a sandbox where this stylesheet does not apply, then clips the
+   overflow. Any box growth at render time pushes the text out of that clip. */
 .mermaid-chart .edgeLabel {
   font-size: 12px;
   font-weight: 400;
   background: var(--background, white);
-  padding: 2px 6px;
-  border-radius: 6px;
+  border-radius: 4px;
 }
 
 .dark .mermaid-chart .edgeLabel {

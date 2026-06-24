@@ -78,6 +78,11 @@ export function Mermaid({ chart }: { chart: string }) {
             labelBoxBkgColor: isDark ? '#111110' : '#ffffff',
             labelBoxBorderColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
             loopTextColor: isDark ? '#4d9fff' : '#2e8bff',
+
+            // Notes - match the surface palette instead of mermaid's default yellow
+            noteBkgColor: isDark ? 'rgba(255, 255, 255, 0.045)' : '#faf9f6',
+            noteTextColor: isDark ? '#f4f3ef' : '#1c1b17',
+            noteBorderColor: isDark ? 'rgba(255, 255, 255, 0.09)' : '#e7e5df',
           },
           flowchart: {
             curve: 'basis',
@@ -87,7 +92,7 @@ export function Mermaid({ chart }: { chart: string }) {
             useMaxWidth: true,
             subGraphTitleMargin: {
               top: 10,
-              bottom: 5
+              bottom: 28
             }
           },
           sequence: {
@@ -113,7 +118,7 @@ export function Mermaid({ chart }: { chart: string }) {
   }, [chart, resolvedTheme])
 
   return (
-    <div className="my-8 overflow-visible">
+    <div className="not-prose my-8 overflow-visible">
       <div
         ref={ref}
         dangerouslySetInnerHTML={{ __html: svg }}
