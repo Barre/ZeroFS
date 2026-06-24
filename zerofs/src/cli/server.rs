@@ -636,6 +636,11 @@ pub async fn build_slatedb(
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
+            if segments_enabled {
+                reader_builder = reader_builder.with_segment_extractor(Arc::new(
+                    crate::segment_extractor::ZeroFsSegmentExtractor,
+                ));
+            }
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -659,6 +664,11 @@ pub async fn build_slatedb(
                 .with_checkpoint_id(checkpoint_id)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
+            if segments_enabled {
+                reader_builder = reader_builder.with_segment_extractor(Arc::new(
+                    crate::segment_extractor::ZeroFsSegmentExtractor,
+                ));
+            }
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
