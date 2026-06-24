@@ -383,7 +383,6 @@ peers = ["10.0.0.2:9000"]             # the other node's replication_listen
 | `role` | yes | `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
 | `replication_listen` | standby; both recommended | `host:port` this node receives the leader's ships and heartbeats on. |
 | `peers` | both recommended | The other node's `replication_listen`. |
-| `tail_buffer_dir` | no | Directory for the replication tail buffer. |
 
 Set both `replication_listen` and `peers` on every node so either can lead after a role swap; ZeroFS warns at startup on an asymmetric config. The data-database WAL (`[lsm] wal_enabled`) is allowed under replication and makes `fsync` cheaper. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
 

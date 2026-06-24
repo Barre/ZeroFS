@@ -164,7 +164,6 @@ peers = ["10.0.0.1:9000"]
 | `role` | yes | Initial role, `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
 | `replication_listen` | standby; both recommended | `host:port` this node receives the leader's ships and heartbeats on. It is bound verbatim, so it must be a socket address. |
 | `peers` | both recommended | The other node's `replication_listen` address. The leader ships here. |
-| `tail_buffer_dir` | no | Directory for the replication tail buffer. |
 
 **Configure a balanced pair.** Set both `replication_listen` and `peers` on every node, so either node can lead after a role swap. A node with only one of the two works for its initial role but cannot fully participate after a failover: a promoted standby with no `peers` has nowhere to ship, and a leader with no `replication_listen` cannot receive once it is demoted. ZeroFS logs a warning at startup when a node is configured asymmetrically.
 
