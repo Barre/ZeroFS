@@ -104,7 +104,7 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         ..Default::default()
     };
 
-    let mut iter = db.scan_with_options::<&[u8], _>(.., &scan_options).await?;
+    let mut iter = db.scan_with_options(.., &scan_options).await?;
 
     let mut count = 0;
     let mut count_by_prefix: std::collections::HashMap<KeyPrefix, usize> =

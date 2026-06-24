@@ -4,10 +4,11 @@
 //! writer-epoch fencing rejects it, without standing up MinIO or real processes.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::fmt::{self, Display, Formatter};
@@ -80,9 +81,25 @@ impl ObjectStore for ZombieObjectStore {
         self.inner.get_opts(location, options).await
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.check_writable()?;
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        // When partitioned, every delete fails fast (yielding once per input,
+        // as `ObjectStoreExt::delete` expects).
+        if self.isolated.load(Ordering::Acquire) {
+            return locations
+                .map(|loc| {
+                    loc.and_then(|_| {
+                        Err(object_store::Error::Generic {
+                            store: "ZombieObjectStore",
+                            source: "node is partitioned (zombie)".into(),
+                        })
+                    })
+                })
+                .boxed();
+        }
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -93,14 +110,14 @@ impl ObjectStore for ZombieObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
         self.check_writable()?;
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.check_writable()?;
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -108,6 +125,7 @@ impl ObjectStore for ZombieObjectStore {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use object_store::ObjectStoreExt;
     use slatedb::DbBuilder;
     use slatedb::config::{PutOptions as SlatePutOptions, ReadOptions, WriteOptions};
 

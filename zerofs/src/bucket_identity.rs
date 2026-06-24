@@ -1,4 +1,4 @@
-use slatedb::object_store::{ObjectStore, PutMode, PutOptions, path::Path};
+use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -17,7 +17,7 @@ impl BucketIdentity {
         object_store: &Arc<dyn ObjectStore>,
         db_path: &str,
     ) -> anyhow::Result<Self> {
-        let marker_path = Path::from(db_path).child(BUCKET_ID_MARKER);
+        let marker_path = Path::from(db_path).join(BUCKET_ID_MARKER);
 
         tracing::debug!("Checking for bucket ID at: {}", marker_path);
 

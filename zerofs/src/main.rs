@@ -19,6 +19,7 @@ mod ninep;
 mod object_store_prefetch;
 mod parse_object_store;
 mod prometheus;
+mod redis_conditional_store;
 mod replication;
 mod rpc;
 mod segment_extractor;

@@ -157,7 +157,7 @@ The KEK is derived from the encryption password; nothing else can unwrap the DEK
 
 ### Password Requirements
 
-ZeroFS validates the password before touching the store: at `zerofs run` startup (the server refuses to start), in `zerofs change-password`, and in the standalone compactor and debug commands.
+ZeroFS validates the password before touching the store: at `zerofs run` startup (the server refuses to start), in `zerofs change-password`, and in the standalone compaction worker and debug commands.
 
 - **Non-empty**: empty passwords are rejected
 - **Minimum length**: 8 characters, enforced with the error `Password must be at least 8 characters long`. Use 25+ characters in practice.

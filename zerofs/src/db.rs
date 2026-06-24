@@ -11,7 +11,6 @@ use bytes::Bytes;
 use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use slatedb::{DbReader, WriteBatch};
 use slatedb_common::metrics::DefaultMetricsRecorder;
-use std::ops::RangeBounds;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
@@ -271,7 +270,7 @@ impl Db {
         Ok(result)
     }
 
-    pub async fn scan<R: RangeBounds<Bytes> + Clone + Send + Sync + 'static>(
+    pub async fn scan<R: slatedb::ByteRangeBounds + Send>(
         &self,
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
@@ -308,9 +307,10 @@ impl Db {
 
     /// Prefix scan that consults SlateDB SST filters to skip non-matching SSTs.
     ///
-    /// `seek_to` lets the caller advance to the first interesting key inside the
-    /// prefix without re-fetching the leading blocks; `read_ahead_bytes` controls
-    /// SlateDB's read-ahead within the iterator.
+    /// `seek_to` (a full key within the prefix) is pushed down as the scan's
+    /// lower bound, so SlateDB prunes sorted runs entirely below the resume
+    /// point at setup instead of opening them and seeking forward.
+    /// `read_ahead_bytes` controls SlateDB's read-ahead within the iterator.
     pub async fn scan_prefix(
         &self,
         prefix: Bytes,
@@ -326,21 +326,36 @@ impl Db {
             ..Default::default()
         };
 
-        let mut iter = match &self.inner {
+        // Push the optional resume point down as the subrange's lower bound
+        // rather than scanning from the prefix start and seeking forward.
+        // SlateDB selects only sorted runs whose key range overlaps the scan
+        // range, so a tighter lower bound prunes SSTs that sit entirely below
+        // the resume point before they are ever opened. `seek_to` is a full key
+        // (`prefix ++ suffix`); the subrange is a prefix-relative suffix, so we
+        // strip the prefix. An empty suffix reproduces the full-prefix scan.
+        let suffix = match &seek_to {
+            Some(key) => {
+                debug_assert!(
+                    key.starts_with(prefix.as_ref()),
+                    "scan_prefix seek_to must fall within the prefix"
+                );
+                key.slice(prefix.len()..)
+            }
+            None => Bytes::new(),
+        };
+
+        let iter = match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
-                db.scan_prefix_with_options(prefix, &scan_options).await?
+                db.scan_prefix_with_options(prefix, suffix.., &scan_options)
+                    .await?
             }
             SlateDbHandle::ReadOnly(reader_swap) => {
                 let reader = reader_swap.load();
                 reader
-                    .scan_prefix_with_options(prefix, &scan_options)
+                    .scan_prefix_with_options(prefix, suffix.., &scan_options)
                     .await?
             }
         };
-
-        if let Some(key) = seek_to {
-            iter.seek(key).await?;
-        }
 
         Ok(Box::pin(futures::stream::unfold(
             iter,
