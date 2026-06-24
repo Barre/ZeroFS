@@ -12,6 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Python: build the wheel, install it, and run it against a real ZeroFS server.
   python:

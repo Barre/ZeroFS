@@ -11,6 +11,10 @@ env:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   collect-pgo-profile:
     name: Collect PGO Profile Data - ${{ matrix.test }}
