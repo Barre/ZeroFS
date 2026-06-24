@@ -208,13 +208,6 @@ pub struct ReplicationConfig {
     /// receives the leader's ships here).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub replication_listen: Option<String>,
-    /// Directory for the replication tail buffer.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_expandable_path",
-        default
-    )]
-    pub tail_buffer_dir: Option<PathBuf>,
 }
 
 impl ReplicationConfig {
