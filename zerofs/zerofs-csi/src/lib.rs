@@ -4,6 +4,7 @@ pub mod identity;
 pub mod node;
 pub mod proto;
 pub mod server;
+pub mod targets;
 
 /// CSI driver name, as registered with the CO and referenced by
 /// StorageClass.provisioner.

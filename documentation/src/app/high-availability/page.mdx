@@ -12,6 +12,7 @@ export const sections = [
   { title: 'What it guarantees', id: 'guarantees' },
   { title: 'Configuration', id: 'configuration' },
   { title: 'Client access', id: 'clients' },
+  { title: 'Kubernetes (CSI)', id: 'kubernetes' },
   { title: 'Limits', id: 'limits' },
 ]
 
@@ -184,6 +185,20 @@ zerofs mount 10.0.0.1:5564,10.0.0.2:5564 /mnt/zerofs
 The [client libraries](/client-libraries) take the same list of targets and behave identically, since they wrap the same Rust core. During a failover an in-flight operation blocks and is retried against the new leader rather than returning an error; the operation id carried by mutating calls makes that retry safe to apply once.
 
 NFS and NBD clients do not reroute between nodes. Use a 9P [mount](/9p-access) or a client library for an HA client.
+
+## Kubernetes (CSI) {{ id: 'kubernetes' }}
+
+The [CSI driver](/kubernetes-csi) runs the gateway as an HA pair. Deploy both nodes as two single-replica StatefulSets, then set the StorageClass `gateway` and `adminEndpoint` parameters to a comma-separated list of the two nodes' addresses:
+
+```yaml
+parameters:
+  gateway: zerofs-gateway-a.zerofs.svc:5564,zerofs-gateway-b.zerofs.svc:5564
+  adminEndpoint: http://zerofs-gateway-a.zerofs.svc:7000,http://zerofs-gateway-b.zerofs.svc:7000
+```
+
+Both planes find the serving leader on their own. A pod's FUSE mount is a `zerofs mount` against both nodes, so it follows the leader and survives a failover without remounting. The controller (volume provisioning) tries each admin endpoint and provisions against whichever node leads; a standby refuses the connection until it takes over, and the create/remove operations are idempotent, so retrying across nodes is safe.
+
+Gate pod readiness on the replication port, not 9P: a standby binds the replication port early (to receive ships and answer heartbeats) but binds 9P only after it takes over, so a 9P readiness probe would drop the standby from its Service and cut off the leader's replication. The `deploy/` directory ships `gateway-example.yaml`, `storageclass-example.yaml`, and `networkpolicy-example.yaml` as a complete starting point.
 
 ## Limits {{ id: 'limits' }}
 

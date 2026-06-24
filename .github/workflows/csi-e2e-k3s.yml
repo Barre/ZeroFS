@@ -54,10 +54,14 @@ jobs:
           docker save zerofs:e2e | sudo k3s ctr images import -
           docker save zerofs-csi:e2e | sudo k3s ctr images import -
 
+      # The gateway is an HA leader/standby pair (two StatefulSets over one
+      # shared file:// store). Readiness is gated on the replication port, which
+      # both roles bind early; the standby binds 9P only after it takes over.
       - name: Deploy gateway
         run: |
           kubectl apply -f zerofs/zerofs-csi/e2e/gateway.yaml
-          kubectl -n zerofs rollout status statefulset/zerofs-gateway --timeout=120s
+          kubectl -n zerofs rollout status statefulset/zerofs-gateway-a --timeout=120s
+          kubectl -n zerofs rollout status statefulset/zerofs-gateway-b --timeout=120s
 
       # The shipped manifests are applied as-is except for the image, which
       # points at the locally imported build (`:e2e` defaults to
@@ -83,25 +87,37 @@ jobs:
           content=$(kubectl exec reader -- cat /data/hello.txt)
           test "$content" = "zerofs-e2e-payload"
 
-      # The flagship claim: published FUSE mounts survive a gateway restart
-      # via 9P reconnect + fid replay. I/O blocks during the outage and
-      # resumes on the same mounts; nothing is republished.
-      - name: Gateway restart survives published mounts
+      # Published FUSE mounts survive a leader failover.
+      # Find the serving leader (its 9P port accepts connections; a standby
+      # refuses until it takes over) and delete it: the standby promotes,
+      # epoch-fencing the old leader, and the mounts follow it with no remount.
+      # Discovering the leader rather than assuming node-a keeps the test correct
+      # even if the cold-start role race resolves the other way.
+      - name: Leader failover survives published mounts
         run: |
-          kubectl -n zerofs delete pod zerofs-gateway-0
-          kubectl -n zerofs rollout status statefulset/zerofs-gateway --timeout=120s
-          # Writer overwrites the shared file after the restart; the reader (a
-          # separate mount on the same RWX volume) must observe it. RWX volumes
-          # mount write-through, so a peer's write is visible within ~1s (bounded
-          # by the FUSE attribute cache); poll briefly rather than assume it is
-          # instantaneous.
-          timeout 120 kubectl exec writer -- sh -c 'echo after-restart > /data/hello.txt'
-          for i in $(seq 1 30); do
-            content=$(timeout 30 kubectl exec reader -- cat /data/hello.txt 2>/dev/null || true)
-            [ "$content" = "after-restart" ] && break
-            sleep 1
+          leader=""
+          for n in a b; do
+            if kubectl exec writer -- sh -c "nc -w3 zerofs-gateway-$n.zerofs.svc 5564 </dev/null" 2>/dev/null; then
+              leader=$n
+              break
+            fi
           done
-          test "$content" = "after-restart"
+          test -n "$leader" || { echo "no serving leader found among the gateways"; exit 1; }
+          echo "serving leader is node-$leader; deleting it to force failover"
+          kubectl -n zerofs delete pod "zerofs-gateway-$leader-0"
+          # The writer overwrites after the failover; its mount blocks through
+          # the takeover gap and re-routes to the promoted leader. The reader (a
+          # separate mount on the same RWX volume) observes it within the
+          # write-through attribute-cache window. Both stalls are bounded by the
+          # takeover TTL, so allow generous time.
+          timeout 180 kubectl exec writer -- sh -c 'echo after-failover > /data/hello.txt'
+          content=""
+          for i in $(seq 1 60); do
+            content=$(timeout 30 kubectl exec reader -- cat /data/hello.txt 2>/dev/null || true)
+            [ "$content" = "after-failover" ] && break
+            sleep 2
+          done
+          test "$content" = "after-failover"
 
       - name: Delete reclaims the volume
         run: |
@@ -110,7 +126,7 @@ jobs:
           kubectl wait pv "$pv" --for=delete --timeout=120s
 
       # Always: component logs with timestamps make slow (not just failed)
-      # runs attributable, e.g. how long a reconnect actually took.
+      # runs attributable, e.g. how long a failover actually took.
       - name: Debug dump
         if: always()
         run: |
@@ -119,6 +135,7 @@ jobs:
           kubectl get pv,pvc -A
           kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
           kubectl describe pod writer reader
-          kubectl -n zerofs logs statefulset/zerofs-gateway --timestamps --tail=100
+          kubectl -n zerofs logs -l app=zerofs-gateway --all-containers --prefix \
+            --timestamps --tail=100 --max-log-requests=6
           kubectl -n zerofs logs deployment/zerofs-csi-controller --all-containers --timestamps --tail=100
           kubectl -n zerofs logs daemonset/zerofs-csi-node --all-containers --timestamps --tail=100

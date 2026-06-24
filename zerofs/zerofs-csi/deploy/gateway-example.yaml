@@ -1,19 +1,32 @@
-# Example shared ZeroFS gateway: a single-replica StatefulSet (ZeroFS is
-# single-writer per bucket/prefix) serving 9P to the CSI node plugins and the
-# admin RPC to the CSI controller.
+# Example ZeroFS gateway: a leader/standby pair over one object store, deployed
+# as two single-replica StatefulSets. The CSI driver points at both nodes; the
+# data-plane 9P client follows the serving leader and re-routes on failover, and
+# the controller reaches whichever node leads for provisioning. See
+# storageclass-example.yaml for the matching StorageClass.
 #
-# Neither port is authenticated: 9P (aname is client-chosen) and the admin RPC
-# (a root-equivalent control plane) both trust network reachability. Apply
-# networkpolicy-example.yaml alongside this to lock them down.
+# Three ports per node:
+#   - 9P (5564)         data plane: node plugins mount from here.
+#   - admin RPC (7000)  control plane: the controller creates/removes volumes.
+#   - replication (9000) leader -> standby ship + heartbeats + role discovery.
+#
+# A standby does not bind 5564 or 7000 until it takes over, so it refuses
+# connections on those (handled by the clients). It DOES bind 9000 early, so
+# readiness is gated on 9000 — not 5564 — to keep the standby in its Service
+# and reachable for the leader's ships. Both nodes need identical [storage] url
+# and encryption_password.
+#
+# Neither 9P nor admin is authenticated; apply networkpolicy-example.yaml
+# alongside this to lock the three ports down.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: zerofs
 ---
+# ----- node A (config role: leader) -----
 apiVersion: v1
 kind: Secret
 metadata:
-  name: zerofs-gateway-config
+  name: zerofs-gateway-a-config
   namespace: zerofs
 stringData:
   ZEROFS_PASSWORD: change-me
@@ -35,9 +48,18 @@ stringData:
     [servers.rpc]
     addresses = ["0.0.0.0:7000"]
 
+    # role is a bootstrap hint: at startup each node asks its peer (Hello) who
+    # is leading and defers to an active peer, so a restart after a failover
+    # does not fence the live leader.
+    [replication]
+    node_id = "node-a"
+    role = "leader"
+    replication_listen = "0.0.0.0:9000"
+    peers = ["zerofs-gateway-b.zerofs.svc:9000"]
+
     # Remove this [aws] section when using IRSA or instance roles: config
-    # parsing fails on unset ${VAR} references, and the AWS SDK picks up
-    # those credential sources on its own.
+    # parsing fails on unset ${VAR} references, and the AWS SDK picks up those
+    # credential sources on its own.
     [aws]
     access_key_id = "${AWS_ACCESS_KEY_ID}"
     secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
@@ -45,32 +67,37 @@ stringData:
 apiVersion: v1
 kind: Service
 metadata:
-  name: zerofs-gateway
+  name: zerofs-gateway-a
   namespace: zerofs
 spec:
   selector:
     app: zerofs-gateway
+    node: node-a
   ports:
     - name: ninep
       port: 5564
     - name: admin
       port: 7000
+    - name: repl
+      port: 9000
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: zerofs-gateway
+  name: zerofs-gateway-a
   namespace: zerofs
 spec:
-  serviceName: zerofs-gateway
+  serviceName: zerofs-gateway-a
   replicas: 1
   selector:
     matchLabels:
       app: zerofs-gateway
+      node: node-a
   template:
     metadata:
       labels:
         app: zerofs-gateway
+        node: node-a
     spec:
       containers:
         - name: zerofs
@@ -81,25 +108,26 @@ spec:
               containerPort: 5564
             - name: admin
               containerPort: 7000
-          # Without this, the pod is Ready as soon as the container starts,
-          # before zerofs has opened the database and bound the 9P port, and
-          # the Service routes reconnecting clients to a gateway that refuses
-          # connections. Gate readiness on 9P actually accepting.
+            - name: repl
+              containerPort: 9000
+          # Gate readiness on the replication port, which both roles bind early
+          # (before the role is resolved). Gating on 9P instead would drop a
+          # standby from this Service and cut off the leader's ships, since a
+          # standby binds 9P only after it takes over.
           readinessProbe:
             tcpSocket:
-              port: ninep
+              port: repl
             periodSeconds: 2
             timeoutSeconds: 1
           env:
             - name: ZEROFS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: zerofs-gateway-config
+                  name: zerofs-gateway-a-config
                   key: ZEROFS_PASSWORD
-            # Supply AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY here to match
-            # the [aws] section above. With IRSA / instance roles, leave them
-            # out AND remove the [aws] section from zerofs.toml (unset ${VAR}
-            # references fail config parsing).
+            # Supply AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY here to match the
+            # [aws] section above. With IRSA / instance roles, leave them out
+            # AND remove the [aws] section from zerofs.toml.
           volumeMounts:
             - name: config
               mountPath: /etc/zerofs
@@ -108,7 +136,122 @@ spec:
       volumes:
         - name: config
           secret:
-            secretName: zerofs-gateway-config
+            secretName: zerofs-gateway-a-config
+            items:
+              - key: zerofs.toml
+                path: zerofs.toml
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# ----- node B (config role: standby) -----
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zerofs-gateway-b-config
+  namespace: zerofs
+stringData:
+  ZEROFS_PASSWORD: change-me
+  zerofs.toml: |
+    [cache]
+    dir = "/data/cache"
+    disk_size_gb = 10.0
+    memory_size_gb = 1.0
+
+    [storage]
+    url = "s3://your-bucket/zerofs-csi"
+    encryption_password = "${ZEROFS_PASSWORD}"
+
+    [servers]
+
+    [servers.ninep]
+    addresses = ["0.0.0.0:5564"]
+
+    [servers.rpc]
+    addresses = ["0.0.0.0:7000"]
+
+    [replication]
+    node_id = "node-b"
+    role = "standby"
+    replication_listen = "0.0.0.0:9000"
+    peers = ["zerofs-gateway-a.zerofs.svc:9000"]
+
+    # Remove this [aws] section when using IRSA or instance roles.
+    [aws]
+    access_key_id = "${AWS_ACCESS_KEY_ID}"
+    secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zerofs-gateway-b
+  namespace: zerofs
+spec:
+  selector:
+    app: zerofs-gateway
+    node: node-b
+  ports:
+    - name: ninep
+      port: 5564
+    - name: admin
+      port: 7000
+    - name: repl
+      port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zerofs-gateway-b
+  namespace: zerofs
+spec:
+  serviceName: zerofs-gateway-b
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zerofs-gateway
+      node: node-b
+  template:
+    metadata:
+      labels:
+        app: zerofs-gateway
+        node: node-b
+    spec:
+      containers:
+        - name: zerofs
+          image: ghcr.io/barre/zerofs:latest
+          args: ["run", "-c", "/etc/zerofs/zerofs.toml"]
+          ports:
+            - name: ninep
+              containerPort: 5564
+            - name: admin
+              containerPort: 7000
+            - name: repl
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: repl
+            periodSeconds: 2
+            timeoutSeconds: 1
+          env:
+            - name: ZEROFS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zerofs-gateway-b-config
+                  key: ZEROFS_PASSWORD
+          volumeMounts:
+            - name: config
+              mountPath: /etc/zerofs
+            - name: cache
+              mountPath: /data/cache
+      volumes:
+        - name: config
+          secret:
+            secretName: zerofs-gateway-b-config
             items:
               - key: zerofs.toml
                 path: zerofs.toml
