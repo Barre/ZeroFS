@@ -115,6 +115,11 @@ pub struct ZeroFS {
     /// When set, a client `fsync`/COMMIT returns without forcing a flush to object
     /// storage; semi-sync replication is relied on for durability. See `client_fsync`.
     pub ignore_fsync: bool,
+    /// Durability lineage token (see `client_fsync_verified`). Identifies the current
+    /// unbroken durable lineage; set once at bring-up, constant for this process's life.
+    /// A `.zerofs4` client carries it, and a verified fsync succeeds only while it is
+    /// still live, so a successful fsync implies the client's writes are durable.
+    pub lineage_token: u64,
     pub max_bytes: u64,
     pub tracer: AccessTracer,
     /// Idempotency cache for retried non-idempotent ops. Shared across all
@@ -195,6 +200,7 @@ impl ZeroFS {
             None,
             None,
             Arc::new(crate::dedup::DedupCache::new(65_536)),
+            false, // single-node / test: never a live takeover, always regenerate
         )
         .await
     }
@@ -213,9 +219,21 @@ impl ZeroFS {
         lease: Option<Arc<crate::replication::Lease>>,
         replicator: Option<Arc<crate::replication::Replicator>>,
         dedup: Arc<crate::dedup::DedupCache>,
+        // True only when this node is a standby promoting after receiving replication
+        // from a live leader; false on a cold bootstrap / config leader / single node.
+        // Decides whether the durability lineage carries forward (resolve_lineage_token).
+        is_live_takeover: bool,
     ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
         let key_codec = Arc::new(KeyCodec::new(use_segment_layout));
+
+        // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
+        // open). Used as a fresh, never-reused lineage token whenever the durability
+        // lineage must be regenerated (see `resolve_lineage_token`).
+        let writer_epoch = match &slatedb {
+            SlateDbHandle::ReadWrite(db) => db.subscribe().borrow().current_manifest.writer_epoch(),
+            SlateDbHandle::ReadOnly(_) => 0,
+        };
 
         let db = Arc::new(match slatedb {
             SlateDbHandle::ReadWrite(db) => {
@@ -290,6 +308,13 @@ impl ZeroFS {
         let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
         let orphan_store = OrphanStore::new(db.clone(), key_codec.clone());
+
+        // Resolve the durability lineage token: carry it forward across an untainted
+        // live takeover (transparent failover), else regenerate it (cold bootstrap or
+        // Solo-tainted takeover). Must precede the WriteCoordinator, which taints it.
+        let lineage_token =
+            Self::resolve_lineage_token(&db, &key_codec, writer_epoch, is_live_takeover).await?;
+
         let write_coordinator = WriteCoordinator::new(
             db.clone(),
             inode_store.clone(),
@@ -299,6 +324,7 @@ impl ZeroFS {
             sync_writes,
             replicator,
             dedup.clone(),
+            lineage_token,
         );
 
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -319,6 +345,7 @@ impl ZeroFS {
             flush_coordinator,
             write_coordinator,
             ignore_fsync,
+            lineage_token,
             max_bytes,
             tracer: AccessTracer::new(),
             dedup,
@@ -334,6 +361,54 @@ impl ZeroFS {
         Ok(fs)
     }
 
+    /// Resolve the durability lineage token at bring-up. Carry the stored token
+    /// forward ONLY on a live-standby takeover of an UNTAINTED lineage — the standby
+    /// provably has every acked write (ship-before-apply, and a Solo episode would
+    /// have left a taint), so a client's un-fsync'd writes stay verifiable and its
+    /// fsync is transparent across the failover. Otherwise regenerate a fresh token
+    /// (`writer_epoch`: monotonic, never reused) and persist it durably: a cold
+    /// bootstrap (the lineage broke — un-fsync'd writes are gone) or a Solo-tainted
+    /// takeover (acked Solo writes the standby never received), where a client's
+    /// pre-break writes must fail their verified fsync rather than match a stale token.
+    async fn resolve_lineage_token(
+        db: &Db,
+        key_codec: &KeyCodec,
+        writer_epoch: u64,
+        is_live_takeover: bool,
+    ) -> anyhow::Result<u64> {
+        if db.is_read_only() {
+            return Ok(0);
+        }
+        let stored = db
+            .get_bytes(&key_codec.lineage_key())
+            .await?
+            .and_then(|b| KeyCodec::decode_u64(&b));
+        // The Solo taint records the token that was live when the leader went Solo.
+        let taint = db
+            .get_bytes(&key_codec.taint_key())
+            .await?
+            .and_then(|b| KeyCodec::decode_u64(&b));
+        let keep = is_live_takeover && stored.is_some() && stored != taint;
+        if keep {
+            return Ok(stored.unwrap());
+        }
+        let token = writer_epoch;
+        db.put_with_options(
+            &key_codec.lineage_key(),
+            &KeyCodec::encode_u64(token),
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        // await_durable:false + explicit flush (a durable write here can stall
+        // bring-up on file://); the token must be durable before this node serves.
+        db.flush().await?;
+        Ok(token)
+    }
+
     /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
     /// `ignore_fsync` is set.
     pub async fn client_fsync(&self) -> Result<(), crate::fs::errors::FsError> {
@@ -341,6 +416,28 @@ impl ZeroFS {
             return Ok(());
         }
         self.flush_coordinator.flush().await
+    }
+
+    /// Durability-verified fsync (9P `Tfsyncdur`, `.zerofs4`). `client_token` is the
+    /// lineage token of the client's oldest un-fsync'd write (`0` = nothing
+    /// un-fsync'd). We FLUSH FIRST (so every write made on THIS instance becomes
+    /// durable), then verify the lineage: OK iff the client wrote nothing, or its
+    /// writes belong to the live lineage (so the flush just made them durable, or a
+    /// clean takeover carried them). Otherwise the client's writes were made under a
+    /// lineage that broke (a cold restart or a Solo-tainted takeover) and may be
+    /// lost, so we return ESTALE rather than a false success. Never reachable under
+    /// `ignore_fsync`: the server does not offer `.zerofs4` then, so the flush above
+    /// always runs and the OK branch's durability assumption holds.
+    pub async fn client_fsync_verified(
+        &self,
+        client_token: u64,
+    ) -> Result<(), crate::fs::errors::FsError> {
+        self.flush_coordinator.flush().await?;
+        if client_token == 0 || client_token == self.lineage_token {
+            Ok(())
+        } else {
+            Err(crate::fs::errors::FsError::StaleHandle)
+        }
     }
 
     #[cfg(test)]

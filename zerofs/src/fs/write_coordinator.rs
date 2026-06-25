@@ -47,6 +47,9 @@ struct WorkerContext {
     /// Idempotency cache: applied op-ids are recorded here atomically with the
     /// commit, so a retry of the same op is recognized as already done.
     dedup: Arc<crate::dedup::DedupCache>,
+    /// This leader's durability lineage token, written as the Solo taint on the
+    /// first downgrade to Solo (see the taint write in `worker_loop`).
+    lineage_token: u64,
 }
 
 impl WriteCoordinator {
@@ -60,6 +63,7 @@ impl WriteCoordinator {
         sync_writes: bool,
         replicator: Option<Arc<crate::replication::Replicator>>,
         dedup: Arc<crate::dedup::DedupCache>,
+        lineage_token: u64,
     ) -> Self {
         // Capture synchronously: the spawned task starts later, by which point
         // callers may already have bumped `next_id`. If we captured inside the
@@ -75,6 +79,7 @@ impl WriteCoordinator {
             sync_writes,
             replicator,
             dedup,
+            lineage_token,
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self { sender }
@@ -95,6 +100,11 @@ async fn worker_loop(
     initial_counter: u64,
 ) {
     let mut last_emitted_counter = initial_counter;
+    // Set once this leader first downgrades to Solo and durably taints its lineage.
+    // The current lineage is always untainted at bring-up (we never carry forward a
+    // tainted one), so it starts false; once set it stays set for this process's
+    // life — a lineage that ever went Solo stays tainted even if it reconnects.
+    let mut taint_written = false;
 
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
@@ -201,7 +211,36 @@ async fn worker_loop(
         // region produces no chunk writes) and no inode was allocated. Reply
         // Ok without touching the db; there's nothing to make durable either.
         let mut result: Result<(), FsError> = Ok(());
-        if any_ops {
+
+        // First Solo batch: durably taint this lineage BEFORE acking any Solo write.
+        // A takeover reads the taint and regenerates the lineage token, so these
+        // un-shipped writes' later fsync fails honestly instead of matching a
+        // carried-forward token. One flush per leader, gated by `taint_written`. If
+        // it can't be made durable we fail the batch rather than ack a write we
+        // cannot stand behind.
+        if !taint_written && any_ops && ctx.replicator.is_some() && shipped_seqno.is_none() {
+            match ctx
+                .db
+                .put_with_options(
+                    &ctx.key_codec.taint_key(),
+                    &KeyCodec::encode_u64(ctx.lineage_token),
+                    &slatedb::config::PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(()) => match ctx.flush_coordinator.flush().await {
+                    Ok(()) => taint_written = true,
+                    Err(e) => result = Err(e),
+                },
+                Err(_) => result = Err(FsError::IoError),
+            }
+        }
+
+        if any_ops && result.is_ok() {
             match ctx
                 .db
                 .write_with_options(

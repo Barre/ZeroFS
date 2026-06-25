@@ -14,6 +14,14 @@ pub const VERSION_9P2000L_ZEROFS2: &[u8] = b"9P2000.L.zerofs2";
 /// for safe retry across a reconnect/failover. Gated by negotiation, so an older
 /// peer never sees the extra field and standard framing is unchanged for it.
 pub const VERSION_9P2000L_ZEROFS3: &[u8] = b"9P2000.L.zerofs3";
+/// `.zerofs4`: durability-verified fsync. The client learns its connection's
+/// durability lineage token via Tgetlineage and presents it on Tfsyncdur; the
+/// server flushes and returns Rfsync only if that token is still the live
+/// durable lineage, else Rlerror(ESTALE). So a successful fsync implies every
+/// write the client acked before it is durable (survives a crash/failover).
+/// A server with `ignore_fsync` set never offers this, so a verified client is
+/// never handed a hollow OK.
+pub const VERSION_9P2000L_ZEROFS4: &[u8] = b"9P2000.L.zerofs4";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -815,6 +823,31 @@ pub struct Runlinkat;
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rfsync;
 
+/// `.zerofs4`: query the connection's current durability lineage token. Sent
+/// once per (re)connection after negotiating `.zerofs4`; off the hot path.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tgetlineage;
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rgetlineage {
+    #[deku(endian = "little")]
+    pub token: u64,
+}
+
+/// `.zerofs4` durability-verified fsync. Like Tfsync but carries the lineage
+/// token of the client's oldest un-fsync'd write (`0` = nothing un-fsync'd). The
+/// server flushes, then replies Rfsync iff the token is still the live durable
+/// lineage, else Rlerror(ESTALE).
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tfsyncdur {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub datasync: u32,
+    #[deku(endian = "little")]
+    pub token: u64,
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rstatfs {
     #[deku(endian = "little")]
@@ -941,6 +974,12 @@ pub enum Message {
     Tfsync(Tfsync),
     #[deku(id = "51")]
     Rfsync(Rfsync),
+    #[deku(id = "232")]
+    Tfsyncdur(Tfsyncdur),
+    #[deku(id = "233")]
+    Tgetlineage(Tgetlineage),
+    #[deku(id = "234")]
+    Rgetlineage(Rgetlineage),
     #[deku(id = "52")]
     Tlock(Tlock),
     #[deku(id = "53")]
@@ -1007,6 +1046,61 @@ pub enum Message {
     Treaddirattr(Treaddirattr),
     #[deku(id = "255")]
     Rreaddirattr(Rreaddirattr),
+}
+
+impl Message {
+    /// Whether this REQUEST mutates durable filesystem state, so a `.zerofs4`
+    /// client must track it as un-fsync'd for durability-verified fsync. Defined as
+    /// "has a durability fid"; see [`Self::durability_fid`].
+    pub fn is_mutation(&self) -> bool {
+        self.durability_fid().is_some()
+    }
+
+    /// The fid this mutation's durability binds to: a verified `fsync` covers the write
+    /// only if it presents this fid. It is the fid of the mutated inode, so the change
+    /// is persisted by `fsync` on the object POSIX holds responsible. File ops
+    /// (write/setattr) use the file fid; directory mutations (mkdir/symlink/mknod/link/
+    /// rename/unlink, and a create's directory entry) use the directory fid, since the
+    /// entry lives in the parent and only `fsync(parent)` persists it. A created file's
+    /// data is covered by `fsync` on its open fid. The FUSE mount aggregates per inode,
+    /// so an obligation on any fid bound to the fsync'd handle's inode is honoured.
+    /// Non-mutating ops (fsync, read, walk, open, clunk) return `None`; truncate-on-open
+    /// arrives as a separate `Tsetattr`, so `Tlopen`/`Tlopenat` are excluded.
+    pub fn durability_fid(&self) -> Option<u32> {
+        match self {
+            Message::Twrite(m) => Some(m.fid),
+            Message::Tsetattr(m) => Some(m.fid),
+            Message::Tsetattrattr(m) => Some(m.fid),
+            Message::Tlcreate(m) => Some(m.fid),
+            // The directory ENTRY is in the parent; `fsync(parent)` must cover it.
+            Message::Tlcreateattr(m) => Some(m.dfid),
+            Message::Tmkdir(m) => Some(m.dfid),
+            Message::Tmkdirattr(m) => Some(m.dfid),
+            Message::Tsymlink(m) => Some(m.dfid),
+            Message::Tsymlinkattr(m) => Some(m.dfid),
+            Message::Tmknod(m) => Some(m.dfid),
+            Message::Tmknodattr(m) => Some(m.dfid),
+            Message::Tlink(m) => Some(m.dfid),
+            Message::Tlinkattr(m) => Some(m.dfid),
+            Message::Trename(m) => Some(m.dfid),
+            Message::Trenameat(m) => Some(m.newdirfid),
+            Message::Tunlinkat(m) => Some(m.dirfid),
+            _ => None,
+        }
+    }
+
+    /// Every fid whose inode this mutation changes, so a verified `fsync` of any of them
+    /// accounts for it. For almost all ops this is just [`Self::durability_fid`]; a
+    /// `Trenameat` changes both directories in one atomic op (the source loses the entry,
+    /// the dest gains it), so it also yields the source dir fid, letting `fsync` on either
+    /// directory verify the rename.
+    pub fn durability_fids(&self) -> impl Iterator<Item = u32> {
+        let extra = match self {
+            Message::Trenameat(m) => Some(m.olddirfid),
+            _ => None,
+        };
+        self.durability_fid().into_iter().chain(extra)
+    }
 }
 
 /// Byte offset of the `type` field within a 9P frame (after the u32 size).
@@ -1140,6 +1234,9 @@ impl P9Message {
             Message::Runlinkat(_) => 77,
             Message::Tfsync(_) => 50,
             Message::Rfsync(_) => 51,
+            Message::Tfsyncdur(_) => 232,
+            Message::Tgetlineage(_) => 233,
+            Message::Rgetlineage(_) => 234,
             Message::Tlock(_) => 52,
             Message::Rlock(_) => 53,
             Message::Tgetlock(_) => 54,
@@ -1202,6 +1299,37 @@ mod tests {
             mode: 0o755,
             gid: 0,
         })
+    }
+
+    #[test]
+    fn durability_fids_yields_both_directories_for_a_renameat() {
+        // A renameat changes both directories (source removal, dest add) in one atomic
+        // op, so a verified fsync of either must account for it: durability_fids yields
+        // both dir fids, while durability_fid (the primary) is only the dest.
+        let m = Message::Trenameat(Trenameat {
+            olddirfid: 11,
+            oldname: P9String::new(b"a".to_vec()),
+            newdirfid: 22,
+            newname: P9String::new(b"b".to_vec()),
+        });
+        assert_eq!(
+            m.durability_fid(),
+            Some(22),
+            "the primary fid is the dest dir"
+        );
+        let mut fids: Vec<u32> = m.durability_fids().collect();
+        fids.sort_unstable();
+        assert_eq!(fids, vec![11, 22], "both source and dest dirs are covered");
+    }
+
+    #[test]
+    fn durability_fids_is_the_single_fid_for_non_rename_ops() {
+        let fids: Vec<u32> = tmkdir().durability_fids().collect();
+        assert_eq!(
+            fids,
+            vec![1],
+            "a single-directory op yields just its own fid"
+        );
     }
 
     #[test]

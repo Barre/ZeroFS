@@ -15,10 +15,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Build the ci-profile binary once and share it with every test job below, so the
+  # durability matrix does not rebuild ZeroFS ten times.
+  build:
+    name: Build ZeroFS (ci profile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci/zerofs
+          if-no-files-found: error
+
   jepsen-ha:
     name: Run jepsen HA suite (leader/standby over MinIO)
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -41,10 +59,6 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
-
       - name: Download MinIO + mc
         run: |
           mkdir -p "$RUNNER_TEMP/minio-bin"
@@ -53,6 +67,13 @@ jobs:
           curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
             -o "$RUNNER_TEMP/minio-bin/mc"
           chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
 
       # The test self-manages MinIO (starts the server, creates the bucket) and the
       # FUSE mount, so only the binaries are needed here. lein exits non-zero on a
@@ -100,5 +121,91 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jepsen-ha-store
+          path: jepsen/ha/store
+          if-no-files-found: ignore
+
+  # The fsync-honesty / durability scenarios. Each is a dedicated deterministic
+  # scenario and a jepsen test runs exactly one generator, so they run as a matrix,
+  # one --fsync-* flag per leg. Each asserts that a successful fsync never reports a
+  # durability it cannot provide (ESTALE over a lost write, never a false success).
+  durability:
+    name: Durability (${{ matrix.scenario }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - fsync-honesty                # cold double-restart: lost un-fsync'd write -> fsync fails
+          - fsync-honesty-partition      # Solo at takeover: unshipped write -> fsync fails
+          - fsync-transparency           # clean kill-leader: replayed write survives -> fsync ok
+          - fsync-crossfid               # fsync(a) must not discharge fsync(b) (per-fd)
+          - fsync-metadata               # ftruncate(fd) un-fsync'd -> fsync(fd) fails (inode aggregation)
+          - fsync-multihandle            # write via one handle, fsync via another, same file
+          - fsync-dirent                 # mkdir un-fsync'd -> fsyncdir(parent) fails
+          - fsync-rename                 # cross-dir rename -> fsyncdir(source) fails
+          - fsync-metadata-transparency  # setattr replayed across a clean failover -> fsync ok
+          - fsync-multifailover          # kept token still invalidated by a later cold restart
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Leiningen + FUSE + gnuplot
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 gnuplot
+          curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
+            -o /usr/local/bin/lein
+          sudo chmod +x /usr/local/bin/lein
+
+      - name: Download MinIO + mc
+        run: |
+          mkdir -p "$RUNNER_TEMP/minio-bin"
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
+            -o "$RUNNER_TEMP/minio-bin/minio"
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
+            -o "$RUNNER_TEMP/minio-bin/mc"
+          chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Run --${{ matrix.scenario }}
+        working-directory: jepsen/ha
+        run: |
+          lein run test \
+            --${{ matrix.scenario }} \
+            --time-limit 120 \
+            --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
+            --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
+            --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
+            --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.scenario }}" 2>&1 | tee scenario.log
+          grep -q "Everything looks good" scenario.log
+
+      - name: Collect node logs on failure
+        if: failure()
+        run: |
+          mkdir -p jepsen/ha/store/node-logs
+          for f in "$RUNNER_TEMP/zerofs-ha-${{ matrix.scenario }}"/*.log; do
+            [ -e "$f" ] || continue
+            cp "$f" "jepsen/ha/store/node-logs/$(basename "$f")"
+          done
+
+      - name: Upload jepsen store on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-ha-store-${{ matrix.scenario }}
           path: jepsen/ha/store
           if-no-files-found: ignore

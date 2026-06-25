@@ -281,6 +281,8 @@ impl NinePHandler {
             Message::Trenameat(tr) => self.renameat(tr, op_id).await,
             Message::Tunlinkat(tu) => self.unlinkat(tu, op_id).await,
             Message::Tfsync(tf) => self.fsync(tf).await,
+            Message::Tfsyncdur(tf) => self.fsyncdur(tf).await,
+            Message::Tgetlineage(_) => self.getlineage().await,
             Message::Tflush(_) => Ok(Message::Rflush(Rflush)),
             Message::Txattrwalk(_) => Err(P9Error::NotSupported),
             Message::Tstatfs(ts) => self.statfs(ts).await,
@@ -348,7 +350,13 @@ impl NinePHandler {
         // v9fs proposes plain `9P2000.L`, so it gets the plain reply and the
         // extension handlers are not used. An old client proposing `.zerofs` gets
         // `.zerofs` back and never sends the compound messages.
-        let version = if version_str.contains(".zerofs3") {
+        // `.zerofs4` (durability-verified fsync) is offered only when this server
+        // can actually honor it: `ignore_fsync` makes fsync a no-op, so we must not
+        // promise a verified fsync — the client then degrades to `.zerofs3` and uses
+        // a plain (unverified) fsync, which is honest about what it provides.
+        let version = if version_str.contains(".zerofs4") && !self.filesystem.ignore_fsync {
+            VERSION_9P2000L_ZEROFS4
+        } else if version_str.contains(".zerofs3") {
             VERSION_9P2000L_ZEROFS3
         } else if version_str.contains(".zerofs2") {
             VERSION_9P2000L_ZEROFS2
@@ -358,10 +366,11 @@ impl NinePHandler {
             VERSION_9P2000L
         };
 
-        // Remember whether `.zerofs3` (per-request frame op-id) was negotiated.
-        self.session
-            .op_id_enabled
-            .store(version == VERSION_9P2000L_ZEROFS3, AtomicOrdering::Relaxed);
+        // `.zerofs4` implies `.zerofs3`, so the frame op-id is enabled for both.
+        self.session.op_id_enabled.store(
+            version == VERSION_9P2000L_ZEROFS3 || version == VERSION_9P2000L_ZEROFS4,
+            AtomicOrdering::Relaxed,
+        );
 
         Ok(Message::Rversion(Rversion {
             msize,
@@ -1539,6 +1548,46 @@ impl NinePHandler {
         }
 
         Ok(Message::Rfsync(Rfsync))
+    }
+
+    /// `.zerofs4` durability-verified fsync. `tf.token` is the lineage token of the
+    /// client's oldest un-fsync'd write (`0` = nothing). The filesystem flushes, then
+    /// returns Ok only if that token is still the live durable lineage; otherwise it
+    /// returns `StaleHandle`, which becomes Rlerror(ESTALE), so the client surfaces the
+    /// lost write rather than receiving a false success.
+    async fn fsyncdur(&self, tf: Tfsyncdur) -> P9Result<Message> {
+        let fid = self.get_fid(tf.fid)?;
+        let fid_path = fid.path.clone();
+
+        self.filesystem.client_fsync_verified(tf.token).await?;
+
+        {
+            let path = if fid_path.is_empty() {
+                "/".to_string()
+            } else {
+                format!(
+                    "/{}",
+                    fid_path
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )
+            };
+            self.filesystem
+                .tracer
+                .emit_with_path(path, FileOperation::Fsync);
+        }
+
+        Ok(Message::Rfsync(Rfsync))
+    }
+
+    /// `.zerofs4`: return this connection's durability lineage token, so the client
+    /// can tag its writes and present it on a later verified fsync.
+    async fn getlineage(&self) -> P9Result<Message> {
+        Ok(Message::Rgetlineage(Rgetlineage {
+            token: self.filesystem.lineage_token,
+        }))
     }
 
     async fn statfs(&self, ts: Tstatfs) -> P9Result<Message> {
