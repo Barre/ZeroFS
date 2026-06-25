@@ -478,7 +478,7 @@ mod tests {
         let db_path = Path::from("data");
         store
             .put(
-                &db_path.child(WRAPPED_KEY_FILENAME),
+                &db_path.clone().join(WRAPPED_KEY_FILENAME),
                 PutPayload::from(Bytes::from_static(b"not a bincode wrapped key")),
             )
             .await
