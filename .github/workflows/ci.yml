@@ -1,0 +1,81 @@
+name: ci
+
+# Single entry point for the test suites that all run the same ci-profile ZeroFS
+# binary. The binary is built once (build job) and every suite downloads it as the
+# zerofs-ci-bin artifact instead of recompiling ZeroFS on its own runner. The suites
+# are reusable workflows (on: workflow_call) invoked here, so they share this run and
+# can see the artifact.
+#
+# Suites that need a different binary keep their own push/PR workflows and are NOT
+# wired in here: cross-compile (other targets + webui), release-pgo (release/PGO),
+# ffi (debug), rust (debug + tests), docker / csi-docker (released/cross binaries),
+# bench, webui, publish-client.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-ci-bin.yml
+
+  jepsen:
+    needs: build
+    uses: ./.github/workflows/jepsen.yml
+  jepsen-ha:
+    needs: build
+    uses: ./.github/workflows/jepsen-ha.yml
+
+  kernel-compile-9p:
+    needs: build
+    uses: ./.github/workflows/kernel-compile-9p.yml
+  kernel-compile-fuse:
+    needs: build
+    uses: ./.github/workflows/kernel-compile-fuse.yml
+  kernel-compile-nfs:
+    needs: build
+    uses: ./.github/workflows/kernel-compile-nfs.yml
+
+  pjdfstest:
+    needs: build
+    uses: ./.github/workflows/pjdfstest.yml
+  pjdfstest-9p:
+    needs: build
+    uses: ./.github/workflows/pjdfstest-9p.yml
+  pjdfstest-fuse:
+    needs: build
+    uses: ./.github/workflows/pjdfstest-fuse.yml
+
+  stress-ng:
+    needs: build
+    uses: ./.github/workflows/stress-ng.yml
+
+  xfstests-9p:
+    needs: build
+    uses: ./.github/workflows/xfstests-9p.yml
+  xfstests-fuse:
+    needs: build
+    uses: ./.github/workflows/xfstests-fuse.yml
+  xfstests-nfs:
+    needs: build
+    uses: ./.github/workflows/xfstests-nfs.yml
+
+  zfs-test:
+    needs: build
+    uses: ./.github/workflows/zfs-test.yml
+
+  csi-sanity:
+    needs: build
+    uses: ./.github/workflows/csi-sanity.yml
+  csi-e2e-k3s:
+    needs: build
+    uses: ./.github/workflows/csi-e2e-k3s.yml

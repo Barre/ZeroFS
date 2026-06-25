@@ -1,18 +1,10 @@
 name: jepsen
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   jepsen:
@@ -40,9 +32,12 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
 
       - name: Assemble local-fs (upstream @ pin + ZeroFS glue)
         run: |

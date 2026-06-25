@@ -1,0 +1,31 @@
+name: build-ci-bin
+
+# Builds the ci-profile zerofs + zerofs-csi binaries once and publishes them as the
+# zerofs-ci-bin artifact. ci.yml calls this first, then fans the test suites out over
+# the artifact so they download the binary instead of each recompiling ZeroFS on its
+# own runner. Reusable-only: it runs as part of the caller's run, so the artifact it
+# uploads is visible to the sibling suite jobs.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ZeroFS (ci profile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build zerofs and zerofs-csi
+        working-directory: zerofs
+        run: cargo build --profile ci -p zerofs -p zerofs-csi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: |
+            zerofs/target/ci/zerofs
+            zerofs/target/ci/zerofs-csi
+          if-no-files-found: error

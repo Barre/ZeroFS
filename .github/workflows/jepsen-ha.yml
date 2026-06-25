@@ -1,40 +1,14 @@
 name: jepsen-ha
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  # Build the ci-profile binary once and share it with every test job below, so the
-  # durability matrix does not rebuild ZeroFS ten times.
-  build:
-    name: Build ZeroFS (ci profile)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci/zerofs
-          if-no-files-found: error
-
   jepsen-ha:
     name: Run jepsen HA suite (leader/standby over MinIO)
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -130,7 +104,6 @@ jobs:
   # durability it cannot provide (ESTALE over a lost write, never a false success).
   durability:
     name: Durability (${{ matrix.scenario }})
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
