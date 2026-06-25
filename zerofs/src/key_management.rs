@@ -10,7 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -164,7 +164,7 @@ impl KeyManager {
 /// Get the path for the wrapped key file in object store
 fn wrapped_key_path(db_path: &Path) -> Path {
     let mut path = db_path.clone();
-    path = path.child(WRAPPED_KEY_FILENAME);
+    path = path.join(WRAPPED_KEY_FILENAME);
     path
 }
 
@@ -478,7 +478,7 @@ mod tests {
         let db_path = Path::from("data");
         store
             .put(
-                &db_path.child(WRAPPED_KEY_FILENAME),
+                &db_path.clone().join(WRAPPED_KEY_FILENAME),
                 PutPayload::from(Bytes::from_static(b"not a bincode wrapped key")),
             )
             .await

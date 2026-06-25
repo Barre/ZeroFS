@@ -483,29 +483,32 @@ The same RPC API also serves `zerofs fatrace` (per-operation tracing) and `zerof
 
 ZeroFS uses an LSM (Log-Structured Merge) tree as its storage engine. Compaction is a background process that merges sorted data files (SSTs) to reclaim space from deleted/updated data and improve read performance by reducing the number of files to search. This process is CPU and I/O intensive.
 
-By default, compaction runs within the main ZeroFS server. For demanding workloads, you can run a standalone compactor on a separate instance:
+Compaction is split into a **coordinator** (schedules compactions and commits their results; bound to the read-write database, so it runs only on the current leader) and **workers** (stateless processes that execute the scheduled jobs). By default `zerofs run` runs the coordinator with an embedded worker, so a single node compacts itself. For demanding workloads you can disable the embedded worker and offload execution to one or more standalone workers:
 
-**Start the writer without compaction:**
+**Keep the coordinator on the writer, but offload execution:**
 
 ```bash
 zerofs run -c zerofs.toml --no-compactor
 ```
 
-**Start the standalone compactor** (on the same or different machine):
+This keeps the coordinator scheduling and committing, but disables its embedded worker. At least one standalone worker must then be running, or compaction never executes.
+
+**Start one or more standalone workers** (on the same or different machines):
 
 ```bash
 zerofs compactor -c zerofs.toml
 ```
 
-Both instances access the same object storage backend.
+Workers are stateless and claim jobs from the shared object store, so you can run as many as you want to scale compaction throughput. All instances access the same object storage backend.
 
-**When to use a standalone compactor:**
+**When to offload compaction:**
 
-- **Reduce egress costs**: Run a small compactor instance in the same region/zone as your S3 bucket. Compaction reads and writes large amounts of data - keeping it in the same zone avoids cross-region data transfer fees while your main server can run anywhere.
-- **Isolate resource usage**: Compaction competes with user requests for CPU and I/O. Separating it prevents latency spikes during heavy compaction.
-- **Cost optimization**: Run the compactor on cheaper spot/preemptible instances since it can be safely interrupted.
+- **Horizontal scaling**: Run multiple workers to increase aggregate compaction throughput beyond a single node.
+- **Reduce egress costs**: Run workers in the same region/zone as your S3 bucket. Compaction reads and writes large amounts of data - keeping it in the same zone avoids cross-region data transfer fees while your main server can run anywhere.
+- **Isolate resource usage**: Compaction competes with user requests for CPU and I/O. Offloading it prevents latency spikes during heavy compaction.
+- **Cost optimization**: Run workers on cheaper spot/preemptible instances since they're stateless and can be safely interrupted.
 
-The compactor uses the same configuration file and respects `[lsm].max_concurrent_compactions` for parallelism.
+Workers use the same configuration file and respect `[lsm].max_concurrent_compactions` for parallelism.
 
 ### Separate WAL Object Store
 

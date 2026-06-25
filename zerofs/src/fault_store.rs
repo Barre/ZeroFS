@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
@@ -158,12 +158,22 @@ impl ObjectStore for FaultStore {
             meta,
             range,
             attributes,
+            extensions: Default::default(),
         })
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.check_writable("delete")?;
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        // A write partition fails every delete fast (one yield per input, as the
+        // provided `ObjectStoreExt::delete` and bulk callers expect).
+        if self.ctl.partition_writes.load(Ordering::SeqCst) {
+            return locations
+                .map(|loc| loc.and_then(|_| Err(Self::transient("delete"))))
+                .boxed();
+        }
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -174,20 +184,21 @@ impl ObjectStore for FaultStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
         self.check_writable("copy")?;
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.check_writable("copy_if_not_exists")?;
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
 
     #[tokio::test]

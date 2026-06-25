@@ -461,20 +461,28 @@ pub async fn build_slatedb(
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
+                dry_run: false,
             }),
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
+                dry_run: false,
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
+                dry_run: false,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
+                dry_run: false,
             }),
             detach_options: None,
+            // Disable WAL fence GC: it defaults to a dry-run that does nothing
+            // but logs a conservative-setting warning every interval. See #352.
+            wal_fence_options: None,
+            ..Default::default()
         }),
         ..Default::default()
     };
@@ -576,13 +584,26 @@ pub async fn build_slatedb(
                 builder = builder.with_wal_object_store(wal_store);
             }
 
-            if !disable_compactor {
+            // The compaction coordinator is bound to the read-write DB, so it runs
+            // only on the current leader. By default it also runs an
+            // embedded worker (self-sufficient, no external processes needed).
+            // `--no-compactor` keeps the coordinator scheduling and committing but
+            // drops the embedded worker, offloading execution to standalone
+            // `zerofs compactor` workers, at least one of which must then be
+            // running, or compaction stalls.
+            {
                 let scheduler_options: std::collections::HashMap<String, String> =
                     slatedb::config::SizeTieredCompactionSchedulerOptions {
                         max_compaction_sources: 16,
                         ..Default::default()
                     }
                     .into();
+                let worker =
+                    (!disable_compactor).then(|| slatedb::config::CompactionWorkerOptions {
+                        max_sst_size: 1024 * 1024 * 1024,
+                        max_fetch_tasks: 4,
+                        ..Default::default()
+                    });
                 let compactor = CompactorBuilder::new(db_path, compactor_object_store)
                     .with_runtime(maintenance_runtime.clone())
                     .with_filter_policies(crate::fs::filter_policy::filter_policies(
@@ -591,9 +612,8 @@ pub async fn build_slatedb(
                     .with_options(slatedb::config::CompactorOptions {
                         poll_interval: std::time::Duration::from_secs(1),
                         max_concurrent_compactions,
-                        max_sst_size: 1024 * 1024 * 1024,
-                        max_fetch_tasks: 4,
                         scheduler_options,
+                        worker,
                         ..Default::default()
                     });
 
@@ -619,6 +639,11 @@ pub async fn build_slatedb(
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
+            if segments_enabled {
+                reader_builder = reader_builder.with_segment_extractor(Arc::new(
+                    crate::segment_extractor::ZeroFsSegmentExtractor,
+                ));
+            }
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -642,6 +667,11 @@ pub async fn build_slatedb(
                 .with_checkpoint_id(checkpoint_id)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
+            if segments_enabled {
+                reader_builder = reader_builder.with_segment_extractor(Arc::new(
+                    crate::segment_extractor::ZeroFsSegmentExtractor,
+                ));
+            }
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }

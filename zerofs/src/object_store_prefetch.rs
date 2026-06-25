@@ -7,8 +7,9 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream};
 use object_store::path::Path;
 use object_store::{
-    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -302,9 +303,21 @@ impl PrefetchingObjectStore {
             || opts.if_modified_since.is_some()
             || opts.if_unmodified_since.is_some()
             || opts.version.is_some()
-            || opts.head
         {
             return self.inner.get_opts(location, opts).await;
+        }
+
+        if opts.head {
+            let meta = self.cached_head(location).await?;
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    stream::empty::<object_store::Result<Bytes>>().boxed(),
+                ),
+                range: 0..0,
+                attributes: Attributes::default(),
+                extensions: Default::default(),
+                meta,
+            });
         }
 
         let access_offset = self.range_start_offset(&opts.range);
@@ -333,6 +346,7 @@ impl PrefetchingObjectStore {
             meta,
             range,
             attributes,
+            extensions: Default::default(),
             payload: GetResultPayload::Stream(result_stream),
         })
     }
@@ -710,10 +724,6 @@ impl ObjectStore for PrefetchingObjectStore {
         self.cached_get_opts(location, options).await
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.cached_head(location).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
@@ -725,14 +735,6 @@ impl ObjectStore for PrefetchingObjectStore {
         Ok(result)
     }
 
-    async fn put_multipart(
-        &self,
-        location: &Path,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.invalidate(location);
-        self.inner.put_multipart(location).await
-    }
-
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -742,10 +744,21 @@ impl ObjectStore for PrefetchingObjectStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        let result = self.inner.delete(location).await;
-        self.invalidate(location);
-        result
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        // Invalidate each successfully deleted path's cached head as it passes.
+        let heads = self.heads.clone();
+        self.inner
+            .delete_stream(locations)
+            .map(move |res| {
+                if let Ok(path) = &res {
+                    heads.remove(path);
+                }
+                res
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -764,24 +777,26 @@ impl ObjectStore for PrefetchingObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let result = self.inner.copy(from, to).await;
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        let result = self.inner.copy_opts(from, to, options).await;
         self.invalidate(to);
         result
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let result = self.inner.rename(from, to).await;
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        let result = self.inner.rename_opts(from, to, options).await;
         self.invalidate(from);
         self.invalidate(to);
-        result
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let result = self.inner.copy_if_not_exists(from, to).await;
-        if result.is_ok() {
-            self.invalidate(to);
-        }
         result
     }
 }
@@ -790,6 +805,7 @@ impl ObjectStore for PrefetchingObjectStore {
 mod tests {
     use super::*;
     use foyer::{BlockEngineConfig, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig};
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 

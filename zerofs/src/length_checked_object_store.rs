@@ -3,8 +3,8 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
 };
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
@@ -66,6 +66,7 @@ impl ObjectStore for LengthCheckedObjectStore {
                     meta,
                     range,
                     attributes,
+                    extensions: Default::default(),
                 });
             }
 
@@ -103,14 +104,10 @@ impl ObjectStore for LengthCheckedObjectStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        self.inner.delete(location).await
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, object_store::Result<Path>>,
-    ) -> BoxStream<'a, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
         self.inner.delete_stream(locations)
     }
 
@@ -130,18 +127,29 @@ impl ObjectStore for LengthCheckedObjectStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -200,10 +208,14 @@ mod tests {
                 meta,
                 range,
                 attributes,
+                extensions: Default::default(),
             })
         }
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
         }
         fn list(
             &self,
@@ -217,11 +229,13 @@ mod tests {
         ) -> object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

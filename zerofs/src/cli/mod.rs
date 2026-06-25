@@ -40,7 +40,9 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
-        /// Run without the built-in compactor (use with external compactor)
+        /// Keep the compaction coordinator but disable its embedded worker,
+        /// offloading compaction execution to standalone `zerofs compactor`
+        /// worker(s), at least one of which must then be running
         #[arg(long)]
         no_compactor: bool,
     },
@@ -70,10 +72,11 @@ pub enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
-    /// Run standalone compactor for the database
+    /// Run a standalone compaction worker for the database
     ///
-    /// Use this to run compaction on a separate instance from the writer.
-    /// The writer should be started with --no-compactor flag.
+    /// Executes compaction jobs scheduled by the coordinator inside `zerofs run`.
+    /// Run one or more alongside the writer; pair with `zerofs run --no-compactor`
+    /// to move all compaction execution off the writer.
     Compactor {
         #[arg(short, long)]
         config: PathBuf,

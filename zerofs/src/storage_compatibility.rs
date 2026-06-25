@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use object_store::{Error, ObjectStore, PutMode, PutOptions, path::Path};
+use object_store::{Error, ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -10,14 +10,14 @@ pub async fn check_if_match_support(
     db_path: &str,
 ) -> anyhow::Result<()> {
     // Clean up any old test files from previous runs (best effort)
-    let prefix_path = Path::from(db_path).child(TEST_FILE_PREFIX);
+    let prefix_path = Path::from(db_path).join(TEST_FILE_PREFIX);
     let mut list = object_store.list(Some(&prefix_path));
     while let Some(Ok(meta)) = list.next().await {
         let _ = object_store.delete(&meta.location).await;
     }
 
     let test_id = Uuid::new_v4();
-    let test_path = Path::from(db_path).child(format!("{}{}", TEST_FILE_PREFIX, test_id));
+    let test_path = Path::from(db_path).join(format!("{}{}", TEST_FILE_PREFIX, test_id));
 
     tracing::info!("Checking storage provider compatibility (conditional writes for fencing)...");
 
@@ -46,7 +46,7 @@ pub async fn check_if_match_support(
             PutMode::Create succeeded when it should have failed. \
             This feature is required for fencing in ZeroFS."
         )),
-        Err(Error::NotImplemented) => Err(anyhow::anyhow!(
+        Err(Error::NotImplemented { .. }) => Err(anyhow::anyhow!(
             "Storage provider does not support conditional writes (PutMode::Create). \
             This feature is required for fencing in ZeroFS."
         )),

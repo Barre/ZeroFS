@@ -500,6 +500,7 @@ impl ZeroFS {
             DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await?,
         );

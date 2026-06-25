@@ -6,18 +6,19 @@ use crate::parse_object_store::parse_url_opts;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
-use slatedb::CompactorBuilder;
-use slatedb::config::CompactorOptions;
+use slatedb::CompactionWorkerBuilder;
 use slatedb::object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Run standalone compactor for the database.
+/// Run a standalone compaction worker for the database.
 ///
-/// This runs compaction operations without starting a full ZeroFS server.
-/// Use this to offload compaction to a separate instance from the writer.
-/// The writer should be started with `--no-compactor` flag.
+/// A worker executes compaction jobs scheduled by the coordinator (which runs
+/// inside `zerofs run`, bound to the read-write DB); it holds no epoch and is
+/// safe to run many of in parallel. Pair with `zerofs run --no-compactor` to
+/// offload all compaction execution off the writer, or run alongside a default
+/// `zerofs run` for extra capacity.
 pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -27,7 +28,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!("Starting standalone compactor");
+    info!("Starting standalone compaction worker");
 
     let settings = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
@@ -72,28 +73,25 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
 
     info!("Max concurrent compactions: {}", max_concurrent_compactions);
 
-    let scheduler_options: std::collections::HashMap<String, String> =
-        slatedb::config::SizeTieredCompactionSchedulerOptions {
-            max_compaction_sources: 16,
-            ..Default::default()
-        }
-        .into();
-    let compactor_options = CompactorOptions {
-        poll_interval: std::time::Duration::from_secs(1),
+    // A stateless compaction worker: it claims and executes jobs from
+    // `.compactions` but never schedules or commits to the manifest, that is the
+    // coordinator's job, which lives with the read-write DB in `zerofs run`. The
+    // worker carries the same block transformer and filter policies as the writer
+    // so its output SSTs match (and, for encrypted volumes, are written correctly).
+    let worker_options = slatedb::config::CompactionWorkerOptions {
         max_concurrent_compactions,
         max_sst_size: 1024 * 1024 * 1024,
         max_fetch_tasks: 8,
-        sst_block_size: slatedb::SstBlockSize::Block32Kib,
-        scheduler_options,
         ..Default::default()
     };
 
     let compactor = Arc::new(
-        CompactorBuilder::new(db_path, object_store)
-            .with_options(compactor_options)
+        CompactionWorkerBuilder::new(db_path, object_store)
+            .with_options(worker_options)
             .with_block_transformer(block_transformer)
             .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
-            .build(),
+            .build()
+            .await?,
     );
 
     let compactor_clone = compactor.clone();

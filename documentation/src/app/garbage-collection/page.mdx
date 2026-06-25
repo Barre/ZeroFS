@@ -80,7 +80,7 @@ Immediate deletion does not mean immediate compaction, and does not mean immedia
 
 SSTs are immutable: once written, an SST is never modified in place. Writes and deletes accumulate as new entries in new SSTs, so the LSM tree holds overlapping data across levels — older versions of keys, deleted entries, and the delete markers that shadow them.
 
-Compaction merges a set of SSTs into new SSTs, keeping the live version of each key and dropping deleted and superseded entries. It runs in the background, either inside the writer process or on a [standalone compactor](/standalone-compactor). The compactor polls for eligible work every 1 second; whether a compaction runs is decided by a size-tiered scheduler from the sizes and counts of accumulated SSTs, not by deletions. Until compaction rewrites the SSTs that contain a deleted file's chunks, those bytes remain in the bucket.
+Compaction merges a set of SSTs into new SSTs, keeping the live version of each key and dropping deleted and superseded entries. A coordinator in the writer process polls for eligible work every 1 second and decides whether a compaction runs via a size-tiered scheduler from the sizes and counts of accumulated SSTs, not by deletions; the work is executed by an embedded worker or, with `--no-compactor`, by [standalone workers](/standalone-compactor). Until compaction rewrites the SSTs that contain a deleted file's chunks, those bytes remain in the bucket.
 
 ## Stage 3: Object Garbage Collection
 
@@ -94,11 +94,11 @@ This is the only stage that removes objects from the bucket. The bucket's billed
 |----------|--------------|------------|-----------------|
 | Read-write | yes | yes | yes |
 | Read-write with `--no-compactor` | yes | no | yes |
-| Standalone compactor | no | yes | no |
+| Standalone worker | no | yes | no |
 | Read-only mount | no | no | no |
 | Checkpoint mount | no | no | no |
 
-A [standalone compactor](/standalone-compactor) rewrites SSTs but never deletes objects; object deletion stays with the writer. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run none of the three stages. The bucket shrinks only while the read-write instance is running.
+A [standalone worker](/standalone-compactor) rewrites SSTs but never deletes objects; both scheduling and object deletion stay with the writer. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run none of the three stages. The bucket shrinks only while the read-write instance is running.
 
 ## Observability
 

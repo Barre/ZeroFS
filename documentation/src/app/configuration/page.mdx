@@ -68,7 +68,7 @@ Full `https://` URLs are routed by host suffix. Hosts ending in `amazonaws.com` 
 A scheme selects the backend only. Credentials come from the `[aws]`, `[azure]`, or `[gcp]` table regardless of which alias is used.
 
 <Note>
-`memory:///` keeps all data in process memory: the store starts empty, everything is lost when the process exits, and it cannot be shared with a standalone compactor. Use it for throwaway testing only.
+`memory:///` keeps all data in process memory: the store starts empty, everything is lost when the process exits, and it cannot be shared with a standalone compaction worker. Use it for throwaway testing only.
 </Note>
 
 ### AWS S3
