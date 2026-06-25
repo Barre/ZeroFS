@@ -55,7 +55,7 @@ mod tests {
     use super::*;
     use tokio::sync::watch;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn takes_over_only_after_observed_then_silent() {
         let (live_tx, live_rx) = watch::channel(0u64);
         let (_sd_tx, sd_rx) = watch::channel(false);
@@ -92,7 +92,7 @@ mod tests {
     }
 
     // A shutdown before any takeover stands the standby down (`Ok(false)`).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn shutdown_stands_down() {
         let (_live_tx, live_rx) = watch::channel(0u64);
         let (sd_tx, sd_rx) = watch::channel(false);

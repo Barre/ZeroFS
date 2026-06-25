@@ -30,6 +30,9 @@ mod telemetry;
 mod webui;
 
 #[cfg(test)]
+mod fault_store;
+
+#[cfg(test)]
 mod test_helpers;
 
 #[cfg(test)]

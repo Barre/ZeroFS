@@ -277,7 +277,7 @@ mod tests {
         ReplOp::Put(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn ships_buffers_prunes_and_fences_stale_epoch() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let endpoint = spawn_receiver(buffer.clone()).await;
@@ -309,7 +309,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn heartbeats_tick_liveness_and_stop_on_break() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let receiver = ReplicationReceiver::new(
@@ -358,7 +358,7 @@ mod tests {
     // tail. A later takeover replays in seqno order, so the stale term-5 batches
     // (high seqno) replay AFTER the term-6 write (low seqno) and must not clobber
     // it. seqno is per-term, not global, so the buffer must drop a superseded epoch.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn stale_prior_epoch_tail_does_not_clobber_newer_writes() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let endpoint = spawn_receiver(buffer.clone()).await;

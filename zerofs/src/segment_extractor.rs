@@ -69,3 +69,114 @@ pub async fn should_enable_segments(
         Some(manifest) => Ok(manifest.segment_extractor_name().is_some()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::key_codec::KeyCodec;
+    use bytes::Bytes;
+    use slatedb::DbBuilder;
+    use slatedb::object_store::memory::InMemory;
+
+    #[test]
+    fn extractor_name_is_stable() {
+        // The name is persisted into the manifest and checked on every reopen, so a
+        // change here would refuse to open existing volumes.
+        assert_eq!(ZeroFsSegmentExtractor.name(), EXTRACTOR_NAME);
+        assert_eq!(EXTRACTOR_NAME, "zerofs-meta-chunk-v1");
+    }
+
+    #[test]
+    fn extractor_routes_meta_and_chunk_domains() {
+        let ex = ZeroFsSegmentExtractor;
+        let meta = Bytes::from_static(b"metaXYZ");
+        let chunk = Bytes::from_static(b"chunkXYZ");
+
+        // Point and Prefix targets route identically.
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Point(meta.clone())),
+            Some(META_DOMAIN.len())
+        );
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Prefix(meta)),
+            Some(META_DOMAIN.len())
+        );
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Point(chunk.clone())),
+            Some(CHUNK_DOMAIN.len())
+        );
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Prefix(chunk)),
+            Some(CHUNK_DOMAIN.len())
+        );
+
+        // A key in neither domain (a v1/legacy key, or empty) routes nowhere.
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Point(Bytes::from_static(b"\x01legacy"))),
+            None
+        );
+        assert_eq!(ex.prefix_len(&PrefixTarget::Point(Bytes::new())), None);
+    }
+
+    // The extractor must agree with the v2 KeyCodec: real metadata keys land in the
+    // meta segment and real chunk keys in the chunk segment, the isolation the whole
+    // segmented layout depends on.
+    #[test]
+    fn extractor_matches_real_v2_keys() {
+        let ex = ZeroFsSegmentExtractor;
+        let codec = KeyCodec::new(true);
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Point(codec.inode_key(1))),
+            Some(META_DOMAIN.len())
+        );
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Point(codec.tombstone_key(0, 1))),
+            Some(META_DOMAIN.len())
+        );
+        assert_eq!(
+            ex.prefix_len(&PrefixTarget::Point(codec.chunk_key(1, 0))),
+            Some(CHUNK_DOMAIN.len())
+        );
+    }
+
+    #[tokio::test]
+    async fn should_enable_segments_is_true_for_a_fresh_store() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        assert!(
+            should_enable_segments(&store, &Path::from("fresh"), None)
+                .await
+                .unwrap(),
+            "a store with no manifest yet must enable segments"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_enable_segments_is_true_for_a_db_built_with_the_extractor() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("segmented");
+        let db = DbBuilder::new(path.clone(), store.clone())
+            .with_segment_extractor(Arc::new(ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        assert!(should_enable_segments(&store, &path, None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn should_enable_segments_is_false_for_a_legacy_db() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("legacy");
+        let db = DbBuilder::new(path.clone(), store.clone())
+            .build()
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        assert!(
+            !should_enable_segments(&store, &path, None).await.unwrap(),
+            "a pre-segmentation volume must keep opening without segments"
+        );
+    }
+}
