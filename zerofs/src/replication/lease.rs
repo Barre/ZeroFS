@@ -97,4 +97,76 @@ mod tests {
         lease.invalidate();
         assert!(!lease.is_valid(), "invalidate revokes immediately");
     }
+
+    async fn open_db(name: &str) -> slatedb::Db {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        slatedb::DbBuilder::new(object_store::path::Path::from(name), store)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn wait_valid(lease: &Lease, want: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lease.is_valid() != want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("lease did not reach is_valid()={want}"));
+    }
+
+    // A healthy data db keeps the lease renewed; a shutdown signal stops the driver
+    // cleanly (without revoking).
+    #[tokio::test]
+    async fn run_lease_renews_from_a_healthy_db_and_stops_on_shutdown() {
+        let db = open_db("lease-healthy").await;
+        let lease = Lease::new();
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_lease_from_status(
+            lease.clone(),
+            db.subscribe(),
+            Duration::from_millis(20),
+            Duration::from_millis(500),
+            sd_rx,
+        ));
+
+        wait_valid(&lease, true).await;
+
+        sd_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver must stop on shutdown")
+            .unwrap();
+
+        db.close().await.unwrap();
+    }
+
+    // When the data db closes (a takeover fences it, surfacing as a close_reason),
+    // the driver revokes the lease so a deposed leader stops serving stale reads.
+    #[tokio::test]
+    async fn run_lease_revokes_when_the_db_closes() {
+        let db = open_db("lease-closed").await;
+        let lease = Lease::new();
+        // Keep the shutdown sender alive so the only exit is the db closing.
+        let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_lease_from_status(
+            lease.clone(),
+            db.subscribe(),
+            Duration::from_millis(20),
+            Duration::from_millis(500),
+            sd_rx,
+        ));
+
+        wait_valid(&lease, true).await;
+
+        db.close().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the driver must return once the db closes")
+            .unwrap();
+        assert!(!lease.is_valid(), "a closed db must revoke the lease");
+    }
 }

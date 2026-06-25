@@ -179,7 +179,7 @@ mod tests {
         assert!(r.pending.lock().unwrap().is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn ship_is_solo_when_disconnected() {
         let r = Replicator::new("http://127.0.0.1:1".to_string(), 0);
         assert_eq!(
@@ -187,5 +187,175 @@ mod tests {
             None,
             "with no standby connected, ship must run solo (None)"
         );
+    }
+
+    use crate::dedup::DedupCache;
+    use crate::replication::tail::TailBuffer;
+    use crate::replication::transport::ReplicationReceiver;
+    use std::sync::atomic::AtomicBool;
+    use tokio::net::TcpListener;
+
+    /// A running receiver. Hold it to keep the standby up; `stop()` it (or drop it)
+    /// to model a standby outage that closes the existing connection.
+    struct ServerHandle {
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        join: tokio::task::JoinHandle<()>,
+    }
+
+    impl ServerHandle {
+        /// Shut down gracefully and wait for connections to close, so a subsequent
+        /// ship on the old connection is guaranteed to fail.
+        async fn stop(self) {
+            let _ = self.shutdown.send(());
+            let _ = self.join.await;
+        }
+    }
+
+    /// Stand up a real receiver over a loopback socket. Returns its endpoint, the
+    /// shared tail buffer, and a handle controlling the server's lifetime.
+    async fn spawn_receiver() -> (String, Arc<Mutex<TailBuffer>>, ServerHandle) {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ReplicationReceiver::new(
+            buffer.clone(),
+            Arc::new(DedupCache::new(64)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .into_server();
+        let (shutdown, rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await;
+        });
+        (
+            format!("http://{addr}"),
+            buffer,
+            ServerHandle { shutdown, join },
+        )
+    }
+
+    async fn connect(endpoint: &str) -> ReplicationSender {
+        for _ in 0..100 {
+            if let Ok(s) = ReplicationSender::connect(endpoint.to_string()).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("could not connect to receiver");
+    }
+
+    fn put() -> [ReplOp; 1] {
+        [ReplOp::Put("k".into(), "v".into())]
+    }
+
+    #[tokio::test]
+    async fn ship_assigns_increasing_seqnos_and_buffers_on_the_standby() {
+        let (endpoint, buffer, _server) = spawn_receiver().await;
+        let r = Replicator::new(endpoint.clone(), 7);
+        *r.sender.lock().await = Some(connect(&endpoint).await);
+
+        assert_eq!(r.ship(&put(), &[]).await, Some(1));
+        assert_eq!(r.ship(&put(), &[]).await, Some(2));
+
+        let seqnos: Vec<u64> = buffer
+            .lock()
+            .await
+            .batches_in_order()
+            .map(|(s, _)| s)
+            .collect();
+        assert_eq!(
+            seqnos,
+            vec![1, 2],
+            "shipped batches land on the standby in order"
+        );
+    }
+
+    // A seqno is consumed only by a real ship, so they stay contiguous per term: a
+    // solo write must not burn one (else a later takeover replays with a gap).
+    #[tokio::test]
+    async fn solo_ship_does_not_consume_a_seqno() {
+        let (endpoint, _buffer, _server) = spawn_receiver().await;
+        let r = Replicator::new(endpoint.clone(), 1);
+
+        assert_eq!(r.ship(&put(), &[]).await, None, "no sender yet: solo");
+
+        *r.sender.lock().await = Some(connect(&endpoint).await);
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            Some(1),
+            "first real ship is seqno 1"
+        );
+    }
+
+    // A standby outage must not block writes: a failed ship downgrades to solo
+    // (clears the sender) and the write still completes single-node durable.
+    #[tokio::test]
+    async fn ship_downgrades_to_solo_when_the_standby_is_unreachable() {
+        let (endpoint, _buffer, server) = spawn_receiver().await;
+        let r = Replicator::new(endpoint.clone(), 1);
+        *r.sender.lock().await = Some(connect(&endpoint).await);
+        assert_eq!(r.ship(&put(), &[]).await, Some(1));
+
+        server.stop().await;
+        assert_eq!(r.ship(&put(), &[]).await, None, "a failed ship runs solo");
+        assert!(
+            r.sender.lock().await.is_none(),
+            "a failed ship must clear the sender so reconnect can re-establish it"
+        );
+    }
+
+    // A deposed leader's ship is rejected by the standby (its epoch is below the
+    // highest seen). The leader must downgrade, not loop re-shipping a rejected batch.
+    #[tokio::test]
+    async fn ship_downgrades_to_solo_on_stale_epoch_rejection() {
+        let (endpoint, _buffer, _server) = spawn_receiver().await;
+        // A newer leader (epoch 5) ships first, bumping the receiver's highest epoch.
+        let newer = connect(&endpoint).await;
+        assert!(
+            newer
+                .ship(1, &[ReplOp::Put("a".into(), "b".into())], &[], 0, 5)
+                .await
+                .unwrap()
+        );
+
+        let r = Replicator::new(endpoint.clone(), 1);
+        *r.sender.lock().await = Some(connect(&endpoint).await);
+        assert_eq!(r.ship(&put(), &[]).await, None, "a rejected ship runs solo");
+        assert!(
+            r.sender.lock().await.is_none(),
+            "a rejected ship must clear the sender"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reconnect_reestablishes_the_sender() {
+        let (endpoint, _buffer, _server) = spawn_receiver().await;
+        let r = Replicator::new(endpoint.clone(), 1);
+        assert!(r.sender.lock().await.is_none(), "starts solo");
+
+        let recon = tokio::spawn(run_reconnect(Arc::downgrade(&r)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while r.sender.lock().await.is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run_reconnect must establish the sender to a reachable standby");
+
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            Some(1),
+            "shipping resumes after reconnect"
+        );
+        recon.abort();
     }
 }

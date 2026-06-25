@@ -127,7 +127,7 @@ mod tests {
     // A deposed leader cannot corrupt shared data: a newer writer has bumped the
     // epoch, so the zombie's flush is fenced (terminal). Committed data is the
     // new leader's.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn deposed_leader_is_fenced_and_cannot_corrupt() {
         let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let (zombie_store, isolated) = ZombieObjectStore::new(inner.clone());

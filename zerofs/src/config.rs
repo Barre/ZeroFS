@@ -1343,4 +1343,99 @@ sync_writes = true"#,
         let err = format!("{:#}", write_and_load(&content).unwrap_err());
         assert!(err.contains("contradictory"), "got: {err}");
     }
+
+    #[test]
+    fn compression_config_serializes_to_canonical_strings() {
+        assert_eq!(
+            serde_json::to_string(&CompressionConfig::Lz4).unwrap(),
+            "\"lz4\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CompressionConfig::Zstd(7)).unwrap(),
+            "\"zstd-7\""
+        );
+    }
+
+    #[test]
+    fn compression_config_parses_valid_strings() {
+        let parse = |s: &str| serde_json::from_str::<CompressionConfig>(s).unwrap();
+        assert_eq!(parse("\"lz4\""), CompressionConfig::Lz4);
+        assert_eq!(parse("\"zstd-1\""), CompressionConfig::Zstd(1));
+        assert_eq!(parse("\"zstd-22\""), CompressionConfig::Zstd(22));
+    }
+
+    #[test]
+    fn compression_config_round_trips() {
+        for cfg in [
+            CompressionConfig::Lz4,
+            CompressionConfig::Zstd(1),
+            CompressionConfig::Zstd(3),
+            CompressionConfig::Zstd(22),
+        ] {
+            let s = serde_json::to_string(&cfg).unwrap();
+            assert_eq!(serde_json::from_str::<CompressionConfig>(&s).unwrap(), cfg);
+        }
+    }
+
+    #[test]
+    fn compression_config_rejects_bad_strings() {
+        for bad in [
+            "\"zstd-0\"",   // below the 1..=22 range
+            "\"zstd-23\"",  // above the range
+            "\"zstd-abc\"", // non-numeric level
+            "\"zstd-\"",    // missing level
+            "\"gzip\"",     // unknown algorithm
+            "\"\"",         // empty
+        ] {
+            assert!(
+                serde_json::from_str::<CompressionConfig>(bad).is_err(),
+                "expected {bad} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn compression_config_default_is_zstd_3() {
+        assert_eq!(CompressionConfig::default(), CompressionConfig::Zstd(3));
+    }
+
+    #[test]
+    fn replication_role_round_trips() {
+        for role in [ReplicationRole::Leader, ReplicationRole::Standby] {
+            let s = serde_json::to_string(&role).unwrap();
+            assert_eq!(serde_json::from_str::<ReplicationRole>(&s).unwrap(), role);
+        }
+        assert_eq!(
+            serde_json::to_string(&ReplicationRole::Standby).unwrap(),
+            "\"standby\""
+        );
+    }
+
+    // Asymmetric (peers set, listen unset) is usable for the initial role, so it
+    // validates with only a degraded-HA warning rather than an error.
+    #[test]
+    fn replication_leader_with_peers_but_no_listen_validates() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+peers = ["127.0.0.1:5600"]"#,
+        );
+        let repl = write_and_load(&content).unwrap().replication.unwrap();
+        assert!(repl.replication_listen.is_none());
+        assert_eq!(repl.peers, vec!["127.0.0.1:5600".to_string()]);
+    }
+
+    #[test]
+    fn replication_empty_peer_entry_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+replication_listen = "127.0.0.1:5599"
+peers = ["127.0.0.1:5600", ""]"#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("empty entry"), "got: {err}");
+    }
 }
