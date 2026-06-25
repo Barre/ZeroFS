@@ -124,6 +124,13 @@ pub enum Commands {
         /// Pass `--writeback false` to write through synchronously instead.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         writeback: bool,
+        /// Allow consistency-relaxing client/kernel caches for speed: the
+        /// open+read prefetch fold, cached symlink targets, a 1s attribute cache,
+        /// and page-cached reads. Pass `--relaxed-consistency false` for strict
+        /// consistency, where every read and lookup hits the server (direct I/O,
+        /// no attribute cache) and writes are synchronous (implies write-through).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        relaxed_consistency: bool,
         /// Root the mount at this server-side directory (a path from the
         /// filesystem root, e.g. /volumes/pvc-1) instead of the whole
         /// filesystem. The directory must already exist.

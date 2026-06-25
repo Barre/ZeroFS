@@ -22,6 +22,15 @@ pub const VERSION_9P2000L_ZEROFS3: &[u8] = b"9P2000.L.zerofs3";
 /// A server with `ignore_fsync` set never offers this, so a verified client is
 /// never handed a hollow OK.
 pub const VERSION_9P2000L_ZEROFS4: &[u8] = b"9P2000.L.zerofs4";
+/// `.zerofs5`: folds a file open and its first read into one round trip.
+/// Tlopenatread opens `fid`'s inode on a fresh `newfid` (exactly like Tlopenat)
+/// and also returns up to `count` bytes from offset 0, so reading a file that
+/// fits in the prefetch window needs no follow-up Tread. The inline read is
+/// best-effort and never affects the open: on a read error the reply carries the
+/// open result with empty data, and the client issues a normal Tread. Implies
+/// `.zerofs4` (the levels are cumulative), so an `ignore_fsync` server, which
+/// caps at `.zerofs3`, does not offer it.
+pub const VERSION_9P2000L_ZEROFS5: &[u8] = b"9P2000.L.zerofs5";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -80,6 +89,11 @@ pub const P9_IOHDRSZ: u32 = (P9_HEADER_SIZE + P9_COUNT_FIELD_LEN) as u32;
 /// header + fid[4] + offset[8] + count[4]. A Twrite carrying `count` bytes is
 /// `P9_TWRITE_HDR + count` bytes on the wire and must not exceed the msize.
 pub const P9_TWRITE_HDR: u32 = (P9_HEADER_SIZE + 4 + 8 + P9_COUNT_FIELD_LEN) as u32;
+/// Wire overhead of an Rlopenatread reply preceding its data payload:
+/// header + qid[13] + iounit[4] + eof[1] + count[4]. This is 18 bytes larger than
+/// `P9_IOHDRSZ` (the extra qid+iounit+eof), so the `.zerofs5` open+read fold must
+/// clamp its prefetch with this, not `P9_IOHDRSZ`, to respect a small msize.
+pub const P9_RLOPENATREAD_HDR: u32 = (P9_HEADER_SIZE + 13 + 4 + 1 + P9_COUNT_FIELD_LEN) as u32;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
 pub const P9_MAX_GROUPS: usize = 16;
@@ -612,6 +626,38 @@ pub struct Rlopenat {
     pub iounit: u32,
 }
 
+// Tlopenatread = Tlopenat + Tread(offset 0, count), negotiated via ".zerofs5".
+// Opens `fid`'s inode on `newfid` and prefetches the start of the file in the
+// same round trip. The read is best-effort: the server returns whatever it could
+// read (possibly nothing) without failing the open.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tlopenatread {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub newfid: u32,
+    #[deku(endian = "little")]
+    pub flags: u32,
+    /// Bytes to prefetch from offset 0. The server clamps this to fit msize.
+    #[deku(endian = "little")]
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rlopenatread {
+    pub qid: Qid,
+    #[deku(endian = "little")]
+    pub iounit: u32,
+    /// 1 when `data` reaches end of file (the whole file fit in `count`), so the
+    /// client may serve the file's reads entirely from `data`; 0 otherwise, when
+    /// the client discards the partial prefetch and reads normally.
+    pub eof: u8,
+    #[deku(endian = "little", update = "self.data.len()")]
+    pub count: u32,
+    #[deku(ctx = "count")]
+    pub data: DekuBytes,
+}
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Tlcreateattr {
     #[deku(endian = "little")]
@@ -1009,6 +1055,11 @@ pub enum Message {
     Tlopenat(Tlopenat),
     #[deku(id = "237")]
     Rlopenat(Rlopenat),
+    // .zerofs5 open+first-read fold.
+    #[deku(id = "230")]
+    Tlopenatread(Tlopenatread),
+    #[deku(id = "231")]
+    Rlopenatread(Rlopenatread),
     #[deku(id = "T_LCREATEATTR")]
     Tlcreateattr(Tlcreateattr),
     #[deku(id = "239")]
@@ -1250,6 +1301,8 @@ impl P9Message {
             Message::Rstatfs(_) => 9,
             Message::Tlopenat(_) => 236,
             Message::Rlopenat(_) => 237,
+            Message::Tlopenatread(_) => 230,
+            Message::Rlopenatread(_) => 231,
             Message::Tlcreateattr(_) => T_LCREATEATTR,
             Message::Rlcreateattr(_) => 239,
             Message::Tmkdirattr(_) => T_MKDIRATTR,

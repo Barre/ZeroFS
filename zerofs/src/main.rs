@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
             access,
             msize,
             writeback,
+            relaxed_consistency,
             aname,
         } => {
             let opts = mount::MountOptions {
@@ -166,6 +167,7 @@ async fn main() -> Result<()> {
                 read_only,
                 access,
                 writeback,
+                relaxed_consistency,
                 aname: aname.unwrap_or_default(),
             };
             if let Err(e) = mount::run(target, mountpoint, opts).await {
