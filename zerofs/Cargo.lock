@@ -2409,7 +2409,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "ninep-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2427,7 +2427,7 @@ dependencies = [
 
 [[package]]
 name = "ninep-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "deku",
@@ -5906,7 +5906,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-client"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -5945,7 +5945,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-ffi"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
