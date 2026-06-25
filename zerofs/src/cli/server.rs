@@ -479,6 +479,9 @@ pub async fn build_slatedb(
                 dry_run: false,
             }),
             detach_options: None,
+            // Disable WAL fence GC: it defaults to a dry-run that does nothing
+            // but logs a conservative-setting warning every interval. See #352.
+            wal_fence_options: None,
             ..Default::default()
         }),
         ..Default::default()
