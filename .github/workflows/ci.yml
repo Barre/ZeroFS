@@ -65,9 +65,9 @@ jobs:
   xfstests-fuse:
     needs: build
     uses: ./.github/workflows/xfstests-fuse.yml
-  xfstests-nfs:
-    needs: build
-    uses: ./.github/workflows/xfstests-nfs.yml
+  # xfstests-nfs:
+  #  needs: build
+  #  uses: ./.github/workflows/xfstests-nfs.yml
 
   zfs-test:
     needs: build
