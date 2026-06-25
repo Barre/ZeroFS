@@ -61,11 +61,11 @@ console-subscriber = { version = "0.5", optional = true }
 # default-features = false drops slatedb's default `aws` feature, which would
 # pull `object_store/aws` (and thus aws-lc-rs); we re-add `foyer` (the cache we
 # use) and keep our crypto provider on `ring`. See the object_store dep below.
-slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "9222d8799f9999e66ab5dbf7f762279f11097442", default-features = false, features = [
+slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "7e2ceb7c9f296ae84a6deedcb55d572ec1915092", default-features = false, features = [
     "wal_disable",
     "foyer",
 ] }
-slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "9222d8799f9999e66ab5dbf7f762279f11097442" }
+slatedb-common = { git = "https://github.com/Barre/slatedb.git", rev = "7e2ceb7c9f296ae84a6deedcb55d572ec1915092" }
 zerofs_nfsserve = "0.19.1"
 tikv-jemallocator = "0.7"
 tikv-jemalloc-ctl = { version = "0.7", features = [
