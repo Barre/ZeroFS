@@ -142,6 +142,13 @@ impl File {
             return Ok(());
         }
         let (session, guard) = rc.fc.reopen_handle(&rc.path, &rc.opts).await?;
+        // Carry this handle's un-fsync'd `.zerofs4` durability obligation from the
+        // failed connection's fid onto the freshly re-opened one, so a verified fsync
+        // after the re-route still verifies the write (and ESTALEs if its lineage broke)
+        // instead of treating the fresh handle as clean.
+        if let Some(token) = failed.session.client.unsynced_oldest(failed.guard.fid()) {
+            session.client.seed_unsynced(guard.fid(), token);
+        }
         self.bound.store(Arc::new(Bound { session, guard }));
         Ok(())
     }
@@ -212,6 +219,13 @@ impl File {
     }
 
     /// Flush data and metadata to durable (S3-backed) storage.
+    ///
+    /// Against a `.zerofs4` server this is a verified fsync: success means every write
+    /// acked on this handle before it is durable and survives any failover. If the
+    /// durability lineage broke (a failover the surviving node could not prove it
+    /// inherited), it returns [`ZeroFsError::Stale`] rather than report success: treat
+    /// the prior writes as lost, redo them, and call `sync_all` again. A pre-`.zerofs4`
+    /// server gives a plain, unverified flush.
     pub async fn sync_all(&self) -> Result<(), ZeroFsError> {
         let path = self.path.clone();
         self.with_binding(move |session, fid| {
@@ -221,7 +235,9 @@ impl File {
         .await
     }
 
-    /// Flush file data only.
+    /// Flush file data only. Like [`Self::sync_all`] this is verified against a
+    /// `.zerofs4` server: it returns [`ZeroFsError::Stale`] if the prior writes' lineage
+    /// broke, rather than report success.
     pub async fn sync_data(&self) -> Result<(), ZeroFsError> {
         let path = self.path.clone();
         self.with_binding(move |session, fid| {

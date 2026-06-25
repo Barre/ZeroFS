@@ -54,6 +54,16 @@ const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // batch so a promoted standby can prune its tail to exactly what the db already
 // holds (see write_coordinator + takeover replay).
 const SYSTEM_HA_SEQNO_SUBTYPE: u8 = 0x02;
+// Durability lineage token (see fsync-honesty / ZeroFS::lineage_token). A single
+// u64 identifying the current unbroken durable lineage. Regenerated at a cold
+// bootstrap or a Solo-tainted takeover; carried forward unchanged at an untainted
+// takeover (so a clean failover keeps a client's fsync transparent).
+const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
+// Solo taint: set to the lineage token that was live when the leader first
+// downgraded to Solo replication. A takeover reads it to decide keep-vs-regenerate
+// the lineage token (taint == stored lineage => the lineage may be missing acked
+// Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
+const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -321,6 +331,33 @@ impl KeyCodec {
         v.extend_from_slice(&writer_epoch.to_le_bytes());
         v.extend_from_slice(&seqno.to_le_bytes());
         Bytes::from(v)
+    }
+
+    /// Key for the durability lineage token (a single u64).
+    pub fn lineage_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_LINEAGE_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    /// Key for the Solo taint (the lineage token that went Solo).
+    pub fn taint_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_TAINT_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    pub fn encode_u64(value: u64) -> Bytes {
+        Bytes::copy_from_slice(&value.to_le_bytes())
+    }
+
+    pub fn decode_u64(data: &[u8]) -> Option<u64> {
+        if data.len() != U64_SIZE {
+            return None;
+        }
+        Some(u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?))
     }
 
     /// Returns `(writer_epoch, seqno)`.

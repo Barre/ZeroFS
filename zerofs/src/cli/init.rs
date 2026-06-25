@@ -525,7 +525,7 @@ impl Replayed {
     async fn into_filesystem(self, settings: &Settings) -> Result<InitResult> {
         let DbOpen {
             prepared,
-            ha: _,
+            ha,
             slatedb,
             db_handle,
             maintenance_runtime,
@@ -533,6 +533,15 @@ impl Replayed {
             sync_writes,
             ignore_fsync,
         } = self.0;
+
+        // A live-standby takeover iff we observed a live leader's epoch on the
+        // replication stream (ships/heartbeats) before promoting. A cold bootstrap /
+        // config leader / single node observed none (highest_epoch stays 0), so it
+        // regenerates the durability lineage rather than carrying a stale one forward.
+        let is_live_takeover = ha
+            .as_ref()
+            .and_then(|h| h.highest_epoch.as_ref())
+            .is_some_and(|e| e.load(Ordering::Relaxed) > 0);
 
         // Leader replicator: ships to the standby when connected, runs solo
         // otherwise, reconnecting when it reappears. Never blocks startup or writes.
@@ -624,6 +633,7 @@ impl Replayed {
             lease,
             replicator,
             prepared.dedup,
+            is_live_takeover,
         )
         .await
         .context("Failed to initialize filesystem")?;

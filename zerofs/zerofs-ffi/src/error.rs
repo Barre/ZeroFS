@@ -85,6 +85,15 @@ pub enum ZeroFsError {
         /// The path the operation targeted (lossy display).
         path: String,
     },
+    /// Stale handle (ESTALE). From `sync_all`/`sync_data` this is the durability signal:
+    /// the `.zerofs4` lineage broke, so writes acked on this handle before the fsync may
+    /// not be durable; redo them and fsync again. From other operations it is a plain
+    /// stale inode/handle (re-open the path).
+    #[error("stale handle (fsync: prior writes may not be durable): {path}")]
+    Stale {
+        /// The path the operation targeted (lossy display).
+        path: String,
+    },
     /// Any other server errno, preserved verbatim.
     #[error("i/o error (errno {errno}): {path}: {message}")]
     Io {
@@ -129,6 +138,7 @@ impl ZeroFsError {
             Self::ConnectFailed { .. } => libc::EIO,
             // P9_ENOTLEADER; the test below enforces parity with the client's value.
             Self::NotLeader { .. } => 108,
+            Self::Stale { .. } => libc::ESTALE,
             Self::Io { errno, .. } => *errno,
             Self::Protocol { .. } => libc::EIO,
         }
@@ -153,6 +163,7 @@ impl From<zerofs_client::ZeroFsError> for ZeroFsError {
             E::Closed => Self::Closed,
             E::ConnectFailed { message } => Self::ConnectFailed { message },
             E::NotLeader { path } => Self::NotLeader { path },
+            E::Stale { path } => Self::Stale { path },
             E::Io {
                 errno,
                 path,
@@ -192,6 +203,7 @@ mod tests {
             C::Closed,
             C::ConnectFailed { message: m() },
             C::NotLeader { path: p() },
+            C::Stale { path: p() },
             // A distinct errno checks the `Io` passthrough, not a fixed mapping.
             C::Io {
                 errno: libc::EXDEV,

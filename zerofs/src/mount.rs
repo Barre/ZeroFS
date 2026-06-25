@@ -80,6 +80,12 @@ struct InodeEntry {
     /// One fid per uid that holds this inode. Every request acts as its caller
     /// (v9fs `access=user` semantics), so each user gets its own server-side fid.
     fids: HashMap<u32, u32>,
+    /// The open-handle fids (from `open`/`opendir`/`create`) for this inode. A `.zerofs4`
+    /// data write rides its open handle, so a verified `fsync` presents every open handle
+    /// of the inode, not just the one being fsync'd: POSIX `fsync(fd)` persists the whole
+    /// file, including a write made through another handle. Populated on open, removed on
+    /// release.
+    handles: std::collections::HashSet<u32>,
     /// The server inode id behind this FUSE ino when it differs from the
     /// default `ino - 1` bijection: only the mount root of an `--aname` mount,
     /// where FUSE ino 1 maps to the attach subtree's root inode.
@@ -428,12 +434,15 @@ impl Filesystem for Fuse9P {
         if let Some(mut e) = self.inodes.get_mut(&ino) {
             e.lookup = e.lookup.saturating_sub(nlookup);
         }
-        // Once the inode's reference count hits zero, drop it and clunk every
-        // per-user fid we held for it.
+        // Once the inode's reference count hits zero, drop it and clunk every fid we
+        // held for it: the per-user inode fids and any still-registered open handles.
+        // Live handles are normally cleared by release/releasedir before the final
+        // forget, so `handles` is empty here; clunking it anyway is leak-hygiene if a
+        // handle outlived its release.
         if let Some((_, entry)) = self.inodes.remove_if(&ino, |_, e| e.lookup == 0) {
             let client = Arc::clone(&self.client);
             self.rt.spawn(async move {
-                for fid in entry.fids.into_values() {
+                for fid in entry.fids.into_values().chain(entry.handles) {
                     let _ = client.clunk(fid).await;
                     client.free_fid(fid);
                 }
@@ -833,48 +842,50 @@ impl Filesystem for Fuse9P {
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.fsync_inner(fh, datasync, reply);
+        self.fsync_inner(ino.0, fh, datasync, reply);
     }
 
     fn fsyncdir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.fsync_inner(fh, datasync, reply);
+        self.fsync_inner(ino.0, fh, datasync, reply);
     }
 
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        self.drop_handle(ino.0, fh);
         self.release_inner(fh, reply);
     }
 
     fn releasedir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
         self.dir_reads.remove(&fh.0);
         self.dir_reads_plus.remove(&fh.0);
+        self.drop_handle(ino.0, fh);
         self.release_inner(fh, reply);
     }
 
@@ -1052,7 +1063,11 @@ impl Filesystem for Fuse9P {
                 .await
             {
                 Ok((open_fid, Some(stat), _iounit)) => {
-                    register_lookup(&inodes, ino_of(stat.qid.path));
+                    let new_ino = ino_of(stat.qid.path);
+                    register_lookup(&inodes, new_ino);
+                    if let Some(mut e) = inodes.get_mut(&new_ino) {
+                        e.handles.insert(open_fid);
+                    }
                     reply.created(
                         &ttl,
                         &stat_to_attr(&stat),
@@ -1074,13 +1089,18 @@ impl Filesystem for Fuse9P {
             // the inode so future lookups and getattrs work after this handle
             // is released.
             match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
-                Ok(attr) => reply.created(
-                    &ttl,
-                    &attr,
-                    Generation(0),
-                    FileHandle(open_fid as u64),
-                    open_flags,
-                ),
+                Ok(attr) => {
+                    if let Some(mut e) = inodes.get_mut(&attr.ino.0) {
+                        e.handles.insert(open_fid);
+                    }
+                    reply.created(
+                        &ttl,
+                        &attr,
+                        Generation(0),
+                        FileHandle(open_fid as u64),
+                        open_flags,
+                    );
+                }
                 Err(e) => {
                     let _ = client.clunk(open_fid).await;
                     client.free_fid(open_fid);
@@ -1446,13 +1466,28 @@ impl Fuse9P {
                 .open_clone(inode_fid, nf, lflags, upgrade.then_some(orig))
                 .await
             {
-                Ok((fid, _, _)) => reply.opened(FileHandle(fid as u64), open_flags),
+                Ok((fid, _, _)) => {
+                    // Track the open handle so a verified fsync of this inode (through
+                    // ANY of its handles) presents this one's un-fsync'd writes too.
+                    if let Some(mut e) = inodes.get_mut(&ino) {
+                        e.handles.insert(fid);
+                    }
+                    reply.opened(FileHandle(fid as u64), open_flags);
+                }
                 Err(e) => {
                     client.free_fid(nf);
                     reply.error(errno(&e));
                 }
             }
         });
+    }
+
+    /// Stop tracking an open handle on its inode (on release), so a later fsync
+    /// does not present a fid the client may have freed and recycled.
+    fn drop_handle(&self, ino: u64, fh: FileHandle) {
+        if let Some(mut e) = self.inodes.get_mut(&ino) {
+            e.handles.remove(&(fh.0 as u32));
+        }
     }
 
     fn release_inner(&self, fh: FileHandle, reply: ReplyEmpty) {
@@ -1465,11 +1500,27 @@ impl Fuse9P {
         });
     }
 
-    fn fsync_inner(&self, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+    fn fsync_inner(&self, ino: u64, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
         let client = Arc::clone(&self.client);
-        let fid = fh.0 as u32;
+        let inodes = Arc::clone(&self.inodes);
+        let primary = fh.0 as u32;
         self.rt.spawn(async move {
-            match client.fsync(fid, datasync as u32).await {
+            // A verified fsync persists the whole inode, but its mutations are spread
+            // across fids: data writes ride the open handles (`inodes[ino].handles`,
+            // including handles the app did not fsync directly), setattr and
+            // directory-entry ops ride the per-user inode fids (`inodes[ino].fids`).
+            // Present them all so the fsync verifies every one and ESTALEs if any broke.
+            let mut fids = vec![primary];
+            if let Some(e) = inodes.get(&ino) {
+                fids.extend(
+                    e.fids
+                        .values()
+                        .chain(e.handles.iter())
+                        .copied()
+                        .filter(|&f| f != primary),
+                );
+            }
+            match client.fsync_inode(&fids, primary, datasync as u32).await {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -1598,6 +1649,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         InodeEntry {
             lookup: u64::MAX,
             fids: HashMap::new(),
+            handles: std::collections::HashSet::new(),
             server_inode: Some(root_inode),
         },
     );

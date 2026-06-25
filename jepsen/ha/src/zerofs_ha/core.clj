@@ -4,7 +4,9 @@
   Workload is a grow-only set (add = create+fsync a uniquely-named file, fsync
   being a global durability barrier; read = ls); set-full checker asserts no
   acked add is lost. All-local: one logical node, dummy SSH, process management
-  via start-stop-daemon + shell rather than jepsen.control."
+  via start-stop-daemon + shell rather than jepsen.control. A separate
+  --fsync-honesty scenario checks that a successful fsync never reports success for
+  an un-fsync'd write lost to a both-nodes cold restart."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -463,10 +465,133 @@
                         (catch java.io.IOException e
                           (assoc op :type :info :value v :error (.getMessage e)))))
                     (assoc op :type :fail :error :nothing-to-remove))
+          ;; An acknowledged write WITHOUT fsync: it lives in the leader memtable +
+          ;; the standby tail, not yet on the object store. :ok means acked (and
+          ;; readable here now), NOT durable.
+          :write (let [v (swap! counter inc)
+                       f (io/file (subdir dir v) (str v))]
+                   (try
+                     (add-file! dir v)
+                     (if (= (str v "\n") (slurp f))
+                       (assoc op :type :ok :value v)
+                       (assoc op :type :info :value v :error :content-not-here))
+                     (catch java.io.IOException e
+                       (assoc op :type :info :value v :error (str (.getMessage e))))))
+          ;; A global fsync durability barrier. :ok = the barrier held; an error
+          ;; (after the fix, a fsync that spans a recovery which dropped this
+          ;; client's un-fsync'd writes) surfaces here as :fail.
+          :fsync (try (fsync-sentinel! dir) (assoc op :type :ok)
+                      (catch java.io.IOException e
+                        (assoc op :type :fail :error (str (.getMessage e)))))
           ;; Drop leftover temps (interrupted renames) before the final read/statfs.
           :cleanup (try (cleanup-temps! dir) (assoc op :type :ok)
                         (catch java.io.IOException e
                           (assoc op :type :fail :error (.getMessage e))))))))
+  (teardown! [_ _test])
+  (close! [_ _test]))
+
+;; Per-fid durability client. fsync is per-fd POSIX (fsync on a fid verifies only
+;; that fid's writes, not a global barrier), so durability honesty is tested by
+;; holding files OPEN and fsyncing each by name. Ops carry :file so the checker
+;; matches a write to the fsync that covers it. `handles` is a shared
+;; name->RandomAccessFile map (the deterministic scenarios run one logical thread).
+
+(defn dc-file [dir f] (io/file dir f))
+
+(defrecord DurabilityClient [dir handles counter]
+  client/Client
+  (open! [this _test _node] this)
+  (setup! [_this _test] (.mkdirs (io/file dir)))
+  (invoke! [_ _test op]
+    ;; A handle is keyed by (:as op) when given, else by (:file op), so the SAME file
+    ;; can be opened on TWO handles (:as "a"/"b"). The checker matches by the
+    ;; underlying :file, so a write on one handle and a fsync on another (same file)
+    ;; are paired.
+    (let [hkey (or (:as op) (:file op) (:dir op))]
+      (util/timeout 30000 (assoc op :type :info :error :timeout)
+        (case (:f op)
+          ;; Open (create) a file, fsync to make its existence durable, so only the
+          ;; later un-fsync'd appends, not the file itself, are at risk.
+          :open (let [raf (java.io.RandomAccessFile. (dc-file dir (:file op)) "rw")]
+                  (.sync (.getFD raf))
+                  (swap! handles assoc hkey {:raf raf :file (:file op)})
+                  (assoc op :type :ok))
+          ;; Append a unique value via this handle; NOT fsync'd (acked, not durable).
+          ;; `locking` serializes concurrent appends so two writes never race on
+          ;; seek+write to the same offset (test artifact, not durability).
+          :write (let [v (swap! counter inc)
+                       {:keys [raf file]} (get @handles hkey)]
+                   (locking raf
+                     (.seek raf (.length raf))
+                     (.write raf (.getBytes (str v "\n"))))
+                   (assoc op :type :ok :value v :file file))
+          ;; ftruncate(fd) to a size: metadata-only change on the open fd (no data
+          ;; write). Via FUSE this is a setattr, which the mount lands on the per-inode
+          ;; fid, NOT this open handle.
+          :truncate (let [{:keys [raf file]} (get @handles hkey)]
+                      (locking raf (.setLength raf (long (:to op))))
+                      (assoc op :type :ok :value (:to op) :file file))
+          ;; fsync this handle's fd. :fail surfaces an ESTALE honestly. The result
+          ;; carries the underlying :file so the checker pairs it with writes to that
+          ;; file made through ANY handle.
+          :fsync (let [{:keys [raf file]} (get @handles hkey)]
+                   (try (.sync (.getFD raf)) (assoc op :type :ok :file file)
+                        (catch java.io.IOException e
+                          (assoc op :type :fail :file file :error (str (.getMessage e))))))
+          ;; Final state per distinct file: {file -> {:values #{values} :size bytes}}.
+          :read (assoc op :type :ok
+                       :value (into {}
+                                    (for [f (distinct (keep :file (vals @handles)))]
+                                      [f {:size (.length (dc-file dir f))
+                                          :values (with-open [r (io/reader (dc-file dir f))]
+                                                    (into (sorted-set)
+                                                          (keep #(try (Long/parseLong %)
+                                                                      (catch Exception _ nil))
+                                                                (line-seq r))))}])))
+
+          ;; Open a directory, fsync it (a force on a dir channel flushes the db, so the
+          ;; directory exists durably and only its later un-fsync'd entries are at risk),
+          ;; and keep the channel keyed by the directory name.
+          :opendir (let [f (dc-file dir (:dir op))]
+                     (.mkdirs f)
+                     (let [ch (java.nio.channels.FileChannel/open
+                               (.toPath f)
+                               (into-array java.nio.file.OpenOption
+                                           [java.nio.file.StandardOpenOption/READ]))]
+                       (.force ch true)
+                       (swap! handles assoc hkey {:dirchan ch :dirname (:dir op)})
+                       (assoc op :type :ok)))
+          ;; Create a subdirectory (un-fsync'd). The entry is durable only once its
+          ;; parent is fsyncdir'd. :dir-facts says what the parent's listing must show.
+          :mkdir (do (.mkdir (io/file (dc-file dir (:in op)) (:name op)))
+                     (assoc op :type :ok
+                            :dir-facts [{:dir (:in op) :name (:name op) :present true}]))
+          ;; Create an empty file in a directory (un-fsync'd); used to set up a rename.
+          :mkfile (do (.createNewFile (io/file (dc-file dir (:in op)) (:name op)))
+                      (assoc op :type :ok))
+          ;; Move an entry between directories (un-fsync'd). The source loses the entry
+          ;; and the dest gains it, so fsyncdir of EITHER must account for the change.
+          :rename (do (java.nio.file.Files/move
+                       (.toPath (io/file (dc-file dir (:from-dir op)) (:from-name op)))
+                       (.toPath (io/file (dc-file dir (:to-dir op)) (:to-name op)))
+                       (into-array java.nio.file.CopyOption []))
+                      (assoc op :type :ok
+                             :dir-facts [{:dir (:from-dir op) :name (:from-name op) :present false}
+                                         {:dir (:to-dir op) :name (:to-name op) :present true}]))
+          ;; fsync a directory. :fail surfaces an ESTALE honestly. Carries :dir so the
+          ;; checker pairs it with entry changes to that directory.
+          :fsyncdir (let [{:keys [dirchan dirname]} (get @handles (:dir op))]
+                      (try (.force dirchan true) (assoc op :type :ok :dir dirname)
+                           (catch java.io.IOException e
+                             (assoc op :type :fail :dir dirname :error (str (.getMessage e))))))
+          ;; Final entry set per open directory: {dir -> #{entry names}}.
+          :readdir (assoc op :type :ok
+                          :value (into {}
+                                       (for [{:keys [dirname]} (vals @handles) :when dirname]
+                                         [dirname (into (sorted-set)
+                                                        (map #(.getName %)
+                                                             (or (.listFiles (dc-file dir dirname))
+                                                                 (into-array java.io.File []))))])))))))
   (teardown! [_ _test])
   (close! [_ _test]))
 
@@ -734,26 +859,492 @@
          :corrupt            (vec (take 50 real))
          :incomplete-ignored (- (count corrupt) (count real))}))))
 
+(defn fsync-honesty-checker
+  "Per-fid fsync durability contract: for each file, if a write to it is acknowledged
+  and the FIRST fsync of THAT file after it returns :ok, that write must be present
+  in the file after recovery. fsync is per-fd POSIX, so an fsync of file A says
+  nothing about file B; matching the fsync to the write's own file keeps an fsync of
+  A from counting B's lost write as required. A FAILED fsync signals the loss
+  honestly. `clean-fsync-ok?` (the last fsync runs in a healthy window, so it must be
+  :ok) rejects a checker that passes by treating every fsync as a failure. The final
+  read returns {file -> #{values}}."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [indexed (vec (map-indexed (fn [i op] (assoc op ::i i)) history))
+            final   (or (->> indexed
+                             (filter #(and (= :ok (:type %)) (= :read (:f %))))
+                             last :value)
+                        {})
+            ;; Pair each fsync's :invoke with its completion, carrying its :file.
+            fsyncs  (->> indexed
+                         (reduce (fn [{:keys [pending done]} op]
+                                   (if (= :fsync (:f op))
+                                     (case (:type op)
+                                       ;; Pair invoke->completion by process. Take :file
+                                       ;; from the COMPLETION: an `:as`-keyed fsync invoke
+                                       ;; carries no :file (the client resolves it from the
+                                       ;; handle and sets it on the reply).
+                                       :invoke {:pending (assoc pending (:process op) (::i op))
+                                                :done done}
+                                       (:ok :fail :info)
+                                       {:pending (dissoc pending (:process op))
+                                        :done (if-let [iv (get pending (:process op))]
+                                                (conj done {:invoke-i iv :file (:file op)
+                                                            :result (:type op)})
+                                                done)}
+                                       {:pending pending :done done})
+                                     {:pending pending :done done}))
+                                 {:pending {} :done []})
+                         :done
+                         (sort-by :invoke-i)
+                         vec)
+            first-fsync-after (fn [iw f]
+                                (first (filter #(and (> (:invoke-i %) iw) (= f (:file %))) fsyncs)))
+            writes  (->> indexed
+                         (filter #(and (= :ok (:type %)) (= :write (:f %)) (some? (:value %)))))
+            required (->> writes
+                          (filter (fn [w] (= :ok (:result (first-fsync-after (::i w) (:file w))))))
+                          (map (fn [w] [(:file w) (:value w)]))
+                          (into (sorted-set)))
+            lost    (->> required
+                         (remove (fn [[f v]] (contains? (get-in final [f :values] #{}) v)))
+                         vec)
+            clean-fsync-ok? (= :ok (:result (last fsyncs)))]
+        {:valid?           (and (empty? lost) clean-fsync-ok?)
+         :required-present (count required)
+         :lost-count       (count lost)
+         :lost             (vec (take 50 lost))
+         :fsyncs           (mapv :result fsyncs)
+         :clean-fsync-ok?  clean-fsync-ok?}))))
+
+(defn metadata-honesty-checker
+  "Per-fid fsync honesty for metadata-only changes (ftruncate). If a truncate of a
+  file to size N is acknowledged and the FIRST fsync of THAT file after it returns
+  :ok, the file must be at size N after recovery. Under FUSE the setattr lands on the
+  per-inode fid while fsync rides the open handle, so an fsync that does not aggregate
+  every fid bound to the inode could report :ok over a lost truncate.
+  `clean-fsync-ok?` rejects a checker that passes by failing every fsync. The final
+  read gives {file -> {:size N ...}}."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [indexed (vec (map-indexed (fn [i op] (assoc op ::i i)) history))
+            final   (or (->> indexed
+                             (filter #(and (= :ok (:type %)) (= :read (:f %))))
+                             last :value)
+                        {})
+            fsyncs  (->> indexed
+                         (reduce (fn [{:keys [pending done]} op]
+                                   (if (= :fsync (:f op))
+                                     (case (:type op)
+                                       ;; Pair invoke->completion by process. Take :file
+                                       ;; from the COMPLETION: an `:as`-keyed fsync invoke
+                                       ;; carries no :file (the client resolves it from the
+                                       ;; handle and sets it on the reply).
+                                       :invoke {:pending (assoc pending (:process op) (::i op))
+                                                :done done}
+                                       (:ok :fail :info)
+                                       {:pending (dissoc pending (:process op))
+                                        :done (if-let [iv (get pending (:process op))]
+                                                (conj done {:invoke-i iv :file (:file op)
+                                                            :result (:type op)})
+                                                done)}
+                                       {:pending pending :done done})
+                                     {:pending pending :done done}))
+                                 {:pending {} :done []})
+                         :done
+                         (sort-by :invoke-i)
+                         vec)
+            first-fsync-after (fn [iw f]
+                                (first (filter #(and (> (:invoke-i %) iw) (= f (:file %))) fsyncs)))
+            truncates (->> indexed
+                           (filter #(and (= :ok (:type %)) (= :truncate (:f %)) (some? (:value %)))))
+            required  (->> truncates
+                           (filter (fn [t] (= :ok (:result (first-fsync-after (::i t) (:file t))))))
+                           (map (fn [t] [(:file t) (:value t)])))
+            lost      (->> required
+                           (remove (fn [[f sz]] (= sz (get-in final [f :size]))))
+                           vec)
+            clean-fsync-ok? (= :ok (:result (last fsyncs)))]
+        {:valid?           (and (empty? lost) clean-fsync-ok?)
+         :required-present (count required)
+         :lost-count       (count lost)
+         :lost             (vec (take 50 lost))
+         :fsyncs           (mapv :result fsyncs)
+         :clean-fsync-ok?  clean-fsync-ok?}))))
+
+(defn dirent-honesty-checker
+  "Per-fid fsync honesty for DIRECTORY ENTRIES (mkdir, rename). Each directory op
+  records `:dir-facts`, one `{:dir :name :present}` per directory it changes (a mkdir
+  adds an entry; a rename removes from the source and adds to the dest). If the FIRST
+  fsyncdir of that directory after the op returns :ok, the fact must hold in the final
+  listing: a `:present true` entry must be present, a `:present false` entry absent.
+  Catches an fsync of a directory that OKs over a lost entry change. `clean-fsyncdir-ok?`
+  guards against a fix that just fails every fsyncdir. The final read is `:readdir`,
+  giving {dir -> #{entry names}}."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [indexed (vec (map-indexed (fn [i op] (assoc op ::i i)) history))
+            final   (or (->> indexed
+                             (filter #(and (= :ok (:type %)) (= :readdir (:f %))))
+                             last :value)
+                        {})
+            fsyncdirs (->> indexed
+                           (reduce (fn [{:keys [pending done]} op]
+                                     (if (= :fsyncdir (:f op))
+                                       (case (:type op)
+                                         :invoke {:pending (assoc pending (:process op) (::i op))
+                                                  :done done}
+                                         (:ok :fail :info)
+                                         {:pending (dissoc pending (:process op))
+                                          :done (if-let [iv (get pending (:process op))]
+                                                  (conj done {:invoke-i iv :dir (:dir op)
+                                                              :result (:type op)})
+                                                  done)}
+                                         {:pending pending :done done})
+                                       {:pending pending :done done}))
+                                   {:pending {} :done []})
+                           :done
+                           (sort-by :invoke-i)
+                           vec)
+            first-fsyncdir-after (fn [iw d]
+                                   (first (filter #(and (> (:invoke-i %) iw) (= d (:dir %)))
+                                                  fsyncdirs)))
+            facts   (->> indexed
+                         (filter #(and (= :ok (:type %)) (seq (:dir-facts %))))
+                         (mapcat (fn [op] (map #(assoc % ::i (::i op)) (:dir-facts op)))))
+            required (->> facts
+                          (filter (fn [f] (= :ok (:result (first-fsyncdir-after (::i f) (:dir f)))))))
+            violated (->> required
+                          (remove (fn [f]
+                                    (= (:present f)
+                                       (contains? (get final (:dir f) #{}) (:name f)))))
+                          vec)
+            clean-fsyncdir-ok? (= :ok (:result (last fsyncdirs)))]
+        {:valid?            (and (empty? violated) clean-fsyncdir-ok?)
+         :required-count    (count required)
+         :violated-count    (count violated)
+         :violated          (vec (take 50 violated))
+         :fsyncdirs         (mapv :result fsyncdirs)
+         :clean-fsyncdir-ok? clean-fsyncdir-ok?}))))
+
+(defn metadata-gen
+  "fsync-honesty for a metadata-only change. Open a file, give it durable data, then
+  ftruncate(fd) it un-fsync'd: under FUSE a setattr the mount lands on the per-inode
+  fid, not the open handle the app fsyncs. A cold double-restart loses the truncate,
+  so a verified fsync(fd) of that file MUST fail rather than report success. A clean
+  truncate+fsync in a healthy window then must be :ok."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "m"}))
+   ;; Durable data so the later truncate is a real metadata change with a known size.
+   (gen/clients (gen/time-limit 3 (repeat {:f :write :file "m"})))
+   (gen/clients (gen/once {:f :fsync :file "m"}))
+   (gen/clients (gen/once {:f :read}))                    ; baseline
+   ;; Un-fsync'd ftruncate(fd) to 0: a setattr on the per-inode fid, not the open handle.
+   (gen/clients (gen/once {:f :truncate :file "m" :to 0}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart}))
+   (gen/sleep 5)
+   ;; fsync(fd) of the file whose un-fsync'd truncate was lost: must FAIL.
+   (gen/clients (gen/once {:f :fsync :file "m"}))
+   (gen/sleep 1)
+   ;; A clean truncate + fsync in a healthy window: must be :ok (final size = 7).
+   (gen/clients (gen/once {:f :truncate :file "m" :to 7}))
+   (gen/clients (gen/once {:f :fsync :file "m"}))
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn multihandle-gen
+  "fsync-honesty across multiple open handles of one inode. Open the SAME file on two
+  handles a and b, write un-fsync'd through b, cold double-restart loses it, then
+  fsync through the OTHER handle a: it MUST fail. POSIX fsync(fd) persists the whole
+  file regardless of which fd wrote it, so a verified fsync must aggregate every open
+  handle of the inode and return ESTALE for b's lost write rather than report success.
+  Writes/fsyncs pair by the underlying file, so the value checker applies."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "h" :as "ha"}))
+   (gen/clients (gen/once {:f :open :file "h" :as "hb"}))
+   (gen/clients (gen/once {:f :read}))                    ; baseline
+   ;; un-fsync'd write through handle b
+   (gen/clients (gen/once {:f :write :as "hb"}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart}))
+   (gen/sleep 5)
+   ;; fsync through handle a (which never wrote): must FAIL over b's lost write.
+   (gen/clients (gen/once {:f :fsync :as "ha"}))
+   (gen/sleep 1)
+   ;; Guard: a clean write through b + fsync through a, must be :ok.
+   (gen/clients (gen/once {:f :write :as "hb"}))
+   (gen/clients (gen/once {:f :fsync :as "ha"}))
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn dirent-gen
+  "fsync-honesty for a DIRECTORY ENTRY. Open a directory, create a subdirectory in it
+  un-fsync'd, cold double-restart loses the entry, then fsyncdir of that directory MUST
+  fail. A clean mkdir+fsyncdir then must be :ok and present."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :opendir :dir "d"}))
+   (gen/clients (gen/once {:f :readdir}))                 ; baseline
+   (gen/clients (gen/once {:f :mkdir :in "d" :name "x"})) ; un-fsync'd entry
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart}))
+   (gen/sleep 5)
+   (gen/clients (gen/once {:f :fsyncdir :dir "d"}))       ; must FAIL (x was lost)
+   (gen/sleep 1)
+   (gen/clients (gen/once {:f :mkdir :in "d" :name "y"})) ; clean entry
+   (gen/clients (gen/once {:f :fsyncdir :dir "d"}))       ; must :ok, y present
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :readdir}))))
+
+(defn rename-gen
+  "fsync-honesty for a CROSS-DIRECTORY rename. Create a file in src durably, move it to
+  dst un-fsync'd, cold double-restart loses the move (the file reappears in src), then
+  fsyncdir of the SOURCE MUST fail: the rename's source-side removal is attributed to
+  the source directory, not only the dest. A clean change to src then must be :ok."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :opendir :dir "src"}))
+   (gen/clients (gen/once {:f :opendir :dir "dst"}))
+   (gen/clients (gen/once {:f :mkfile :in "src" :name "a"}))
+   (gen/clients (gen/once {:f :fsyncdir :dir "src"}))     ; make src/a durable
+   (gen/clients (gen/once {:f :readdir}))                 ; baseline
+   (gen/clients (gen/once {:f :rename :from-dir "src" :from-name "a"
+                           :to-dir "dst" :to-name "b"}))  ; un-fsync'd
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart}))
+   (gen/sleep 5)
+   (gen/clients (gen/once {:f :fsyncdir :dir "src"}))     ; must FAIL (a is back in src)
+   (gen/sleep 1)
+   (gen/clients (gen/once {:f :mkdir :in "src" :name "c"})) ; a clean tracked entry on src
+   (gen/clients (gen/once {:f :fsyncdir :dir "src"}))     ; must :ok
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :readdir}))))
+
+(defn metadata-transparency-gen
+  "TRANSPARENCY for a METADATA change. ftruncate(fd) un-fsync'd on a Connected leader
+  (shipped to the standby), then a CLEAN kill-leader. The standby replays the tail so
+  the truncate SURVIVES, and a fsync of the file must SUCCEED with the truncated size
+  intact. Verifies tail replay carries setattr, so the kept token stays honest for
+  metadata, not only data."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "m"}))
+   (gen/clients (gen/time-limit 3 (repeat {:f :write :file "m"})))
+   (gen/clients (gen/once {:f :fsync :file "m"}))         ; durable baseline
+   (gen/clients (gen/once {:f :read}))
+   (gen/clients (gen/once {:f :truncate :file "m" :to 7})) ; un-fsync'd, shipped Connected
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :kill-leader})) ; clean failover, standby replays the truncate
+   (gen/sleep 8)
+   (gen/clients (gen/once {:f :fsync :file "m"}))         ; must :ok (transparent), size stays 7
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn multifailover-gen
+  "A write survives a TRANSPARENT failover, then a later cold restart loses it. The
+  write is shipped Connected and carried (token kept) across a clean kill-leader, so it
+  lives on the promoted leader's memtable; a subsequent kill-both + cold restart
+  regenerates the token, so a fsync over the carried-then-lost write MUST fail. Verifies
+  a kept token is still invalidated by a later lineage break (cross-term)."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "h"}))
+   (gen/clients (gen/time-limit 4 (repeat {:f :write :file "h"}))) ; un-fsync'd, shipped
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :kill-leader})) ; failover 1: standby promotes, keeps token, replays
+   (gen/sleep 6)
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))   ; failover 2: the promoted leader also dies
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart})) ; cold restart regenerates the token
+   (gen/sleep 5)
+   (gen/clients (gen/once {:f :fsync :file "h"}))         ; must FAIL (the carried writes are gone)
+   (gen/sleep 1)
+   (gen/clients (gen/once {:f :write :file "h"}))
+   (gen/clients (gen/once {:f :fsync :file "h"}))         ; guard :ok
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn honesty-gen
+  "fsync-honesty (per-fid). Open a file (existence made durable), write a burst of
+  acknowledged-but-un-fsync'd values to it, kill BOTH nodes + cold-restart (no tail,
+  so the un-fsync'd writes are gone), then fsync THAT file: it must FAIL, the writes
+  are lost. A clean write+fsync to it in a healthy window must be :ok, so a verified
+  fsync is not simply failing every call."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "h"}))          ; create + fsync: existence durable
+   (gen/clients (gen/once {:f :read}))                    ; baseline
+   ;; acknowledged, un-fsync'd appends (only in memtable + standby tail)
+   (gen/clients (gen/time-limit 6 (repeat {:f :write :file "h"})))
+   (gen/sleep 1)
+   ;; Cold double restart: both die, both reopen with no tail; the appends are gone.
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart}))
+   (gen/sleep 5)
+   ;; Post-recovery fsync of the file: must FAIL (its un-fsync'd writes are gone).
+   (gen/clients (gen/once {:f :fsync :file "h"}))
+   (gen/sleep 1)
+   ;; A clean write + fsync in a healthy window: must be :ok.
+   (gen/clients (gen/once {:f :write :file "h"}))
+   (gen/clients (gen/once {:f :fsync :file "h"}))
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn honesty-partition-gen
+  "fsync-honesty under a partition (per-fid, the Solo-at-takeover case). Open a file,
+  cut leader<->standby so the leader goes Solo (its ships fail); un-fsync'd writes to
+  the file land on it but are NEVER shipped to the standby. The standby promotes +
+  fences the old leader; the client re-routes, and a fsync of that file on the new
+  leader MUST fail: it never received the Solo writes. The Solo term regenerates the
+  lineage token, so the Solo writes' token mismatches and the fsync fails honestly."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "h"}))
+   (gen/clients (gen/once {:f :read}))
+   ;; Cut leader<->standby. The leader stays up + serving but goes Solo.
+   (gen/nemesis (gen/once {:type :info :f :partition}))
+   ;; Un-fsync'd writes onto the still-serving Solo leader: acked, but never shipped.
+   (gen/clients (gen/time-limit 3 (repeat {:f :write :file "h"})))
+   ;; The standby promotes + fences the old leader; the client re-routes to it.
+   (gen/sleep 8)
+   ;; fsync of the file on the new leader: must FAIL (the Solo writes are gone).
+   (gen/clients (gen/once {:f :fsync :file "h"}))
+   (gen/sleep 1)
+   ;; Clean write + fsync on the new leader: must succeed (the guard).
+   (gen/clients (gen/once {:f :write :file "h"}))
+   (gen/clients (gen/once {:f :fsync :file "h"}))
+   (gen/sleep 2)
+   ;; Heal (restores connectivity + canonical roles) so teardown + final read are clean.
+   (gen/nemesis (gen/once {:type :info :f :heal-partition}))
+   (gen/sleep 3)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn honesty-transparent-gen
+  "Transparency (per-fid): open a file, write un-fsync'd values onto a healthy
+  Connected leader (shipped to the standby's tail), then a CLEAN kill-leader. The
+  standby promotes + replays the tail so the writes SURVIVE; the client re-routes and
+  a fsync of that file must SUCCEED, the writes really are durable, in contrast to the
+  conservative ESTALE the cold-restart/partition cases return. The carried-forward
+  (untainted) lineage token keeps the :ok honest. The checker still catches a kept
+  token over a write that was actually lost."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "h"}))
+   (gen/clients (gen/once {:f :read}))
+   ;; Acknowledged, un-fsync'd writes on the Connected leader -> shipped to the standby.
+   (gen/clients (gen/time-limit 6 (repeat {:f :write :file "h"})))
+   (gen/sleep 1)
+   ;; Clean kill-leader: the standby promotes + replays the tail, so the writes live on.
+   (gen/nemesis (gen/once {:type :info :f :kill-leader}))
+   (gen/sleep 8)
+   ;; fsync of the file on the promoted leader: must be :ok (transparent, survived).
+   (gen/clients (gen/once {:f :fsync :file "h"}))
+   (gen/sleep 1)
+   ;; Clean write + fsync (the guard).
+   (gen/clients (gen/once {:f :write :file "h"}))
+   (gen/clients (gen/once {:f :fsync :file "h"}))
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
+(defn crossfid-gen
+  "Cross-fid honesty: the per-fd POSIX case a single global barrier cannot catch. Open
+  TWO files a and b, write un-fsync'd values to BOTH, then a cold double-restart loses
+  both. fsync(a) fails; the app, per POSIX since the ESTALE on a says nothing about b,
+  redoes ONLY a, and fsync(a) succeeds. fsync(b) MUST STILL FAIL: a's redo must not
+  discharge b's lost write. The fsync obligation is per-fid, so b stays independent of
+  a's redo. A final clean write+fsync keeps the last fsync :ok for the healthy-window
+  guard."
+  []
+  (gen/phases
+   (gen/clients (gen/once {:f :open :file "a"}))
+   (gen/clients (gen/once {:f :open :file "b"}))
+   (gen/clients (gen/once {:f :read}))
+   ;; Un-fsync'd writes to BOTH files under the same lineage.
+   (gen/clients (gen/once {:f :write :file "a"}))
+   (gen/clients (gen/once {:f :write :file "b"}))
+   (gen/sleep 1)
+   ;; Cold double restart: both un-fsync'd writes are lost.
+   (gen/nemesis (gen/once {:type :info :f :kill-both}))
+   (gen/sleep 1)
+   (gen/nemesis (gen/once {:type :info :f :heal-restart}))
+   (gen/sleep 5)
+   ;; fsync(a) fails -> the app redoes ONLY a (per-fd) -> fsync(a) succeeds.
+   (gen/clients (gen/once {:f :fsync :file "a"}))
+   (gen/clients (gen/once {:f :write :file "a"}))
+   (gen/clients (gen/once {:f :fsync :file "a"}))
+   ;; fsync(b) must STILL fail: a's redo did not discharge b.
+   (gen/clients (gen/once {:f :fsync :file "b"}))
+   (gen/sleep 1)
+   ;; Guard: a clean write+fsync so the LAST fsync is :ok.
+   (gen/clients (gen/once {:f :write :file "a"}))
+   (gen/clients (gen/once {:f :fsync :file "a"}))
+   (gen/sleep 2)
+   (gen/clients (gen/once {:f :read}))))
+
 (defn ha-test [opts]
-  (merge tests/noop-test
+  (let [durability? (or (:fsync-honesty opts) (:fsync-honesty-partition opts)
+                        (:fsync-transparency opts) (:fsync-crossfid opts)
+                        (:fsync-metadata opts) (:fsync-multihandle opts)
+                        (:fsync-dirent opts) (:fsync-rename opts)
+                        (:fsync-metadata-transparency opts) (:fsync-multifailover opts))]
+   (merge tests/noop-test
          opts
          {:name      "zerofs-ha"
           :os        os/noop
           :db        (db)
-          :client    (->SetClient (str (:work-dir opts) "/mnt") (:fsync opts)
-                                   (atom -1) (atom {}))
+          ;; Per-fid durability scenarios hold files open and fsync them by name; the
+          ;; set workload uses the SetClient.
+          :client    (if durability?
+                       (->DurabilityClient (str (:work-dir opts) "/mnt/dc") (atom {}) (atom 0))
+                       (->SetClient (str (:work-dir opts) "/mnt") (:fsync opts)
+                                    (atom -1) (atom {})))
           :nemesis   (ha-nemesis)
-          :checker   (checker/compose
-                      ;; :set  -> no :ok add lost, no :ok-removed value resurrected.
-                      ;; :statfs -> the usage-stats inode count tracks the live set
-                      ;;            (catches a regressed stats/allocator or a bad delete).
-                      ;; :content -> no file's content disagrees with its name
-                      ;;             (catches inode-id reuse the set check can't see).
-                      {:set     (set-checker)
-                       :statfs  (statfs-checker)
-                       :content (content-checker)
-                       :perf    (checker/perf)})
-          :generator (if (:fsync opts)
+          :checker   (if durability?
+                       (checker/compose
+                        {:fsync-honesty (cond
+                                          (or (:fsync-metadata opts) (:fsync-metadata-transparency opts))
+                                          (metadata-honesty-checker)
+                                          (or (:fsync-dirent opts) (:fsync-rename opts))
+                                          (dirent-honesty-checker)
+                                          :else (fsync-honesty-checker))
+                         :perf          (checker/perf)})
+                       (checker/compose
+                        ;; :set  -> no :ok add lost, no :ok-removed value resurrected.
+                        ;; :statfs -> the usage-stats inode count tracks the live set
+                        ;;            (catches a regressed stats/allocator or a bad delete).
+                        ;; :content -> no file's content disagrees with its name
+                        ;;             (catches inode-id reuse the set check can't see).
+                        {:set     (set-checker)
+                         :statfs  (statfs-checker)
+                         :content (content-checker)
+                         :perf    (checker/perf)}))
+          :generator (cond
+                       (:fsync-dirent opts) (dirent-gen)
+                       (:fsync-rename opts) (rename-gen)
+                       (:fsync-metadata-transparency opts) (metadata-transparency-gen)
+                       (:fsync-multifailover opts) (multifailover-gen)
+                       (:fsync-multihandle opts) (multihandle-gen)
+                       (:fsync-metadata opts) (metadata-gen)
+                       (:fsync-crossfid opts) (crossfid-gen)
+                       (:fsync-transparency opts) (honesty-transparent-gen)
+                       (:fsync-honesty-partition opts) (honesty-partition-gen)
+                       (:fsync-honesty opts) (honesty-gen)
+                       (:fsync opts)
                        ;; fsync'd: full fault suite. Every acked add is durable on the
                        ;; shared store, so this checks store durability across all faults.
                        (gen/phases
@@ -777,6 +1368,7 @@
                        ;; is Connected-only, so a SINGLE Connected kill-leader failover.
                        ;; Solo/kill-both would lose un-fsynced writes (POSIX-legal, not a
                        ;; bug). The survivor keeps serving, so no heal is needed.
+                       :else
                        (gen/phases
                         (gen/clients (gen/once {:f :read}))
                         (->> (gen/mix [(repeat {:f :add}) (repeat {:f :add})
@@ -790,7 +1382,7 @@
                         (gen/clients (gen/once {:f :read}))))
           :nodes     ["n1"]
           :ssh       {:dummy? true}
-          :pure-generators true}))
+          :pure-generators true})))
 
 (def cli-opts
   "Extra CLI options. Path defaults read an env var first (set by run.sh locally
@@ -805,7 +1397,27 @@
    [nil "--mc-bin PATH" "Path to the mc (minio client) binary"
     :default (or (System/getenv "MC_BIN") "mc")]
    [nil "--[no-]fsync" "fsync every add (default true). --no-fsync acks writes without flushing, so a single Connected kill-leader failover tests semi-sync replication of un-fsynced writes."
-    :default true]])
+    :default true]
+   [nil "--fsync-honesty" "Run the fsync-durability-honesty scenario: a burst of un-fsync'd writes, then kill-both + cold restart, then a fsync. Asserts a successful fsync never reports success for the lost writes."
+    :default false]
+   [nil "--fsync-honesty-partition" "fsync-honesty under a partition (the Solo-at-takeover case): un-fsync'd writes onto a partitioned Solo leader the standby never receives, then a fsync on the promoted leader must fail rather than report success. The lineage token regenerates on takeover (the Solo term marks it), so it fails honestly."
+    :default false]
+   [nil "--fsync-transparency" "Transparency (per-fid): un-fsync'd writes to an open file on a Connected leader, then a CLEAN kill-leader. The standby replays the tail so the writes survive, and a fsync of that file must SUCCEED (carried-forward untainted lineage token), in contrast to the conservative ESTALE of the cold/partition cases."
+    :default false]
+   [nil "--fsync-crossfid" "Cross-fid (per-fd POSIX): two open files written un-fsync'd, a cold double-restart loses both, fsync(a) fails, the app redoes ONLY a and fsync(a) succeeds, then fsync(b) MUST STILL fail. The fsync obligation is per-fid, so a's redo does not discharge b's lost write."
+    :default false]
+   [nil "--fsync-metadata" "Metadata honesty (FUSE fid-mapping): ftruncate(fd) un-fsync'd is a setattr the mount lands on the per-inode fid, not the open handle the app fsyncs. A cold double-restart loses the truncate; fsync(fd) MUST fail. A verified fsync aggregates every fid bound to the inode and returns ESTALE rather than reporting success over the lost truncate."
+    :default false]
+   [nil "--fsync-multihandle" "Multiple-open-handle honesty: open the same file twice, write un-fsync'd through one handle, cold double-restart loses it, fsync through the OTHER handle MUST fail (POSIX fsync(fd) persists the whole file). A verified fsync aggregates every open handle of the inode and returns ESTALE rather than reporting success over the sibling handle's lost write."
+    :default false]
+   [nil "--fsync-dirent" "Directory-entry honesty: mkdir un-fsync'd, cold double-restart loses the entry, fsyncdir of the parent MUST fail. fsync of a directory verifies the entries created or removed in it."
+    :default false]
+   [nil "--fsync-rename" "Cross-directory rename honesty: move a file from src to dst un-fsync'd, cold double-restart loses the move, fsyncdir of the SOURCE MUST fail. A rename is attributed to both directories, so fsync of either covers it."
+    :default false]
+   [nil "--fsync-metadata-transparency" "Metadata transparency: ftruncate un-fsync'd on a Connected leader, clean kill-leader. The standby replays the tail so the truncate survives, and a fsync must SUCCEED with the size intact. Verifies tail replay carries setattr."
+    :default false]
+   [nil "--fsync-multifailover" "Cross-term honesty: a write survives a transparent failover (token kept), then a cold restart regenerates the token, so a fsync over the carried-then-lost write MUST fail. Verifies a kept token is still invalidated by a later lineage break."
+    :default false]])
 
 (defn -main [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn ha-test :opt-spec cli-opts})

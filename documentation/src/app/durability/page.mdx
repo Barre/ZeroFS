@@ -216,6 +216,14 @@ ZeroFS follows standard POSIX durability semantics. Write operations are buffere
   </Col>
 </Row>
 
+## Verified fsync
+
+A successful `fsync` is verified: it means every write the descriptor acknowledged before it is durable on object storage. Acknowledged writes live in the memtable until the next flush, so a crash before that flush loses them. ZeroFS does not let that loss pass silently. A `fsync` issued after a restart, over writes made before it, returns a stale-handle error (`ESTALE`) rather than a false success.
+
+Each acknowledged write is tagged with a durability *lineage token* naming the current unbroken durable lineage. A restart reopens the database and, with no way to prove it inherited the un-flushed memtable, regenerates the token. A `fsync` presents the token its writes were made under; if the database has since regenerated, the tokens differ and the `fsync` fails. The first `fsync` after a write is the binding promise, so a failure is an honest report of loss: redo the writes and `fsync` again.
+
+This holds on a single node and under replication alike. With a replicated standby a clean failover can prove it inherited the writes and keeps the token, so the `fsync` succeeds transparently; the failover cases are diagrammed in [High availability](/high-availability). The check is per descriptor and matches POSIX: it covers the whole file across every open handle, speaks for no other file, and verifies data, metadata, directory entries, and `rename`.
+
 ## Eliminating the Durability Window
 
 By default, writes between fsync calls live in the memtable and become durable only when the next periodic flush, capacity threshold, or explicit fsync persists them. For workloads that need every write durable on return, set `sync_writes = true` in the `[lsm]` section.
@@ -245,9 +253,9 @@ The durability guarantees available to applications depend on the access protoco
 
     The 9P protocol provides direct mapping of POSIX synchronization semantics:
 
-    - `fsync()` system call generates a `Tfsync` protocol message
-    - ZeroFS flushes all buffered data to object storage
-    - The call returns only after durability is confirmed
+    - `fsync()` issues a durability-verified flush (`Tfsyncdur`)
+    - ZeroFS flushes all buffered data to object storage, then verifies the writes' lineage
+    - The call returns success only when durability is confirmed, otherwise `ESTALE` (see [Verified fsync](#verified-fsync))
 
   </Col>
   <Col>

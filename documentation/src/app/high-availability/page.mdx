@@ -64,6 +64,71 @@ graph TB
 
 **Connected and Solo.** The leader ships while the standby is reachable (Connected). If the standby is down or slow, the leader degrades to Solo and keeps serving, with writes single-node-durable as on a standalone node, instead of blocking on an absent replica. It re-establishes shipping when the standby returns. Solo trades the replication of un-`fsync`'d writes for availability; fencing still prevents split-brain.
 
+**`fsync` never reports a false success.** Replication shrinks the un-`fsync`'d window but cannot remove it: a simultaneous loss of both nodes, or a single-node loss in Solo, can still drop writes that were acknowledged but not yet flushed. ZeroFS does not let that pass silently. A successful `fsync` against an HA pair means every write acknowledged on that file descriptor before it is durable on object storage and will survive any failover. If the lineage that carried those writes did not survive the recovery, the `fsync` returns `ESTALE` instead. It is never a false success.
+
+The mechanism is a single value, the *lineage token*, that names one unbroken durable lineage. A takeover keeps the token when it can prove it inherited the leader's data, which holds for a connected standby that replayed the buffered tail, and regenerates it when it cannot: a cold restart of both nodes, or a takeover after the leader had degraded to Solo, where the un-shipped writes never reached the standby. A leader running Solo marks the lineage un-inheritable on object storage before it acknowledges its first Solo write, so any later takeover regenerates rather than inherits writes it does not hold. The client records each un-`fsync`'d change against the token it was made under and, on `fsync`, presents the oldest token still outstanding. The leader flushes the whole database to object storage and then checks that token against the current lineage. A match means the data is durable; a mismatch means the lineage broke and those writes did not survive, so the `fsync` fails.
+
+The verification is per descriptor and matches POSIX. An `fsync` covers the whole file the descriptor points at, across every open handle to that file, and speaks for no other file: `fsync`ing one file never confirms or blames another. It covers every kind of change, not only data writes: file metadata (`truncate`, `chmod`, `chown`, timestamps), directory entries (`create`, `mkdir`, `unlink`, `rmdir`, `symlink`, `mknod`, hard link), and `rename` across both its source and destination directories. As in POSIX, a file's contents and metadata are made durable by `fsync` on the file and a directory entry by `fsync` on its directory; ZeroFS verifies each change on the descriptor POSIX makes responsible for it.
+
+A clean single-node failover keeps the token, so writes the standby replayed survive and `fsync` succeeds transparently, exactly as on a single node. The error is raised only when a recovery genuinely left the data behind. When it is, the application learns that its un-`fsync`'d work since the last successful `fsync` on that descriptor is gone; it should redo those writes and `fsync` again. The first `fsync` after a write is the binding promise, so a failure is an honest report of loss rather than a transient error to retry. The client libraries surface it as a distinct stale-handle error, separate from any other failure, so an application can detect it and recover.
+
+The three outcomes follow from one rule: whether the takeover keeps the lineage token or must regenerate it.
+
+**Clean single-node crash: the writes survived, so `fsync` succeeds transparently.** The standby held the writes (semi-sync) and replayed the tail, so it keeps the token the client carries.
+
+<Mermaid chart={`
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant S as Standby
+    participant O as Object storage
+
+    C->>L: write (not yet fsynced)
+    L->>S: ship (semi-sync)
+    L-->>C: ack, tagged with lineage token T
+    Note over L: Leader crashes
+    S->>S: take over, replay tail, keep token T
+    C->>S: fsync, presents token T
+    S->>O: flush
+    S-->>C: ok: T is the live lineage, the writes are durable
+`} />
+
+**Both nodes lost: the writes are gone, so `fsync` returns ESTALE.** A cold restart cannot prove it inherited anything, so it regenerates the token; the one the client carries no longer matches.
+
+<Mermaid chart={`
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant O as Object storage
+
+    C->>L: write (not yet fsynced)
+    L-->>C: ack, tagged with lineage token T
+    Note over C,O: both nodes die, the write was only in memory
+    L->>O: reopen cold, regenerate to a new token
+    C->>L: fsync, presents token T
+    L->>O: flush
+    L-->>C: ESTALE: T is no longer the live lineage, the write is gone
+`} />
+
+**Solo at takeover: the new leader never received the writes, so `fsync` returns ESTALE.** A leader running Solo taints the lineage before acking its first Solo write, so the takeover regenerates rather than inherit writes it does not hold.
+
+<Mermaid chart={`
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant S as Standby
+    participant O as Object storage
+
+    Note over L,S: standby unreachable, leader runs Solo
+    L->>O: taint the lineage (before the first Solo ack)
+    C->>L: write (not yet fsynced, not shipped to the standby)
+    L-->>C: ack, tagged with lineage token T
+    Note over L: Leader fails, standby takes over
+    S->>O: taint matches the stored lineage, regenerate the token
+    C->>S: fsync, presents token T
+    S-->>C: ESTALE: the new leader never received the write
+`} />
+
 **The lease.** A node serves only while its lease is valid. The lease tracks SlateDB's view of the database: renewed while it is open, and revoked the instant SlateDB closes it. A takeover bumps the writer epoch, and SlateDB's manifest poll closes the deposed leader's database as soon as it observes that newer epoch. So a deposed leader steps down, answering clients with a "not the leader" signal, within one manifest-poll interval of the takeover: it learns from the poll, so even an idle, read-only deposed leader stops without having to attempt a write first. Fencing is the hard guarantee against split-brain writes; the lease, riding the same epoch the poll observes, extends that to reads.
 
 **Client failover.** A ZeroFS client connects to every node address, finds the one currently serving as leader, and reroutes when that node stops serving, whether the connection dropped, an operation timed out, or the node replied "not the leader". Retried mutating operations carry a stable operation id that the leader deduplicates, so rerouting a non-idempotent operation (`mkdir`, `rename`, and so on) never applies it twice. A write whose acknowledgment is lost to a failover is therefore not left ambiguous: the client retries it, deduplication keeps the retry exactly-once, and the call returns a definitive result instead of a timeout. See [Client access](#clients).
@@ -108,13 +173,14 @@ sequenceDiagram
 | At most one committed writer | Yes, via `writer_epoch` fencing, independent of timing. |
 | `fsync`'d writes | Durable on object storage; survive any single-node loss and a failover. |
 | Un-`fsync`'d acked writes | Survive a leader crash while replication is Connected (shipped and acked to the standby). In Solo mode they are single-node-durable, as on a standalone node. |
+| `fsync` honesty | A successful `fsync` means every write acknowledged on that descriptor before it is durable on object storage. If a recovery did not inherit those writes, the `fsync` returns a distinct stale-handle error, never a false success. The check is per descriptor and follows POSIX: it covers the whole file (or, for a directory, its entries) across every open handle, speaks for no other file, and verifies every kind of change, data writes, metadata, directory entries, and `rename`. |
 | Split-brain corruption | Prevented by fencing, even if two nodes briefly both believe they lead. |
 | Stale reads | None for a single client (read-your-writes and monotonic reads hold across a failover). Cross-client and bounded: for at most one manifest-poll interval after a takeover, a client still pinned to a deposed-but-reachable leader can read a value another client has already overwritten. Reads only; never split-brain or lost data. |
 | Failover time | Bounded by the takeover TTL (about two seconds) on a crash; faster when a deposed leader reaches the standby directly and it takes over without waiting out the gap. |
 | Surviving failures | Any single-node loss; not a simultaneous loss of both nodes before a flush reaches object storage. |
 
 <Note>
-The durability contract is `fsync`. An `fsync`'d write is on object storage and survives whatever a single object store survives. Replication additionally protects un-`fsync`'d acked writes, but only while the standby is connected. Do not treat HA as a substitute for `fsync` where durability matters.
+The durability contract is `fsync`. An `fsync`'d write is on object storage and survives whatever a single object store survives. Replication additionally protects un-`fsync`'d acked writes, but only while the standby is connected. Do not treat HA as a substitute for `fsync` where durability matters. When a failure does cross that line and drops un-`fsync`'d writes, the affected client's next `fsync` fails rather than reporting a durability it cannot provide, so the loss is never silent.
 </Note>
 
 ## Configuration {{ id: 'configuration' }}
