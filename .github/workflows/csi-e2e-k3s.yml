@@ -1,20 +1,13 @@
 name: CSI e2e (k3s)
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  workflow_call:
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   e2e:
@@ -23,11 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build zerofs and zerofs-csi
-        working-directory: zerofs
-        run: cargo build --profile ci -p zerofs -p zerofs-csi
+      - name: Fetch the prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs zerofs/target/ci/zerofs-csi
 
       - name: Build images
         run: |

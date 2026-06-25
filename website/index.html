@@ -710,39 +710,39 @@ footer a:hover { color: var(--text); }
   <div class="wrap">
     <div class="sec-head rv"><span class="idx">01</span><span class="label">Verification</span></div>
     <h2 class="rv">The test suites run in public CI.</h2>
-    <p class="sec-intro rv">CI runs pjdfstest, xfstests, kernel builds, stress-ng, ZFS scrubs, Jepsen's local-fs suite, and a Jepsen failover suite on every change. The first three run separately over NFS, 9P, and the FUSE client. Each card links to its workflow.</p>
+    <p class="sec-intro rv">CI runs pjdfstest, xfstests, kernel builds, stress-ng, ZFS scrubs, Jepsen's local-fs suite, and a Jepsen failover suite on every change. The first three run separately over NFS, 9P, and the FUSE client. Each card links to the CI pipeline.</p>
     <div class="proof-grid">
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/pjdfstest.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>POSIX semantics</h3>
         <p>The pjdfstest suite runs on every change, once per protocol: permissions, ownership, links, rename behavior. The exclude lists, a few cases per protocol, are published in the repository.</p>
         <span class="src">pjdfstest workflow →</span>
       </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/xfstests-9p.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>xfstests</h3>
         <p>The kernel filesystem test suite runs over NFS, 9P, and FUSE in separate workflows. These are the tests ext4 and XFS themselves are validated against.</p>
         <span class="src">xfstests workflow →</span>
       </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/zfs-test.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>ZFS as the end-to-end test</h3>
         <p>CI builds a ZFS pool on ZeroFS block devices, extracts the Linux kernel source tree onto it, and runs a full scrub. The scrub reports no checksum errors.</p>
         <span class="src">zfs-test workflow →</span>
       </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/kernel-compile-9p.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>Kernel builds</h3>
         <p>CI compiles the Linux kernel on NFS, 9P, and FUSE mounts with <code>make -j$(nproc)</code>. Parallel compilation is the stress test: many processes writing the same tree at once.</p>
         <span class="src">kernel-compile workflow →</span>
       </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/stress-ng.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>stress-ng</h3>
         <p>Filesystem stressors run against live mounts in CI: access, chdir, chmod, chown, and the rest of the file-handling set, all at once.</p>
         <span class="src">stress-ng workflow →</span>
       </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/jepsen.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>Model-based checking</h3>
         <p>Jepsen's local-fs suite drives a 9P mount with random operation histories and checks each against a reference filesystem model. A crash mode kills the server mid-run and verifies the recovered state matches the last fsync.</p>
         <span class="src">jepsen workflow →</span>
       </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/jepsen-ha.yml">
+      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
         <h3>Failover under fault injection</h3>
         <p>A second Jepsen suite runs a leader and standby over MinIO, then kills, restarts, and pauses the leader mid-workload. It confirms every acknowledged write survives the failover and the recovered filesystem stays consistent.</p>
         <span class="src">jepsen-ha workflow →</span>
