@@ -1,6 +1,6 @@
 [package]
 name = "ninep-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Async 9P2000.L client with transparent reconnection"
 license = "AGPL-3.0"
@@ -13,7 +13,7 @@ categories = ["network-programming", "filesystem", "asynchronous"]
 [dependencies]
 # Path for local/CI resolution; version so crates.io accepts the dependency.
 # The transport crates are on their own pre-1.0 line, independent of the server.
-ninep-proto = { path = "../ninep-proto", version = "0.1.1" }
+ninep-proto = { path = "../ninep-proto", version = "0.1.2" }
 tokio = { version = "1.52", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"

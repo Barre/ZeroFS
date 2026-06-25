@@ -1,17 +1,10 @@
 name: xfstests-nfs
 
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   xfstests:
@@ -49,9 +42,12 @@ jobs:
           make
           sudo make install
 
-      - name: Build ZeroFS
-        working-directory: zerofs
-        run: cargo build --profile ci
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+      - run: chmod +x zerofs/target/ci/zerofs
 
       - name: Create ZeroFS data directories
         run: |

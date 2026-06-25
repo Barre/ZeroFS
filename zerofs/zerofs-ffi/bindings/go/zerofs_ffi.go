@@ -4264,6 +4264,7 @@ var ErrZeroFsErrorTooManySymlinks = fmt.Errorf("ZeroFsErrorTooManySymlinks")
 var ErrZeroFsErrorClosed = fmt.Errorf("ZeroFsErrorClosed")
 var ErrZeroFsErrorConnectFailed = fmt.Errorf("ZeroFsErrorConnectFailed")
 var ErrZeroFsErrorNotLeader = fmt.Errorf("ZeroFsErrorNotLeader")
+var ErrZeroFsErrorStale = fmt.Errorf("ZeroFsErrorStale")
 var ErrZeroFsErrorIo = fmt.Errorf("ZeroFsErrorIo")
 var ErrZeroFsErrorProtocol = fmt.Errorf("ZeroFsErrorProtocol")
 
@@ -4650,6 +4651,42 @@ func (self ZeroFsErrorNotLeader) Is(target error) bool {
 	return target == ErrZeroFsErrorNotLeader
 }
 
+// Stale handle (ESTALE). From `sync_all`/`sync_data` this is the durability signal:
+// the `.zerofs4` lineage broke, so writes acked on this handle before the fsync may
+// not be durable; redo them and fsync again. From other operations it is a plain
+// stale inode/handle (re-open the path).
+type ZeroFsErrorStale struct {
+	Path string
+}
+
+// Stale handle (ESTALE). From `sync_all`/`sync_data` this is the durability signal:
+// the `.zerofs4` lineage broke, so writes acked on this handle before the fsync may
+// not be durable; redo them and fsync again. From other operations it is a plain
+// stale inode/handle (re-open the path).
+func NewZeroFsErrorStale(
+	path string,
+) *ZeroFsError {
+	return &ZeroFsError{err: &ZeroFsErrorStale{
+		Path: path}}
+}
+
+func (e ZeroFsErrorStale) destroy() {
+	FfiDestroyerString{}.Destroy(e.Path)
+}
+
+func (err ZeroFsErrorStale) Error() string {
+	return fmt.Sprint("Stale",
+		": ",
+
+		"Path=",
+		err.Path,
+	)
+}
+
+func (self ZeroFsErrorStale) Is(target error) bool {
+	return target == ErrZeroFsErrorStale
+}
+
 // Any other server errno, preserved verbatim.
 type ZeroFsErrorIo struct {
 	Errno   int32
@@ -4795,12 +4832,16 @@ func (c FfiConverterZeroFsError) Read(reader io.Reader) *ZeroFsError {
 			Path: FfiConverterStringINSTANCE.Read(reader),
 		}}
 	case 14:
+		return &ZeroFsError{&ZeroFsErrorStale{
+			Path: FfiConverterStringINSTANCE.Read(reader),
+		}}
+	case 15:
 		return &ZeroFsError{&ZeroFsErrorIo{
 			Errno:   FfiConverterInt32INSTANCE.Read(reader),
 			Path:    FfiConverterStringINSTANCE.Read(reader),
 			Message: FfiConverterStringINSTANCE.Read(reader),
 		}}
-	case 15:
+	case 16:
 		return &ZeroFsError{&ZeroFsErrorProtocol{
 			Message: FfiConverterStringINSTANCE.Read(reader),
 		}}
@@ -4849,13 +4890,16 @@ func (c FfiConverterZeroFsError) Write(writer io.Writer, value *ZeroFsError) {
 	case *ZeroFsErrorNotLeader:
 		writeInt32(writer, 13)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Path)
-	case *ZeroFsErrorIo:
+	case *ZeroFsErrorStale:
 		writeInt32(writer, 14)
+		FfiConverterStringINSTANCE.Write(writer, variantValue.Path)
+	case *ZeroFsErrorIo:
+		writeInt32(writer, 15)
 		FfiConverterInt32INSTANCE.Write(writer, variantValue.Errno)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Path)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Message)
 	case *ZeroFsErrorProtocol:
-		writeInt32(writer, 15)
+		writeInt32(writer, 16)
 		FfiConverterStringINSTANCE.Write(writer, variantValue.Message)
 	default:
 		_ = variantValue
@@ -4892,6 +4936,8 @@ func (_ FfiDestroyerZeroFsError) Destroy(value *ZeroFsError) {
 	case ZeroFsErrorConnectFailed:
 		variantValue.destroy()
 	case ZeroFsErrorNotLeader:
+		variantValue.destroy()
+	case ZeroFsErrorStale:
 		variantValue.destroy()
 	case ZeroFsErrorIo:
 		variantValue.destroy()

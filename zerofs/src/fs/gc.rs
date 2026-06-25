@@ -224,3 +224,117 @@ impl GarbageCollector {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::ZeroFS;
+    use crate::fs::store::tombstone::TombstoneEntry;
+
+    fn no_wait() -> WriteOptions {
+        WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        }
+    }
+
+    async fn gc_for(fs: &ZeroFS) -> GarbageCollector {
+        GarbageCollector::new(
+            Arc::clone(&fs.db),
+            fs.tombstone_store.clone(),
+            fs.chunk_store.clone(),
+            Arc::clone(&fs.stats),
+        )
+    }
+
+    async fn tombstones(store: &TombstoneStore) -> Vec<TombstoneEntry> {
+        let iter = store.list().await.unwrap();
+        futures::pin_mut!(iter);
+        let mut out = Vec::new();
+        while let Some(r) = futures::StreamExt::next(&mut iter).await {
+            out.push(r.unwrap());
+        }
+        out
+    }
+
+    // The core sweep: a tombstone for a deleted file's chunks is reclaimed — every
+    // chunk deleted, the tombstone removed, and the stats counters advanced.
+    #[tokio::test]
+    async fn gc_deletes_chunks_and_removes_the_tombstone() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let gc = gc_for(&fs).await;
+
+        let inode_id = 4242u64;
+        let size = (CHUNK_SIZE * 3) as u64;
+
+        let mut txn = fs.db.new_transaction().unwrap();
+        fs.chunk_store
+            .write(
+                &mut txn,
+                inode_id,
+                0,
+                &Bytes::from(vec![1u8; size as usize]),
+                0,
+            )
+            .await
+            .unwrap();
+        fs.tombstone_store.add(&mut txn, inode_id, size);
+        fs.db
+            .write_with_options(txn.into_inner(), &no_wait())
+            .await
+            .unwrap();
+
+        for idx in 0..3 {
+            assert!(
+                fs.chunk_store.get(inode_id, idx).await.unwrap().is_some(),
+                "chunk {idx} should exist before GC"
+            );
+        }
+
+        gc.run().await.unwrap();
+
+        for idx in 0..3 {
+            assert!(
+                fs.chunk_store.get(inode_id, idx).await.unwrap().is_none(),
+                "chunk {idx} must be reclaimed by GC"
+            );
+        }
+        assert!(
+            tombstones(&fs.tombstone_store).await.is_empty(),
+            "tombstone must be removed"
+        );
+        assert_eq!(fs.stats.gc_chunks_deleted.load(Ordering::Relaxed), 3);
+        assert_eq!(fs.stats.tombstones_processed.load(Ordering::Relaxed), 1);
+        assert!(fs.stats.gc_runs.load(Ordering::Relaxed) >= 1);
+    }
+
+    // A zero-remaining-size tombstone (its chunks already gone) is just removed.
+    #[tokio::test]
+    async fn gc_removes_a_zero_size_tombstone() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let gc = gc_for(&fs).await;
+
+        let mut txn = fs.db.new_transaction().unwrap();
+        fs.tombstone_store.add(&mut txn, 9u64, 0);
+        fs.db
+            .write_with_options(txn.into_inner(), &no_wait())
+            .await
+            .unwrap();
+
+        gc.run().await.unwrap();
+
+        assert!(tombstones(&fs.tombstone_store).await.is_empty());
+        assert_eq!(fs.stats.gc_chunks_deleted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn gc_on_an_empty_store_is_a_noop() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let gc = gc_for(&fs).await;
+
+        gc.run().await.unwrap();
+
+        assert_eq!(fs.stats.gc_chunks_deleted.load(Ordering::Relaxed), 0);
+        assert!(fs.stats.gc_runs.load(Ordering::Relaxed) >= 1);
+    }
+}

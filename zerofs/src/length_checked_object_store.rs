@@ -289,4 +289,35 @@ mod tests {
         let got = store.get_range(&path, 100..200).await.unwrap();
         assert_eq!(&got[..], &body[100..200]);
     }
+
+    // A hard get error must propagate, not be mistaken for a short body and
+    // retried forever. (Retrying a hard error is the layer above's job.)
+    #[tokio::test]
+    async fn propagates_a_hard_get_error() {
+        let (faulty, ctl) = crate::fault_store::FaultStore::new(Arc::new(InMemory::new()));
+        let path = Path::from("obj");
+        faulty.put(&path, b"data".to_vec().into()).await.unwrap();
+
+        ctl.fail_gets(1);
+        let store = LengthCheckedObjectStore::new(faulty);
+        assert!(store.get(&path).await.is_err());
+    }
+
+    // The short-body guard applies to the range length too: a truncated ranged
+    // read is re-fetched until the requested window arrives in full.
+    #[tokio::test(start_paused = true)]
+    async fn retries_a_truncated_ranged_read() {
+        let raw = Arc::new(InMemory::new());
+        let path = Path::from("obj");
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        raw.put(&path, body.clone().into()).await.unwrap();
+
+        let (faulty, ctl) = crate::fault_store::FaultStore::new(raw);
+        ctl.truncate_gets(3, 10);
+        let store = LengthCheckedObjectStore::new(faulty);
+
+        let got = store.get_range(&path, 100..200).await.unwrap();
+        assert_eq!(&got[..], &body[100..200]);
+        assert_eq!(ctl.get_count(), 4, "3 truncated + 1 full");
+    }
 }

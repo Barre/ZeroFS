@@ -82,6 +82,16 @@ pub enum ZeroFsError {
         /// The path the operation targeted (lossy display).
         path: String,
     },
+    /// Stale handle (ESTALE). From [`crate::File::sync_all`]/[`crate::File::sync_data`]
+    /// this is the durability signal: the `.zerofs4` lineage broke (a failover the
+    /// surviving node could not prove it inherited), so every write acked on this handle
+    /// before the fsync may not be durable. Treat those writes as lost, redo them, and
+    /// fsync again. From other operations it is a plain stale inode/handle (re-open the
+    /// path).
+    Stale {
+        /// The path the operation targeted (lossy display).
+        path: String,
+    },
     /// Any other server errno, preserved verbatim.
     Io {
         /// The Linux errno the server returned.
@@ -116,6 +126,12 @@ impl std::fmt::Display for ZeroFsError {
             Self::Closed => write!(f, "handle is closed"),
             Self::ConnectFailed { message } => write!(f, "connection failed: {message}"),
             Self::NotLeader { path } => write!(f, "not the leader (re-route): {path}"),
+            Self::Stale { path } => {
+                write!(
+                    f,
+                    "stale handle (fsync: prior writes may not be durable): {path}"
+                )
+            }
             Self::Io {
                 errno,
                 path,
@@ -155,6 +171,7 @@ impl ZeroFsError {
             Self::Closed => libc::EBADF,
             Self::ConnectFailed { .. } => libc::EIO,
             Self::NotLeader { .. } => P9_ENOTLEADER as i32,
+            Self::Stale { .. } => libc::ESTALE,
             Self::Io { errno, .. } => *errno,
             Self::Protocol { .. } => libc::EIO,
         }
@@ -176,6 +193,7 @@ impl ZeroFsError {
                 message: format!("{path}: invalid argument"),
             },
             libc::ELOOP => Self::TooManySymlinks { path },
+            libc::ESTALE => Self::Stale { path },
             c if c == P9_ENOTLEADER as i32 => Self::NotLeader { path },
             errno => Self::Io {
                 message: std::io::Error::from_raw_os_error(errno).to_string(),

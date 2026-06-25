@@ -54,6 +54,16 @@ const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // batch so a promoted standby can prune its tail to exactly what the db already
 // holds (see write_coordinator + takeover replay).
 const SYSTEM_HA_SEQNO_SUBTYPE: u8 = 0x02;
+// Durability lineage token (see fsync-honesty / ZeroFS::lineage_token). A single
+// u64 identifying the current unbroken durable lineage. Regenerated at a cold
+// bootstrap or a Solo-tainted takeover; carried forward unchanged at an untainted
+// takeover (so a clean failover keeps a client's fsync transparent).
+const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
+// Solo taint: set to the lineage token that was live when the leader first
+// downgraded to Solo replication. A takeover reads it to decide keep-vs-regenerate
+// the lineage token (taint == stored lineage => the lineage may be missing acked
+// Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
+const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -321,6 +331,33 @@ impl KeyCodec {
         v.extend_from_slice(&writer_epoch.to_le_bytes());
         v.extend_from_slice(&seqno.to_le_bytes());
         Bytes::from(v)
+    }
+
+    /// Key for the durability lineage token (a single u64).
+    pub fn lineage_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_LINEAGE_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    /// Key for the Solo taint (the lineage token that went Solo).
+    pub fn taint_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_TAINT_SUBTYPE);
+        Bytes::from(key)
+    }
+
+    pub fn encode_u64(value: u64) -> Bytes {
+        Bytes::copy_from_slice(&value.to_le_bytes())
+    }
+
+    pub fn decode_u64(data: &[u8]) -> Option<u64> {
+        if data.len() != U64_SIZE {
+            return None;
+        }
+        Some(u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?))
     }
 
     /// Returns `(writer_epoch, seqno)`.
@@ -595,5 +632,140 @@ mod tests {
         ));
         let inode_key = codec.inode_key(1);
         assert!(matches!(codec.parse_key(&inode_key), ParsedKey::Unknown));
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn codecs() -> [KeyCodec; 2] {
+        [KeyCodec::new(false), KeyCodec::new(true)]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        // Big-endian id encoding is the reason lexicographic key order matches
+        // numeric order; every range scan (chunk reads, dir listing, GC) leans on
+        // it. The prose comments assert this layout; nothing tested it until now.
+        #[test]
+        fn chunk_key_roundtrips_and_orders(
+            a in (any::<u64>(), any::<u64>()),
+            b in (any::<u64>(), any::<u64>()),
+        ) {
+            for codec in codecs() {
+                let ka = codec.chunk_key(a.0, a.1);
+                let kb = codec.chunk_key(b.0, b.1);
+                prop_assert_eq!(codec.parse_chunk_key(&ka), Some(a.1));
+                prop_assert_eq!(codec.parse_chunk_key(&kb), Some(b.1));
+                prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
+            }
+        }
+
+        #[test]
+        fn tombstone_key_roundtrips_and_orders(
+            a in (any::<u64>(), any::<u64>()),
+            b in (any::<u64>(), any::<u64>()),
+        ) {
+            for codec in codecs() {
+                let ka = codec.tombstone_key(a.0, a.1);
+                let kb = codec.tombstone_key(b.0, b.1);
+                match codec.parse_key(&ka) {
+                    ParsedKey::Tombstone { inode_id } => prop_assert_eq!(inode_id, a.1),
+                    other => prop_assert!(false, "expected Tombstone, got {:?}", other),
+                }
+                // Ordered by (timestamp, inode_id): GC scans tombstones in time order.
+                prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
+            }
+        }
+
+        #[test]
+        fn dir_scan_key_roundtrips_and_orders(
+            a in (any::<u64>(), any::<u64>()),
+            b in (any::<u64>(), any::<u64>()),
+        ) {
+            for codec in codecs() {
+                let ka = codec.dir_scan_key(a.0, a.1);
+                let kb = codec.dir_scan_key(b.0, b.1);
+                match codec.parse_key(&ka) {
+                    ParsedKey::DirScan { cookie } => prop_assert_eq!(cookie, a.1),
+                    other => prop_assert!(false, "expected DirScan, got {:?}", other),
+                }
+                prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
+            }
+        }
+
+        // A resume key must land exactly on the next cookie, so a paged scan
+        // continues strictly after `cookie` with no skipped or repeated entry.
+        #[test]
+        fn dir_scan_resume_is_next_cookie(dir in any::<u64>(), cookie in 0u64..u64::MAX) {
+            for codec in codecs() {
+                let resume = codec.dir_scan_resume_key(dir, cookie);
+                prop_assert_eq!(&resume, &codec.dir_scan_key(dir, cookie + 1));
+                prop_assert!(resume.as_ref() > codec.dir_scan_key(dir, cookie).as_ref());
+            }
+        }
+
+        #[test]
+        fn orphan_key_roundtrips(ino in any::<u64>()) {
+            for codec in codecs() {
+                match codec.parse_key(&codec.orphan_key(ino)) {
+                    ParsedKey::Orphan { inode_id } => prop_assert_eq!(inode_id, ino),
+                    other => prop_assert!(false, "expected Orphan, got {:?}", other),
+                }
+            }
+        }
+
+        // parse_chunk_key must reject every non-chunk key, including ones that share
+        // the chunk key's byte length (v1 tombstone and chunk keys are both 17 bytes,
+        // separated only by the kind byte).
+        #[test]
+        fn non_chunk_keys_never_parse_as_chunk(
+            ino in any::<u64>(),
+            x in any::<u64>(),
+            name in prop::collection::vec(any::<u8>(), 0..40),
+        ) {
+            for codec in codecs() {
+                prop_assert_eq!(codec.parse_chunk_key(&codec.inode_key(ino)), None);
+                prop_assert_eq!(codec.parse_chunk_key(&codec.tombstone_key(x, ino)), None);
+                prop_assert_eq!(codec.parse_chunk_key(&codec.orphan_key(ino)), None);
+                prop_assert_eq!(codec.parse_chunk_key(&codec.dir_scan_key(ino, x)), None);
+                prop_assert_eq!(codec.parse_chunk_key(&codec.dir_entry_key(ino, &name)), None);
+            }
+        }
+
+        #[test]
+        fn value_codecs_roundtrip(x in any::<u64>(), y in any::<u64>()) {
+            prop_assert_eq!(KeyCodec::decode_u64(&KeyCodec::encode_u64(x)), Some(x));
+            prop_assert_eq!(KeyCodec::decode_counter(&KeyCodec::encode_counter(x)).unwrap(), x);
+            prop_assert_eq!(
+                KeyCodec::decode_tombstone_size(&KeyCodec::encode_tombstone_size(x)).unwrap(),
+                x
+            );
+            prop_assert_eq!(KeyCodec::decode_ha_seqno(&KeyCodec::encode_ha_seqno(x, y)), Some((x, y)));
+            prop_assert_eq!(
+                KeyCodec::decode_dir_entry(&KeyCodec::encode_dir_entry(x, y)).unwrap(),
+                (x, y)
+            );
+        }
+
+        // The half-open prefix range must contain every chunk key and no metadata
+        // key, so a chunk-domain scan can never read (or GC) metadata.
+        #[test]
+        fn prefix_range_isolates_chunks(ino in any::<u64>(), idx in any::<u64>(), x in any::<u64>()) {
+            for codec in codecs() {
+                let (start, end) = codec.prefix_range(KeyPrefix::Chunk);
+                let chunk = codec.chunk_key(ino, idx);
+                prop_assert!(chunk.as_ref() >= start.as_ref() && chunk.as_ref() < end.as_ref());
+
+                let meta = codec.tombstone_key(x, ino);
+                prop_assert!(
+                    !(meta.as_ref() >= start.as_ref() && meta.as_ref() < end.as_ref()),
+                    "a metadata key leaked into the chunk prefix range"
+                );
+            }
+        }
     }
 }

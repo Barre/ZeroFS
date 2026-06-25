@@ -276,3 +276,109 @@ mod tests {
         assert!(transformer.decode(short_data).await.is_err());
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    thread_local! {
+        static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        RT.with(|rt| rt.block_on(f))
+    }
+
+    fn compression() -> impl Strategy<Value = CompressionConfig> {
+        prop_oneof![
+            Just(CompressionConfig::Lz4),
+            (1i32..=19).prop_map(CompressionConfig::Zstd),
+        ]
+    }
+
+    // Payloads straddling the 64KiB inline/spawn_blocking boundary, sometimes
+    // carrying the zstd magic inline so decode's algorithm auto-detection is
+    // exercised against data that could be mistaken for a zstd frame.
+    fn payload() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..70_000),
+            prop::collection::vec(0u8..=3, 0..70_000),
+            (0usize..64, prop::collection::vec(any::<u8>(), 0..512)).prop_map(|(off, mut v)| {
+                if v.len() >= off + 4 {
+                    v[off..off + 4].copy_from_slice(&ZSTD_MAGIC);
+                }
+                v
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        // encode then decode on the same transformer must return the input exactly,
+        // for any payload: decode auto-detects the algorithm from the decrypted
+        // bytes, so a payload that looks like the other format must not misroute.
+        #[test]
+        fn encode_decode_roundtrips(data in payload(), cfg in compression()) {
+            let key = [7u8; 32];
+            let out = block_on(async {
+                let t = ZeroFsBlockTransformer::new(&key, cfg);
+                let enc = t.encode(Bytes::from(data.clone())).await?;
+                t.decode(enc).await
+            });
+            match out {
+                Ok(dec) => prop_assert_eq!(dec.as_ref(), data.as_slice()),
+                Err(e) => prop_assert!(
+                    false,
+                    "roundtrip failed ({} bytes, {:?}): {}",
+                    data.len(),
+                    cfg,
+                    e
+                ),
+            }
+        }
+
+        // A block encoded under one algorithm decodes under a transformer configured
+        // for the other: decode keys off the payload, not its own config.
+        #[test]
+        fn decode_is_algorithm_agnostic(data in payload(), level in 1i32..=19) {
+            let key = [9u8; 32];
+            let out = block_on(async {
+                let enc = ZeroFsBlockTransformer::new(&key, CompressionConfig::Lz4)
+                    .encode(Bytes::from(data.clone()))
+                    .await?;
+                ZeroFsBlockTransformer::new(&key, CompressionConfig::Zstd(level))
+                    .decode(enc)
+                    .await
+            });
+            match out {
+                Ok(dec) => prop_assert_eq!(dec.as_ref(), data.as_slice()),
+                Err(e) => prop_assert!(false, "cross-decode failed ({} bytes): {}", data.len(), e),
+            }
+        }
+
+        // AEAD integrity: a block never decodes under a different key.
+        #[test]
+        fn wrong_key_never_decodes(
+            data in prop::collection::vec(any::<u8>(), 1..4096),
+            k1 in prop::array::uniform32(any::<u8>()),
+            k2 in prop::array::uniform32(any::<u8>()),
+        ) {
+            prop_assume!(k1 != k2);
+            let out = block_on(async {
+                let enc = ZeroFsBlockTransformer::new(&k1, CompressionConfig::Lz4)
+                    .encode(Bytes::from(data.clone()))
+                    .await
+                    .unwrap();
+                ZeroFsBlockTransformer::new(&k2, CompressionConfig::Lz4)
+                    .decode(enc)
+                    .await
+            });
+            prop_assert!(out.is_err(), "a block decoded under the wrong key");
+        }
+    }
+}

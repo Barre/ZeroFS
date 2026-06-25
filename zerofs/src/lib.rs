@@ -14,4 +14,7 @@ pub mod task;
 pub mod failpoints;
 
 #[cfg(test)]
+pub mod fault_store;
+
+#[cfg(test)]
 pub mod test_helpers;

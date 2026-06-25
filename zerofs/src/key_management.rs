@@ -406,4 +406,104 @@ mod tests {
             .expect("later load");
         assert_eq!(ka, kc, "a later load must return the committed key");
     }
+
+    fn store() -> Arc<dyn ObjectStore> {
+        Arc::new(object_store::memory::InMemory::new())
+    }
+
+    // Password rotation must preserve the DEK (data stays decryptable) and the old
+    // password must stop working.
+    #[tokio::test]
+    async fn change_password_rotates_without_losing_the_dek() {
+        let store = store();
+        let db_path = Path::from("data");
+        let (old_pw, new_pw) = ("old-pw-123", "new-pw-456");
+
+        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, false)
+            .await
+            .unwrap();
+
+        change_encryption_password(&store, &db_path, old_pw, new_pw)
+            .await
+            .unwrap();
+
+        assert!(
+            load_or_init_encryption_key(&store, &db_path, old_pw, false)
+                .await
+                .is_err(),
+            "the old password must stop unwrapping the key"
+        );
+        let dek2 = load_or_init_encryption_key(&store, &db_path, new_pw, false)
+            .await
+            .unwrap();
+        assert_eq!(dek, dek2, "rotation must preserve the data key");
+    }
+
+    #[tokio::test]
+    async fn change_password_without_a_key_errors() {
+        let store = store();
+        assert!(
+            change_encryption_password(&store, &Path::from("data"), "a", "b")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_init_without_a_key_errors() {
+        let store = store();
+        let err = load_or_init_encryption_key(&store, &Path::from("data"), "pw", true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("read-only"), "got: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn reload_with_wrong_password_errors() {
+        let store = store();
+        let db_path = Path::from("data");
+        load_or_init_encryption_key(&store, &db_path, "right", false)
+            .await
+            .unwrap();
+        assert!(
+            load_or_init_encryption_key(&store, &db_path, "wrong", false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn load_wrapped_key_rejects_corrupt_bytes() {
+        let store = store();
+        let db_path = Path::from("data");
+        store
+            .put(
+                &db_path.child(WRAPPED_KEY_FILENAME),
+                PutPayload::from(Bytes::from_static(b"not a bincode wrapped key")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            load_wrapped_key_from_object_store(&store, &db_path)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unwrap_rejects_an_unsupported_version() {
+        let km = KeyManager::new();
+        let (mut wrapped, _) = km.generate_and_wrap_key("pw").unwrap();
+        wrapped.version = 2;
+        let err = km.unwrap_key("pw", &wrapped).unwrap_err();
+        assert!(format!("{err:#}").contains("version"), "got: {err:#}");
+    }
+
+    #[test]
+    fn unwrap_rejects_a_corrupt_salt() {
+        let km = KeyManager::new();
+        let (mut wrapped, _) = km.generate_and_wrap_key("pw").unwrap();
+        wrapped.salt = "###not-valid-b64###".to_string();
+        assert!(km.unwrap_key("pw", &wrapped).is_err());
+    }
 }

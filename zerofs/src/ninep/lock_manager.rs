@@ -430,4 +430,154 @@ mod tests {
             "owner 1's read lock must survive the failed upgrade"
         );
     }
+
+    fn lock_fid(lock_type: LockType, start: u64, length: u64, fid: u32) -> FileLock {
+        FileLock {
+            lock_type,
+            start,
+            length,
+            proc_id: 0,
+            client_id: Vec::new(),
+            fid,
+            inode_id: INODE,
+        }
+    }
+
+    /// Does any lock overlap `[start, start+length)`? Probed as a write from a
+    /// session that holds nothing, so same-session skipping never hides a lock.
+    fn occupied(m: &FileLockManager, start: u64, length: u64) -> bool {
+        m.check_would_block(INODE, &lock(LockType::WriteLock, start, length), 99)
+            .is_some()
+    }
+
+    #[test]
+    fn file_lock_end_handles_zero_length_and_overflow() {
+        assert_eq!(
+            lock(LockType::ReadLock, 10, 0).end(),
+            u64::MAX,
+            "length 0 = to EOF"
+        );
+        assert_eq!(lock(LockType::ReadLock, 10, 5).end(), 15);
+        assert_eq!(
+            lock(LockType::ReadLock, u64::MAX, 10).end(),
+            u64::MAX,
+            "end saturates"
+        );
+    }
+
+    #[test]
+    fn read_locks_share_but_writes_conflict() {
+        let m = FileLockManager::new();
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).is_some());
+        assert!(
+            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)).is_some(),
+            "read locks are compatible"
+        );
+        assert!(
+            m.try_add_lock(3, lock(LockType::WriteLock, 5, 2)).is_none(),
+            "a write conflicts with held reads"
+        );
+    }
+
+    #[test]
+    fn same_session_relock_replaces_in_place() {
+        let m = FileLockManager::new();
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).is_some());
+        assert!(
+            m.try_add_lock(1, lock(LockType::WriteLock, 0, 10))
+                .is_some()
+        );
+        assert!(
+            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)).is_none(),
+            "the same-session read was replaced by a write"
+        );
+    }
+
+    #[test]
+    fn unlock_range_splits_a_lock_in_the_middle() {
+        let m = FileLockManager::new();
+        m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)).unwrap();
+        assert!(m.unlock_range(INODE, 0, 10, 10, 1));
+        assert!(occupied(&m, 5, 1), "[0,10) stays locked");
+        assert!(!occupied(&m, 12, 1), "[10,20) is freed");
+        assert!(occupied(&m, 22, 1), "[20,30) stays locked");
+    }
+
+    #[test]
+    fn unlock_range_trims_the_front() {
+        let m = FileLockManager::new();
+        m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)).unwrap();
+        m.unlock_range(INODE, 0, 0, 10, 1);
+        assert!(!occupied(&m, 5, 1), "[0,10) freed");
+        assert!(occupied(&m, 15, 1), "[10,30) kept");
+    }
+
+    #[test]
+    fn unlock_range_trims_the_back() {
+        let m = FileLockManager::new();
+        m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)).unwrap();
+        m.unlock_range(INODE, 0, 20, 10, 1);
+        assert!(occupied(&m, 5, 1), "[0,20) kept");
+        assert!(!occupied(&m, 25, 1), "[20,30) freed");
+    }
+
+    #[test]
+    fn unlock_range_removes_a_whole_lock_then_reports_nothing_left() {
+        let m = FileLockManager::new();
+        m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)).unwrap();
+        assert!(m.unlock_range(INODE, 0, 0, 10, 1));
+        assert!(!occupied(&m, 0, 10), "fully unlocked");
+        assert!(
+            !m.unlock_range(INODE, 0, 0, 10, 1),
+            "nothing left to unlock"
+        );
+    }
+
+    #[test]
+    fn check_would_block_returns_the_conflicting_lock() {
+        let m = FileLockManager::new();
+        m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).unwrap();
+        let blocker = m
+            .check_would_block(INODE, &lock(LockType::WriteLock, 5, 2), 2)
+            .expect("a write over a held read must report the blocker");
+        assert_eq!((blocker.start, blocker.length), (0, 10));
+        assert!(matches!(blocker.lock_type, LockType::ReadLock));
+        assert!(
+            m.check_would_block(INODE, &lock(LockType::WriteLock, 5, 2), 1)
+                .is_none(),
+            "the holder sees no conflict with its own lock"
+        );
+    }
+
+    #[test]
+    fn release_session_locks_clears_all_of_a_sessions_locks() {
+        let m = FileLockManager::new();
+        m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)).unwrap();
+        m.try_add_lock(1, lock(LockType::WriteLock, 100, 10))
+            .unwrap();
+        assert!(m.session_has_locks(1));
+
+        m.release_session_locks(1);
+        assert!(!m.session_has_locks(1));
+        assert!(!occupied(&m, 0, 10) && !occupied(&m, 100, 10));
+    }
+
+    #[test]
+    fn release_fid_locks_targets_one_fid_and_backs_the_lock_guard() {
+        let m = Arc::new(FileLockManager::new());
+        m.try_add_lock(1, lock_fid(LockType::WriteLock, 0, 10, 1))
+            .unwrap();
+        m.try_add_lock(1, lock_fid(LockType::WriteLock, 100, 10, 2))
+            .unwrap();
+
+        assert!(m.release_fid_locks(1, 1), "fid 1's lock released");
+        assert!(!occupied(&m, 0, 10), "fid 1's range freed");
+        assert!(occupied(&m, 100, 10), "fid 2's lock untouched");
+        assert!(!m.release_fid_locks(1, 1), "nothing left for fid 1");
+
+        // LockGuard frees the remaining fid on drop.
+        drop(LockGuard::new(Arc::clone(&m), 1, 2));
+        assert!(!occupied(&m, 100, 10), "drop released fid 2's lock");
+        assert!(!m.session_has_locks(1));
+    }
 }

@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -117,6 +117,10 @@ struct Conn {
     writer_tx: mpsc::Sender<Vec<u8>>,
     pending: DashMap<u16, oneshot::Sender<Bytes>>,
     tag_ctr: AtomicU16,
+    /// `.zerofs4` durability lineage token of the instance this connection reached,
+    /// learned via Tgetlineage during negotiation (`0` if not `.zerofs4`). A write
+    /// that returns on this connection is recorded as un-fsync'd under this token.
+    lineage_token: AtomicU64,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
     /// Signals the (possibly idle) writer task to stop when the reader exits.
@@ -215,6 +219,64 @@ pub struct NinePClient {
     fid_free: Mutex<Vec<u32>>,
     /// Recorded fids (by inode id) and held locks, replayed on reconnect.
     state: Mutex<SessionState>,
+    /// `.zerofs4` durability tracking, keyed by the fid each mutation targets and
+    /// carried across reconnect (an un-fsync'd write's obligation outlives the
+    /// connection it was made on). Per-fid because `fsync` is per-fd POSIX: a verified
+    /// fsync of one fid accounts only for that fid's writes. See [`Unsynced`].
+    unsynced: DashMap<u32, Unsynced>,
+}
+
+/// One fid's outstanding un-fsync'd writes for `.zerofs4` verified fsync. Holds the
+/// lineage token of the OLDEST un-fsync'd write on the fid (the one most likely to
+/// predate a broken lineage), a `generation` bumped on every write to the fid, and a
+/// `reported` flag.
+///
+/// `generation` gates the fsync completion: a write that lands between an fsync's
+/// snapshot and its reply leaves the obligation in place rather than being cleared by
+/// a result that did not cover it. `reported` survives a repeated fsync: an ESTALE
+/// leaves the writes lost but still tracked (not cleared), so a later fsync of the fid
+/// keeps returning ESTALE until the app redoes them; the first redo to the fid
+/// supersedes the obligation.
+#[derive(Default)]
+struct Unsynced {
+    oldest: Option<u64>,
+    generation: u64,
+    reported: bool,
+}
+
+impl Unsynced {
+    /// Record a write under `token`: start a fresh obligation, or supersede a
+    /// reported-lost one (this write is the app's redo). An existing un-reported
+    /// obligation is kept, since its older token is the one that matters.
+    fn note(&mut self, token: u64) {
+        if self.reported || self.oldest.is_none() {
+            self.oldest = Some(token);
+            self.reported = false;
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn snapshot(&self) -> (Option<u64>, u64) {
+        (self.oldest, self.generation)
+    }
+
+    /// On a successful fsync: the whole db was flushed, so every prior write is
+    /// durable. Clear the obligation iff no write raced the in-flight fsync.
+    fn clear_if_unchanged(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.oldest = None;
+            self.reported = false;
+        }
+    }
+
+    /// On an ESTALE fsync: the writes are lost but reported, NOT resolved. Keep the
+    /// obligation (so a later fsync still surfaces the loss) and flag it reported, so
+    /// the app's next write supersedes it. Skipped if a write raced the fsync.
+    fn report_if_unchanged(&mut self, generation: u64) {
+        if self.generation == generation {
+            self.reported = true;
+        }
+    }
 }
 
 impl NinePClient {
@@ -267,6 +329,7 @@ impl NinePClient {
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
+            unsynced: DashMap::new(),
         });
         client.spawn_supervisor();
         Ok(client)
@@ -284,6 +347,7 @@ impl NinePClient {
             writer_tx,
             pending: DashMap::new(),
             tag_ctr: AtomicU16::new(0),
+            lineage_token: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
@@ -583,6 +647,62 @@ impl NinePClient {
         self.extensions.load(Ordering::Relaxed) >= 3
     }
 
+    /// `.zerofs4` negotiated: this connection uses durability-verified fsync.
+    fn durability_enabled(&self) -> bool {
+        self.extensions.load(Ordering::Relaxed) >= 4
+    }
+
+    /// Record a just-acked mutating write on `fid` as un-fsync'd under `token` (the
+    /// lineage token of the connection it returned on).
+    fn note_unsynced(&self, fid: u32, token: u64) {
+        self.unsynced.entry(fid).or_default().note(token);
+    }
+
+    /// Snapshot `(oldest token, generation)` of `fid` for a verified fsync.
+    fn snapshot_unsynced(&self, fid: u32) -> (Option<u64>, u64) {
+        self.unsynced.get(&fid).map_or((None, 0), |u| u.snapshot())
+    }
+
+    /// On a successful (Rfsync) verified fsync of `fid`: clear its obligation, unless a
+    /// write to it raced the in-flight fsync. The drop of the `get_mut` guard releases
+    /// the shard lock before `remove_if`, which re-checks under the lock, so a note that
+    /// races between the clear and the remove keeps the entry rather than being dropped.
+    fn clear_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
+        if let Some(mut u) = self.unsynced.get_mut(&fid) {
+            u.clear_if_unchanged(generation);
+        }
+        self.unsynced.remove_if(&fid, |_, u| u.oldest.is_none());
+    }
+
+    /// On an ESTALE verified fsync of `fid`: keep its obligation but flag it reported,
+    /// so a later fsync of the fid still surfaces the loss and the app's next write to
+    /// it supersedes it. Skipped if a write to the fid raced the fsync.
+    fn report_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
+        if let Some(mut u) = self.unsynced.get_mut(&fid) {
+            u.report_if_unchanged(generation);
+        }
+    }
+
+    /// Drop a fid's durability tracking when the fid is clunked/recycled, so a reused
+    /// fid never inherits a stale obligation (closing a fid without fsync makes no
+    /// durability promise, per POSIX).
+    fn forget_unsynced(&self, fid: u32) {
+        self.unsynced.remove(&fid);
+    }
+
+    /// The lineage token of `fid`'s oldest un-fsync'd write, if any. Used to CARRY a
+    /// failover-aware handle's obligation across a re-open onto a new connection.
+    pub fn unsynced_oldest(&self, fid: u32) -> Option<u64> {
+        self.snapshot_unsynced(fid).0
+    }
+
+    /// Seed `fid`'s obligation with a token carried from a prior connection (a failover
+    /// re-open), so a verified fsync after the re-route still verifies the carried
+    /// un-fsync'd write instead of treating the fresh handle as clean.
+    pub fn seed_unsynced(&self, fid: u32, token: u64) {
+        self.note_unsynced(fid, token);
+    }
+
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
     /// within the negotiated msize: `msize - header - count`.
     pub fn max_io(&self) -> u32 {
@@ -607,6 +727,7 @@ impl NinePClient {
 
     /// Return a fid to the free list. The caller must have clunked it already.
     pub fn free_fid(&self, fid: u32) {
+        self.forget_unsynced(fid);
         self.fid_free.lock().unwrap().push(fid);
     }
 
@@ -700,6 +821,16 @@ impl NinePClient {
                         self.force_reprobe(&conn);
                         tokio::task::yield_now().await;
                         continue;
+                    }
+                    // A mutating op that just succeeded is durable-but-un-fsync'd under
+                    // this connection's lineage token; track it on every fid a later
+                    // verified fsync checks (one for most ops, both directories for a
+                    // renameat). A failed mutation (Rlerror) changed nothing.
+                    if self.durability_enabled() && !matches!(msg.body, Message::Rlerror(_)) {
+                        let token = conn.lineage_token.load(Ordering::Relaxed);
+                        for fid in body.durability_fids() {
+                            self.note_unsynced(fid, token);
+                        }
                     }
                     return Ok(msg.body);
                 }
@@ -1603,11 +1734,83 @@ impl NinePClient {
         }
     }
 
-    pub async fn fsync(&self, fid: u32, datasync: u32) -> ClientResult<()> {
-        match self.rpc(Message::Tfsync(Tfsync { fid, datasync })).await? {
-            Message::Rfsync(_) => Ok(()),
-            _ => Err(ClientError::Unexpected("fsync")),
+    /// Verified fsync over an inode's whole fid set. A POSIX `fsync(fd)` persists the
+    /// whole file, but the FUSE mount spreads one inode's mutations across fids: data
+    /// writes ride the open handle, setattr and directory-entry ops ride the per-user
+    /// inode fid. So the fsync presents the oldest outstanding token across all of `fids`
+    /// and verifies them together; a broken lineage on any of them ESTALEs the whole
+    /// call, and only this inode's fids are presented. `primary` carries the Tfsyncdur;
+    /// single-fid callers use [`Self::fsync`].
+    pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
+        if self.durability_enabled() {
+            // Present the oldest token across the fids: a broken lineage is an older
+            // token than the current one, so the min ESTALEs the whole fsync. Each
+            // generation gates that fid's completion against a write racing the RPC.
+            let mut token: Option<u64> = None;
+            let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
+            for &fid in fids {
+                let (oldest, generation) = self.snapshot_unsynced(fid);
+                if let Some(t) = oldest {
+                    token = Some(token.map_or(t, |w| w.min(t)));
+                }
+                snaps.push((fid, generation));
+            }
+            match self
+                .rpc(Message::Tfsyncdur(Tfsyncdur {
+                    fid: primary,
+                    datasync,
+                    token: token.unwrap_or(0),
+                }))
+                .await
+            {
+                Ok(Message::Rfsync(_)) => {
+                    // The whole db was flushed, so every covered fid's writes are durable.
+                    for (fid, generation) in snaps {
+                        self.clear_unsynced_if_unchanged(fid, generation);
+                    }
+                    Ok(())
+                }
+                Ok(_) => Err(ClientError::Unexpected("fsync")),
+                Err(ClientError::Errno(e)) if e == libc::ESTALE as u32 => {
+                    // A covered fid's lineage broke: its writes are lost. Keep each
+                    // obligation (not cleared, so a later fsync of the inode still
+                    // surfaces the loss), flagged reported so the app's redo supersedes
+                    // it. Only this inode's fids are touched.
+                    for (fid, generation) in snaps {
+                        self.report_unsynced_if_unchanged(fid, generation);
+                    }
+                    Err(ClientError::Errno(e))
+                }
+                Err(e) => Err(e),
+            }
+        } else if fids
+            .iter()
+            .any(|&fid| self.snapshot_unsynced(fid).0.is_some())
+        {
+            // Fail-closed: we hold un-fsync'd writes from an earlier `.zerofs4` session
+            // but are now on a connection that cannot verify durability (an
+            // `ignore_fsync` or pre-`.zerofs4` server). A plain unchecked fsync could
+            // succeed over a lost write, so refuse.
+            Err(ClientError::Errno(libc::ESTALE as u32))
+        } else {
+            match self
+                .rpc(Message::Tfsync(Tfsync {
+                    fid: primary,
+                    datasync,
+                }))
+                .await?
+            {
+                Message::Rfsync(_) => Ok(()),
+                _ => Err(ClientError::Unexpected("fsync")),
+            }
         }
+    }
+
+    /// Verified fsync of a single fid (its own writes only). The library `File` API
+    /// keeps one fid per open handle, so a per-fid fsync is exact; the FUSE mount,
+    /// which fans an inode across fids, uses [`Self::fsync_inode`].
+    pub async fn fsync(&self, fid: u32, datasync: u32) -> ClientResult<()> {
+        self.fsync_inode(&[fid], fid, datasync).await
     }
 
     pub async fn statfs(&self, fid: u32) -> ClientResult<Rstatfs> {
@@ -1763,9 +1966,13 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
     // older/foreign server substring-match down to the highest it supports.
     let (otx, orx) = oneshot::channel();
     conn.pending.insert(NOTAG, otx);
+    // Propose the newest extension plus `.zerofs3` so the server's substring match
+    // lands on `.zerofs4` when offered, and degrades cleanly to `.zerofs3` (keeping
+    // the op-id) on an `ignore_fsync` or pre-`.zerofs4` server rather than dropping
+    // all the way to plain `.zerofs`.
     let body = Message::Tversion(Tversion {
         msize: requested,
-        version: P9String::new(VERSION_9P2000L_ZEROFS3.to_vec()),
+        version: P9String::new(b"9P2000.L.zerofs4.zerofs3".to_vec()),
     });
     let bytes = match P9Message::new(NOTAG, body).to_bytes() {
         Ok(b) => b,
@@ -1789,7 +1996,9 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
                 return Err(ClientError::Unexpected("version"));
             }
             // The server echoes the highest suffix it supports; plain `9P2000.L` means none.
-            let extensions = if vstr.contains(".zerofs3") {
+            let extensions = if vstr.contains(".zerofs4") {
+                4
+            } else if vstr.contains(".zerofs3") {
                 3
             } else if vstr.contains(".zerofs2") {
                 2
@@ -1804,10 +2013,50 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
                 warn!("server negotiated msize {negotiated} below minimum 4096");
                 return Err(ClientError::Unexpected("version"));
             }
+            // `.zerofs4`: learn this instance's durability lineage token now, before
+            // the connection serves writes, so each write can be tracked under it.
+            if extensions >= 4 {
+                query_lineage_token(conn).await?;
+            }
             debug!("9P version negotiated, msize={negotiated}, extensions={extensions}");
             Ok((negotiated, extensions))
         }
         _ => Err(ClientError::Unexpected("version")),
+    }
+}
+
+/// `.zerofs4`: ask the freshly-negotiated connection for its durability lineage
+/// token and record it on the `Conn`. Runs during negotiation (before the
+/// connection serves any request), so a plain non-NOTAG tag is collision-free.
+async fn query_lineage_token(conn: &Conn) -> ClientResult<()> {
+    let (otx, orx) = oneshot::channel();
+    let tag = loop {
+        let t = conn.tag_ctr.fetch_add(1, Ordering::Relaxed);
+        if t != NOTAG {
+            break t;
+        }
+    };
+    conn.pending.insert(tag, otx);
+    let bytes = match P9Message::new(tag, Message::Tgetlineage(Tgetlineage)).to_bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            conn.pending.remove(&tag);
+            return Err(ClientError::Codec(e));
+        }
+    };
+    if conn.writer_tx.send(bytes).await.is_err() {
+        conn.pending.remove(&tag);
+        return Err(ClientError::Disconnected);
+    }
+    let frame = orx.await.map_err(|_| ClientError::Disconnected)?;
+    let (_, msg) = P9Message::from_bytes((&frame, 0)).map_err(ClientError::Codec)?;
+    match msg.body {
+        Message::Rgetlineage(r) => {
+            conn.lineage_token.store(r.token, Ordering::Relaxed);
+            Ok(())
+        }
+        Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
+        _ => Err(ClientError::Unexpected("getlineage")),
     }
 }
 
@@ -1895,4 +2144,107 @@ fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconn
         conn.writer_shutdown.notify_one();
         reconnect.notify_waiters();
     });
+}
+
+#[cfg(test)]
+mod durability_tracking_tests {
+    use super::Unsynced;
+
+    #[test]
+    fn fsync_clears_the_obligation_when_quiescent() {
+        let mut u = Unsynced::default();
+        u.note(7); // a write under lineage token 7
+        let (oldest, generation) = u.snapshot();
+        assert_eq!(oldest, Some(7));
+        // No write lands during the fsync RPC, so the clear fires.
+        u.clear_if_unchanged(generation);
+        assert_eq!(u.snapshot().0, None);
+    }
+
+    #[test]
+    fn a_repeated_fsync_on_one_fid_keeps_failing_until_a_redo() {
+        // Per-fid reported flag: an ESTALE fsync on a fid must NOT clear its
+        // obligation, so a second fsync on the SAME fid (no redo) still surfaces the
+        // loss; only the app's redo to that fid supersedes it (no livelock).
+        let mut u = Unsynced::default();
+        u.note(1); // a write on this fid under lineage 1
+        let (oldest, generation) = u.snapshot();
+        assert_eq!(oldest, Some(1));
+        // First fsync ESTALEs (lineage broke): report, do NOT clear.
+        u.report_if_unchanged(generation);
+        // A second fsync on this fid, no redo: still sees the loss.
+        assert_eq!(
+            u.snapshot().0,
+            Some(1),
+            "a reported loss must persist so a repeated fsync still fails"
+        );
+        // The app's redo under the new lineage supersedes the reported-lost write.
+        u.note(2);
+        assert_eq!(
+            u.snapshot().0,
+            Some(2),
+            "a redo after a report advances the obligation (no livelock)"
+        );
+        let (_, gen2) = u.snapshot();
+        u.clear_if_unchanged(gen2); // that redo's fsync succeeds
+        assert_eq!(u.snapshot().0, None);
+    }
+
+    #[test]
+    fn an_estale_and_redo_on_one_fid_does_not_discharge_a_sibling_fid() {
+        // Obligations are per-fid: a full ESTALE -> redo -> success cycle on fid X
+        // leaves fid Y's still-lost obligation intact, so a later fsync(Y) ESTALEs.
+        use std::collections::HashMap;
+        let mut map: HashMap<u32, Unsynced> = HashMap::new();
+        map.entry(10).or_default().note(1); // fid 10 (file X) wrote under lineage 1
+        map.entry(20).or_default().note(1); // fid 20 (file Y) wrote under lineage 1
+        // fsync(fid 10) ESTALEs; report only fid 10.
+        let (_, g) = map.get(&10).unwrap().snapshot();
+        map.get_mut(&10).unwrap().report_if_unchanged(g);
+        // App redoes file X under lineage 2 (supersede fid 10), then fsync(10) succeeds.
+        map.get_mut(&10).unwrap().note(2);
+        let (_, g2) = map.get(&10).unwrap().snapshot();
+        map.get_mut(&10).unwrap().clear_if_unchanged(g2);
+        if map.get(&10).unwrap().snapshot().0.is_none() {
+            map.remove(&10);
+        }
+        // fid 20 (file Y) is untouched: its lost write is still tracked under L1.
+        assert_eq!(
+            map.get(&20).unwrap().snapshot().0,
+            Some(1),
+            "fid 10's ESTALE+redo+success cycle must not touch fid 20"
+        );
+    }
+
+    #[test]
+    fn fsync_does_not_erase_a_write_from_its_window() {
+        // The generation guard: a write that lands between the fsync snapshot and its
+        // clear must survive, so a later fsync still verifies it.
+        let mut u = Unsynced::default();
+        u.note(7);
+        let (_, generation) = u.snapshot(); // fsync snapshots here...
+        u.note(7); // ...a concurrent write lands during the in-flight RPC...
+        u.clear_if_unchanged(generation); // ...so the clear must be skipped.
+        assert_eq!(
+            u.snapshot().0,
+            Some(7),
+            "a write racing the fsync must stay tracked"
+        );
+    }
+
+    #[test]
+    fn oldest_token_is_kept_across_a_lineage_change() {
+        // After a reconnect to a new lineage, an older un-fsync'd write's token is
+        // the one most likely to be stale, so it must drive the verdict.
+        let mut u = Unsynced::default();
+        u.note(5); // oldest, under the original lineage
+        u.note(9); // later, under a new lineage after a reconnect
+        assert_eq!(u.snapshot().0, Some(5), "the oldest (riskiest) token wins");
+    }
+
+    #[test]
+    fn nothing_tracked_reports_none() {
+        let u = Unsynced::default();
+        assert_eq!(u.snapshot(), (None, 0));
+    }
 }
