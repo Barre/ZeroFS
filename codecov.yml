@@ -1,0 +1,16 @@
+# Coverage is report-only: Codecov posts the numbers (and a PR comment) but never
+# fails a check on a coverage threshold. `informational: true` makes both the
+# project and patch status checks always pass while still reporting the delta.
+# The lcov report is produced by .github/workflows/coverage.yml (cargo-llvm-cov).
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: false

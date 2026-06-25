@@ -1,0 +1,44 @@
+name: Coverage
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Report-only. The failpoints crash suite is intentionally excluded to keep
+      # this job fast and deterministic; add `--features failpoints` to include it.
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: zerofs/lcov.info
+          # Coverage never gates the build: a Codecov hiccup must not fail CI, and
+          # the thresholds are informational (see codecov.yml).
+          fail_ci_if_error: false
