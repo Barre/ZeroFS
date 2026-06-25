@@ -292,6 +292,7 @@ impl NinePHandler {
             Message::Twalkgetattr(tw) => self.walk_getattr(tw).await,
             Message::Treaddirattr(tr) => self.readdir_attr(tr).await,
             Message::Tlopenat(tl) => self.lopenat(tl).await,
+            Message::Tlopenatread(tl) => self.lopenatread(tl).await,
             Message::Tlcreateattr(tc) => self.lcreateattr(tc, op_id).await,
             Message::Tmkdirattr(tm) => self.mkdir_attr(tm, op_id).await,
             Message::Tsymlinkattr(ts) => self.symlink_attr(ts, op_id).await,
@@ -354,7 +355,13 @@ impl NinePHandler {
         // can actually honor it: `ignore_fsync` makes fsync a no-op, so we must not
         // promise a verified fsync — the client then degrades to `.zerofs3` and uses
         // a plain (unverified) fsync, which is honest about what it provides.
-        let version = if version_str.contains(".zerofs4") && !self.filesystem.ignore_fsync {
+        // `.zerofs5` (open+first-read fold) is cumulative over `.zerofs4`, so it is
+        // offered on the same terms: only when fsync is real, since the level implies
+        // durability-verified fsync. An `ignore_fsync` server therefore caps at
+        // `.zerofs3` and the read fold is simply not used.
+        let version = if version_str.contains(".zerofs5") && !self.filesystem.ignore_fsync {
+            VERSION_9P2000L_ZEROFS5
+        } else if version_str.contains(".zerofs4") && !self.filesystem.ignore_fsync {
             VERSION_9P2000L_ZEROFS4
         } else if version_str.contains(".zerofs3") {
             VERSION_9P2000L_ZEROFS3
@@ -366,9 +373,11 @@ impl NinePHandler {
             VERSION_9P2000L
         };
 
-        // `.zerofs4` implies `.zerofs3`, so the frame op-id is enabled for both.
+        // `.zerofs4`/`.zerofs5` imply `.zerofs3`, so the frame op-id is enabled for all.
         self.session.op_id_enabled.store(
-            version == VERSION_9P2000L_ZEROFS3 || version == VERSION_9P2000L_ZEROFS4,
+            version == VERSION_9P2000L_ZEROFS3
+                || version == VERSION_9P2000L_ZEROFS4
+                || version == VERSION_9P2000L_ZEROFS5,
             AtomicOrdering::Relaxed,
         );
 
@@ -849,6 +858,51 @@ impl NinePHandler {
         Ok(Message::Rlopenat(Rlopenat {
             qid,
             iounit: self.iounit(),
+        }))
+    }
+
+    // Tlopenatread = Tlopenat + a best-effort read of [0, count). The open is
+    // authoritative: the inline read never fails it, so a read error returns the
+    // open result with empty data (eof=0) and the client falls back to a plain Tread.
+    async fn lopenatread(&self, tl: Tlopenatread) -> P9Result<Message> {
+        // Reuse the open path so the fid/handle bookkeeping is identical to Tlopenat.
+        let (qid, iounit) = match self
+            .lopenat(Tlopenat {
+                fid: tl.fid,
+                newfid: tl.newfid,
+                flags: tl.flags,
+            })
+            .await?
+        {
+            Message::Rlopenat(r) => (r.qid, r.iounit),
+            other => return Ok(other),
+        };
+
+        // The new fid is open; prefetch from offset 0, clamped to msize. eof here
+        // means the read reached end of file, i.e. (offset 0) the whole file fit in
+        // `count`, which is what lets the client serve the file's reads from `data`.
+        let new_fid = self.get_fid(tl.newfid)?;
+        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
+        // Clamp with the Rlopenatread overhead (not P9_IOHDRSZ): its reply carries an
+        // extra qid+iounit+eof, so the whole `29 + count` frame must fit the msize.
+        // At a small msize this is what keeps the reply from overrunning it.
+        let count = tl.count.min(msize.saturating_sub(P9_RLOPENATREAD_HDR));
+        let auth = AuthContext::from(&new_fid.creds);
+        let (data, eof) = match self
+            .filesystem
+            .read_file(&auth, new_fid.inode_id, 0, count)
+            .await
+        {
+            Ok((d, e)) => (DekuBytes::from(d), e),
+            Err(_) => (DekuBytes::default(), false),
+        };
+
+        Ok(Message::Rlopenatread(Rlopenatread {
+            qid,
+            iounit,
+            eof: eof as u8,
+            count: data.len() as u32,
+            data,
         }))
     }
 

@@ -10,6 +10,7 @@
 
 use crate::ninep::lock_manager::{FileLock, FileLockManager};
 use anyhow::{Context, Result, anyhow};
+use bytes::Bytes;
 use dashmap::DashMap;
 use fuser::{
     AccessFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -26,7 +27,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::debug;
@@ -45,6 +46,16 @@ const READDIR_BATCH: u32 = 256 * 1024;
 /// the expected ENAMETOOLONG.
 const NAME_MAX: usize = 255;
 
+/// Upper bound on the bytes a `.zerofs5` open folds in as a first read. A file no
+/// larger than this is served from the open's reply with no follow-up Tread; larger
+/// files fall back to normal reads. Clamped down to the negotiated msize at open.
+const PREFETCH_WINDOW: u32 = 128 * 1024;
+
+/// Attribute/entry cache lifetime handed to the kernel (relaxed mode), and the
+/// staleness bound on a prefetched open+read buffer: a buffer whose first read
+/// arrives later than this is dropped and served fresh from the server instead.
+const ATTR_TTL: Duration = Duration::from_secs(1);
+
 /// Read-ahead state for one open directory handle.
 type DirRead = ReaddirState<ninep_proto::DirEntry>;
 
@@ -58,6 +69,10 @@ pub struct MountOptions {
     pub read_only: bool,
     pub access: MountAccess,
     pub writeback: bool,
+    /// Allow consistency-relaxing client/kernel caches (prefetch fold, cached
+    /// symlink targets, attribute cache, page-cached reads). When false, the mount
+    /// runs strict: direct-I/O reads, no attribute cache, write-through.
+    pub relaxed_consistency: bool,
     /// Server-side directory the mount is rooted at (9P attach aname). Empty
     /// (or "/") mounts the whole filesystem.
     pub aname: String,
@@ -111,11 +126,21 @@ struct Fuse9P {
     dir_reads: Arc<DashMap<u64, Arc<AsyncMutex<DirRead>>>>,
     /// Same, for directories the kernel reads via readdirplus.
     dir_reads_plus: Arc<DashMap<u64, Arc<AsyncMutex<DirReadPlus>>>>,
+    /// Whole-file bytes prefetched by a `.zerofs5` open+read fold, keyed by the open
+    /// file handle, with the instant they were fetched. Present only when the file fit
+    /// in the prefetch window (so a short read is a legitimate EOF). A `read` serves
+    /// from here and drops the entry once it is consumed or older than `ttl`; `release`
+    /// drops any that the kernel never read. See `open_inner`.
+    prefetch: Arc<DashMap<u64, (Instant, Bytes)>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
     /// When true, request the FUSE writeback cache so the kernel buffers writes
     /// and flushes them asynchronously (instead of synchronous write-through).
     writeback: bool,
+    /// Strict consistency (the inverse of `--relaxed-consistency`): no prefetch
+    /// fold, no cached symlink targets, a zero attribute-cache TTL, and direct-I/O
+    /// file handles so every read/write hits the server. Forces `writeback` off.
+    strict: bool,
 }
 
 // FUSE inode numbers and server inode ids (== qid.path) are bijective via a +1
@@ -377,6 +402,21 @@ impl Filesystem for Fuse9P {
         // capability it handles POSIX locks locally and never calls getlk/setlk.
         let _ = config.add_capabilities(InitFlags::FUSE_POSIX_LOCKS);
 
+        // PARALLEL_DIROPS adds no staleness, so it is always on; it
+        // only removes a client-side bottleneck.
+        let _ = config.add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS);
+
+        if self.strict {
+            // Direct-I/O file handles still need this to allow mmap.
+            let _ = config.add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP);
+        } else {
+            // CACHE_SYMLINKS caches readlink results, skipping repeat Treadlink
+            // trips. A symlink is replaced via rename (which invalidates the cache),
+            // not rewritten in place, so staleness is moot, but it is still a cache,
+            // so strict consistency forgoes it.
+            let _ = config.add_capabilities(InitFlags::FUSE_CACHE_SYMLINKS);
+        }
+
         // When the server speaks the fast path, let the kernel use readdirplus so
         // a directory listing returns entries with their attributes in one shot
         // (no lookup/getattr per entry). AUTO lets the kernel pick plain readdir
@@ -397,6 +437,22 @@ impl Filesystem for Fuse9P {
         }
 
         let _ = config.set_max_background(64);
+        // Let async readahead/writeback keep flowing: don't signal congestion until
+        // close to the background cap.
+        let _ = config.set_congestion_threshold(60);
+
+        // Bump sequential read-ahead so the kernel pipelines more, larger reads ahead
+        // of the app, which hides latency over a remote backend. Read-ahead below
+        // msize is pointless, and the kernel only reads ahead on detected-sequential
+        // access, so random IO is largely unaffected. Clamp to the kernel's own cap.
+        let want_readahead = self
+            .client
+            .msize()
+            .saturating_mul(4)
+            .clamp(1 << 20, 4 << 20);
+        if let Err(max) = config.set_max_readahead(want_readahead) {
+            let _ = config.set_max_readahead(max);
+        }
         Ok(())
     }
 
@@ -441,8 +497,13 @@ impl Filesystem for Fuse9P {
         // handle outlived its release.
         if let Some((_, entry)) = self.inodes.remove_if(&ino, |_, e| e.lookup == 0) {
             let client = Arc::clone(&self.client);
+            let prefetch = Arc::clone(&self.prefetch);
             self.rt.spawn(async move {
                 for fid in entry.fids.into_values().chain(entry.handles) {
+                    // Same leak-hygiene as the clunk: drop any prefetch buffer that
+                    // outlived its release (keyed by the open-handle fid; a no-op for
+                    // the inode fids, which never hold one).
+                    prefetch.remove(&(fid as u64));
                     let _ = client.clunk(fid).await;
                     client.free_fid(fid);
                 }
@@ -757,12 +818,32 @@ impl Filesystem for Fuse9P {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        // Files honor the writeback cache; directories never do.
-        self.open_inner(req.uid(), ino, flags, reply, self.writeback);
+        // Fold the first read into the open (.zerofs5) for a plain read-only,
+        // non-truncating open: those reliably read from the start, while writable or
+        // O_TRUNC opens may never read or are about to zero the file. Strict
+        // consistency disables the fold (it serves open-time bytes on a later read).
+        let raw = flags.0;
+        let prefetch = if !self.strict
+            && (raw & libc::O_ACCMODE) == libc::O_RDONLY
+            && (raw & libc::O_TRUNC) == 0
+        {
+            PREFETCH_WINDOW.min(self.client.msize())
+        } else {
+            0
+        };
+        self.open_inner(
+            req.uid(),
+            ino,
+            flags,
+            reply,
+            self.writeback,
+            prefetch,
+            self.strict,
+        );
     }
 
     fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        self.open_inner(req.uid(), ino, flags, reply, false);
+        self.open_inner(req.uid(), ino, flags, reply, false, 0, false);
     }
 
     fn read(
@@ -776,8 +857,31 @@ impl Filesystem for Fuse9P {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let client = Arc::clone(&self.client);
         let fid = fh.0 as u32;
+        // Serve a folded-in read (.zerofs5) from the open's prefetch. The buffer is
+        // the whole file, so a slice shorter than `size` is a legitimate EOF. Once a
+        // read reaches its end the buffer is consumed and dropped; a read starting
+        // past it (a file grown elsewhere since open) drops it and goes to the server.
+        if let Some(entry) = self.prefetch.get(&fh.0) {
+            let (fetched, buf) = entry.value();
+            // Bound the fold's staleness to the attribute-cache TTL: a buffer whose
+            // first read arrives late (an open that read much later) is dropped and
+            // served fresh from the server rather than handing back open-time bytes.
+            if fetched.elapsed() <= self.ttl && (offset as usize) <= buf.len() {
+                let start = offset as usize;
+                let end = (start + size as usize).min(buf.len());
+                let consumed = end >= buf.len();
+                reply.data(&buf[start..end]);
+                drop(entry);
+                if consumed {
+                    self.prefetch.remove(&fh.0);
+                }
+                return;
+            }
+            drop(entry);
+            self.prefetch.remove(&fh.0);
+        }
+        let client = Arc::clone(&self.client);
         self.rt.spawn(async move {
             match client.read(fid, offset, size).await {
                 Ok(data) => reply.data(&data),
@@ -1041,11 +1145,8 @@ impl Filesystem for Fuse9P {
         } else {
             flags
         } as u32;
-        let open_flags = if self.writeback {
-            FopenFlags::FOPEN_KEEP_CACHE
-        } else {
-            FopenFlags::empty()
-        };
+        // create is always a regular file, so direct I/O follows strict mode.
+        let open_flags = handle_open_flags(self.writeback, self.strict);
         self.rt.spawn(async move {
             let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
                 Ok(f) => f,
@@ -1415,7 +1516,21 @@ impl Filesystem for Fuse9P {
     }
 }
 
+/// FOPEN flags for a regular-file handle. Strict consistency takes `direct_io`,
+/// bypassing the page cache so every read/write hits the server; otherwise the
+/// writeback cache keeps pages across opens. Directories pass both false.
+fn handle_open_flags(writeback: bool, direct_io: bool) -> FopenFlags {
+    if direct_io {
+        FopenFlags::FOPEN_DIRECT_IO
+    } else if writeback {
+        FopenFlags::FOPEN_KEEP_CACHE
+    } else {
+        FopenFlags::empty()
+    }
+}
+
 impl Fuse9P {
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         &self,
         uid: u32,
@@ -1423,9 +1538,12 @@ impl Fuse9P {
         flags: OpenFlags,
         reply: ReplyOpen,
         writeback: bool,
+        prefetch: u32,
+        direct_io: bool,
     ) {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
+        let prefetch_map = Arc::clone(&self.prefetch);
         let ino = ino.0;
         // Append is handled by the kernel: it computes the write offset from the
         // file size (i_size) and sends each write at that offset, so the backing
@@ -1445,11 +1563,7 @@ impl Fuse9P {
             raw as u32
         };
         let orig = raw as u32;
-        let open_flags = if writeback {
-            FopenFlags::FOPEN_KEEP_CACHE
-        } else {
-            FopenFlags::empty()
-        };
+        let open_flags = handle_open_flags(writeback, direct_io);
         self.rt.spawn(async move {
             let inode_fid = match user_fid(&client, &inodes, uid, ino).await {
                 Ok(f) => f,
@@ -1460,17 +1574,32 @@ impl Fuse9P {
             };
             // Open on a fresh fid, leaving the inode fid untouched (Tlopenat
             // on v2, clone + lopen otherwise); a refused writeback upgrade is
-            // retried with the original flags.
+            // retried with the original flags. A read-only open additionally folds
+            // in the first read (.zerofs5); `prefetch` is the window (0 = none), and
+            // the writeback upgrade only applies to writable opens, so the two paths
+            // are mutually exclusive.
             let nf = client.alloc_fid();
-            match client
-                .open_clone(inode_fid, nf, lflags, upgrade.then_some(orig))
-                .await
-            {
-                Ok((fid, _, _)) => {
+            let opened = if prefetch > 0 {
+                client
+                    .open_clone_prefetch(inode_fid, nf, lflags, prefetch)
+                    .await
+            } else {
+                client
+                    .open_clone(inode_fid, nf, lflags, upgrade.then_some(orig))
+                    .await
+                    .map(|(fid, qid, iounit)| (fid, qid, iounit, None))
+            };
+            match opened {
+                Ok((fid, _, _, buf)) => {
                     // Track the open handle so a verified fsync of this inode (through
                     // ANY of its handles) presents this one's un-fsync'd writes too.
                     if let Some(mut e) = inodes.get_mut(&ino) {
                         e.handles.insert(fid);
+                    }
+                    // Stash the folded-in bytes for `read` to serve, keyed by the
+                    // handle, stamped now so a late first read can expire it.
+                    if let Some(buf) = buf {
+                        prefetch_map.insert(fid as u64, (Instant::now(), buf));
                     }
                     reply.opened(FileHandle(fid as u64), open_flags);
                 }
@@ -1491,6 +1620,8 @@ impl Fuse9P {
     }
 
     fn release_inner(&self, fh: FileHandle, reply: ReplyEmpty) {
+        // Drop any unread prefetch (an open that never read, or read part of the file).
+        self.prefetch.remove(&fh.0);
         let client = Arc::clone(&self.client);
         let fid = fh.0 as u32;
         self.rt.spawn(async move {
@@ -1654,6 +1785,10 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         },
     );
 
+    // Strict consistency turns off every cache that can serve stale data, so it
+    // also forces write-through (the writeback cache delays write visibility) and
+    // a zero attribute-cache TTL (every lookup/getattr revalidates).
+    let strict = !opts.relaxed_consistency;
     let fs = Fuse9P {
         client,
         rt: Handle::current(),
@@ -1662,8 +1797,10 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         client_id: Arc::new(node_name()),
         dir_reads: Arc::new(DashMap::new()),
         dir_reads_plus: Arc::new(DashMap::new()),
-        ttl: Duration::from_secs(1),
-        writeback: opts.writeback,
+        prefetch: Arc::new(DashMap::new()),
+        ttl: if strict { Duration::ZERO } else { ATTR_TTL },
+        writeback: opts.writeback && !strict,
+        strict,
     };
 
     // Device string = connection target, so device-matching tools (xfstests'
@@ -1762,6 +1899,22 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+
+    #[test]
+    fn open_flags_precedence() {
+        // Default: let the kernel cache normally.
+        assert_eq!(handle_open_flags(false, false), FopenFlags::empty());
+        // Writeback keeps the page cache across opens.
+        assert_eq!(handle_open_flags(true, false), FopenFlags::FOPEN_KEEP_CACHE);
+        // Strict (direct I/O) bypasses the page cache and wins over writeback.
+        assert_eq!(handle_open_flags(false, true), FopenFlags::FOPEN_DIRECT_IO);
+        assert_eq!(handle_open_flags(true, true), FopenFlags::FOPEN_DIRECT_IO);
+    }
 }
 
 #[cfg(test)]
@@ -2042,6 +2195,207 @@ mod client_tests {
         }
         client.clunk(od).await.unwrap();
         client.free_fid(od);
+
+        shutdown.cancel();
+    }
+
+    /// The `.zerofs5` open+first-read fold: `lopenatread` opens on a fresh fid (leaving
+    /// the source untouched) and returns the start of the file. A file within the
+    /// window comes back whole with eof set; a larger file returns a prefix with eof
+    /// clear, and the opened fid still reads the remainder normally. The
+    /// `open_clone_prefetch` wrapper keeps a whole-file buffer and drops a partial one.
+    #[tokio::test]
+    async fn open_read_fold() {
+        let (client, shutdown, _dir, _sock) = setup().await;
+        assert!(
+            client.extensions_v5_enabled(),
+            "server should negotiate the .zerofs5 open+read fold"
+        );
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        // Helper: create `name` with `body`.
+        async fn make(client: &Arc<NinePClient>, name: &[u8], body: &[u8]) {
+            let cf = client.alloc_fid();
+            client.walk(ROOT_FID_TEST, cf, &[]).await.unwrap();
+            client
+                .lcreate(
+                    cf,
+                    name,
+                    (libc::O_RDWR | libc::O_CREAT) as u32,
+                    libc::S_IFREG | 0o644,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.write(cf, 0, body).await.unwrap(), body.len() as u64);
+            client.clunk(cf).await.unwrap();
+            client.free_fid(cf);
+        }
+
+        let small = b"hello prefetch";
+        make(&client, b"small.txt", small).await;
+        let big = vec![b'Z'; 4096];
+        make(&client, b"big.txt", &big).await;
+
+        // Walk to an unopened inode fid for `name`.
+        async fn inode_fid(client: &Arc<NinePClient>, name: &[u8]) -> u32 {
+            let f = client.alloc_fid();
+            client.walk(ROOT_FID_TEST, f, &[name]).await.unwrap();
+            f
+        }
+
+        // Small file: the whole file folds into the open with eof set.
+        let sfid = inode_fid(&client, b"small.txt").await;
+        let nf = client.alloc_fid();
+        let (qid, _io, data, eof) = client
+            .lopenatread(sfid, nf, libc::O_RDONLY as u32, 1024)
+            .await
+            .unwrap();
+        assert_eq!(qid.type_, QID_TYPE_FILE);
+        assert_eq!(&data[..], &small[..], "the fold returns the whole file");
+        assert!(eof, "a file within the window reports eof");
+        client.clunk(nf).await.unwrap();
+        client.free_fid(nf);
+        // The source fid is untouched (still an unopened inode fid): re-folding works.
+        let nf2 = client.alloc_fid();
+        let (_q, _i, data2, _e) = client
+            .lopenatread(sfid, nf2, libc::O_RDONLY as u32, 1024)
+            .await
+            .unwrap();
+        assert_eq!(&data2[..], &small[..], "source fid left openable");
+        client.clunk(nf2).await.unwrap();
+        client.free_fid(nf2);
+        client.clunk(sfid).await.unwrap();
+        client.free_fid(sfid);
+
+        // Large file: a 16-byte window yields a prefix with eof clear, and the opened
+        // fid serves the remainder over a normal read.
+        let lfid = inode_fid(&client, b"big.txt").await;
+        let lnf = client.alloc_fid();
+        let (_q, _i, prefix, eof) = client
+            .lopenatread(lfid, lnf, libc::O_RDONLY as u32, 16)
+            .await
+            .unwrap();
+        assert_eq!(prefix.len(), 16, "prefetch is clamped to the window");
+        assert!(!eof, "a file larger than the window does not report eof");
+        let rest = client.read(lnf, 16, 4096).await.unwrap();
+        assert_eq!(rest.len(), big.len() - 16);
+        assert!(rest.iter().all(|&b| b == b'Z'));
+        client.clunk(lnf).await.unwrap();
+        client.free_fid(lnf);
+        client.clunk(lfid).await.unwrap();
+        client.free_fid(lfid);
+
+        // The wrapper keeps a whole-file buffer for a small file...
+        let w1 = inode_fid(&client, b"small.txt").await;
+        let o1 = client.alloc_fid();
+        let (_f, _q, _i, buf) = client
+            .open_clone_prefetch(w1, o1, libc::O_RDONLY as u32, 1024)
+            .await
+            .unwrap();
+        assert_eq!(buf.as_deref(), Some(&small[..]));
+        client.clunk(o1).await.unwrap();
+        client.free_fid(o1);
+        client.clunk(w1).await.unwrap();
+        client.free_fid(w1);
+        // ...and drops a partial prefetch of a large file (the mount reads normally).
+        let w2 = inode_fid(&client, b"big.txt").await;
+        let o2 = client.alloc_fid();
+        let (_f, _q, _i, buf) = client
+            .open_clone_prefetch(w2, o2, libc::O_RDONLY as u32, 16)
+            .await
+            .unwrap();
+        assert!(buf.is_none(), "a partial prefetch is dropped");
+        client.clunk(o2).await.unwrap();
+        client.free_fid(o2);
+        client.clunk(w2).await.unwrap();
+        client.free_fid(w2);
+
+        shutdown.cancel();
+    }
+
+    /// At a small msize the fold must keep the whole Rlopenatread frame
+    /// (`P9_RLOPENATREAD_HDR` + data) within the negotiated msize, not just an
+    /// Rread's smaller overhead. A file at the old (P9_IOHDRSZ) clamp boundary must
+    /// come back as a partial prefetch (no eof), not a reply that overruns the msize.
+    #[tokio::test]
+    async fn open_read_fold_respects_small_msize() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("small-msize.9p.sock");
+        let shutdown = start_server(Arc::clone(&fs), sock.clone());
+
+        // Connect with a small msize so the reply's fixed overhead matters.
+        let msize = 8192u32;
+        let mut client = None;
+        for _ in 0..100 {
+            if let Ok(c) = NinePClient::connect_unix(&sock, msize).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let client = client.expect("client failed to connect");
+        assert_eq!(client.msize(), msize, "server honors the small msize");
+        assert!(client.extensions_v5_enabled());
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        // A file at the OLD clamp boundary (msize - P9_IOHDRSZ): the buggy code read
+        // it whole and replied with P9_RLOPENATREAD_HDR + (msize - P9_IOHDRSZ) > msize.
+        let body = vec![b'q'; (msize - P9_IOHDRSZ) as usize];
+        let cf = client.alloc_fid();
+        client.walk(ROOT_FID_TEST, cf, &[]).await.unwrap();
+        client
+            .lcreate(
+                cf,
+                b"boundary.bin",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.write(cf, 0, &body).await.unwrap(), body.len() as u64);
+        client.clunk(cf).await.unwrap();
+        client.free_fid(cf);
+
+        let sfid = client.alloc_fid();
+        client
+            .walk(ROOT_FID_TEST, sfid, &[b"boundary.bin".as_ref()])
+            .await
+            .unwrap();
+        let nf = client.alloc_fid();
+        let (_q, _io, data, eof) = client
+            .lopenatread(sfid, nf, libc::O_RDONLY as u32, msize)
+            .await
+            .unwrap();
+        // The whole reply must fit the negotiated msize.
+        assert!(
+            data.len() as u32 + P9_RLOPENATREAD_HDR <= msize,
+            "reply data {} + hdr {} must fit msize {}",
+            data.len(),
+            P9_RLOPENATREAD_HDR,
+            msize
+        );
+        // The file exceeds the data budget, so it folds only partially (no eof) and
+        // the opened fid serves the remainder over a normal read.
+        assert!(!eof, "a file past the msize budget folds only partially");
+        let rest = client.read(nf, data.len() as u64, msize).await.unwrap();
+        assert_eq!(
+            data.len() + rest.len(),
+            body.len(),
+            "fold + tail = whole file"
+        );
+        client.clunk(nf).await.unwrap();
+        client.free_fid(nf);
+        client.clunk(sfid).await.unwrap();
+        client.free_fid(sfid);
 
         shutdown.cancel();
     }

@@ -5,6 +5,7 @@
 //! to clunk; on error nothing is left server-side.
 
 use crate::{ClientError, ClientResult, NinePClient};
+use bytes::Bytes;
 use ninep_proto::{
     DirEntry, DirEntryPlus, GETATTR_ALL, Qid, SETATTR_ATIME, SETATTR_ATIME_SET, SETATTR_GID,
     SETATTR_MODE, SETATTR_MTIME, SETATTR_MTIME_SET, SETATTR_SIZE, SETATTR_UID, Stat, Tsetattr,
@@ -187,6 +188,32 @@ impl NinePClient {
                 Err(e)
             }
         }
+    }
+
+    /// Like [`Self::open_clone`] but, under `.zerofs5` with `prefetch > 0`, also
+    /// returns the start of the file in the same round trip (`Tlopenatread`). Used
+    /// for read opens, where the writeback O_WRONLY->O_RDWR upgrade never applies, so
+    /// there is no fallback to thread through. The returned buffer is `Some` only when
+    /// the prefetch is the *whole* file: a short read served from a whole-file buffer
+    /// is a legitimate EOF, whereas a short read from a partial (non-eof) prefetch of a
+    /// large file would be misread as EOF, so a partial prefetch is dropped and the
+    /// file is read normally. Falls back to a plain open when `.zerofs5` is not
+    /// negotiated or `prefetch == 0`. Caller owns `newfid`.
+    pub async fn open_clone_prefetch(
+        &self,
+        from: u32,
+        newfid: u32,
+        flags: u32,
+        prefetch: u32,
+    ) -> ClientResult<(u32, Qid, u32, Option<Bytes>)> {
+        if prefetch > 0 && self.extensions_v5_enabled() {
+            let (qid, iounit, data, eof) = self.lopenatread(from, newfid, flags, prefetch).await?;
+            // Keep the ref-counted Bytes as-is (zero-copy); drop a partial prefetch.
+            let buf = eof.then_some(data);
+            return Ok((newfid, qid, iounit, buf));
+        }
+        let (fid, qid, iounit) = self.open_clone(from, newfid, flags, None).await?;
+        Ok((fid, qid, iounit, None))
     }
 
     /// Create and open `name` under `dfid` on `newfid`, leaving `dfid` untouched:

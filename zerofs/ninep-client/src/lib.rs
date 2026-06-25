@@ -652,6 +652,11 @@ impl NinePClient {
         self.extensions.load(Ordering::Relaxed) >= 4
     }
 
+    /// `.zerofs5` negotiated: a file open can fold in its first read (Tlopenatread).
+    pub fn extensions_v5_enabled(&self) -> bool {
+        self.extensions.load(Ordering::Relaxed) >= 5
+    }
+
     /// Record a just-acked mutating write on `fid` as un-fsync'd under `token` (the
     /// lineage token of the connection it returned on).
     fn note_unsynced(&self, fid: u32, token: u64) {
@@ -1134,6 +1139,50 @@ impl NinePClient {
                 Ok((r.qid, r.iounit))
             }
             _ => Err(ClientError::Unexpected("lopenat")),
+        }
+    }
+
+    /// `.zerofs5`: open `fid`'s inode on `newfid` like [`Self::lopenat`] AND prefetch
+    /// up to `count` bytes from offset 0 in the same round trip. Returns the qid, the
+    /// iounit, the prefetched bytes, and whether they reach EOF (the whole file fit in
+    /// `count`). The inline read is best-effort: a server-side read error yields empty
+    /// data with `eof = false`, and the open still succeeds. Only valid with
+    /// [`Self::extensions_v5_enabled`].
+    pub async fn lopenatread(
+        &self,
+        fid: u32,
+        newfid: u32,
+        flags: u32,
+        count: u32,
+    ) -> ClientResult<(Qid, u32, Bytes, bool)> {
+        let resp = self
+            .rpc(Message::Tlopenatread(Tlopenatread {
+                fid,
+                newfid,
+                flags,
+                count,
+            }))
+            .await?;
+        match resp {
+            Message::Rlopenatread(r) => {
+                // Same fid bookkeeping as lopenat: bind newfid to the opened inode.
+                let mut st = self.state.lock().unwrap();
+                if let Some(n_uname) = st.fids.get(&fid).map(FidRecord::n_uname) {
+                    st.fids.insert(
+                        newfid,
+                        FidRecord {
+                            kind: FidKind::Inode {
+                                inode_id: r.qid.path,
+                                n_uname,
+                            },
+                            opened: Some(flags),
+                        },
+                    );
+                }
+                drop(st);
+                Ok((r.qid, r.iounit, r.data.0, r.eof != 0))
+            }
+            _ => Err(ClientError::Unexpected("lopenatread")),
         }
     }
 
@@ -1966,13 +2015,13 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
     // older/foreign server substring-match down to the highest it supports.
     let (otx, orx) = oneshot::channel();
     conn.pending.insert(NOTAG, otx);
-    // Propose the newest extension plus `.zerofs3` so the server's substring match
-    // lands on `.zerofs4` when offered, and degrades cleanly to `.zerofs3` (keeping
-    // the op-id) on an `ignore_fsync` or pre-`.zerofs4` server rather than dropping
-    // all the way to plain `.zerofs`.
+    // Propose the newest extension down through `.zerofs3` so the server's substring
+    // match lands on the highest it offers and degrades cleanly: a pre-`.zerofs5`
+    // server picks `.zerofs4`, and an `ignore_fsync` or pre-`.zerofs4` server picks
+    // `.zerofs3` (keeping the op-id) rather than dropping all the way to `.zerofs`.
     let body = Message::Tversion(Tversion {
         msize: requested,
-        version: P9String::new(b"9P2000.L.zerofs4.zerofs3".to_vec()),
+        version: P9String::new(b"9P2000.L.zerofs5.zerofs4.zerofs3".to_vec()),
     });
     let bytes = match P9Message::new(NOTAG, body).to_bytes() {
         Ok(b) => b,
@@ -1996,7 +2045,9 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
                 return Err(ClientError::Unexpected("version"));
             }
             // The server echoes the highest suffix it supports; plain `9P2000.L` means none.
-            let extensions = if vstr.contains(".zerofs4") {
+            let extensions = if vstr.contains(".zerofs5") {
+                5
+            } else if vstr.contains(".zerofs4") {
                 4
             } else if vstr.contains(".zerofs3") {
                 3
