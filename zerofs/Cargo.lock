@@ -4187,7 +4187,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.14.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=7e2ceb7c9f296ae84a6deedcb55d572ec1915092#7e2ceb7c9f296ae84a6deedcb55d572ec1915092"
+source = "git+https://github.com/Barre/slatedb.git?rev=77d7c54b5a78bb10840e6a6e6fe25e8f9d8b17bd#77d7c54b5a78bb10840e6a6e6fe25e8f9d8b17bd"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4231,7 +4231,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.14.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=7e2ceb7c9f296ae84a6deedcb55d572ec1915092#7e2ceb7c9f296ae84a6deedcb55d572ec1915092"
+source = "git+https://github.com/Barre/slatedb.git?rev=77d7c54b5a78bb10840e6a6e6fe25e8f9d8b17bd#77d7c54b5a78bb10840e6a6e6fe25e8f9d8b17bd"
 dependencies = [
  "chrono",
  "log",
@@ -4246,7 +4246,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.14.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=7e2ceb7c9f296ae84a6deedcb55d572ec1915092#7e2ceb7c9f296ae84a6deedcb55d572ec1915092"
+source = "git+https://github.com/Barre/slatedb.git?rev=77d7c54b5a78bb10840e6a6e6fe25e8f9d8b17bd#77d7c54b5a78bb10840e6a6e6fe25e8f9d8b17bd"
 dependencies = [
  "async-trait",
  "bytes",
