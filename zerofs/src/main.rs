@@ -14,6 +14,7 @@ mod length_checked_object_store;
 #[cfg(target_os = "linux")]
 mod mount;
 mod nbd;
+mod net_util;
 mod nfs;
 mod ninep;
 mod object_store_prefetch;

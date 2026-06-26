@@ -84,7 +84,9 @@ impl NinePServer {
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
             Transport::Tcp(addr) => {
-                let listener = TcpListener::bind(addr).await?;
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| crate::net_util::tcp_bind_error("9P", addr, &e))?;
                 info!("9P server listening on TCP {}", addr);
 
                 loop {

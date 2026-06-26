@@ -323,6 +323,38 @@ fn start_periodic_flush(
     })
 }
 
+/// Walk an error's source chain looking for an open-file-descriptor exhaustion
+/// (EMFILE/ENFILE). foyer reports these as an opaque `I/O error => coding error`
+/// whose only clue is the wrapped os error code, so detection has to go by the
+/// raw code rather than the (libc-dependent) message text.
+fn is_fd_exhaustion(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(e) = source {
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && matches!(io.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+        {
+            return true;
+        }
+        source = e.source();
+    }
+    false
+}
+
+/// Wrap a foyer cache build failure, keeping the real error visible and adding a
+/// `ulimit -n` hint when the cause is fd exhaustion (which foyer otherwise hides
+/// behind a useless "coding error").
+fn foyer_build_error(context: &str, err: foyer::Error) -> anyhow::Error {
+    if is_fd_exhaustion(&err) {
+        anyhow::anyhow!(
+            "{context}: {err}\n\nZeroFS ran out of open file descriptors while building \
+             the on-disk cache. Raise the open-file limit (e.g. `ulimit -n 1048576`, or \
+             LimitNOFILE= in the systemd unit) and restart."
+        )
+    } else {
+        anyhow::anyhow!("{context}: {err}")
+    }
+}
+
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     disk_bytes: usize,
@@ -350,13 +382,13 @@ pub(crate) async fn build_parts_hybrid(
                 FsDeviceBuilder::new(&parts_root)
                     .with_capacity(disk_bytes)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("parts foyer device build failed: {e}"))?,
+                    .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
             )
             .with_block_size(64 * 1024 * 1024),
         )
         .build()
         .await
-        .map_err(|e| anyhow::anyhow!("parts foyer hybrid build failed: {e}"))
+        .map_err(|e| foyer_build_error("parts foyer hybrid build failed", e))
 }
 
 /// Compute (parts_disk_bytes, decoded_blocks_disk_bytes) from a total disk
@@ -527,13 +559,13 @@ pub async fn build_slatedb(
                 FsDeviceBuilder::new(&hybrid_cache_root)
                     .with_capacity(hybrid_disk_bytes)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("foyer device build failed: {e}"))?,
+                    .map_err(|e| foyer_build_error("foyer device build failed", e))?,
             )
             .with_block_size(64 * 1024 * 1024),
         )
         .build()
         .await
-        .map_err(|e| anyhow::anyhow!("foyer hybrid build failed: {e}"))?;
+        .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
     let cache = Arc::new(FoyerHybridCache::new_with_cache(hybrid));
 
     let parts_cache = build_parts_hybrid(
@@ -939,4 +971,40 @@ pub async fn run_server(
 
     info!("Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // foyer builds the same `I/O error => coding error` wrapping around the os
+    // error regardless of the build site, so exercise its own From<io::Error>.
+    fn foyer_os_error(raw: i32) -> foyer::Error {
+        std::io::Error::from_raw_os_error(raw).into()
+    }
+
+    #[test]
+    fn emfile_is_detected_and_hinted() {
+        let err = foyer_os_error(libc::EMFILE);
+        assert!(is_fd_exhaustion(&err));
+        let msg = foyer_build_error("foyer hybrid build failed", err).to_string();
+        assert!(
+            msg.contains("foyer hybrid build failed"),
+            "lost context: {msg}"
+        );
+        assert!(msg.contains("ulimit -n"), "missing fd hint: {msg}");
+    }
+
+    #[test]
+    fn enfile_is_detected() {
+        assert!(is_fd_exhaustion(&foyer_os_error(libc::ENFILE)));
+    }
+
+    #[test]
+    fn other_io_errors_get_no_hint() {
+        let err = foyer_os_error(libc::ENOSPC);
+        assert!(!is_fd_exhaustion(&err));
+        let msg = foyer_build_error("foyer device build failed", err).to_string();
+        assert!(!msg.contains("ulimit"), "spurious fd hint: {msg}");
+    }
 }
