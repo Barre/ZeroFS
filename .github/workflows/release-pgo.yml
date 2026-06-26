@@ -16,13 +16,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect-pgo-profile:
-    name: Collect PGO Profile Data - ${{ matrix.test }}
+  build-instrumented:
+    name: Build instrumented binary for profiling
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
-
     steps:
       - uses: actions/checkout@v4
 
@@ -32,13 +28,62 @@ jobs:
           components: llvm-tools-preview
           targets: x86_64-unknown-linux-musl
 
-      - name: Install dependencies
+      - name: Setup musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc musl-tools
+          sudo apt-get install -y musl-tools
           # Profile a musl build so the PGO data matches the musl release targets.
           # The C deps (jemalloc, lz4, zstd, ring) need a musl C compiler.
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build with PGO instrumentation
+        working-directory: zerofs
+        run: |
+          RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -Cprofile-generate=/tmp/pgo-data" \
+            cargo build --release --target=x86_64-unknown-linux-musl
+
+      # One instrumented binary feeds every profiling workload below. The
+      # profile output path is chosen at runtime via LLVM_PROFILE_FILE, so the
+      # same binary profiles 9p/fuse/zfs/nfs without a rebuild per matrix leg.
+      - name: Upload instrumented binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-instrumented
+          path: zerofs/target/x86_64-unknown-linux-musl/release/zerofs
+          retention-days: 1
+
+  collect-pgo-profile:
+    name: Collect PGO Profile Data - ${{ matrix.test }}
+    needs: build-instrumented
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test: [9p, fuse, zfs-on-zerofs, nfs-kernel-compile]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # llvm-tools-preview supplies llvm-profdata for the merge step; no
+      # compilation happens here, so the musl target/toolchain aren't needed.
+      - name: Install Rust with PGO support
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Download instrumented binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-instrumented
+          path: zerofs/target/x86_64-unknown-linux-musl/release/
+
+      - name: Make instrumented binary executable
+        run: chmod +x zerofs/target/x86_64-unknown-linux-musl/release/zerofs
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # build-essential/bison/flex/... drive the in-tree kernel-compile workload.
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
 
           if [ "${{ matrix.test }}" = "9p" ]; then
             sudo modprobe 9p
@@ -84,14 +129,6 @@ jobs:
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             ./mc mb myminio/pgo-nfs-test || true
           fi
-
-      - name: Build with PGO instrumentation
-        working-directory: zerofs
-        run: |
-          rm -rf /tmp/pgo-data
-
-          RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -Cprofile-generate=/tmp/pgo-data" \
-            cargo build --release --target=x86_64-unknown-linux-musl
 
       - name: Run profiling workloads
         env:
