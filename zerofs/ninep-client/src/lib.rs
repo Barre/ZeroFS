@@ -60,6 +60,18 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Exceeds the leader's 5s ship timeout so a healthy write awaiting a slow ship is
 /// not falsely re-routed.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// How recently the reader must have decoded any frame for the connection to
+/// count as alive without an explicit probe. Under a write storm other replies
+/// keep flowing, so a merely-slow op takes this cheap path and never triggers a
+/// teardown; short enough that a genuine freeze (no frames at all) falls through
+/// to the probe within roughly one [`REQUEST_TIMEOUT`] window.
+const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
+/// Cap on how many extra [`REQUEST_TIMEOUT`] windows one request may wait while
+/// the connection keeps proving itself alive. Bounds worst-case failover latency
+/// when the leader answers liveness checks but a wedged write-path never lands
+/// this op (reads fine, writes stuck): after the cap we tear down and re-probe
+/// regardless. 7 extra windows plus the initial one is about a minute.
+const MAX_LIVENESS_EXTENSIONS: u32 = 7;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -123,6 +135,15 @@ struct Conn {
     lineage_token: AtomicU64,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
+    /// Monotonic base for [`Conn::last_alive`].
+    base: std::time::Instant,
+    /// Millis (since `base`) at which the reader last decoded a frame: proof the
+    /// server is answering. Read by the timeout path to tell a slow leader from a
+    /// hung one without always paying for an explicit probe.
+    last_alive: AtomicU64,
+    /// Serialises explicit liveness probes so concurrent timed-out waiters issue
+    /// at most one (they share the single reserved probe fid).
+    probe_lock: tokio::sync::Mutex<()>,
     /// Signals the (possibly idle) writer task to stop when the reader exits.
     writer_shutdown: Notify,
     /// Signals the reader to stop while the socket is still healthy: it otherwise
@@ -141,6 +162,26 @@ impl Conn {
         self.dead.store(true, Ordering::Release);
         self.reader_shutdown.notify_one();
         self.writer_shutdown.notify_one();
+    }
+
+    /// Record that the server just answered (any decoded frame). Called by the reader.
+    fn mark_alive(&self) {
+        self.last_alive
+            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// `now_ms - last_ms < window`, saturating (a `last` ahead of `now` counts as within).
+    fn within(now_ms: u64, last_ms: u64, window: Duration) -> bool {
+        now_ms.saturating_sub(last_ms) < window.as_millis() as u64
+    }
+
+    /// Did the reader decode a frame within `window`?
+    fn heard_within(&self, window: Duration) -> bool {
+        Self::within(
+            self.base.elapsed().as_millis() as u64,
+            self.last_alive.load(Ordering::Relaxed),
+            window,
+        )
     }
 }
 
@@ -349,6 +390,9 @@ impl NinePClient {
             tag_ctr: AtomicU16::new(0),
             lineage_token: AtomicU64::new(0),
             dead: AtomicBool::new(false),
+            base: std::time::Instant::now(),
+            last_alive: AtomicU64::new(0),
+            probe_lock: tokio::sync::Mutex::new(()),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
         });
@@ -777,11 +821,11 @@ impl NinePClient {
     /// Send a request, blocking through any reconnect and resending across one
     /// (see the module docs for the in-flight double-apply caveat).
     async fn send_request(&self, op_id: [u8; 16], body: Message) -> ClientResult<Message> {
-        loop {
+        'resend: loop {
             self.wait_until_live().await;
             let conn = self.conn.load_full();
 
-            let (otx, orx) = oneshot::channel();
+            let (otx, mut orx) = oneshot::channel();
             let tag = Self::alloc_tag(&conn, otx);
 
             // `live` can briefly lag a conn's death, so we may have loaded the dead
@@ -812,50 +856,94 @@ impl NinePClient {
                 tokio::task::yield_now().await;
                 continue;
             }
-            // Parse here, not on the reader task, to keep the reader unblocked.
-            match tokio::time::timeout(REQUEST_TIMEOUT, orx).await {
-                Ok(Ok(frame)) => {
-                    let (_, msg) =
-                        P9Message::from_bytes((&frame, 0)).map_err(ClientError::Codec)?;
-                    // Bound node is no longer the leader (lease lapsed or fenced):
-                    // re-probe and resend. The stable op-id keeps the resend
-                    // exactly-once even if leadership moves again before it lands.
-                    if let Message::Rlerror(ref e) = msg.body
-                        && e.ecode == P9_ENOTLEADER
-                    {
+
+            // Await the reply. A missed REQUEST_TIMEOUT is not by itself proof the
+            // leader is dead: under write backpressure a healthy leader is simply
+            // slow. Grant another window for as long as the connection keeps proving
+            // itself alive (see `conn_alive`), bounded by MAX_LIVENESS_EXTENSIONS so a
+            // wedged leader still fails over. Only a hung/silent connection is torn
+            // down. We re-await the SAME `orx` across extensions, so the request stays
+            // in flight (no duplicate send) and the stable op-id keeps any eventual
+            // resend exactly-once.
+            let mut extensions = 0u32;
+            let frame = loop {
+                match tokio::time::timeout(REQUEST_TIMEOUT, &mut orx).await {
+                    Ok(Ok(frame)) => break frame,
+                    Ok(Err(_)) => {
+                        // Lost the reply to a drop: wait for reconnect and resend.
+                        conn.pending.remove(&tag);
+                        tokio::task::yield_now().await;
+                        continue 'resend;
+                    }
+                    Err(_) => {
+                        if extensions < MAX_LIVENESS_EXTENSIONS && Self::conn_alive(&conn).await {
+                            extensions += 1;
+                            continue;
+                        }
+                        // Hung, or out of patience: tear it down, reprobe, resend.
+                        conn.pending.remove(&tag);
                         self.force_reprobe(&conn);
                         tokio::task::yield_now().await;
-                        continue;
+                        continue 'resend;
                     }
-                    // A mutating op that just succeeded is durable-but-un-fsync'd under
-                    // this connection's lineage token; track it on every fid a later
-                    // verified fsync checks (one for most ops, both directories for a
-                    // renameat). A failed mutation (Rlerror) changed nothing.
-                    if self.durability_enabled() && !matches!(msg.body, Message::Rlerror(_)) {
-                        let token = conn.lineage_token.load(Ordering::Relaxed);
-                        for fid in body.durability_fids() {
-                            self.note_unsynced(fid, token);
-                        }
-                    }
-                    return Ok(msg.body);
                 }
-                Ok(Err(_)) => {
-                    // Lost the reply to a drop: wait for reconnect and resend.
-                    conn.pending.remove(&tag);
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(_) => {
-                    // No reply within REQUEST_TIMEOUT: the leader is hung but its
-                    // connection is still open (a clean crash would have dropped it
-                    // and reconnected on its own). Tear it down, reprobe, resend.
-                    conn.pending.remove(&tag);
-                    self.force_reprobe(&conn);
-                    tokio::task::yield_now().await;
-                    continue;
+            };
+
+            // Parse here, not on the reader task, to keep the reader unblocked.
+            let (_, msg) = P9Message::from_bytes((&frame, 0)).map_err(ClientError::Codec)?;
+            // Bound node is no longer the leader (lease lapsed or fenced): re-probe
+            // and resend. The stable op-id keeps the resend exactly-once even if
+            // leadership moves again before it lands.
+            if let Message::Rlerror(ref e) = msg.body
+                && e.ecode == P9_ENOTLEADER
+            {
+                self.force_reprobe(&conn);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            // A mutating op that just succeeded is durable-but-un-fsync'd under this
+            // connection's lineage token; track it on every fid a later verified fsync
+            // checks (one for most ops, both directories for a renameat). A failed
+            // mutation (Rlerror) changed nothing.
+            if self.durability_enabled() && !matches!(msg.body, Message::Rlerror(_)) {
+                let token = conn.lineage_token.load(Ordering::Relaxed);
+                for fid in body.durability_fids() {
+                    self.note_unsynced(fid, token);
                 }
             }
+            return Ok(msg.body);
         }
+    }
+
+    /// Decide whether a connection that just missed a reply deadline is still
+    /// serving (merely slow, e.g. under write backpressure) rather than hung.
+    ///
+    /// Cheap path: if the reader decoded any frame within [`LIVENESS_WINDOW`] the
+    /// socket is provably live, so no probe is sent (the common case under load,
+    /// where other replies keep arriving). A silent connection gets one explicit,
+    /// lease-gated round trip on the reserved probe fid; this also catches a quietly
+    /// deposed leader (the lease check fails), routing us to the new one. The probe
+    /// is single-flighted so concurrent waiters do not collide on the probe fid, and
+    /// a re-check after taking the lock lets those queued behind a successful probe
+    /// skip their own.
+    async fn conn_alive(conn: &Conn) -> bool {
+        if conn.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        if conn.heard_within(LIVENESS_WINDOW) {
+            return true;
+        }
+        let _guard = conn.probe_lock.lock().await;
+        if conn.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        if conn.heard_within(LIVENESS_WINDOW) {
+            return true;
+        }
+        matches!(
+            tokio::time::timeout(PROBE_TIMEOUT, Self::leader_check(conn)).await,
+            Ok(Ok(()))
+        )
     }
 
     /// Tear down `conn` and wake the supervisor to re-probe. Used on
@@ -2174,6 +2262,9 @@ fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconn
                 }
                 None => break,
             };
+            // Any frame is proof of life; the timeout path reads this to tell a
+            // slow leader from a hung one without paying for an explicit probe.
+            conn.mark_alive();
             if frame.len() < P9_HEADER_SIZE {
                 warn!(
                     "9P client: response frame too short ({} bytes)",
@@ -2297,5 +2388,51 @@ mod durability_tracking_tests {
     fn nothing_tracked_reports_none() {
         let u = Unsynced::default();
         assert_eq!(u.snapshot(), (None, 0));
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    fn test_conn() -> Conn {
+        let (writer_tx, _rx) = mpsc::channel(1);
+        Conn {
+            writer_tx,
+            pending: DashMap::new(),
+            tag_ctr: AtomicU16::new(0),
+            lineage_token: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            base: std::time::Instant::now(),
+            last_alive: AtomicU64::new(0),
+            probe_lock: tokio::sync::Mutex::new(()),
+            writer_shutdown: Notify::new(),
+            reader_shutdown: Notify::new(),
+        }
+    }
+
+    #[test]
+    fn within_is_strict_and_saturates() {
+        let w = Duration::from_millis(300);
+        assert!(Conn::within(1000, 800, w), "200ms ago is within 300ms");
+        assert!(
+            !Conn::within(1000, 700, w),
+            "exactly at the window is NOT within (strict <)"
+        );
+        assert!(!Conn::within(1000, 500, w), "500ms ago is past 300ms");
+        // A `last` ahead of `now` cannot arise from one Instant base, but the
+        // saturating subtraction must still treat it as within rather than wrap.
+        assert!(Conn::within(500, 1000, w));
+    }
+
+    #[test]
+    fn a_just_marked_conn_is_heard() {
+        let conn = test_conn();
+        // Never marked: last_alive is 0 but base is ~now, so a long window still holds.
+        assert!(conn.heard_within(Duration::from_secs(60)));
+        conn.mark_alive();
+        assert!(conn.heard_within(Duration::from_secs(60)));
+        // A zero window is never satisfied (now - last == 0, not < 0).
+        assert!(!conn.heard_within(Duration::from_millis(0)));
     }
 }
