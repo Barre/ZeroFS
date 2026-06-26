@@ -53,7 +53,9 @@ impl NBDServer {
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
             Transport::Tcp(socket) => {
-                let listener = TcpListener::bind(socket).await?;
+                let listener = TcpListener::bind(socket)
+                    .await
+                    .map_err(|e| crate::net_util::tcp_bind_error("NBD", socket, &e))?;
                 info!("NBD server listening on {}", socket);
 
                 loop {

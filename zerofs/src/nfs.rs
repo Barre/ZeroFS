@@ -442,7 +442,9 @@ pub async fn start_nfs_server_with_config(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let adapter = NFSAdapter::new(filesystem);
-    let listener = NFSTcpListener::bind(socket, adapter).await?;
+    let listener = NFSTcpListener::bind(socket, adapter)
+        .await
+        .map_err(|e| crate::net_util::tcp_bind_error("NFS", socket, &e))?;
 
     info!("NFS server listening on {}", socket);
 
