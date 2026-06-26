@@ -226,7 +226,7 @@ where
             }
 
             let builder = opts.into_iter().fold(
-                object_store::aws::AmazonS3Builder::new()
+                object_store::aws::AmazonS3Builder::from_env()
                     .with_url(url.to_string())
                     .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.parse() {
@@ -249,7 +249,7 @@ where
         }
         ObjectStoreScheme::GoogleCloudStorage => {
             let builder = options.into_iter().fold(
-                object_store::gcp::GoogleCloudStorageBuilder::new()
+                object_store::gcp::GoogleCloudStorageBuilder::from_env()
                     .with_url(url.to_string())
                     .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
@@ -261,7 +261,7 @@ where
         }
         ObjectStoreScheme::MicrosoftAzure => {
             let builder = options.into_iter().fold(
-                object_store::azure::MicrosoftAzureBuilder::new()
+                object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_url(url.to_string())
                     .with_client_options(default_client_options()),
                 |builder, (key, value)| match key.as_ref().parse() {
