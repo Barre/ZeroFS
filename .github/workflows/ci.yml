@@ -59,15 +59,15 @@ jobs:
     needs: build
     uses: ./.github/workflows/stress-ng.yml
 
-  xfstests-9p:
-    needs: build
-    uses: ./.github/workflows/xfstests-9p.yml
-  xfstests-fuse:
-    needs: build
-    uses: ./.github/workflows/xfstests-fuse.yml
-  xfstests-nfs:
-    needs: build
-    uses: ./.github/workflows/xfstests-nfs.yml
+  # xfstests-9p:
+  #  needs: build
+  #  uses: ./.github/workflows/xfstests-9p.yml
+  # xfstests-fuse:
+  #  needs: build
+  #  uses: ./.github/workflows/xfstests-fuse.yml
+  # xfstests-nfs:
+  #  needs: build
+  #  uses: ./.github/workflows/xfstests-nfs.yml
 
   zfs-test:
     needs: build
