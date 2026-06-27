@@ -14,28 +14,28 @@ This guide covers installing ZeroFS, writing a basic configuration, and mounting
 
 ## Installation
 
-ZeroFS is distributed as a single binary. The Linux amd64 and arm64 builds are statically linked against musl; the other Linux builds link glibc dynamically. Choose your installation method:
+ZeroFS is distributed as a single binary. The Linux amd64 and arm64 builds are statically linked against musl; the other Linux builds link glibc dynamically. On Debian/Ubuntu and Fedora/RHEL, install from the apt or dnf repository: it keeps `zerofs` up to date through the package manager and also installs a systemd service and a config skeleton. On other platforms, use the install script or build from source.
 
 <CodeGroup>
 
-```bash {{ title: 'Install script (Recommended)' }}
-curl -sSfL https://sh.zerofs.net | sh
-
-# Pin a release and install without root
-curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
-```
-
-```bash {{ title: 'APT (Debian/Ubuntu)' }}
+```bash {{ title: 'APT (Debian/Ubuntu) (Recommended)' }}
 # amd64 and arm64
 curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg
 echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list
 sudo apt update && sudo apt install zerofs
 ```
 
-```bash {{ title: 'DNF (Fedora/RHEL)' }}
+```bash {{ title: 'DNF (Fedora/RHEL) (Recommended)' }}
 # x86_64 and aarch64
 curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo
 sudo dnf install zerofs
+```
+
+```bash {{ title: 'Install script' }}
+curl -sSfL https://sh.zerofs.net | sh
+
+# Pin a release and install without root
+curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
 ```
 
 ```bash {{ title: 'Build from Source' }}
