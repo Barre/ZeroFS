@@ -1,0 +1,41 @@
+# ZeroFS system service configuration.
+#
+# Secrets are not stored here. The ${VAR} placeholders are expanded from the
+# environment at startup; the systemd unit loads them from /etc/zerofs/zerofs.env.
+# Edit that file to set ZEROFS_PASSWORD and your object-store credentials, set
+# the storage url below, then: systemctl enable --now zerofs
+#
+# Full reference: run `zerofs init -` to print an annotated config.
+
+[cache]
+# Matches the unit's CacheDirectory=. Change this and you must also grant the
+# service write access to the new path (see ReadWritePaths in the unit).
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 1.0
+
+[storage]
+url = "s3://your-bucket/zerofs-data"
+encryption_password = "${ZEROFS_PASSWORD}"
+# storage_class = "..."   # Optional object storage class/tier for all writes.
+
+# Server protocols. Bound to loopback by default; change to 0.0.0.0 to expose
+# them, and remember these are unauthenticated wire protocols.
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+unix_socket = "/run/zerofs/9p.sock"
+
+# [servers.nbd]
+# addresses = ["127.0.0.1:10809"]
+# unix_socket = "/run/zerofs/nbd.sock"
+
+# AWS S3 / S3-compatible credentials, read from the environment.
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+# default_region = "us-east-1"
+# endpoint = "https://s3.us-east-1.amazonaws.com"  # For S3-compatible services
+# allow_http = "true"                               # For non-HTTPS endpoints

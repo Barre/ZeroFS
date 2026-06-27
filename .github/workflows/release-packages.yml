@@ -1,0 +1,175 @@
+name: Publish deb/rpm packages
+
+# Builds .deb/.rpm from the PGO release binaries and publishes signed apt + yum
+# repositories to Cloudflare R2. Triggers on a v* tag push (same as the Docker
+# build, which pulls the same release tarball), or on demand against a tag.
+#
+# Required repo configuration (Settings -> Secrets and variables -> Actions):
+#   Variables:
+#     REPO_BASE_URL   public URL the R2 bucket is served at, e.g. https://pkgs.zerofs.net
+#     R2_BUCKET       R2 bucket name, e.g. zerofs-packages
+#     GPG_KEY_ID      long key id / fingerprint of the signing key
+#   Secrets:
+#     R2_ACCOUNT_ID         Cloudflare account id (for the S3 endpoint)
+#     R2_ACCESS_KEY_ID      R2 token access key id
+#     R2_SECRET_ACCESS_KEY  R2 token secret
+#     GPG_PRIVATE_KEY       ASCII-armored private signing key (passphrase-less; see packaging/README.md)
+#
+# The signing key should be a dedicated, passphrase-less key used only for this
+# repo (GitHub Secrets is the protection boundary). See packaging/README.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)publish packages for, e.g. v1.4.1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  # Repo metadata is read-modify-write against the bucket; never publish two at once.
+  group: release-packages
+  cancel-in-progress: false
+
+env:
+  NFPM_VERSION: "2.47.0"
+  CODENAME: stable
+  COMPONENT: main
+
+jobs:
+  packages:
+    name: Build and publish packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag and version
+        id: ver
+        run: |
+          # tag push -> github.ref_name; manual run -> the input.
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ]; then echo "no tag resolved" >&2; exit 1; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          # gettext-base: envsubst; rpm: rpmsign; createrepo-c: yum metadata; rclone: R2 sync
+          sudo apt-get install -y gettext-base rpm createrepo-c rclone ruby gnupg
+          sudo gem install --no-document deb-s3
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_linux_x86_64.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" nfpm
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download release binaries
+        run: |
+          # Same source the Docker build pulls from: the release tarball asset.
+          mkdir -p bin
+          curl -fsSL \
+            "https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}/zerofs-pgo-multiplatform.tar.gz" \
+            | tar xz -C bin zerofs-linux-amd64-pgo zerofs-linux-arm64-pgo
+          chmod +x bin/zerofs-linux-*-pgo
+
+      - name: Build packages
+        run: |
+          mkdir -p out
+          build() {  # $1 = nfpm arch, $2 = binary path
+            export ARCH="$1" VERSION="${{ steps.ver.outputs.version }}" BIN="$2"
+            envsubst '${ARCH} ${VERSION} ${BIN}' < packaging/nfpm.yaml > nfpm.rendered.yaml
+            nfpm pkg -f nfpm.rendered.yaml -p deb -t out/
+            nfpm pkg -f nfpm.rendered.yaml -p rpm -t out/
+          }
+          build amd64 bin/zerofs-linux-amd64-pgo
+          build arm64 bin/zerofs-linux-arm64-pgo
+          ls -l out/
+
+      - name: Import signing key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          gpg --armor --export "${{ vars.GPG_KEY_ID }}" > zerofs.gpg
+
+      - name: Sign RPMs
+        run: |
+          cat > "$HOME/.rpmmacros" <<EOF
+          %_gpg_name ${{ vars.GPG_KEY_ID }}
+          %__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --no-secmem-warning --pinentry-mode loopback -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
+          EOF
+          rpmsign --addsign out/*.rpm
+          rpm --import zerofs.gpg
+          rpm --checksig out/*.rpm
+
+      - name: Configure R2 (rclone)
+        run: |
+          mkdir -p "$HOME/.config/rclone"
+          cat > "$HOME/.config/rclone/rclone.conf" <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Publish apt repo (deb-s3)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          deb-s3 upload \
+            --bucket "${{ vars.R2_BUCKET }}" \
+            --endpoint "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --s3-region auto \
+            --force-path-style \
+            --prefix deb \
+            --codename "${CODENAME}" \
+            --component "${COMPONENT}" \
+            --visibility private \
+            --sign "${{ vars.GPG_KEY_ID }}" \
+            --gpg-options "--pinentry-mode=loopback --batch --yes" \
+            --preserve-versions \
+            out/*.deb
+
+      - name: Publish yum repo (createrepo_c)
+        run: |
+          mkdir -p rpmrepo
+          # Pull existing tree so createrepo_c --update keeps prior versions.
+          rclone copy "r2:${{ vars.R2_BUCKET }}/rpm" rpmrepo || true
+          cp out/*.rpm rpmrepo/
+          createrepo_c --update rpmrepo
+          gpg --batch --pinentry-mode loopback --detach-sign --armor \
+            --local-user "${{ vars.GPG_KEY_ID }}" rpmrepo/repodata/repomd.xml
+          # rpms are append-only (never delete); metadata is mirrored exactly.
+          rclone copy rpmrepo "r2:${{ vars.R2_BUCKET }}/rpm" --exclude "repodata/**"
+          rclone sync rpmrepo/repodata "r2:${{ vars.R2_BUCKET }}/rpm/repodata"
+
+      - name: Publish public key and yum .repo descriptor
+        run: |
+          cat > zerofs.repo <<EOF
+          [zerofs]
+          name=ZeroFS
+          baseurl=${{ vars.REPO_BASE_URL }}/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=${{ vars.REPO_BASE_URL }}/zerofs.gpg
+          EOF
+          rclone copy zerofs.gpg "r2:${{ vars.R2_BUCKET }}/"
+          rclone copy zerofs.repo "r2:${{ vars.R2_BUCKET }}/"
+
+      - name: Attach packages to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Best-effort: packages are already published to R2; only attach if a
+          # release exists for this tag.
+          gh release upload "${{ steps.ver.outputs.tag }}" out/*.deb out/*.rpm \
+            --repo "${{ github.repository }}" --clobber \
+            || echo "No release for ${{ steps.ver.outputs.tag }} to attach to; skipped."

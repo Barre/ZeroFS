@@ -25,6 +25,19 @@ curl -sSfL https://sh.zerofs.net | sh
 curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
 ```
 
+```bash {{ title: 'APT (Debian/Ubuntu)' }}
+# amd64 and arm64
+curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg
+echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list
+sudo apt update && sudo apt install zerofs
+```
+
+```bash {{ title: 'DNF (Fedora/RHEL)' }}
+# x86_64 and aarch64
+curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo
+sudo dnf install zerofs
+```
+
 ```bash {{ title: 'Build from Source' }}
 # Requires Rust toolchain
 git clone https://github.com/Barre/ZeroFS
@@ -69,6 +82,27 @@ Each release ships prebuilt binaries for ten targets:
 | `x86_64-unknown-freebsd` | FreeBSD amd64 | Dynamic (system libc) |
 
 The aarch64 binaries are built with jemalloc configured for page sizes up to 64 KiB (`JEMALLOC_SYS_WITH_LG_PAGE=16`). They run on kernels with 4 KiB, 16 KiB, or 64 KiB pages.
+
+### Package repositories (apt/dnf)
+
+The apt and dnf repositories serve `zerofs` for amd64/arm64 only (the statically linked musl builds); other architectures use the install script or tarball. The repository metadata and packages are GPG-signed. Unlike the install script, a package also installs a systemd service and a config skeleton:
+
+| Path | Purpose |
+| --- | --- |
+| `/usr/bin/zerofs` | the binary |
+| `/lib/systemd/system/zerofs.service` | systemd unit, runs as the `zerofs` user |
+| `/etc/zerofs/config.toml` | configuration (preserved across upgrades) |
+| `/etc/zerofs/zerofs.env` | secrets, mode `0600` (preserved across upgrades) |
+
+The service is **not enabled by default**: it cannot start until you set the storage URL and credentials. Secrets are read from `zerofs.env` and referenced as `${VAR}` from `config.toml`:
+
+```bash
+sudoedit /etc/zerofs/zerofs.env    # set ZEROFS_PASSWORD and S3 credentials
+sudoedit /etc/zerofs/config.toml   # set [storage] url, protocols and ports
+sudo systemctl enable --now zerofs
+```
+
+The unit is hardened (`ProtectSystem=strict`, private `/tmp`, restricted capabilities). Its cache lives in `/var/cache/zerofs` and its unix sockets in `/run/zerofs`. If you point `[cache] dir` or a `file://` WAL at another path, grant write access with `sudo systemctl edit zerofs` and a `ReadWritePaths=` line.
 
 ### Install script options
 
