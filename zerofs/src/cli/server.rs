@@ -355,6 +355,46 @@ fn foyer_build_error(context: &str, err: foyer::Error) -> anyhow::Error {
     }
 }
 
+/// Build the foyer hybrid cache used as slatedb's block cache. Shared by the
+/// server open path and the warm-metadata integration test.
+pub(crate) async fn build_block_hybrid(
+    hybrid_cache_root: &std::path::Path,
+    memory_bytes: usize,
+    disk_bytes: usize,
+    foyer_handle: &tokio::runtime::Handle,
+) -> Result<Arc<FoyerHybridCache>> {
+    tokio::fs::create_dir_all(hybrid_cache_root)
+        .await
+        .with_context(|| {
+            format!(
+                "creating foyer hybrid cache dir at {}",
+                hybrid_cache_root.display()
+            )
+        })?;
+
+    let hybrid = HybridCacheBuilder::new()
+        .with_name("zerofs-slatedb-hybrid")
+        .memory(memory_bytes)
+        .with_eviction_config(S3FifoConfig::default())
+        .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
+        .storage()
+        .with_spawner(Spawner::from(foyer_handle.clone()))
+        .with_io_engine_config(PsyncIoEngineConfig::new())
+        .with_engine_config(
+            BlockEngineConfig::new(
+                FsDeviceBuilder::new(hybrid_cache_root)
+                    .with_capacity(disk_bytes)
+                    .build()
+                    .map_err(|e| foyer_build_error("foyer device build failed", e))?,
+            )
+            .with_block_size(64 * 1024 * 1024),
+        )
+        .build()
+        .await
+        .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
+    Ok(Arc::new(FoyerHybridCache::new_with_cache(hybrid)))
+}
+
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     disk_bytes: usize,
@@ -537,36 +577,13 @@ pub async fn build_slatedb(
     };
 
     let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
-    tokio::fs::create_dir_all(&hybrid_cache_root)
-        .await
-        .with_context(|| {
-            format!(
-                "creating foyer hybrid cache dir at {}",
-                hybrid_cache_root.display()
-            )
-        })?;
-
-    let hybrid = HybridCacheBuilder::new()
-        .with_name("zerofs-slatedb-hybrid")
-        .memory(hybrid_memory_bytes)
-        .with_eviction_config(S3FifoConfig::default())
-        .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
-        .storage()
-        .with_spawner(Spawner::from(maintenance_runtime.clone()))
-        .with_io_engine_config(PsyncIoEngineConfig::new())
-        .with_engine_config(
-            BlockEngineConfig::new(
-                FsDeviceBuilder::new(&hybrid_cache_root)
-                    .with_capacity(hybrid_disk_bytes)
-                    .build()
-                    .map_err(|e| foyer_build_error("foyer device build failed", e))?,
-            )
-            .with_block_size(64 * 1024 * 1024),
-        )
-        .build()
-        .await
-        .map_err(|e| foyer_build_error("foyer hybrid build failed", e))?;
-    let cache = Arc::new(FoyerHybridCache::new_with_cache(hybrid));
+    let cache = build_block_hybrid(
+        &hybrid_cache_root,
+        hybrid_memory_bytes,
+        hybrid_disk_bytes,
+        &maintenance_runtime,
+    )
+    .await?;
 
     let parts_cache = build_parts_hybrid(
         &cache_config.root_folder,
@@ -865,6 +882,30 @@ pub async fn run_server(
     )
     .await;
 
+    // Keep the metadata block cache warm so the first wave of reads (and the
+    // reads right after every compaction, which replaces meta SSTs with cold
+    // ones) doesn't serialize on object-store GETs of filters/indexes. Read-only
+    // opens get no block cache (see `open_database`), so `subscribe_status`
+    // returns `None` and warming is skipped there.
+    if settings.cache.warm_metadata != crate::config::WarmMetadata::Off
+        && let Some(status) = fs.db.subscribe_status()
+    {
+        let fs = Arc::clone(&fs);
+        let warm_data = settings.cache.warm_metadata == crate::config::WarmMetadata::Full;
+        let shutdown = shutdown.clone();
+        let warm = async move {
+            fs.db.warm_metadata_watch(warm_data, status, shutdown).await;
+        };
+        match &init_result.maintenance_runtime {
+            Some(handle) => {
+                handle.spawn(warm);
+            }
+            None => {
+                tokio::spawn(warm);
+            }
+        }
+    }
+
     let gc_handle = if !db_mode.is_read_only() {
         let gc = Arc::new(GarbageCollector::new(
             Arc::clone(&fs.db),
@@ -1006,5 +1047,164 @@ mod tests {
         assert!(!is_fd_exhaustion(&err));
         let msg = foyer_build_error("foyer device build failed", err).to_string();
         assert!(!msg.contains("ulimit"), "spurious fd hint: {msg}");
+    }
+
+    mod warm_metadata {
+        use super::*;
+        use crate::fault_store::{FaultControls, FaultStore};
+        use crate::fs::key_codec::KeyCodec;
+        use bytes::Bytes;
+        use object_store::ObjectStore;
+        use slatedb::config::WriteOptions;
+        use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
+        use slatedb::{SstBlockSize, WriteBatch};
+        use std::sync::Arc;
+
+        const INODES: u64 = 8_000;
+        // Sample keys spread across the keyspace so the cold reads touch many
+        // distinct SST data blocks, not just one.
+        const SAMPLE_STRIDE: u64 = 400;
+
+        async fn hybrid(root: &std::path::Path) -> Arc<FoyerHybridCache> {
+            build_block_hybrid(
+                root,
+                64 * 1024 * 1024,
+                512 * 1024 * 1024,
+                &tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("foyer hybrid")
+        }
+
+        // Open a writer over `store` with the same segment/filter/block config the
+        // server uses, so writes route into the `meta` segment exactly as in prod.
+        async fn open(store: Arc<dyn ObjectStore>, cache: Arc<FoyerHybridCache>) -> slatedb::Db {
+            // Small L0s so the 8k rows freeze into several SSTs, exercising the
+            // warm fan-out over more than one SST.
+            let settings = slatedb::config::Settings {
+                l0_sst_size_bytes: 64 * 1024,
+                ..Default::default()
+            };
+            slatedb::DbBuilder::new(slatedb::object_store::path::Path::from("db"), store)
+                .with_settings(settings)
+                .with_db_cache(cache)
+                .with_sst_block_size(SstBlockSize::Block32Kib)
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .expect("open slatedb")
+        }
+
+        // Object-store GETs charged while reading the sample keys cold.
+        async fn read_sample_gets(
+            db: &crate::db::Db,
+            codec: &KeyCodec,
+            ctl: &FaultControls,
+        ) -> usize {
+            let before = ctl.get_count();
+            let mut id = 0;
+            while id < INODES {
+                let v = db
+                    .get_bytes(&codec.inode_key(id))
+                    .await
+                    .expect("get")
+                    .expect("inode present");
+                assert_eq!(v.len(), 64);
+                id += SAMPLE_STRIDE;
+            }
+            ctl.get_count() - before
+        }
+
+        /// A cold `Db` (fresh foyer cache, all metadata on the object store)
+        /// pays object-store GETs for SST filters/indexes/data on its first
+        /// reads. `warm_metadata` pulls the `meta` segment into cache up front,
+        /// so the same reads issue no object-store GETs. The bulk segment, which
+        /// these keys don't touch, is irrelevant. Real foyer cache + real
+        /// LocalFileSystem store; GETs counted by the FaultStore decorator.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn warm_eliminates_cold_metadata_gets() {
+            let dir = tempfile::tempdir().unwrap();
+            let store_root = dir.path().join("store");
+            std::fs::create_dir_all(&store_root).unwrap();
+            let local = Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&store_root).unwrap(),
+            );
+            let (store, ctl) = FaultStore::new(local);
+            let store: Arc<dyn ObjectStore> = store;
+            let codec = KeyCodec::new(true);
+
+            // Setup: write the metadata and persist it to SSTs, in several flushes
+            // so the meta segment ends up with more than one SST.
+            {
+                let raw = open(store.clone(), hybrid(&dir.path().join("c_setup")).await).await;
+                for chunk in 0..4u64 {
+                    let mut batch = WriteBatch::new();
+                    for i in 0..(INODES / 4) {
+                        let id = chunk * (INODES / 4) + i;
+                        batch.put_bytes(codec.inode_key(id), Bytes::from(vec![id as u8; 64]));
+                    }
+                    raw.write_with_options(
+                        batch,
+                        &WriteOptions {
+                            await_durable: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    raw.flush().await.unwrap();
+                }
+                raw.close().await.unwrap();
+            }
+
+            // Cold read, no warm: reopen with a fresh cache and read the samples.
+            let cold_gets = {
+                let raw = open(store.clone(), hybrid(&dir.path().join("c_cold")).await).await;
+                let db = crate::db::Db::new(Arc::new(raw), None);
+                let gets = read_sample_gets(&db, &codec, &ctl).await;
+                db.close().await.unwrap();
+                gets
+            };
+
+            // Cold read, warmed: reopen with a fresh cache, warm the meta segment,
+            // then read the same samples.
+            let (warm_gets, warm_second, warmed) = {
+                let raw = open(store.clone(), hybrid(&dir.path().join("c_warm")).await).await;
+                let db = crate::db::Db::new(Arc::new(raw), None);
+                let warmed = db.warm_metadata(true).await;
+                let gets = read_sample_gets(&db, &codec, &ctl).await;
+                // A second pass over the same keys: warm + first-touch should have
+                // left the whole metadata working set in cache.
+                let second = read_sample_gets(&db, &codec, &ctl).await;
+                db.close().await.unwrap();
+                (gets, second, warmed)
+            };
+
+            assert!(
+                warmed.ssts >= 2,
+                "expected the meta segment to span several SSTs, got {}",
+                warmed.ssts
+            );
+            assert_eq!(warmed.failed, 0, "warm should not fail any SST");
+            assert!(
+                cold_gets > 0,
+                "cold reads must hit the object store, got {cold_gets}"
+            );
+            // Warming collapses the cold read cost by a wide margin. It is not
+            // exactly zero: `warm_sst` reuses the manifest's SST handles and so
+            // intentionally skips the per-SST footer `open_sst` GET the read path
+            // still pays once on first access (~2 per SST), plus the foyer hybrid
+            // cache's async disk tier can require an occasional re-fetch. So both
+            // warmed passes must stay far below cold, not necessarily at zero.
+            assert!(
+                warm_gets * 2 <= cold_gets,
+                "warming should cut cold GETs by a wide margin: cold={cold_gets} warm={warm_gets}"
+            );
+            assert!(
+                warm_second * 2 <= cold_gets,
+                "reads after warming must stay far below cold: cold={cold_gets} second={warm_second}"
+            );
+        }
     }
 }
