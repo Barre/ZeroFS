@@ -70,8 +70,6 @@ Each release ships prebuilt binaries for ten targets:
 
 The aarch64 binaries are built with jemalloc configured for page sizes up to 64 KiB (`JEMALLOC_SYS_WITH_LG_PAGE=16`). They run on kernels with 4 KiB, 16 KiB, or 64 KiB pages.
 
-The prebuilt Linux amd64 binary is compiled with `-C target-cpu=x86-64-v3` and requires a CPU with AVX2, BMI2, and FMA: Intel Haswell (2013) or later, AMD Excavator (2015) or later. The amd64 Docker image contains the same binary. On older CPUs the binary exits at startup with an illegal-instruction error (SIGILL). Builds from source target baseline x86-64 and run on those CPUs. See [troubleshooting](/troubleshooting).
-
 ### Install script options
 
 The install script reads three environment variables. Set them on the right side of the pipe, as in the pinned-release example above.

@@ -457,9 +457,8 @@ jobs:
             platform: linux
             use_cross: false
             # BOLT instrumentation can't dump a profile from a static (no-INTERP)
-            # musl binary, so we ship PGO + target-cpu=v3 without the BOLT pass.
+            # musl binary, so we ship PGO without the BOLT pass.
             bolt: false
-            extra_rustflags: "-C target-cpu=x86-64-v3"
           - target: aarch64-unknown-linux-musl
             arch: arm64
             os: ubuntu-24.04-arm
