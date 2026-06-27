@@ -1,0 +1,54 @@
+[Unit]
+Description=ZeroFS - the filesystem that makes S3 your primary storage
+Documentation=https://www.zerofs.net
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=zerofs
+Group=zerofs
+
+# Secrets and any other ${VAR} referenced from config.toml (ZEROFS_PASSWORD,
+# AWS_ACCESS_KEY_ID, ...) are read here. systemd loads this as root before
+# dropping privileges, so the file stays root-only (see install: mode 0600).
+EnvironmentFile=/etc/zerofs/zerofs.env
+ExecStart=/usr/bin/zerofs run --config /etc/zerofs/config.toml
+
+Restart=on-failure
+RestartSec=5s
+# Flushing the LSM tree to object storage on shutdown can take a while; don't
+# SIGKILL a clean shutdown out from under a large flush.
+TimeoutStopSec=120
+
+# systemd creates and owns these for the service user. The default config puts
+# the cache in CacheDirectory and the unix sockets in RuntimeDirectory.
+CacheDirectory=zerofs
+CacheDirectoryMode=0750
+StateDirectory=zerofs
+RuntimeDirectory=zerofs
+RuntimeDirectoryMode=0750
+
+# zerofs binds NFS/9P/NBD on unprivileged ports by default; this only matters if
+# you reconfigure it onto a port below 1024.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+LimitNOFILE=1048576
+
+# Hardening. ProtectSystem=strict makes the whole filesystem read-only except
+# the Cache/State/Runtime dirs above. If you point [cache] dir or a file:// WAL
+# at another path, add it via a drop-in: ReadWritePaths=/your/path
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

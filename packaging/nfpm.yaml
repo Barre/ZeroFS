@@ -1,0 +1,57 @@
+# nfpm config for the zerofs .deb / .rpm. Templated by the environment:
+#   ARCH    nfpm arch (amd64 | arm64); maps to deb amd64/arm64 and rpm x86_64/aarch64
+#   VERSION package version, e.g. 1.4.1 (no leading v)
+#   BIN     path to the prebuilt zerofs binary for this arch
+# Build:  ARCH=amd64 VERSION=1.4.1 BIN=./zerofs-linux-amd64 \
+#           nfpm pkg -f packaging/nfpm.yaml -p deb -t out/
+# Signing is done after the fact in CI (rpm) and at the repo level (apt), so
+# this file stays usable locally without any keys.
+name: zerofs
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Pierre Barre <pierre@zerofs.net>
+description: |
+  The filesystem that makes S3 your primary storage.
+  ZeroFS exposes an S3 (or S3-compatible / Azure / GCS) bucket as a real
+  filesystem over NFS, 9P, and NBD, with a local cache, encryption, and
+  compression.
+vendor: ZeroFS
+homepage: https://www.zerofs.net
+license: AGPL-3.0
+
+contents:
+  - src: ${BIN}
+    dst: /usr/bin/zerofs
+    file_info:
+      mode: 0755
+
+  - src: ./packaging/systemd/zerofs.service
+    dst: /lib/systemd/system/zerofs.service
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/config.toml
+    dst: /etc/zerofs/config.toml
+    type: "config|noreplace"
+    file_info:
+      mode: 0644
+
+  - src: ./packaging/zerofs.env.example
+    dst: /etc/zerofs/zerofs.env
+    type: "config|noreplace"
+    file_info:
+      mode: 0600
+
+scripts:
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh
+
+deb:
+  compression: zstd
+
+rpm:
+  compression: zstd

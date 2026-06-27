@@ -171,9 +171,24 @@ curl -sSfL https://sh.zerofs.net | sh
 curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
 ```
 
-ndexify dpeloy
-
 The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64, armv7, i686, ppc64le, s390x, riscv64), macOS (x86_64, aarch64), or FreeBSD (amd64). Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
+
+#### Via apt / dnf (amd64, arm64)
+
+Signed package repositories. Unlike the install script, a package also installs a systemd service (`zerofs.service`, disabled by default) and a config skeleton under `/etc/zerofs/`.
+
+```bash
+# Debian / Ubuntu
+curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg
+echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list
+sudo apt update && sudo apt install zerofs
+
+# Fedora / RHEL / Rocky
+curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo
+sudo dnf install zerofs
+```
+
+Then set `ZEROFS_PASSWORD` and credentials in `/etc/zerofs/zerofs.env`, the `[storage]` url in `/etc/zerofs/config.toml`, and `sudo systemctl enable --now zerofs`. See [packaging/README.md](packaging/README.md) for details.
 
 #### Via Docker
 ```bash
