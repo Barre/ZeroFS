@@ -19,7 +19,7 @@ members = ["ninep-proto", "ninep-client", "zerofs-csi", "zerofs-client", "zerofs
 # same release, so the version the driver reports (GetPluginInfo) must not
 # drift from zerofs's.
 [workspace.package]
-version = "1.4.3"
+version = "1.4.4"
 
 [profile.release]
 lto = true
