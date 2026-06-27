@@ -133,7 +133,7 @@ jobs:
             --component "${COMPONENT}" \
             --visibility private \
             --sign "${{ vars.GPG_KEY_ID }}" \
-            --gpg-options "--pinentry-mode=loopback --batch --yes" \
+            --gpg-options="--pinentry-mode=loopback --batch --yes" \
             --preserve-versions \
             out/*.deb
 
