@@ -8,8 +8,9 @@ use crate::fs::errors::FsError;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
+use futures::stream::StreamExt;
 use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, ScanOptions, WriteOptions};
-use slatedb::{DbReader, WriteBatch};
+use slatedb::{CacheTarget, DbCacheManagerOps, DbReader, WriteBatch};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,6 +36,54 @@ impl Clone for SlateDbHandle {
 impl SlateDbHandle {
     pub fn is_read_only(&self) -> bool {
         matches!(self, SlateDbHandle::ReadOnly(_))
+    }
+}
+
+/// Outcome of a [`Db::warm_metadata`] pass.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WarmStats {
+    /// Metadata SSTs the warm fan-out touched.
+    pub ssts: usize,
+    /// Of those, how many had at least one target fail (counted, not fatal).
+    pub failed: usize,
+}
+
+/// Tracks which metadata SSTs have already been warmed, so that across manifest
+/// changes (L0 flushes and compactions, which swap SSTs in and out) each SST is
+/// warmed exactly once. Generic over the id type purely so the diff can be unit
+/// tested with plain ids; production instantiates it with slatedb's `SsTableId`.
+struct WarmTracker<Id> {
+    seen: std::collections::HashSet<Id>,
+    last_manifest_id: u64,
+}
+
+impl<Id: Eq + std::hash::Hash + Copy> WarmTracker<Id> {
+    fn new() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            last_manifest_id: 0,
+        }
+    }
+
+    /// Given a manifest id and that manifest's live metadata SST ids, return the
+    /// ids not yet warmed (recording them as warmed) and forget ids that are no
+    /// longer live. Returns empty when the manifest id is unchanged, so a status
+    /// notification that didn't change the manifest (e.g. a durability advance) is
+    /// a no-op.
+    fn plan(&mut self, manifest_id: u64, current: impl Iterator<Item = Id>) -> Vec<Id> {
+        if manifest_id == self.last_manifest_id {
+            return Vec::new();
+        }
+        self.last_manifest_id = manifest_id;
+        let current: std::collections::HashSet<Id> = current.collect();
+        // Drop retired ids so the set can't grow without bound (and a future SST
+        // that reuses a retired id would warm again).
+        self.seen.retain(|id| current.contains(id));
+        current
+            .into_iter()
+            .filter(|id| self.seen.insert(*id))
+            .collect()
     }
 }
 
@@ -443,6 +492,170 @@ impl Db {
         self.metrics_recorder.clone()
     }
 
+    /// Concurrency cap for the warm fan-out. Each task issues at most a couple of
+    /// object-store GETs (filter + index), so a small cap drains thousands of
+    /// SSTs quickly without crowding the serving path off the object store.
+    const WARM_CONCURRENCY: usize = 16;
+
+    /// Cache targets for a metadata warm. Filters + index are always warmed
+    /// (small, bounded, and they gate every point lookup); `warm_data` adds the
+    /// data blocks (the whole `meta` segment is metadata, so the full range).
+    fn warm_targets(warm_data: bool) -> Vec<CacheTarget> {
+        let mut targets = vec![CacheTarget::Filters, CacheTarget::Index];
+        if warm_data {
+            targets.push(CacheTarget::data::<&[u8], _>(..));
+        }
+        targets
+    }
+
+    /// One-shot warm of the whole metadata segment, returning what it touched.
+    /// Production keeps the cache warm with [`warm_metadata_watch`](Self::warm_metadata_watch)
+    /// instead (which also re-warms after compactions); this primitive exists for
+    /// tests that assert the cache effect of a single warm.
+    ///
+    /// Best-effort and side-effect-only: a per-SST failure is counted, not
+    /// propagated. A no-op on volumes without the metadata segment (legacy
+    /// unsegmented layout) or without a block cache. Not lease-gated.
+    #[cfg(test)]
+    pub async fn warm_metadata(&self, warm_data: bool) -> WarmStats {
+        let targets = Self::warm_targets(warm_data);
+
+        // Snapshot the metadata segment's SST ids; the manifest borrow ends with
+        // the collect (ids are `Copy`), before the fan-out.
+        let manifest = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.manifest(),
+            SlateDbHandle::ReadOnly(reader) => reader.load().manifest(),
+        };
+        let Some(segment) = manifest.segment(crate::fs::key_codec::META_DOMAIN) else {
+            tracing::info!("metadata cache warm skipped: no metadata segment on this volume");
+            return WarmStats::default();
+        };
+        let ids: Vec<_> = segment
+            .l0()
+            .iter()
+            .chain(
+                segment
+                    .compacted()
+                    .iter()
+                    .flat_map(|run| run.sst_views.iter()),
+            )
+            .map(|view| view.sst.id)
+            .collect();
+
+        let total = ids.len();
+        let failed = futures::stream::iter(ids)
+            .map(|id| {
+                let targets = &targets;
+                async move {
+                    match &self.inner {
+                        SlateDbHandle::ReadWrite(db) => db.warm_sst(id, targets).await,
+                        SlateDbHandle::ReadOnly(reader) => {
+                            reader.load_full().warm_sst(id, targets).await
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(Self::WARM_CONCURRENCY)
+            .filter(|r| std::future::ready(r.is_err()))
+            .count()
+            .await;
+
+        WarmStats {
+            ssts: total,
+            failed,
+        }
+    }
+
+    /// A fresh status subscription (manifest + durability updates) for the
+    /// read-write handle, or `None` for a read-only open (which has no block
+    /// cache to keep warm).
+    pub fn subscribe_status(&self) -> Option<tokio::sync::watch::Receiver<slatedb::DbStatus>> {
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => Some(db.subscribe()),
+            SlateDbHandle::ReadOnly(_) => None,
+        }
+    }
+
+    /// Keep the metadata block cache warm for the life of the process.
+    ///
+    /// Warms the meta segment once up front, then re-warms newly-appeared SSTs
+    /// whenever the manifest changes. Compactions (and L0 flushes) replace meta
+    /// SSTs with cold ones, and the compactor shares no block cache, so without
+    /// this the startup warm decays and metadata reads pay the cold object-store
+    /// cost again right after every compaction. The set of already-warmed ids is
+    /// diffed against each new manifest, so each SST is warmed exactly once and an
+    /// unchanged manifest is a no-op. Runs until `shutdown`.
+    pub async fn warm_metadata_watch(
+        &self,
+        warm_data: bool,
+        mut status: tokio::sync::watch::Receiver<slatedb::DbStatus>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let targets = Self::warm_targets(warm_data);
+        let mut tracker = WarmTracker::new();
+        let mut first = true;
+
+        loop {
+            let new_ids: Vec<_> = {
+                let snapshot = status.borrow();
+                let manifest = &snapshot.current_manifest;
+                match manifest.segment(crate::fs::key_codec::META_DOMAIN) {
+                    None => Vec::new(),
+                    Some(segment) => {
+                        let live = segment
+                            .l0()
+                            .iter()
+                            .chain(
+                                segment
+                                    .compacted()
+                                    .iter()
+                                    .flat_map(|run| run.sst_views.iter()),
+                            )
+                            .map(|view| view.sst.id);
+                        tracker.plan(manifest.id(), live)
+                    }
+                }
+            };
+
+            if !new_ids.is_empty() {
+                let count = new_ids.len();
+                let failed = futures::stream::iter(new_ids)
+                    .map(|id| {
+                        let targets = &targets;
+                        async move {
+                            match &self.inner {
+                                SlateDbHandle::ReadWrite(db) => db.warm_sst(id, targets).await,
+                                SlateDbHandle::ReadOnly(reader) => {
+                                    reader.load_full().warm_sst(id, targets).await
+                                }
+                            }
+                        }
+                    })
+                    .buffer_unordered(Self::WARM_CONCURRENCY)
+                    .filter(|r| std::future::ready(r.is_err()))
+                    .count()
+                    .await;
+                // The first pass is the startup warm (whole segment); later passes
+                // are the post-compaction / post-flush deltas.
+                if first {
+                    tracing::info!("metadata cache warm: {count} SSTs ({failed} failed)");
+                } else {
+                    tracing::debug!("metadata cache re-warm: {count} new SSTs ({failed} failed)");
+                }
+            }
+            first = false;
+
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = status.changed() => {
+                    if changed.is_err() {
+                        break; // sender dropped: the db is closing
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn close(&self) -> Result<()> {
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
@@ -456,6 +669,48 @@ impl Db {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod warm_tracker_tests {
+    use super::WarmTracker;
+
+    fn sorted(mut v: Vec<u64>) -> Vec<u64> {
+        v.sort_unstable();
+        v
+    }
+
+    // The tracker warms each SST once across the manifest changes a long-running
+    // leader sees: the initial open, L0 flushes (add an SST), and compactions
+    // (retire several SSTs, add new ones). Only genuinely-new ids are warmed.
+    #[test]
+    fn warms_new_ssts_once_across_flushes_and_compactions() {
+        let mut t = WarmTracker::<u64>::new();
+
+        // Initial manifest: warm everything.
+        assert_eq!(
+            sorted(t.plan(1, [10, 11, 12].into_iter())),
+            vec![10, 11, 12]
+        );
+
+        // A status notification that didn't bump the manifest id (e.g. a
+        // durability advance): nothing to do.
+        assert!(t.plan(1, [10, 11, 12].into_iter()).is_empty());
+
+        // An L0 flush adds one SST: only the new one is warmed.
+        assert_eq!(sorted(t.plan(2, [10, 11, 12, 13].into_iter())), vec![13]);
+
+        // A compaction retires 11, 12, 13 into a new run 20 and keeps 10: only the
+        // compaction output is cold, so only it is warmed.
+        assert_eq!(sorted(t.plan(3, [10, 20].into_iter())), vec![20]);
+
+        // Re-presenting the same set after another change warms nothing.
+        assert!(t.plan(4, [10, 20].into_iter()).is_empty());
+
+        // An id that was retired and reappears is treated as new (its blocks are
+        // no longer guaranteed cached), so it warms again.
+        assert_eq!(sorted(t.plan(5, [10, 20, 11].into_iter())), vec![11]);
     }
 }
 

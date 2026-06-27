@@ -277,6 +277,25 @@ impl ReplicationConfig {
     }
 }
 
+/// What slatedb block-cache content to warm for the metadata segment at startup.
+///
+/// Every filesystem op is a point lookup gated by per-SST bloom filters and the
+/// SST index, so warming those removes the cold-cache latency cliff a fresh node
+/// or restart otherwise pays on its first reads. The bulk chunk segment is never
+/// warmed.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmMetadata {
+    /// Don't warm anything on startup.
+    Off,
+    /// Warm the metadata SST filters and indexes only (small, bounded). Default.
+    #[default]
+    FiltersIndex,
+    /// Also warm the metadata data blocks (larger; for metadata-heavy workloads
+    /// whose working set fits the cache).
+    Full,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
@@ -285,6 +304,8 @@ pub struct CacheConfig {
     pub disk_size_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_size_gb: Option<f64>,
+    #[serde(default)]
+    pub warm_metadata: WarmMetadata,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -741,6 +762,7 @@ impl Settings {
                 dir: PathBuf::from("${HOME}/.cache/zerofs"),
                 disk_size_gb: 10.0,
                 memory_size_gb: Some(1.0),
+                warm_metadata: WarmMetadata::default(),
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/zerofs-data".to_string(),
@@ -792,6 +814,18 @@ impl Settings {
             "encryption_password = \"${ZEROFS_PASSWORD}\"\n",
             "encryption_password = \"${ZEROFS_PASSWORD}\"\n\
              # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n"
+        );
+
+        // Document warm_metadata in place (the [cache] table is not last, so the
+        // hint can't be appended like the sections below).
+        toml_string = toml_string.replace(
+            "warm_metadata = \"filters_index\"\n",
+            "# Keep the metadata block cache warm so reads don't pay cold object-store latency\n\
+             # on startup and right after each compaction. Values:\n\
+             #   \"filters_index\" (default)  warm metadata SST filters + indexes (small, bounded)\n\
+             #   \"full\"                      also warm the metadata data blocks (metadata-heavy working sets)\n\
+             #   \"off\"                       disable warming\n\
+             warm_metadata = \"filters_index\"\n",
         );
 
         toml_string.push_str("\n# Optional AWS S3 settings (uncomment to use):\n");
