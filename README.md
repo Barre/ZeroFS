@@ -163,19 +163,9 @@ A `[replication]` section runs a leader and a standby backed by the same object 
 
 ### Installation
 
-#### Install script (Recommended)
-```bash
-curl -sSfL https://sh.zerofs.net | sh
+#### Via apt / dnf (Recommended, amd64/arm64)
 
-# Pin a release and install without root
-curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
-```
-
-The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64, armv7, i686, ppc64le, s390x, riscv64), macOS (x86_64, aarch64), or FreeBSD (amd64). Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
-
-#### Via apt / dnf (amd64, arm64)
-
-Signed package repositories. Unlike the install script, a package also installs a systemd service (`zerofs.service`, disabled by default) and a config skeleton under `/etc/zerofs/`.
+Signed package repositories. A package keeps `zerofs` up to date through the package manager and, unlike the install script, also installs a systemd service (`zerofs.service`, disabled by default) and a config skeleton under `/etc/zerofs/`.
 
 ```bash
 # Debian / Ubuntu
@@ -189,6 +179,19 @@ sudo dnf install zerofs
 ```
 
 Then set `ZEROFS_PASSWORD` and credentials in `/etc/zerofs/zerofs.env`, the `[storage]` url in `/etc/zerofs/config.toml`, and `sudo systemctl enable --now zerofs`. See [packaging/README.md](packaging/README.md) for details.
+
+#### Install script
+
+For platforms without a package repository, or to install without root:
+
+```bash
+curl -sSfL https://sh.zerofs.net | sh
+
+# Pin a release and install without root
+curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
+```
+
+The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64, armv7, i686, ppc64le, s390x, riscv64), macOS (x86_64, aarch64), or FreeBSD (amd64). Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
 
 #### Via Docker
 ```bash
