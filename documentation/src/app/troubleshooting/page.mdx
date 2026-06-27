@@ -164,24 +164,6 @@ touch /var/cache/zerofs/test && rm /var/cache/zerofs/test
 
 ## Startup Errors
 
-### Illegal Instruction (SIGILL)
-
-`zerofs` crashes at startup with `Illegal instruction` (SIGILL) before producing any log output.
-
-The prebuilt Linux amd64 binary is compiled with `-C target-cpu=x86-64-v3` and requires AVX2 (Intel Haswell 2013 and later, AMD Excavator 2015 and later). The published amd64 Docker image contains the same binary. On a CPU without AVX2, the process exits at the first unsupported instruction.
-
-```bash
-# Check for AVX2 — no output means the CPU cannot run the prebuilt binary
-grep -o avx2 /proc/cpuinfo | head -1
-
-# Fix: build from source (targets baseline x86-64)
-git clone https://github.com/Barre/ZeroFS
-cd ZeroFS/zerofs
-cargo build --release
-```
-
-See [Installation](/quickstart#installation) in the quickstart for all install methods.
-
 ### Conditional Write Check Fails
 
 Startup fails with:

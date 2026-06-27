@@ -173,7 +173,7 @@ curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin s
 
 ndexify dpeloy
 
-The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64, armv7, i686, ppc64le, s390x, riscv64), macOS (x86_64, aarch64), or FreeBSD (amd64). The prebuilt Linux amd64 binary and the amd64 Docker image are compiled with `-C target-cpu=x86-64-v3` and require a CPU with AVX2: Intel Haswell (2013) or later, AMD Excavator (2015) or later. On older CPUs the binary exits at startup with an illegal-instruction error; builds from source target baseline x86-64 and run on those CPUs. Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
+The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64, armv7, i686, ppc64le, s390x, riscv64), macOS (x86_64, aarch64), or FreeBSD (amd64). Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
 
 #### Via Docker
 ```bash
