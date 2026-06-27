@@ -371,7 +371,7 @@ addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional: adds Unix socket support
 
 [servers.rpc]
-addresses = ["127.0.0.1:7000"]  # Admin endpoint for zerofs checkpoint, flush, monitor, fatrace
+addresses = ["127.0.0.1:7000"]  # Admin endpoint for zerofs checkpoint, flush, monitor, fatrace, otrace
 unix_socket = "/tmp/zerofs.rpc.sock"  # Optional: adds Unix socket support
 
 [servers.webui]
@@ -477,7 +477,7 @@ The monitor connects to the running ZeroFS instance via RPC and streams stats at
 
 Requires the RPC server to be configured (see [Checkpoints](#checkpoints) for RPC configuration).
 
-The same RPC API also serves `zerofs fatrace` (per-operation tracing) and `zerofs flush` (on-demand flush of buffered writes); see the [Monitoring documentation](https://www.zerofs.net/monitoring).
+The same RPC API also serves `zerofs fatrace` (per-operation filesystem tracing), `zerofs otrace` (per-request object-store tracing), and `zerofs flush` (on-demand flush of buffered writes); see the [Monitoring documentation](https://www.zerofs.net/monitoring).
 
 ### Standalone Compactor
 

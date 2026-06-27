@@ -18,6 +18,7 @@ mod net_util;
 mod nfs;
 mod ninep;
 mod object_store_prefetch;
+mod object_trace;
 mod parse_object_store;
 mod prometheus;
 mod redis_conditional_store;
@@ -142,6 +143,9 @@ async fn main() -> Result<()> {
         },
         cli::Commands::Fatrace { config } => {
             cli::fatrace::run_fatrace(config).await?;
+        }
+        cli::Commands::Otrace { config } => {
+            cli::otrace::run_otrace(config).await?;
         }
         cli::Commands::Compactor { config } => {
             cli::compactor::run_compactor(config).await?;

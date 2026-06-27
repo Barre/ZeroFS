@@ -271,6 +271,9 @@ impl AdminService for AdminRpcServer {
     type WatchFileAccessStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::FileAccessEvent, Status>> + Send>>;
 
+    type WatchObjectAccessStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ObjectAccessEvent, Status>> + Send>>;
+
     type StreamStatsStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::StatsSnapshot, Status>> + Send>>;
 
@@ -348,6 +351,22 @@ impl AdminService for AdminRpcServer {
         _request: Request<proto::WatchFileAccessRequest>,
     ) -> Result<Response<Self::WatchFileAccessStream>, Status> {
         let receiver = self.fs.tracer.subscribe();
+
+        let stream = BroadcastStream::new(receiver)
+            .filter_map(|result| result.ok())
+            .map(|event| Ok(event.into()));
+
+        Ok(Response::new(take_until_cancelled(
+            stream,
+            self.shutdown.clone(),
+        )))
+    }
+
+    async fn watch_object_access(
+        &self,
+        _request: Request<proto::WatchObjectAccessRequest>,
+    ) -> Result<Response<Self::WatchObjectAccessStream>, Status> {
+        let receiver = self.fs.object_tracer.subscribe();
 
         let stream = BroadcastStream::new(receiver)
             .filter_map(|result| result.ok())

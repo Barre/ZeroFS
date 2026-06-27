@@ -22,6 +22,7 @@ use self::store::{ChunkStore, DirectoryStore, InodeStore, OrphanStore, Tombstone
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use crate::db::{Db, SlateDbHandle};
+use crate::object_trace::ObjectTracer;
 use slatedb::config::{PutOptions, WriteOptions};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
@@ -122,6 +123,10 @@ pub struct ZeroFS {
     pub lineage_token: u64,
     pub max_bytes: u64,
     pub tracer: AccessTracer,
+    /// Traces backend object-store requests (the `otrace` feature). Created in
+    /// `Prepared::prepare` and shared with the `TracingObjectStore` wrappers so
+    /// the RPC server can stream what the wrappers see.
+    pub object_tracer: ObjectTracer,
     /// Idempotency cache for retried non-idempotent ops. Shared across all
     /// connections (a retry may arrive on a new one); on a standby it is also fed
     /// by the replication stream.
@@ -201,6 +206,7 @@ impl ZeroFS {
             None,
             Arc::new(crate::dedup::DedupCache::new(65_536)),
             false, // single-node / test: never a live takeover, always regenerate
+            ObjectTracer::new(),
         )
         .await
     }
@@ -223,6 +229,7 @@ impl ZeroFS {
         // from a live leader; false on a cold bootstrap / config leader / single node.
         // Decides whether the durability lineage carries forward (resolve_lineage_token).
         is_live_takeover: bool,
+        object_tracer: ObjectTracer,
     ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
         let key_codec = Arc::new(KeyCodec::new(use_segment_layout));
@@ -348,6 +355,7 @@ impl ZeroFS {
             lineage_token,
             max_bytes,
             tracer: AccessTracer::new(),
+            object_tracer,
             dedup,
         };
 

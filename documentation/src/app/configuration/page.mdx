@@ -240,7 +240,7 @@ addresses = ["127.0.0.1:7000"]
 unix_socket = "/tmp/zerofs.rpc.sock"
 ```
 
-The admin endpoint for `zerofs checkpoint`, `zerofs flush`, `zerofs monitor`, and `zerofs fatrace`. These commands read the same configuration file, try the Unix socket first if the socket file exists, then each address in order. Without a `[servers.rpc]` section, they exit with `RPC server not configured in config file`. See [Monitoring](/monitoring) and [Checkpoints](/checkpoints).
+The admin endpoint for `zerofs checkpoint`, `zerofs flush`, `zerofs monitor`, `zerofs fatrace`, and `zerofs otrace`. These commands read the same configuration file, try the Unix socket first if the socket file exists, then each address in order. Without a `[servers.rpc]` section, they exit with `RPC server not configured in config file`. See [Monitoring](/monitoring) and [Checkpoints](/checkpoints).
 
 ### Web UI
 
