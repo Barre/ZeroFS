@@ -144,7 +144,9 @@ jobs:
           rclone copy "r2:${{ vars.R2_BUCKET }}/rpm" rpmrepo || true
           cp out/*.rpm rpmrepo/
           createrepo_c --update rpmrepo
-          gpg --batch --pinentry-mode loopback --detach-sign --armor \
+          # --yes: overwrite the previous run's repomd.xml.asc pulled down above
+          # (gpg --batch refuses to clobber an existing output file otherwise).
+          gpg --batch --yes --pinentry-mode loopback --detach-sign --armor \
             --local-user "${{ vars.GPG_KEY_ID }}" rpmrepo/repodata/repomd.xml
           # rpms are append-only (never delete); metadata is mirrored exactly.
           rclone copy rpmrepo "r2:${{ vars.R2_BUCKET }}/rpm" --exclude "repodata/**"
