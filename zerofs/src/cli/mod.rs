@@ -11,6 +11,7 @@ pub mod fatrace;
 pub mod flush;
 mod init;
 pub mod monitor;
+pub mod otrace;
 pub mod password;
 pub mod server;
 
@@ -69,6 +70,11 @@ pub enum Commands {
     },
     /// Trace file system operations in real-time
     Fatrace {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Trace object store requests in real-time
+    Otrace {
         #[arg(short, long)]
         config: PathBuf,
     },

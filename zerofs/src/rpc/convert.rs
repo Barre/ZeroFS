@@ -1,5 +1,6 @@
 use crate::checkpoint_manager::CheckpointInfo;
 use crate::fs::tracing::{FileAccessEvent, FileOperation};
+use crate::object_trace::{ObjectAccessEvent, ObjectOperation};
 use crate::rpc::proto;
 use prost_types::Timestamp;
 use std::fmt;
@@ -22,6 +23,22 @@ impl fmt::Display for proto::FileOperation {
             proto::FileOperation::Mknod => "mknod  ",
             proto::FileOperation::Trim => "trim   ",
             proto::FileOperation::Fsync => "fsync  ",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl fmt::Display for proto::ObjectOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            proto::ObjectOperation::ObjGet => "get   ",
+            proto::ObjectOperation::ObjHead => "head  ",
+            proto::ObjectOperation::ObjPut => "put   ",
+            proto::ObjectOperation::ObjPutMultipart => "mpart ",
+            proto::ObjectOperation::ObjDelete => "delete",
+            proto::ObjectOperation::ObjList => "list  ",
+            proto::ObjectOperation::ObjCopy => "copy  ",
+            proto::ObjectOperation::ObjRename => "rename",
         };
         write!(f, "{}", s)
     }
@@ -160,6 +177,71 @@ impl From<FileAccessEvent> for proto::FileAccessEvent {
             operation,
             path: event.path,
             params: Some(params),
+        }
+    }
+}
+
+impl From<ObjectAccessEvent> for proto::ObjectAccessEvent {
+    fn from(event: ObjectAccessEvent) -> Self {
+        let (operation, params) = match event.operation {
+            ObjectOperation::Get { offset, length } => (
+                proto::ObjectOperation::ObjGet as i32,
+                proto::ObjectParams {
+                    offset,
+                    length,
+                    ..Default::default()
+                },
+            ),
+            ObjectOperation::Head => (
+                proto::ObjectOperation::ObjHead as i32,
+                proto::ObjectParams::default(),
+            ),
+            ObjectOperation::Put { size } => (
+                proto::ObjectOperation::ObjPut as i32,
+                proto::ObjectParams {
+                    size: Some(size),
+                    ..Default::default()
+                },
+            ),
+            ObjectOperation::PutMultipart => (
+                proto::ObjectOperation::ObjPutMultipart as i32,
+                proto::ObjectParams::default(),
+            ),
+            ObjectOperation::Delete => (
+                proto::ObjectOperation::ObjDelete as i32,
+                proto::ObjectParams::default(),
+            ),
+            ObjectOperation::List => (
+                proto::ObjectOperation::ObjList as i32,
+                proto::ObjectParams::default(),
+            ),
+            ObjectOperation::Copy { to } => (
+                proto::ObjectOperation::ObjCopy as i32,
+                proto::ObjectParams {
+                    target_path: Some(to),
+                    ..Default::default()
+                },
+            ),
+            ObjectOperation::Rename { to } => (
+                proto::ObjectOperation::ObjRename as i32,
+                proto::ObjectParams {
+                    target_path: Some(to),
+                    ..Default::default()
+                },
+            ),
+        };
+
+        proto::ObjectAccessEvent {
+            timestamp: Some(Timestamp {
+                seconds: event.timestamp as i64,
+                nanos: 0,
+            }),
+            store: event.store.to_string(),
+            operation,
+            path: event.path,
+            params: Some(params),
+            duration_us: event.duration_us,
+            error: event.error,
         }
     }
 }

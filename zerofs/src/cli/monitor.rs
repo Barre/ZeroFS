@@ -530,7 +530,7 @@ fn render_memory_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn format_bytes_human(bytes: u64) -> String {
+pub(crate) fn format_bytes_human(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB", "EB"];
     let mut size = bytes as f64;
     for unit in UNITS {

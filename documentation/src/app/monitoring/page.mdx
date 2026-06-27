@@ -1,12 +1,12 @@
 export const metadata = {
   title: 'Monitoring & Tracing',
   description:
-    'Live stats dashboard, per-operation tracing, and on-demand flush: zerofs monitor, zerofs fatrace, zerofs flush, and the gRPC AdminService behind them.',
+    'Live stats dashboard, per-operation tracing, object-store request tracing, and on-demand flush: zerofs monitor, zerofs fatrace, zerofs otrace, zerofs flush, and the gRPC AdminService behind them.',
 }
 
 # Monitoring & Tracing
 
-A running ZeroFS server exposes a gRPC admin API. Three CLI commands consume it: `zerofs monitor` renders a live stats dashboard in the terminal, `zerofs fatrace` prints one line per filesystem operation, and `zerofs flush` persists buffered writes to durable storage on demand. Any gRPC client can call the same API. {{ className: 'lead' }}
+A running ZeroFS server exposes a gRPC admin API. Four CLI commands consume it: `zerofs monitor` renders a live stats dashboard in the terminal, `zerofs fatrace` prints one line per filesystem operation, `zerofs otrace` prints one line per object-store request, and `zerofs flush` persists buffered writes to durable storage on demand. Any gRPC client can call the same API. {{ className: 'lead' }}
 
 ## The RPC Server
 
@@ -98,6 +98,44 @@ When no client is subscribed, the server checks the subscriber count and returns
 
 Events pass through a broadcast channel that buffers 1,024 events. When a subscriber falls behind during a burst, the oldest buffered events are dropped from that subscriber's stream rather than slowing the filesystem. The trace is an observation tool, not a complete audit log.
 
+## zerofs otrace
+
+<Row>
+  <Col>
+
+    Where `zerofs fatrace` traces filesystem operations, `zerofs otrace` traces the layer below: the requests ZeroFS actually sends to the object store. It subscribes to the server's object access stream and prints one line per backend request — the operation, the object key, request parameters, the request duration, and an `ERR` marker when the request failed.
+
+    The trace sits at the bottom of the storage stack, so it shows what leaves the process: cache misses, prefetch reads, compaction, manifest and WAL writes, and deletes. Reads served from the [cache](/caching) make no backend request and so produce no line — the trace is a faithful picture of object-store traffic, not of logical reads. Eight operations are traced: get, head, put, mpart (multipart upload), delete, list, copy, and rename.
+
+    | Operations | Extra fields |
+    | --- | --- |
+    | get | `off=` byte offset and `len=` length for ranged reads |
+    | put | `size=` payload size |
+    | copy, rename | `->` destination key |
+
+    Requests against a [separate WAL store](/separate-wal) are tagged `wal`; primary-store requests carry no tag, so an unconfigured WAL leaves the output uncluttered.
+
+  </Col>
+  <Col>
+
+    ```bash {{ title: 'Trace Object-Store Traffic' }}
+    $ zerofs otrace -c zerofs.toml
+    Tracing object store requests (Ctrl+C to stop)...
+    get    | .../manifest/0000000000000010.manifest  118µs
+    put    | .../compacted/01J9X...sst size=4.0 MB  21.4ms
+    get    | .../compacted/01J8A...sst off=131072 len=128.0 KB  9.7ms
+    list   | .../compactions
+    get    | .../gc/manifest.boundary  240µs  ERR
+    put    | wal .../wal/0000000000000042.sst size=4.0 KB  410µs
+    ```
+
+  </Col>
+</Row>
+
+### Overhead
+
+Like `fatrace`, the object tracer checks the subscriber count first: with no client attached, every wrapped call is a plain delegation to the inner store and emits nothing. With a subscriber attached, each request is timed and broadcast inline — there is no path to resolve, so no background task is spawned. Events share the same 1,024-event broadcast buffer semantics: a subscriber that falls behind drops its oldest buffered events rather than slowing the store.
+
 ## zerofs flush
 
 <Row>
@@ -124,7 +162,7 @@ Events pass through a broadcast channel that buffers 1,024 events. When a subscr
 
 ## The gRPC AdminService
 
-The three commands, along with the [checkpoint commands](/checkpoints), are clients of a single gRPC service: `zerofs.admin.AdminService`, defined in [`zerofs/proto/admin.proto`](https://github.com/Barre/ZeroFS/blob/main/zerofs/proto/admin.proto). It exposes seven RPCs:
+The four commands, along with the [checkpoint commands](/checkpoints), are clients of a single gRPC service: `zerofs.admin.AdminService`, defined in [`zerofs/proto/admin.proto`](https://github.com/Barre/ZeroFS/blob/main/zerofs/proto/admin.proto). It exposes eight RPCs:
 
 <Properties>
   <Property name="CreateCheckpoint" type="unary">
@@ -144,6 +182,9 @@ The three commands, along with the [checkpoint commands](/checkpoints), are clie
   </Property>
   <Property name="WatchFileAccess" type="server streaming">
     Streams one `FileAccessEvent` per filesystem operation (the `zerofs fatrace` feed)
+  </Property>
+  <Property name="WatchObjectAccess" type="server streaming">
+    Streams one `ObjectAccessEvent` per object-store request (the `zerofs otrace` feed)
   </Property>
   <Property name="StreamStats" type="server streaming">
     Streams `StatsSnapshot` messages at the requested `interval_ms`, clamped to a 250 ms minimum (the `zerofs monitor` feed)

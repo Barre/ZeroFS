@@ -165,6 +165,19 @@ impl RpcClient {
         Ok(response.into_inner())
     }
 
+    pub async fn watch_object_access(&self) -> Result<Streaming<proto::ObjectAccessEvent>> {
+        let request = proto::WatchObjectAccessRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .watch_object_access(request)
+            .await
+            .map_err(|s| anyhow!("Failed to start object access stream: {}", s.message()))?;
+
+        Ok(response.into_inner())
+    }
+
     pub async fn stream_stats(&self, interval_ms: u32) -> Result<Streaming<proto::StatsSnapshot>> {
         let request = proto::StreamStatsRequest { interval_ms };
 

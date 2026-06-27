@@ -16,6 +16,7 @@ use crate::db::SlateDbHandle;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
+use crate::object_trace::{ObjectTracer, TracingObjectStore};
 use crate::parse_object_store::parse_url_opts;
 use crate::replication::{ReplicationParams, TailBuffer};
 use crate::storage_class_object_store::with_storage_class;
@@ -32,6 +33,9 @@ use tracing::info;
 struct Prepared {
     object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
+    /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
+    /// the filesystem so the RPC server can stream backend requests (`otrace`).
+    object_tracer: ObjectTracer,
     actual_db_path: String,
     block_transformer: Arc<dyn BlockTransformer>,
     cache_config: CacheConfig,
@@ -189,9 +193,25 @@ impl Prepared {
         // cache warm for after a takeover.
         let dedup = Arc::new(crate::dedup::DedupCache::new(65_536));
 
+        // Trace at the bottom of the stack so otrace sees the requests that
+        // actually leave the process. Everything above (length-check, prefetch,
+        // compactor) reads through these wrappers; cache hits make no backend
+        // request and so produce no event.
+        let object_tracer = ObjectTracer::new();
+        let object_store = Arc::new(TracingObjectStore::new(
+            object_store,
+            object_tracer.clone(),
+            "data",
+        )) as Arc<dyn object_store::ObjectStore>;
+        let wal_object_store = wal_object_store.map(|s| {
+            Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
+                as Arc<dyn object_store::ObjectStore>
+        });
+
         Ok(Self {
             object_store,
             wal_object_store,
+            object_tracer,
             actual_db_path,
             block_transformer,
             cache_config,
@@ -634,6 +654,7 @@ impl Replayed {
             replicator,
             prepared.dedup,
             is_live_takeover,
+            prepared.object_tracer.clone(),
         )
         .await
         .context("Failed to initialize filesystem")?;
