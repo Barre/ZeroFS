@@ -525,6 +525,7 @@ pub async fn build_slatedb(
         l0_sst_size_bytes: 64 * 1024 * 1024,
         compactor_options: None,
         flush_interval: Some(std::time::Duration::from_secs(30)),
+        manifest_poll_interval: std::time::Duration::from_secs(5),
         max_unflushed_bytes,
         compression_codec: None, // Disable compression as we handle it in encryption layer
         l0_flush_parallelism: 16,
@@ -649,8 +650,9 @@ pub async fn build_slatedb(
                     .into();
                 let worker =
                     (!disable_compactor).then(|| slatedb::config::CompactionWorkerOptions {
-                        max_sst_size: 1024 * 1024 * 1024,
-                        max_fetch_tasks: 4,
+                        max_sst_size: 256 * 1024 * 1024,
+                        max_fetch_tasks: 2,
+                        bytes_to_fetch: 16 * 1024 * 1024,
                         ..Default::default()
                     });
                 let compactor = CompactorBuilder::new(db_path, compactor_object_store)
@@ -659,7 +661,8 @@ pub async fn build_slatedb(
                         segments_enabled,
                     ))
                     .with_options(slatedb::config::CompactorOptions {
-                        poll_interval: std::time::Duration::from_secs(1),
+                        poll_interval: std::time::Duration::from_secs(5),
+                        commit_compacted_interval: std::time::Duration::from_secs(5),
                         max_concurrent_compactions,
                         scheduler_options,
                         worker,

@@ -80,8 +80,9 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
     // so its output SSTs match (and, for encrypted volumes, are written correctly).
     let worker_options = slatedb::config::CompactionWorkerOptions {
         max_concurrent_compactions,
-        max_sst_size: 1024 * 1024 * 1024,
-        max_fetch_tasks: 8,
+        max_sst_size: 256 * 1024 * 1024,
+        max_fetch_tasks: 4,
+        bytes_to_fetch: 16 * 1024 * 1024,
         ..Default::default()
     };
 
