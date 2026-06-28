@@ -72,6 +72,15 @@ const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
 /// this op (reads fine, writes stuck): after the cap we tear down and re-probe
 /// regardless. 7 extra windows plus the initial one is about a minute.
 const MAX_LIVENESS_EXTENSIONS: u32 = 7;
+/// Cap on replaying the whole recorded session (re-attach/rebind every fid,
+/// re-open files, re-acquire locks) onto a fresh connection during reconnect.
+/// `send_raw` has no per-reply timeout, so without this a server that accepts
+/// the connection and negotiates but then stalls on a replayed request (e.g. its
+/// store is not ready yet right after a restart) would wedge the supervisor
+/// forever, leaving every waiting op parked in `wait_until_live`. On elapse the
+/// half-built connection is torn down and the supervisor retries with backoff.
+/// Generous so a large session over a slow link still replays in one pass.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -576,10 +585,19 @@ impl NinePClient {
 
         self.msize.store(msize, Ordering::Relaxed);
         self.extensions.store(extensions, Ordering::Relaxed);
-        // Replay failure discards this connection; tear it down so its fd is not leaked.
-        if let Err(e) = self.replay(&conn).await {
-            conn.shutdown();
-            return Err(e);
+        // Replay failure, or a stall past REPLAY_TIMEOUT, discards this connection:
+        // tear it down so its fd is not leaked and the supervisor reconnects afresh.
+        match tokio::time::timeout(REPLAY_TIMEOUT, self.replay(&conn)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                conn.shutdown();
+                return Err(e);
+            }
+            Err(_) => {
+                conn.shutdown();
+                warn!("9P session replay stalled past {REPLAY_TIMEOUT:?}; retrying reconnect");
+                return Err(ClientError::Disconnected);
+            }
         }
         let old = self.conn.swap(conn);
         old.dead.store(true, Ordering::Release);
