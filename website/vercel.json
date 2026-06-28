@@ -7,7 +7,7 @@
   ],
   "redirects": [
     {
-      "source": "/:path((?!docs|assets|favicon\\.png|robots\\.txt|sitemap\\.xml).+)",
+      "source": "/:path((?!docs|blog|assets|favicon\\.png|robots\\.txt|sitemap\\.xml).+)",
       "destination": "/docs/:path",
       "permanent": true
     }
