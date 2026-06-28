@@ -1195,6 +1195,9 @@ const io = new IntersectionObserver(entries => {
 document.querySelectorAll(".rv").forEach((el, i) => {
   el.style.transitionDelay = el.dataset.d ? `${el.dataset.d}ms` : `${Math.min((i % 6) * 70, 350)}ms`;
   io.observe(el);
+  // the observer's -8% bottom margin strands hero content in the viewport's bottom
+  // strip (e.g. the alt-install line) until the first scroll; reveal what's already on screen
+  if (el.getBoundingClientRect().top < innerHeight) el.classList.add("in");
 });
 
 // asciinema recordings — player lib loads only when the section nears the viewport
