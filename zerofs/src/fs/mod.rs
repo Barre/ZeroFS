@@ -796,7 +796,8 @@ impl ZeroFS {
 
                 let mut txn = self.db.new_transaction()?;
 
-                self.chunk_store
+                let tail_update = self
+                    .chunk_store
                     .write(&mut txn, id, offset, data, old_size)
                     .await?;
 
@@ -833,6 +834,10 @@ impl ZeroFS {
                 let db_write_start = std::time::Instant::now();
                 self.write_coordinator.commit(txn).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
+
+                // Only after the commit is durable: a cache ahead of the store
+                // would splice later writes onto bytes that never landed.
+                self.chunk_store.apply_tail_update(id, tail_update);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_COMMIT);
@@ -4070,6 +4075,189 @@ mod tests {
             .unwrap();
 
         assert_eq!(read_data.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_tail_cache_sequential_append_matches() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"seq.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        // Small sequential appends that cross chunk boundaries, so the tail chunk
+        // fills and rolls over repeatedly: every append into a partially-filled
+        // chunk takes the cached-tail splice path instead of re-reading.
+        let step = 5000usize;
+        let total = CHUNK_SIZE * 3 + 1234;
+        let mut expected = Vec::with_capacity(total);
+        let mut offset = 0u64;
+        while expected.len() < total {
+            let n = step.min(total - expected.len());
+            let chunk: Vec<u8> = (0..n)
+                .map(|i| ((offset as usize + i) % 251) as u8)
+                .collect();
+            fs.write(
+                &(&test_auth()).into(),
+                file_id,
+                offset,
+                &Bytes::copy_from_slice(&chunk),
+            )
+            .await
+            .unwrap();
+            expected.extend_from_slice(&chunk);
+            offset += n as u64;
+        }
+
+        let (read_data, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 0, total as u32)
+            .await
+            .unwrap();
+        assert_eq!(&read_data[..], &expected[..]);
+    }
+
+    #[tokio::test]
+    async fn test_tail_cache_invalidated_by_truncate() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"trunc.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        // Build a partial tail chunk; this populates the tail cache.
+        let a = vec![b'A'; 1000];
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::copy_from_slice(&a),
+        )
+        .await
+        .unwrap();
+
+        // Shrink into that chunk. truncate must drop the cache, else the next
+        // append splices onto the stale pre-truncate bytes.
+        fs.setattr(
+            &test_creds(),
+            file_id,
+            &SetAttributes {
+                size: SetSize::Set(800),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Append past the hole the truncate left. Bytes 800..900 must read back as
+        // zeros, not the 'A's a non-invalidated cache would carry forward.
+        let b = vec![b'B'; 100];
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            900,
+            &Bytes::copy_from_slice(&b),
+        )
+        .await
+        .unwrap();
+
+        let (gap, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 800, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            gap,
+            vec![0u8; 100],
+            "truncate must invalidate the tail cache"
+        );
+
+        let (tail, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 900, 100)
+            .await
+            .unwrap();
+        assert_eq!(tail, b);
+    }
+
+    #[tokio::test]
+    async fn test_tail_cache_sparse_write_creates_hole_without_corruption() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"sparse.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        // Partial tail in chunk 0 -> cache holds chunk 0.
+        let a = vec![b'A'; 1000];
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::copy_from_slice(&a),
+        )
+        .await
+        .unwrap();
+
+        // Write far past EOF, leaving a hole. The target chunk is beyond_eof, so it
+        // must build on zeros, never on the cached chunk-0 bytes.
+        let far = 6 * CHUNK_SIZE as u64 + 500;
+        let b = vec![b'B'; 100];
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            far,
+            &Bytes::copy_from_slice(&b),
+        )
+        .await
+        .unwrap();
+
+        // The bytes before the far write within its own chunk are part of the hole:
+        // must be zeros, not the cached 'A's.
+        let (lead, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 6 * CHUNK_SIZE as u64, 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            lead,
+            vec![0u8; 500],
+            "hole chunk must not inherit cached bytes"
+        );
+
+        // The hole between the two writes reads as zeros.
+        let (hole, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 3 * CHUNK_SIZE as u64, 256)
+            .await
+            .unwrap();
+        assert_eq!(hole, vec![0u8; 256]);
+
+        // The original tail and the far write are both intact.
+        let (head, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 0, 1000)
+            .await
+            .unwrap();
+        assert_eq!(head, a);
+        let (tail, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, far, 100)
+            .await
+            .unwrap();
+        assert_eq!(tail, b);
+
+        // Back-fill into the old chunk 0; it must read chunk 0 from the store (the
+        // cache moved to the far chunk), not splice onto a stale entry.
+        let c = vec![b'C'; 100];
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            500,
+            &Bytes::copy_from_slice(&c),
+        )
+        .await
+        .unwrap();
+        let (head2, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 0, 1000)
+            .await
+            .unwrap();
+        let mut want = vec![b'A'; 1000];
+        want[500..600].fill(b'C');
+        assert_eq!(head2, want);
     }
 
     #[tokio::test]

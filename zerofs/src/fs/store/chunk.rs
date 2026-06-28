@@ -3,6 +3,7 @@ use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::{CHUNK_SIZE, FsError};
 use bytes::{Bytes, BytesMut};
+use foyer::{Cache, CacheBuilder};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,15 +12,61 @@ use tracing::error;
 const PARALLEL_CHUNK_OPS: usize = 20;
 const ZERO_CHUNK: &[u8] = &[0u8; CHUNK_SIZE];
 
+/// Weighted byte budget for the tail cache. Each entry is one CHUNK_SIZE buffer,
+/// so this holds the just-written tail of ~`TAIL_CACHE_BYTES / CHUNK_SIZE` inodes
+/// (32 MiB = 1024 tails). A global ceiling, independent of open-file count.
+const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// What a `write` leaves for the tail cache. Applied by the caller only after the
+/// transaction commits, so the cache never runs ahead of durable state.
+pub enum TailUpdate {
+    Set { chunk_idx: u64, data: Bytes },
+    Clear,
+    Keep,
+}
+
 #[derive(Clone)]
 pub struct ChunkStore {
     db: Arc<Db>,
     key_codec: Arc<KeyCodec>,
+    /// Per-inode copy of the most-recently-written (chunk_idx, full chunk), so a
+    /// sequential append splices into it rather than re-reading the chunk it just
+    /// wrote. Sharded + LRU via foyer; eviction only ever costs a re-read.
+    tail_cache: Cache<InodeId, (u64, Bytes)>,
 }
 
 impl ChunkStore {
     pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
-        Self { db, key_codec }
+        let tail_cache = CacheBuilder::new(TAIL_CACHE_BYTES)
+            .with_weighter(|_id: &InodeId, (_idx, data): &(u64, Bytes)| data.len())
+            .build();
+        Self {
+            db,
+            key_codec,
+            tail_cache,
+        }
+    }
+
+    /// The cached tail chunk for `id`, if any.
+    fn tail_get(&self, id: InodeId) -> Option<(u64, Bytes)> {
+        self.tail_cache.get(&id).map(|e| (*e).clone())
+    }
+
+    fn tail_set(&self, id: InodeId, chunk_idx: u64, data: Bytes) {
+        self.tail_cache.insert(id, (chunk_idx, data));
+    }
+
+    fn tail_invalidate(&self, id: InodeId) {
+        self.tail_cache.remove(&id);
+    }
+
+    /// Apply a `write`'s tail-cache effect. Call only after its commit succeeds.
+    pub fn apply_tail_update(&self, id: InodeId, update: TailUpdate) {
+        match update {
+            TailUpdate::Set { chunk_idx, data } => self.tail_set(id, chunk_idx, data),
+            TailUpdate::Clear => self.tail_invalidate(id),
+            TailUpdate::Keep => {}
+        }
     }
 
     pub async fn get(&self, id: InodeId, chunk_idx: u64) -> Result<Option<Bytes>, FsError> {
@@ -47,6 +94,7 @@ impl ChunkStore {
     }
 
     pub fn delete_range(&self, txn: &mut Transaction, id: InodeId, start: u64, end: u64) {
+        self.tail_invalidate(id);
         for chunk_idx in start..end {
             self.delete(txn, id, chunk_idx);
         }
@@ -121,14 +169,17 @@ impl ChunkStore {
         offset: u64,
         data: &Bytes,
         old_size: u64,
-    ) -> Result<(), FsError> {
+    ) -> Result<TailUpdate, FsError> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(TailUpdate::Keep);
         }
 
         let end_offset = offset + data.len() as u64;
         let start_chunk = offset / CHUNK_SIZE as u64;
         let end_chunk = (end_offset - 1) / CHUNK_SIZE as u64;
+
+        // The tail chunk of the previous write, splice-able without a re-read.
+        let cached = self.tail_get(id);
 
         let existing_chunks: Result<HashMap<u64, Bytes>, FsError> =
             stream::iter(start_chunk..=end_chunk)
@@ -142,9 +193,14 @@ impl ChunkStore {
                     let beyond_eof = chunk_start >= old_size;
 
                     let store = self.clone();
+                    let cached = cached.clone();
                     async move {
                         let data = if will_overwrite_fully || beyond_eof {
                             Bytes::from_static(ZERO_CHUNK)
+                        } else if let Some((_, bytes)) = cached.filter(|(ci, _)| *ci == chunk_idx) {
+                            // We wrote this chunk last; splice into our copy of it
+                            // rather than re-reading it back from the store.
+                            bytes
                         } else {
                             store
                                 .get(id, chunk_idx)
@@ -160,7 +216,13 @@ impl ChunkStore {
 
         let existing_chunks = existing_chunks?;
 
+        // Cache the new tail only when this write reaches EOF (so end_chunk really
+        // is the file's tail) and that tail is partial; a future append re-reads
+        // exactly that chunk. Any other outcome drops a now-stale entry.
+        let cache_tail = end_offset >= old_size && !end_offset.is_multiple_of(CHUNK_SIZE as u64);
+
         let mut data_offset = 0usize;
+        let mut tail: Option<Bytes> = None;
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_start = chunk_idx * CHUNK_SIZE as u64;
             let chunk_end = chunk_start + CHUNK_SIZE as u64;
@@ -190,11 +252,20 @@ impl ChunkStore {
             if chunk.as_ref() == ZERO_CHUNK {
                 self.delete(txn, id, chunk_idx);
             } else {
+                if chunk_idx == end_chunk && cache_tail {
+                    tail = Some(chunk.clone());
+                }
                 self.save(txn, id, chunk_idx, chunk);
             }
         }
 
-        Ok(())
+        Ok(match tail {
+            Some(data) => TailUpdate::Set {
+                chunk_idx: end_chunk,
+                data,
+            },
+            None => TailUpdate::Clear,
+        })
     }
 
     pub async fn truncate(
@@ -207,6 +278,7 @@ impl ChunkStore {
         if new_size >= old_size {
             return Ok(());
         }
+        self.tail_invalidate(id);
 
         let old_chunks = old_size.div_ceil(CHUNK_SIZE as u64);
         let new_chunks = new_size.div_ceil(CHUNK_SIZE as u64);
@@ -245,6 +317,7 @@ impl ChunkStore {
         if length == 0 {
             return;
         }
+        self.tail_invalidate(id);
 
         let end_offset = offset + length;
         let start_chunk = offset / CHUNK_SIZE as u64;
