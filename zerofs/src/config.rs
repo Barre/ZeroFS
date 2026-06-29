@@ -198,6 +198,7 @@ impl<'de> Deserialize<'de> for ReplicationRole {
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     /// This node's stable identity within the pair.
+    #[serde(deserialize_with = "deserialize_expandable_string")]
     pub node_id: String,
     /// Role: "leader" or "standby".
     pub role: ReplicationRole,
@@ -1471,5 +1472,20 @@ peers = ["127.0.0.1:5600", ""]"#,
         );
         let err = format!("{:#}", write_and_load(&content).unwrap_err());
         assert!(err.contains("empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn test_replication_node_id_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_NODE_ID", "my-node");
+        }
+        
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "${ZEROFS_TEST_NODE_ID}"
+role = "leader""#,
+        );
+        let repl = write_and_load(&content).unwrap().replication.unwrap();
+        assert_eq!(repl.node_id, "my-node");
     }
 }
