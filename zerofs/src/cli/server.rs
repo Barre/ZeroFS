@@ -622,6 +622,7 @@ pub async fn build_slatedb(
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
                 .with_metrics_recorder(metrics_recorder.clone());
 
             if segments_enabled {
@@ -660,6 +661,7 @@ pub async fn build_slatedb(
                     .with_filter_policies(crate::fs::filter_policy::filter_policies(
                         segments_enabled,
                     ))
+                    .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
                     .with_options(slatedb::config::CompactorOptions {
                         poll_interval: std::time::Duration::from_secs(5),
                         commit_compacted_interval: std::time::Duration::from_secs(5),
@@ -690,7 +692,8 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator());
             if segments_enabled {
                 reader_builder = reader_builder.with_segment_extractor(Arc::new(
                     crate::segment_extractor::ZeroFsSegmentExtractor,
@@ -718,7 +721,8 @@ pub async fn build_slatedb(
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_checkpoint_id(checkpoint_id)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
+                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator());
             if segments_enabled {
                 reader_builder = reader_builder.with_segment_extractor(Arc::new(
                     crate::segment_extractor::ZeroFsSegmentExtractor,
@@ -1094,6 +1098,7 @@ mod tests {
                 .with_sst_block_size(SstBlockSize::Block32Kib)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
                 .build()
                 .await
                 .expect("open slatedb")

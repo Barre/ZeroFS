@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod chunk_merge;
 pub mod directory;
 pub mod inode;
 pub mod orphan;

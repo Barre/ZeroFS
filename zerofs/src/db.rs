@@ -97,6 +97,9 @@ pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
 
 enum TxOp {
     Put(Bytes, Bytes),
+    /// A merge operand (resolved by the configured merge operator). Used by the
+    /// chunk store to record sub-chunk deltas instead of rewriting a whole chunk.
+    Merge(Bytes, Bytes),
     Delete(Bytes),
 }
 
@@ -143,6 +146,12 @@ impl Transaction {
         self.ops.push(TxOp::Put(key.clone(), value));
     }
 
+    /// Record a merge operand for `key`, resolved by the configured merge
+    /// operator. The chunk store uses this to write sub-chunk deltas.
+    pub fn merge_bytes(&mut self, key: &Bytes, value: Bytes) {
+        self.ops.push(TxOp::Merge(key.clone(), value));
+    }
+
     pub fn delete_bytes(&mut self, key: &Bytes) {
         self.ops.push(TxOp::Delete(key.clone()));
     }
@@ -175,6 +184,7 @@ impl Transaction {
         for op in self.ops {
             match op {
                 TxOp::Put(k, v) => target.put_bytes(k, v),
+                TxOp::Merge(k, v) => target.merge(k, v),
                 TxOp::Delete(k) => target.delete(k),
             }
         }
@@ -191,6 +201,19 @@ impl Transaction {
                 TxOp::Put(k, v) => {
                     target.put_bytes(k.clone(), v.clone());
                     ops.push(ReplOp::Put(k, v));
+                }
+                TxOp::Merge(k, v) => {
+                    // Faithfully replicate the merge operand. A merge is only ever
+                    // produced when the chunk store's `deltas_enabled` gate is open,
+                    // which is decided once at leader startup from the peers'
+                    // advertised protocol version (see `all_peers_support_merge`).
+                    // This assumes a compatible, forward-only deployment: it does
+                    // NOT re-check on reconnect, so downgrading a live standby below
+                    // the merge protocol version while the leader stays up is out of
+                    // scope (the old peer would mis-decode the op). Keep peer
+                    // versions matched.
+                    target.merge(k.clone(), v.clone());
+                    ops.push(ReplOp::Merge(k, v));
                 }
                 TxOp::Delete(k) => {
                     target.delete(k.clone());

@@ -22,6 +22,11 @@ message ReplOp {
     bytes key = 1;
     bytes value = 2; // ignored when delete is true
     bool delete = 3;
+    // A merge operand (resolved by the merge operator), e.g. a sub-chunk chunk
+    // delta. Only ever set once the standby has advertised a protocol_version
+    // that understands merges (HelloResponse.protocol_version), so an older
+    // standby never receives one. When false, the op is a put/delete as before.
+    bool merge = 4;
 }
 
 message ReplicateRequest {
@@ -59,4 +64,8 @@ message HelloResponse {
     // True if the peer is leading or holds an un-replayed tail: the caller must
     // NOT open as writer; it should defer and follow.
     bool peer_active = 1;
+    // The responder's replication protocol version. Absent (0) from a peer too
+    // old to set it. The leader ships merge ops only to a peer whose version is
+    // high enough to understand them; otherwise it falls back to full-chunk puts.
+    uint32 protocol_version = 2;
 }

@@ -8,6 +8,7 @@ export const metadata = {
 
 export const sections = [
   { title: 'System Overview', id: 'system-overview' },
+  { title: 'Storing File Data', id: 'storing-file-data' },
   { title: 'Choosing a Protocol', id: 'choosing-a-protocol' },
   { title: 'Filesystem Limits', id: 'filesystem-limits' },
 ]
@@ -57,6 +58,14 @@ graph TB
     P9 --> P9D
     NBD --> NBDD
     `} />
+
+## Storing File Data {{ id: 'storing-file-data' }}
+
+File data is split into fixed **32 KiB chunks**, each keyed by `(inode, chunk index)` and stored as a value in SlateDB's LSM tree, so a read fetches only the chunks a request actually covers.
+
+Small in-place writes get special treatment. Rewriting a few bytes of a chunk used to mean reading the whole 32 KiB chunk, splicing in the change, and writing all 32 KiB back, so a file edited in place left a trail of superseded full-chunk versions that compaction later had to read just to discard. Instead, a partial write to an existing chunk now records only the changed byte range as a small **delta** (a merge operand) while a new chunk or a full-chunk overwrite still stores the complete chunk as a **base**. The merge operator transparently reassembles each chunk from its base plus any deltas, on reads, flushes, and compaction; nothing in the read path has to know whether a chunk is stored whole or as base-plus-deltas.
+
+This cuts both the data written per small change and the volume of superseded data compaction has to sift through, lowering write amplification and storage churn, most noticeably for random-write workloads such as databases. It needs no migration: chunks written before the change read back unchanged, and a chunk's deltas are folded back into a single value as it flushes and compacts, so read cost stays bounded no matter how many times a chunk is rewritten.
 
 ## Choosing a Protocol {{ id: 'choosing-a-protocol' }}
 

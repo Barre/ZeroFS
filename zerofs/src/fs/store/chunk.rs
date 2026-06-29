@@ -33,10 +33,15 @@ pub struct ChunkStore {
     /// sequential append splices into it rather than re-reading the chunk it just
     /// wrote. Sharded + LRU via foyer; eviction only ever costs a re-read.
     tail_cache: Cache<InodeId, (u64, Bytes)>,
+    /// When true, a partial write to a chunk that already has a base is recorded
+    /// as a sub-chunk merge delta instead of rewriting the whole chunk, cutting
+    /// the volume of superseded versions compaction must later read. Gated off
+    /// when a replication peer can't apply merge ops (see `all_peers_support_merge`).
+    deltas_enabled: bool,
 }
 
 impl ChunkStore {
-    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
+    pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>, deltas_enabled: bool) -> Self {
         let tail_cache = CacheBuilder::new(TAIL_CACHE_BYTES)
             .with_weighter(|_id: &InodeId, (_idx, data): &(u64, Bytes)| data.len())
             .build();
@@ -44,6 +49,7 @@ impl ChunkStore {
             db,
             key_codec,
             tail_cache,
+            deltas_enabled,
         }
     }
 
@@ -86,6 +92,21 @@ impl ChunkStore {
     fn save(&self, txn: &mut Transaction, id: InodeId, chunk_idx: u64, data: Bytes) {
         let key = self.key_codec.chunk_key(id, chunk_idx);
         txn.put_bytes(&key, data);
+    }
+
+    /// Record a partial write as a sub-chunk merge delta (the merge operator
+    /// applies it onto the chunk's base on read/compaction). Only valid when the
+    /// chunk already has a base; a new chunk must be established with `save`.
+    fn save_delta(
+        &self,
+        txn: &mut Transaction,
+        id: InodeId,
+        chunk_idx: u64,
+        offset: usize,
+        data: Bytes,
+    ) {
+        let key = self.key_codec.chunk_key(id, chunk_idx);
+        txn.merge_bytes(&key, super::chunk_merge::encode_delta(offset, data));
     }
 
     pub fn delete(&self, txn: &mut Transaction, id: InodeId, chunk_idx: u64) {
@@ -181,7 +202,11 @@ impl ChunkStore {
         // The tail chunk of the previous write, splice-able without a re-read.
         let cached = self.tail_get(id);
 
-        let existing_chunks: Result<HashMap<u64, Bytes>, FsError> =
+        // For each touched chunk: its current bytes for splicing, plus whether a
+        // real base exists in the store. `had_base` is what makes a partial write
+        // eligible to be recorded as a delta: a new/hole chunk has no base to
+        // merge onto, so it must be written whole.
+        let existing_chunks: Result<HashMap<u64, (Bytes, bool)>, FsError> =
             stream::iter(start_chunk..=end_chunk)
                 .map(|chunk_idx| {
                     let chunk_start = chunk_idx * CHUNK_SIZE as u64;
@@ -195,19 +220,22 @@ impl ChunkStore {
                     let store = self.clone();
                     let cached = cached.clone();
                     async move {
-                        let data = if will_overwrite_fully || beyond_eof {
-                            Bytes::from_static(ZERO_CHUNK)
+                        let (data, had_base) = if will_overwrite_fully || beyond_eof {
+                            // A full overwrite replaces the chunk and a beyond-EOF
+                            // chunk is new: neither has a base to delta against.
+                            (Bytes::from_static(ZERO_CHUNK), false)
                         } else if let Some((_, bytes)) = cached.filter(|(ci, _)| *ci == chunk_idx) {
                             // We wrote this chunk last; splice into our copy of it
                             // rather than re-reading it back from the store.
-                            bytes
+                            (bytes, true)
                         } else {
-                            store
-                                .get(id, chunk_idx)
-                                .await?
-                                .unwrap_or_else(|| Bytes::from_static(ZERO_CHUNK))
+                            match store.get(id, chunk_idx).await? {
+                                Some(bytes) => (bytes, true),
+                                // A hole within the file: no base on disk.
+                                None => (Bytes::from_static(ZERO_CHUNK), false),
+                            }
                         };
-                        Ok::<(u64, Bytes), FsError>((chunk_idx, data))
+                        Ok::<(u64, (Bytes, bool)), FsError>((chunk_idx, (data, had_base)))
                     }
                 })
                 .buffer_unordered(PARALLEL_CHUNK_OPS)
@@ -239,15 +267,36 @@ impl ChunkStore {
             };
 
             let write_len = write_end - write_start;
-            let chunk: Bytes = if write_start == 0 && write_end == CHUNK_SIZE {
-                data.slice(data_offset..data_offset + write_len)
+            let (base, had_base) = &existing_chunks[&chunk_idx];
+            let is_full = write_start == 0 && write_end == CHUNK_SIZE;
+            let new_bytes = data.slice(data_offset..data_offset + write_len);
+            data_offset += write_len;
+
+            if !is_full && self.deltas_enabled && *had_base {
+                // Partial write to an existing chunk: record only the changed
+                // range as a merge delta. The base stays put and the merge
+                // operator reassembles the chunk on read/compaction, so we avoid
+                // rewriting (and later re-reading) a whole superseded chunk.
+                self.save_delta(txn, id, chunk_idx, write_start, new_bytes.clone());
+                // Keep the tail cache materialized so a following append still
+                // splices without a re-read.
+                if chunk_idx == end_chunk && cache_tail {
+                    let mut spliced = BytesMut::from(base.as_ref());
+                    spliced[write_start..write_end].copy_from_slice(&new_bytes);
+                    tail = Some(spliced.freeze());
+                }
+                continue;
+            }
+
+            // Full overwrite, a new/hole chunk, or deltas disabled: write the
+            // whole chunk, establishing or replacing its base.
+            let chunk: Bytes = if is_full {
+                new_bytes
             } else {
-                let mut chunk = BytesMut::from(existing_chunks[&chunk_idx].as_ref());
-                chunk[write_start..write_end]
-                    .copy_from_slice(&data[data_offset..data_offset + write_len]);
+                let mut chunk = BytesMut::from(base.as_ref());
+                chunk[write_start..write_end].copy_from_slice(&new_bytes);
                 chunk.freeze()
             };
-            data_offset += write_len;
 
             if chunk.as_ref() == ZERO_CHUNK {
                 self.delete(txn, id, chunk_idx);

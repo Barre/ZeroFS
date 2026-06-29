@@ -516,6 +516,9 @@ impl DbOpen {
                             crate::replication::ReplOp::Put(k, v) => {
                                 batch.put_bytes(k.clone(), v.clone())
                             }
+                            crate::replication::ReplOp::Merge(k, v) => {
+                                batch.merge(k.clone(), v.clone())
+                            }
                             crate::replication::ReplOp::Delete(k) => batch.delete(k.clone()),
                         }
                     }
@@ -643,6 +646,21 @@ impl Replayed {
             _ => (None, None),
         };
 
+        // Chunk deltas (sub-chunk merge operands) are safe to write only when
+        // every replication peer understands merge ops; otherwise fall back to
+        // full-chunk writes. A non-replicating leader (no peers) writes deltas
+        // freely.
+        let deltas_enabled = if replicator.is_some() {
+            let peers = prepared
+                .replication_params
+                .as_ref()
+                .map(|p| p.peers.clone())
+                .unwrap_or_default();
+            crate::replication::transport::all_peers_support_merge(&peers).await
+        } else {
+            true
+        };
+
         let fs = ZeroFS::new_with_slatedb_and_lease(
             slatedb,
             settings.max_bytes(),
@@ -652,6 +670,7 @@ impl Replayed {
             prepared.segments_enabled,
             lease,
             replicator,
+            deltas_enabled,
             prepared.dedup,
             is_live_takeover,
             prepared.object_tracer.clone(),

@@ -14,6 +14,10 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplOp {
     Put(Bytes, Bytes),
+    /// A merge operand (resolved by the merge operator on the standby), e.g. a
+    /// sub-chunk delta. Replayed as `WriteBatch::merge`, not a put. Only shipped
+    /// to a standby that advertised it understands merges (protocol version).
+    Merge(Bytes, Bytes),
     Delete(Bytes),
 }
 

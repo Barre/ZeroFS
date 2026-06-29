@@ -22,11 +22,22 @@ use proto::{
     ReplicateRequest, ReplicateResponse,
 };
 
+/// This build's replication protocol version, advertised in `HelloResponse`.
+/// Bump when the wire format gains a capability a peer must understand.
+pub const REPLICATION_PROTOCOL_VERSION: u32 = 2;
+
+/// The minimum peer protocol version that understands `ReplOp::Merge`. The
+/// leader ships merge ops (and so the chunk store writes deltas) only to a peer
+/// at or above this; below it, writes fall back to full-chunk puts.
+pub const MERGE_MIN_PROTOCOL_VERSION: u32 = 2;
+
 fn to_repl_ops(ops: Vec<ProtoOp>) -> Vec<ReplOp> {
     ops.into_iter()
         .map(|o| {
             if o.delete {
                 ReplOp::Delete(Bytes::from(o.key))
+            } else if o.merge {
+                ReplOp::Merge(Bytes::from(o.key), Bytes::from(o.value))
             } else {
                 ReplOp::Put(Bytes::from(o.key), Bytes::from(o.value))
             }
@@ -41,11 +52,19 @@ fn to_proto_ops(ops: &[ReplOp]) -> Vec<ProtoOp> {
                 key: k.to_vec(),
                 value: v.to_vec(),
                 delete: false,
+                merge: false,
+            },
+            ReplOp::Merge(k, v) => ProtoOp {
+                key: k.to_vec(),
+                value: v.to_vec(),
+                delete: false,
+                merge: true,
             },
             ReplOp::Delete(k) => ProtoOp {
                 key: k.to_vec(),
                 value: Vec::new(),
                 delete: true,
+                merge: false,
             },
         })
         .collect()
@@ -175,6 +194,7 @@ impl ReplicationService for ReplicationReceiver {
         // over and preserve it). Either way the caller must defer, not open as writer.
         Ok(Response::new(HelloResponse {
             peer_active: leading || has_tail,
+            protocol_version: REPLICATION_PROTOCOL_VERSION,
         }))
     }
 }
@@ -219,6 +239,46 @@ pub async fn hello_peer(endpoint: String) -> anyhow::Result<bool> {
     let mut client = ReplicationServiceClient::connect(endpoint).await?;
     let resp = client.hello(HelloRequest {}).await?;
     Ok(resp.into_inner().peer_active)
+}
+
+/// Ask a peer (Hello) for its replication protocol version (0 if too old to
+/// report one). Used to decide whether the leader may ship merge ops to it.
+pub async fn hello_peer_protocol_version(endpoint: String) -> anyhow::Result<u32> {
+    let mut client = ReplicationServiceClient::connect(endpoint).await?;
+    let resp = client.hello(HelloRequest {}).await?;
+    Ok(resp.into_inner().protocol_version)
+}
+
+/// True if every peer is reachable and advertises a protocol version that
+/// understands merge ops. Conservative: an unreachable or too-old peer returns
+/// false, so the leader falls back to full-chunk puts (always safe) rather than
+/// risk shipping a merge a peer can't apply.
+pub async fn all_peers_support_merge(peers: &[String]) -> bool {
+    for peer in peers {
+        let endpoint = if peer.starts_with("http") {
+            peer.clone()
+        } else {
+            format!("http://{peer}")
+        };
+        match hello_peer_protocol_version(endpoint).await {
+            Ok(v) if v >= MERGE_MIN_PROTOCOL_VERSION => {}
+            Ok(v) => {
+                tracing::info!(
+                    "HA: peer {peer} protocol version {v} < {MERGE_MIN_PROTOCOL_VERSION}; \
+                     chunk deltas disabled (using full-chunk writes)"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::info!(
+                    "HA: peer {peer} unreachable for merge-capability check ({e:#}); \
+                     chunk deltas disabled (using full-chunk writes)"
+                );
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Stream heartbeats at `interval` until the connection breaks. `epoch` is the
@@ -405,6 +465,10 @@ mod tests {
                     ReplOp::Delete(k) => {
                         state.remove(k.as_ref());
                     }
+                    // This epoch-ordering test ships only puts/deletes.
+                    ReplOp::Merge(_, _) => {
+                        unreachable!("merge ops are not exercised in this replay-ordering test")
+                    }
                 }
             }
         }
@@ -414,5 +478,99 @@ mod tests {
             "the post-restart (epoch 6) write must win, but a stale epoch-5 batch at a \
              higher seqno replayed last and clobbered it (cross-term seqno collision)"
         );
+    }
+
+    // A merge operand must survive `ship` -> proto -> receive as a `Merge`, not
+    // be silently mis-decoded as a `Put` of the raw delta bytes (which would
+    // corrupt the chunk on takeover).
+    #[tokio::test]
+    async fn merge_op_round_trips_the_wire() {
+        use crate::fs::store::chunk_merge::encode_delta;
+
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let endpoint = spawn_receiver(buffer.clone()).await;
+        let sender = loop {
+            match ReplicationSender::connect(endpoint.clone()).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+
+        let key = Bytes::from_static(b"chunk-key");
+        let delta = encode_delta(2, Bytes::from_static(b"XY"));
+        let op = ReplOp::Merge(key.clone(), delta.clone());
+        assert!(sender.ship(1, &[op.clone()], &[], 0, 1).await.unwrap());
+
+        let buf = buffer.lock().await;
+        let got: Vec<ReplOp> = buf
+            .batches_in_order()
+            .flat_map(|(_, ops)| ops.iter().cloned())
+            .collect();
+        assert_eq!(
+            got,
+            vec![op],
+            "the merge op must round-trip the wire intact, not become a Put"
+        );
+    }
+
+    // End to end: ship a full-chunk base and a sub-chunk delta through the real
+    // wire, then replay the buffered tail into a real SlateDB carrying the chunk
+    // merge operator (exactly as a takeover does in cli/init.rs), and confirm the
+    // promoted node reconstructs the chunk.
+    #[tokio::test]
+    async fn replayed_base_plus_delta_reconstructs_the_chunk() {
+        use crate::fs::store::chunk_merge::{chunk_merge_operator, encode_delta};
+        use slatedb::{DbBuilder, WriteBatch};
+
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let endpoint = spawn_receiver(buffer.clone()).await;
+        let sender = loop {
+            match ReplicationSender::connect(endpoint.clone()).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+
+        let key = Bytes::from_static(b"chunk-key");
+        let base = ReplOp::Put(key.clone(), Bytes::from_static(b"abcdefgh"));
+        let delta = ReplOp::Merge(key.clone(), encode_delta(2, Bytes::from_static(b"XY")));
+        assert!(sender.ship(1, &[base], &[], 0, 1).await.unwrap());
+        assert!(sender.ship(2, &[delta], &[], 0, 1).await.unwrap());
+
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let db = DbBuilder::new(slatedb::object_store::path::Path::from("replay"), store)
+            .with_merge_operator(chunk_merge_operator())
+            .build()
+            .await
+            .unwrap();
+        {
+            let buf = buffer.lock().await;
+            for (_seqno, ops) in buf.batches_in_order() {
+                let mut batch = WriteBatch::new();
+                for op in ops {
+                    match op {
+                        ReplOp::Put(k, v) => batch.put_bytes(k.clone(), v.clone()),
+                        ReplOp::Merge(k, v) => batch.merge(k.clone(), v.clone()),
+                        ReplOp::Delete(k) => batch.delete(k.clone()),
+                    }
+                }
+                db.write_with_options(batch, &slatedb::config::WriteOptions::default())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let got = db
+            .get(key.clone())
+            .await
+            .unwrap()
+            .expect("chunk present after replay");
+        assert_eq!(
+            got,
+            Bytes::from_static(b"abXYefgh"),
+            "the replayed delta must overlay the base via the merge operator"
+        );
+        db.close().await.unwrap();
     }
 }

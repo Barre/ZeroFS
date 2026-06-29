@@ -91,6 +91,7 @@ pub async fn run_compactor(config_path: PathBuf) -> Result<()> {
             .with_options(worker_options)
             .with_block_transformer(block_transformer)
             .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
+            .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
             .build()
             .await?,
     );

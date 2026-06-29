@@ -204,6 +204,7 @@ impl ZeroFS {
             use_segment_layout,
             None,
             None,
+            true, // single-node / test: no replication peers, so deltas are safe
             Arc::new(crate::dedup::DedupCache::new(65_536)),
             false, // single-node / test: never a live takeover, always regenerate
             ObjectTracer::new(),
@@ -224,6 +225,10 @@ impl ZeroFS {
         use_segment_layout: bool,
         lease: Option<Arc<crate::replication::Lease>>,
         replicator: Option<Arc<crate::replication::Replicator>>,
+        // Whether the chunk store may write sub-chunk merge deltas. False when a
+        // replication peer is too old to understand merge ops (see
+        // `all_peers_support_merge`); true for a non-replicating node.
+        deltas_enabled: bool,
         dedup: Arc<crate::dedup::DedupCache>,
         // True only when this node is a standby promoting after receiving replication
         // from a live leader; false on a cold bootstrap / config leader / single node.
@@ -310,7 +315,7 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
-        let chunk_store = ChunkStore::new(db.clone(), key_codec.clone());
+        let chunk_store = ChunkStore::new(db.clone(), key_codec.clone(), deltas_enabled);
         let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
         let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
@@ -474,6 +479,7 @@ impl ZeroFS {
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
                 .build()
                 .await?,
         );
@@ -509,6 +515,7 @@ impl ZeroFS {
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
                 .build()
                 .await?,
         );
@@ -3453,6 +3460,7 @@ mod tests {
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .with_merge_operator(crate::fs::store::chunk_merge::chunk_merge_operator())
                 .build()
                 .await
                 .unwrap(),
