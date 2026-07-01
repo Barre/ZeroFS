@@ -586,6 +586,7 @@ Substitution applies to these keys only; all other values are taken literally:
 - `url` under `[wal]`
 - `unix_socket` under `[servers.ninep]`, `[servers.nbd]`, and `[servers.rpc]`
 - every value in `[aws]`, `[azure]`, and `[gcp]`, including their `[wal.*]` variants
+- `node_id` under `[replication]`
 
 If a referenced variable is unset, the configuration fails to load with `Failed to expand environment variable`. A literal `$` in an expandable value — an encryption password, for example — must be written `$$`.
 
