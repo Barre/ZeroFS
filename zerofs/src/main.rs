@@ -24,6 +24,7 @@ mod parse_object_store;
 mod prometheus;
 mod redis_conditional_store;
 mod replication;
+mod retrying_object_store;
 mod rpc;
 mod segment;
 mod segment_extractor;

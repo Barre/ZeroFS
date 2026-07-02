@@ -412,8 +412,17 @@ impl Writer {
         // multiple databases sharing one bucket don't see (or collide on) a global
         // `segments/` keyspace. The prefix sits outside the prefetcher so the parts
         // cache keys are db-distinct as well.
+        //
+        // Retries sit under the prefetcher so a single-flight window GET rides out
+        // a transient backend error before failing every reader waiting on it, and
+        // above the tracing layer so each attempt is visible to otrace. SlateDB's
+        // own SST/manifest I/O is covered by its internal retrying wrapper.
+        let retrying: Arc<dyn object_store::ObjectStore> =
+            Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
+                self.prepared.object_store.clone(),
+            ));
         let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
-            self.prepared.object_store.clone(),
+            retrying,
             parts_cache,
         ));
         let db_prefix = Path::from(self.prepared.actual_db_path.clone());
@@ -775,7 +784,12 @@ impl Replayed {
 
         Ok(InitResult {
             fs,
-            object_store: prepared.object_store,
+            // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
+            // admin and the checkpoint manager), whose listings would otherwise
+            // fail on one transient backend error.
+            object_store: Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
+                prepared.object_store,
+            )),
             wal_object_store: prepared.wal_object_store,
             db_path: prepared.actual_db_path,
             db_handle,

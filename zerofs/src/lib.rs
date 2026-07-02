@@ -8,6 +8,7 @@ pub mod length_checked_object_store;
 pub mod object_store_prefetch;
 pub mod object_trace;
 pub mod replication;
+pub mod retrying_object_store;
 pub mod segment;
 pub mod segment_extractor;
 pub mod segment_store;
