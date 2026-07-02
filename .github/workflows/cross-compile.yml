@@ -115,6 +115,9 @@ jobs:
         uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
+          # The action's 6 GiB default gets rustc OOM-killed during parallel
+          # codegen of the bin crate; the ubuntu-latest host has 16 GiB.
+          mem: 12288
           prepare: |
             pkg install -y gmake curl cmake
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
