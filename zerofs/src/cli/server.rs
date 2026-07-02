@@ -443,9 +443,11 @@ pub(crate) async fn build_parts_hybrid(
 /// a tiny config.
 pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
     const MIN_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB floor per side
-    const MAX_META_BYTES: usize = 16 * 1024 * 1024 * 1024; // metadata rarely needs more
+    // u64: 16 GiB overflows usize on 32-bit targets
+    const MAX_META_BYTES: u64 = 16 * 1024 * 1024 * 1024; // metadata rarely needs more
 
-    let decoded = (total_disk_bytes / 10).clamp(MIN_BYTES, MAX_META_BYTES);
+    let max_meta = usize::try_from(MAX_META_BYTES).unwrap_or(usize::MAX);
+    let decoded = (total_disk_bytes / 10).clamp(MIN_BYTES, max_meta);
     let parts = total_disk_bytes.saturating_sub(decoded).max(MIN_BYTES);
     (parts, decoded)
 }

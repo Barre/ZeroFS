@@ -195,7 +195,7 @@ curl -sSfL https://sh.zerofs.net | sh
 curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
 ```
 
-The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64, armv7, i686, ppc64le, s390x, riscv64), macOS (x86_64, aarch64), or FreeBSD (amd64). Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
+The script downloads the release tarball, verifies it against the published SHA-256 checksum, and installs the prebuilt binary for the detected platform: Linux (amd64, arm64), macOS (x86_64, aarch64), or FreeBSD (amd64). Full platform matrix: [quickstart](https://www.zerofs.net/quickstart#installation).
 
 #### Via Docker
 ```bash

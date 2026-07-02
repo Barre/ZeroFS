@@ -65,23 +65,8 @@ detect_arch() {
                 echo "arm64"
             fi
             ;;
-        armv7l|armv7)
-            echo "armv7"
-            ;;
-        i386|i686)
-            echo "i686"
-            ;;
-        ppc64le)
-            echo "ppc64le"
-            ;;
-        riscv64)
-            echo "riscv64"
-            ;;
-        s390x)
-            echo "s390x"
-            ;;
         *)
-            error "Unsupported architecture: $arch"
+            error "No prebuilt binary for architecture: $arch (build from source with 'cargo build --release')"
             ;;
     esac
 }

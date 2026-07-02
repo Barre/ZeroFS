@@ -455,7 +455,6 @@ jobs:
             arch: amd64
             os: ubuntu-latest
             platform: linux
-            use_cross: false
             # BOLT instrumentation can't dump a profile from a static (no-INTERP)
             # musl binary, so we ship PGO without the BOLT pass.
             bolt: false
@@ -463,48 +462,19 @@ jobs:
             arch: arm64
             os: ubuntu-24.04-arm
             platform: linux
-            use_cross: false
             bolt: false
-          - target: armv7-unknown-linux-gnueabihf
-            arch: armv7
-            os: ubuntu-latest
-            platform: linux
-            use_cross: true
-          - target: i686-unknown-linux-gnu
-            arch: i686
-            os: ubuntu-latest
-            platform: linux
-            use_cross: true
-          - target: powerpc64le-unknown-linux-gnu
-            arch: ppc64le
-            os: ubuntu-latest
-            platform: linux
-            use_cross: true
-          - target: s390x-unknown-linux-gnu
-            arch: s390x
-            os: ubuntu-latest
-            platform: linux
-            use_cross: true
-          - target: riscv64gc-unknown-linux-gnu
-            arch: riscv64
-            os: ubuntu-latest
-            platform: linux
-            use_cross: true
           - target: x86_64-apple-darwin
             arch: x86_64
             os: macos-latest
             platform: darwin
-            use_cross: false
           - target: aarch64-apple-darwin
             arch: aarch64
             os: macos-latest
             platform: darwin
-            use_cross: false
           - target: x86_64-unknown-freebsd
             arch: amd64
             os: ubuntu-latest
             platform: freebsd
-            use_cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -526,11 +496,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install cross (Linux only)
-        if: matrix.use_cross
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Setup musl toolchain
         if: contains(matrix.target, 'musl')
@@ -554,27 +519,13 @@ jobs:
           cp pgo-data/merged.profdata zerofs/
           cp pgo-data/Cargo.lock zerofs/
 
-      - name: Build with PGO (cross)
-        if: matrix.use_cross && !matrix.bolt
-        env:
-          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:${{ github.workspace }}/webui/dist:ro"
-        run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata" cross build --release --features webui --target ${{ matrix.target }}
-
-      - name: Build with PGO + BOLT relocs (cross)
-        if: matrix.use_cross && matrix.bolt
-        env:
-          CROSS_CONTAINER_OPTS: "--volume ${{ github.workspace }}/webui/dist:${{ github.workspace }}/webui/dist:ro"
-        run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --features webui --target ${{ matrix.target }}
-
       - name: Build with PGO (cargo)
-        if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
+        if: matrix.platform != 'freebsd' && !matrix.bolt
         run: |
           cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cargo)
-        if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
+        if: matrix.platform != 'freebsd' && matrix.bolt
         run: |
           cd zerofs && RUSTFLAGS="--cfg tokio_unstable --cfg io_uring_skip_arch_check -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none ${{ matrix.extra_rustflags }}" cargo build --release --features webui --target ${{ matrix.target }}
 
