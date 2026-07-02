@@ -181,9 +181,9 @@ jobs:
             sudo mkdir -p /mnt/zerofs
             sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
             cd /mnt/zerofs
-            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
-            tar -xf linux-6.11.tar.xz
-            cd linux-6.11
+            wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            tar -xf linux-7.2-rc1.tar.gz
+            cd linux-7.2-rc1
             make tinyconfig
             make -j$(nproc)
             cd /mnt/zerofs
@@ -237,9 +237,9 @@ jobs:
               sleep 0.5
             done
             cd /mnt/zerofs
-            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
-            tar -xf linux-6.11.tar.xz
-            cd linux-6.11
+            wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            tar -xf linux-7.2-rc1.tar.gz
+            cd linux-7.2-rc1
             make tinyconfig
             make -j$(nproc)
             cd /mnt/zerofs
@@ -298,8 +298,8 @@ jobs:
             sudo zfs create testpool/data
             sudo zfs set mountpoint=/mnt/zfsdata testpool/data
             cd /mnt/zfsdata
-            sudo wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
-            sudo tar -xf linux-6.11.tar.xz
+            sudo wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            sudo tar -xf linux-7.2-rc1.tar.gz
             sudo zfs snapshot testpool/data@snapshot1
             kill -TERM $ZEROFS_PID || true
             wait $ZEROFS_PID || true
@@ -341,9 +341,9 @@ jobs:
             sudo mkdir -p /mnt/zerofs
             sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
             cd /mnt/zerofs
-            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
-            tar -xf linux-6.11.tar.xz
-            cd linux-6.11
+            wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+            tar -xf linux-7.2-rc1.tar.gz
+            cd linux-7.2-rc1
             make tinyconfig
             make -j$(nproc)
             cd /
@@ -705,9 +705,9 @@ jobs:
           done
 
           cd /mnt/zerofs
-          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
-          tar -xf linux-6.11.tar.xz
-          cd linux-6.11
+          wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
+          tar -xf linux-7.2-rc1.tar.gz
+          cd linux-7.2-rc1
           make tinyconfig
           make -j$(nproc)
           cd /mnt/zerofs
