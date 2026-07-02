@@ -21,29 +21,24 @@ use fp::fail_point;
 
 const MAX_EXTENTS_PER_ROUND: usize = 10_000;
 const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
-/// Interval between segment reclamation passes (on its own task; see `start`).
-/// Deletion safety rides on the per-segment delete horizon, not this interval, so
-/// it's purely a responsiveness knob. Kept at/above the periodic flush cadence
-/// (~30s) so the pass's seal+flush is a near no-op (the flush task already sealed
-/// the open buffer and flushed the memtable).
+/// Interval between segment reclamation passes. Purely a responsiveness knob:
+/// deletion safety rides on the per-segment delete horizon. Kept at/above the
+/// periodic flush cadence (~30s) so the pass's seal+flush is a near no-op.
 const SEGMENT_GC_INTERVAL_SECS: u64 = 60;
 
 /// Floor the delete horizon this far past now, so reclamation still covers the
-/// writer's own in-flight reads when no checkpoint is currently pinning a view.
+/// writer's own in-flight reads when no checkpoint is pinning a view.
 const INFLIGHT_FLOOR_SECS: i64 = 60;
 
-/// Added past a checkpoint's declared `expire_time` before its pinned segments
-/// may be deleted. `expire_time` is the reader's wall clock; this margin covers
-/// clock skew (and the reader finishing its last read) so a stalled follower on a
-/// slower clock can't have a segment deleted out from under it.
+/// Margin past a checkpoint's `expire_time` (the reader's wall clock) before
+/// its pinned segments may be deleted, covering clock skew and the reader
+/// finishing its last read.
 const CLOCK_SKEW_MARGIN_SECS: i64 = 30;
 
-/// Cadence of the slow orphan sweep (the only `list("segments")`). Gated by a
-/// persisted wall-clock timestamp, not process uptime, so it fires on this interval
-/// across restarts. Coarse on purpose: the fast reclaim runs entirely off the local
-/// segcount scan; this sweep exists only to reclaim counter-less orphan objects (a
-/// crash between sealing an object and its crediting commit, or a compaction whose
-/// repoints all lost the CAS), which are rare.
+/// Cadence of the slow orphan sweep, the only `list("segments")`. Gated by a
+/// persisted wall-clock timestamp so it holds across restarts. Coarse on
+/// purpose: it exists only to reclaim counter-less orphan objects, which are
+/// rare; the fast reclaim covers everything else.
 const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 pub struct GarbageCollector {
@@ -51,9 +46,8 @@ pub struct GarbageCollector {
     tombstone_store: TombstoneStore,
     extent_store: ExtentStore,
     stats: Arc<FileSystemStats>,
-    /// A read-only admin used to list active checkpoints, to gate segment
-    /// reclamation (skip while any pins an older manifest whose view may
-    /// reference more). `None` disables the check (tests).
+    /// Read-only admin for listing active checkpoints, which gate segment
+    /// reclamation. `None` disables the check (tests).
     checkpoint_admin: Option<Admin>,
 }
 
@@ -77,23 +71,19 @@ impl GarbageCollector {
     /// Reclaim dead segment objects, unless a checkpoint pins an older manifest
     /// (whose view may still reference segments dead in the current view).
     async fn maybe_reclaim_segments(&self) {
-        // The horizon gate is evaluated by reclaim_segments_gated after its durable
-        // seal+flush barrier, not here: a checkpoint created between listing and the
-        // flush would otherwise pin the pre-flush manifest (still referencing a
-        // to-be-dead segment) yet be invisible to the horizon. Listing post-barrier,
-        // any such checkpoint is either seen here (and extends the horizon) or pins
-        // the post-flush manifest in which the reclaimed segments are unreferenced.
+        // The gate runs inside reclaim_segments_gated, after its durable
+        // barrier — see that method for the checkpoint race this ordering
+        // closes. `floor` is sampled there too, so it covers in-flight reads
+        // relative to the actual scan time.
         let checkpoint_admin = &self.checkpoint_admin;
         let gate = move || async move {
-            // now/floor are sampled post-barrier (inside the gate), so the floor
-            // covers the writer's in-flight reads relative to the actual scan time.
             let floor = Utc::now() + chrono::Duration::seconds(INFLIGHT_FLOOR_SECS);
             match checkpoint_admin {
                 Some(admin) => match admin.list_checkpoints(None).await {
                     Ok(cps) => {
-                        // Wait out the latest-expiring ephemeral checkpoint (compactor
-                        // / following reader): until it expires it may still reference
-                        // a just-superseded segment.
+                        // Wait out the latest-expiring ephemeral checkpoint:
+                        // until then it may still reference a just-superseded
+                        // segment.
                         let horizon = cps
                             .iter()
                             .filter_map(|c| c.expire_time)
@@ -102,11 +92,9 @@ impl GarbageCollector {
                                 (e + chrono::Duration::seconds(CLOCK_SKEW_MARGIN_SECS)).max(floor)
                             })
                             .unwrap_or(floor);
-                        // A persistent checkpoint (no expiry — backup / pinned reader)
-                        // pins a view that can't be timed out; while one exists the
-                        // pass pauses all deletion and compaction (see
-                        // reclaim_segments_gated). Only its presence matters; the
-                        // timestamp is logged for the operator.
+                        // A persistent checkpoint (no expiry) can't be timed
+                        // out; its presence pauses all deletion and compaction
+                        // (see reclaim_segments_gated).
                         let protect_before = cps
                             .iter()
                             .filter(|c| c.expire_time.is_none())
@@ -133,11 +121,9 @@ impl GarbageCollector {
         }
     }
 
-    /// Drive the slow orphan sweep on its wall-clock cadence. The gate (read the
-    /// persisted last-sweep timestamp, run only if `>= ORPHAN_SWEEP_INTERVAL_SECS`
-    /// elapsed, then persist the new timestamp) lives in
-    /// [`ExtentStore::sweep_orphans_if_due`], which owns the db + key codec; here we
-    /// just supply the interval and log the outcome.
+    /// Drive the slow orphan sweep. The timestamp gate lives in
+    /// [`ExtentStore::sweep_orphans_if_due`]; this just supplies the interval
+    /// and logs the outcome.
     async fn maybe_sweep_orphans(&self) {
         let interval = chrono::Duration::seconds(ORPHAN_SWEEP_INTERVAL_SECS);
         match self.extent_store.sweep_orphans_if_due(interval).await {
@@ -152,11 +138,10 @@ impl GarbageCollector {
         shutdown: CancellationToken,
         runtime: Option<tokio::runtime::Handle>,
     ) -> JoinHandle<()> {
-        // Segment reclamation runs on its own task, independent of the tombstone
-        // pass. `run()` drains its entire backlog before returning, so gating
-        // reclaim behind it in one loop would let a large backlog starve (and
-        // silence) reclamation; a separate task keeps it ticking regardless.
-        // Runs once immediately, then every interval.
+        // Segment reclamation runs on its own task: `run()` drains its whole
+        // backlog before returning, so sharing a loop would let a large
+        // tombstone backlog starve reclamation. Runs once immediately, then
+        // every interval.
         {
             let gc = Arc::clone(&self);
             let shutdown = shutdown.clone();

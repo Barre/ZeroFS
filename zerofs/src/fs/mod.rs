@@ -402,7 +402,7 @@ impl ZeroFS {
     }
 
     /// Resolve the durability lineage token at bring-up. Carry the stored token
-    /// forward ONLY on a live-standby takeover of an UNTAINTED lineage — the standby
+    /// forward only on a live-standby takeover of an untainted lineage — the standby
     /// provably has every acked write (ship-before-apply, and a Solo episode would
     /// have left a taint), so a client's un-fsync'd writes stay verifiable and its
     /// fsync is transparent across the failover. Otherwise regenerate a fresh token
@@ -460,7 +460,7 @@ impl ZeroFS {
 
     /// Durability-verified fsync (9P `Tfsyncdur`, `.zerofs4`). `client_token` is the
     /// lineage token of the client's oldest un-fsync'd write (`0` = nothing
-    /// un-fsync'd). We FLUSH FIRST (so every write made on THIS instance becomes
+    /// un-fsync'd). We flush first (so every write made on this instance becomes
     /// durable), then verify the lineage: OK iff the client wrote nothing, or its
     /// writes belong to the live lineage (so the flush just made them durable, or a
     /// clean takeover carried them). Otherwise the client's writes were made under a

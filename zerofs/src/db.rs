@@ -116,11 +116,9 @@ pub struct StatsDelta {
 pub struct Transaction {
     ops: Vec<TxOp>,
     stats_deltas: Vec<StatsDelta>,
-    /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`).
-    /// The single commit worker aggregates these across a batch and persists one
-    /// absolute `(live, total)` per segment. Same lock-free pattern as
-    /// `stats_deltas`. `live` credits on write and debits on overwrite/delete;
-    /// `total` only ever credits (monotonic), so a debit carries `total_delta == 0`.
+    /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`),
+    /// aggregated by the commit worker into one absolute `(live, total)` per
+    /// segment. Same lock-free pattern as `stats_deltas`.
     seg_deltas: Vec<(Bytes, (i64, i64))>,
     op_id: crate::dedup::OpId,
 }

@@ -37,19 +37,16 @@ type Result<T> = std::result::Result<T, SegmentStoreError>;
 /// layer below buffers at once.
 const LIST_SHARD_CONCURRENCY: usize = 16;
 
-/// Concurrent multipart part uploads per sealing segment. Aggregate upload
-/// parallelism is this times the extent store's in-flight-seal cap and already
-/// saturates a 10-20 Gbps link at the library default of 8; the reason to run
-/// higher is the durability barrier, which waits out in-flight seals, so
-/// per-seal wall time is fsync tail latency. Costs `this x part size (10 MiB)`
-/// of in-flight part buffers per sealing segment.
+/// Concurrent multipart part uploads per sealing segment. Higher than the
+/// throughput-saturating default of 8 because per-seal wall time is fsync tail
+/// latency (the durability barrier waits out in-flight seals). Costs
+/// `this × part size (10 MiB)` of in-flight buffers per sealing segment.
 const SEAL_UPLOAD_CONCURRENCY: usize = 16;
 
-/// Warm a just-written segment into the object store's read (parts) cache. The
-/// production upload streams as multipart, which bypasses the store's single-PUT
-/// write-through, so `put_segment` calls this with the bytes it already holds. The
-/// hook receives the segment's object path and full bytes and is responsible for
-/// applying any object-store prefix. `None` when there is no such cache (tests).
+/// Warm a just-written segment into the read (parts) cache: the multipart
+/// upload bypasses the store's single-PUT write-through, so `put_segment`
+/// calls this with the bytes it already holds. The hook applies any
+/// object-store prefix itself. `None` when there is no such cache (tests).
 pub type SegmentWarmHook = Arc<dyn Fn(&Path, Bytes) + Send + Sync>;
 
 /// Writes and reads `segments/` objects against an object store.
@@ -60,10 +57,8 @@ pub struct SegmentStore {
     counter: AtomicU64,
     /// Count of ranged segment GETs issued (a read-amplification metric).
     read_calls: AtomicU64,
-    /// Warms the parts cache with a just-written segment (see [`SegmentWarmHook`]).
-    /// That cache (RAM + disk, the bulk of the configured budget) is the only
-    /// segment cache; same-process read-your-writes and the in-flight-PUT window
-    /// are served upstream from the open/sealing buffers before a read reaches here.
+    /// Warms the parts cache with a just-written segment (see
+    /// [`SegmentWarmHook`]); that cache is the only segment cache.
     warm: Option<SegmentWarmHook>,
 }
 
@@ -115,10 +110,9 @@ impl SegmentStore {
         w.shutdown()
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        // The multipart path above doesn't write through the parts cache; warm it
-        // with the bytes we already hold so a read after this segment ages out of
-        // the small RAM cache hits the (disk-backed) parts cache, not the object
-        // store. Runs after the upload commits, mirroring the single-PUT path.
+        // The multipart path doesn't write through the parts cache; warm it
+        // with the bytes in hand, after the upload commits (mirroring the
+        // single-PUT path).
         if let Some(warm) = &self.warm {
             warm(&path, bytes);
         }
@@ -232,14 +226,11 @@ impl SegmentStore {
     pub fn list_segments_stream(
         &self,
     ) -> impl futures::Stream<Item = Result<(Segid, u64, chrono::DateTime<chrono::Utc>)>> + '_ {
-        // One listing per shard prefix (segments/00 .. segments/ff) flattened
-        // with bounded concurrency, not one flat list("segments"): paged LISTs
-        // are sequential within a prefix (each page needs the prior page's
-        // token), so per-shard chains parallelize the scan across the
-        // partitions the shard byte exists to spread, and shrink each chain —
-        // the unit a retrying layer below must buffer per attempt, and the
-        // progress lost to a transient error — to 1/256th of the keyspace.
-        // Shard streams interleave, so consumers must not assume key order.
+        // One listing per shard prefix (segments/00 .. segments/ff), flattened
+        // with bounded concurrency. Paged LISTs are sequential within a prefix,
+        // so per-shard chains parallelize the scan and shrink the unit a
+        // retrying layer must buffer per attempt to 1/256th of the keyspace.
+        // Shard streams interleave: consumers must not assume key order.
         futures::stream::iter((0..=0xffu8).map(|shard| Path::from(format!("segments/{shard:02x}"))))
             .map(move |prefix| self.object_store.list(Some(&prefix)))
             .flatten_unordered(LIST_SHARD_CONCURRENCY)
@@ -286,9 +277,9 @@ impl SegmentStore {
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         let meta = crate::segment::parse_footer(&footer, object_size)?;
-        // Defense-in-depth: the object at this key must be the segment we asked for.
-        // A misdirected read or a key collision returning a different (self-consistent)
-        // segment would otherwise feed the wrong directory into the coalescer.
+        // Defense-in-depth: a misdirected read returning a different
+        // (self-consistent) segment would feed the wrong directory into the
+        // coalescer.
         if meta.segid != segid {
             return Err(crate::segment::SegmentError::SegidMismatch {
                 expected: segid,

@@ -34,20 +34,18 @@ use tracing::{error, info, warn};
 
 const PARALLEL_EXTENT_OPS: usize = 20;
 
-/// Frames per write batch before pre-compression fans out on rayon. Below this
-/// the rayon dispatch overhead outweighs the parallelism; at or above it (a
-/// ≥256 KiB write) the batch's compression scales across cores.
+/// Frames per write batch before pre-compression fans out on rayon; below
+/// this the dispatch overhead outweighs the parallelism.
 const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
 const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
 const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Logical (file-offset) read-ahead. Once a read stream is confirmed sequential,
-/// prefetch this far ahead — following the file's extents across segments, which
-/// the physical (per-object) prefetcher can't do — so the next read lands warm in
-/// the parts cache. Refilled when the buffered-ahead drops below half.
+/// Logical (file-offset) read-ahead distance for a confirmed-sequential
+/// stream. Follows the file's extents across segments, which the physical
+/// (per-object) prefetcher can't do.
 const READ_AHEAD_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
-/// Consecutive sequential reads before prefetch kicks in (so a one-off read of a
-/// file doesn't drag in a whole window).
+/// Consecutive sequential reads before prefetch kicks in, so a one-off read
+/// doesn't drag in a whole window.
 const READ_AHEAD_MIN_SEQ: u32 = 2;
 /// Global cap on concurrent in-flight read-ahead fetches.
 const READ_AHEAD_MAX_CONCURRENT: usize = 16;
@@ -55,16 +53,15 @@ const READ_AHEAD_MAX_CONCURRENT: usize = 16;
 const READ_AHEAD_TRACK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Given the per-inode read-ahead state `(last_read_end, prefetched_to, seq_run)`
-/// and a read of `[offset, offset+length)`, return the new state and, when the
-/// stream is confirmed sequential and the buffered-ahead has run low, the
-/// `[start, end)` file range to prefetch. Pure so it's unit-testable.
+/// and a read of `[offset, offset+length)`, return the new state and, when a
+/// prefetch is warranted, the `[start, end)` file range to fetch.
 fn plan_read_ahead(
     (last_end, prefetched_to, seq): (u64, u64, u32),
     offset: u64,
     length: u64,
 ) -> ((u64, u64, u32), Option<(u64, u64)>) {
     let read_end = offset + length;
-    // A jump resets the window: this read starts a new (unconfirmed) sequence.
+    // A jump starts a new (unconfirmed) sequence.
     if offset != last_end {
         return ((read_end, read_end, 1), None);
     }
@@ -72,8 +69,8 @@ fn plan_read_ahead(
     if seq < READ_AHEAD_MIN_SEQ {
         return ((read_end, read_end, seq), None);
     }
-    // Refill only when less than half a window remains ahead, so prefetch is
-    // coarse-grained (few, large fetches) rather than one tiny fetch per read.
+    // Refill only once less than half a window remains ahead: few large
+    // fetches, not one tiny fetch per read.
     let ahead = prefetched_to.saturating_sub(read_end);
     if ahead >= READ_AHEAD_WINDOW_BYTES / 2 {
         return ((read_end, prefetched_to, seq), None);
@@ -84,23 +81,19 @@ fn plan_read_ahead(
 }
 
 /// Seal (PUT) the open segment once its packed frames reach this size, bounding
-/// the in-RAM buffer between flushes. Large (256 MiB) so the object/segment count
-/// stays low at scale — fewer GC/LIST/segcount entries per byte stored. The seal
-/// PUT is uploaded as concurrent multipart (BufWriter), so its fsync-path latency
-/// stays bounded despite the size.
+/// the in-RAM buffer between flushes. The seal PUT is concurrent multipart
+/// (BufWriter), so its fsync-path latency stays bounded despite the size.
 const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 
-/// Max segments sealing (PUT in flight) concurrently. More parallelism raises
-/// write throughput (~ part_bandwidth × this); bounded so the un-PUT RAM held in
-/// `sealing` stays ~this × SEAL_THRESHOLD (4 × 256 MiB = 1 GiB). Also the fsync
-/// barrier: acquiring all permits waits for every in-flight seal to land.
+/// Max segments sealing (PUT in flight) concurrently. Bounds the un-PUT RAM in
+/// `sealing` to ~this × SEAL_THRESHOLD; acquiring all permits is the fsync
+/// drain barrier.
 const MAX_INFLIGHT_SEALS: usize = 4;
 
-/// Compaction (packing) thresholds. A live segment is a compaction candidate
-/// when it is *fragmented* (live bytes below this percent of the object size,
-/// i.e. repeated rewrites have left mostly-dead frames) or *small* (below
-/// SMALL_SEGMENT_BYTES, worth merging with neighbours). Dense, full-size
-/// segments are left alone: re-sealing one 1:1 reclaims nothing.
+/// Compaction thresholds. A live segment is a candidate when *fragmented*
+/// (live bytes below this percent of total) or *small* (below
+/// SMALL_SEGMENT_BYTES). Dense, full-size segments are left alone: re-sealing
+/// one 1:1 reclaims nothing.
 const FRAG_LIVE_PERCENT: u64 = 50;
 const SMALL_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
 
@@ -108,27 +101,22 @@ const SMALL_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
 /// target size (the same threshold the open buffer seals at).
 const PACK_TARGET_BYTES: u64 = SEAL_THRESHOLD as u64;
 
-/// Per-round compaction bounds: cap candidate count and the bytes read+rewritten
-/// in one pass so a large backlog is worked down incrementally, not all at once.
+/// Per-round compaction bounds, so a large backlog is worked down incrementally.
 const MAX_COMPACT_SEGMENTS_PER_ROUND: usize = 64;
 const MAX_COMPACT_BYTES_PER_ROUND: u64 = 256 << 20; // 256 MiB (~one PACK_TARGET segment/round)
 
 /// A compaction round must free at least this much dead space to run (unless
-/// enough small-segment live bytes have accumulated to pack into a dense
-/// segment; see the gate in `reclaim_segments_gated`). A repack that frees less
-/// is churn: a near-1:1 rewrite of mostly-live data reclaims nothing.
+/// enough small-segment live bytes have accumulated to pack a dense segment;
+/// see `reclaim_segments_gated`). A near-1:1 repack is churn.
 const MIN_FREED_BYTES: u64 = SMALL_SEGMENT_BYTES;
 
-/// Cap on compaction candidates held in RAM during a reclaim pass: well above a
-/// round's selection budget, but bounded so a huge store can't make the candidate
-/// list O(#segments). When reached, the most-fragmented half is kept.
+/// Cap on buffered compaction candidates, so a huge store can't make the list
+/// O(#segments). When reached, the most-fragmented half is kept.
 const MAX_CANDIDATES_BUFFERED: usize = 8192;
 
-/// Cap on segments verified + deleted per reclaim pass. Each delete runs a
-/// fail-closed `verify_segment_reclaimable` (a dir read plus O(frames) point-lookups), so
-/// an unbounded burst of simultaneously-expiring dead segments could make one pass
-/// arbitrarily long. Excess past-horizon segments keep their (already-elapsed)
-/// deadline and are retried on the next pass, so nothing is stranded.
+/// Cap on segments verified + deleted per reclaim pass; each delete costs a
+/// dir read plus O(frames) point-lookups. Deferred segments keep their
+/// (already-elapsed) deadline and are retried next pass.
 const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
 
 /// A coalesced run of contiguous live frames within one source segment, for the
@@ -196,14 +184,13 @@ pub struct ExtentStore {
     sealing: Arc<Mutex<HashMap<Segid, Bytes>>>,
     /// Permits = max in-flight seals; acquiring all is the fsync drain barrier.
     seal_sem: Arc<Semaphore>,
-    /// Deadline after which each currently-dead segment may be deleted, recorded
-    /// the first pass it's seen dead as the latest expiry of the checkpoints active
-    /// then (compactor / following readers). Lets reclamation outlast anything that
-    /// could still reference a just-superseded segment, with no hardcoded grace.
+    /// Deadline after which each currently-dead segment may be deleted:
+    /// recorded the first pass it's seen dead, from the latest expiry of the
+    /// checkpoints active then, so reclamation outlasts anything that could
+    /// still reference it.
     delete_at: Arc<Mutex<HashMap<Segid, DateTime<Utc>>>>,
-    /// Same, but for the slow orphan sweep's absent-counter candidates. Kept
-    /// separate from `delete_at` so the fast loop's per-pass `retain` can't clobber
-    /// an orphan's recorded horizon (the two loops run on independent cadences).
+    /// Same, for the slow orphan sweep. Separate so the fast loop's per-pass
+    /// `retain` can't clobber an orphan's horizon (independent cadences).
     orphan_delete_at: Arc<Mutex<HashMap<Segid, DateTime<Utc>>>>,
     /// Per-inode copy of the most-recently-written (extent_idx, full extent), so a
     /// sequential append splices into it rather than re-decoding the buffered/sealed
@@ -334,11 +321,10 @@ impl ExtentStore {
         (end <= bytes.len()).then(|| bytes.slice(start..end))
     }
 
-    /// Enrich a batch's replication ops: an extent-write `Put` whose segment is still
-    /// un-PUT becomes a `PutFrame` carrying the sealed frame bytes, so the standby
-    /// can materialize that segment on takeover (no-acked-loss for un-fsync'd
-    /// writes). Already-PUT segments stay plain `Put` — the standby reads them from
-    /// the shared store. Called by the commit worker only when replicating.
+    /// Enrich a batch's replication ops: an extent-write `Put` whose segment is
+    /// still un-PUT becomes a `PutFrame` carrying the sealed frame bytes, so
+    /// the standby can materialize that segment on takeover. Already-PUT
+    /// segments stay plain `Put`. Called by the commit worker when replicating.
     pub fn enrich_repl_ops(&self, ops: Vec<ReplOp>) -> Vec<ReplOp> {
         ops.into_iter()
             .map(|op| match op {
@@ -449,11 +435,9 @@ impl ExtentStore {
         }
     }
 
-    /// Every stored data frame decodes to exactly one full [`EXTENT_SIZE`] extent
-    /// (writers always splice into full-extent buffers). Enforce it before a caller
-    /// slices the plaintext, so a truncated/corrupt frame that still passed AEAD
-    /// (e.g. a writer-side bug or a cross-version frame) surfaces as EIO instead of
-    /// panicking on an out-of-range slice.
+    /// Every stored frame decodes to exactly one full [`EXTENT_SIZE`] extent.
+    /// Enforce that before callers slice the plaintext, so a bad frame that
+    /// still passed AEAD surfaces as EIO instead of a panic.
     fn validate_extent_frame(id: InodeId, extent: u64, data: &Bytes) -> Result<(), FsError> {
         if data.len() != EXTENT_SIZE {
             error!(
@@ -468,10 +452,10 @@ impl ExtentStore {
         Ok(())
     }
 
-    /// Read a contiguous run of frames from RAM — the open buffer or an in-flight
-    /// sealing buffer (read-your-writes) — or `None` if `segid` is already sealed
-    /// to the object store. Frame byte offsets are identical in the open buffer
-    /// and the finalized segment, so the same slice works for both.
+    /// Read a contiguous run of frames from the open or an in-flight sealing
+    /// buffer (read-your-writes), or `None` if `segid` is already on the object
+    /// store. Frame offsets are identical in the buffer and the finalized
+    /// segment, so the same slice works for both.
     fn read_frames_in_ram(
         &self,
         segid: Segid,
@@ -518,10 +502,9 @@ impl ExtentStore {
         txn.delete_bytes(&key);
     }
 
-    /// Stage live/total byte deltas for `segid`'s counter onto the txn. The commit
-    /// worker (the sole segcount writer) folds these into the segment's absolute
-    /// `(live, total)`. `total` is only ever credited (monotonic), so a debit passes
-    /// `total_delta == 0`.
+    /// Stage live/total byte deltas for `segid`'s counter onto the txn; the
+    /// commit worker folds them into the absolute `(live, total)`. A debit
+    /// passes `total_delta == 0` (`total` is monotonic).
     fn seg_delta(&self, txn: &mut Transaction, segid: Segid, live_delta: i64, total_delta: i64) {
         txn.add_seg_delta(
             &self.key_codec.segcount_key(segid.epoch, segid.counter),
@@ -576,10 +559,9 @@ impl ExtentStore {
         id: InodeId,
         edits: &[(u64, Option<Bytes>)],
     ) -> Result<(), FsError> {
-        // Prior FrameLoc per edited extent, read before the open lock (async): each
-        // overwrite/hole debits the old segment's live-byte counter. Absent = a pure
-        // append (nothing to debit). Read under the caller's inode write lock, which
-        // serialises it against a concurrent write to the same extent.
+        // Prior FrameLoc per edited extent: an overwrite/hole debits the old
+        // segment's live counter (absent = pure append). The caller's inode
+        // write lock serialises this against a concurrent write.
         let mut old_debits: Vec<(Segid, u32)> = Vec::with_capacity(edits.len());
         for (extent, _) in edits {
             let key = self.key_codec.extent_key(id, *extent);
@@ -593,14 +575,11 @@ impl ExtentStore {
                 old_debits.push((loc.segid, loc.byte_len));
             }
         }
-        // Compress every payload before taking the open-segment lock: compression
-        // is the expensive half of the codec and depends only on the plaintext,
-        // while the AEAD binds (segid, frame_index), which exist only under the
-        // lock. Serializing just the AEAD and the buffer append keeps concurrent
-        // writers off each other's compression time. A batch large enough to
-        // amortize the fan-out compresses in parallel on rayon; block_in_place
-        // needs the multi-thread runtime (tests run current-thread), and small
-        // batches stay inline where the fan-out would cost more than it buys.
+        // Compress before taking the open-segment lock: compression is the
+        // expensive half of the codec and depends only on the plaintext, while
+        // the AEAD binds (segid, frame_index), assigned under the lock. Large
+        // batches fan out on rayon; block_in_place needs the multi-thread
+        // runtime (tests run current-thread), and small batches stay inline.
         let payloads: Vec<&Bytes> = edits.iter().filter_map(|(_, e)| e.as_ref()).collect();
         let compressed: Vec<Vec<u8>> = if payloads.len() >= PARALLEL_COMPRESS_MIN_FRAMES
             && tokio::runtime::Handle::current().runtime_flavor()
@@ -703,11 +682,10 @@ impl ExtentStore {
         }
 
         // Synchronously seal the current open buffer. Register it in `sealing`
-        // (under the open lock, before the PUT) and remove it only on success, so
-        // the rotated segment is never absent from BOTH the open buffer and
-        // `sealing`: otherwise a concurrent read of its frames during the PUT falls
-        // through to the object store and 404s the not-yet-PUT object, and a failed
-        // PUT strands it permanently (its buffer already taken). Mirrors spawn_seal.
+        // under the open lock and remove it only on success, so the rotated
+        // segment is never absent from both maps: a concurrent read would 404
+        // the not-yet-PUT object, and a failed PUT would strand it. Mirrors
+        // spawn_seal.
         let current = {
             let mut open = self.open.lock().unwrap();
             if open.dir.is_empty() {
@@ -716,9 +694,9 @@ impl ExtentStore {
                 let segid = open.segid;
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
-                // Seal the directory FIRST: on error the open buffer (and its
-                // already-committed FrameLocs) is left untouched to retry, instead
-                // of being dropped into a dangling pointer.
+                // Seal the directory first: on error the open buffer and its
+                // committed FrameLocs stay intact for retry, instead of being
+                // dropped into a dangling pointer.
                 let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
                     .map_err(|_| FsError::IoError)?;
                 let k = open.dir.len() as u32;
@@ -765,9 +743,8 @@ impl ExtentStore {
                 return;
             }
             let segid = open.segid;
-            // Seal the directory before taking the buffer: on error, leave the open
-            // buffer intact so the next seal/flush retries. Taking it first would
-            // strand the already-committed FrameLocs (a dangling read -> EIO).
+            // Directory first, as in seal_open: an error must leave the open
+            // buffer intact for the next seal/flush to retry.
             let sealed_dir = match crate::segment::seal_directory(&self.codec, segid, &open.dir) {
                 Ok(s) => s,
                 Err(e) => {
@@ -816,10 +793,9 @@ impl ExtentStore {
         });
     }
 
-    /// Read `[offset, offset+length)`, then kick off a bounded, sequential-only
-    /// logical read-ahead: once a stream is confirmed sequential it prefetches
-    /// along the file's extents (across segments, which the physical per-object
-    /// prefetcher can't follow), so the next read lands warm in the parts cache.
+    /// Read `[offset, offset+length)`, then kick off the bounded,
+    /// sequential-only logical read-ahead so the next read lands warm in the
+    /// parts cache.
     pub async fn read(&self, id: InodeId, offset: u64, length: u64) -> Result<Bytes, FsError> {
         let data = self.read_range(id, offset, length).await?;
         self.trigger_read_ahead(id, offset, length);
@@ -828,7 +804,7 @@ impl ExtentStore {
 
     /// Sequential-read detection + a bounded forward prefetch. Best-effort: the
     /// per-inode state is racy under concurrent readers of one file, which only
-    /// costs a slightly-off prefetch, never wrong data.
+    /// costs a slightly-off prefetch.
     fn trigger_read_ahead(
         &self,
         id: InodeId,
@@ -849,12 +825,10 @@ impl ExtentStore {
         let read_end = offset + length;
         Some(crate::task::spawn_named("read-ahead", async move {
             let _permit = permit;
-            // Cross-segment only: within one segment the physical (per-object)
-            // prefetcher already reads ahead, so a logical prefetch here just adds a
-            // second interleaved stream over the same object, fragmenting the physical
-            // prefetcher's window ramp into many tiny GETs. Only prefetch when the
-            // window reaches a different segment, which the per-object prefetcher
-            // can't follow.
+            // Cross-segment only: within one segment the per-object prefetcher
+            // already reads ahead, and a second interleaved stream would
+            // fragment its window ramp into tiny GETs. Prefetch only when the
+            // window reaches a segment it can't follow into.
             let cur_ext = read_end.saturating_sub(1) / EXTENT_SIZE as u64;
             let tgt_ext = end.saturating_sub(1) / EXTENT_SIZE as u64;
             let cur_seg = this.segment_at(id, cur_ext).await;
@@ -865,9 +839,7 @@ impl ExtentStore {
         }))
     }
 
-    /// The segment an extent's current frame lives in, or `None` for a hole / not-yet
-    /// written extent. Lets read-ahead fire only when its window crosses into another
-    /// segment (the physical prefetcher covers within-segment).
+    /// The segment an extent's current frame lives in, or `None` for a hole.
     async fn segment_at(&self, id: InodeId, extent: u64) -> Option<Segid> {
         let key = self.key_codec.extent_key(id, extent);
         self.db
@@ -968,11 +940,9 @@ impl ExtentStore {
                 &slots,
             )? {
                 Some(f) => Some(f),
-                // A GET error here is swallowed: a GC compaction repoint+delete can
-                // 404 this run's segment out from under us, so fall back to
-                // per-extent reads, which re-resolve each FrameLoc (and retry once)
-                // via `get` and read a relocated extent from its new segment
-                // instead of surfacing EIO.
+                // A GET error is swallowed: a compaction repoint+delete can 404
+                // this run's segment out from under us. Fall back to per-extent
+                // reads via `get`, which re-resolves each FrameLoc.
                 None => self
                     .segments
                     .read_run(
@@ -1229,43 +1199,15 @@ impl ExtentStore {
         self.reclaim_segments(chrono::Utc::now(), None).await
     }
 
-    /// Reclaim object-store space: delete fully-dead segments and coalesce the
-    /// most-fragmented partially-dead ones. Returns (segments deleted, frames
-    /// relocated). Driven entirely off the local `segcount` key scan (no object
-    /// LIST): each counter carries `(live, total)`, so both the dead test
-    /// (`live == 0`) and the fragmentation test (`live/total`) come from the scan.
-    /// Absent-counter orphan objects are the slow [`Self::sweep_orphans`] loop's job.
-    ///
-    /// Durable-horizon sound: it seals the open segment then flushes, so the scan
-    /// sees the durable view of the extents — a crash or a standby takeover that
-    /// recovers that manifest agrees every reclaimed segment is dead, so it never
-    /// strands a referenced one. Reference sets only shrink after a seal, so a
-    /// segment unreferenced now stays unreferenced.
-    ///
-    /// A fully-dead segment is deleted only once `now >= delete_horizon`, where
-    /// the horizon is recorded the first pass the segment is seen dead and kept on
-    /// later passes. The caller derives it from the live checkpoints' actual expiry
-    /// (latest ephemeral expire_time, floored a little for the writer's own
-    /// in-flight reads), so reclamation outlasts every checkpoint that could still
-    /// reference a just-superseded segment — the compactor's 15-min checkpoint and a
-    /// following reader's ephemeral one — with no hardcoded grace. Persistent
-    /// checkpoints (no expiry) can't be timed out; the GC's gate skips reclamation
-    /// entirely while one exists.
-    ///
-    /// The `(delete_horizon, protect_before)` gate is supplied directly here; the
-    /// production path uses [`Self::reclaim_segments_gated`] so the gate (which
-    /// lists checkpoints) is evaluated AFTER the durable barrier — see that method.
-    /// This fixed-gate form is used by the unit and failpoints tests only.
-    #[allow(dead_code)]
+    /// Reclaim object-store space: delete fully-dead segments and compact the
+    /// most-fragmented ones, driven entirely off the local `segcount` scan.
+    /// Returns (segments deleted, frames relocated).
+    #[cfg(test)]
     pub async fn reclaim_segments(
         &self,
         delete_horizon: DateTime<Utc>,
-        // When set, a persistent checkpoint pins an un-timeout-able view. The
-        // scan-driven fast path performs no object LIST, so it has no object mtime
-        // to bound that view against and conservatively skips all deletion and
-        // compaction while pinned; the slow orphan sweep is unaffected (orphans
-        // are unreferenced by any manifest). This preserves the invariant that no
-        // segment a persistent checkpoint may reference is ever deleted.
+        // Set when a persistent checkpoint pins a view; see the `pinned` gate
+        // in reclaim_segments_gated.
         protect_before: Option<DateTime<Utc>>,
     ) -> Result<(usize, usize), FsError> {
         self.reclaim_segments_gated(move || {
@@ -1275,14 +1217,12 @@ impl ExtentStore {
     }
 
     /// As [`Self::reclaim_segments`], but the horizon gate is computed by `gate`
-    /// after the durable barrier (seal + flush). This ordering closes a race: a
-    /// checkpoint created concurrently is either visible to `gate` (so its expiry
-    /// extends the delete horizon) or it was created after the flush and therefore
-    /// pins the already-flushed manifest, in which case every segment this pass
-    /// reclaims is already unreferenced. Listing checkpoints before the barrier
-    /// could miss a checkpoint that pins the pre-flush manifest still referencing
-    /// a to-be-dead segment. `gate` returning `Ok(None)` skips the pass (e.g.
-    /// checkpoint listing failed) after the harmless barrier; `Err` aborts.
+    /// after the durable barrier (seal + flush). That ordering closes a race: a
+    /// concurrently-created checkpoint is either visible to `gate` (extending
+    /// the horizon) or pins the already-flushed manifest, in which everything
+    /// this pass reclaims is unreferenced. Listed before the barrier, it could
+    /// pin the pre-flush manifest and a to-be-dead segment with it. `gate`
+    /// returning `Ok(None)` skips the pass; `Err` aborts.
     pub async fn reclaim_segments_gated<F, Fut>(&self, gate: F) -> Result<(usize, usize), FsError>
     where
         F: FnOnce() -> Fut,
@@ -1301,30 +1241,24 @@ impl ExtentStore {
         }
         tracing::debug!("segment GC: durable barrier done (sealed + flushed), scanning extents");
 
-        // Compute the horizon gate now, AFTER the barrier so a checkpoint created
-        // concurrently is visible here or else pins the post-flush manifest.
+        // Post-barrier on purpose; see the doc comment for the race this closes.
         let (delete_horizon, protect_before) = match gate().await? {
             Some(v) => v,
             None => return Ok((0, 0)),
         };
 
         let cur_epoch = self.segments.epoch();
-        // Exclusive counter cutoff for eligibility. It MUST be the still-open
-        // segment's own counter, not `next_counter()`: `seal_open()` above rotated
-        // in a fresh open segment (counter == next_counter()-1) that is still
-        // accepting frames whose FrameLoc+segcount-credit commits may not yet be
-        // visible to the segcount scan below. Using `next_counter()` would make
-        // `counter < cutoff` include that live open segment, so a mid-pass
-        // background seal that PUTs it before its segcount credit lands would
-        // mis-classify a fully-live segment as dead. Taking the open segid's counter
-        // excludes exactly that segment (and anything sealed after this point).
+        // Exclusive counter cutoff for eligibility: the still-open segment's
+        // own counter, not `next_counter()`. seal_open() just rotated in a
+        // fresh open segment that is still accepting frames whose credits may
+        // not be visible to the scan below; `next_counter()` would include it,
+        // and a mid-pass background seal could then mis-classify that fully
+        // live segment as dead.
         let cutoff = self.open.lock().unwrap().segid.counter;
 
-        // A persistent checkpoint pins a view this scan-driven fast path can't bound
-        // by object mtime (it performs no object LIST). Rather than risk deleting or
-        // compacting a segment the pinned view may reference, skip classification
-        // entirely while any persistent checkpoint is present; the scan below still
-        // runs (for the footprint log) but classifies nothing.
+        // A persistent checkpoint pins a view this scan-driven path can't
+        // bound by object mtime (it never LISTs). Skip classification entirely
+        // while one exists; the scan still runs for the footprint log.
         let pinned = protect_before.is_some();
 
         // A segment is reclaimable only once it can no longer gain references: it was
@@ -1332,20 +1266,14 @@ impl ExtentStore {
         let eligible =
             |s: &Segid| s.epoch < cur_epoch || (s.epoch == cur_epoch && s.counter < cutoff);
 
-        // Fast path: The commit worker maintains each segment's `(live, total)` incrementally as
-        // extents are written, overwritten, deleted, and compacted: `live` = bytes
-        // still referenced, `total` = cumulative bytes ever appended (monotonic). A
-        // present-zero `live` means every frame has been superseded or deleted (a
-        // dead segment) and the fragmentation test divides `live` by `total` with no
-        // size from a listing. Absent counters (a compaction orphan whose repoints all
-        // lost the CAS, or a crash between seal and the crediting commit) never appear
-        // here; carrying no counter, they are reclaimed by the slow orphan sweep (the
-        // only `list("segments")`), not this loop. Every delete is still directory-
-        // verified below before removal.
+        // The commit worker keeps each counter's `(live, total)` current, so
+        // `live == 0` is the dead test and `live/total` the fragmentation
+        // ratio — no listing needed. Absent counters never appear in this scan;
+        // the slow orphan sweep owns those. Every delete is still
+        // directory-verified below.
         //
-        // Stream the scan, classifying on the fly and holding only dead segids plus a
-        // bounded set of the most-fragmented candidates, so per-pass RAM is
-        // O(dead + cap), not O(#segments).
+        // Stream the scan, keeping only dead segids plus a bounded candidate
+        // set, so per-pass RAM is O(dead + cap), not O(#segments).
         let (sc_start, sc_end) = self.key_codec.segcount_prefix_range();
         let mut candidates: Vec<(Segid, u64, u64)> = Vec::new(); // (segid, total, live)
         let mut dead: Vec<(Segid, u64)> = Vec::new(); // (segid, total ~= bytes freed)
@@ -1377,9 +1305,6 @@ impl ExtentStore {
             if live == 0 {
                 dead.push((segid, total));
             } else {
-                // Fragmented (repeated rewrites have left mostly-dead frames) or small
-                // (worth merging with neighbours); dense, full-size segments are left
-                // alone.
                 let fragmented = live.saturating_mul(100) < total.saturating_mul(FRAG_LIVE_PERCENT);
                 let small = total < SMALL_SEGMENT_BYTES;
                 if fragmented || small {
@@ -1419,17 +1344,14 @@ impl ExtentStore {
                     to_delete.push((segid, size));
                     delete_at.remove(&segid);
                 } else {
-                    // Not yet due, OR due but over this pass's verify+delete budget.
-                    // Either way keep the deadline: a budget-deferred segment keeps
-                    // its already-elapsed horizon, so the next pass retries it at once
-                    // instead of restarting the wait.
+                    // Not yet due, or over this pass's budget. Keep the deadline
+                    // either way, so a budget-deferred segment retries at once.
                     still_waiting.insert(segid);
                     awaiting_bytes += size;
                 }
             }
-            // Forget segments no longer dead/listed (now live, deleted, or gone) so
-            // the map can't grow unbounded; the retain also drops live segments that
-            // were dead in a prior pass.
+            // Forget segments no longer dead/listed, so the map can't grow
+            // unbounded.
             delete_at.retain(|s, _| still_waiting.contains(s));
             to_delete
         };
@@ -1451,20 +1373,17 @@ impl ExtentStore {
                     continue;
                 }
                 SegmentDeadVerdict::ObjectAbsent => {
-                    // Object already gone (a crash between deleting it and committing
-                    // the counter drop left the counter behind). Nothing to delete;
-                    // drop the orphaned counter so it stops re-appearing as dead each
-                    // pass (and stops wasting a directory GET on a missing object).
+                    // A crash between deleting the object and committing the
+                    // counter drop left the counter behind; drop it so it stops
+                    // re-appearing as dead each pass.
                     freed_counters.push(segid);
                     continue;
                 }
                 SegmentDeadVerdict::Reclaim => {}
             }
             if let Err(e) = self.segments.delete_segment(segid).await {
-                // A transient delete failure on one segment must not abort the pass:
-                // the segments already deleted this pass still need their counters
-                // dropped (else those keys leak), and the rest of the batch can still
-                // proceed. Leave this segment (and its counter) for the next pass.
+                // Don't abort the pass: already-deleted segments still need
+                // their counters dropped. This one retries next pass.
                 error!("segment GC: delete of {segid:?} failed: {e}; skipping (retried next pass)");
                 continue;
             }
@@ -1472,9 +1391,8 @@ impl ExtentStore {
             #[cfg(feature = "failpoints")]
             fail_point!(fp::RECLAIM_AFTER_SEGMENT_DELETE);
 
-            // Audit trail for the irreversible action: which object, when, and the
-            // bytes it carried. The key (not just the segid) so the line joins
-            // directly against object-store access logs.
+            // Audit line for the irreversible delete; the object key joins
+            // against object-store access logs.
             info!(
                 "segment GC: deleted dead segment {:?} at {} (~{})",
                 segid,
@@ -1485,8 +1403,8 @@ impl ExtentStore {
             deleted_bytes += size;
             deleted += 1;
         }
-        // Drop the counters of deleted segments, else one segcount key leaks per
-        // segment ever created. Through the worker (the sole segcount writer).
+        // Drop the counters of deleted segments, else one segcount key leaks
+        // per segment ever created.
         if !freed_counters.is_empty() {
             let mut txn = self.db.new_transaction()?;
             for segid in &freed_counters {
@@ -1526,11 +1444,9 @@ impl ExtentStore {
             (frames_relocated, packed_segments) = self.compact_segments(&selected).await?;
         }
 
-        // One rich info line per pass: the store's footprint (cumulative appended
-        // bytes) and how much is reclaimable (the GC heartbeat + a health signal),
-        // then what this pass did. `total_appended` sums each counter's `total`, so it
-        // slightly exceeds on-store object bytes (segment framing/footer overhead isn't
-        // counted), but tracks live/dead fragmentation without a LIST.
+        // One info line per pass: footprint, reclaimable bytes, and what the
+        // pass did. `total_appended` excludes segment framing overhead, so it
+        // slightly exceeds on-store bytes.
         let reclaimable = total_appended.saturating_sub(total_live);
         let dead_pct = reclaimable
             .saturating_mul(100)
@@ -1569,27 +1485,19 @@ impl ExtentStore {
         Ok((deleted, frames_relocated))
     }
 
-    /// Sweep absent-counter orphan segment objects. This is the only path that
-    /// LISTs the object store; the fast reclaim loop runs entirely off the local
-    /// `segcount` scan and never sees an object without a counter. An orphan is a
-    /// segment object present on the store with no `segcount` key: a compaction
-    /// whose repoints all lost the CAS, or a crash between sealing the object and
-    /// the commit that would have credited its counter. A frame's counter credit and
-    /// its `FrameLoc` commit atomically, so an absent counter means no extent
-    /// references the object — safe to delete. `verify_segment_reclaimable` is the
-    /// fail-closed backstop before every delete.
+    /// Sweep orphan segment objects: present on the store with no `segcount`
+    /// key (a crash between seal and the crediting commit, or a compaction
+    /// whose repoints all lost the CAS). A frame's counter credit commits
+    /// atomically with its FrameLoc, so an absent counter means no extent
+    /// references the object. This is the only path that LISTs the object
+    /// store — hence the slow cadence; the fast reclaim never sees
+    /// counter-less objects.
     ///
-    /// Each candidate passes the same gates as the fast dead-segment reclaim:
-    /// `eligible()` (sealed before this round, so its reference set can only shrink),
-    /// the delete horizon (recorded on first sight, deleted once due), and the
-    /// directory verify. Per-object counter point-gets keep RAM O(1) over the
-    /// listing; only the small orphan set (capped per pass) is buffered.
-    ///
-    /// For the slow (daily) cadence: the LIST + per-object point-get is O(#segments)
-    /// object-store work, the price of finding counter-less objects the local scan
-    /// can't. The caller runs it after the fast reclaim, never concurrently, so no
-    /// in-flight compaction can leave a not-yet-credited packed segment eligible.
-    /// Returns the number of orphan objects reclaimed.
+    /// Candidates pass the same gates as the fast reclaim: `eligible()`, the
+    /// delete horizon, and the directory verify. The caller runs it after the
+    /// fast reclaim, never concurrently, so an in-flight compaction can't
+    /// leave a not-yet-credited packed segment eligible. Returns the number of
+    /// orphans reclaimed.
     pub async fn sweep_orphans(&self, delete_horizon: DateTime<Utc>) -> Result<usize, FsError> {
         // Durable barrier, as in the fast reclaim: seal the open buffer and flush so
         // the eligibility cutoff and the directory verify observe the durable view.
@@ -1600,19 +1508,16 @@ impl ExtentStore {
         }
 
         let cur_epoch = self.segments.epoch();
-        // Exclusive counter cutoff: a segment is reclaimable only once it can no
-        // longer gain a reference — sealed before this round. MUST be the still-open
-        // segment's own counter (see reclaim_segments_gated); a freshly-packed
+        // Same eligibility cutoff as reclaim_segments_gated. A freshly-packed
         // compaction segment always carries a higher counter, so it is never
         // eligible even mid-compaction.
         let cutoff = self.open.lock().unwrap().segid.counter;
         let eligible =
             |s: &Segid| s.epoch < cur_epoch || (s.epoch == cur_epoch && s.counter < cutoff);
 
-        // The one and only list("segments"). Point-get each object's counter as the
-        // listing streams: PRESENT => counted (the fast loop owns it, live or dead);
-        // ABSENT => orphan candidate. Buffer only the (small) orphan set, capped so a
-        // pathological store can't make it O(#segments); the rest sweep next cadence.
+        // The one and only list("segments"). Point-get each object's counter
+        // as the listing streams: present => the fast loop owns it; absent =>
+        // orphan candidate. Cap the buffered set; the rest sweep next cadence.
         let mut orphans: Vec<Segid> = Vec::new();
         let mut scanned = 0usize;
         let stream = self.segments.list_segments_stream();
@@ -1639,9 +1544,8 @@ impl ExtentStore {
             }
         }
 
-        // Horizon gate on the orphan-only map: record each candidate's deadline the
-        // first sweep it's seen and delete once past it. Own map (not `delete_at`) so
-        // the fast loop's retain can't wipe an orphan mid-wait.
+        // Horizon gate on the orphan-only map (see the `orphan_delete_at`
+        // field for why it's separate).
         let now = Utc::now();
         let to_delete = {
             let mut delete_at = self.orphan_delete_at.lock().unwrap();
@@ -1656,22 +1560,19 @@ impl ExtentStore {
                     still_waiting.insert(segid);
                 }
             }
-            // Drop entries for segids no longer listed as orphans (deleted, or since
-            // credited), so the map can't grow without bound.
+            // Drop entries no longer listed as orphans, so the map can't grow
+            // without bound.
             delete_at.retain(|s, _| still_waiting.contains(s));
             to_delete
         };
 
         let mut deleted = 0;
         for segid in to_delete {
-            // Fail-closed: an absent counter should mean nothing references the
-            // object, but confirm via the directory before deleting. A read error or
-            // any still-pointing extent keeps it (leak beats loss). Sound because an
-            // eligible segment can never regain a reference.
+            // Fail-closed, as in the fast reclaim: confirm via the directory
+            // before deleting.
             match self.verify_segment_reclaimable(segid).await {
                 SegmentDeadVerdict::Reclaim => {}
-                // Already gone (deleted concurrently). Nothing to do — an orphan has
-                // no counter to drop.
+                // Deleted concurrently; an orphan has no counter to drop.
                 SegmentDeadVerdict::ObjectAbsent => continue,
                 SegmentDeadVerdict::Keep => {
                     error!(
@@ -1698,11 +1599,10 @@ impl ExtentStore {
         Ok(deleted)
     }
 
-    /// Run the slow orphan sweep at most once per `interval`, gated by a persisted
-    /// wall-clock timestamp so the cadence survives restarts. A process-uptime timer
-    /// would let a frequently-restarting deployment never reach the interval; keying
-    /// off a stored last-run time fires it on wall-clock cadence regardless. Returns
-    /// the orphans reclaimed when it runs, `None` when not yet due.
+    /// Run the slow orphan sweep at most once per `interval`, gated by a
+    /// persisted wall-clock timestamp so the cadence survives restarts (an
+    /// uptime timer would never fire on a frequently-restarting deployment).
+    /// Returns the orphans reclaimed, or `None` when not yet due.
     pub async fn sweep_orphans_if_due(
         &self,
         interval: chrono::Duration,
@@ -1720,13 +1620,13 @@ impl ExtentStore {
         {
             return Ok(None);
         }
-        // Orphans carry no committed FrameLoc, so no manifest (or checkpoint) ever
-        // references them; a modest in-flight floor is the only horizon needed.
+        // No manifest or checkpoint ever references an orphan, so a modest
+        // in-flight floor is the only horizon needed.
         let deleted = self
             .sweep_orphans(now + chrono::Duration::seconds(60))
             .await?;
-        // Persist the completion time AFTER the sweep, so a crash mid-sweep just
-        // re-runs it sooner rather than skipping a whole cadence.
+        // Persist the timestamp after the sweep, so a crash mid-sweep re-runs
+        // it sooner rather than skipping a cadence.
         let mut txn = self.db.new_transaction()?;
         txn.put_bytes(
             &self.key_codec.last_orphan_sweep_key(),
@@ -1753,11 +1653,8 @@ impl ExtentStore {
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
         let dir = match self.segments.read_directory(segid).await {
             Ok(d) => d,
-            // The object is genuinely gone (e.g. a crash between deleting it and
-            // committing its counter drop): trivially dead, and there is nothing to
-            // delete — the caller just drops the leaked counter.
             Err(SegmentStoreError::NotFound) => return SegmentDeadVerdict::ObjectAbsent,
-            // Any other (transient) read error: fail-closed, keep the segment.
+            // Transient read error: fail-closed, keep the segment.
             Err(_) => return SegmentDeadVerdict::Keep,
         };
         // Unique extents the directory names (an extent can recur across rewrites).
@@ -1993,12 +1890,10 @@ impl ExtentStore {
                     && loc.segid == old_segid
                 {
                     txn.put_bytes(&key, Bytes::copy_from_slice(&new_loc.encode()));
-                    // Move the live bytes from source to compacted segment. Only on a
-                    // won CAS: a lost race means a foreground write already debited the
-                    // source, and the relocated frame is dead weight in the new segment
-                    // (no live pointer), so it must not be credited. The source debit is
-                    // live-only (its total stays put); the packed frame is a fresh append
-                    // to the new segment, crediting both live and total.
+                    // Move the bytes only on a won CAS: after a lost race the
+                    // relocated frame is dead weight (no live pointer) and must
+                    // not be credited. Source debit is live-only; the packed
+                    // frame credits both live and total.
                     self.seg_delta(&mut txn, old_segid, -(loc.byte_len as i64), 0);
                     self.seg_delta(
                         &mut txn,
@@ -2015,11 +1910,9 @@ impl ExtentStore {
             }
         }
 
-        // Nothing repointed to the freshly-sealed segment: every gathered frame was
-        // overwritten out from under us before the CAS, so it's a pure orphan (PUT,
-        // no live pointer, no counter). Delete it now instead of leaving a
-        // counter-less object for reclaim to directory-verify and sweep. Best-effort:
-        // a crash before this delete leaves the orphan for reclaim, which handles it.
+        // Nothing repointed: every gathered frame was overwritten before the
+        // CAS, leaving a pure orphan (PUT, no pointer, no counter). Delete it
+        // now, best-effort; a crash here leaves it for the orphan sweep.
         let orphaned = swapped == 0;
         let mut orphan_note = "";
         if orphaned && let Some(segid) = new_segid {
@@ -2379,7 +2272,7 @@ mod tests {
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[2u8; 1000]);
     }
 
-    // The slow sweep DOES reclaim the no-counter orphan the fast loop leaves alone:
+    // The slow sweep reclaims the no-counter orphan the fast loop leaves alone:
     // it lists the objects, point-gets each counter, and deletes those with none
     // (directory-verified first). Live data is untouched.
     #[tokio::test]

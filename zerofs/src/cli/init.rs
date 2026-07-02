@@ -403,20 +403,16 @@ impl Writer {
             parts_cache,
         } = opened;
 
-        // Segment reads reuse SlateDB's prefetch parts cache: sequential read-ahead
-        // for cold reads, segment and SST objects sharing one budget (keyed by path).
-        // The seal-cache still serves same-process read-after-write with zero GETs.
+        // Segment reads share SlateDB's prefetch parts cache (one budget, keyed
+        // by path); the seal-cache still serves same-process read-after-write.
         //
-        // Segments are namespaced under the db path (the same root SlateDB uses for
-        // its wal/compacted/manifest subtrees, which never include `segments/`), so
-        // multiple databases sharing one bucket don't see (or collide on) a global
-        // `segments/` keyspace. The prefix sits outside the prefetcher so the parts
-        // cache keys are db-distinct as well.
+        // Segments are namespaced under the db path, so databases sharing one
+        // bucket don't collide on a global `segments/` keyspace. The prefix
+        // sits outside the prefetcher so the cache keys are db-distinct too.
         //
-        // Retries sit under the prefetcher so a single-flight window GET rides out
-        // a transient backend error before failing every reader waiting on it, and
-        // above the tracing layer so each attempt is visible to otrace. SlateDB's
-        // own SST/manifest I/O is covered by its internal retrying wrapper.
+        // Retries sit under the prefetcher, so a single-flight window GET rides
+        // out a transient error before failing every waiting reader, and above
+        // the tracing layer, so each attempt is visible to otrace.
         let retrying: Arc<dyn object_store::ObjectStore> =
             Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
                 self.prepared.object_store.clone(),
@@ -480,7 +476,7 @@ impl Writer {
 
 impl DbOpen {
     /// A promoted standby replays its buffered tail into the freshly-opened data
-    /// db (idempotent, seqno order) and flushes BEFORE serving, so no acknowledged
+    /// db (idempotent, seqno order) and flushes before serving, so no acknowledged
     /// write is lost.
     async fn replay_tail(self) -> Result<Replayed> {
         if let (Some(ha), SlateDbHandle::ReadWrite(raw_db)) = (&self.ha, &self.slatedb)
@@ -489,7 +485,7 @@ impl DbOpen {
             let mut buf = buffer.lock().await;
             // Prune the tail to exactly what this db already holds. The leader
             // stamps each shipped batch with its seqno (`ha_seqno_key`), flushed
-            // ATOMICALLY with the batch, so the db's durable value is the highest
+            // atomically with the batch, so the db's durable value is the highest
             // shipped batch flushed here. A deposed leader that kept flushing Solo
             // (a partition) advances it past the whole tail, so we drop those stale
             // batches instead of replaying them (a replay would regress monotonic
@@ -539,9 +535,8 @@ impl DbOpen {
                     buf.len()
                 );
                 let key_codec = KeyCodec::new();
-                // Un-PUT segments referenced by shipped extent writes, rebuilt on the
-                // shared store so the replayed FrameLocs resolve (no-acked-loss for
-                // un-fsync'd writes under the segment data plane).
+                // Un-PUT segments referenced by shipped extent writes, rebuilt
+                // on the shared store so the replayed FrameLocs resolve.
                 let mut recon: std::collections::HashMap<
                     crate::segment::Segid,
                     Vec<crate::segment_store::ReconFrame>,
@@ -584,17 +579,15 @@ impl DbOpen {
                         .await
                         .context("HA takeover tail replay failed")?;
                 }
-                // Materialize the un-PUT segments before serving — the FrameLocs are
-                // now durable; HEAD-guarded so a leader-sealed object is never
-                // overwritten with a (possibly partial) reconstruction.
+                // Materialize the un-PUT segments before serving; HEAD-guarded
+                // so a leader-sealed object is never overwritten with a
+                // (possibly partial) reconstruction.
                 let mut materialized = 0usize;
                 for (segid, frames) in &recon {
-                    // A materialization failure MUST NOT be swallowed: the next step
-                    // flushes these FrameLocs durably, so serving without the segment
-                    // object would leave a permanent dangling pointer (EIO forever)
-                    // for writes the old leader already acked as replicated. Retry a
-                    // transient object-store error a few times, then fail takeover so
-                    // it is retried from a clean state rather than serving corruption.
+                    // A failure here can't be swallowed: the next step flushes
+                    // these FrameLocs durably, and serving without the segment
+                    // object would leave acked writes permanently dangling.
+                    // Retry a few times, then fail the takeover.
                     const MATERIALIZE_ATTEMPTS: u32 = 5;
                     let mut attempt = 0;
                     loop {

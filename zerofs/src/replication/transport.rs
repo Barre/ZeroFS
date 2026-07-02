@@ -218,7 +218,7 @@ impl ReplicationService for ReplicationReceiver {
 }
 
 /// The leader side: ships batches and reports whether the standby accepted them.
-/// Errors propagate so the caller does NOT ack the client on a failed ship.
+/// Errors propagate so the caller does not ack the client on a failed ship.
 pub struct ReplicationSender {
     client: Mutex<ReplicationServiceClient<Channel>>,
 }
@@ -414,7 +414,7 @@ mod tests {
     // standby tail, then RESTARTS (epoch bumps to 6, Replicator seqno resets to 1)
     // and re-ships new writes at low seqnos while the standby keeps its term-5
     // tail. A later takeover replays in seqno order, so the stale term-5 batches
-    // (high seqno) replay AFTER the term-6 write (low seqno) and must not clobber
+    // (high seqno) replay after the term-6 write (low seqno) and must not clobber
     // it. seqno is per-term, not global, so the buffer must drop a superseded epoch.
     #[tokio::test]
     async fn stale_prior_epoch_tail_does_not_clobber_newer_writes() {
@@ -474,11 +474,9 @@ mod tests {
         );
     }
 
-    // Repro: a standby promotes (leading=true), then a deposed leader that shares
-    // the same writer epoch (its object-store fence hasn't bitten yet) re-ships.
-    // A leader must NEVER accept a ship: doing so would let the zombie ack an
-    // acked-but-lost write and poison this node's dedup. Being the writer is the
-    // authoritative "every other term is deposed" signal.
+    // A standby promotes (leading=true), then a deposed leader sharing the
+    // same writer epoch re-ships. The ship must be rejected — see the
+    // `leading` check in `replicate`.
     #[tokio::test]
     async fn promoted_node_rejects_equal_epoch_zombie_ship() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));

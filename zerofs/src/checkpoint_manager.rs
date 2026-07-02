@@ -82,14 +82,11 @@ impl CheckpointManager {
             return Err(anyhow!("A checkpoint with name '{}' already exists", name));
         }
 
-        // Seal the open data-plane segment and flush the metadata memtable under
-        // the flush barrier before checkpointing. `CheckpointScope::All` would
-        // freeze+flush the memtable itself, durably publishing any FrameLoc whose
-        // segment is still only in the RAM open buffer (a dangling pointer the
-        // checkpoint would pin forever). Instead we make the latest writes durable
-        // through the seal-gated flush, then checkpoint `Durable` scope, which
-        // captures only the already-durable manifest (no memtable freeze), so a
-        // concurrent un-sealed write is excluded rather than corrupted.
+        // Seal + flush under the barrier, then checkpoint `Durable` scope,
+        // which captures only the already-durable manifest. `Scope::All` would
+        // freeze the memtable itself and durably publish FrameLocs whose
+        // segment is still the RAM open buffer — dangling pointers the
+        // checkpoint would pin forever.
         if let Some(pre_flush) = self.pre_flush.get() {
             pre_flush()
                 .await

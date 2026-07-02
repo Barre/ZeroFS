@@ -387,11 +387,9 @@ impl PrefetchingObjectStore {
             .maybe_prefetch_range(location, opts.clone(), fetch_window, access_offset)
             .await?;
         let range = self.canonicalize_range(opts.range.clone(), meta.size)?;
-        // Whichever part leads a window fetch must cover through the request's last
-        // part in one GET, so a large coalesced read is never split just because its
-        // bounds aren't part-aligned. Each part's window therefore reaches from that
-        // part to the request's aligned end, or the ramped fetch window when larger
-        // (which is what prefetches ahead of the request).
+        // Each part's window reaches at least to the request's aligned end, so
+        // a large read is never split just because its bounds aren't
+        // part-aligned; the ramped fetch window applies when larger.
         let end_part = usize::try_from(range.end.div_ceil(self.part_size_bytes as u64))
             .expect("part id exceeds usize");
         let parts = self.split_range_into_parts(range.clone());
@@ -428,12 +426,10 @@ impl PrefetchingObjectStore {
             return;
         }
 
-        // The stream frontier advances in fixed windows with no notion of the
-        // object's length, so a sequential read approaching EOF pushes it past
-        // the end. A GET starting there is unsatisfiable (HTTP 416), not a
-        // useful prefetch; the head is already cached by the stream's earlier
-        // reads, so drop the window here. A window merely *ending* past EOF is
-        // fine: the backend truncates it.
+        // The frontier has no notion of object length, so a stream nearing EOF
+        // pushes it past the end. A GET starting there is unsatisfiable
+        // (HTTP 416) — drop it. A window merely *ending* past EOF is fine: the
+        // backend truncates it.
         if let Some((meta, _)) = self.read_head(&location)
             && prefetch.start >= meta.size
         {
@@ -601,13 +597,10 @@ impl PrefetchingObjectStore {
         Ok(())
     }
 
-    /// Write-through: populate the parts cache from a just-uploaded object's full
-    /// bytes, so the first read after it ages out of the small segment cache is a
-    /// cache hit, not an object-store GET. A single-chunk payload (a sealed
-    /// segment) slices zero-copy; a multi-chunk payload concatenates once. Inserts
-    /// are synchronous (foyer flushes to disk in the background), so this adds no
-    /// I/O wait to the put. The final part is partial when the object isn't a
-    /// part-size multiple — the read path already handles a partial trailing part.
+    /// Write-through: populate the parts cache from a just-uploaded object's
+    /// bytes. A single-chunk payload slices zero-copy; multi-chunk
+    /// concatenates once. Inserts are synchronous (foyer flushes to disk in
+    /// the background), so this adds no I/O wait to the put.
     fn write_through(&self, location: &Path, payload: PutPayload) {
         let chunks: Vec<Bytes> = payload.into_iter().collect();
         let bytes = match chunks.len() {
@@ -624,11 +617,9 @@ impl PrefetchingObjectStore {
         self.warm_object(location, bytes);
     }
 
-    /// Warm the parts cache with an object's full bytes, sliced into part-sized
-    /// entries keyed from part 0 (the same keying the read path uses). For callers
-    /// that already hold the bytes but upload via a path that does not write through
-    /// (multipart), so the object is cached at write time rather than on the first
-    /// post-eviction read.
+    /// Warm the parts cache with an object's full bytes, sliced into
+    /// part-sized entries keyed as the read path expects. For callers that
+    /// hold the bytes but upload via multipart, which doesn't write through.
     pub fn warm_object(&self, location: &Path, bytes: Bytes) {
         let ps = self.part_size_bytes;
         let mut off = 0usize;
@@ -698,12 +689,10 @@ impl PrefetchingObjectStore {
                 parts.remove(&key);
             }
 
-            // Single-flight the miss over the whole window it will fetch: overlapping
-            // reads (the main read plus the read-ahead layers) whose part lands inside
-            // this window join the one GET instead of each issuing their own. The
-            // leader registers every part the window covers and holds a `FetchGuard`
-            // that clears them on drop, whether the fetch completes or the awaiting
-            // read is cancelled, so a dropped read can't strand a slot.
+            // Single-flight the miss over the whole window: overlapping reads
+            // whose part lands inside it join the one GET. The leader
+            // registers every covered part and holds a `FetchGuard` that
+            // clears them on drop, so a cancelled read can't strand a slot.
             let extra_parts = (fetch_window / part_size_bytes).max(1);
             let (shared, _guard) = match fetches.entry(key.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(e) => (e.get().clone(), None),
@@ -754,16 +743,13 @@ impl PrefetchingObjectStore {
         })
     }
 
-    /// Fetch the window of `window_parts` parts starting at `part_id`, cache every
-    /// part it spans, and return `(part_id, window bytes)`. `window_parts` comes
-    /// from the caller so the GET's span always matches the part slots the caller
-    /// registered under the shared fetch. Driven through [`SharedFetch`] so
-    /// concurrent readers of any part inside the window collapse onto this one GET
-    /// and slice their part from the returned bytes.
-    /// `access_offset` is the triggering request's start offset: the stream tracker
-    /// keys on request offsets, so the fetch must be credited under it — the aligned
-    /// window start would miss the stream entirely for an unaligned read, leaving
-    /// `fetched_until` unseeded and the async prefetch pipeline never engaging.
+    /// Fetch `window_parts` parts starting at `part_id` in one GET, cache every
+    /// part spanned, and return `(part_id, window bytes)`. `window_parts` comes
+    /// from the caller so the GET's span matches the part slots registered
+    /// under the shared fetch. `access_offset` is the triggering request's
+    /// start offset: the stream tracker keys on request offsets, so crediting
+    /// the aligned window start instead would miss the stream for an unaligned
+    /// read and the prefetch pipeline would never engage.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_part_window(
         inner: Arc<dyn ObjectStore>,

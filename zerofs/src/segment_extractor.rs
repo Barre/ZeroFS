@@ -2,17 +2,11 @@ use slatedb::{PrefixExtractor, PrefixTarget};
 
 use crate::fs::key_codec::{EXTENT_DOMAIN, META_DOMAIN};
 
-/// Segment extractor that routes keys into two slatedb segments:
-/// `b"meta"` for any metadata kind (`KeyPrefix::Inode..=Tombstone`) and
-/// `b"extent"` for bulk data.
-///
-/// Routing is determined by the leading domain bytes that `KeyCodec`
-/// prepends (see `fs::key_codec`). The kind byte sits
-/// inside the domain segment so the original keyspace ordering within
-/// each domain is preserved.
-///
-/// `b"meta"` and `b"extent"` are disjoint with no proper-prefix relation,
-/// so the antichain invariant SlateDB requires on segment prefixes holds.
+/// Routes keys into two slatedb segments by the leading domain bytes
+/// `KeyCodec` prepends: `b"meta"` for any metadata kind, `b"extent"` for bulk
+/// data. The kind byte sits inside the domain segment, preserving keyspace
+/// ordering within each domain. The two prefixes are disjoint with no
+/// proper-prefix relation, satisfying SlateDB's antichain invariant.
 pub struct ZeroFsSegmentExtractor;
 
 /// Persisted name. Stamped onto the manifest at first creation; checked on

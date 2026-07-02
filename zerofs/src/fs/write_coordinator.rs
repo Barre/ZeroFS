@@ -49,7 +49,7 @@ struct WorkerContext {
     global_stats: Arc<FileSystemGlobalStats>,
     sync_writes: bool,
     /// Present on a leader with a standby: each batch is shipped and durably
-    /// acked here BEFORE it is applied (commit-then-apply). `None` for a
+    /// acked here before it is applied (commit-then-apply). `None` for a
     /// single-node or a solo (post-failover) node, which applies directly.
     replicator: Option<Arc<crate::replication::Replicator>>,
     /// Idempotency cache: applied op-ids are recorded here atomically with the
@@ -129,14 +129,12 @@ impl WeakWriteCoordinator {
     }
 }
 
-/// Materialize per-segment `(live, total)` deltas as absolute `segcount` values:
-/// aggregate per key, RMW-read the current value, write the new absolute into
-/// `batch`, and return the `(key, value)` pairs written so a replicating caller can
-/// ship them. `live` credits on write and debits on overwrite/delete/relocate-out;
-/// `total` only ever credits (a debit carries `total_delta == 0`), so it is the
-/// cumulative-appended-bytes denominator the compactor divides `live` by and never
-/// decreases. Correctness rests on the caller being the SOLE writer of these keys
-/// (the commit worker, or a no-coordinator test path) so the RMW never races.
+/// Materialize per-segment `(live, total)` deltas as absolute `segcount`
+/// values: aggregate per key, RMW-read the current value, write the new
+/// absolute into `batch`, and return the `(key, value)` pairs so a replicating
+/// caller can ship them. `total` only ever credits (a debit carries
+/// `total_delta == 0`). Correctness rests on the caller being the sole writer
+/// of these keys, so the RMW never races.
 pub(crate) async fn stage_seg_deltas(
     db: &Db,
     deltas: impl IntoIterator<Item = (bytes::Bytes, (i64, i64))>,
@@ -148,14 +146,11 @@ pub(crate) async fn stage_seg_deltas(
         e.0 = e.0.saturating_add(dl);
         e.1 = e.1.saturating_add(dt);
     }
-    // Read each segment's current base concurrently: a large overwrite can touch
-    // many distinct old segments, and a serial RMW would be O(#segments) round
-    // trips. Still race-free because this worker is the sole writer of these keys,
-    // so no concurrent write can invalidate a base between the read and the write.
-    // The base MUST come from a successful read: swallowing a read error as 0 would
-    // undercount a live segment (a debit clamps the absolute to 0, a credit drops
-    // the real base), and an undercount lets GC delete a still-referenced segment
-    // (data loss). Fail the batch so the caller retries instead.
+    // Read each segment's base concurrently: a large overwrite can touch many
+    // old segments, and a serial RMW would be O(#segments) round trips. Still
+    // race-free — this worker is the keys' sole writer. A failed read must
+    // fail the batch, not default to 0: an undercounted live segment is one GC
+    // can delete (data loss).
     let bases: Vec<SegBase> = stream::iter(agg)
         .map(|(key, net)| async move {
             match db.get_bytes(&key).await {
@@ -175,9 +170,7 @@ pub(crate) async fn stage_seg_deltas(
     let mut out = Vec::with_capacity(bases.len());
     for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
         let live = (cur_live as i128 + net_live as i128).max(0) as u64;
-        // `total` only ever grows (credited on write, never debited): clamp it to at
-        // least its current value so it stays the cumulative-appended-bytes
-        // denominator the compactor divides `live` by.
+        // `total` is monotonic: clamp to at least its current value.
         let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
         let val = KeyCodec::encode_segcount(live, total);
         batch.put_bytes(key.clone(), val.clone());
@@ -231,7 +224,7 @@ async fn worker_loop(
                 entry.0 = entry.0.saturating_add(delta.bytes);
                 entry.1 = entry.1.saturating_add(delta.inodes);
             }
-            // Segment counter deltas: aggregate per key BEFORE apply_to consumes the
+            // Segment counter deltas: aggregate per key before apply_to consumes the
             // txn (apply_to merges only the ops and drops the deltas).
             for (key, (dl, dt)) in txn.take_seg_deltas() {
                 let e = seg_map.entry(key).or_default();
@@ -287,10 +280,9 @@ async fn worker_loop(
         let seg_abs = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await {
             Ok(v) => v,
             Err(e) => {
-                // A segcount base read failed. Committing with a guessed base would
-                // undercount a live segment and let GC delete it (data loss), so
-                // abort the whole batch before shipping or committing: reply Err so
-                // every caller retries, and ship/commit nothing.
+                // A segcount base read failed; committing with a guessed base
+                // risks data loss (see stage_seg_deltas). Abort the whole batch
+                // before shipping or committing.
                 for reply in replies {
                     let _ = reply.send(Err(e));
                 }
@@ -306,15 +298,13 @@ async fn worker_loop(
             }
         }
 
-        // Attach the sealed bytes of any still-un-PUT segment an extent write points
-        // at, so the standby can materialize it on takeover (no-acked-loss even for
-        // un-fsync'd writes). Already-PUT segments stay plain Puts (read from the
-        // shared store).
+        // Attach the sealed bytes of any still-un-PUT segment an extent write
+        // points at, so the standby can materialize it on takeover.
         if replicating {
             repl_ops = ctx.extent_store.enrich_repl_ops(repl_ops);
         }
 
-        // Commit-then-apply: ship and await the standby's durable ack BEFORE
+        // Commit-then-apply: ship and await the standby's durable ack before
         // applying, so a visible write is always replicated. `ship` returns None
         // when solo (no standby, or just downgraded); a solo write is still valid,
         // just single-node durable until the standby returns.
@@ -328,7 +318,7 @@ async fn worker_loop(
         };
 
         // HA: stamp this data db with the highest shipped batch seqno, flushed
-        // ATOMICALLY with the batch. On takeover a promoted standby prunes its
+        // atomically with the batch. On takeover a promoted standby prunes its
         // buffered tail to this watermark, so a batch already flushed here is
         // never replayed (replaying a stale batch would regress monotonic
         // counters and double-count stats against the newer db state). Local
@@ -346,7 +336,7 @@ async fn worker_loop(
         // Ok without touching the db; there's nothing to make durable either.
         let mut result: Result<(), FsError> = Ok(());
 
-        // First Solo batch: durably taint this lineage BEFORE acking any Solo write.
+        // First Solo batch: durably taint this lineage before acking any Solo write.
         // A takeover reads the taint and regenerates the lineage token, so these
         // un-shipped writes' later fsync fails honestly instead of matching a
         // carried-forward token. One flush per leader, gated by `taint_written`. If

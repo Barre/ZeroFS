@@ -1,11 +1,8 @@
 //! One-line digests of metadata (LSM) compaction activity.
 //!
-//! The default log filter drops the LSM engine's own per-compaction lines
-//! (one per compaction, in its internal vocabulary; see `init_logging`). This
-//! task retells that story in ZeroFS's voice: at most one line per interval,
-//! emitted only when compaction actually ran, mirroring the segment GC's
-//! one-line-per-pass summary. The L0 depth rides along as the early-warning
-//! signal: flushes stack up in L0 until compaction folds them down, and a
+//! The default log filter drops the LSM engine's own per-compaction lines;
+//! this task summarizes them instead: at most one line per interval, only when
+//! compaction ran. The L0 depth rides along as the early-warning signal — a
 //! full backlog (`l0_max_ssts`) stalls writers.
 
 use std::sync::Arc;

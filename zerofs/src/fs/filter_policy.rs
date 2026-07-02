@@ -5,7 +5,7 @@
 //! `[domain, kind, id]` portion lets a single SST be skipped for an entire
 //! directory on `readdir`.
 //!
-//! Extents are deliberately NOT extracted: `scan_prefix(extent_inode_prefix)`
+//! Extents are deliberately not extracted: `scan_prefix(extent_inode_prefix)`
 //! would expand the SST set considered (every SST holding any extent of the
 //! inode), losing more on iterator init than the filter can save. The narrow
 //! `scan(extent(id, start)..extent(id, end+1))` is already optimal.

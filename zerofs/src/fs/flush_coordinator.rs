@@ -37,12 +37,11 @@ impl FlushCoordinator {
                     pending_senders.push(sender);
                 }
 
-                // Seal the open data-plane segment first, so a durable manifest
-                // never references an un-PUT segment (the durability barrier). If
-                // sealing fails, do not flush — that would durably commit dangling
-                // extents. Hold the flush barrier across seal+flush so a concurrent
-                // commit can't slip a pointer to the (newly-rotated) un-PUT open
-                // buffer into the flushed set.
+                // Seal first (the durability barrier); if sealing fails, don't
+                // flush — that would durably commit dangling extents. Hold the
+                // flush barrier across seal+flush so a concurrent commit can't
+                // slip a pointer to the newly-rotated open buffer into the
+                // flushed set.
                 let result = {
                     let _barrier = db.flush_barrier().write_owned().await;
                     match hook.get() {

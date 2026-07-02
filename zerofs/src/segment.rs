@@ -73,9 +73,9 @@ impl Segid {
     }
 
     /// Object key under which this segment is stored. Sharded on the counter's
-    /// low byte so consecutive segments round-robin across 256 object-store
-    /// prefixes: classic S3 hot-prefixes on a monotonic tail otherwise, and reads
-    /// are exact-key (FrameLoc -> path), so the shard costs the read path nothing.
+    /// low byte so consecutive segments round-robin across 256 prefixes (a
+    /// monotonic tail would hot-spot one S3 partition); reads are exact-key,
+    /// so the shard costs the read path nothing.
     pub fn object_key(self) -> String {
         format!(
             "segments/{:02x}/{:016x}/{:016x}",
@@ -282,11 +282,10 @@ pub(crate) fn seal_compressed_frame(
     Ok(codec.seal_compressed(compressed, &frame_aad(segid, frame_index, inode, extent))?)
 }
 
-/// Seal the segment directory into its AEAD frame. This is the one fallible step
-/// of finalizing, kept separate from [`assemble_segment`] so a caller holding the
-/// live open buffer can run it BEFORE taking/rotating that buffer: on failure the
-/// buffer stays intact to retry, instead of its extent bytes being dropped while
-/// the already-committed FrameLocs are left dangling.
+/// Seal the segment directory into its AEAD frame. The one fallible step of
+/// finalizing, kept separate from [`assemble_segment`] so a caller can run it
+/// before taking the live open buffer: on failure the buffer stays intact to
+/// retry.
 pub(crate) fn seal_directory(
     codec: &FrameCodec,
     segid: Segid,
@@ -303,12 +302,10 @@ pub(crate) fn seal_directory(
     Ok(codec.seal(&dir_plain, &dir_aad(segid, k))?)
 }
 
-/// Append an already-sealed directory (from [`seal_directory`]) and the plaintext
-/// CRC footer to a frame region, producing the final segment object bytes. `k` is
-/// the directory entry count. Infallible: once [`seal_directory`] has succeeded,
-/// finalization cannot fail partway, so a caller may take the buffer knowing the
-/// segment will materialize. Shared by [`SegmentBuilder`] and the data plane's
-/// open-segment buffer.
+/// Append an already-sealed directory and the plaintext CRC footer to a frame
+/// region, producing the final segment bytes. `k` is the directory entry
+/// count. Infallible, so a caller that has run [`seal_directory`] may take the
+/// buffer knowing the segment will materialize.
 pub(crate) fn assemble_segment(
     segid: Segid,
     mut buf: Vec<u8>,
@@ -331,11 +328,10 @@ pub(crate) fn assemble_segment(
     footer[F_COUNTER..F_COUNTER + 8].copy_from_slice(&segid.counter.to_le_bytes());
     footer[F_SEALED_SEQNO..F_SEALED_SEQNO + 8].copy_from_slice(&sealed_seqno.to_le_bytes());
     footer[F_TOTAL_LEN..F_TOTAL_LEN + 8].copy_from_slice(&total_len.to_le_bytes());
-    // F_RESERVED stays zero. The CRC covers only the metadata tail — the directory
-    // plus footer[0..F_CRC], i.e. bytes[dir_offset .. total_len - 8]. Frames carry
-    // per-frame AEAD, so they aren't re-covered here; this keeps the CRC a cheap
-    // keyless check over the one plaintext region (the footer) and lets a reader
-    // verify it from a ranged tail read instead of the whole object.
+    // F_RESERVED stays zero. The CRC covers only the metadata tail
+    // (bytes[dir_offset .. total_len - 8]): frames carry per-frame AEAD, so a
+    // reader can verify the tail from a ranged read instead of the whole
+    // object.
     buf.extend_from_slice(&footer);
     let crc_end = buf.len() - (FOOTER_LEN - F_CRC);
     let crc = crc32c::crc32c(&buf[dir_offset as usize..crc_end]);
@@ -345,10 +341,9 @@ pub(crate) fn assemble_segment(
 }
 
 /// Seal the directory and assemble the final segment bytes in one step, for
-/// callers that own `buf` outright and have nothing to preserve on error
-/// ([`SegmentBuilder::finish`], HA-takeover materialization). The open-segment
-/// buffer instead uses [`seal_directory`] + [`assemble_segment`] so a seal error
-/// can't drop it.
+/// callers that own `buf` outright and have nothing to preserve on error. The
+/// open-segment buffer instead uses [`seal_directory`] + [`assemble_segment`]
+/// so a seal error can't drop it.
 pub(crate) fn finalize_segment(
     codec: &FrameCodec,
     segid: Segid,

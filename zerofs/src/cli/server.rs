@@ -430,17 +430,14 @@ pub(crate) async fn build_parts_hybrid(
         .map_err(|e| foyer_build_error("parts foyer hybrid build failed", e))
 }
 
-/// Split the user's configured disk-cache total into
+/// Split the configured disk-cache total into
 /// (parts_disk_bytes, decoded_blocks_disk_bytes).
 ///
-/// SlateDB holds only metadata (inode/dir entries + 32-byte extent
-/// pointers): a small working set that the block cache and metadata warming keep
-/// hot, and one the raw-parts cache backs anyway (it caches SlateDB's SST object
-/// bytes next to the segment bytes, keyed by path, so a decoded-cache miss is a
-/// parts-cache hit plus a cheap re-decode). So the decoded-blocks (metadata)
-/// cache takes only a bounded slice and the raw-parts cache, where the bulk
-/// segment bytes live, gets the rest. Floors keep either side from collapsing on
-/// a tiny config.
+/// SlateDB holds only metadata — a small working set the raw-parts cache backs
+/// anyway (it caches SST object bytes next to segment bytes, so a decoded-cache
+/// miss is a parts-cache hit plus a re-decode). The decoded-blocks side gets a
+/// bounded slice; the parts cache, where the bulk segment bytes live, gets the
+/// rest. Floors keep either side from collapsing on a tiny config.
 pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
     const MIN_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB floor per side
     // u64: 16 GiB overflows usize on 32-bit targets
@@ -453,12 +450,9 @@ pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
 }
 
 /// Split the configured memory-cache total into (parts_memory_bytes,
-/// decoded_blocks_memory_bytes). Same data-favored split as [`split_disk_budget`]:
-/// the raw-parts cache holds the bulk segment (file data) bytes and is the primary
-/// read cache, while SlateDB's decoded-metadata blocks need only a slice. Both
-/// tiers come out of the configured budget, so the parts tier scales with the
-/// user's memory cap instead of being a fixed off-budget add-on. Memory-scale
-/// floors (not the disk 1 GiB) so a small default still splits.
+/// decoded_blocks_memory_bytes). Same data-favored split as
+/// [`split_disk_budget`], with memory-scale floors so a small default still
+/// splits.
 pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize) {
     const MIN_BYTES: usize = 32 * 1024 * 1024; // 32 MiB floor per side
     const MAX_META_BYTES: usize = 2 * 1024 * 1024 * 1024; // metadata blocks rarely need more
@@ -535,43 +529,32 @@ pub async fn build_slatedb(
         }
     }
 
-    // The WAL is permanently off; a correctness requirement, not a tuning choice.
-    // With the WAL on, SlateDB flushes it durably on the write path once it
-    // crosses `max_wal_bytes_size` (which SlateDB ties to `l0_sst_size_bytes`),
-    // without taking our seal barrier, so a FrameLoc can become durable while the
-    // segment it points at is still the un-PUT open buffer (a dangling pointer /
-    // post-crash EIO). With the WAL off, `db.flush()` is a `FlushType::MemTable`
-    // freeze, so the barrier-gated flush (which seals the open segment first) is
-    // the only path that makes metadata durable, and it drains the active memtable
-    // on every flush (bounding its RAM; see l0_sst_size_bytes below). Turning the
-    // WAL back on would reopen the hole, so it is not config-overridable.
+    // The WAL is permanently off, a correctness requirement: with it on,
+    // SlateDB flushes durably on the write path without taking our seal
+    // barrier, so a FrameLoc could become durable while its segment is still
+    // the un-PUT open buffer (a dangling pointer after a crash). With it off,
+    // the barrier-gated flush — which seals the open segment first — is the
+    // only path that makes metadata durable.
     let wal_enabled = false;
 
     let settings = slatedb::config::Settings {
         wal_enabled,
         l0_max_ssts,
         l0_max_ssts_per_key: l0_max_ssts,
-        // Disable SlateDB's write-path memtable size-freeze. `flush_interval: None`
-        // does not disable it (that only kills the WAL timer): the size check
-        // (`l0_sst_size_est >= l0_sst_size_bytes`) runs on every write batch and
-        // dispatches a durable L0 SST + manifest commit on a background task that
-        // never takes our seal barrier. Left finite, it would publish FrameLocs
-        // for a still-un-PUT segment (dangling on crash). At usize::MAX, with the
-        // WAL off, the memtable freezes only on our barrier-gated `db.flush()`
-        // (FlushType::MemTable), which seals the open segment first, so a durable
-        // manifest never references an un-PUT segment, and the memtable is drained
-        // (RAM-bounded) on every flush rather than growing to the
-        // max_wal_flushes_before_l0_flush horizon.
+        // Disable SlateDB's write-path memtable size-freeze (`flush_interval:
+        // None` does not — that only kills the WAL timer). Left finite, the
+        // size check would dispatch a durable L0 flush from a background task
+        // that never takes our seal barrier, publishing FrameLocs for a
+        // still-un-PUT segment. At usize::MAX the memtable freezes only on our
+        // barrier-gated `db.flush()`, which also drains it (RAM-bounded) on
+        // every flush.
         l0_sst_size_bytes: usize::MAX,
         compactor_options: None,
         flush_interval: None,
         manifest_poll_interval: std::time::Duration::from_secs(5),
-        // Backpressure ceiling for frozen-but-not-yet-L0 memtables only (the WAL is
-        // off, so WAL bytes are zero and this is the whole count). Our flushes are
-        // barrier-gated and serialized, so at most one frozen memtable exists at a
-        // time and this never actually triggers; it's a generous safety floor, not
-        // a tuning knob (hence no config surface). The active memtable is excluded
-        // from this count and is instead bounded by the periodic autoflush.
+        // Backpressure ceiling for frozen-but-not-yet-L0 memtables. Our flushes
+        // are serialized, so at most one frozen memtable exists at a time and
+        // this never actually triggers — a safety floor, not a tuning knob.
         max_unflushed_bytes: 1_073_741_824,
         compression_codec: None, // Disable compression as we handle it in encryption layer
         l0_flush_parallelism: 16,
@@ -674,10 +657,9 @@ pub async fn build_slatedb(
                 builder = builder.with_wal_object_store(wal_store);
             }
 
-            // The compaction coordinator is bound to the read-write DB, so it runs
-            // only on the current leader, with an embedded worker (self-sufficient,
-            // no external processes needed). SlateDB holds only metadata, so its
-            // compaction is light enough to always run in-process.
+            // The compaction coordinator is bound to the read-write DB, so it
+            // runs only on the current leader. SlateDB holds only metadata, so
+            // its compaction is light enough to embed in-process.
             {
                 let scheduler_options: std::collections::HashMap<String, String> =
                     slatedb::config::SizeTieredCompactionSchedulerOptions {
@@ -791,11 +773,9 @@ pub async fn run_server(
 ) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
-    // Default: ZeroFS's own logs at info, the embedded LSM engine's internals
-    // only at warn and above. The engine's routine story (metadata compaction)
-    // is retold, less verbosely, by the metadata-compaction digest task.
-    // RUST_LOG replaces this entirely (e.g. RUST_LOG='zerofs=trace,slatedb=debug'
-    // for deep debugging).
+    // Default: ZeroFS at info, the embedded LSM engine at warn and above (the
+    // metadata-compaction digest task summarizes its routine activity).
+    // RUST_LOG replaces this entirely.
     let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info,slatedb=warn"));
 
     #[cfg(feature = "tokio-console")]
@@ -881,10 +861,9 @@ pub async fn run_server(
     };
 
     // Metadata compaction digest: at most one line per interval, only when
-    // compaction ran, plus a crossing-only L0 backlog warning. Retells the
-    // story of the engine's per-compaction log lines, which the default
-    // filter drops (see init_logging). Read-write mode only: readers run no
-    // compaction.
+    // compaction ran, plus a crossing-only L0 backlog warning. Summarizes the
+    // engine's per-compaction lines, which the default filter drops.
+    // Read-write mode only: readers run no compaction.
     let digest_handle = match (fs.db.slatedb_metrics(), fs.db.subscribe_status()) {
         (Some(recorder), Some(status)) => Some(crate::metadata_digest::spawn(
             recorder,
@@ -1087,13 +1066,11 @@ pub async fn run_server(
     if !db_mode.is_read_only()
         && let Err(e) = fs.flush_coordinator.flush().await
     {
-        // The final seal-gated flush failed (a segment PUT could not complete), so
-        // the memtable holds FrameLocs pointing at an un-PUT segment. Do NOT call
-        // db.close(): SlateDB's close flushes the memtable while the db is still
-        // healthy, which would durably publish those dangling pointers (permanent
-        // EIO on restart). Exit hard instead — the unflushed writes since the last
-        // good flush were never durable, so discarding them is correct crash
-        // semantics; a durable dangling FrameLoc would be corruption.
+        // The final seal-gated flush failed, so the memtable holds FrameLocs
+        // pointing at an un-PUT segment. db.close() would flush that memtable
+        // and durably publish the dangling pointers; exit hard instead. The
+        // unflushed writes were never durable, so discarding them is correct
+        // crash semantics.
         tracing::error!(
             "Final flush failed during shutdown ({e:?}); exiting without closing the database \
              to avoid durably committing dangling extent pointers. Writes since the last \
