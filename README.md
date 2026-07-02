@@ -17,7 +17,8 @@
 
 ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as raw block devices over NBD. All three servers run in one userspace process. Data is compressed and encrypted before upload.
 
-| | |                                                                               |---|---|
+| | |
+|---|---|
 | **File access** | NFS and 9P servers. `zerofs mount`, the bundled FUSE client, is the recommended Linux mount. |
 | **Block access** | NBD devices with TRIM. FLUSH and FUA replies return only after data is durable. |
 | **Encryption** | Extents are encrypted with XChaCha20-Poly1305. Data key wrapped via Argon2id. |
@@ -98,20 +99,20 @@ gid = 1000  # Required
 <p align="center">
     <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/file_manager.png" alt="ZeroFS Web UI File Manager"
   width="700">
-  </p>
+</p>
 
 The file manager speaks 9P over WebSocket. Drag-and-drop uploads work, including entire folders.
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/dashboard.png" alt="ZeroFS Web UI Dashboard"
   width="700">
-  </p>
+</p>
 
 The dashboard streams stats over gRPC-web, plus a file access tracer.
 
-<p align="center">                                                                                                                                  <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Terminal"
+<p align="center">                                                                     <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Terminal"
   width="700">
-  </p>
+</p>
 
 The terminal boots a Linux VM via [v86](https://github.com/copy/v86), with the filesystem at `/mnt` over the same 9P WebSocket. The guest has no network device.
 
