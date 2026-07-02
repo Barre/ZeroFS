@@ -38,12 +38,11 @@ struct Prepared {
     object_tracer: ObjectTracer,
     actual_db_path: String,
     block_transformer: Arc<dyn BlockTransformer>,
+    segment_codec: crate::frame_codec::FrameCodec,
     cache_config: CacheConfig,
-    segments_enabled: bool,
     dedup: Arc<crate::dedup::DedupCache>,
     replication_params: Option<ReplicationParams>,
     db_mode: DatabaseMode,
-    disable_compactor: bool,
 }
 
 /// Present only with a `replication_listen` address. `leading` answers a peer's
@@ -81,17 +80,19 @@ struct DbOpen {
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     sync_writes: bool,
     ignore_fsync: bool,
+    /// Prefetch-wrapped object store for the segment data plane (cold read-ahead).
+    segment_object_store: Arc<dyn object_store::ObjectStore>,
+    /// Warms the parts cache with a just-sealed segment (multipart uploads bypass
+    /// the prefetcher's own write-through). Applies the same db-path prefix as
+    /// `segment_object_store` so the cache key matches the read path.
+    segment_warm: Option<crate::segment_store::SegmentWarmHook>,
 }
 
 /// The buffered tail (if any) has been replayed into the open db.
 struct Replayed(DbOpen);
 
 impl Prepared {
-    async fn prepare(
-        settings: &Settings,
-        db_mode: DatabaseMode,
-        disable_compactor: bool,
-    ) -> Result<Self> {
+    async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
         let url = settings.storage.url.clone();
 
         let cache_config = CacheConfig {
@@ -171,19 +172,6 @@ impl Prepared {
                 None
             };
 
-        let segments_enabled = crate::segment_extractor::should_enable_segments(
-            &object_store,
-            &db_path,
-            wal_object_store.as_ref(),
-        )
-        .await
-        .context("Failed to determine segment compaction mode")?;
-        if segments_enabled {
-            info!("Segment-oriented compaction enabled (RFC-0024); using v2 key layout");
-        } else {
-            info!("Segment-oriented compaction disabled; using legacy v1 key layout");
-        }
-
         let replication_params = settings
             .replication
             .as_ref()
@@ -214,12 +202,15 @@ impl Prepared {
             object_tracer,
             actual_db_path,
             block_transformer,
+            segment_codec: crate::frame_codec::FrameCodec::new(
+                &encryption_key,
+                crate::segment::SEGMENT_INFO,
+                settings.compression(),
+            ),
             cache_config,
-            segments_enabled,
             dedup,
             replication_params,
             db_mode,
-            disable_compactor,
         })
     }
 
@@ -398,10 +389,8 @@ impl Writer {
             self.prepared.actual_db_path.clone(),
             self.prepared.db_mode,
             settings.lsm,
-            self.prepared.disable_compactor,
             self.prepared.block_transformer.clone(),
             self.prepared.wal_object_store.clone(),
-            self.prepared.segments_enabled,
             self.prepared.replication_params.as_ref(),
         )
         .await
@@ -411,7 +400,36 @@ impl Writer {
             data: slatedb,
             maintenance_runtime,
             metrics_recorder,
+            parts_cache,
         } = opened;
+
+        // Segment reads reuse SlateDB's prefetch parts cache: sequential read-ahead
+        // for cold reads, segment and SST objects sharing one budget (keyed by path).
+        // The seal-cache still serves same-process read-after-write with zero GETs.
+        //
+        // Segments are namespaced under the db path (the same root SlateDB uses for
+        // its wal/compacted/manifest subtrees, which never include `segments/`), so
+        // multiple databases sharing one bucket don't see (or collide on) a global
+        // `segments/` keyspace. The prefix sits outside the prefetcher so the parts
+        // cache keys are db-distinct as well.
+        let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
+            self.prepared.object_store.clone(),
+            parts_cache,
+        ));
+        let db_prefix = Path::from(self.prepared.actual_db_path.clone());
+        let segment_object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::prefix::PrefixStore::new(
+                Arc::clone(&prefetch) as Arc<dyn object_store::ObjectStore>,
+                db_prefix.clone(),
+            ));
+        // Warm the parts cache at seal time. `put_segment` passes the unprefixed
+        // object path, so prepend the db prefix exactly as PrefixStore would, giving
+        // the same cache key the read path derives.
+        let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
+            Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes| {
+                let full: Path = db_prefix.parts().chain(loc.parts()).collect();
+                prefetch.warm_object(&full, bytes);
+            }));
 
         let db_handle = slatedb.clone();
         // Now the writer; the Hello handler reports `leading` so a (re)starting
@@ -445,6 +463,8 @@ impl Writer {
             metrics_recorder,
             sync_writes,
             ignore_fsync,
+            segment_object_store,
+            segment_warm,
         })
     }
 }
@@ -469,7 +489,7 @@ impl DbOpen {
             // stay > the watermark and are replayed (un-fsynced recovery). Trust it
             // only when written by this same term, since the seqno restarts per term.
             {
-                let codec = KeyCodec::new(self.prepared.segments_enabled);
+                let codec = KeyCodec::new();
                 match raw_db.get(&codec.ha_seqno_key()).await {
                     Ok(Some(v)) => {
                         if let Some((epoch, seqno)) = KeyCodec::decode_ha_seqno(&v) {
@@ -509,6 +529,14 @@ impl DbOpen {
                     "HA takeover: replaying {} buffered batch(es) into the data db",
                     buf.len()
                 );
+                let key_codec = KeyCodec::new();
+                // Un-PUT segments referenced by shipped extent writes, rebuilt on the
+                // shared store so the replayed FrameLocs resolve (no-acked-loss for
+                // un-fsync'd writes under the segment data plane).
+                let mut recon: std::collections::HashMap<
+                    crate::segment::Segid,
+                    Vec<crate::segment_store::ReconFrame>,
+                > = std::collections::HashMap::new();
                 for (_seqno, ops) in buf.batches_in_order() {
                     let mut batch = slatedb::WriteBatch::new();
                     for op in ops {
@@ -517,6 +545,23 @@ impl DbOpen {
                                 batch.put_bytes(k.clone(), v.clone())
                             }
                             crate::replication::ReplOp::Delete(k) => batch.delete(k.clone()),
+                            crate::replication::ReplOp::PutFrame(k, v, frame) => {
+                                batch.put_bytes(k.clone(), v.clone());
+                                if let Some((inode, extent)) = key_codec.parse_extent_key_full(k)
+                                    && let Some(loc) = crate::segment::FrameLoc::decode(v)
+                                {
+                                    recon.entry(loc.segid).or_default().push(
+                                        crate::segment_store::ReconFrame {
+                                            frame_index: loc.frame_index,
+                                            byte_offset: loc.byte_offset,
+                                            byte_len: loc.byte_len,
+                                            inode,
+                                            extent,
+                                            bytes: frame.clone(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     raw_db
@@ -529,6 +574,67 @@ impl DbOpen {
                         )
                         .await
                         .context("HA takeover tail replay failed")?;
+                }
+                // Materialize the un-PUT segments before serving — the FrameLocs are
+                // now durable; HEAD-guarded so a leader-sealed object is never
+                // overwritten with a (possibly partial) reconstruction.
+                let mut materialized = 0usize;
+                for (segid, frames) in &recon {
+                    // A materialization failure MUST NOT be swallowed: the next step
+                    // flushes these FrameLocs durably, so serving without the segment
+                    // object would leave a permanent dangling pointer (EIO forever)
+                    // for writes the old leader already acked as replicated. Retry a
+                    // transient object-store error a few times, then fail takeover so
+                    // it is retried from a clean state rather than serving corruption.
+                    const MATERIALIZE_ATTEMPTS: u32 = 5;
+                    let mut attempt = 0;
+                    loop {
+                        match crate::segment_store::materialize_segment_if_absent(
+                            &self.segment_object_store,
+                            &self.prepared.segment_codec,
+                            *segid,
+                            frames,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                materialized += 1;
+                                break;
+                            }
+                            Ok(false) => break,
+                            Err(e) => {
+                                attempt += 1;
+                                if attempt >= MATERIALIZE_ATTEMPTS {
+                                    return Err(anyhow::anyhow!(
+                                        "HA takeover: reconstructing un-PUT segment {:?} failed \
+                                         after {} attempts: {}. Aborting takeover rather than \
+                                         durably committing a dangling FrameLoc for an acked write.",
+                                        segid,
+                                        MATERIALIZE_ATTEMPTS,
+                                        e
+                                    ));
+                                }
+                                tracing::warn!(
+                                    "HA takeover: reconstructing segment {:?} failed \
+                                     (attempt {}/{}): {}; retrying",
+                                    segid,
+                                    attempt,
+                                    MATERIALIZE_ATTEMPTS,
+                                    e
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    200 * attempt as u64,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+                if materialized > 0 {
+                    info!(
+                        "HA takeover: materialized {} un-PUT segment(s) from the replayed tail",
+                        materialized
+                    );
                 }
                 raw_db
                     .flush()
@@ -552,6 +658,8 @@ impl Replayed {
             metrics_recorder,
             sync_writes,
             ignore_fsync,
+            segment_object_store,
+            segment_warm,
         } = self.0;
 
         // A live-standby takeover iff we observed a live leader's epoch on the
@@ -649,12 +757,14 @@ impl Replayed {
             metrics_recorder,
             sync_writes,
             ignore_fsync,
-            prepared.segments_enabled,
             lease,
             replicator,
             prepared.dedup,
             is_live_takeover,
             prepared.object_tracer.clone(),
+            segment_object_store,
+            prepared.segment_codec,
+            segment_warm,
         )
         .await
         .context("Failed to initialize filesystem")?;
@@ -680,9 +790,8 @@ impl Replayed {
 pub async fn initialize_filesystem(
     settings: &Settings,
     db_mode: DatabaseMode,
-    disable_compactor: bool,
 ) -> Result<InitResult> {
-    Prepared::prepare(settings, db_mode, disable_compactor)
+    Prepared::prepare(settings, db_mode)
         .await?
         .start_receiver()?
         .become_writer()

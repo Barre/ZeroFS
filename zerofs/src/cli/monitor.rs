@@ -466,8 +466,8 @@ fn render_gc_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
                 .unwrap_or_default(),
         )),
         Line::from(format!(
-            "Chunks deleted: {} ({} GC runs)",
-            s.map(|s| s.gc_chunks_deleted.to_formatted_string(&Locale::en))
+            "Extents deleted: {} ({} GC runs)",
+            s.map(|s| s.gc_extents_deleted.to_formatted_string(&Locale::en))
                 .unwrap_or_default(),
             s.map(|s| s.gc_runs.to_formatted_string(&Locale::en))
                 .unwrap_or_default(),

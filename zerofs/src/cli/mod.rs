@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 pub mod checkpoint;
-pub mod compactor;
 pub mod debug;
 pub mod fatrace;
 pub mod flush;
@@ -41,11 +40,6 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
-        /// Keep the compaction coordinator but disable its embedded worker,
-        /// offloading compaction execution to standalone `zerofs compactor`
-        /// worker(s), at least one of which must then be running
-        #[arg(long)]
-        no_compactor: bool,
     },
     /// Change the encryption password
     ///
@@ -75,15 +69,6 @@ pub enum Commands {
     },
     /// Trace object store requests in real-time
     Otrace {
-        #[arg(short, long)]
-        config: PathBuf,
-    },
-    /// Run a standalone compaction worker for the database
-    ///
-    /// Executes compaction jobs scheduled by the coordinator inside `zerofs run`.
-    /// Run one or more alongside the writer; pair with `zerofs run --no-compactor`
-    /// to move all compaction execution off the writer.
-    Compactor {
         #[arg(short, long)]
         config: PathBuf,
     },

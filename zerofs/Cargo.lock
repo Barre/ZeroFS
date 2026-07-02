@@ -837,6 +837,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4186,8 +4195,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slatedb"
-version = "0.14.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=9bfd234182d392a1ec217b4f84ee204a2c3544bd#9bfd234182d392a1ec217b4f84ee204a2c3544bd"
+version = "0.14.1"
+source = "git+https://github.com/Barre/slatedb.git?rev=9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c#9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4230,8 +4239,8 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.14.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=9bfd234182d392a1ec217b4f84ee204a2c3544bd#9bfd234182d392a1ec217b4f84ee204a2c3544bd"
+version = "0.14.1"
+source = "git+https://github.com/Barre/slatedb.git?rev=9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c#9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c"
 dependencies = [
  "chrono",
  "log",
@@ -4245,8 +4254,8 @@ dependencies = [
 
 [[package]]
 name = "slatedb-txn-obj"
-version = "0.14.0"
-source = "git+https://github.com/Barre/slatedb.git?rev=9bfd234182d392a1ec217b4f84ee204a2c3544bd#9bfd234182d392a1ec217b4f84ee204a2c3544bd"
+version = "0.14.1"
+source = "git+https://github.com/Barre/slatedb.git?rev=9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c#9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5927,7 +5936,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "1.4.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5941,6 +5950,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "console-subscriber",
+ "crc32c",
  "crossterm",
  "dashmap",
  "deku",
@@ -6018,7 +6028,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-csi"
-version = "1.4.5"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",

@@ -2,7 +2,6 @@ mod consistency;
 
 use bytes::Bytes;
 use slatedb::DbBuilder;
-use slatedb::config::Settings;
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::path::Path;
@@ -45,9 +44,22 @@ impl CrashTestContext {
     /// Create a new filesystem instance
     async fn create_fs(&self) -> Arc<ZeroFS> {
         let db_path = Path::from("slatedb");
+        // Mirror the production durability-critical SlateDB config (see
+        // cli/server.rs): WAL off + l0_sst_size_bytes MAX means the only path to a
+        // durable manifest is our seal-gated flush. Without this the harness would
+        // use SlateDB's default WAL recovery, which resurrects un-flushed writes on
+        // restart and so never exercises the barrier the data plane relies on.
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            l0_sst_size_bytes: usize::MAX,
+            l0_max_ssts: 256,
+            l0_max_ssts_per_key: 256,
+            ..Default::default()
+        };
         let slatedb = Arc::new(
             DbBuilder::new(db_path, Arc::clone(&self.object_store))
-                .with_filter_policies(zerofs::fs::filter_policy::filter_policies(true))
+                .with_settings(settings)
+                .with_filter_policies(zerofs::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(zerofs::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
@@ -60,7 +72,12 @@ impl CrashTestContext {
                 u64::MAX,
                 None,
                 false,
-                true,
+                Arc::clone(&self.object_store),
+                zerofs::frame_codec::FrameCodec::new(
+                    &[7u8; 32],
+                    zerofs::segment::SEGMENT_INFO,
+                    zerofs::config::CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),
@@ -164,7 +181,7 @@ async fn test_basic_consistency_after_clean_restart() {
 }
 
 #[tokio::test]
-async fn test_crash_write_after_chunk() {
+async fn test_crash_write_after_extent() {
     let (
         _scenario,
         TestSetup {
@@ -182,7 +199,7 @@ async fn test_crash_write_after_chunk() {
 
     fs.flush_coordinator.flush().await.unwrap();
 
-    fail::cfg(fp::WRITE_AFTER_CHUNK, "panic").unwrap();
+    fail::cfg(fp::WRITE_AFTER_EXTENT, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
     let auth_clone = auth.clone();
@@ -193,7 +210,7 @@ async fn test_crash_write_after_chunk() {
     });
     let _ = handle.await;
 
-    fail::cfg(fp::WRITE_AFTER_CHUNK, "off").unwrap();
+    fail::cfg(fp::WRITE_AFTER_EXTENT, "off").unwrap();
 
     drop(fs);
 
@@ -858,7 +875,7 @@ async fn test_crash_rename_overwrite_after_target_delete() {
 }
 
 #[tokio::test]
-async fn test_crash_gc_after_chunk_delete() {
+async fn test_crash_gc_after_extent_delete() {
     let (
         _scenario,
         TestSetup {
@@ -884,18 +901,19 @@ async fn test_crash_gc_after_chunk_delete() {
 
     fs.flush_coordinator.flush().await.unwrap();
 
-    fail::cfg(fp::GC_AFTER_CHUNK_DELETE, "panic").unwrap();
+    fail::cfg(fp::GC_AFTER_EXTENT_DELETE, "panic").unwrap();
 
     let gc = Arc::new(GarbageCollector::new(
         Arc::clone(&fs.db),
         fs.tombstone_store.clone(),
-        fs.chunk_store.clone(),
+        fs.extent_store.clone(),
         Arc::clone(&fs.stats),
+        None,
     ));
     let handle = tokio::task::spawn(async move { gc.run().await });
     let _ = handle.await;
 
-    fail::cfg(fp::GC_AFTER_CHUNK_DELETE, "off").unwrap();
+    fail::cfg(fp::GC_AFTER_EXTENT_DELETE, "off").unwrap();
     drop(fs);
 
     let fs_after = ctx.restart_fs().await;
@@ -934,8 +952,9 @@ async fn test_crash_gc_after_tombstone_update() {
     let gc = Arc::new(GarbageCollector::new(
         Arc::clone(&fs.db),
         fs.tombstone_store.clone(),
-        fs.chunk_store.clone(),
+        fs.extent_store.clone(),
         Arc::clone(&fs.stats),
+        None,
     ));
     let handle = tokio::task::spawn(async move { gc.run().await });
     let _ = handle.await;
@@ -1468,7 +1487,7 @@ async fn test_crash_mkdir_after_commit() {
 }
 
 #[tokio::test]
-async fn test_crash_truncate_after_chunks() {
+async fn test_crash_truncate_after_extents() {
     let (
         _scenario,
         TestSetup {
@@ -1490,7 +1509,7 @@ async fn test_crash_truncate_after_chunks() {
 
     fs.flush_coordinator.flush().await.unwrap();
 
-    fail::cfg(fp::TRUNCATE_AFTER_CHUNKS, "panic").unwrap();
+    fail::cfg(fp::TRUNCATE_AFTER_EXTENTS, "panic").unwrap();
 
     let fs_clone = Arc::clone(&fs);
     let creds_clone = creds;
@@ -1508,7 +1527,7 @@ async fn test_crash_truncate_after_chunks() {
     });
     let _ = handle.await;
 
-    fail::cfg(fp::TRUNCATE_AFTER_CHUNKS, "off").unwrap();
+    fail::cfg(fp::TRUNCATE_AFTER_EXTENTS, "off").unwrap();
     drop(fs);
 
     let fs_after = ctx.restart_fs().await;
@@ -2885,7 +2904,7 @@ async fn test_crash_open_unlink_after_orphan_add() {
 }
 
 /// Defer commits cleanly, then the process crashes before the open fid is
-/// clunked. The startup drain reclaims the orphan: inode + chunks gone, orphan
+/// clunked. The startup drain reclaims the orphan: inode + extents gone, orphan
 /// set empty, namespace effect (name absent) preserved.
 #[tokio::test]
 async fn test_crash_open_unlink_committed_then_crash_drains() {
@@ -2937,7 +2956,7 @@ async fn test_crash_open_unlink_committed_then_crash_drains() {
 }
 
 /// A panic at CLUNK_AFTER_RECLAIM_INODE_DELETE is pre-commit: the reclaim txn
-/// (inode delete + chunk delete + stats delta + orphan-remove) never lands, so
+/// (inode delete + extent delete + stats delta + orphan-remove) never lands, so
 /// the orphan key survives. The next startup drain re-runs reclaim exactly
 /// once (idempotent), leaving a consistent, drained filesystem.
 #[tokio::test]
@@ -2988,4 +3007,267 @@ async fn test_crash_reclaim_after_inode_delete_redrains() {
         fs_after.inode_store.get(file_id).await,
         Err(zerofs::fs::errors::FsError::NotFound)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Data plane (extent-over-segments) crash windows.
+// ---------------------------------------------------------------------------
+
+/// Crash mid-flush, after the open segment is sealed + PUT but before the metadata
+/// manifest is durable. The manifest never captures this write, so on restart it
+/// is absent (the PUT segment is orphaned and reclaimable), never a durable
+/// FrameLoc pointing at a missing segment.
+#[tokio::test]
+async fn test_crash_flush_after_seal_before_manifest() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"f.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 200_000]))
+        .await
+        .unwrap();
+
+    // The flush coordinator task panics between seal and manifest flush; the flush
+    // call then errors (its reply sender was dropped).
+    fail::cfg(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST, "panic").unwrap();
+    let _ = fs.flush_coordinator.flush().await;
+    fail::cfg(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST, "off").unwrap();
+    drop(fs);
+
+    let fs_after = ctx.restart_fs().await;
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(report.is_consistent(), "Inconsistent:\n{report}");
+}
+
+/// Crash mid-compaction, after the packed segment is sealed + PUT but before any
+/// extent is repointed to it. The repoint never commits, so every source frame stays
+/// live and readable (no relocated data lost); the packed segment is orphaned.
+#[tokio::test]
+async fn test_crash_compact_after_seal_before_repoint() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"f.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    // Write + seal segment A, then overwrite extent 0 + seal segment B, so B holds
+    // the only live copy of extent 0 and A's copy is dead.
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 4096]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![2u8; 4096]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    let segids = fs.extent_store.list_segments().await.unwrap();
+    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "panic").unwrap();
+    let es = fs.extent_store.clone();
+    let handle = tokio::task::spawn(async move { es.compact_segments(&segids).await });
+    let _ = handle.await;
+    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
+    drop(fs);
+
+    let fs_after = ctx.restart_fs().await;
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(report.is_consistent(), "Inconsistent:\n{report}");
+    // Extent 0 still resolves to B's live frame: the current content survived.
+    let data = fs_after.extent_store.read(file_id, 0, 4096).await.unwrap();
+    assert_eq!(
+        &data[..],
+        &vec![2u8; 4096][..],
+        "compaction crash lost data"
+    );
+}
+
+/// Crash mid-reclaim, after a dead segment's object is deleted but before its
+/// `segcount` counter key is dropped. The segment was directory-verified dead, so no
+/// FrameLoc dangles; the stale counter is a benign leak (a later pass ignores it, as
+/// the object is no longer listed).
+#[tokio::test]
+async fn test_crash_reclaim_after_segment_delete() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"f.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    // Seal segment A, then overwrite so A becomes fully dead, and seal B.
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 4096]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![2u8; 4096]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    fail::cfg(fp::RECLAIM_AFTER_SEGMENT_DELETE, "panic").unwrap();
+    let es = fs.extent_store.clone();
+    let handle = tokio::task::spawn(async move { es.reclaim_now().await });
+    let _ = handle.await;
+    fail::cfg(fp::RECLAIM_AFTER_SEGMENT_DELETE, "off").unwrap();
+    drop(fs);
+
+    let fs_after = ctx.restart_fs().await;
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(report.is_consistent(), "Inconsistent:\n{report}");
+    let data = fs_after.extent_store.read(file_id, 0, 4096).await.unwrap();
+    assert_eq!(&data[..], &vec![2u8; 4096][..], "reclaim crash lost data");
+}
+
+/// A non-crash seal error on the flush path (the directory AEAD seal fails) must
+/// not drop the open buffer. The just-written extents and their already-committed
+/// FrameLocs stay readable, and once the fault clears a retry seals them durably.
+/// Guards a regression: the buffer was taken and the segid rotated before
+/// finalize ran, so a seal error stranded the extents behind a dangling FrameLoc
+/// (404 -> EIO) with no way to recover them.
+#[tokio::test]
+async fn test_seal_error_preserves_open_buffer() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"f.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    // Two extents' worth, well below the seal threshold, so it sits in the un-sealed
+    // open buffer with its FrameLocs already committed.
+    let payload = vec![7u8; 40_000];
+    fs.write(&auth, file_id, 0, &Bytes::from(payload.clone()))
+        .await
+        .unwrap();
+
+    // Force the seal to fail: the flush must error (no durable manifest) and leave
+    // the open buffer intact.
+    fail::cfg(fp::SEAL_OPEN_FAIL, "return").unwrap();
+    assert!(
+        fs.flush_coordinator.flush().await.is_err(),
+        "a seal error must fail the flush, not silently commit"
+    );
+    // The extent still reads back from the preserved open buffer. Before the fix
+    // this hit a rotated-away, never-PUT segid and errored.
+    let during = fs
+        .extent_store
+        .read(file_id, 0, payload.len() as u64)
+        .await
+        .expect("seal error dropped the open buffer");
+    assert_eq!(&during[..], &payload[..], "open buffer content changed");
+
+    // Fault clears: the retry seals the preserved buffer and the data is durable.
+    fail::cfg(fp::SEAL_OPEN_FAIL, "off").unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+    drop(fs);
+
+    let fs_after = ctx.restart_fs().await;
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(report.is_consistent(), "Inconsistent:\n{report}");
+    let after = fs_after
+        .extent_store
+        .read(file_id, 0, payload.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(&after[..], &payload[..], "retried seal lost the data");
+}
+
+/// With the WAL off and l0_sst_size_bytes at MAX (the production config this
+/// harness mirrors), the only path to a durable manifest is the seal-gated
+/// flush, which PUTs the open segment before committing. So an un-flushed write is
+/// lost cleanly on a crash rather than leaving a durable FrameLoc pointing at a
+/// segment that was never PUT (a dangling 404 -> EIO). A durably-flushed file is
+/// unaffected. This is a consistency check of the un-flushed-write path under the
+/// real config; the seal-before-flush barrier that makes an *explicit* flush safe
+/// is covered by the `*_persists_after_flush` tests.
+#[tokio::test]
+async fn test_unflushed_write_leaves_no_dangling_frameloc() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    // File A: written and flushed, so its open segment is durably PUT.
+    let (a_id, _) = fs
+        .create(&creds, 0, b"a.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    let a_data = Bytes::from(vec![0xA5u8; 20_000]);
+    fs.write(&auth, a_id, 0, &a_data).await.unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+
+    // File B: several extents written without a flush. Their FrameLocs live only in
+    // the memtable and B's open segment is never sealed/PUT.
+    let (b_id, _) = fs
+        .create(&creds, 0, b"b.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    for i in 0..8u64 {
+        fs.write(&auth, b_id, i * 32_768, &Bytes::from(vec![7u8; 30_000]))
+            .await
+            .unwrap();
+    }
+
+    // Crash: drop without flushing. With the WAL off, B's un-flushed state is lost
+    // cleanly rather than resurrected against a segment that was never PUT.
+    drop(fs);
+    let fs_after = ctx.restart_fs().await;
+
+    // No dangling FrameLoc anywhere: verify_consistency reads every file's extents
+    // back and flags any that 404 into EIO.
+    let report = verify_consistency(&fs_after).await.unwrap();
+    assert!(
+        report.is_consistent(),
+        "un-flushed write left a dangling FrameLoc:\n{report}"
+    );
+
+    // The flushed file survived intact (its segment was PUT), so the check above
+    // didn't pass vacuously.
+    let got = fs_after
+        .extent_store
+        .read(a_id, 0, a_data.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(
+        &got[..],
+        &a_data[..],
+        "flushed file lost data across the crash"
+    );
 }

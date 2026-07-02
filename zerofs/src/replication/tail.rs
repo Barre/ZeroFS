@@ -3,6 +3,15 @@
 //! leader's monotonic batch seqno. On takeover the new leader replays this tail
 //! so no acknowledged write is lost.
 //!
+//! Under the segment data plane (RFC-0025) an extent write's value is a `FrameLoc`
+//! pointer whose bytes live in an external `segments/` object that may still be
+//! the leader's un-PUT open buffer. `PutFrame` closes that gap: it ships the
+//! sealed frame bytes alongside the `FrameLoc`, and on takeover the new leader
+//! materializes any missing segment on the shared store from the buffered frames
+//! (HEAD-guarded so a leader-sealed segment is never overwritten). Segment
+//! objects are immutable and deterministically keyed, so that PUT is idempotent
+//! with the leader's.
+//!
 //! Replay is idempotent (last-write-wins per key in seqno order), so keeping an
 //! already-durable batch is harmless. Pruning must therefore stay conservative:
 //! prune too little and you waste memory, prune too much and you lose acked writes.
@@ -15,6 +24,10 @@ use std::collections::BTreeMap;
 pub enum ReplOp {
     Put(Bytes, Bytes),
     Delete(Bytes),
+    /// An extent-write Put (key, FrameLoc value) carrying its sealed frame bytes, so
+    /// the standby can materialize the still-un-PUT segment on takeover. Applied to
+    /// the db exactly like `Put`; the frame bytes are used only for materialization.
+    PutFrame(Bytes, Bytes, Bytes),
 }
 
 #[derive(Default)]

@@ -397,13 +397,12 @@ pub(crate) async fn build_block_hybrid(
 
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
+    memory_bytes: usize,
     disk_bytes: usize,
     foyer_handle: &tokio::runtime::Handle,
 ) -> Result<foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>> {
     use crate::object_store_prefetch::PartKey;
     use bytes::Bytes;
-
-    const PARTS_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 
     let parts_root = cache_root.join("parts_cache");
     tokio::fs::create_dir_all(&parts_root)
@@ -411,7 +410,7 @@ pub(crate) async fn build_parts_hybrid(
         .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
     HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
-        .memory(PARTS_MEMORY_BYTES)
+        .memory(memory_bytes)
         .with_eviction_config(S3FifoConfig::default())
         .with_weighter(|_: &PartKey, v: &Bytes| v.len())
         .storage()
@@ -431,20 +430,39 @@ pub(crate) async fn build_parts_hybrid(
         .map_err(|e| foyer_build_error("parts foyer hybrid build failed", e))
 }
 
-/// Compute (parts_disk_bytes, decoded_blocks_disk_bytes) from a total disk
-/// budget. Parts get 10% of the budget, clamped to [256 MiB, 10 GiB]; the
-/// decoded-blocks hybrid takes the rest. Floors at 256 MiB so neither side
-/// collapses to zero on tiny configurations.
+/// Split the user's configured disk-cache total into
+/// (parts_disk_bytes, decoded_blocks_disk_bytes).
+///
+/// SlateDB holds only metadata (inode/dir entries + 32-byte extent
+/// pointers): a small working set that the block cache and metadata warming keep
+/// hot, and one the raw-parts cache backs anyway (it caches SlateDB's SST object
+/// bytes next to the segment bytes, keyed by path, so a decoded-cache miss is a
+/// parts-cache hit plus a cheap re-decode). So the decoded-blocks (metadata)
+/// cache takes only a bounded slice and the raw-parts cache, where the bulk
+/// segment bytes live, gets the rest. Floors keep either side from collapsing on
+/// a tiny config.
 pub(crate) fn split_disk_budget(total_disk_bytes: usize) -> (usize, usize) {
-    const MIN_PARTS_BYTES: usize = 1024 * 1024 * 1024;
-    const MAX_PARTS_BYTES: usize = 10_usize
-        .saturating_mul(1024)
-        .saturating_mul(1024)
-        .saturating_mul(1024);
+    const MIN_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB floor per side
+    const MAX_META_BYTES: usize = 16 * 1024 * 1024 * 1024; // metadata rarely needs more
 
-    let parts = (total_disk_bytes / 10).clamp(MIN_PARTS_BYTES, MAX_PARTS_BYTES);
-    let parts = parts.min(total_disk_bytes.saturating_sub(MIN_PARTS_BYTES));
-    let decoded = total_disk_bytes.saturating_sub(parts).max(MIN_PARTS_BYTES);
+    let decoded = (total_disk_bytes / 10).clamp(MIN_BYTES, MAX_META_BYTES);
+    let parts = total_disk_bytes.saturating_sub(decoded).max(MIN_BYTES);
+    (parts, decoded)
+}
+
+/// Split the configured memory-cache total into (parts_memory_bytes,
+/// decoded_blocks_memory_bytes). Same data-favored split as [`split_disk_budget`]:
+/// the raw-parts cache holds the bulk segment (file data) bytes and is the primary
+/// read cache, while SlateDB's decoded-metadata blocks need only a slice. Both
+/// tiers come out of the configured budget, so the parts tier scales with the
+/// user's memory cap instead of being a fixed off-budget add-on. Memory-scale
+/// floors (not the disk 1 GiB) so a small default still splits.
+pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize) {
+    const MIN_BYTES: usize = 32 * 1024 * 1024; // 32 MiB floor per side
+    const MAX_META_BYTES: usize = 2 * 1024 * 1024 * 1024; // metadata blocks rarely need more
+
+    let decoded = (total_memory_bytes / 4).clamp(MIN_BYTES, MAX_META_BYTES);
+    let parts = total_memory_bytes.saturating_sub(decoded).max(MIN_BYTES);
     (parts, decoded)
 }
 
@@ -453,6 +471,9 @@ pub struct SlateDbOpen {
     pub data: SlateDbHandle,
     pub maintenance_runtime: Option<tokio::runtime::Handle>,
     pub metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+    /// The raw-parts prefetch cache, returned so the segment store reuses it
+    /// (one budget; segment objects and SST objects share it, keyed by path).
+    pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -462,10 +483,8 @@ pub async fn build_slatedb(
     db_path: String,
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
-    disable_compactor: bool,
     block_transformer: Arc<dyn BlockTransformer>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-    segments_enabled: bool,
     replication: Option<&crate::replication::ReplicationParams>,
 ) -> Result<SlateDbOpen> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
@@ -473,25 +492,23 @@ pub async fn build_slatedb(
 
     let total_disk_bytes = (total_disk_cache_gb * 1_000_000_000.0) as usize;
     let (parts_disk_bytes, hybrid_disk_bytes) = split_disk_budget(total_disk_bytes);
-    let hybrid_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
+    let total_memory_bytes = (total_memory_cache_gb * 1_000_000_000.0) as usize;
+    let (parts_memory_bytes, hybrid_memory_bytes) = split_memory_budget(total_memory_bytes);
 
     info!(
         "Cache allocation - Disk: {:.2}GB total ({} MB decoded-blocks + {} MB raw-parts), \
-         Memory: {:.2}GB",
+         Memory: {:.2}GB total ({} MB decoded-blocks + {} MB raw-parts)",
         total_disk_cache_gb,
         hybrid_disk_bytes / 1_000_000,
         parts_disk_bytes / 1_000_000,
         total_memory_cache_gb,
+        hybrid_memory_bytes / 1_000_000,
+        parts_memory_bytes / 1_000_000,
     );
 
     let l0_max_ssts = lsm_config
         .map(|c| c.l0_max_ssts())
         .unwrap_or(crate::config::LsmConfig::DEFAULT_L0_MAX_SSTS);
-    let max_unflushed_bytes = lsm_config
-        .map(|c| c.max_unflushed_bytes())
-        .unwrap_or_else(|| {
-            (crate::config::LsmConfig::DEFAULT_MAX_UNFLUSHED_GB * 1_000_000_000.0) as usize
-        });
     let max_concurrent_compactions = lsm_config
         .map(|c| c.max_concurrent_compactions())
         .unwrap_or(crate::config::LsmConfig::DEFAULT_MAX_CONCURRENT_COMPACTIONS);
@@ -516,17 +533,44 @@ pub async fn build_slatedb(
         }
     }
 
-    let wal_enabled = lsm_config.map(|c| c.wal_enabled()).unwrap_or(false);
+    // The WAL is permanently off; a correctness requirement, not a tuning choice.
+    // With the WAL on, SlateDB flushes it durably on the write path once it
+    // crosses `max_wal_bytes_size` (which SlateDB ties to `l0_sst_size_bytes`),
+    // without taking our seal barrier, so a FrameLoc can become durable while the
+    // segment it points at is still the un-PUT open buffer (a dangling pointer /
+    // post-crash EIO). With the WAL off, `db.flush()` is a `FlushType::MemTable`
+    // freeze, so the barrier-gated flush (which seals the open segment first) is
+    // the only path that makes metadata durable, and it drains the active memtable
+    // on every flush (bounding its RAM; see l0_sst_size_bytes below). Turning the
+    // WAL back on would reopen the hole, so it is not config-overridable.
+    let wal_enabled = false;
 
     let settings = slatedb::config::Settings {
         wal_enabled,
         l0_max_ssts,
         l0_max_ssts_per_key: l0_max_ssts,
-        l0_sst_size_bytes: 64 * 1024 * 1024,
+        // Disable SlateDB's write-path memtable size-freeze. `flush_interval: None`
+        // does not disable it (that only kills the WAL timer): the size check
+        // (`l0_sst_size_est >= l0_sst_size_bytes`) runs on every write batch and
+        // dispatches a durable L0 SST + manifest commit on a background task that
+        // never takes our seal barrier. Left finite, it would publish FrameLocs
+        // for a still-un-PUT segment (dangling on crash). At usize::MAX, with the
+        // WAL off, the memtable freezes only on our barrier-gated `db.flush()`
+        // (FlushType::MemTable), which seals the open segment first, so a durable
+        // manifest never references an un-PUT segment, and the memtable is drained
+        // (RAM-bounded) on every flush rather than growing to the
+        // max_wal_flushes_before_l0_flush horizon.
+        l0_sst_size_bytes: usize::MAX,
         compactor_options: None,
-        flush_interval: Some(std::time::Duration::from_secs(30)),
+        flush_interval: None,
         manifest_poll_interval: std::time::Duration::from_secs(5),
-        max_unflushed_bytes,
+        // Backpressure ceiling for frozen-but-not-yet-L0 memtables only (the WAL is
+        // off, so WAL bytes are zero and this is the whole count). Our flushes are
+        // barrier-gated and serialized, so at most one frozen memtable exists at a
+        // time and this never actually triggers; it's a generous safety floor, not
+        // a tuning knob (hence no config surface). The active memtable is excluded
+        // from this count and is instead bounded by the periodic autoflush.
+        max_unflushed_bytes: 1_073_741_824,
         compression_codec: None, // Disable compression as we handle it in encryption layer
         l0_flush_parallelism: 16,
         min_filter_keys: 10,
@@ -588,6 +632,7 @@ pub async fn build_slatedb(
 
     let parts_cache = build_parts_hybrid(
         &cache_config.root_folder,
+        parts_memory_bytes,
         parts_disk_bytes,
         &maintenance_runtime,
     )
@@ -600,18 +645,16 @@ pub async fn build_slatedb(
     let compactor_object_store = object_store.clone();
     let wal_object_store = wal_object_store
         .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
-    let object_store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(PrefetchingObjectStore::new(object_store, parts_cache));
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(PrefetchingObjectStore::new(
+        object_store,
+        parts_cache.clone(),
+    ));
 
     let db_path = Path::from(db_path);
 
     match db_mode {
         DatabaseMode::ReadWrite => {
-            if disable_compactor {
-                info!("Opening database in read-write mode (compactor disabled)");
-            } else {
-                info!("Opening database in read-write mode");
-            }
+            info!("Opening database in read-write mode");
 
             let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
 
@@ -621,26 +664,18 @@ pub async fn build_slatedb(
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled))
-                .with_metrics_recorder(metrics_recorder.clone());
-
-            if segments_enabled {
-                builder = builder.with_segment_extractor(Arc::new(
-                    crate::segment_extractor::ZeroFsSegmentExtractor,
-                ));
-            }
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_metrics_recorder(metrics_recorder.clone())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
 
             if let Some(wal_store) = wal_object_store {
                 builder = builder.with_wal_object_store(wal_store);
             }
 
             // The compaction coordinator is bound to the read-write DB, so it runs
-            // only on the current leader. By default it also runs an
-            // embedded worker (self-sufficient, no external processes needed).
-            // `--no-compactor` keeps the coordinator scheduling and committing but
-            // drops the embedded worker, offloading execution to standalone
-            // `zerofs compactor` workers, at least one of which must then be
-            // running, or compaction stalls.
+            // only on the current leader, with an embedded worker (self-sufficient,
+            // no external processes needed). SlateDB holds only metadata, so its
+            // compaction is light enough to always run in-process.
             {
                 let scheduler_options: std::collections::HashMap<String, String> =
                     slatedb::config::SizeTieredCompactionSchedulerOptions {
@@ -648,18 +683,15 @@ pub async fn build_slatedb(
                         ..Default::default()
                     }
                     .into();
-                let worker =
-                    (!disable_compactor).then(|| slatedb::config::CompactionWorkerOptions {
-                        max_sst_size: 256 * 1024 * 1024,
-                        max_fetch_tasks: 2,
-                        bytes_to_fetch: 16 * 1024 * 1024,
-                        ..Default::default()
-                    });
+                let worker = Some(slatedb::config::CompactionWorkerOptions {
+                    max_sst_size: 256 * 1024 * 1024,
+                    max_fetch_tasks: 2,
+                    bytes_to_fetch: 16 * 1024 * 1024,
+                    ..Default::default()
+                });
                 let compactor = CompactorBuilder::new(db_path, compactor_object_store)
                     .with_runtime(maintenance_runtime.clone())
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies(
-                        segments_enabled,
-                    ))
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_options(slatedb::config::CompactorOptions {
                         poll_interval: std::time::Duration::from_secs(5),
                         commit_compacted_interval: std::time::Duration::from_secs(5),
@@ -683,6 +715,7 @@ pub async fn build_slatedb(
                 data: SlateDbHandle::ReadWrite(slatedb),
                 maintenance_runtime: Some(maintenance_runtime),
                 metrics_recorder: Some(metrics_recorder),
+                parts_cache: parts_cache.clone(),
             })
         }
         DatabaseMode::ReadOnly => {
@@ -690,12 +723,8 @@ pub async fn build_slatedb(
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
-            if segments_enabled {
-                reader_builder = reader_builder.with_segment_extractor(Arc::new(
-                    crate::segment_extractor::ZeroFsSegmentExtractor,
-                ));
-            }
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -710,6 +739,7 @@ pub async fn build_slatedb(
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 maintenance_runtime: None,
                 metrics_recorder: None,
+                parts_cache: parts_cache.clone(),
             })
         }
         DatabaseMode::Checkpoint(checkpoint_id) => {
@@ -718,12 +748,8 @@ pub async fn build_slatedb(
             let mut reader_builder = DbReader::builder(db_path, object_store)
                 .with_checkpoint_id(checkpoint_id)
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(segments_enabled));
-            if segments_enabled {
-                reader_builder = reader_builder.with_segment_extractor(Arc::new(
-                    crate::segment_extractor::ZeroFsSegmentExtractor,
-                ));
-            }
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
             if let Some(wal_store) = wal_object_store {
                 reader_builder = reader_builder.with_wal_object_store(wal_store);
             }
@@ -738,6 +764,7 @@ pub async fn build_slatedb(
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
                 maintenance_runtime: None,
                 metrics_recorder: None,
+                parts_cache: parts_cache.clone(),
             })
         }
     }
@@ -759,7 +786,6 @@ pub async fn run_server(
     config_path: PathBuf,
     read_only: bool,
     checkpoint_name: Option<String>,
-    no_compactor: bool,
 ) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -808,8 +834,7 @@ pub async fn run_server(
 
     crate::telemetry::send_startup_event(&settings);
 
-    let init_result =
-        crate::cli::init::initialize_filesystem(&settings, db_mode, no_compactor).await?;
+    let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let fs = init_result.fs;
     let heartbeat_shutdown = init_result.heartbeat_shutdown;
 
@@ -869,12 +894,40 @@ pub async fn run_server(
     )
     .await;
 
+    // A read-only admin over the same store for the GC's checkpoint gate; built
+    // before the store/path are moved into the checkpoint manager below.
+    let gc_admin = if !db_mode.is_read_only() {
+        Some(
+            AdminBuilder::new(
+                slatedb::object_store::path::Path::from(init_result.db_path.clone()),
+                Arc::clone(&init_result.object_store),
+            )
+            .build(),
+        )
+    } else {
+        None
+    };
+
     let checkpoint_manager = Arc::new(CheckpointManager::new(
         init_result.db_handle,
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
         init_result.wal_object_store.clone(),
     ));
+    // Checkpoints must not durably publish a FrameLoc whose segment is still in
+    // the RAM open buffer: seal + flush under the barrier first (see
+    // CheckpointManager::create_checkpoint). Read-only mode has no writer to seal.
+    if !db_mode.is_read_only() {
+        let fc = fs.flush_coordinator.clone();
+        checkpoint_manager.set_pre_flush(Arc::new(move || {
+            let fc = fc.clone();
+            Box::pin(async move {
+                fc.flush()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("seal+flush failed: {:?}", e))
+            })
+        }));
+    }
     #[cfg(feature = "webui")]
     let checkpoint_manager_for_webui = Arc::clone(&checkpoint_manager);
     let rpc_handles = start_rpc_servers(
@@ -913,8 +966,9 @@ pub async fn run_server(
         let gc = Arc::new(GarbageCollector::new(
             Arc::clone(&fs.db),
             fs.tombstone_store.clone(),
-            fs.chunk_store.clone(),
+            fs.extent_store.clone(),
             Arc::clone(&fs.stats),
+            gc_admin,
         ));
         Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
     } else {
@@ -1005,7 +1059,19 @@ pub async fn run_server(
     if !db_mode.is_read_only()
         && let Err(e) = fs.flush_coordinator.flush().await
     {
-        tracing::error!("Final flush failed: {:?}", e);
+        // The final seal-gated flush failed (a segment PUT could not complete), so
+        // the memtable holds FrameLocs pointing at an un-PUT segment. Do NOT call
+        // db.close(): SlateDB's close flushes the memtable while the db is still
+        // healthy, which would durably publish those dangling pointers (permanent
+        // EIO on restart). Exit hard instead — the unflushed writes since the last
+        // good flush were never durable, so discarding them is correct crash
+        // semantics; a durable dangling FrameLoc would be corruption.
+        tracing::error!(
+            "Final flush failed during shutdown ({e:?}); exiting without closing the database \
+             to avoid durably committing dangling extent pointers. Writes since the last \
+             successful flush are discarded (they were never durable)."
+        );
+        std::process::exit(1);
     }
 
     if let Err(e) = fs.db.close().await {
@@ -1020,6 +1086,29 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_disk_budget_favors_segments() {
+        let gib = 1024 * 1024 * 1024;
+        // 10% to metadata, the rest to segments.
+        assert_eq!(split_disk_budget(100 * gib), (90 * gib, 10 * gib));
+        // Metadata capped at 16 GiB on a huge budget; segments get everything else.
+        assert_eq!(split_disk_budget(4096 * gib), (4080 * gib, 16 * gib));
+        // Tiny budgets still floor each side at 1 GiB.
+        assert_eq!(split_disk_budget(gib / 2), (gib, gib));
+    }
+
+    #[test]
+    fn split_memory_budget_favors_segments() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        // 25% to metadata blocks, the rest to segment parts.
+        assert_eq!(split_memory_budget(gib), (768 * mib, 256 * mib));
+        // Metadata capped at 2 GiB on a huge budget; parts get everything else.
+        assert_eq!(split_memory_budget(40 * gib), (38 * gib, 2 * gib));
+        // Tiny budgets floor each side at 32 MiB.
+        assert_eq!(split_memory_budget(16 * mib), (32 * mib, 32 * mib));
+    }
 
     // foyer builds the same `I/O error => coding error` wrapping around the os
     // error regardless of the build site, so exercise its own From<io::Error>.
@@ -1092,7 +1181,7 @@ mod tests {
                 .with_settings(settings)
                 .with_db_cache(cache)
                 .with_sst_block_size(SstBlockSize::Block32Kib)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
@@ -1135,16 +1224,16 @@ mod tests {
             );
             let (store, ctl) = FaultStore::new(local);
             let store: Arc<dyn ObjectStore> = store;
-            let codec = KeyCodec::new(true);
+            let codec = KeyCodec::new();
 
             // Setup: write the metadata and persist it to SSTs, in several flushes
             // so the meta segment ends up with more than one SST.
             {
                 let raw = open(store.clone(), hybrid(&dir.path().join("c_setup")).await).await;
-                for chunk in 0..4u64 {
+                for extent in 0..4u64 {
                     let mut batch = WriteBatch::new();
                     for i in 0..(INODES / 4) {
-                        let id = chunk * (INODES / 4) + i;
+                        let id = extent * (INODES / 4) + i;
                         batch.put_bytes(codec.inode_key(id), Bytes::from(vec![id as u8; 64]));
                     }
                     raw.write_with_options(

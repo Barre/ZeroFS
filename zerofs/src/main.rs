@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod db;
 mod dedup;
+mod frame_codec;
 mod fs;
 mod key_management;
 mod length_checked_object_store;
@@ -24,7 +25,9 @@ mod prometheus;
 mod redis_conditional_store;
 mod replication;
 mod rpc;
+mod segment;
 mod segment_extractor;
+mod segment_store;
 mod storage_class_object_store;
 mod storage_compatibility;
 mod task;
@@ -113,11 +116,8 @@ async fn main() -> Result<()> {
             config,
             read_only,
             checkpoint,
-            no_compactor,
         } => {
-            if let Err(e) =
-                cli::server::run_server(config, read_only, checkpoint, no_compactor).await
-            {
+            if let Err(e) = cli::server::run_server(config, read_only, checkpoint).await {
                 eprintln!("✗ Error: {:#}", e);
                 std::process::exit(1);
             }
@@ -146,9 +146,6 @@ async fn main() -> Result<()> {
         }
         cli::Commands::Otrace { config } => {
             cli::otrace::run_otrace(config).await?;
-        }
-        cli::Commands::Compactor { config } => {
-            cli::compactor::run_compactor(config).await?;
         }
         cli::Commands::Flush { config } => {
             cli::flush::flush(&config).await?;

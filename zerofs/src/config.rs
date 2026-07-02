@@ -6,7 +6,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-/// Compression algorithm configuration for chunk data.
+/// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionConfig {
@@ -281,7 +281,7 @@ impl ReplicationConfig {
 ///
 /// Every filesystem op is a point lookup gated by per-SST bloom filters and the
 /// SST index, so warming those removes the cold-cache latency cliff a fresh node
-/// or restart otherwise pays on its first reads. The bulk chunk segment is never
+/// or restart otherwise pays on its first reads. The bulk extent segment is never
 /// warmed.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -326,7 +326,7 @@ pub struct StorageConfig {
 pub struct FilesystemConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_size_gb: Option<f64>,
-    /// Compression algorithm for chunk data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
+    /// Compression algorithm for extent data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
     #[serde(default)]
     pub compression: CompressionConfig,
     /// Treat `fsync` as a no-op: a client fsync/COMMIT returns without forcing a
@@ -353,22 +353,16 @@ pub struct LsmConfig {
     /// Maximum number of SST files in level 0 before triggering compaction
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub l0_max_ssts: Option<usize>,
-    /// Maximum unflushed data before forcing a flush (in gigabytes)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_unflushed_gb: Option<f64>,
     /// Maximum number of concurrent compactions
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_concurrent_compactions: Option<usize>,
     /// Interval in seconds between periodic flushes
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flush_interval_secs: Option<u64>,
-    /// Whether the write-ahead log (WAL) is enabled
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wal_enabled: Option<bool>,
     /// When true, every committed write is durably flushed to object storage
     /// before returning success. Trades per-op latency for zero unflushed data
-    /// in case of a crash. Pair with `wal_enabled = true` for acceptable
-    /// performance.
+    /// in case of a crash. Expensive: the WAL is off, so each write forces a
+    /// full seal + memtable flush.
     ///
     /// This does NOT change POSIX semantics: with `sync_writes = false` (the
     /// default), explicit fsync from clients is still honored and
@@ -380,10 +374,14 @@ pub struct LsmConfig {
 }
 
 impl LsmConfig {
-    /// Default l0_max_ssts: 64.
-    pub const DEFAULT_L0_MAX_SSTS: usize = 64;
-    /// Default max_unflushed_gb: 1.0 GiB
-    pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;
+    /// Default l0_max_ssts: 256. The WAL is off (see server.rs), so every `db.flush()`
+    /// freezes the memtable into a fresh L0 SST — periodic flushes plus every fsync.
+    /// L0 must therefore hold a deep backlog so a flush is just an L0 upload and never
+    /// stalls a writer waiting on compaction; the SSTs are small metadata and
+    /// bloom-filtered, so the extra point-lookup cost is negligible. Applies to
+    /// `l0_max_ssts_per_key` too (a hot-overwritten extent gains one version per flush,
+    /// not per write, so 256 is a generous compaction horizon).
+    pub const DEFAULT_L0_MAX_SSTS: usize = 256;
     /// Default max_concurrent_compactions: 8
     pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 8;
     /// Default flush_interval_secs: 30 seconds
@@ -391,8 +389,6 @@ impl LsmConfig {
 
     /// Minimum l0_max_ssts to maintain reasonable performance
     pub const MIN_L0_MAX_SSTS: usize = 4;
-    /// Minimum max_unflushed_gb: 0.1 GB (100 MB)
-    pub const MIN_MAX_UNFLUSHED_GB: f64 = 0.1;
     /// Minimum max_concurrent_compactions: 1
     pub const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
     /// Minimum flush_interval_secs: 5 seconds
@@ -402,14 +398,6 @@ impl LsmConfig {
         self.l0_max_ssts
             .unwrap_or(Self::DEFAULT_L0_MAX_SSTS)
             .max(Self::MIN_L0_MAX_SSTS)
-    }
-
-    pub fn max_unflushed_bytes(&self) -> usize {
-        let gb = self
-            .max_unflushed_gb
-            .unwrap_or(Self::DEFAULT_MAX_UNFLUSHED_GB)
-            .max(Self::MIN_MAX_UNFLUSHED_GB);
-        (gb * 1_000_000_000.0) as usize
     }
 
     pub fn max_concurrent_compactions(&self) -> usize {
@@ -422,10 +410,6 @@ impl LsmConfig {
         self.flush_interval_secs
             .unwrap_or(Self::DEFAULT_FLUSH_INTERVAL_SECS)
             .max(Self::MIN_FLUSH_INTERVAL_SECS)
-    }
-
-    pub fn wal_enabled(&self) -> bool {
-        self.wal_enabled.unwrap_or(false)
     }
 
     pub fn sync_writes(&self) -> bool {
@@ -842,7 +826,7 @@ impl Settings {
         toml_string
             .push_str("# If not specified, defaults to 16 EiB, the maximum filesystem size\n");
         toml_string.push_str("#\n");
-        toml_string.push_str("# Compression algorithm for chunk data:\n");
+        toml_string.push_str("# Compression algorithm for extent data:\n");
         toml_string.push_str(
             "#   - \"zstd-{level}\" (default: \"zstd-3\"): Configurable compression (level 1-22)\n",
         );
@@ -863,16 +847,14 @@ impl Settings {
             .push_str("# Advanced performance tuning for the underlying LSM tree storage engine\n");
         toml_string.push_str("# Only modify these if you understand LSM tree behavior\n");
         toml_string.push_str("\n# [lsm]\n");
-        toml_string.push_str("# l0_max_ssts = 64                 # Max SST files in L0 before compaction (default: 64, min: 4)\n");
-        toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
+        toml_string.push_str("# l0_max_ssts = 256                # Max SST files in L0 before compaction (default: 256, min: 4)\n");
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
-        toml_string.push_str("# wal_enabled = false              # Whether the write-ahead log (WAL) is enabled (default: false)\n");
         toml_string.push_str("# sync_writes = false              # Flush every write to object storage before returning success (default: false).\n");
         toml_string.push_str("                                   # Does NOT affect POSIX fsync semantics: explicit fsync from clients\n");
         toml_string.push_str("                                   # is always honored. This flag only governs writes between fsync calls. When on,\n");
         toml_string.push_str("                                   # they become durable on return instead of buffered until the next periodic flush.\n");
-        toml_string.push_str("                                   # wal_enabled = true is strongly recommended when this is on.\n");
+        toml_string.push_str("                                   # Expensive: the WAL is off, so each write forces a full seal + memtable flush.\n");
 
         toml_string.push_str("\n# Optional separate WAL (Write-Ahead Log) object store\n");
         toml_string.push_str("# Use a faster/closer store for WAL to improve fsync latency\n");
@@ -1315,34 +1297,6 @@ node_id = "n1"
 role = "witness""#,
         );
         assert!(write_and_load(&content).is_err());
-    }
-
-    #[test]
-    fn test_replication_allows_data_wal_enabled() {
-        // The WAL is permitted under HA: SlateDB fences WAL writes too, so the
-        // fenced manifest is not the only path that contains a deposed leader.
-        let content = base_config_with_replication(
-            r#"[lsm]
-wal_enabled = true
-
-[replication]
-node_id = "n1"
-role = "leader""#,
-        );
-        assert!(write_and_load(&content).is_ok());
-    }
-
-    #[test]
-    fn test_replication_allows_data_wal_disabled() {
-        let content = base_config_with_replication(
-            r#"[lsm]
-wal_enabled = false
-
-[replication]
-node_id = "n1"
-role = "leader""#,
-        );
-        assert!(write_and_load(&content).is_ok());
     }
 
     #[test]

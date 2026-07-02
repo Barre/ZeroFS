@@ -22,6 +22,10 @@ message ReplOp {
     bytes key = 1;
     bytes value = 2; // ignored when delete is true
     bool delete = 3;
+    // Sealed frame bytes ([len][sealed]) for an extent-write Put whose segment is
+    // still the leader's un-PUT open buffer, so the standby can materialize that
+    // segment on takeover (no-acked-loss for un-fsync'd writes). Empty otherwise.
+    bytes frame = 4;
 }
 
 message ReplicateRequest {
