@@ -66,7 +66,18 @@ impl RetryingObjectStore {
                 | object_store::Error::NotFound { .. }
                 | object_store::Error::NotImplemented { .. }
                 | object_store::Error::NotSupported { .. }
-        )
+        ) && !Self::is_unsatisfiable_range(err)
+    }
+
+    /// A range the object can never satisfy (start at or past EOF) is
+    /// deterministic: retrying re-sends the same doomed request forever.
+    /// Every backend surfaces it as `Error::Generic`, so match the message:
+    /// "InvalidRange" is the S3/R2/Azure error code, "not satisfiable" the
+    /// HTTP 416 reason phrase (GCS), and "StartTooLarge" object_store's own
+    /// `InvalidGetRange` variant for the fs/memory backends.
+    fn is_unsatisfiable_range(err: &object_store::Error) -> bool {
+        let s = format!("{err:?}");
+        s.contains("InvalidRange") || s.contains("not satisfiable") || s.contains("StartTooLarge")
     }
 
     /// Expected byte length of a range read, truncated at the actual object
@@ -464,6 +475,23 @@ mod tests {
         assert_eq!(got, Bytes::from_static(b"hello"));
         // 1 truncated attempt (caught by the size check) + 1 clean retry.
         assert_eq!(flaky.gets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unsatisfiable_range_is_not_retried() {
+        let (flaky, retrying) = seeded();
+        let path = Path::from("obj");
+        retrying
+            .put(&path, PutPayload::from_static(b"short"))
+            .await
+            .unwrap();
+
+        retrying
+            .get_range(&path, 100..200)
+            .await
+            .expect_err("a range starting past EOF can never be satisfied");
+        // Deterministic error: exactly one attempt, no retry loop.
+        assert_eq!(flaky.gets.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

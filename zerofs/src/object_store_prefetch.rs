@@ -428,6 +428,18 @@ impl PrefetchingObjectStore {
             return;
         }
 
+        // The stream frontier advances in fixed windows with no notion of the
+        // object's length, so a sequential read approaching EOF pushes it past
+        // the end. A GET starting there is unsatisfiable (HTTP 416), not a
+        // useful prefetch; the head is already cached by the stream's earlier
+        // reads, so drop the window here. A window merely *ending* past EOF is
+        // fine: the backend truncates it.
+        if let Some((meta, _)) = self.read_head(&location)
+            && prefetch.start >= meta.size
+        {
+            return;
+        }
+
         let start_part: PartId = match (prefetch.start / part_size_u64).try_into() {
             Ok(p) => p,
             Err(_) => return,
@@ -1055,6 +1067,68 @@ mod tests {
         async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
             self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(self.delay).await;
+            self.inner.get_opts(l, o).await
+        }
+        async fn put_opts(
+            &self,
+            l: &Path,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+        async fn rename_opts(
+            &self,
+            f: &Path,
+            t: &Path,
+            o: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(f, t, o).await
+        }
+    }
+
+    /// Wraps a store, recording each `get_opts` range so a test can assert
+    /// what actually reaches the backend.
+    #[derive(Debug)]
+    struct RangeRecordingStore {
+        inner: Arc<InMemory>,
+        ranges: Arc<std::sync::Mutex<Vec<GetRange>>>,
+    }
+
+    impl Display for RangeRecordingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "RangeRecordingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RangeRecordingStore {
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            if let Some(r) = &o.range {
+                self.ranges.lock().unwrap().push(r.clone());
+            }
             self.inner.get_opts(l, o).await
         }
         async fn put_opts(
@@ -1902,5 +1976,44 @@ mod tests {
                 .contains_key(&PartKey::new(&path, start_part)),
             "in_flight key should be released after prefetch completes"
         );
+    }
+
+    // The async prefetch frontier must stop at EOF. It advances in fixed
+    // windows with no notion of the object's length, so a sequential stream
+    // near the end would otherwise emit windows starting past EOF — GETs the
+    // backend rejects as unsatisfiable (HTTP 416) and that a retrying layer
+    // below would re-send forever.
+    #[tokio::test]
+    async fn async_prefetch_never_fetches_past_eof() {
+        let part_size = 1024;
+        let len = 2 * FETCH_WINDOW_MIN;
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from("seq");
+        inner.put(&path, vec![7u8; len].into()).await.unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        // Sequential reads: the second ramps the window past the minimum and
+        // refills the prefetch frontier, whose later windows start past EOF.
+        store.get_range(&path, 0..1024).await.unwrap();
+        store.get_range(&path, 1024..2048).await.unwrap();
+        store.get_range(&path, 2048..3072).await.unwrap();
+        // The prefetches run on spawned tasks; give them time to issue GETs.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let seen = ranges.lock().unwrap().clone();
+        assert!(!seen.is_empty());
+        for r in &seen {
+            if let GetRange::Bounded(b) = r {
+                assert!(
+                    b.start < len as u64,
+                    "GET issued past EOF: {b:?} (object is {len} bytes)"
+                );
+            }
+        }
     }
 }
