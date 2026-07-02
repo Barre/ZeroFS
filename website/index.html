@@ -814,8 +814,8 @@ footer a:hover { color: var(--text); }
     <div class="hero-particles"></div>
   </div>
   <div class="wrap">
-    <h1><span class="l"><span class="li">Make S3 your</span></span><span class="l"><span class="li">primary storage<span class="dot">.</span></span></span></h1>
-    <p class="lede rv" data-d="550">ZeroFS serves S3-compatible buckets as <strong>POSIX filesystems</strong> over NFS and 9P, or as <strong>raw block devices</strong> over NBD. Data is compressed and encrypted before upload. Warm reads come from local cache in microseconds.</p>
+    <h1><span class="l"><span class="li">A log-structured</span></span><span class="l"><span class="li">filesystem for S3<span class="dot">.</span></span></span></h1>
+    <p class="lede rv" data-d="550">ZeroFS serves S3-compatible buckets as <strong>POSIX filesystems</strong> over NFS and 9P, or as <strong>raw block devices</strong> over NBD. The engine is <strong>log-structured</strong>: writes go out as immutable objects and compaction reclaims what you delete. Data is compressed and encrypted before upload, and warm reads come from local cache in microseconds.</p>
     <div class="install rv" data-d="750">
       <div class="cmd tabbed">
         <div class="cmd-head">
@@ -859,7 +859,7 @@ footer a:hover { color: var(--text); }
       <sup>1</sup> <a href="https://github.com/Barre/pjdfstest_nfs">pjdfstest</a> runs on every change. A few cases needing semantics NFS/9P can't express are excluded; the list is public in the repo.&ensp;
       <sup>2</sup> SQLite bench, random reads on ZeroFS served from local cache. A raw S3 round-trip is 50–300&thinsp;ms.&ensp;
       <sup>3</sup> File appends over NFS, <a href="https://www.zerofs.net/docs/zerofs-vs-juicefs">ZeroFS bench suite</a>; data at rest in S3.&ensp;
-      <sup>4</sup> Addressable by design: 64-bit inode and size fields, 32&thinsp;KiB chunks.
+      <sup>4</sup> Addressable by design: 64-bit inode and size fields, 32&thinsp;KiB extents.
     </div>
   </div>
 </div>
@@ -1052,9 +1052,9 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
       <div class="feat rv"><span class="num">04.3</span><h3>Caching</h3><p>Configurable memory and disk caches hold recently used blocks. Warm reads return in microseconds. A raw S3 round trip takes 50 to 300 milliseconds.</p></div>
       <div class="feat rv"><span class="num">04.4</span><h3>Checkpoints</h3><p>Named checkpoints capture the filesystem at a point in time. Any of them can be opened read-only with a single flag at startup.</p></div>
       <div class="feat rv"><span class="num">04.5</span><h3>Read replicas</h3><p>One instance writes while read-only instances serve the same bucket. Replicas pick up the writer's changes automatically and return EROFS on writes.</p></div>
-      <div class="feat rv"><span class="num">04.6</span><h3>TRIM support</h3><p>Discard from any filesystem or zpool deletes the corresponding chunks from the LSM tree. Compaction then reclaims the space in S3, so freed blocks come off the bill.</p></div>
-      <div class="feat rv"><span class="num">04.7</span><h3>Standalone compactor</h3><p>Compaction can run as a separate process on its own machine. A spot instance in the bucket's region avoids egress fees and keeps the load off the serving path.</p></div>
-      <div class="feat rv"><span class="num">04.8</span><h3>Separate WAL store</h3><p>With the WAL enabled, fsync latency is the latency of the WAL's backing store. The WAL can live on local NVMe or S3 Express One-Zone while data stays in the main bucket.</p></div>
+      <div class="feat rv"><span class="num">04.6</span><h3>TRIM support</h3><p>Discard from any filesystem or zpool frees the corresponding extents. Compaction repacks the live data and deletes the emptied segments from S3, so freed blocks come off the bill.</p></div>
+      <div class="feat rv"><span class="num">04.7</span><h3>Immutable segments</h3><p>File data is packed into 32&thinsp;KiB extents inside immutable segment objects, addressed by a separate metadata index. Nothing is rewritten in place, so checkpoints and read replicas see a consistent view of the bucket.</p></div>
+      <div class="feat rv"><span class="num">04.8</span><h3>Honest fsync</h3><p>A successful fsync means every acknowledged write is durable in S3. If a failover may have lost unflushed writes, the next fsync returns an error instead of a false success.</p></div>
       <div class="feat rv"><span class="num">04.9</span><h3>High availability</h3><p>An optional standby tracks the leader over the same bucket and takes over automatically when the leader fails. While the two are connected, the standby also holds writes the leader has acknowledged but not yet flushed, so a failover preserves them.</p></div>
     </div>
   </div>

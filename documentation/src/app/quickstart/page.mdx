@@ -102,7 +102,7 @@ sudoedit /etc/zerofs/config.toml   # set [storage] url, protocols and ports
 sudo systemctl enable --now zerofs
 ```
 
-The unit is hardened (`ProtectSystem=strict`, private `/tmp`, restricted capabilities). Its cache lives in `/var/cache/zerofs` and its unix sockets in `/run/zerofs`. If you point `[cache] dir` or a `file://` WAL at another path, grant write access with `sudo systemctl edit zerofs` and a `ReadWritePaths=` line.
+The unit is hardened (`ProtectSystem=strict`, private `/tmp`, restricted capabilities). Its cache lives in `/var/cache/zerofs` and its unix sockets in `/run/zerofs`. If you point `[cache] dir` at another path, grant write access with `sudo systemctl edit zerofs` and a `ReadWritePaths=` line.
 
 ### Install script options
 

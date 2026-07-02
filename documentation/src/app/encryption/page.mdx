@@ -3,7 +3,7 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Encryption & Security',
   description:
-    'How ZeroFS encryption works: XChaCha20-Poly1305 at the SST block level, Argon2id key derivation, what stays plaintext on the object store, and password handling.',
+    'How ZeroFS encryption works: XChaCha20-Poly1305 per-frame for file data in segment objects and per SST block for metadata, Argon2id key derivation, what stays plaintext on the object store, and password handling.',
 }
 
 # Encryption & Security
@@ -22,6 +22,8 @@ ZeroFS encrypts all data with XChaCha20-Poly1305. There is no unencrypted mode. 
     3. **Encrypted DEK Storage**: The KEK-wrapped DEK is a standalone object, `zerofs.key`, at the database path on the object store — not a record inside the database
 
     The `zerofs.key` object is bincode-serialized and holds the Argon2id salt, a 24-byte nonce, a plaintext version field, and the wrapped DEK. `zerofs change-password` rewrites it in place: the DEK is re-wrapped, the data itself is not re-encrypted.
+
+    The DEK is not used as a cipher key directly. Two subkeys are derived from it with HKDF-SHA256, one per encryption domain: info label `zerofs-v1-segment` for file-data frames, `zerofs-v1-encryption` for metadata SST blocks. A data frame and a metadata block never share a key.
 
     ### Encryption Algorithm
 
@@ -55,7 +57,11 @@ ZeroFS encrypts all data with XChaCha20-Poly1305. There is no unencrypted mode. 
 
 ## What's Encrypted
 
-Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
+There are two encryption domains.
+
+**File contents** never enter the LSM. Each 32 KiB extent is compressed, then encrypted as a self-describing frame — wire format `[nonce: 24][ciphertext + tag: 16]`, with a random 24-byte nonce per frame — and packed into immutable segment objects at `segments/<shard>/<epoch>/<counter>`. Each frame's AAD binds it to its segment ID, frame index, inode, and extent index, so a ciphertext frame cannot be spliced into another segment, slot, file, or offset. Under [replication](/high-availability), frames shipped to a standby for not-yet-uploaded segments are the already-sealed ciphertext bytes, not plaintext.
+
+**Metadata** (inodes, directory entries, per-extent pointers) lives in SlateDB. Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block with an empty AAD — byte-identical to the historical SST block format, so existing SSTs still decode. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 <Row>
   <Col>
@@ -64,13 +70,16 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
 
     <Properties>
       <Property name="File Contents" type="encrypted">
-        All file data is encrypted in 32 KiB chunks using unique nonces
+        Each 32 KiB extent is sealed as its own frame with a unique 24-byte nonce and an AAD naming its segment, frame slot, inode, and extent index. Segment objects hold file data only as ciphertext frames.
+      </Property>
+      <Property name="Segment Directory" type="encrypted">
+        Each segment ends with a reverse-map directory (inode and extent index per frame, used by GC). It is sealed as one AEAD frame, so the file-to-frame mapping is not readable from the object store.
       </Property>
       <Property name="File Metadata" type="encrypted">
         Permissions, timestamps, ownership, directory-entry payloads, symlink targets, and other inode data
       </Property>
       <Property name="Keys Inside Blocks" type="encrypted">
-        Inode IDs, directory entry names, chunk identifiers. Each block is encrypted as a unit, so the keys it indexes are protected.
+        Inode IDs, directory entry names, extent identifiers, and the 32-byte `FrameLoc` pointer each extent key stores (segment epoch, counter, frame index, byte offset, byte length). Each block is encrypted as a unit, so the keys it indexes are protected.
       </Property>
       <Property name="SST Index & Filter Blocks" type="encrypted">
         Per-block first-key markers and bloom filter contents
@@ -84,18 +93,26 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
         The SST footer's `SsTableInfo` flatbuffer stores each SST's first and last key in plaintext. For a directory-entry SST this leaks the lexicographically-first and -last `(dir_id, filename)` it contains.
       </Property>
       <Property name="Manifest" type="plaintext">
-        SST IDs, segment prefixes (`"meta"`, `"chunk"`), object sizes, checkpoint pointers, format version
+        SST IDs, key-domain prefixes (`"meta"`, `"extent"`), the extractor name `zerofs-meta-extent-v1`, object sizes, checkpoint pointers, format version
+      </Property>
+      <Property name="Segment Footer & Frame Sizes" type="plaintext">
+        Every segment object ends with a fixed 64-byte plaintext footer: magic `ZSEG`, version, frame count, directory offset and length, sealed epoch, counter, sealed sequence number, total length, and a CRC32C. The CRC32C is keyless torn-write detection, not authentication — integrity comes from the per-frame AEAD tags. The plaintext `u32` length prefix before each frame reveals per-extent compressed sizes.
       </Property>
       <Property name="Object Metadata" type="plaintext">
-        SST blob names, sizes, and counts (anything visible to an S3 LIST).
+        SST and segment object names, sizes, and counts (anything visible to an S3 LIST). A segment key encodes its writer epoch and segment counter.
       </Property>
     </Properties>
 
     ### Local Cache Directory
 
+    The on-disk cache (default `~/.cache/zerofs`) has two tiers with different security postures:
+
     <Properties>
-      <Property name="Cache Contents" type="plaintext">
-        The on-disk cache (default `~/.cache/zerofs`) stores **decrypted, decompressed** SST blocks so subsequent reads don't pay the decrypt cost.
+      <Property name="File Data (parts_cache/)" type="encrypted">
+        The raw-parts cache stores object bytes exactly as fetched: segment frames stay **compressed and encrypted** on the local cache disk. File contents never touch the local disk in plaintext.
+      </Property>
+      <Property name="Metadata Blocks (hybrid_cache/)" type="plaintext">
+        The decoded-block cache stores **decrypted, decompressed** metadata SST blocks so metadata reads don't pay the decrypt cost.
       </Property>
     </Properties>
 
@@ -103,29 +120,43 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
   <Col>
 
     ```bash {{ title: 'What S3 Sees' }}
-    # Encrypted block payloads in SST data files:
+    # File data in segment objects,
+    # metadata in SST files:
     s3://bucket/path/
     ├── compacted
     │   ├── 01K1JW549K0H0MV3FH28CKBWTY.sst
     │   ├── 01K1JW54FCCA109H1RJEHZ5NYK.sst
     │   ├── 01K1JW54KE1XMV5DQG9KQ5R9B5.sst
+    ├── compactions
+    │   ├── 00000000000000000001.compactions
+    │   └── ...   # plaintext compactor state (SST ids
+    │             # being compacted), like the manifest
     ├── manifest
     │   ├── 00000000000000000001.manifest
     │   └── ...
-    ├── wal
-    │   ├── 00000000000000000001.sst
-    │   └── ...
+    ├── segments
+    │   └── 4e                    # shard = counter & 0xff
+    │       └── 0000000000000007  # writer epoch
+    │           └── 000000000000034e
+    │                             # segment counter
     ├── zerofs.key                # wrapped DEK
     ├── .zerofs_bucket_id         # cache-namespace UUID
     └── .zerofs_compatibility_test_<uuid>
                                   # transient startup probe
-    # Inside each SST:
+    # Inside each segment object (file data):
+    # - Frames: encrypted; only the u32 length
+    #   prefix per frame is plaintext
+    # - Directory: encrypted as one AEAD frame
+    # - Footer: 64 bytes plaintext (magic, frame
+    #   count, epoch, counter, offsets, CRC32C)
+    # Inside each SST (metadata only):
     # - Data blocks: encrypted (keys + values opaque on disk)
     # - Index blocks: encrypted (per-block first-key markers)
     # - Filter blocks: encrypted (bloom filter bytes)
     # - SST footer (SsTableInfo): plaintext, includes
     #   the SST's first and last key
     # The manifest is plaintext.
+    # No wal/ objects: the WAL is permanently off.
     ```
 
   </Col>
@@ -133,7 +164,7 @@ Encryption applies at the SST block level: ZeroFS hands each encoded block (cont
 
 ## Sidecar Objects
 
-ZeroFS writes three plaintext objects to the database path alongside the SST, manifest, and WAL files.
+ZeroFS writes three plaintext objects to the database path alongside the SST, manifest, and segment objects.
 
 <Properties>
   <Property name="zerofs.key" type="plaintext">
@@ -157,7 +188,7 @@ The KEK is derived from the encryption password; nothing else can unwrap the DEK
 
 ### Password Requirements
 
-ZeroFS validates the password before touching the store: at `zerofs run` startup (the server refuses to start), in `zerofs change-password`, and in the standalone compaction worker and debug commands.
+ZeroFS validates the password before opening the database or loading the encryption key: at `zerofs run` startup (the server refuses to start), in `zerofs change-password` (validated before the store is even contacted), and in the debug commands.
 
 - **Non-empty**: empty passwords are rejected
 - **Minimum length**: 8 characters, enforced with the error `Password must be at least 8 characters long`. Use 25+ characters in practice.
@@ -225,29 +256,33 @@ addresses = ["127.0.0.1:10809"]
 
 ## Security Architecture
 
+File data and metadata take separate paths to the object store. Both are compressed then encrypted; only metadata passes through SlateDB.
+
 <Mermaid chart={`
 graph TB
     APP[Application]
-    NFS[NFS]
-    
+    PROTO[NFS / 9P / NBD / FUSE]
+
     subgraph ZEROFS["ZeroFS"]
-        COMP[Zstd or LZ4<br/>Compression Layer]
-        ENC[XChaCha20-Poly1305<br/>Encryption Layer]
-        
-        COMP --> ENC
+        FRAME[Frame Codec<br/>compress then encrypt<br/>XChaCha20-Poly1305]
+        SEGBUF[Open Segment Buffer<br/>sealed frames, in RAM]
+        SLATE[SlateDB<br/>Metadata LSM]
+        BT[Block Transformer<br/>compress then encrypt<br/>XChaCha20-Poly1305]
+
+        FRAME --> SEGBUF
+        SLATE --> BT
     end
-    
-    SLATE[SlateDB<br/>LSM Tree Storage]
+
     S3[S3 Storage<br/>Object Storage]
-    
-    APP --> NFS
-    NFS --> COMP
-    ENC --> SLATE
-    SLATE --> S3
-        
+
+    APP --> PROTO
+    PROTO -->|file data: 32 KiB extents| FRAME
+    PROTO -->|metadata + FrameLoc pointers| SLATE
+    SEGBUF -->|immutable segment objects| S3
+    BT -->|SST blocks| S3
+
     class SLATE,S3 storage
-    class ENC crypto
-    class COMP compress
+    class FRAME,BT crypto
 `} />
 
 

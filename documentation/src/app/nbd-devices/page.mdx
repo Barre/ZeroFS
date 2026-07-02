@@ -15,7 +15,7 @@ ZeroFS runs a Network Block Device (NBD) server that exposes S3 storage as raw b
 - **Dynamic Device Management** - Create and delete devices through the filesystem; new devices are picked up at runtime without a server restart
 - **Multiple Devices** - One NBD server exposes every device in the `.nbd/` directory
 - **Unix Socket Support** - Connect over TCP or a Unix socket
-- **TRIM Support** - Discard deletes the corresponding chunks from the LSM tree; compaction then reclaims the space in S3
+- **TRIM Support** - Discard deletes the extent pointers from the metadata store; segment garbage collection then reclaims the space in S3
 - **Shared Caches** - NBD reads and writes go through the same memory and disk caches as NFS and 9P
 - **Any Filesystem** - Format with ext4, XFS, ZFS, or any other filesystem
 
@@ -24,14 +24,18 @@ ZeroFS runs a Network Block Device (NBD) server that exposes S3 storage as raw b
 Configure NBD support in your ZeroFS configuration file:
 
 ```toml
-# TCP mode (default port 10809)
+# TCP mode
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
+```
 
+```toml
 # Unix socket mode (better performance for local access)
 [servers.nbd]
 unix_socket = "/tmp/zerofs-nbd.sock"
+```
 
+```toml
 # Both TCP and Unix socket
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
@@ -44,7 +48,7 @@ zerofs run --config zerofs.toml
 ```
 
 Configuration options:
-- `addresses` - Array of bind addresses for NBD TCP server (default: ["127.0.0.1:10809"])
+- `addresses` - Array of TCP bind addresses. If omitted, no TCP listener is started (use `unix_socket` instead). The `zerofs init` template sets `["127.0.0.1:10809"]`
 - `unix_socket` - Unix socket path for NBD (optional)
 
 ## Device Management
@@ -101,7 +105,7 @@ lsblk | grep nbd
 
 The handshake advertises `NBD_FLAG_SEND_FLUSH`, `NBD_FLAG_SEND_FUA`, and `NBD_FLAG_CAN_MULTI_CONN`. Command behavior:
 
-- **FLUSH** - Flushes the entire filesystem database: memtable to object storage, or a WAL append when the WAL is enabled. The reply is sent only after the flush completes. Concurrent FLUSH and FUA requests coalesce into a single database flush.
+- **FLUSH** - Flushes the entire filesystem: seals the open segment buffer and uploads it to the object store, then flushes the metadata memtable. The reply is sent only after both complete. Concurrent FLUSH and FUA requests coalesce into a single flush. Flush latency includes the segment upload: up to 256 MiB of writes buffered since the last seal.
 - **FUA** - A WRITE, TRIM, or WRITE_ZEROES with the FUA flag set blocks until the data is durable, through the same flush path as FLUSH.
 - **CACHE** - Accepted as a no-op.
 - **Structured replies** - Not negotiated; clients fall back to simple replies.
@@ -163,15 +167,15 @@ zpool trim mypool
 ```
 
 When blocks are trimmed:
-1. ZeroFS deletes the corresponding chunks from the LSM tree
-2. Compaction reclaims the space in S3
-3. Freed blocks come off the bill
+1. ZeroFS deletes the extent pointers from the metadata store and debits each affected segment's live-byte counter
+2. Segment garbage collection, every 60 seconds, deletes segments with no live bytes and repacks fragmented ones (live data below 50%, or segments under 1 MiB)
+3. Freed segments come off the bill
 
 See [Garbage Collection](/garbage-collection) for the full reclamation pipeline.
 
 ### WRITE_ZEROES vs TRIM
 
-WRITE_ZEROES writes physical zeros in 1 MiB chunks. It overwrites chunks and never deletes them, so `blkdiscard --zeroout` does not free object-store space. TRIM is the only command that deletes chunks and lets compaction reclaim the space. To free space, use plain `blkdiscard`, `fstrim`, or `zpool trim` / `autotrim`.
+WRITE_ZEROES routes zero data through the normal write path in 1 MiB pieces. The write path elides any resulting all-zero extent into a pointer delete, so extent-aligned zeroing (for example `blkdiscard --zeroout` over a whole device) frees object-store space the same way TRIM does. TRIM is still the cheaper command: it deletes extent pointers directly, without pushing zero buffers through the write pipeline, and it skips extents beyond end of file. Both free space at 32 KiB extent granularity; a partially covered extent is zeroed in place and freed only if the whole extent becomes zero. Prefer plain `blkdiscard`, `fstrim`, or `zpool trim` / `autotrim`.
 
 ## Managing Device Files
 
@@ -192,14 +196,14 @@ nbd-client -d /dev/nbd3
 rm /mnt/zerofs/.nbd/old-device
 ```
 
-**Important**: Device sizes cannot be changed after creation. To resize:
+A connected client keeps the size negotiated at connect time; the server re-reads the device file's size at every connection. To resize, disconnect the client, truncate the device file to the new size, and reconnect. Growing preserves existing data; shrinking discards data beyond the new size.
+
 ```bash
 # Disconnect the NBD client
 nbd-client -d /dev/nbd0
-# Delete and recreate with new size
-rm /mnt/zerofs/.nbd/database
+# Resize the device file (growing preserves data)
 truncate -s 2G /mnt/zerofs/.nbd/database
-# Reconnect NBD client with optimal settings
+# Reconnect; the new size is negotiated at connect time
 nbd-client 127.0.0.1 10809 /dev/nbd0 -N database -persist -timeout 600 -connections 4
 ```
 

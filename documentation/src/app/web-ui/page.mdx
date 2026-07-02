@@ -114,7 +114,7 @@ The guest has no network device — files move in and out only through the mount
 The Web UI has no authentication on any route.
 
 - `/ws/9p` hands the connection to the same 9P handler that serves TCP clients. All operations run as the configured `uid`/`gid` — full read/write access to the filesystem.
-- The gRPC-web endpoint exposes the complete `AdminService`: `CreateCheckpoint`, `ListCheckpoints`, `DeleteCheckpoint`, `GetCheckpointInfo`, `WatchFileAccess`, `WatchObjectAccess`, `Flush`, and `StreamStats` — including methods the UI itself never calls.
+- The gRPC-web endpoint exposes the complete `AdminService`: `CreateCheckpoint`, `ListCheckpoints`, `DeleteCheckpoint`, `GetCheckpointInfo`, `WatchFileAccess`, `WatchObjectAccess`, `Flush`, `StreamStats`, `CreateDirectory`, and `RemoveDirectory` — including methods the UI itself never calls.
 - CORS on the gRPC-web routes reflects any request Origin and allows all headers, so a web page on any site can issue admin RPCs from a visitor's browser if that browser can reach the port.
 - The `/ws/9p` WebSocket performs no Origin check, and WebSocket connections are not subject to CORS.
 
