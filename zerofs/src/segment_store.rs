@@ -37,6 +37,14 @@ type Result<T> = std::result::Result<T, SegmentStoreError>;
 /// layer below buffers at once.
 const LIST_SHARD_CONCURRENCY: usize = 16;
 
+/// Concurrent multipart part uploads per sealing segment. Aggregate upload
+/// parallelism is this times the extent store's in-flight-seal cap and already
+/// saturates a 10-20 Gbps link at the library default of 8; the reason to run
+/// higher is the durability barrier, which waits out in-flight seals, so
+/// per-seal wall time is fsync tail latency. Costs `this x part size (10 MiB)`
+/// of in-flight part buffers per sealing segment.
+const SEAL_UPLOAD_CONCURRENCY: usize = 16;
+
 /// Warm a just-written segment into the object store's read (parts) cache. The
 /// production upload streams as multipart, which bypasses the store's single-PUT
 /// write-through, so `put_segment` calls this with the bytes it already holds. The
@@ -100,7 +108,7 @@ impl SegmentStore {
             self.object_store.clone(),
             path.clone(),
         )
-        .with_max_concurrency(8);
+        .with_max_concurrency(SEAL_UPLOAD_CONCURRENCY);
         w.write_all(&bytes)
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
