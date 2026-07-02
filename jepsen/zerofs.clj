@@ -46,14 +46,12 @@
        "addresses = [\"127.0.0.1:" port "\"]\n"
        "\n"
        ; Crash-fault determinism: make an explicit fsync the only thing that
-       ; flushes the memtable to the store. Otherwise the periodic flush or the
-       ; unflushed-size threshold would persist un-fsynced writes on their own,
-       ; so a SIGKILL would keep more than the model (which reverts to the last
-       ; fsync) expects. The workload writes tiny data, so the high cap is safe.
+       ; flushes to the store. Otherwise the periodic flush would persist
+       ; un-fsynced writes on its own, so a SIGKILL would keep more than the
+       ; model (which reverts to the last fsync) expects.
        ; sync_writes stays at its default (false) so un-fsynced writes are lost.
        "[lsm]\n"
-       "flush_interval_secs = 86400\n"
-       "max_unflushed_gb = 100.0\n"))
+       "flush_interval_secs = 86400\n"))
 
 (defn daemon-start!
   "Daemonizes a zerofs invocation via start-stop-daemon, writing its pid to

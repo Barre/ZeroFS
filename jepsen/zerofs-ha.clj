@@ -59,8 +59,7 @@
          "replication_listen = \"127.0.0.1:" (repl-port port node-key) "\"\n"
          "peers = [\"127.0.0.1:" (repl-port port (peer-key node-key)) "\"]\n\n"
          "[lsm]\n"
-         "flush_interval_secs = 86400\n"
-         "max_unflushed_gb = 100.0\n")))
+         "flush_interval_secs = 86400\n")))
 
 (defn daemon-start! [bin pidfile log args]
   (sh :bash :-c

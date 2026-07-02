@@ -7,7 +7,7 @@ interface GCStatsProps {
 export function GCStats({ snapshot }: GCStatsProps) {
   const items = [
     { label: "GC Runs", value: snapshot.gcRuns },
-    { label: "Chunks Deleted", value: snapshot.gcChunksDeleted },
+    { label: "Extents Deleted", value: snapshot.gcExtentsDeleted },
     { label: "Tombstones Created", value: snapshot.tombstonesCreated },
     { label: "Tombstones Processed", value: snapshot.tombstonesProcessed },
   ];
