@@ -419,12 +419,12 @@
                   :corrupt (corrupt-files dir))
            (catch java.io.IOException e
              (assoc op :type :fail :error (.getMessage e))))
-      (util/timeout 30000 (assoc op :type :info :error :timeout)
-        (case (:f op)
-          ;; Assign a unique value, record it under this worker, then create it.
-          :add (let [v (swap! counter inc)
-                     f (io/file (subdir dir v) (str v))]
-                 (swap! live update (:process op) (fnil conj #{}) v)
+      (case (:f op)
+        ;; Assign a unique value, record it under this worker, then create it.
+        :add (let [v (swap! counter inc)
+                   f (io/file (subdir dir v) (str v))]
+               (swap! live update (:process op) (fnil conj #{}) v)
+               (util/timeout 30000 (assoc op :type :info :value v :error :timeout)
                  (try
                    (add-file! dir v)
                    (when fsync? (fsync-sentinel! dir))
@@ -445,11 +445,12 @@
                          (assoc op :type :info :value v :error :retried-create)
                          (re-find #"(?i)no such file|not found" msg)
                          (assoc op :type :info :value v :error :not-durable-here)
-                         :else (assoc op :type :fail :value v :error msg))))))
-          ;; Remove one of THIS worker's live values (none queued -> nothing to do).
-          :remove (if-let [v (first (get @live (:process op)))]
-                    (let [f (io/file (subdir dir v) (str v))]
-                      (swap! live update (:process op) disj v)
+                         :else (assoc op :type :fail :value v :error msg)))))))
+        ;; Remove one of THIS worker's live values (none queued -> nothing to do).
+        :remove (if-let [v (first (get @live (:process op)))]
+                  (let [f (io/file (subdir dir v) (str v))]
+                    (swap! live update (:process op) disj v)
+                    (util/timeout 30000 (assoc op :type :info :value v :error :timeout)
                       (try
                         (remove-file! dir v)
                         (when fsync? (fsync-sentinel! dir))
@@ -463,28 +464,31 @@
                             (assoc op :type :info :value v :error :still-present-here)
                             (assoc op :type :ok :value v)))
                         (catch java.io.IOException e
-                          (assoc op :type :info :value v :error (.getMessage e)))))
-                    (assoc op :type :fail :error :nothing-to-remove))
-          ;; An acknowledged write WITHOUT fsync: it lives in the leader memtable +
-          ;; the standby tail, not yet on the object store. :ok means acked (and
-          ;; readable here now), NOT durable.
-          :write (let [v (swap! counter inc)
-                       f (io/file (subdir dir v) (str v))]
+                          (assoc op :type :info :value v :error (.getMessage e))))))
+                  (assoc op :type :fail :error :nothing-to-remove))
+        ;; An acknowledged write WITHOUT fsync: it lives in the leader memtable +
+        ;; the standby tail, not yet on the object store. :ok means acked (and
+        ;; readable here now), NOT durable.
+        :write (let [v (swap! counter inc)
+                     f (io/file (subdir dir v) (str v))]
+                 (util/timeout 30000 (assoc op :type :info :value v :error :timeout)
                    (try
                      (add-file! dir v)
                      (if (= (str v "\n") (slurp f))
                        (assoc op :type :ok :value v)
                        (assoc op :type :info :value v :error :content-not-here))
                      (catch java.io.IOException e
-                       (assoc op :type :info :value v :error (str (.getMessage e))))))
-          ;; A global fsync durability barrier. :ok = the barrier held; an error
-          ;; (after the fix, a fsync that spans a recovery which dropped this
-          ;; client's un-fsync'd writes) surfaces here as :fail.
-          :fsync (try (fsync-sentinel! dir) (assoc op :type :ok)
+                       (assoc op :type :info :value v :error (str (.getMessage e)))))))
+        ;; A global fsync durability barrier. :ok = the barrier held; an error
+        ;; (after the fix, a fsync that spans a recovery which dropped this
+        ;; client's un-fsync'd writes) surfaces here as :fail.
+        :fsync (util/timeout 30000 (assoc op :type :info :error :timeout)
+                 (try (fsync-sentinel! dir) (assoc op :type :ok)
                       (catch java.io.IOException e
-                        (assoc op :type :fail :error (str (.getMessage e)))))
-          ;; Drop leftover temps (interrupted renames) before the final read/statfs.
-          :cleanup (try (cleanup-temps! dir) (assoc op :type :ok)
+                        (assoc op :type :fail :error (str (.getMessage e))))))
+        ;; Drop leftover temps (interrupted renames) before the final read/statfs.
+        :cleanup (util/timeout 30000 (assoc op :type :info :error :timeout)
+                   (try (cleanup-temps! dir) (assoc op :type :ok)
                         (catch java.io.IOException e
                           (assoc op :type :fail :error (.getMessage e))))))))
   (teardown! [_ _test])

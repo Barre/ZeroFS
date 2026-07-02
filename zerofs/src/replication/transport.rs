@@ -22,6 +22,15 @@ use proto::{
     ReplicateRequest, ReplicateResponse,
 };
 
+/// Bounds a gRPC dial so a peer that accepts the TCP connection but never
+/// finishes the HTTP/2 handshake cannot hang the caller forever (leader startup
+/// `hello_peer`, the heartbeat sender, or the shipping reconnect loop). Without
+/// it a half-open standby silently wedges the leader's control plane.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds a unary control RPC (Hello) so a peer that accepts the call but never
+/// answers does not stall the leader's startup role election.
+const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn to_repl_ops(ops: Vec<ProtoOp>) -> Vec<ReplOp> {
     ops.into_iter()
         .map(|o| {
@@ -216,7 +225,10 @@ pub struct ReplicationSender {
 
 impl ReplicationSender {
     pub async fn connect(endpoint: String) -> anyhow::Result<Self> {
-        let client = ReplicationServiceClient::connect(endpoint).await?;
+        let client =
+            tokio::time::timeout(CONNECT_TIMEOUT, ReplicationServiceClient::connect(endpoint))
+                .await
+                .map_err(|_| anyhow::anyhow!("replication dial timed out"))??;
         Ok(Self {
             client: Mutex::new(client),
         })
@@ -245,8 +257,13 @@ impl ReplicationSender {
 /// Ask a peer (Hello) whether the caller should defer instead of opening as
 /// writer: true if the peer is leading or holds an un-replayed tail.
 pub async fn hello_peer(endpoint: String) -> anyhow::Result<bool> {
-    let mut client = ReplicationServiceClient::connect(endpoint).await?;
-    let resp = client.hello(HelloRequest {}).await?;
+    let mut client =
+        tokio::time::timeout(CONNECT_TIMEOUT, ReplicationServiceClient::connect(endpoint))
+            .await
+            .map_err(|_| anyhow::anyhow!("Hello dial timed out"))??;
+    let resp = tokio::time::timeout(RPC_TIMEOUT, client.hello(HelloRequest {}))
+        .await
+        .map_err(|_| anyhow::anyhow!("Hello RPC timed out"))??;
     Ok(resp.into_inner().peer_active)
 }
 
@@ -257,7 +274,12 @@ pub async fn run_heartbeat_sender(
     epoch: u64,
     interval: Duration,
 ) -> anyhow::Result<()> {
-    let mut client = ReplicationServiceClient::connect(endpoint).await?;
+    // Only the dial is bounded; the heartbeat stream itself is long-lived by
+    // design (it runs until the connection breaks).
+    let mut client =
+        tokio::time::timeout(CONNECT_TIMEOUT, ReplicationServiceClient::connect(endpoint))
+            .await
+            .map_err(|_| anyhow::anyhow!("heartbeat dial timed out"))??;
     let beats = futures::stream::unfold(true, move |first| async move {
         // First beat immediately (so a watching standby observes the leader at
         // once); pace the rest by `interval`.
