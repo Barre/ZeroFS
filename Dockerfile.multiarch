@@ -20,21 +20,6 @@ RUN case "${TARGETPLATFORM}" in \
         "linux/arm64") \
             mv /tmp/zerofs-linux-arm64-pgo /usr/local/bin/zerofs \
             ;; \
-        "linux/arm/v7") \
-            mv /tmp/zerofs-linux-armv7-pgo /usr/local/bin/zerofs \
-            ;; \
-        "linux/386") \
-            mv /tmp/zerofs-linux-i686-pgo /usr/local/bin/zerofs \
-            ;; \
-        "linux/ppc64le") \
-            mv /tmp/zerofs-linux-ppc64le-pgo /usr/local/bin/zerofs \
-            ;; \
-        "linux/s390x") \
-            mv /tmp/zerofs-linux-s390x-pgo /usr/local/bin/zerofs \
-            ;; \
-        "linux/riscv64") \
-            mv /tmp/zerofs-linux-riscv64-pgo /usr/local/bin/zerofs \
-            ;; \
         *) \
             echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 \
             ;; \
