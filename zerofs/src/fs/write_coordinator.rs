@@ -148,18 +148,17 @@ pub(crate) async fn stage_seg_deltas(
     }
     // Read each segment's base concurrently: a large overwrite can touch many
     // old segments, and a serial RMW would be O(#segments) round trips. Still
-    // race-free — this worker is the keys' sole writer. A failed read must
-    // fail the batch, not default to 0: an undercounted live segment is one GC
-    // can delete (data loss).
+    // race-free — this worker is the keys' sole writer. A failed read — or a
+    // present-but-undecodable value — must fail the batch, not default to 0:
+    // an undercounted live segment is one GC can delete (data loss). Only a
+    // genuinely absent key starts at 0.
     let bases: Vec<SegBase> = stream::iter(agg)
         .map(|(key, net)| async move {
             match db.get_bytes(&key).await {
-                Ok(v) => Ok((
-                    key,
-                    net,
-                    v.and_then(|b| KeyCodec::decode_segcount(&b))
-                        .unwrap_or((0, 0)),
-                )),
+                Ok(None) => Ok((key, net, (0, 0))),
+                Ok(Some(b)) => KeyCodec::decode_segcount(&b)
+                    .map(|base| (key, net, base))
+                    .ok_or(FsError::IoError),
                 Err(_) => Err(FsError::IoError),
             }
         })
@@ -243,7 +242,8 @@ async fn worker_loop(
         // last emission. See the module doc for why this value is always a safe
         // upper bound on every inode id in this batch.
         let current = ctx.inode_store.next_id();
-        if current > last_emitted_counter {
+        let counter_staged = current > last_emitted_counter;
+        if counter_staged {
             let counter_key = ctx.key_codec.system_counter_key();
             let counter_value = KeyCodec::encode_counter(current);
             if replicating {
@@ -282,7 +282,16 @@ async fn worker_loop(
             Err(e) => {
                 // A segcount base read failed; committing with a guessed base
                 // risks data loss (see stage_seg_deltas). Abort the whole batch
-                // before shipping or committing.
+                // before shipping or committing. If the dropped batch staged a
+                // counter emission, `last_emitted_counter` is now ahead of
+                // anything persisted and no later batch would re-emit it
+                // (`current > last_emitted_counter` stays false), so a restart
+                // could re-allocate ids that already own durable inode
+                // records. Burn one id: `next_id` moves past the watermark and
+                // the next committed batch emits a covering value.
+                if counter_staged {
+                    ctx.inode_store.allocate();
+                }
                 for reply in replies {
                     let _ = reply.send(Err(e));
                 }
@@ -408,6 +417,13 @@ async fn worker_loop(
             result = ctx.flush_coordinator.flush().await;
         }
 
+        // Same watermark hole as the seg-delta abort above, for the failures
+        // below it (lost lease, taint flush): a failed batch may have dropped
+        // its staged counter emission. Burning an id when the counter may not
+        // have been applied is always safe — over-emission only wastes ids.
+        if counter_staged && result.is_err() {
+            ctx.inode_store.allocate();
+        }
         for reply in replies {
             let _ = reply.send(result);
         }
@@ -532,6 +548,75 @@ mod tests {
         assert_ne!(
             after, after_allocate,
             "counter key should advance after allocate"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_segcount_value_fails_the_batch() {
+        let fs = make_fs().await;
+        let codec = codec();
+        let seg_key = codec.segcount_key(1, 1);
+        // Five bytes: neither the 16-byte encoding nor the legacy 8-byte one.
+        fs.db
+            .put_with_options(
+                &seg_key,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(7, 0), Bytes::from_static(b"v"));
+        txn.add_seg_delta(&seg_key, 5, 5);
+        fs.write_coordinator
+            .commit(txn)
+            .await
+            .expect_err("a corrupt segcount base must abort the batch, not default to 0");
+    }
+
+    #[tokio::test]
+    async fn counter_reemitted_after_aborted_batch() {
+        let fs = make_fs().await;
+        let codec = codec();
+        let seg_key = codec.segcount_key(1, 2);
+        // Corrupt segcount base so the seg-delta-bearing batch aborts.
+        fs.db
+            .put_with_options(
+                &seg_key,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Allocate so the aborting batch stages a counter emission, then lose
+        // that batch (and the staged counter put) to the segcount abort.
+        let id = fs.inode_store.allocate();
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(id, 0), Bytes::from_static(b"v"));
+        txn.add_seg_delta(&seg_key, 5, 5);
+        fs.write_coordinator.commit(txn).await.unwrap_err();
+
+        // A later batch with no new allocation must still emit a counter
+        // covering `id` (via the id burned on abort); otherwise a restart
+        // would hand out `id` again over this batch's durable records.
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(id, 1), Bytes::from_static(b"w"));
+        fs.write_coordinator.commit(txn).await.unwrap();
+
+        let persisted = fs
+            .db
+            .get_bytes(&codec.system_counter_key())
+            .await
+            .unwrap()
+            .map(|b| KeyCodec::decode_counter(&b).unwrap())
+            .unwrap_or(0);
+        assert!(
+            persisted > id,
+            "persisted counter {persisted} must cover allocated id {id}"
         );
     }
 
