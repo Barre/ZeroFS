@@ -32,6 +32,11 @@ pub enum SegmentStoreError {
 
 type Result<T> = std::result::Result<T, SegmentStoreError>;
 
+/// Concurrent per-shard LIST chains inside [`SegmentStore::list_segments_stream`].
+/// Bounds in-flight LIST requests and, with them, how much listing a retrying
+/// layer below buffers at once.
+const LIST_SHARD_CONCURRENCY: usize = 16;
+
 /// Warm a just-written segment into the object store's read (parts) cache. The
 /// production upload streams as multipart, which bypasses the store's single-PUT
 /// write-through, so `put_segment` calls this with the bytes it already holds. The
@@ -219,8 +224,17 @@ impl SegmentStore {
     pub fn list_segments_stream(
         &self,
     ) -> impl futures::Stream<Item = Result<(Segid, u64, chrono::DateTime<chrono::Utc>)>> + '_ {
-        self.object_store
-            .list(Some(&Path::from("segments")))
+        // One listing per shard prefix (segments/00 .. segments/ff) flattened
+        // with bounded concurrency, not one flat list("segments"): paged LISTs
+        // are sequential within a prefix (each page needs the prior page's
+        // token), so per-shard chains parallelize the scan across the
+        // partitions the shard byte exists to spread, and shrink each chain —
+        // the unit a retrying layer below must buffer per attempt, and the
+        // progress lost to a transient error — to 1/256th of the keyspace.
+        // Shard streams interleave, so consumers must not assume key order.
+        futures::stream::iter((0..=0xffu8).map(|shard| Path::from(format!("segments/{shard:02x}"))))
+            .map(move |prefix| self.object_store.list(Some(&prefix)))
+            .flatten_unordered(LIST_SHARD_CONCURRENCY)
             .filter_map(|meta| {
                 futures::future::ready(match meta {
                     Ok(m) => Segid::from_object_key(m.location.as_ref())
@@ -416,6 +430,25 @@ mod tests {
             store.read_extent(b[0].2, 1, 0).await.unwrap().as_ref(),
             b"b"
         );
+    }
+
+    // The listing fans out one LIST per shard prefix; every sealed segment must
+    // come back exactly once, whichever of the 256 shards its counter lands in.
+    #[tokio::test]
+    async fn list_segments_covers_all_shards_exactly_once() {
+        let store = store();
+        let mut expect = Vec::new();
+        for i in 0..20u64 {
+            let locs = store
+                .seal(&[(i, 0, Bytes::from(vec![i as u8; 64]))])
+                .await
+                .unwrap();
+            expect.push(locs[0].2.segid);
+        }
+        let mut listed = store.list_segments().await.unwrap();
+        listed.sort_by_key(|s| (s.epoch, s.counter));
+        expect.sort_by_key(|s| (s.epoch, s.counter));
+        assert_eq!(listed, expect, "20 seals span 20 shard prefixes");
     }
 
     // Two databases sharing one bucket must not see — or clobber — each other's
