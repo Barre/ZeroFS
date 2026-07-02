@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use slatedb::object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path};
+use slatedb::object_store::{
+    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, path::Path,
+};
 
 use crate::frame_codec::FrameCodec;
 use crate::fs::inode::InodeId;
@@ -39,9 +41,14 @@ const LIST_SHARD_CONCURRENCY: usize = 16;
 
 /// Concurrent multipart part uploads per sealing segment. Higher than the
 /// throughput-saturating default of 8 because per-seal wall time is fsync tail
-/// latency (the durability barrier waits out in-flight seals). Costs
-/// `this × part size (10 MiB)` of in-flight buffers per sealing segment.
+/// latency (the durability barrier waits out in-flight seals). Parts are
+/// zero-copy slices of the seal bytes, so extra concurrency costs requests in
+/// flight, not buffer copies.
 const SEAL_UPLOAD_CONCURRENCY: usize = 16;
+
+/// Multipart part size, and the seal size at which `put_segment` switches from
+/// a single PUT to multipart.
+const SEAL_PART_SIZE: usize = 10 * 1024 * 1024;
 
 /// Warm a just-written segment into the read (parts) cache: the multipart
 /// upload bypasses the store's single-PUT write-through, so `put_segment`
@@ -93,28 +100,70 @@ impl SegmentStore {
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
     /// `assemble_segment`.
     pub async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
-        // BufWriter uploads a small (partial-fsync) seal as a single PUT (which
-        // still writes through the parts cache) but streams a full 256 MiB seal
-        // as concurrent multipart, so the fsync-path PUT latency stays bounded
+        // A small (partial-fsync) seal goes up as a single PUT (which still
+        // writes through the parts cache) but a full 256 MiB seal streams as
+        // concurrent multipart, so the fsync-path PUT latency stays bounded
         // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
-        use tokio::io::AsyncWriteExt;
-        let mut w = slatedb::object_store::buffered::BufWriter::new(
-            self.object_store.clone(),
-            path.clone(),
-        )
-        .with_max_concurrency(SEAL_UPLOAD_CONCURRENCY);
-        w.write_all(&bytes)
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        w.shutdown()
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        if bytes.len() < SEAL_PART_SIZE {
+            self.object_store
+                .put(&path, bytes.clone().into())
+                .await
+                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        } else {
+            self.put_segment_multipart(&path, &bytes).await?;
+        }
         // The multipart path doesn't write through the parts cache; warm it
         // with the bytes in hand, after the upload commits (mirroring the
         // single-PUT path).
         if let Some(warm) = &self.warm {
             warm(&path, bytes);
+        }
+        Ok(())
+    }
+
+    /// Multipart PUT of `bytes` in `SEAL_PART_SIZE` parts, at most
+    /// `SEAL_UPLOAD_CONCURRENCY` in flight. Any failure aborts the upload before
+    /// the error propagates: parts of an unfinished multipart upload are
+    /// invisible to LIST — and so to the orphan sweep — yet billed until
+    /// aborted, and each retried seal targets a fresh upload, so leaks would
+    /// accrete per failure.
+    async fn put_segment_multipart(&self, path: &Path, bytes: &Bytes) -> Result<()> {
+        let mut upload = self
+            .object_store
+            .put_multipart(path)
+            .await
+            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        // Parts run as spawned tasks, so upload progress never waits on this
+        // future being polled.
+        let mut parts = tokio::task::JoinSet::new();
+        let uploaded = async {
+            let mut rest = bytes.clone();
+            while !rest.is_empty() {
+                while parts.len() >= SEAL_UPLOAD_CONCURRENCY {
+                    parts
+                        .join_next()
+                        .await
+                        .expect("parts is non-empty")
+                        .expect("part upload panicked")?;
+                }
+                let part = rest.split_to(rest.len().min(SEAL_PART_SIZE));
+                parts.spawn(upload.put_part(part.into()));
+            }
+            while let Some(part) = parts.join_next().await {
+                part.expect("part upload panicked")?;
+            }
+            upload.complete().await
+        }
+        .await;
+        if let Err(e) = uploaded {
+            // Best-effort cleanup: surface the seal error even if the abort
+            // itself fails (leaving the parts to the backend's lifecycle rule).
+            parts.shutdown().await;
+            if let Err(abort_err) = upload.abort().await {
+                tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
+            }
+            return Err(SegmentStoreError::ObjectStore(e.to_string()));
         }
         Ok(())
     }
@@ -372,12 +421,154 @@ mod tests {
     use super::*;
     use crate::config::CompressionConfig;
     use crate::segment::SEGMENT_INFO;
+    use futures::stream::BoxStream;
     use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::{
+        CopyOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult, Result as OsResult, UploadPart,
+    };
+    use std::sync::atomic::AtomicBool;
 
     fn store() -> SegmentStore {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
         SegmentStore::new(os, codec, 5, None)
+    }
+
+    /// `len` bytes of keyed xorshift noise: incompressible, so a seal built
+    /// from it stays past the single-PUT threshold.
+    fn noise(seed: u64, len: usize) -> Bytes {
+        let mut x = seed | 1;
+        let mut v = Vec::with_capacity(len + 8);
+        while v.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.truncate(len);
+        Bytes::from(v)
+    }
+
+    /// Wraps `InMemory` so multipart uploads fail (the part at `fail_part`, or
+    /// the COMPLETE call) and records whether the upload got aborted.
+    #[derive(Debug)]
+    struct MultipartFaultStore {
+        inner: Arc<dyn ObjectStore>,
+        fail_part: Option<usize>,
+        fail_complete: bool,
+        aborted: Arc<AtomicBool>,
+    }
+
+    impl MultipartFaultStore {
+        fn new(fail_part: Option<usize>, fail_complete: bool) -> (Arc<Self>, Arc<AtomicBool>) {
+            let aborted = Arc::new(AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    inner: Arc::new(InMemory::new()),
+                    fail_part,
+                    fail_complete,
+                    aborted: aborted.clone(),
+                }),
+                aborted,
+            )
+        }
+
+        fn injected() -> slatedb::object_store::Error {
+            slatedb::object_store::Error::Generic {
+                store: "MultipartFaultStore",
+                source: "injected multipart fault".into(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for MultipartFaultStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MultipartFaultStore({})", self.inner)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FaultUpload {
+        inner: Box<dyn MultipartUpload>,
+        fail_part: Option<usize>,
+        fail_complete: bool,
+        next_part: usize,
+        aborted: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for FaultUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let idx = self.next_part;
+            self.next_part += 1;
+            if self.fail_part == Some(idx) {
+                return Box::pin(futures::future::ready(Err(MultipartFaultStore::injected())));
+            }
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> OsResult<PutResult> {
+            if self.fail_complete {
+                return Err(MultipartFaultStore::injected());
+            }
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> OsResult<()> {
+            self.aborted.store(true, Ordering::SeqCst);
+            self.inner.abort().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for MultipartFaultStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            let inner = self.inner.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(FaultUpload {
+                inner,
+                fail_part: self.fail_part,
+                fail_complete: self.fail_complete,
+                next_part: 0,
+                aborted: self.aborted.clone(),
+            }))
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OsResult<Path>>,
+        ) -> BoxStream<'static, OsResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OsResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
     }
 
     #[tokio::test]
@@ -428,6 +619,64 @@ mod tests {
         assert_eq!(
             store.read_extent(b[0].2, 1, 0).await.unwrap().as_ref(),
             b"b"
+        );
+    }
+
+    // A seal past the single-PUT threshold streams as concurrent multipart and
+    // must read back byte-identically.
+    #[tokio::test]
+    async fn multipart_seal_roundtrips() {
+        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os.clone(), codec, 5, None);
+        let frames: Vec<(u64, u64, Bytes)> =
+            (0..4u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
+        let locs = store.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let size = os.head(&Path::from(segid.object_key())).await.unwrap().size;
+        assert!(
+            size as usize > SEAL_PART_SIZE,
+            "seal must take the multipart path"
+        );
+        for ((id, extent, data), (_, _, loc)) in frames.iter().zip(&locs) {
+            let got = store.read_extent(*loc, *id, *extent).await.unwrap();
+            assert_eq!(&got, data);
+        }
+    }
+
+    // A part failing mid-multipart must abort the upload on the way out: an
+    // unaborted upload's parts are invisible to LIST — and so to the orphan
+    // sweep — yet billed until aborted, and every retried seal would strand a
+    // fresh batch.
+    #[tokio::test]
+    async fn failed_multipart_part_aborts_the_upload() {
+        let (os, aborted) = MultipartFaultStore::new(Some(1), false);
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os, codec, 5, None);
+        let res = store
+            .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
+            .await;
+        assert!(res.is_err(), "the seal error must surface");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "failed seal must abort its multipart upload"
+        );
+    }
+
+    // COMPLETE failing after every part landed must abort too: those parts are
+    // already durable on the backend, just as invisible and billed.
+    #[tokio::test]
+    async fn failed_multipart_complete_aborts_the_upload() {
+        let (os, aborted) = MultipartFaultStore::new(None, true);
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let store = SegmentStore::new(os, codec, 5, None);
+        let res = store
+            .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
+            .await;
+        assert!(res.is_err(), "the seal error must surface");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "failed COMPLETE must abort its multipart upload"
         );
     }
 

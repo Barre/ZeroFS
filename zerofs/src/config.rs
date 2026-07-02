@@ -371,6 +371,14 @@ pub struct LsmConfig {
     /// buffered until the next flush.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sync_writes: Option<bool>,
+    /// Deprecated, ignored: the WAL is permanently off (sealing correctness
+    /// requires it). Accepted so pre-2.0 configs still parse; never re-emitted.
+    #[serde(default, skip_serializing)]
+    pub wal_enabled: Option<bool>,
+    /// Deprecated, ignored: unflushed-data budgeting went away with the WAL.
+    /// Accepted so pre-2.0 configs still parse; never re-emitted.
+    #[serde(default, skip_serializing)]
+    pub max_unflushed_gb: Option<f64>,
 }
 
 impl LsmConfig {
@@ -704,6 +712,24 @@ impl Settings {
                 "[filesystem] ignore_fsync and [lsm] sync_writes are contradictory: \
                  sync_writes flushes after every write, ignore_fsync skips the fsync flush"
             );
+        }
+
+        // Deprecated [lsm] keys still parse (an upgrade must not brick startup
+        // on an old config) but no longer do anything; nudge the operator to
+        // drop them.
+        if let Some(lsm) = &self.lsm {
+            if lsm.wal_enabled.is_some() {
+                tracing::warn!(
+                    "[lsm] wal_enabled is deprecated and ignored (the WAL is permanently off); \
+                     remove it from the config"
+                );
+            }
+            if lsm.max_unflushed_gb.is_some() {
+                tracing::warn!(
+                    "[lsm] max_unflushed_gb is deprecated and ignored (it tuned the removed WAL); \
+                     remove it from the config"
+                );
+            }
         }
         Ok(())
     }
@@ -1315,6 +1341,58 @@ ignore_fsync = true"#,
         );
         let settings = write_and_load(&content).unwrap();
         assert!(settings.filesystem.unwrap().ignore_fsync);
+    }
+
+    // Pre-2.0 configs set the removed [lsm] wal_enabled / max_unflushed_gb
+    // keys; they must still parse (ignored, with a warning) so an upgrade
+    // doesn't brick startup, and must be dropped on re-serialization.
+    #[test]
+    fn test_deprecated_lsm_keys_parse_and_round_trip() {
+        let content = base_config_with_replication(
+            r#"[lsm]
+wal_enabled = true
+max_unflushed_gb = 2.0
+flush_interval_secs = 30"#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        let lsm = settings.lsm.as_ref().unwrap();
+        assert_eq!(lsm.wal_enabled, Some(true));
+        assert_eq!(lsm.max_unflushed_gb, Some(2.0));
+        assert_eq!(lsm.flush_interval_secs, Some(30));
+
+        // Round-trip: the deprecated keys are never re-emitted, and the
+        // result still parses.
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("wal_enabled"), "got: {serialized}");
+        assert!(
+            !serialized.contains("max_unflushed_gb"),
+            "got: {serialized}"
+        );
+        let reparsed: Settings = toml::from_str(&serialized).unwrap();
+        let lsm = reparsed.lsm.unwrap();
+        assert!(lsm.wal_enabled.is_none());
+        assert!(lsm.max_unflushed_gb.is_none());
+        assert_eq!(lsm.flush_interval_secs, Some(30));
+    }
+
+    // deny_unknown_fields still catches typos: only the two deprecated keys
+    // get a pass.
+    #[test]
+    fn test_unknown_lsm_key_still_rejected() {
+        let content = base_config_with_replication(
+            r#"[lsm]
+wal_enable = true"#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("unknown field"), "got: {err}");
+    }
+
+    // The generated config must not resurrect the deprecated keys.
+    #[test]
+    fn test_generated_config_omits_deprecated_lsm_keys() {
+        let rendered = Settings::render_default_config().unwrap();
+        assert!(!rendered.contains("wal_enabled"));
+        assert!(!rendered.contains("max_unflushed_gb"));
     }
 
     #[test]

@@ -82,7 +82,8 @@ fn plan_read_ahead(
 
 /// Seal (PUT) the open segment once its packed frames reach this size, bounding
 /// the in-RAM buffer between flushes. The seal PUT is concurrent multipart
-/// (BufWriter), so its fsync-path latency stays bounded despite the size.
+/// (`SegmentStore::put_segment`), so its fsync-path latency stays bounded
+/// despite the size.
 const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 
 /// Max segments sealing (PUT in flight) concurrently. Bounds the un-PUT RAM in
@@ -118,6 +119,14 @@ const MAX_CANDIDATES_BUFFERED: usize = 8192;
 /// dir read plus O(frames) point-lookups. Deferred segments keep their
 /// (already-elapsed) deadline and are retried next pass.
 const MAX_SEGMENT_DELETES_PER_PASS: usize = 1024;
+
+/// Orphan-sweep age floor: an uncounted segment object must have been PUT at
+/// least this long ago before it is deletable. Guards the window where an
+/// object exists but its crediting commit is still in flight (a compaction
+/// seal PUTs before its repoint commits). Judged from the object's
+/// `last_modified`, not process-local state, so a restarted process still
+/// reclaims old orphans on its first sweep.
+const ORPHAN_MIN_AGE_SECS: i64 = 60 * 60;
 
 /// A coalesced run of contiguous live frames within one source segment, for the
 /// compaction gather: (byte_offset, total byte_len, first frame index, the
@@ -189,9 +198,6 @@ pub struct ExtentStore {
     /// checkpoints active then, so reclamation outlasts anything that could
     /// still reference it.
     delete_at: Arc<Mutex<HashMap<Segid, DateTime<Utc>>>>,
-    /// Same, for the slow orphan sweep. Separate so the fast loop's per-pass
-    /// `retain` can't clobber an orphan's horizon (independent cadences).
-    orphan_delete_at: Arc<Mutex<HashMap<Segid, DateTime<Utc>>>>,
     /// Per-inode copy of the most-recently-written (extent_idx, full extent), so a
     /// sequential append splices into it rather than re-decoding the buffered/sealed
     /// frame. Eviction only ever costs a re-fetch.
@@ -239,7 +245,6 @@ impl ExtentStore {
             sealing: Arc::new(Mutex::new(HashMap::new())),
             seal_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_SEALS)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
-            orphan_delete_at: Arc::new(Mutex::new(HashMap::new())),
             tail_cache,
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
@@ -309,7 +314,7 @@ impl ExtentStore {
     /// the shared store directly). Used to ship un-PUT segments' bytes for HA.
     fn read_frame_for_ship(&self, segid: Segid, byte_offset: u64, byte_len: u32) -> Option<Bytes> {
         let start = byte_offset as usize;
-        let end = start + byte_len as usize;
+        let end = start.checked_add(byte_len as usize)?;
         {
             let open = self.open.lock().unwrap();
             if open.segid == segid {
@@ -388,13 +393,12 @@ impl ExtentStore {
                 // the extent key once: if the pointer moved, read the new location;
                 // if the extent was deleted concurrently (truncate/unlink) it is now
                 // a hole; otherwise the error is real.
-                match self
+                let reresolved = self
                     .db
                     .get_bytes(&key)
                     .await
-                    .map_err(|_| FsError::IoError)?
-                    .and_then(|enc| FrameLoc::decode(&enc))
-                {
+                    .map_err(|_| FsError::IoError)?;
+                match Self::decode_reresolved_extent(id, extent_idx, reresolved.as_ref())? {
                     Some(new_loc) if new_loc.segid != loc.segid => {
                         if let Some(mut frames) = self.read_frames_in_ram(
                             new_loc.segid,
@@ -452,6 +456,28 @@ impl ExtentStore {
         Ok(())
     }
 
+    /// Classify the re-resolved extent value in `get`'s GC-repoint retry.
+    /// An absent key means a concurrent truncate/unlink made the extent a
+    /// genuine hole; a present but undecodable value is the same
+    /// corrupt-value EIO as the primary path — never a fabricated hole of
+    /// zeros.
+    fn decode_reresolved_extent(
+        id: InodeId,
+        extent: u64,
+        enc: Option<&Bytes>,
+    ) -> Result<Option<FrameLoc>, FsError> {
+        match enc {
+            None => Ok(None),
+            Some(enc) => match FrameLoc::decode(enc) {
+                Some(loc) => Ok(Some(loc)),
+                None => {
+                    error!("Corrupt extent value (inode={}, extent={})", id, extent);
+                    Err(FsError::IoError)
+                }
+            },
+        }
+    }
+
     /// Read a contiguous run of frames from the open or an in-flight sealing
     /// buffer (read-your-writes), or `None` if `segid` is already on the object
     /// store. Frame offsets are identical in the buffer and the finalized
@@ -464,14 +490,35 @@ impl ExtentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Option<Vec<Bytes>>, FsError> {
-        let start = byte_offset as usize;
-        let end = start + byte_len as usize;
+        // The range comes from a db-stored FrameLoc: bounds-checked, never
+        // trusted, so a corrupt value surfaces as EIO instead of an
+        // out-of-range panic that would poison the open-segment lock for
+        // every later writer.
+        fn region(
+            buf: &[u8],
+            segid: Segid,
+            byte_offset: u64,
+            byte_len: u32,
+        ) -> Result<&[u8], FsError> {
+            let start = byte_offset as usize;
+            start
+                .checked_add(byte_len as usize)
+                .and_then(|end| buf.get(start..end))
+                .ok_or_else(|| {
+                    error!(
+                        "Corrupt FrameLoc for in-RAM {segid:?}: {byte_len} bytes at {byte_offset} \
+                         exceed the {}-byte buffer",
+                        buf.len()
+                    );
+                    FsError::IoError
+                })
+        }
         {
             let open = self.open.lock().unwrap();
             if segid == open.segid {
                 let frames = crate::segment::read_frames_from_region(
                     &self.codec,
-                    &open.buf[start..end],
+                    region(&open.buf, segid, byte_offset, byte_len)?,
                     segid,
                     first_frame,
                     slots,
@@ -485,7 +532,7 @@ impl ExtentStore {
             if let Some(bytes) = sealing.get(&segid) {
                 let frames = crate::segment::read_frames_from_region(
                     &self.codec,
-                    &bytes[start..end],
+                    region(bytes.as_ref(), segid, byte_offset, byte_len)?,
                     segid,
                     first_frame,
                     slots,
@@ -816,11 +863,20 @@ impl ExtentStore {
         }
         let prev = self.read_ahead.get(&id).map(|e| *e).unwrap_or((0, 0, 0));
         let (state, plan) = plan_read_ahead(prev, offset, length);
-        self.read_ahead.insert(id, state);
-        let (start, end) = plan?;
+        let Some((start, end)) = plan else {
+            self.read_ahead.insert(id, state);
+            return None;
+        };
         // Skip when at the concurrency cap rather than queueing (read-ahead is
-        // best-effort; the next read re-triggers it).
-        let permit = Arc::clone(&self.prefetch_sem).try_acquire_owned().ok()?;
+        // best-effort). Coverage is committed only once the fetch is spawned:
+        // on a skip, `prefetched_to` stays at the true high-water mark
+        // (`start`), so the next read re-plans and re-tries the permit.
+        let Ok(permit) = Arc::clone(&self.prefetch_sem).try_acquire_owned() else {
+            let (read_end, _, seq) = state;
+            self.read_ahead.insert(id, (read_end, start, seq));
+            return None;
+        };
+        self.read_ahead.insert(id, state);
         let this = self.clone();
         let read_end = offset + length;
         Some(crate::task::spawn_named("read-ahead", async move {
@@ -882,9 +938,14 @@ impl ExtentStore {
                 error!("Failed to read extent during scan (inode={}): {}", id, e);
                 FsError::IoError
             })?;
-            if let Some(extent_idx) = self.key_codec.parse_extent_key(&key)
-                && let Some(loc) = FrameLoc::decode(&value)
-            {
+            if let Some(extent_idx) = self.key_codec.parse_extent_key(&key) {
+                // A present-but-undecodable value is the same corrupt-value
+                // EIO as the single-extent path (`get`) — skipping it would
+                // serve the extent as a fabricated hole of zeros.
+                let loc = FrameLoc::decode(&value).ok_or_else(|| {
+                    error!("Corrupt extent value (inode={}, extent={})", id, extent_idx);
+                    FsError::IoError
+                })?;
                 loc_map.insert(extent_idx, loc);
             }
         }
@@ -1493,12 +1554,16 @@ impl ExtentStore {
     /// store — hence the slow cadence; the fast reclaim never sees
     /// counter-less objects.
     ///
-    /// Candidates pass the same gates as the fast reclaim: `eligible()`, the
-    /// delete horizon, and the directory verify. The caller runs it after the
-    /// fast reclaim, never concurrently, so an in-flight compaction can't
-    /// leave a not-yet-credited packed segment eligible. Returns the number of
-    /// orphans reclaimed.
-    pub async fn sweep_orphans(&self, delete_horizon: DateTime<Utc>) -> Result<usize, FsError> {
+    /// Candidates pass the same `eligible()` gate as the fast reclaim, an age
+    /// gate — only objects `last_modified` before `modified_before` are
+    /// deletable, so a PUT whose crediting commit is still in flight is never
+    /// swept — and the directory verify. The age gate is stateless (the
+    /// object's mtime, no process-local first-seen map), so a restarted
+    /// process reclaims old orphans on its first sweep. The caller runs it
+    /// after the fast reclaim, never concurrently, so an in-flight compaction
+    /// can't leave a not-yet-credited packed segment eligible. Returns the
+    /// number of orphans reclaimed.
+    pub async fn sweep_orphans(&self, modified_before: DateTime<Utc>) -> Result<usize, FsError> {
         // Durable barrier, as in the fast reclaim: seal the open buffer and flush so
         // the eligibility cutoff and the directory verify observe the durable view.
         {
@@ -1523,9 +1588,15 @@ impl ExtentStore {
         let stream = self.segments.list_segments_stream();
         futures::pin_mut!(stream);
         while let Some(result) = futures::StreamExt::next(&mut stream).await {
-            let (segid, _size, _mtime) = result.map_err(|_| FsError::IoError)?;
+            let (segid, _size, mtime) = result.map_err(|_| FsError::IoError)?;
             scanned += 1;
             if !eligible(&segid) {
+                continue;
+            }
+            // Age gate: an uncounted object younger than the cutoff may be a
+            // PUT whose crediting commit is still in flight; it sweeps next
+            // cadence once safely old.
+            if mtime >= modified_before {
                 continue;
             }
             let key = self.key_codec.segcount_key(segid.epoch, segid.counter);
@@ -1544,30 +1615,8 @@ impl ExtentStore {
             }
         }
 
-        // Horizon gate on the orphan-only map (see the `orphan_delete_at`
-        // field for why it's separate).
-        let now = Utc::now();
-        let to_delete = {
-            let mut delete_at = self.orphan_delete_at.lock().unwrap();
-            let mut to_delete: Vec<Segid> = Vec::new();
-            let mut still_waiting: HashSet<Segid> = HashSet::new();
-            for &segid in &orphans {
-                let due = *delete_at.entry(segid).or_insert(delete_horizon);
-                if now >= due {
-                    to_delete.push(segid);
-                    delete_at.remove(&segid);
-                } else {
-                    still_waiting.insert(segid);
-                }
-            }
-            // Drop entries no longer listed as orphans, so the map can't grow
-            // without bound.
-            delete_at.retain(|s, _| still_waiting.contains(s));
-            to_delete
-        };
-
         let mut deleted = 0;
-        for segid in to_delete {
+        for segid in orphans {
             // Fail-closed, as in the fast reclaim: confirm via the directory
             // before deleting.
             match self.verify_segment_reclaimable(segid).await {
@@ -1620,10 +1669,10 @@ impl ExtentStore {
         {
             return Ok(None);
         }
-        // No manifest or checkpoint ever references an orphan, so a modest
-        // in-flight floor is the only horizon needed.
+        // No manifest or checkpoint ever references an orphan, so a generous
+        // in-flight age floor is the only gate needed.
         let deleted = self
-            .sweep_orphans(now + chrono::Duration::seconds(60))
+            .sweep_orphans(now - chrono::Duration::seconds(ORPHAN_MIN_AGE_SECS))
             .await?;
         // Persist the timestamp after the sweep, so a crash mid-sweep re-runs
         // it sooner rather than skipping a cadence.
@@ -1951,10 +2000,13 @@ mod tests {
     use slatedb::{BlockTransformer, DbBuilder};
 
     async fn make() -> (ExtentStore, Arc<Db>) {
-        make_with_compression(CompressionConfig::Lz4).await
+        let (store, db, _object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        (store, db)
     }
 
-    async fn make_with_compression(compression: CompressionConfig) -> (ExtentStore, Arc<Db>) {
+    async fn make_with_compression(
+        compression: CompressionConfig,
+    ) -> (ExtentStore, Arc<Db>, Arc<dyn ObjectStore>) {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let bt: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
@@ -1967,19 +2019,23 @@ mod tests {
                 .unwrap(),
         );
         let db = Arc::new(Db::new(slatedb, None));
+        let store = make_store(object_store.clone(), db.clone(), compression, 7);
+        (store, db, object_store)
+    }
+
+    /// A store over given backing state, as a restarted process would build:
+    /// fresh in-RAM state, and a higher epoch than any earlier incarnation's.
+    fn make_store(
+        object_store: Arc<dyn ObjectStore>,
+        db: Arc<Db>,
+        compression: CompressionConfig,
+        epoch: u64,
+    ) -> ExtentStore {
         let key_codec = Arc::new(KeyCodec::new());
         let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, compression);
-        let segments = Arc::new(SegmentStore::new(object_store, codec, 7, None));
-        (
-            ExtentStore::new(
-                db.clone(),
-                key_codec,
-                segments,
-                Arc::new(KeyedLockManager::new()),
-            )
-            .with_seal_threshold(8 * 1024 * 1024),
-            db,
-        )
+        let segments = Arc::new(SegmentStore::new(object_store, codec, epoch, None));
+        ExtentStore::new(db, key_codec, segments, Arc::new(KeyedLockManager::new()))
+            .with_seal_threshold(8 * 1024 * 1024)
     }
 
     async fn commit(store: &ExtentStore, txn: Transaction) {
@@ -2369,11 +2425,11 @@ mod tests {
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[7u8; 1000]);
     }
 
-    // The sweep's own delete horizon defers a candidate until it is due: a future
-    // horizon leaves the orphan in place; once the deadline passes a later sweep
-    // reclaims it (deadline recorded on first sight, so it isn't restarted).
+    // The sweep's age gate defers a too-young candidate: a cutoff predating the
+    // orphan's PUT leaves it in place (its crediting commit could still be in
+    // flight); a cutoff past its mtime reclaims it in that same pass.
     #[tokio::test]
-    async fn sweep_orphans_waits_for_its_delete_horizon() {
+    async fn sweep_orphans_waits_for_the_age_floor() {
         let (store, db) = make().await;
         let mut model = Vec::new();
         write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
@@ -2386,9 +2442,9 @@ mod tests {
         txn.delete_bytes(&key);
         commit(&store, txn).await;
 
-        // First sweep records a future horizon and deletes nothing.
-        let horizon = Utc::now() + chrono::Duration::milliseconds(80);
-        assert_eq!(store.sweep_orphans(horizon).await.unwrap(), 0);
+        // A cutoff older than the orphan's PUT: too young, kept.
+        let before_put = Utc::now() - chrono::Duration::seconds(60);
+        assert_eq!(store.sweep_orphans(before_put).await.unwrap(), 0);
         assert!(
             store
                 .segments
@@ -2398,9 +2454,7 @@ mod tests {
                 .contains(&orphan)
         );
 
-        // Past the recorded horizon the next sweep reclaims it (the new arg is
-        // irrelevant; the orphan keeps its first-seen deadline).
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // A cutoff past its mtime: old enough, reclaimed in one pass.
         assert_eq!(store.sweep_orphans(Utc::now()).await.unwrap(), 1);
         assert!(
             !store
@@ -2411,6 +2465,48 @@ mod tests {
                 .contains(&orphan)
         );
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[2u8; 1000]);
+    }
+
+    // The age gate reads the object's mtime, not process-lifetime state, so a
+    // restarted process (fresh ExtentStore over the same backing store) reclaims
+    // a pre-existing orphan on its very first sweep. The cutoff is past the
+    // orphan's mtime, as production's `now - age floor` is for a day-old orphan.
+    #[tokio::test]
+    async fn sweep_orphans_reclaims_an_old_orphan_after_restart() {
+        let (store, db, object_store) = make_with_compression(CompressionConfig::Lz4).await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        let orphan = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        write_and_check(&store, &db, &mut model, 0, &[2u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        let key = store.key_codec.segcount_key(orphan.epoch, orphan.counter);
+        let mut txn = db.new_transaction().unwrap();
+        txn.delete_bytes(&key);
+        commit(&store, txn).await;
+        drop(store);
+
+        // The "restarted" store shares the object store and db but none of the
+        // in-RAM sweep state, and opens under the next epoch.
+        let restarted = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let cutoff = Utc::now() + chrono::Duration::seconds(60);
+        assert_eq!(
+            restarted.sweep_orphans(cutoff).await.unwrap(),
+            1,
+            "a fresh process's first sweep must reclaim an old-enough orphan"
+        );
+        assert!(
+            !restarted
+                .segments
+                .list_segments()
+                .await
+                .unwrap()
+                .contains(&orphan)
+        );
+        assert_eq!(
+            restarted.read(1, 0, 1000).await.unwrap().as_ref(),
+            &[2u8; 1000]
+        );
     }
 
     #[tokio::test]
@@ -2538,6 +2634,80 @@ mod tests {
         );
     }
 
+    // A stored FrameLoc whose byte range lies outside the open buffer (a torn or
+    // corrupt LSM value — any 32-byte value decodes) must surface as EIO, not an
+    // out-of-range panic that poisons the open-segment lock for every later writer.
+    #[tokio::test]
+    async fn corrupt_frameloc_into_open_segment_is_eio_not_panic() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &[1u8; 100]).await;
+
+        // Fabricate a pointer at the current open segment with an impossible range.
+        let bogus = FrameLoc {
+            segid: store.open.lock().unwrap().segid,
+            frame_index: 0,
+            byte_offset: 1 << 40,
+            byte_len: 4096,
+        };
+        let key = store.key_codec.extent_key(1, 5);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(&key, Bytes::copy_from_slice(&bogus.encode()));
+        commit(&store, txn).await;
+
+        assert!(matches!(store.get(1, 5).await, Err(FsError::IoError)));
+        // The open-segment lock survived (not poisoned): writes still work.
+        write_and_check(&store, &db, &mut model, 0, &[2u8; 100]).await;
+    }
+
+    // A corrupt extent value inside a multi-extent scan is the same EIO as the
+    // single-extent path — skipping it would serve that extent as fabricated
+    // zeros while a single-extent read of the same key errors.
+    #[tokio::test]
+    async fn multi_extent_read_of_a_corrupt_value_is_eio_not_zeros() {
+        let (store, db) = make().await;
+
+        // Plant a torn (undecodable) value at extent 1, then read across
+        // extents 0..=2 so the ranged-scan path (not `get`) resolves it.
+        let key = store.key_codec.extent_key(1, 1);
+        let mut txn = db.new_transaction().unwrap();
+        txn.put_bytes(&key, Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]));
+        commit(&store, txn).await;
+
+        let r = store.read_range(1, 0, 3 * EXTENT_SIZE as u64).await;
+        assert!(matches!(r, Err(FsError::IoError)));
+    }
+
+    // In `get`'s GC-repoint retry, a re-resolved value that fails to decode is the
+    // same corrupt-value EIO as the primary path — treating it like an absent key
+    // would fabricate a hole of zeros from a torn LSM value.
+    #[test]
+    fn reresolve_distinguishes_a_hole_from_a_corrupt_value() {
+        // Absent: a concurrent truncate/unlink made the extent a genuine hole.
+        assert!(matches!(
+            ExtentStore::decode_reresolved_extent(1, 0, None),
+            Ok(None)
+        ));
+        // Present but undecodable (torn/truncated): EIO, never a hole.
+        let torn = Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]);
+        assert!(matches!(
+            ExtentStore::decode_reresolved_extent(1, 0, Some(&torn)),
+            Err(FsError::IoError)
+        ));
+        // A decodable value passes through for the segid comparison.
+        let loc = FrameLoc {
+            segid: Segid::new(1, 2),
+            frame_index: 3,
+            byte_offset: 4,
+            byte_len: 5,
+        };
+        let enc = Bytes::copy_from_slice(&loc.encode());
+        assert_eq!(
+            ExtentStore::decode_reresolved_extent(1, 0, Some(&enc)).unwrap(),
+            Some(loc)
+        );
+    }
+
     // Not a correctness test: measures single-stream engine-side write
     // throughput (codec + open-buffer append + seal + commit, no protocol, no
     // inode lock) against an in-memory object store.
@@ -2553,7 +2723,7 @@ mod tests {
                 ("incompressible", incompressible(1, 256 * 1024)),
                 ("zeros", vec![0u8; 256 * 1024]),
             ] {
-                let (store, db) = make_with_compression(compression).await;
+                let (store, db, _object_store) = make_with_compression(compression).await;
                 let chunk = data.len();
                 let total: usize = 512 * 1024 * 1024;
                 let payload = Bytes::from(data);
@@ -2887,6 +3057,28 @@ mod tests {
         h.unwrap().await.unwrap();
         // A non-contiguous jump: nothing spawned.
         assert!(store.trigger_read_ahead(1, 9_000_000, 1000).is_none());
+    }
+
+    #[tokio::test]
+    async fn read_ahead_skip_at_cap_keeps_coverage_honest() {
+        let (store, _db) = make().await;
+        // Hold every permit so the planned prefetch is skipped at the cap.
+        let held: Vec<_> = (0..READ_AHEAD_MAX_CONCURRENT)
+            .map(|_| Arc::clone(&store.prefetch_sem).try_acquire_owned().unwrap())
+            .collect();
+        assert!(store.trigger_read_ahead(1, 0, 1000).is_none());
+        assert!(
+            store.trigger_read_ahead(1, 1000, 1000).is_none(),
+            "at the cap -> skip"
+        );
+        // The skip must not count the window as covered: `prefetched_to`
+        // stays at the read end, so the next read re-plans.
+        let (_, prefetched_to, _) = store.read_ahead.get(&1).map(|e| *e).unwrap();
+        assert_eq!(prefetched_to, 2000, "skipped window recorded as covered");
+        drop(held);
+        let h = store.trigger_read_ahead(1, 2000, 1000);
+        assert!(h.is_some(), "freed permit -> the next read re-triggers");
+        h.unwrap().await.unwrap();
     }
 
     #[tokio::test]
