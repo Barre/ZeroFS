@@ -5,1554 +5,2828 @@
   See website/LICENSE.
 -->
 <html lang="en">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ZeroFS — S3 as your primary storage</title>
-<meta name="description" content="ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, or as raw block devices over NBD. Data is compressed and encrypted before upload.">
-<link rel="icon" type="image/png" href="favicon.png">
-<script defer data-domain="zerofs.net" src="https://p.merklemap.com/js/script.js"></script>
-<meta property="og:title" content="ZeroFS — S3 as your primary storage">
-<meta property="og:description" content="File and block storage on S3-compatible buckets. NFS, 9P, and NBD run in one process, and encryption is always on.">
-<meta property="og:type" content="website">
-<meta property="og:url" content="https://www.zerofs.net">
-<meta property="og:image" content="https://www.zerofs.net/assets/og-card.jpg">
-<meta property="og:image:width" content="2400">
-<meta property="og:image:height" content="1260">
-<meta name="twitter:card" content="summary_large_image">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400..900;1,400..900&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-:root {
-  --bg: #0a0a09;
-  --bg-raise: #111110;
-  --panel: rgba(255, 255, 255, 0.035);
-  --panel-hover: rgba(255, 255, 255, 0.06);
-  --line: rgba(255, 255, 255, 0.09);
-  --line-bright: rgba(255, 255, 255, 0.22);
-  --text: #f4f3ef;
-  --text-dim: #a8a69e;
-  --text-faint: #6e6c64;
-  --accent: #4d9fff;
-  --accent-soft: rgba(77, 159, 255, 0.13);
-  --sans: "Schibsted Grotesk", sans-serif;
-  --mono: "Geist Mono", monospace;
-  --r: 12px;
-}
-* { margin: 0; padding: 0; box-sizing: border-box; }
-html { scroll-behavior: smooth; }
-::selection { background: var(--accent); color: #0a0a09; }
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--sans);
-  font-size: 16.5px;
-  line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  overflow-x: hidden;
-}
-/* global fine grid */
-body::before {
-  content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
-  background-image:
-    linear-gradient(to right, rgba(255,255,255,0.022) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255,255,255,0.022) 1px, transparent 1px);
-  background-size: 88px 88px;
-  mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 30%, transparent 75%);
-}
-a { color: inherit; text-decoration: none; }
-.wrap { max-width: 1160px; margin: 0 auto; padding: 0 32px; position: relative; z-index: 1; }
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZeroFS — A log-structured filesystem for S3</title>
+  <meta name="description"
+    content="ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, or as raw block devices over NBD. Data is compressed and encrypted before upload.">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <script defer data-domain="zerofs.net" src="https://p.merklemap.com/js/script.js"></script>
+  <meta property="og:title" content="ZeroFS — A log-structured filesystem for S3">
+  <meta property="og:description"
+    content="File and block storage on S3-compatible buckets. NFS, 9P, and NBD run in one process, and encryption is always on.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://www.zerofs.net">
+  <meta property="og:image" content="https://www.zerofs.net/assets/og-card.jpg">
+  <meta property="og:image:width" content="2400">
+  <meta property="og:image:height" content="1260">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400..900;1,400..900&family=Geist+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0a0a09;
+      --bg-raise: #111110;
+      --panel: rgba(255, 255, 255, 0.035);
+      --panel-hover: rgba(255, 255, 255, 0.06);
+      --line: rgba(255, 255, 255, 0.09);
+      --line-bright: rgba(255, 255, 255, 0.22);
+      --text: #f4f3ef;
+      --text-dim: #a8a69e;
+      --text-faint: #6e6c64;
+      --accent: #4d9fff;
+      --accent-soft: rgba(77, 159, 255, 0.13);
+      --sans: "Schibsted Grotesk", sans-serif;
+      --mono: "Geist Mono", monospace;
+      --r: 12px;
+    }
 
-/* ---------- header ---------- */
-header {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
-  background: transparent;
-  border-bottom: 1px solid transparent;
-  transition: background .3s ease, border-color .3s ease;
-}
-header.scrolled {
-  background: rgba(10, 10, 9, 0.96);
-  border-bottom-color: var(--line);
-}
-.bar {
-  display: flex; align-items: center; justify-content: space-between;
-  max-width: 1180px; height: 72px;
-  margin: 0 auto;
-  padding: 0 32px;
-}
-.brand { display: flex; align-items: center; gap: 13px; }
-.brand svg { display: block; color: var(--text); }
-.brand .mark {
-  width: 36px; height: 36px;
-  filter: drop-shadow(0 0 12px rgba(255,255,255,0.18));
-  transition: filter .2s;
-}
-.brand:hover .mark { filter: drop-shadow(0 0 18px rgba(255,255,255,0.35)); }
-.brand .wm { width: 84px; height: 18.1px; }
-nav { display: flex; align-items: center; gap: 6px; }
-nav a {
-  font-size: 14px; font-weight: 500; letter-spacing: -0.005em;
-  color: var(--text-dim);
-  padding: 8px 13px; border-radius: 8px;
-  transition: color .15s, background .15s;
-}
-nav a:hover { color: var(--text); background: var(--panel-hover); }
-nav a.gh { display: flex; align-items: center; gap: 7px; }
-nav a.gh svg { display: block; opacity: 0.9; }
-nav a.gh span { font-family: var(--mono); font-size: 12.5px; }
-nav a.cta {
-  color: #0a0a09; background: var(--text);
-  font-weight: 600; font-size: 14px;
-  margin-left: 14px;
-  padding: 10px 20px; border-radius: 999px;
-  transition: transform .15s, box-shadow .15s, background .15s;
-}
-nav a.cta:hover {
-  background: #fff; transform: translateY(-1px);
-  box-shadow: 0 6px 28px rgba(255,255,255,0.22);
-}
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
 
-/* ---------- hero ---------- */
-.hero {
-  position: relative; overflow: clip;
-  border-bottom: 1px solid var(--line);
-}
-.hero::before {
-  content: ""; position: absolute; inset: -40% -20% auto;
-  height: 130%;
-  background:
-    radial-gradient(ellipse 46% 56% at 50% 12%, rgba(255,255,255,0.07), transparent 65%),
-    radial-gradient(ellipse 30% 40% at 62% 30%, var(--accent-soft), transparent 70%);
-  pointer-events: none;
-}
-.hero-scene {
-  position: absolute; inset: 0; pointer-events: none;
-  -webkit-mask: linear-gradient(to bottom, transparent 0, #000 150px);
-  mask: linear-gradient(to bottom, transparent 0, #000 150px);
-}
-/* film grain */
-.hero::after {
-  content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none;
-  opacity: 0.5;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='gn'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23gn)'/%3E%3C/svg%3E");
-}
-.hero .wrap {
-  padding-top: 196px; padding-bottom: 104px;
-  display: flex; flex-direction: column; align-items: center; text-align: center;
-}
-@property --sweep {
-  syntax: "<angle>"; initial-value: 420deg; inherits: false;
-}
-@property --tail {
-  syntax: "<angle>"; initial-value: -70deg; inherits: false;
-}
-@property --soft {
-  syntax: "<angle>"; initial-value: 24deg; inherits: false;
-}
-.enso-tilt {
-  position: absolute; left: 50%; top: 46%;
-  width: 760px; height: 760px;
-  transform: translate(-50%, -50%) perspective(1100px) rotateX(var(--mtx, 0deg)) rotateY(var(--mty, 0deg));
-  pointer-events: none;
-}
-.enso-prec {
-  position: absolute; inset: 0;
-  animation: precess 17s linear infinite;
-}
-.hero-enso {
-  position: absolute; inset: 0;
-  width: 100%; height: 100%;
-  color: #d6d3cb; opacity: 0.17;
-  pointer-events: none;
-  -webkit-mask: conic-gradient(from -90deg, transparent var(--tail), #000 calc(var(--tail) + 70deg), #000 calc(var(--sweep) - var(--soft)), transparent var(--sweep));
-  mask: conic-gradient(from -90deg, transparent var(--tail), #000 calc(var(--tail) + 70deg), #000 calc(var(--sweep) - var(--soft)), transparent var(--sweep));
-  animation: spin 120s linear infinite, sweep 2.6s cubic-bezier(.55,0,.3,1) .15s backwards;
-}
-@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-@keyframes precess {
-  0.00% { transform: perspective(1100px) rotateZ(0deg) rotateX(5deg) rotateZ(-0deg); }
-  8.33% { transform: perspective(1100px) rotateZ(30deg) rotateX(5deg) rotateZ(-30deg); }
-  16.67% { transform: perspective(1100px) rotateZ(60deg) rotateX(5deg) rotateZ(-60deg); }
-  25.00% { transform: perspective(1100px) rotateZ(90deg) rotateX(5deg) rotateZ(-90deg); }
-  33.33% { transform: perspective(1100px) rotateZ(120deg) rotateX(5deg) rotateZ(-120deg); }
-  41.67% { transform: perspective(1100px) rotateZ(150deg) rotateX(5deg) rotateZ(-150deg); }
-  50.00% { transform: perspective(1100px) rotateZ(180deg) rotateX(5deg) rotateZ(-180deg); }
-  58.33% { transform: perspective(1100px) rotateZ(210deg) rotateX(5deg) rotateZ(-210deg); }
-  66.67% { transform: perspective(1100px) rotateZ(240deg) rotateX(5deg) rotateZ(-240deg); }
-  75.00% { transform: perspective(1100px) rotateZ(270deg) rotateX(5deg) rotateZ(-270deg); }
-  83.33% { transform: perspective(1100px) rotateZ(300deg) rotateX(5deg) rotateZ(-300deg); }
-  91.67% { transform: perspective(1100px) rotateZ(330deg) rotateX(5deg) rotateZ(-330deg); }
-  100.00% { transform: perspective(1100px) rotateZ(360deg) rotateX(5deg) rotateZ(-360deg); }
-}
-.hero-glow {
-  position: absolute; left: 50%; top: 46%;
-  width: 980px; height: 980px;
-  transform: translate(-50%, -50%);
-  background: radial-gradient(circle closest-side, transparent 42%, rgba(168,199,250,0.05) 55%, rgba(255,255,255,0.10) 65%, rgba(120,160,255,0.05) 79%, transparent 97%);
-  filter: blur(44px);
-  pointer-events: none;
-  animation: breathe 9s ease-in-out infinite alternate;
-}
-.hero-glow::before {
-  content: ""; position: absolute; inset: -30%;
-  background: radial-gradient(circle, transparent 46%, rgba(0, 0, 0, 0.7) 64%, transparent 88%);
-}
-@keyframes breathe {
-  from { opacity: 0.7; transform: translate(-50%, -50%) scale(0.97); }
-  to { opacity: 1; transform: translate(-50%, -50%) scale(1.05); }
-}
-.hero-particles {
-  position: absolute; left: 50%; top: 46%;
-  width: 0; height: 0;
-  pointer-events: none;
-  --r0: 310px;
-}
-.hero-particles canvas {
-  position: absolute;
-  opacity: 0;
-  animation: motes-in 1.8s ease 0.8s forwards;
-}
-@keyframes motes-in { to { opacity: 1; } }
-@keyframes sweep {
-  0%   { --sweep: 155deg; --tail: 0deg; --soft: 85deg; opacity: 0; }
-  14%  { opacity: 0.17; }
-  60%  { --tail: 0deg; --soft: 85deg; }
-  100% { --sweep: 384deg; --tail: -70deg; --soft: 24deg; opacity: 0.17; }
-}
-h1 {
-  font-weight: 800; letter-spacing: -0.038em;
-  font-size: clamp(46px, 7vw, 88px);
-  line-height: 1.02;
-  max-width: 12em;
-}
-h1 .l { display: block; overflow: hidden; padding-bottom: 0.12em; margin-bottom: -0.12em; }
-h1 .li {
-  display: block; transform: translateY(112%);
-  animation: lineup 1s cubic-bezier(.16,.84,.28,1) forwards;
-  background: linear-gradient(180deg, #fff 55%, rgba(255,255,255,0.62));
-  -webkit-background-clip: text; background-clip: text; color: transparent;
-}
-h1 .l:nth-child(1) .li { animation-delay: 0.25s; }
-h1 .l:nth-child(2) .li { animation-delay: 0.42s; }
-@keyframes lineup { to { transform: translateY(0); } }
-h1 .dot { -webkit-text-fill-color: var(--accent); }
-.lede {
-  margin-top: 26px; max-width: 640px;
-  font-size: 19px; line-height: 1.65; color: var(--text-dim);
-  font-weight: 400;
-}
-.lede strong { color: var(--text); font-weight: 600; }
-.install { margin-top: 44px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 14px; }
-.cmd {
-  display: flex; align-items: center; gap: 14px;
-  border: 1px solid var(--line-bright); border-radius: var(--r);
-  background: rgba(255,255,255,0.045);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 32px rgba(0,0,0,0.45);
-  padding: 14px 18px;
-  font-family: var(--mono); font-size: 14px;
-}
-.cmd .ps1 { color: var(--accent); user-select: none; }
-.cmd > button, .cmd-copy {
-  border: none; background: none; cursor: pointer;
-  min-width: 72px; text-align: center;
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.07em;
-  text-transform: uppercase; color: var(--text-faint);
-  padding: 5px 10px; border-radius: 7px;
-  border: 1px solid var(--line);
-  transition: color .15s, border-color .15s, background .15s;
-}
-.cmd > button:hover, .cmd-copy:hover { color: var(--text); border-color: var(--line-bright); background: var(--panel-hover); }
-.cmd .caret {
-  display: inline-block; width: 0.55em; height: 1.05em;
-  vertical-align: -0.15em; margin-left: 7px;
-  background: var(--accent);
-  animation: blink 1s steps(1) infinite;
-}
-.ghost {
-  position: relative; isolation: isolate; overflow: hidden;
-  font-family: var(--mono); font-size: 15px; letter-spacing: 0.16em; text-transform: uppercase;
-  color: #cbc9c1;
-  padding: 18px 40px; border: 1px solid rgba(255,255,255,0.13); border-radius: var(--r);
-  background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(0,0,0,0.4));
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
-  transition: color .2s, border-color .2s, background .2s, box-shadow .2s, text-shadow .2s;
-}
-.ghost:hover {
-  color: #fff; border-color: var(--accent);
-  background: #01020a;
-  box-shadow: 0 0 26px rgba(77,159,255,0.4), inset 0 0 22px rgba(77,159,255,0.28);
-  text-shadow: 0 1px 10px rgba(0,0,0,0.75), 0 0 8px rgba(77,159,255,0.55);
-  animation: ghostShake 0.4s linear infinite;
-}
-@keyframes ghostShake {
-  0%, 100% { transform: translate(0, 0); }
-  10% { transform: translate(-1.1px, 0.6px); }
-  20% { transform: translate(1px, -0.9px); }
-  30% { transform: translate(-1.3px, 1px); }
-  40% { transform: translate(1.2px, 0.5px); }
-  50% { transform: translate(-0.6px, -1.2px); }
-  60% { transform: translate(1.3px, 0.9px); }
-  70% { transform: translate(-1px, -0.6px); }
-  80% { transform: translate(0.9px, 1.1px); }
-  90% { transform: translate(-0.8px, -1px); }
-}
-/* hyperspace portal */
-.ghost-label {
-  position: relative; z-index: 2;
-  display: inline-flex; align-items: center; gap: 0.7em;
-}
-.ghost-mark {
-  flex: none; width: 1.5em; height: 1.5em;
-  color: #bcd6ff;
-  filter: drop-shadow(0 0 5px rgba(77,159,255,0.5));
-  transition: opacity .3s, transform .4s;
-}
-.ghost:hover .ghost-mark { opacity: 0; transform: scale(1.8); }
-.ghost-arrow { display: inline-block; transition: transform .25s ease; }
-.ghost:hover .ghost-arrow { transform: translateX(5px); }
-.ghost-portal {
-  position: absolute; inset: 0; z-index: 0;
-  opacity: 0; transition: opacity .3s;
-  color: #bcd6ff; pointer-events: none;
-  perspective: 560px; perspective-origin: 50% 50%;
-}
-.ghost:hover .ghost-portal { opacity: 1; }
-.ghost-portal::before {
-  content: ""; position: absolute; left: 50%; top: 50%;
-  width: 0.9em; height: 0.9em; transform: translate(-50%, -50%);
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(205,227,255,0.95), rgba(77,159,255,0.5) 45%, transparent 72%);
-  filter: blur(2px);
-}
-.ghost-portal svg {
-  position: absolute; left: 50%; top: 50%;
-  width: 2.9em; height: 2.9em; margin: -1.45em 0 0 -1.45em;
-  opacity: 0; transform-origin: 50% 50%;
-  filter: drop-shadow(0 0 6px rgba(77,159,255,0.9));
-  will-change: transform, opacity;
-}
-.ghost:hover .ghost-portal svg { animation: ensowarp 3s linear infinite; }
-.ghost:hover .ghost-portal svg:nth-child(2) { animation-delay: -0.375s; }
-.ghost:hover .ghost-portal svg:nth-child(3) { animation-delay: -0.75s; }
-.ghost:hover .ghost-portal svg:nth-child(4) { animation-delay: -1.125s; }
-.ghost:hover .ghost-portal svg:nth-child(5) { animation-delay: -1.5s; }
-.ghost:hover .ghost-portal svg:nth-child(6) { animation-delay: -1.875s; }
-.ghost:hover .ghost-portal svg:nth-child(7) { animation-delay: -2.25s; }
-.ghost:hover .ghost-portal svg:nth-child(8) { animation-delay: -2.625s; }
-@keyframes ensowarp {
-  0%   { opacity: 0;   transform: translateZ(-1600px) rotate(-12deg); }
-  10%  { opacity: 1; }
-  78%  { opacity: 1; }
-  100% { opacity: 0;   transform: translateZ(520px) rotate(92deg); }
-}
-/* hyperspace noise */
-.ghost-noise {
-  position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: 0;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size: 160px 160px;
-  mix-blend-mode: screen;
-}
-.ghost:hover .ghost-noise { opacity: 0.11; animation: ghostNoise 0.1s steps(3) infinite; }
-@keyframes ghostNoise {
-  0%   { background-position: 0 0; }
-  33%  { background-position: -54px 38px; }
-  66%  { background-position: 42px -30px; }
-  100% { background-position: -28px -52px; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ghost:hover { animation: none; }
-  .ghost:hover .ghost-portal svg { animation: none; }
-  .ghost:hover .ghost-portal svg:nth-child(4) { opacity: 0.55; transform: translateZ(0) scale(1.1); }
-  .ghost:hover .ghost-noise { animation: none; opacity: 0; }
-}
-.alt-install {
-  margin-top: 20px;
-  font-family: var(--mono); font-size: 12px; color: var(--text-faint);
-}
-.alt-install code { color: var(--text-dim); }
-.alt-install a { color: var(--text-dim); border-bottom: 1px solid var(--line); transition: color .15s, border-color .15s; }
-.alt-install a:hover { color: var(--text); border-color: var(--line-bright); }
+    html {
+      scroll-behavior: smooth;
+    }
 
-/* tabbed install panel */
-.hero .install { flex-direction: column; }
-.cmd.tabbed {
-  display: block;
-  padding: 0; overflow: hidden; text-align: left;
-  width: min(640px, 92vw);
-  background: rgba(0,0,0,0.32);
-}
-.cmd-head {
-  display: flex; align-items: stretch; justify-content: space-between;
-  padding: 0 8px 0 6px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(255,255,255,0.025);
-}
-.cmd-tabs { display: flex; }
-.cmd-tabs button {
-  cursor: pointer; background: none; border: none;
-  font-family: var(--mono); font-size: 13px; font-weight: 500; letter-spacing: 0.02em;
-  color: var(--text-dim);
-  padding: 11px 16px 10px;
-  border-bottom: 2px solid transparent; margin-bottom: -1px;
-  transition: color .15s, border-color .15s;
-}
-.cmd-tabs button:hover { color: var(--text); }
-.cmd-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
-.cmd-copy {
-  align-self: center;
-  color: var(--text-dim); border-color: var(--line-bright);
-  background: rgba(0,0,0,0.35);
-}
-.cmd-head .cmd-copy:hover { background: rgba(0,0,0,0.5); }
-.cmd-body {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 7px;
-  padding: 15px 18px;
-  min-width: 0;
-  min-height: calc(3 * 1.4em + 14px + 42px);
-  overflow-x: auto;
-  scrollbar-width: thin; scrollbar-color: var(--line-bright) transparent;
-  line-height: 1.4;
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
-          mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
-}
-.cmd-body::-webkit-scrollbar { height: 8px; }
-.cmd-body::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 999px; }
-.cmd-body::-webkit-scrollbar-track { background: transparent; }
-.cmd-body .line { display: flex; gap: 10px; white-space: pre; padding-right: 30px; }
-.cmd-body .line .ps1 { flex: none; }
+    ::selection {
+      background: var(--accent);
+      color: #0a0a09;
+    }
 
-/* ---------- stats ---------- */
-.stats { border-bottom: 1px solid var(--line); background: linear-gradient(180deg, rgba(255,255,255,0.014), transparent); }
-.stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); }
-.stat { padding: 44px 28px 36px; border-left: 1px solid var(--line); }
-.stat:first-child { border-left: none; padding-left: 0; }
-.stat .n {
-  font-weight: 800; letter-spacing: -0.03em;
-  font-size: clamp(32px, 3.4vw, 46px); line-height: 1;
-  font-variant-numeric: tabular-nums;
-  background: linear-gradient(180deg, #fff, rgba(255,255,255,0.55));
-  -webkit-background-clip: text; background-clip: text; color: transparent;
-  white-space: nowrap;
-}
-.stat .n small { font-size: 0.55em; font-weight: 700; }
-.stat .n sup { font-family: var(--mono); font-size: 12px; -webkit-text-fill-color: var(--accent); margin-left: 4px; font-weight: 500; }
-.stat .d {
-  margin-top: 13px;
-  font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.07em;
-  text-transform: uppercase; color: var(--text-faint); line-height: 1.7;
-}
-.footnotes {
-  padding: 16px 0 18px; border-top: 1px solid var(--line);
-  font-family: var(--mono); font-size: 11px; line-height: 1.8; color: var(--text-faint);
-}
-.footnotes sup { color: var(--accent); }
-.footnotes a { color: var(--text-dim); border-bottom: 1px solid var(--line); }
-.footnotes a:hover { color: var(--text); border-color: var(--line-bright); }
-.footnotes code { color: var(--text-dim); }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 16.5px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      overflow-x: hidden;
+    }
 
-/* ---------- sections ---------- */
-section { border-bottom: 1px solid var(--line); position: relative; }
-.sec-head { display: flex; align-items: baseline; gap: 18px; padding-top: 88px; }
-.sec-head .idx { font-family: var(--mono); font-size: 12.5px; color: var(--accent); letter-spacing: 0.08em; }
-.sec-head .label {
-  font-family: var(--mono); font-size: 12px; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--text-faint);
-}
-h2 {
-  font-weight: 800; letter-spacing: -0.03em;
-  font-size: clamp(32px, 4.2vw, 52px); line-height: 1.06;
-  margin-top: 20px; max-width: 15em;
-  background: linear-gradient(180deg, #fff 60%, rgba(255,255,255,0.7));
-  -webkit-background-clip: text; background-clip: text; color: transparent;
-}
-.sec-intro { margin-top: 20px; max-width: 620px; font-size: 17.5px; color: var(--text-dim); }
-.sec-intro a { color: var(--text); border-bottom: 1px solid var(--line-bright); }
-.sec-intro code { font-family: var(--mono); font-size: 0.88em; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+    /* global fine grid */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      background-image:
+        linear-gradient(to right, rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.022) 1px, transparent 1px);
+      background-size: 88px 88px;
+      mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 30%, transparent 75%);
+    }
 
-/* cursor spotlight on cards */
-.proof, .proto, .feat { position: relative; overflow: hidden; }
-.proof::after, .proto::after, .feat::after {
-  content: ""; position: absolute; inset: 0; border-radius: inherit;
-  opacity: 0; pointer-events: none;
-  background: radial-gradient(440px circle at var(--mx, 50%) var(--my, 50%), rgba(77,159,255,0.09), transparent 65%);
-  transition: opacity .3s;
-}
-.proof:hover::after, .proto:hover::after, .feat:hover::after { opacity: 1; }
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
 
-/* flow diagram */
-.flow { margin-top: 52px; }
-.flow svg { width: 100%; height: auto; display: block; }
-.flow .flow-m { display: none; max-width: 400px; margin: 0 auto; }
-@media (max-width: 700px) {
-  .flow .flow-d { display: none; }
-  .flow .flow-m { display: block; }
-}
-.flow .wire { stroke: rgba(255,255,255,0.1); stroke-width: 1.5; fill: none; }
-.flow .node { fill: rgba(255,255,255,0.03); stroke: rgba(255,255,255,0.14); }
-.flow .nodelabel {
-  font-family: var(--mono); font-size: 13px; letter-spacing: 1.5px;
-  fill: var(--text-dim);
-}
-.flow .wirelabel {
-  font-family: var(--mono); font-size: 10px; letter-spacing: 1.2px;
-  fill: var(--text-faint);
-}
-@media (prefers-reduced-motion: reduce) {
-  .flow .pulse { display: none; }
-  .tabs.gliding .glider { transition: none; }
-}
+    .wrap {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 0 32px;
+      position: relative;
+      z-index: 1;
+    }
 
-/* proof cards */
-.proof-grid {
-  margin-top: 56px; margin-bottom: 96px;
-  display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
-}
-.proof {
-  display: block;
-  background: var(--panel);
-  border: 1px solid var(--line); border-radius: var(--r);
-  padding: 28px 30px 30px;
-  transition: border-color .2s, background .2s, transform .2s, box-shadow .2s;
-}
-.proof:hover {
-  border-color: var(--line-bright); background: var(--panel-hover);
-  transform: translateY(-2px);
-  box-shadow: 0 16px 48px rgba(0,0,0,0.5);
-}
-.proof h3 {
-  font-family: var(--mono); font-weight: 600; font-size: 14px;
-  letter-spacing: 0.02em; display: flex; align-items: baseline; gap: 10px;
-}
-.proof h3::before { content: "▸"; color: var(--accent); font-size: 11px; }
-.proof p { margin-top: 12px; font-size: 15.5px; color: var(--text-dim); max-width: 52ch; }
-.proof p code { font-family: var(--mono); font-size: 0.88em; color: var(--text); }
-.proof .src {
-  display: inline-block; margin-top: 18px;
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--text-dim);
-  transition: color .15s;
-}
-.proof:hover .src { color: var(--accent); }
+    /* ---------- header ---------- */
+    header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: transparent;
+      border-bottom: 1px solid transparent;
+      transition: background .3s ease, border-color .3s ease;
+    }
 
-/* protocols */
-.proto-grid { margin-top: 40px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-.proto {
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
-  padding: 30px 28px 30px;
-  transition: border-color .2s, background .2s;
-  display: flex; flex-direction: column;
-}
-.proto:hover { border-color: var(--line-bright); background: var(--panel-hover); }
-.proto .tag {
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
-  text-transform: uppercase; color: var(--accent);
-}
-.proto h3 { font-weight: 800; font-size: 30px; letter-spacing: -0.02em; margin-top: 12px; line-height: 1.1; }
-.proto p { margin-top: 12px; font-size: 15px; color: var(--text-dim); flex: 1; }
-.proto pre {
-  margin-top: 22px;
-  font-family: var(--mono); font-size: 12px; line-height: 1.75;
-  color: var(--text);
-  background: rgba(0,0,0,0.45);
-  border: 1px solid var(--line); border-radius: 9px;
-  padding: 14px 16px;
-  white-space: pre-wrap; word-break: break-word;
-}
-.proto pre .c { color: var(--text-faint); }
-.backends {
-  margin-top: 28px; margin-bottom: 96px;
-  padding: 18px 24px;
-  border: 1px dashed var(--line); border-radius: var(--r);
-  font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--text-faint);
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 26px;
-}
-.backends b { color: var(--text); font-weight: 600; }
+    header.scrolled {
+      background: rgba(10, 10, 9, 0.96);
+      border-bottom-color: var(--line);
+    }
 
-/* terminal */
-.term-sec .wrap { padding-bottom: 96px; }
-.term {
-  margin-top: 56px;
-  position: relative;
-  background: #0d0d0c;
-  border: 1px solid var(--line-bright); border-radius: 16px;
-  box-shadow: 0 24px 80px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07);
-  font-family: var(--mono); font-size: 13.5px; line-height: 1.95;
-  padding: 0; overflow: hidden;
-}
-.term::before {
-  content: ""; position: absolute; inset: 0; pointer-events: none;
-  background: radial-gradient(ellipse 70% 50% at 50% -10%, rgba(255,255,255,0.05), transparent 60%);
-}
-.term .titlebar {
-  display: flex; align-items: center; gap: 8px;
-  padding: 13px 18px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(255,255,255,0.025);
-}
-.term .titlebar i { width: 11px; height: 11px; border-radius: 50%; background: rgba(255,255,255,0.12); display: block; }
-.term .titlebar span {
-  margin-left: 10px; font-size: 11px; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--text-faint);
-}
-.term .body { padding: 22px 26px 26px; overflow-x: auto; color: #d9d7cf; }
-.term .body > div { transition: opacity .2s; }
-.term .body > div.line-hidden { opacity: 0; }
-.term .body > div.line-active::after {
-  content: "▋"; color: var(--accent); margin-left: 6px;
-  animation: blink 0.9s steps(1) infinite;
-}
-@keyframes blink { 50% { opacity: 0; } }
-.term .ps1 { color: var(--accent); }
-.term .c { color: var(--text-faint); }
-.term .out { color: #8e8c83; }
-.term .ok { color: #7dd97b; }
-.term-caption {
-  margin-top: 20px;
-  font-family: var(--mono); font-size: 12px; letter-spacing: 0.05em;
-  color: var(--text-faint);
-}
-.term-caption b { color: var(--text); font-weight: 600; }
+    .bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      max-width: 1180px;
+      height: 72px;
+      margin: 0 auto;
+      padding: 0 32px;
+    }
 
-/* asciinema casts */
-.casts .wrap { padding-bottom: 96px; }
-.cast-frame { margin-top: 18px; }
-.cast-frame .body { padding: 0; }
-#cast-player { min-height: 320px; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+    }
 
-/* features */
-.feat-grid {
-  margin-top: 56px; margin-bottom: 96px;
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
-}
-.feat {
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
-  padding: 24px 22px 26px;
-  transition: border-color .2s, background .2s, transform .2s;
-}
-.feat:hover { border-color: var(--line-bright); background: var(--panel-hover); transform: translateY(-2px); }
-.feat .num { font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: 0.08em; }
-.feat h3 {
-  font-weight: 700; font-size: 15.5px; letter-spacing: -0.01em;
-  margin-top: 13px; line-height: 1.35;
-}
-.feat p { margin-top: 9px; font-size: 14px; line-height: 1.55; color: var(--text-dim); }
+    .brand svg {
+      display: block;
+      color: var(--text);
+    }
 
-/* web ui */
-.shots .wrap { padding-bottom: 96px; }
-.tabs {
-  margin-top: 48px;
-  display: inline-flex; position: relative;
-  max-width: 100%; overflow-x: auto;
-  background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
-  padding: 4px; gap: 2px;
-  scrollbar-width: none;
-}
-.tabs::-webkit-scrollbar { display: none; }
-.tabs .glider {
-  position: absolute; top: 4px; left: 0; height: calc(100% - 8px);
-  background: rgba(255,255,255,0.085);
-  border: 1px solid var(--line-bright); box-sizing: border-box;
-  border-radius: 999px;
-  pointer-events: none;
-  will-change: transform, width;
-}
-.tabs.gliding .glider {
-  transition: transform .35s cubic-bezier(.3,1,.3,1), width .35s cubic-bezier(.3,1,.3,1);
-}
-.tabs button {
-  position: relative; z-index: 1;
-  cursor: pointer; white-space: nowrap;
-  font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.07em;
-  text-transform: uppercase; color: var(--text-faint);
-  background: none; border: none; border-radius: 999px;
-  padding: 9px 16px;
-  transition: color .25s, transform .1s;
-}
-.tabs button:hover { color: var(--text-dim); }
-.tabs button[aria-selected="true"] { color: var(--text); }
-.tabs button:active { transform: scale(0.97); }
-.browser {
-  margin-top: 18px;
-  background: #0d0d0c;
-  border: 1px solid var(--line-bright); border-radius: 16px;
-  box-shadow: 0 24px 80px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.07);
-  overflow: hidden;
-}
-.browser .chrome {
-  display: flex; align-items: center; gap: 8px;
-  padding: 12px 18px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(255,255,255,0.025);
-}
-.browser .chrome i { width: 11px; height: 11px; border-radius: 50%; background: rgba(255,255,255,0.12); display: block; }
-.browser .chrome .url {
-  margin-left: 12px; flex: 1; max-width: 360px;
-  font-family: var(--mono); font-size: 11.5px; color: var(--text-faint);
-  background: rgba(0,0,0,0.4); border: 1px solid var(--line); border-radius: 7px;
-  padding: 5px 12px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.browser .view { position: relative; aspect-ratio: 1600 / 933; }
-.browser .view img {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  object-fit: cover; object-position: top;
-  opacity: 0; transition: opacity .35s ease;
-}
-.browser .view img.active { opacity: 1; }
-.shot-caption {
-  margin-top: 18px;
-  font-family: var(--mono); font-size: 12px; letter-spacing: 0.05em;
-  color: var(--text-faint); min-height: 1.8em;
-}
-.shot-caption b { color: var(--text-dim); font-weight: 500; }
+    .brand .mark {
+      width: 36px;
+      height: 36px;
+      filter: drop-shadow(0 0 12px rgba(255, 255, 255, 0.18));
+      transition: filter .2s;
+    }
 
-/* closer */
-.closer { text-align: center; border-bottom: 1px solid var(--line); position: relative; overflow: clip; }
-.closer::before {
-  content: ""; position: absolute; inset: auto -20% -60%; height: 120%;
-  background: radial-gradient(ellipse 50% 60% at 50% 100%, rgba(255,255,255,0.06), transparent 65%);
-  pointer-events: none;
-}
-.closer .wrap { padding-top: 120px; padding-bottom: 120px; display: flex; flex-direction: column; align-items: center; }
-.closer svg {
-  width: 72px; height: 72px; color: var(--text); margin-bottom: 36px;
-  filter: drop-shadow(0 0 28px rgba(255,255,255,0.25));
-}
-.closer h2 { margin: 0 auto; max-width: 16em; text-align: center; }
-.closer .install { margin-top: 48px; }
-.closer .links {
-  margin-top: 28px; font-family: var(--mono); font-size: 12px;
-  letter-spacing: 0.07em; text-transform: uppercase;
-}
-.closer .links a { color: var(--text-dim); margin: 0 14px; transition: color .15s; }
-.closer .links a:hover { color: var(--accent); }
+    .brand:hover .mark {
+      filter: drop-shadow(0 0 18px rgba(255, 255, 255, 0.35));
+    }
 
-/* footer */
-footer .wrap {
-  padding: 28px 32px 36px;
-  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px;
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em;
-  color: var(--text-faint);
-}
-footer a { color: var(--text-dim); }
-footer a:hover { color: var(--text); }
+    .brand .wm {
+      width: 84px;
+      height: 18.1px;
+    }
 
-/* reveal */
-.rv { opacity: 0; transform: translateY(16px); transition: opacity .8s cubic-bezier(.2,.6,.2,1), transform .8s cubic-bezier(.2,.6,.2,1); }
-.rv.in { opacity: 1; transform: none; }
-@media (prefers-reduced-motion: reduce) {
-  .rv { opacity: 1; transform: none; transition: none; }
-  .hero-enso { animation: none; }
-  .enso-prec { animation: none; }
-  .hero-glow { animation: none; }
-  .hero-particles { display: none; }
-  h1 .li { animation: none; transform: none; }
-  html { scroll-behavior: auto; }
-}
+    nav {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
 
-/* responsive */
-@media (max-width: 980px) {
-  .stats-grid { grid-template-columns: repeat(2, 1fr); }
-  .stat:nth-child(odd) { border-left: none; padding-left: 0; }
-  .stat:nth-child(even) { padding-left: 28px; }
-  .stat:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
-  .proto-grid { grid-template-columns: 1fr; }
-  .feat-grid { grid-template-columns: repeat(2, 1fr); }
-  .enso-tilt { width: 560px; height: 560px; }
-  .hero-glow { width: 720px; height: 720px; }
+    nav a {
+      font-size: 14px;
+      font-weight: 500;
+      letter-spacing: -0.005em;
+      color: var(--text-dim);
+      padding: 8px 13px;
+      border-radius: 8px;
+      transition: color .15s, background .15s;
+    }
 
-  .hero-particles { --r0: 228px; }
-}
-@media (max-width: 640px) {
-  .wrap { padding: 0 20px; }
-  .bar { height: 60px; padding: 0 20px; }
-  nav { gap: 2px; }
-  nav a:not(.cta):not(.keep) { display: none; }
-  .proof-grid { grid-template-columns: 1fr; }
-  .feat-grid { grid-template-columns: 1fr; }
-  .cmd { font-size: 12px; flex-wrap: wrap; }
-  .hero .wrap { padding-top: 156px; padding-bottom: 72px; }
-  h1 { font-size: clamp(34px, 10.8vw, 46px); }
-  .sec-head { padding-top: 64px; }
-}
-</style>
+    nav a:hover {
+      color: var(--text);
+      background: var(--panel-hover);
+    }
+
+    nav a.gh {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    nav a.gh svg {
+      display: block;
+      opacity: 0.9;
+    }
+
+    nav a.gh span {
+      font-family: var(--mono);
+      font-size: 12.5px;
+    }
+
+    nav a.cta {
+      color: #0a0a09;
+      background: var(--text);
+      font-weight: 600;
+      font-size: 14px;
+      margin-left: 14px;
+      padding: 10px 20px;
+      border-radius: 999px;
+      transition: transform .15s, box-shadow .15s, background .15s;
+    }
+
+    nav a.cta:hover {
+      background: #fff;
+      transform: translateY(-1px);
+      box-shadow: 0 6px 28px rgba(255, 255, 255, 0.22);
+    }
+
+    /* ---------- hero ---------- */
+    .hero {
+      position: relative;
+      overflow: clip;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: -40% -20% auto;
+      height: 130%;
+      background:
+        radial-gradient(ellipse 46% 56% at 50% 12%, rgba(255, 255, 255, 0.07), transparent 65%),
+        radial-gradient(ellipse 30% 40% at 62% 30%, var(--accent-soft), transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-scene {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      -webkit-mask: linear-gradient(to bottom, transparent 0, #000 150px);
+      mask: linear-gradient(to bottom, transparent 0, #000 150px);
+    }
+
+    /* film grain */
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      pointer-events: none;
+      opacity: 0.5;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='gn'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23gn)'/%3E%3C/svg%3E");
+    }
+
+    .hero .wrap {
+      padding-top: 196px;
+      padding-bottom: 104px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    @property --sweep {
+      syntax: "<angle>";
+      initial-value: 420deg;
+      inherits: false;
+    }
+
+    @property --tail {
+      syntax: "<angle>";
+      initial-value: -70deg;
+      inherits: false;
+    }
+
+    @property --soft {
+      syntax: "<angle>";
+      initial-value: 24deg;
+      inherits: false;
+    }
+
+    .enso-tilt {
+      position: absolute;
+      left: 50%;
+      top: 46%;
+      width: 760px;
+      height: 760px;
+      transform: translate(-50%, -50%) perspective(1100px) rotateX(var(--mtx, 0deg)) rotateY(var(--mty, 0deg));
+      pointer-events: none;
+    }
+
+    .enso-prec {
+      position: absolute;
+      inset: 0;
+      animation: precess 17s linear infinite;
+    }
+
+    .hero-enso {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      color: #d6d3cb;
+      opacity: 0.17;
+      pointer-events: none;
+      -webkit-mask: conic-gradient(from -90deg, transparent var(--tail), #000 calc(var(--tail) + 70deg), #000 calc(var(--sweep) - var(--soft)), transparent var(--sweep));
+      mask: conic-gradient(from -90deg, transparent var(--tail), #000 calc(var(--tail) + 70deg), #000 calc(var(--sweep) - var(--soft)), transparent var(--sweep));
+      animation: spin 120s linear infinite, sweep 2.6s cubic-bezier(.55, 0, .3, 1) .15s backwards;
+    }
+
+    @keyframes spin {
+      from {
+        transform: rotate(0deg);
+      }
+
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    @keyframes precess {
+      0.00% {
+        transform: perspective(1100px) rotateZ(0deg) rotateX(5deg) rotateZ(-0deg);
+      }
+
+      8.33% {
+        transform: perspective(1100px) rotateZ(30deg) rotateX(5deg) rotateZ(-30deg);
+      }
+
+      16.67% {
+        transform: perspective(1100px) rotateZ(60deg) rotateX(5deg) rotateZ(-60deg);
+      }
+
+      25.00% {
+        transform: perspective(1100px) rotateZ(90deg) rotateX(5deg) rotateZ(-90deg);
+      }
+
+      33.33% {
+        transform: perspective(1100px) rotateZ(120deg) rotateX(5deg) rotateZ(-120deg);
+      }
+
+      41.67% {
+        transform: perspective(1100px) rotateZ(150deg) rotateX(5deg) rotateZ(-150deg);
+      }
+
+      50.00% {
+        transform: perspective(1100px) rotateZ(180deg) rotateX(5deg) rotateZ(-180deg);
+      }
+
+      58.33% {
+        transform: perspective(1100px) rotateZ(210deg) rotateX(5deg) rotateZ(-210deg);
+      }
+
+      66.67% {
+        transform: perspective(1100px) rotateZ(240deg) rotateX(5deg) rotateZ(-240deg);
+      }
+
+      75.00% {
+        transform: perspective(1100px) rotateZ(270deg) rotateX(5deg) rotateZ(-270deg);
+      }
+
+      83.33% {
+        transform: perspective(1100px) rotateZ(300deg) rotateX(5deg) rotateZ(-300deg);
+      }
+
+      91.67% {
+        transform: perspective(1100px) rotateZ(330deg) rotateX(5deg) rotateZ(-330deg);
+      }
+
+      100.00% {
+        transform: perspective(1100px) rotateZ(360deg) rotateX(5deg) rotateZ(-360deg);
+      }
+    }
+
+    .hero-glow {
+      position: absolute;
+      left: 50%;
+      top: 46%;
+      width: 980px;
+      height: 980px;
+      transform: translate(-50%, -50%);
+      background: radial-gradient(circle closest-side, transparent 42%, rgba(168, 199, 250, 0.05) 55%, rgba(255, 255, 255, 0.10) 65%, rgba(120, 160, 255, 0.05) 79%, transparent 97%);
+      filter: blur(44px);
+      pointer-events: none;
+      animation: breathe 9s ease-in-out infinite alternate;
+    }
+
+    .hero-glow::before {
+      content: "";
+      position: absolute;
+      inset: -30%;
+      background: radial-gradient(circle, transparent 46%, rgba(0, 0, 0, 0.7) 64%, transparent 88%);
+    }
+
+    @keyframes breathe {
+      from {
+        opacity: 0.7;
+        transform: translate(-50%, -50%) scale(0.97);
+      }
+
+      to {
+        opacity: 1;
+        transform: translate(-50%, -50%) scale(1.05);
+      }
+    }
+
+    .hero-particles {
+      position: absolute;
+      left: 50%;
+      top: 46%;
+      width: 0;
+      height: 0;
+      pointer-events: none;
+      --r0: 310px;
+    }
+
+    .hero-particles canvas {
+      position: absolute;
+      opacity: 0;
+      animation: motes-in 1.8s ease 0.8s forwards;
+    }
+
+    @keyframes motes-in {
+      to {
+        opacity: 1;
+      }
+    }
+
+    @keyframes sweep {
+      0% {
+        --sweep: 155deg;
+        --tail: 0deg;
+        --soft: 85deg;
+        opacity: 0;
+      }
+
+      14% {
+        opacity: 0.17;
+      }
+
+      60% {
+        --tail: 0deg;
+        --soft: 85deg;
+      }
+
+      100% {
+        --sweep: 384deg;
+        --tail: -70deg;
+        --soft: 24deg;
+        opacity: 0.17;
+      }
+    }
+
+    h1 {
+      font-weight: 800;
+      letter-spacing: -0.038em;
+      font-size: clamp(46px, 7vw, 88px);
+      line-height: 1.02;
+      max-width: 12em;
+    }
+
+    h1 .l {
+      display: block;
+      overflow: hidden;
+      padding-bottom: 0.12em;
+      margin-bottom: -0.12em;
+    }
+
+    h1 .li {
+      display: block;
+      transform: translateY(112%);
+      animation: lineup 1s cubic-bezier(.16, .84, .28, 1) forwards;
+      background: linear-gradient(180deg, #fff 55%, rgba(255, 255, 255, 0.62));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    h1 .l:nth-child(1) .li {
+      animation-delay: 0.25s;
+    }
+
+    h1 .l:nth-child(2) .li {
+      animation-delay: 0.42s;
+    }
+
+    @keyframes lineup {
+      to {
+        transform: translateY(0);
+      }
+    }
+
+    h1 .dot {
+      -webkit-text-fill-color: var(--accent);
+    }
+
+    .lede {
+      margin-top: 26px;
+      max-width: 640px;
+      font-size: 19px;
+      line-height: 1.65;
+      color: var(--text-dim);
+      font-weight: 400;
+    }
+
+    .lede strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .install {
+      margin-top: 44px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+    }
+
+    .cmd {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      border: 1px solid var(--line-bright);
+      border-radius: var(--r);
+      background: rgba(255, 255, 255, 0.045);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 32px rgba(0, 0, 0, 0.45);
+      padding: 14px 18px;
+      font-family: var(--mono);
+      font-size: 14px;
+    }
+
+    .cmd .ps1 {
+      color: var(--accent);
+      user-select: none;
+    }
+
+    .cmd>button,
+    .cmd-copy {
+      border: none;
+      background: none;
+      cursor: pointer;
+      min-width: 72px;
+      text-align: center;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      transition: color .15s, border-color .15s, background .15s;
+    }
+
+    .cmd>button:hover,
+    .cmd-copy:hover {
+      color: var(--text);
+      border-color: var(--line-bright);
+      background: var(--panel-hover);
+    }
+
+    .cmd .caret {
+      display: inline-block;
+      width: 0.55em;
+      height: 1.05em;
+      vertical-align: -0.15em;
+      margin-left: 7px;
+      background: var(--accent);
+      animation: blink 1s steps(1) infinite;
+    }
+
+    .ghost {
+      position: relative;
+      isolation: isolate;
+      overflow: hidden;
+      font-family: var(--mono);
+      font-size: 15px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: #cbc9c1;
+      padding: 18px 40px;
+      border: 1px solid rgba(255, 255, 255, 0.13);
+      border-radius: var(--r);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(0, 0, 0, 0.4));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+      transition: color .2s, border-color .2s, background .2s, box-shadow .2s, text-shadow .2s;
+    }
+
+    .ghost:hover {
+      color: #fff;
+      border-color: var(--accent);
+      background: #01020a;
+      box-shadow: 0 0 26px rgba(77, 159, 255, 0.4), inset 0 0 22px rgba(77, 159, 255, 0.28);
+      text-shadow: 0 1px 10px rgba(0, 0, 0, 0.75), 0 0 8px rgba(77, 159, 255, 0.55);
+      animation: ghostShake 0.4s linear infinite;
+    }
+
+    @keyframes ghostShake {
+
+      0%,
+      100% {
+        transform: translate(0, 0);
+      }
+
+      10% {
+        transform: translate(-1.1px, 0.6px);
+      }
+
+      20% {
+        transform: translate(1px, -0.9px);
+      }
+
+      30% {
+        transform: translate(-1.3px, 1px);
+      }
+
+      40% {
+        transform: translate(1.2px, 0.5px);
+      }
+
+      50% {
+        transform: translate(-0.6px, -1.2px);
+      }
+
+      60% {
+        transform: translate(1.3px, 0.9px);
+      }
+
+      70% {
+        transform: translate(-1px, -0.6px);
+      }
+
+      80% {
+        transform: translate(0.9px, 1.1px);
+      }
+
+      90% {
+        transform: translate(-0.8px, -1px);
+      }
+    }
+
+    /* hyperspace portal */
+    .ghost-label {
+      position: relative;
+      z-index: 2;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.7em;
+    }
+
+    .ghost-mark {
+      flex: none;
+      width: 1.5em;
+      height: 1.5em;
+      color: #bcd6ff;
+      filter: drop-shadow(0 0 5px rgba(77, 159, 255, 0.5));
+      transition: opacity .3s, transform .4s;
+    }
+
+    .ghost:hover .ghost-mark {
+      opacity: 0;
+      transform: scale(1.8);
+    }
+
+    .ghost-arrow {
+      display: inline-block;
+      transition: transform .25s ease;
+    }
+
+    .ghost:hover .ghost-arrow {
+      transform: translateX(5px);
+    }
+
+    .ghost-portal {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      opacity: 0;
+      transition: opacity .3s;
+      color: #bcd6ff;
+      pointer-events: none;
+      perspective: 560px;
+      perspective-origin: 50% 50%;
+    }
+
+    .ghost:hover .ghost-portal {
+      opacity: 1;
+    }
+
+    .ghost-portal::before {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 0.9em;
+      height: 0.9em;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(205, 227, 255, 0.95), rgba(77, 159, 255, 0.5) 45%, transparent 72%);
+      filter: blur(2px);
+    }
+
+    .ghost-portal svg {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 2.9em;
+      height: 2.9em;
+      margin: -1.45em 0 0 -1.45em;
+      opacity: 0;
+      transform-origin: 50% 50%;
+      filter: drop-shadow(0 0 6px rgba(77, 159, 255, 0.9));
+      will-change: transform, opacity;
+    }
+
+    .ghost:hover .ghost-portal svg {
+      animation: ensowarp 3s linear infinite;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(2) {
+      animation-delay: -0.375s;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(3) {
+      animation-delay: -0.75s;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(4) {
+      animation-delay: -1.125s;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(5) {
+      animation-delay: -1.5s;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(6) {
+      animation-delay: -1.875s;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(7) {
+      animation-delay: -2.25s;
+    }
+
+    .ghost:hover .ghost-portal svg:nth-child(8) {
+      animation-delay: -2.625s;
+    }
+
+    @keyframes ensowarp {
+      0% {
+        opacity: 0;
+        transform: translateZ(-1600px) rotate(-12deg);
+      }
+
+      10% {
+        opacity: 1;
+      }
+
+      78% {
+        opacity: 1;
+      }
+
+      100% {
+        opacity: 0;
+        transform: translateZ(520px) rotate(92deg);
+      }
+    }
+
+    /* hyperspace noise */
+    .ghost-noise {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+      opacity: 0;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+      background-size: 160px 160px;
+      mix-blend-mode: screen;
+    }
+
+    .ghost:hover .ghost-noise {
+      opacity: 0.11;
+      animation: ghostNoise 0.1s steps(3) infinite;
+    }
+
+    @keyframes ghostNoise {
+      0% {
+        background-position: 0 0;
+      }
+
+      33% {
+        background-position: -54px 38px;
+      }
+
+      66% {
+        background-position: 42px -30px;
+      }
+
+      100% {
+        background-position: -28px -52px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .ghost:hover {
+        animation: none;
+      }
+
+      .ghost:hover .ghost-portal svg {
+        animation: none;
+      }
+
+      .ghost:hover .ghost-portal svg:nth-child(4) {
+        opacity: 0.55;
+        transform: translateZ(0) scale(1.1);
+      }
+
+      .ghost:hover .ghost-noise {
+        animation: none;
+        opacity: 0;
+      }
+    }
+
+    .alt-install {
+      margin-top: 20px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text-faint);
+    }
+
+    .alt-install code {
+      color: var(--text-dim);
+    }
+
+    .alt-install a {
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--line);
+      transition: color .15s, border-color .15s;
+    }
+
+    .alt-install a:hover {
+      color: var(--text);
+      border-color: var(--line-bright);
+    }
+
+    /* tabbed install panel */
+    .hero .install {
+      flex-direction: column;
+    }
+
+    .cmd.tabbed {
+      display: block;
+      padding: 0;
+      overflow: hidden;
+      text-align: left;
+      width: min(640px, 92vw);
+      background: rgba(0, 0, 0, 0.32);
+    }
+
+    .cmd-head {
+      display: flex;
+      align-items: stretch;
+      justify-content: space-between;
+      padding: 0 8px 0 6px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .cmd-tabs {
+      display: flex;
+    }
+
+    .cmd-tabs button {
+      cursor: pointer;
+      background: none;
+      border: none;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      color: var(--text-dim);
+      padding: 11px 16px 10px;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: color .15s, border-color .15s;
+    }
+
+    .cmd-tabs button:hover {
+      color: var(--text);
+    }
+
+    .cmd-tabs button[aria-selected="true"] {
+      color: var(--text);
+      border-bottom-color: var(--accent);
+    }
+
+    .cmd-copy {
+      align-self: center;
+      color: var(--text-dim);
+      border-color: var(--line-bright);
+      background: rgba(0, 0, 0, 0.35);
+    }
+
+    .cmd-head .cmd-copy:hover {
+      background: rgba(0, 0, 0, 0.5);
+    }
+
+    .cmd-body {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 7px;
+      padding: 15px 18px;
+      min-width: 0;
+      min-height: calc(3 * 1.4em + 14px + 42px);
+      overflow-x: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--line-bright) transparent;
+      line-height: 1.4;
+      -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+      mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+    }
+
+    .cmd-body::-webkit-scrollbar {
+      height: 8px;
+    }
+
+    .cmd-body::-webkit-scrollbar-thumb {
+      background: var(--line-bright);
+      border-radius: 999px;
+    }
+
+    .cmd-body::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .cmd-body .line {
+      display: flex;
+      gap: 10px;
+      white-space: pre;
+      padding-right: 30px;
+    }
+
+    .cmd-body .line .ps1 {
+      flex: none;
+    }
+
+    /* ---------- stats ---------- */
+    .stats {
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.014), transparent);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+    }
+
+    .stat {
+      padding: 44px 28px 36px;
+      border-left: 1px solid var(--line);
+    }
+
+    .stat:first-child {
+      border-left: none;
+      padding-left: 0;
+    }
+
+    .stat .n {
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      font-size: clamp(32px, 3.4vw, 46px);
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+      background: linear-gradient(180deg, #fff, rgba(255, 255, 255, 0.55));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      white-space: nowrap;
+    }
+
+    .stat .n small {
+      font-size: 0.55em;
+      font-weight: 700;
+    }
+
+    .stat .n sup {
+      font-family: var(--mono);
+      font-size: 12px;
+      -webkit-text-fill-color: var(--accent);
+      margin-left: 4px;
+      font-weight: 500;
+    }
+
+    .stat .d {
+      margin-top: 13px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      line-height: 1.7;
+    }
+
+    .footnotes {
+      padding: 16px 0 18px;
+      border-top: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.8;
+      color: var(--text-faint);
+    }
+
+    .footnotes sup {
+      color: var(--accent);
+    }
+
+    .footnotes a {
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .footnotes a:hover {
+      color: var(--text);
+      border-color: var(--line-bright);
+    }
+
+    .footnotes code {
+      color: var(--text-dim);
+    }
+
+    /* ---------- sections ---------- */
+    section {
+      border-bottom: 1px solid var(--line);
+      position: relative;
+    }
+
+    .sec-head {
+      display: flex;
+      align-items: baseline;
+      gap: 18px;
+      padding-top: 88px;
+    }
+
+    .sec-head .idx {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      color: var(--accent);
+      letter-spacing: 0.08em;
+    }
+
+    .sec-head .label {
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+    }
+
+    h2 {
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      font-size: clamp(32px, 4.2vw, 52px);
+      line-height: 1.06;
+      margin-top: 20px;
+      max-width: 15em;
+      background: linear-gradient(180deg, #fff 60%, rgba(255, 255, 255, 0.7));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .sec-intro {
+      margin-top: 20px;
+      max-width: 620px;
+      font-size: 17.5px;
+      color: var(--text-dim);
+    }
+
+    .sec-intro a {
+      color: var(--text);
+      border-bottom: 1px solid var(--line-bright);
+    }
+
+    .sec-intro code {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      color: var(--text);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 2px 6px;
+    }
+
+    /* cursor spotlight on cards */
+    .proof,
+    .proto,
+    .feat {
+      position: relative;
+      overflow: hidden;
+    }
+
+    .proof::after,
+    .proto::after,
+    .feat::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      opacity: 0;
+      pointer-events: none;
+      background: radial-gradient(440px circle at var(--mx, 50%) var(--my, 50%), rgba(77, 159, 255, 0.09), transparent 65%);
+      transition: opacity .3s;
+    }
+
+    .proof:hover::after,
+    .proto:hover::after,
+    .feat:hover::after {
+      opacity: 1;
+    }
+
+    /* flow diagram */
+    .flow {
+      margin-top: 52px;
+    }
+
+    .flow svg {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .flow .flow-m {
+      display: none;
+      max-width: 400px;
+      margin: 0 auto;
+    }
+
+    @media (max-width: 700px) {
+      .flow .flow-d {
+        display: none;
+      }
+
+      .flow .flow-m {
+        display: block;
+      }
+    }
+
+    .flow .wire {
+      stroke: rgba(255, 255, 255, 0.1);
+      stroke-width: 1.5;
+      fill: none;
+    }
+
+    .flow .node {
+      fill: rgba(255, 255, 255, 0.03);
+      stroke: rgba(255, 255, 255, 0.14);
+    }
+
+    .flow .nodelabel {
+      font-family: var(--mono);
+      font-size: 13px;
+      letter-spacing: 1.5px;
+      fill: var(--text-dim);
+    }
+
+    .flow .wirelabel {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 1.2px;
+      fill: var(--text-faint);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .flow .pulse {
+        display: none;
+      }
+
+      .tabs.gliding .glider {
+        transition: none;
+      }
+    }
+
+    /* proof cards */
+    .proof-grid {
+      margin-top: 56px;
+      margin-bottom: 96px;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+
+    .proof {
+      display: block;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 28px 30px 30px;
+      transition: border-color .2s, background .2s, transform .2s, box-shadow .2s;
+    }
+
+    .proof:hover {
+      border-color: var(--line-bright);
+      background: var(--panel-hover);
+      transform: translateY(-2px);
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+    }
+
+    .proof h3 {
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .proof h3::before {
+      content: "▸";
+      color: var(--accent);
+      font-size: 11px;
+    }
+
+    .proof p {
+      margin-top: 12px;
+      font-size: 15.5px;
+      color: var(--text-dim);
+      max-width: 52ch;
+    }
+
+    .proof p code {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      color: var(--text);
+    }
+
+    .proof .src {
+      display: inline-block;
+      margin-top: 18px;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      transition: color .15s;
+    }
+
+    .proof:hover .src {
+      color: var(--accent);
+    }
+
+    /* protocols */
+    .proto-grid {
+      margin-top: 40px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .proto {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 30px 28px 30px;
+      transition: border-color .2s, background .2s;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .proto:hover {
+      border-color: var(--line-bright);
+      background: var(--panel-hover);
+    }
+
+    .proto .tag {
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .proto h3 {
+      font-weight: 800;
+      font-size: 30px;
+      letter-spacing: -0.02em;
+      margin-top: 12px;
+      line-height: 1.1;
+    }
+
+    .proto p {
+      margin-top: 12px;
+      font-size: 15px;
+      color: var(--text-dim);
+      flex: 1;
+    }
+
+    .proto pre {
+      margin-top: 22px;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.75;
+      color: var(--text);
+      background: rgba(0, 0, 0, 0.45);
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 14px 16px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .proto pre .c {
+      color: var(--text-faint);
+    }
+
+    .backends {
+      margin-top: 28px;
+      margin-bottom: 96px;
+      padding: 18px 24px;
+      border: 1px dashed var(--line);
+      border-radius: var(--r);
+      font-family: var(--mono);
+      font-size: 11.5px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 26px;
+    }
+
+    .backends b {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    /* terminal */
+    .term-sec .wrap {
+      padding-bottom: 96px;
+    }
+
+    .term {
+      margin-top: 56px;
+      position: relative;
+      background: #0d0d0c;
+      border: 1px solid var(--line-bright);
+      border-radius: 16px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+      font-family: var(--mono);
+      font-size: 13.5px;
+      line-height: 1.95;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    .term::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: radial-gradient(ellipse 70% 50% at 50% -10%, rgba(255, 255, 255, 0.05), transparent 60%);
+    }
+
+    .term .titlebar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .term .titlebar i {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.12);
+      display: block;
+    }
+
+    .term .titlebar span {
+      margin-left: 10px;
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+    }
+
+    .term .body {
+      padding: 22px 26px 26px;
+      overflow-x: auto;
+      color: #d9d7cf;
+    }
+
+    .term .body>div {
+      transition: opacity .2s;
+    }
+
+    .term .body>div.line-hidden {
+      opacity: 0;
+    }
+
+    .term .body>div.line-active::after {
+      content: "▋";
+      color: var(--accent);
+      margin-left: 6px;
+      animation: blink 0.9s steps(1) infinite;
+    }
+
+    @keyframes blink {
+      50% {
+        opacity: 0;
+      }
+    }
+
+    .term .ps1 {
+      color: var(--accent);
+    }
+
+    .term .c {
+      color: var(--text-faint);
+    }
+
+    .term .out {
+      color: #8e8c83;
+    }
+
+    .term .ok {
+      color: #7dd97b;
+    }
+
+    .term-caption {
+      margin-top: 20px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.05em;
+      color: var(--text-faint);
+    }
+
+    .term-caption b {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    /* asciinema casts */
+    .casts .wrap {
+      padding-bottom: 96px;
+    }
+
+    .cast-frame {
+      margin-top: 18px;
+    }
+
+    .cast-frame .body {
+      padding: 0;
+    }
+
+    #cast-player {
+      min-height: 320px;
+    }
+
+    /* features */
+    .feat-grid {
+      margin-top: 56px;
+      margin-bottom: 96px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+
+    .feat {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      padding: 24px 22px 26px;
+      transition: border-color .2s, background .2s, transform .2s;
+    }
+
+    .feat:hover {
+      border-color: var(--line-bright);
+      background: var(--panel-hover);
+      transform: translateY(-2px);
+    }
+
+    .feat .num {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--accent);
+      letter-spacing: 0.08em;
+    }
+
+    .feat h3 {
+      font-weight: 700;
+      font-size: 15.5px;
+      letter-spacing: -0.01em;
+      margin-top: 13px;
+      line-height: 1.35;
+    }
+
+    .feat p {
+      margin-top: 9px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--text-dim);
+    }
+
+    /* web ui */
+    .shots .wrap {
+      padding-bottom: 96px;
+    }
+
+    .tabs {
+      margin-top: 48px;
+      display: inline-flex;
+      position: relative;
+      max-width: 100%;
+      overflow-x: auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px;
+      gap: 2px;
+      scrollbar-width: none;
+    }
+
+    .tabs::-webkit-scrollbar {
+      display: none;
+    }
+
+    .tabs .glider {
+      position: absolute;
+      top: 4px;
+      left: 0;
+      height: calc(100% - 8px);
+      background: rgba(255, 255, 255, 0.085);
+      border: 1px solid var(--line-bright);
+      box-sizing: border-box;
+      border-radius: 999px;
+      pointer-events: none;
+      will-change: transform, width;
+    }
+
+    .tabs.gliding .glider {
+      transition: transform .35s cubic-bezier(.3, 1, .3, 1), width .35s cubic-bezier(.3, 1, .3, 1);
+    }
+
+    .tabs button {
+      position: relative;
+      z-index: 1;
+      cursor: pointer;
+      white-space: nowrap;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      background: none;
+      border: none;
+      border-radius: 999px;
+      padding: 9px 16px;
+      transition: color .25s, transform .1s;
+    }
+
+    .tabs button:hover {
+      color: var(--text-dim);
+    }
+
+    .tabs button[aria-selected="true"] {
+      color: var(--text);
+    }
+
+    .tabs button:active {
+      transform: scale(0.97);
+    }
+
+    .browser {
+      margin-top: 18px;
+      background: #0d0d0c;
+      border: 1px solid var(--line-bright);
+      border-radius: 16px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+      overflow: hidden;
+    }
+
+    .browser .chrome {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .browser .chrome i {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.12);
+      display: block;
+    }
+
+    .browser .chrome .url {
+      margin-left: 12px;
+      flex: 1;
+      max-width: 360px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: var(--text-faint);
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 5px 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .browser .view {
+      position: relative;
+      aspect-ratio: 1600 / 933;
+    }
+
+    .browser .view img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: top;
+      opacity: 0;
+      transition: opacity .35s ease;
+    }
+
+    .browser .view img.active {
+      opacity: 1;
+    }
+
+    .shot-caption {
+      margin-top: 18px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.05em;
+      color: var(--text-faint);
+      min-height: 1.8em;
+    }
+
+    .shot-caption b {
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+
+    /* closer */
+    .closer {
+      text-align: center;
+      border-bottom: 1px solid var(--line);
+      position: relative;
+      overflow: clip;
+    }
+
+    .closer::before {
+      content: "";
+      position: absolute;
+      inset: auto -20% -60%;
+      height: 120%;
+      background: radial-gradient(ellipse 50% 60% at 50% 100%, rgba(255, 255, 255, 0.06), transparent 65%);
+      pointer-events: none;
+    }
+
+    .closer .wrap {
+      padding-top: 120px;
+      padding-bottom: 120px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .closer svg {
+      width: 72px;
+      height: 72px;
+      color: var(--text);
+      margin-bottom: 36px;
+      filter: drop-shadow(0 0 28px rgba(255, 255, 255, 0.25));
+    }
+
+    .closer h2 {
+      margin: 0 auto;
+      max-width: 16em;
+      text-align: center;
+    }
+
+    .closer .install {
+      margin-top: 48px;
+    }
+
+    .closer .links {
+      margin-top: 28px;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .closer .links a {
+      color: var(--text-dim);
+      margin: 0 14px;
+      transition: color .15s;
+    }
+
+    .closer .links a:hover {
+      color: var(--accent);
+    }
+
+    /* footer */
+    footer .wrap {
+      padding: 28px 32px 36px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--text-faint);
+    }
+
+    footer a {
+      color: var(--text-dim);
+    }
+
+    footer a:hover {
+      color: var(--text);
+    }
+
+    /* reveal */
+    .rv {
+      opacity: 0;
+      transform: translateY(16px);
+      transition: opacity .8s cubic-bezier(.2, .6, .2, 1), transform .8s cubic-bezier(.2, .6, .2, 1);
+    }
+
+    .rv.in {
+      opacity: 1;
+      transform: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .rv {
+        opacity: 1;
+        transform: none;
+        transition: none;
+      }
+
+      .hero-enso {
+        animation: none;
+      }
+
+      .enso-prec {
+        animation: none;
+      }
+
+      .hero-glow {
+        animation: none;
+      }
+
+      .hero-particles {
+        display: none;
+      }
+
+      h1 .li {
+        animation: none;
+        transform: none;
+      }
+
+      html {
+        scroll-behavior: auto;
+      }
+    }
+
+    /* responsive */
+    @media (max-width: 980px) {
+      .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .stat:nth-child(odd) {
+        border-left: none;
+        padding-left: 0;
+      }
+
+      .stat:nth-child(even) {
+        padding-left: 28px;
+      }
+
+      .stat:nth-child(-n+2) {
+        border-bottom: 1px solid var(--line);
+      }
+
+      .proto-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .feat-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .enso-tilt {
+        width: 560px;
+        height: 560px;
+      }
+
+      .hero-glow {
+        width: 720px;
+        height: 720px;
+      }
+
+      .hero-particles {
+        --r0: 228px;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .wrap {
+        padding: 0 20px;
+      }
+
+      .bar {
+        height: 60px;
+        padding: 0 20px;
+      }
+
+      nav {
+        gap: 2px;
+      }
+
+      nav a:not(.cta):not(.keep) {
+        display: none;
+      }
+
+      .proof-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .feat-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .cmd {
+        font-size: 12px;
+        flex-wrap: wrap;
+      }
+
+      .hero .wrap {
+        padding-top: 156px;
+        padding-bottom: 72px;
+      }
+
+      h1 {
+        font-size: clamp(34px, 10.8vw, 46px);
+      }
+
+      .sec-head {
+        padding-top: 64px;
+      }
+    }
+  </style>
 </head>
+
 <body>
-<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true"><symbol id="enso" viewBox="0 0 100 100"><g transform="matrix(1.0970785445864348,0,0,1.0970785445864348,-4.869122522979331,-6.419241787751226)"><path fill="currentColor" d="M51.5,85.2c-0.4-0.5-0.8-0.2-0.8-0.5c-2.4,0.6-6.9-1-8.8-0.8c0.4-0.6-0.6-0.5-0.6-0.9c-0.4,0.6-0.8,0-1.4,0.2 c-0.6-1.5-3-0.4-3.3-2.3c-1.4,0-1.9-0.8-3.3-1.6c0.1-0.1,0.2-0.1,0.3-0.2c-0.7-0.1-0.7-0.5-1.3-0.5l0.2-0.4 c-1.1-0.2-1.5-1.9-3.1-2.5c-0.5-0.1-1.6-1.8-2.2-2.2c-0.3-0.2-0.8-0.2-0.1-0.3c-0.1-0.1-0.1-0.3,0-0.4c-0.7-0.2-0.8-0.8-1.7-1.1 c-0.1-0.3,0.2-0.5,0-0.7c-0.2-0.1-0.5,0.1-0.7,0c-0.1,1.8,1.9,2,2.5,3.5c-0.2-0.2-0.5-0.8-0.7-0.4c-0.1,0.3,0.8,1.4,0.8,0.8 c-0.3,0.2-0.4-0.3-0.2-0.4c0.3,0.5,0.9,0.4,0.9,0.8c-0.3,0.3-0.7-0.3-0.6,0.2c0.9,0.5,0.8,1,1.3,1.7c-0.4-0.5-0.5,0.4-0.9,0 c-0.1-1.5-1.8-1.2-1.8-2.7c-0.2-0.5-0.4-0.1-0.7-0.3c0.4-0.4-1.2-1.8-1.2-1.3c-0.5-0.6-0.2-0.8-0.3-1.2 c-0.4-0.1-0.1,0.4-0.4,0.1c0.4-0.7-0.5-1.6-1.1-2.3l0.4-0.2c-0.7-0.4-0.8-1.2-1.3-2.1c-0.6,0.9,1.2,2.9,0.9,3.3 c0,0.1,0.7,0.9,0.9,1.3c0.8,1.4,1.4,3.1,2.5,3.9c-0.2-0.1-0.1-0.7,0.2-0.4c0,0.3-0.2,0.6-0.2,0.9c0.6,0.6,1.1,1.1,1.7,1.7 c-1.3-0.8-2.6-1.6-3.5-2.8c0.5-0.1,1,0.8,1.4,0.7c-1-0.8-0.7-1.1-1.1-2.1c-0.4-0.3,0.1,0.4-0.3,0.5c-1.3-1.2-2.3-1.9-2.9-3 c0.1-0.1,0.2-0.2,0.2-0.4c-0.1-0.1-0.1-0.1-0.2-0.2c0.6,0.6,0.8,1.1,1.5,1.2c-0.3-0.3,0-0.4-0.4-0.7c-0.2-0.4-0.5,0.2-0.7-0.1 c0.2-0.3,0-0.7,0-1c-0.2,0-0.4,0-0.5-0.3c-0.2-0.1-0.3,0-0.4,0.2c-0.1-0.1-0.1-0.3-0.2-0.4c0,0,0-0.1,0-0.1 c-0.1-0.1-0.2-0.3-0.3-0.4c-0.8-2.1-1.3-4.9-2.4-6.7c0.3-1.2-0.2-3.6-0.5-4.2c0.3-0.5,0.1-2.8-0.1-3.2c-0.5,0.2,0.1,1.3-0.4,1.6 c-0.5-2.2,0.3-4.7,0.1-6.7c0.2,0,0.4,0,0.4-0.1c-0.3-0.3,0.2-0.9,0.1-1.6c0.4-0.9-0.9,1.3-0.9,2.2c-0.1,0.2-0.5,0-0.4,0.5 c0,0.7,0.2,2.1-0.2,3.1c-0.2,0-0.2-0.2-0.4-0.1c-0.1,0.5-0.2,1.1-0.3,1.6c-0.1-0.2-0.2-0.5-0.2-0.6c-0.5-2.5,0-5.4-0.2-7.5 c0.4,0,0.4-0.6,0.7-0.8c-0.1,0.8-0.3,1.8,0.2,2c0.4-3.9,1.2-8.2,3-12.4c1.3-3.1,3.2-6.2,5.5-8.7c0.2,0.3-0.1,1,0,1.3 c2-2.1,3.3-4.6,5.5-6c0.1,0.5-0.9,0.9-0.9,1.3c0.9-0.9,1.2-0.6,2.2-0.9c0.3-0.4-0.4,0-0.5-0.4c0.6-0.4,1-0.9,1.4-1.2 c0,0.1-0.1,0.1-0.1,0.2c1.1-0.3,1.2-0.9,2-1.1c-0.1-0.1-0.3-0.2-0.6-0.1c0.2-0.1,0.5-0.3,0.8-0.4c-0.1,0-0.1,0.1-0.2,0.1 c0.6-0.3,0.1,0.1,0.1,0.3c0.1,0,0.2-0.1,0.2-0.1c-0.6,0.4-1,0.6-1.2,1.3c0.3-0.2,0.4,0,0.8-0.3c0.4-0.2-0.1-0.5,0.2-0.7 c0.3,0.2,0.7,0.1,1,0.1c0-0.2,0.1-0.4,0.3-0.5c0.1-0.2,0-0.3-0.1-0.3c0.1-0.1,0.2-0.1,0.4-0.2c0,0,0.1,0,0.1,0.1 c1.7-0.8,3.6-1.5,5.4-2.1c1.1-0.1,2.5-0.1,3.1-0.8c-0.2,0-0.4,0.1-0.5,0c0.1,0,0.3-0.1,0.4-0.1c0.2,0.2,0.5,0,0.2,0.4 c0.1,0,0.1,0,0.2-0.1c0,0.1,0,0.1,0.1,0.2c0.1,0,0.2-0.1,0.3-0.3c0.1,0,0.2,0,0.3-0.1c0,0-0.1,0.1-0.1,0.1 c0.8-0.2,1.5-0.1,2.6-0.3c0-0.1,0-0.2,0-0.3c0.2,0,0.3-0.1,0.5-0.1c0,0,0,0.1,0,0.1c0.4-0.2,0.8,0.2,0.8,0c0.1,0,0.1,0,0.2,0 c0,0.2-0.1,0.3-0.1,0.4c0.5,0,0.8,0,1-0.3c-0.1-0.1-0.2-0.1-0.3-0.1c0.2,0,0.4-0.1,0.6-0.2c0.3,0.1,0.4,0.2,0.4,0.6 c0.5-0.9,2.1,0.2,2.8,0c0.3,0,0.2-0.4,0.4-0.6c0.1,0,0.2,0,0.3,0c0.5,0.4,1.2,0.8,2.1,0.9c-0.8-0.2,0.1-0.3,0.2-0.4 c-0.2,0-0.2-0.1-0.2-0.2c0.3,0,0.6,0.1,0.9,0.1c0,0.2,0.1,0.3,0.3,0.3c0.2,0,0.2-0.1,0.2-0.3c0.3,0,0.5,0,0.8,0.1 c-0.1,0.4,0.5,0.5,0.7,0.8c-0.8-0.2-1.7-0.5-2,0c3.2,0.7,6.7,1.7,10.1,3.4c0,0,0,0,0,0.1c0,0,0.1,0,0.1,0 c0.6,0.3,1.2,0.6,1.8,0.9c0.4,0.2,0.7,0.4,1.1,0.7c0,0.1,0,0.2,0.2,0.2c0,0,0.1,0,0.1,0c0.4,0.3,0.8,0.5,1.2,0.8 c0.4,0.6,0.8,1.4,1.5,1.2c1.5,2.3,3.1,3.2,4.4,5.6c0.1-0.4,0.4,0.9,0.9,1c-0.8-0.1,0.5,0.5-0.3,0.4c0.7,0.7,0.9,1,1,1.8 c-0.2-0.4-0.3-0.5-0.4-0.1c-0.1,0.6,0.7-0.1,1,0.5c-0.6,0-0.4,0.4-0.3,0.9c0.3-0.3,0.2-0.6,0.5-0.5c0.4,0.4-0.2,0.5-0.1,0.8 c0.3-0.4,0.4-0.2,0.8,0c-0.5,0.1,0.3,0.8-0.3,0.5c0.4,0.5,0.5,0.8,0.3,1.3c-0.4-0.6-0.1-1-0.7-0.9c1.2,1,0.6,3.3,2,3.5 c-0.9,0.2,0,0.6-0.5,0.7c0.6,0.2,0.3,1,1,1.2c-0.1,0.5-0.3,0.8-0.4,1.3c0.3,0.4,0.4,1.2,0.9,1.3c-0.3,0.3-0.1,1.1-0.4,1.4 c0.4-0.2,0.6-0.2,0.9,0.2c-0.5,0.4-0.1,0.8-0.4,0.9c0.9,2.3-0.2,7,0.3,8.8c-0.6-0.3-0.4,0.7-0.8,0.7c0.7,0.3,0.1,0.8,0.4,1.3 c-1.4,0.8,0,3-1.9,3.5c0.2,1.4-0.6,2-1.2,3.5c-0.1-0.1-0.1-0.2-0.2-0.3c-0.1,0.7-0.5,0.8-0.3,1.4l-0.4-0.2 c0,1.1-1.7,1.7-2.1,3.4c-0.1,0.5-1.6,1.8-2,2.5c-0.2,0.3-0.1,0.8-0.3,0.1c-0.1,0.1-0.3,0.1-0.4,0.1c-0.1,0.7-0.7,0.9-0.9,1.8 c-0.2,0.1-0.5-0.2-0.7,0.1c0,0.2,0.2,0.5,0.1,0.7c1.8-0.1,1.8-2.2,3.2-2.9c-0.1,0.3-0.7,0.6-0.3,0.8c0.3,0,1.2-1,0.7-0.9 c0.3,0.2-0.3,0.4-0.4,0.3c0.5-0.4,0.3-0.9,0.7-1c0.3,0.2-0.3,0.7,0.3,0.6c0.4-0.9,0.9-1,1.5-1.5c-0.4,0.4,0.5,0.5,0.1,0.9 c-1.5,0.3-1,2-2.5,2.2c-0.4,0.3-0.1,0.4-0.2,0.7c-0.5-0.3-1.6,1.4-1.2,1.3c-0.5,0.5-0.8,0.3-1.2,0.4c-0.1,0.4,0.4,0.1,0.2,0.4 c-0.7-0.3-1.6,0.7-2.2,1.4l-0.3-0.3c-0.3,0.8-1.1,0.9-2,1.5c1,0.5,2.7-1.6,3.2-1.3c0.1,0,0.9-0.8,1.2-1.1c1.3-1,2.9-1.8,3.5-2.9 c-0.1,0.2-0.7,0.2-0.4-0.1c0.3-0.1,0.6,0.1,0.9,0.1c1.6-2.2,3.6-4,5.1-6.6c0.1-0.1,0.2-0.3,0.3-0.5c-0.2,0.6-0.5,1.1-0.7,1.7 c-1.6,1.1-2.2,4.3-4.1,4.8c0.1,1.1-0.9,1.4-1.4,2.7c-0.3,0.4-0.5-0.3-0.8,0.2c0.3,1.4-2.5,1.3-2.4,2.6c-0.2,0.1-0.5,0.2-0.7,0.4 c0,0-0.1,0-0.1,0c-0.1,0.1-0.1,0.1-0.2,0.2c-0.5,0.3-0.9,0.6-1.3,0.9c-1.4,0.8-3.3,1.4-4.8,2.2c0,0,0-0.1,0-0.1 c-0.4,0.2-0.9,0.1-0.8,0.5c-0.3,0.2-0.6,0.4-0.9,0.6c-0.1,0-0.1,0-0.2,0c0,0-0.1-0.1-0.2-0.1c-0.2,0-0.2,0-0.3,0.1 c-1.3,0.1-3,0.7-3.5,1.1c-0.5-0.3-2.8,0.2-3.2,0.4c0.2,0.3,0.8,0,1.3,0c-0.3,0.1-0.6,0.2-0.7,0.4c-0.1,0-0.1,0-0.2,0 c-0.1-0.3-0.4,0-0.5-0.1c0,0,0.1,0,0.1,0c-0.1-0.4-0.4-0.6-0.9-0.5c0,0.2,0,0.3-0.1,0.5c0.2,0,0.8-0.3,0.8,0 c-0.1,0-0.1,0.1,0,0.1c-0.2,0.2-0.5,0.2-0.7,0.3c-0.4,0-0.9,0-1.3,0c-0.1-0.1-0.2-0.1-0.4-0.2c-0.1,0.1-0.3,0.1-0.4,0.2 c-0.6,0-1.3,0.1-1.8,0.2c0-0.2,0-0.4-0.2-0.4c-0.3,0.4-0.9-0.1-1.6,0.1c-0.7-0.2,0.4,0.3,1.4,0.5C51.9,85,51.8,85.1,51.5,85.2 M37.5,86.6c-1.4-1.3-4.3-1.9-4.8-2.9c-0.8-0.1-2-1.6-3-1.8c0.5,0,0.1-0.3,0-0.5c-0.2,0.2-0.4,0.3-0.6,0.3 c0-0.8-0.8-1.3-1.5-1.8c0.5,0.3,0.9,0.5,1.5,0.6c0-0.2,0-0.4,0.2-0.4c0.7,0.7,1.5,1.4,2.4,2.1c1.2,1.1,7.4,3.9,8.5,4.4 c0,0-0.2,0.4-0.1,0.4c0.5,0.3,0.9-0.3,1,0.4C39.5,87.6,38.9,86.5,37.5,86.6 M83.6,63.4c0,0,0,0.1,0,0.1c0,0,0,0,0,0 C83.5,63.5,83.6,63.4,83.6,63.4 M43.2,17.1c-0.1,0.1-0.2,0.1-0.2,0.1C43,17.1,43.1,17.1,43.2,17.1 M41.3,17.6 C41.3,17.7,41.3,17.7,41.3,17.6C41.3,17.7,41.3,17.7,41.3,17.6C41.3,17.7,41.3,17.6,41.3,17.6 M34.7,19.7 C34.7,19.7,34.7,19.7,34.7,19.7c0.1-0.1,0.1-0.1,0.2-0.1C34.8,19.6,34.7,19.7,34.7,19.7 M50.7,16.4c-0.2,0-0.3,0-0.4-0.1 c0.1,0,0.2,0,0.3,0c0,0,0.1,0,0.1,0C50.7,16.3,50.7,16.3,50.7,16.4 M52.5,16.6c-0.1-0.1-0.4-0.2-0.7-0.2c0-0.1,0.1-0.2,0.1-0.2 c0.1,0,0.2,0,0.3,0c0,0,0.1,0,0.1,0.1c0,0,0,0,0-0.1c0.1,0,0.1,0,0.2,0C52.6,16.4,52.7,16.5,52.5,16.6 M55.8,16.9 c-0.5,0.1-0.8-0.1-1.3-0.4c0.3,0,0.7,0.1,1,0.2C55.6,16.7,55.7,16.8,55.8,16.9 M91.4,31.1c-0.2,0.1-0.3,0.1-0.5-0.3 c-1.6-3.4-4.5-8.3-8.7-12.4c-4.1-4.2-9.6-7.6-14.6-9.4c0.3,0.1,0.7,0.3,0.5,0.5c-4.4-1.7-8.6-2.7-12.6-3.1 C44.7,4.7,33.4,7,24.7,12.6c0.1,0.2,0.1,0.3-0.2,0.5c-3.2,2-7.7,5.5-11.3,10.1c-3.6,4.6-6.4,10.4-7.6,15.6 C5.7,38.5,5.8,38,6,38.2C3.4,48.5,4.1,57.3,7.7,64.9c0.2-0.2-0.5-1.2,0.1-1.1c0.4,1.1,0.9,2.3,1.5,3.4c0.7,1.6,1.5,3.7,2.6,4.2 C9.1,65.9,7.2,59.6,7,54c0.4,0.8,0.3,2.5,0.9,3.2c0.2-3.8-0.7-8.9,0.6-12.5c-0.3,1.9-0.5,4.5-0.3,7.1c0,1.9,0.9,7.2,1.5,7.7 c-0.1-0.1-0.1-0.6,0-0.6c0.3,0.6-0.4,0.9,0.1,1c0-0.2,0.1-0.2,0.2-0.2c1,2.2,2.3,5.6,3.3,7.3c1.2,2.2,2.8,4.2,4.6,6 c0,0.1,0.1,0.1,0.1,0.2c0.2,0.5,0.9,1.1,1.1,1.5c0.1,0.2-0.1,0.5,0,0.7c1.5,2.8,3.7,5.6,6.4,7.8c1.7,2,4.4,4.1,7.7,5.9 c3.2,1.7,6.9,3.1,10.3,3.9c2.4,0.6,5.3,0.7,7.1,1.1c2.4,0.5,6.6-0.2,8.7-0.6c12.6-1.9,25.1-10.5,31.4-22.9 C97.2,58.1,97,42.8,91.4,31.1"/></g></symbol><symbol id="wordmark" viewBox="-0.24 5.16 70.64 15.24"><path fill="currentColor" d="M9.5508 13.3594 l-2.793 2.959 l5.8594 0 l-0.83984 3.7207 l-12.021 0 l0.73242 -3.2227 l3.252 -3.457 l-0.87891 0 l4.043 -4.2773 l-5.2344 0 l0.84961 -3.7012 l11.377 0 l-0.74219 3.2422 l-4.4922 4.7363 l0.88867 0 z M13.91598125 14.5703 c0.078125 -0.33203 0.18555 -0.625 0.2832 -0.9375 l-1.084 0 c2.3438 -6.377 12.383 -7.0117 11.084 0 l1.0938 0 c-0.019531 0.11719 -0.019531 0.23438 -0.048828 0.36133 l-0.41992 1.6309 l-6.4648 0 c-0.33203 2.4121 4.248 1.6797 4.6973 0.81055 l1.4941 0 l-0.71289 2.7832 c-3.8574 2.2168 -11.357 1.6602 -9.9219 -4.6484 z M20.839881249999998 12.685500000000001 c0.21484 -1.0645 -2.1289 -1.6699 -3.2324 0 c0.0097656 0 3.2324 0.0097656 3.2324 0 z M30.624965625 13.6328 l-1.4453 6.3574 l-4.5801 0 l1.4551 -6.3574 l-0.88867 0 l1.0645 -4.6094 l4.5801 0 l-0.13672 0.52734 c1.2891 -0.6543 2.1973 -0.6543 3.5352 -0.41016 l-0.89844 3.877 l-1.2109 0 c-0.20508 -0.92773 -1.9238 -0.57617 -2.2461 0.14648 l-0.11719 0.46875 l0.88867 0 z M45.947265625 14.541 c-0.81055 3.5547 -3.4082 5.8203 -7.0996 5.8203 c-3.6035 0 -5.2734 -2.168 -4.4336 -5.8203 c0.068359 -0.29297 0.14648 -0.5957 0.26367 -0.86914 l-1.0059 0 c1.0449 -3.0957 3.5156 -4.9707 6.875 -4.9707 c3.457 0 4.9316 2.0215 4.5703 4.9707 l0.98633 0 c-0.029297 0.27344 -0.087891 0.57617 -0.15625 0.86914 z M38.349565625 13.6719 l0.97656 0 c-0.55664 1.4648 -0.66406 3.3789 0.30273 3.3789 c0.88867 0 1.6797 -1.9141 1.7969 -3.3789 l-0.9668 0 c0.078125 -0.91797 -0.10742 -1.6602 -0.68359 -1.6602 c-0.53711 0 -1.0742 0.74219 -1.4258 1.6602 z M56.1620625 13.6719 l0.97656 0 l-0.12695 0.5957 l-5.0391 0 l-1.3281 5.7715 l-4.9121 0 l1.4844 -6.3672 l-0.99609 0 l1.9043 -8.2422 l10.371 0 l-0.85938 3.7012 l-5.459 0 l-0.3418 1.4355 l5.0293 0 z M69.8340625 13.3594 c0.56641 2.0508 -1.1328 4.4727 -2.7051 5.5371 c-3.0859 2.0215 -7.1582 1.6992 -10.313 0.078125 l0.91797 -4.0625 l1.5137 0 c0.19531 2.0996 4.8926 2.9688 5.3711 0.89844 c0.23438 -1.0254 -3.4473 -1.3086 -4.6777 -2.2754 c-0.068359 -0.058594 -0.14648 -0.11719 -0.20508 -0.17578 l-0.89844 0 c-0.97656 -0.91797 -1.0645 -2.1387 -0.78125 -3.4082 c1.1914 -5.2051 8.2617 -5.7227 12.344 -3.6621 l-0.9082 3.9551 l-1.5234 0 c0.097656 -1.4844 -4.3945 -2.5 -4.8145 -0.71289 c-0.2832 1.3867 4.2676 0.97656 5.5273 3.1738 c0.10742 0.19531 0.19531 0.42969 0.25391 0.6543 l0.89844 0 z"/></symbol></svg>
+  <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+    <symbol id="enso" viewBox="0 0 100 100">
+      <g transform="matrix(1.0970785445864348,0,0,1.0970785445864348,-4.869122522979331,-6.419241787751226)">
+        <path fill="currentColor"
+          d="M51.5,85.2c-0.4-0.5-0.8-0.2-0.8-0.5c-2.4,0.6-6.9-1-8.8-0.8c0.4-0.6-0.6-0.5-0.6-0.9c-0.4,0.6-0.8,0-1.4,0.2 c-0.6-1.5-3-0.4-3.3-2.3c-1.4,0-1.9-0.8-3.3-1.6c0.1-0.1,0.2-0.1,0.3-0.2c-0.7-0.1-0.7-0.5-1.3-0.5l0.2-0.4 c-1.1-0.2-1.5-1.9-3.1-2.5c-0.5-0.1-1.6-1.8-2.2-2.2c-0.3-0.2-0.8-0.2-0.1-0.3c-0.1-0.1-0.1-0.3,0-0.4c-0.7-0.2-0.8-0.8-1.7-1.1 c-0.1-0.3,0.2-0.5,0-0.7c-0.2-0.1-0.5,0.1-0.7,0c-0.1,1.8,1.9,2,2.5,3.5c-0.2-0.2-0.5-0.8-0.7-0.4c-0.1,0.3,0.8,1.4,0.8,0.8 c-0.3,0.2-0.4-0.3-0.2-0.4c0.3,0.5,0.9,0.4,0.9,0.8c-0.3,0.3-0.7-0.3-0.6,0.2c0.9,0.5,0.8,1,1.3,1.7c-0.4-0.5-0.5,0.4-0.9,0 c-0.1-1.5-1.8-1.2-1.8-2.7c-0.2-0.5-0.4-0.1-0.7-0.3c0.4-0.4-1.2-1.8-1.2-1.3c-0.5-0.6-0.2-0.8-0.3-1.2 c-0.4-0.1-0.1,0.4-0.4,0.1c0.4-0.7-0.5-1.6-1.1-2.3l0.4-0.2c-0.7-0.4-0.8-1.2-1.3-2.1c-0.6,0.9,1.2,2.9,0.9,3.3 c0,0.1,0.7,0.9,0.9,1.3c0.8,1.4,1.4,3.1,2.5,3.9c-0.2-0.1-0.1-0.7,0.2-0.4c0,0.3-0.2,0.6-0.2,0.9c0.6,0.6,1.1,1.1,1.7,1.7 c-1.3-0.8-2.6-1.6-3.5-2.8c0.5-0.1,1,0.8,1.4,0.7c-1-0.8-0.7-1.1-1.1-2.1c-0.4-0.3,0.1,0.4-0.3,0.5c-1.3-1.2-2.3-1.9-2.9-3 c0.1-0.1,0.2-0.2,0.2-0.4c-0.1-0.1-0.1-0.1-0.2-0.2c0.6,0.6,0.8,1.1,1.5,1.2c-0.3-0.3,0-0.4-0.4-0.7c-0.2-0.4-0.5,0.2-0.7-0.1 c0.2-0.3,0-0.7,0-1c-0.2,0-0.4,0-0.5-0.3c-0.2-0.1-0.3,0-0.4,0.2c-0.1-0.1-0.1-0.3-0.2-0.4c0,0,0-0.1,0-0.1 c-0.1-0.1-0.2-0.3-0.3-0.4c-0.8-2.1-1.3-4.9-2.4-6.7c0.3-1.2-0.2-3.6-0.5-4.2c0.3-0.5,0.1-2.8-0.1-3.2c-0.5,0.2,0.1,1.3-0.4,1.6 c-0.5-2.2,0.3-4.7,0.1-6.7c0.2,0,0.4,0,0.4-0.1c-0.3-0.3,0.2-0.9,0.1-1.6c0.4-0.9-0.9,1.3-0.9,2.2c-0.1,0.2-0.5,0-0.4,0.5 c0,0.7,0.2,2.1-0.2,3.1c-0.2,0-0.2-0.2-0.4-0.1c-0.1,0.5-0.2,1.1-0.3,1.6c-0.1-0.2-0.2-0.5-0.2-0.6c-0.5-2.5,0-5.4-0.2-7.5 c0.4,0,0.4-0.6,0.7-0.8c-0.1,0.8-0.3,1.8,0.2,2c0.4-3.9,1.2-8.2,3-12.4c1.3-3.1,3.2-6.2,5.5-8.7c0.2,0.3-0.1,1,0,1.3 c2-2.1,3.3-4.6,5.5-6c0.1,0.5-0.9,0.9-0.9,1.3c0.9-0.9,1.2-0.6,2.2-0.9c0.3-0.4-0.4,0-0.5-0.4c0.6-0.4,1-0.9,1.4-1.2 c0,0.1-0.1,0.1-0.1,0.2c1.1-0.3,1.2-0.9,2-1.1c-0.1-0.1-0.3-0.2-0.6-0.1c0.2-0.1,0.5-0.3,0.8-0.4c-0.1,0-0.1,0.1-0.2,0.1 c0.6-0.3,0.1,0.1,0.1,0.3c0.1,0,0.2-0.1,0.2-0.1c-0.6,0.4-1,0.6-1.2,1.3c0.3-0.2,0.4,0,0.8-0.3c0.4-0.2-0.1-0.5,0.2-0.7 c0.3,0.2,0.7,0.1,1,0.1c0-0.2,0.1-0.4,0.3-0.5c0.1-0.2,0-0.3-0.1-0.3c0.1-0.1,0.2-0.1,0.4-0.2c0,0,0.1,0,0.1,0.1 c1.7-0.8,3.6-1.5,5.4-2.1c1.1-0.1,2.5-0.1,3.1-0.8c-0.2,0-0.4,0.1-0.5,0c0.1,0,0.3-0.1,0.4-0.1c0.2,0.2,0.5,0,0.2,0.4 c0.1,0,0.1,0,0.2-0.1c0,0.1,0,0.1,0.1,0.2c0.1,0,0.2-0.1,0.3-0.3c0.1,0,0.2,0,0.3-0.1c0,0-0.1,0.1-0.1,0.1 c0.8-0.2,1.5-0.1,2.6-0.3c0-0.1,0-0.2,0-0.3c0.2,0,0.3-0.1,0.5-0.1c0,0,0,0.1,0,0.1c0.4-0.2,0.8,0.2,0.8,0c0.1,0,0.1,0,0.2,0 c0,0.2-0.1,0.3-0.1,0.4c0.5,0,0.8,0,1-0.3c-0.1-0.1-0.2-0.1-0.3-0.1c0.2,0,0.4-0.1,0.6-0.2c0.3,0.1,0.4,0.2,0.4,0.6 c0.5-0.9,2.1,0.2,2.8,0c0.3,0,0.2-0.4,0.4-0.6c0.1,0,0.2,0,0.3,0c0.5,0.4,1.2,0.8,2.1,0.9c-0.8-0.2,0.1-0.3,0.2-0.4 c-0.2,0-0.2-0.1-0.2-0.2c0.3,0,0.6,0.1,0.9,0.1c0,0.2,0.1,0.3,0.3,0.3c0.2,0,0.2-0.1,0.2-0.3c0.3,0,0.5,0,0.8,0.1 c-0.1,0.4,0.5,0.5,0.7,0.8c-0.8-0.2-1.7-0.5-2,0c3.2,0.7,6.7,1.7,10.1,3.4c0,0,0,0,0,0.1c0,0,0.1,0,0.1,0 c0.6,0.3,1.2,0.6,1.8,0.9c0.4,0.2,0.7,0.4,1.1,0.7c0,0.1,0,0.2,0.2,0.2c0,0,0.1,0,0.1,0c0.4,0.3,0.8,0.5,1.2,0.8 c0.4,0.6,0.8,1.4,1.5,1.2c1.5,2.3,3.1,3.2,4.4,5.6c0.1-0.4,0.4,0.9,0.9,1c-0.8-0.1,0.5,0.5-0.3,0.4c0.7,0.7,0.9,1,1,1.8 c-0.2-0.4-0.3-0.5-0.4-0.1c-0.1,0.6,0.7-0.1,1,0.5c-0.6,0-0.4,0.4-0.3,0.9c0.3-0.3,0.2-0.6,0.5-0.5c0.4,0.4-0.2,0.5-0.1,0.8 c0.3-0.4,0.4-0.2,0.8,0c-0.5,0.1,0.3,0.8-0.3,0.5c0.4,0.5,0.5,0.8,0.3,1.3c-0.4-0.6-0.1-1-0.7-0.9c1.2,1,0.6,3.3,2,3.5 c-0.9,0.2,0,0.6-0.5,0.7c0.6,0.2,0.3,1,1,1.2c-0.1,0.5-0.3,0.8-0.4,1.3c0.3,0.4,0.4,1.2,0.9,1.3c-0.3,0.3-0.1,1.1-0.4,1.4 c0.4-0.2,0.6-0.2,0.9,0.2c-0.5,0.4-0.1,0.8-0.4,0.9c0.9,2.3-0.2,7,0.3,8.8c-0.6-0.3-0.4,0.7-0.8,0.7c0.7,0.3,0.1,0.8,0.4,1.3 c-1.4,0.8,0,3-1.9,3.5c0.2,1.4-0.6,2-1.2,3.5c-0.1-0.1-0.1-0.2-0.2-0.3c-0.1,0.7-0.5,0.8-0.3,1.4l-0.4-0.2 c0,1.1-1.7,1.7-2.1,3.4c-0.1,0.5-1.6,1.8-2,2.5c-0.2,0.3-0.1,0.8-0.3,0.1c-0.1,0.1-0.3,0.1-0.4,0.1c-0.1,0.7-0.7,0.9-0.9,1.8 c-0.2,0.1-0.5-0.2-0.7,0.1c0,0.2,0.2,0.5,0.1,0.7c1.8-0.1,1.8-2.2,3.2-2.9c-0.1,0.3-0.7,0.6-0.3,0.8c0.3,0,1.2-1,0.7-0.9 c0.3,0.2-0.3,0.4-0.4,0.3c0.5-0.4,0.3-0.9,0.7-1c0.3,0.2-0.3,0.7,0.3,0.6c0.4-0.9,0.9-1,1.5-1.5c-0.4,0.4,0.5,0.5,0.1,0.9 c-1.5,0.3-1,2-2.5,2.2c-0.4,0.3-0.1,0.4-0.2,0.7c-0.5-0.3-1.6,1.4-1.2,1.3c-0.5,0.5-0.8,0.3-1.2,0.4c-0.1,0.4,0.4,0.1,0.2,0.4 c-0.7-0.3-1.6,0.7-2.2,1.4l-0.3-0.3c-0.3,0.8-1.1,0.9-2,1.5c1,0.5,2.7-1.6,3.2-1.3c0.1,0,0.9-0.8,1.2-1.1c1.3-1,2.9-1.8,3.5-2.9 c-0.1,0.2-0.7,0.2-0.4-0.1c0.3-0.1,0.6,0.1,0.9,0.1c1.6-2.2,3.6-4,5.1-6.6c0.1-0.1,0.2-0.3,0.3-0.5c-0.2,0.6-0.5,1.1-0.7,1.7 c-1.6,1.1-2.2,4.3-4.1,4.8c0.1,1.1-0.9,1.4-1.4,2.7c-0.3,0.4-0.5-0.3-0.8,0.2c0.3,1.4-2.5,1.3-2.4,2.6c-0.2,0.1-0.5,0.2-0.7,0.4 c0,0-0.1,0-0.1,0c-0.1,0.1-0.1,0.1-0.2,0.2c-0.5,0.3-0.9,0.6-1.3,0.9c-1.4,0.8-3.3,1.4-4.8,2.2c0,0,0-0.1,0-0.1 c-0.4,0.2-0.9,0.1-0.8,0.5c-0.3,0.2-0.6,0.4-0.9,0.6c-0.1,0-0.1,0-0.2,0c0,0-0.1-0.1-0.2-0.1c-0.2,0-0.2,0-0.3,0.1 c-1.3,0.1-3,0.7-3.5,1.1c-0.5-0.3-2.8,0.2-3.2,0.4c0.2,0.3,0.8,0,1.3,0c-0.3,0.1-0.6,0.2-0.7,0.4c-0.1,0-0.1,0-0.2,0 c-0.1-0.3-0.4,0-0.5-0.1c0,0,0.1,0,0.1,0c-0.1-0.4-0.4-0.6-0.9-0.5c0,0.2,0,0.3-0.1,0.5c0.2,0,0.8-0.3,0.8,0 c-0.1,0-0.1,0.1,0,0.1c-0.2,0.2-0.5,0.2-0.7,0.3c-0.4,0-0.9,0-1.3,0c-0.1-0.1-0.2-0.1-0.4-0.2c-0.1,0.1-0.3,0.1-0.4,0.2 c-0.6,0-1.3,0.1-1.8,0.2c0-0.2,0-0.4-0.2-0.4c-0.3,0.4-0.9-0.1-1.6,0.1c-0.7-0.2,0.4,0.3,1.4,0.5C51.9,85,51.8,85.1,51.5,85.2 M37.5,86.6c-1.4-1.3-4.3-1.9-4.8-2.9c-0.8-0.1-2-1.6-3-1.8c0.5,0,0.1-0.3,0-0.5c-0.2,0.2-0.4,0.3-0.6,0.3 c0-0.8-0.8-1.3-1.5-1.8c0.5,0.3,0.9,0.5,1.5,0.6c0-0.2,0-0.4,0.2-0.4c0.7,0.7,1.5,1.4,2.4,2.1c1.2,1.1,7.4,3.9,8.5,4.4 c0,0-0.2,0.4-0.1,0.4c0.5,0.3,0.9-0.3,1,0.4C39.5,87.6,38.9,86.5,37.5,86.6 M83.6,63.4c0,0,0,0.1,0,0.1c0,0,0,0,0,0 C83.5,63.5,83.6,63.4,83.6,63.4 M43.2,17.1c-0.1,0.1-0.2,0.1-0.2,0.1C43,17.1,43.1,17.1,43.2,17.1 M41.3,17.6 C41.3,17.7,41.3,17.7,41.3,17.6C41.3,17.7,41.3,17.7,41.3,17.6C41.3,17.7,41.3,17.6,41.3,17.6 M34.7,19.7 C34.7,19.7,34.7,19.7,34.7,19.7c0.1-0.1,0.1-0.1,0.2-0.1C34.8,19.6,34.7,19.7,34.7,19.7 M50.7,16.4c-0.2,0-0.3,0-0.4-0.1 c0.1,0,0.2,0,0.3,0c0,0,0.1,0,0.1,0C50.7,16.3,50.7,16.3,50.7,16.4 M52.5,16.6c-0.1-0.1-0.4-0.2-0.7-0.2c0-0.1,0.1-0.2,0.1-0.2 c0.1,0,0.2,0,0.3,0c0,0,0.1,0,0.1,0.1c0,0,0,0,0-0.1c0.1,0,0.1,0,0.2,0C52.6,16.4,52.7,16.5,52.5,16.6 M55.8,16.9 c-0.5,0.1-0.8-0.1-1.3-0.4c0.3,0,0.7,0.1,1,0.2C55.6,16.7,55.7,16.8,55.8,16.9 M91.4,31.1c-0.2,0.1-0.3,0.1-0.5-0.3 c-1.6-3.4-4.5-8.3-8.7-12.4c-4.1-4.2-9.6-7.6-14.6-9.4c0.3,0.1,0.7,0.3,0.5,0.5c-4.4-1.7-8.6-2.7-12.6-3.1 C44.7,4.7,33.4,7,24.7,12.6c0.1,0.2,0.1,0.3-0.2,0.5c-3.2,2-7.7,5.5-11.3,10.1c-3.6,4.6-6.4,10.4-7.6,15.6 C5.7,38.5,5.8,38,6,38.2C3.4,48.5,4.1,57.3,7.7,64.9c0.2-0.2-0.5-1.2,0.1-1.1c0.4,1.1,0.9,2.3,1.5,3.4c0.7,1.6,1.5,3.7,2.6,4.2 C9.1,65.9,7.2,59.6,7,54c0.4,0.8,0.3,2.5,0.9,3.2c0.2-3.8-0.7-8.9,0.6-12.5c-0.3,1.9-0.5,4.5-0.3,7.1c0,1.9,0.9,7.2,1.5,7.7 c-0.1-0.1-0.1-0.6,0-0.6c0.3,0.6-0.4,0.9,0.1,1c0-0.2,0.1-0.2,0.2-0.2c1,2.2,2.3,5.6,3.3,7.3c1.2,2.2,2.8,4.2,4.6,6 c0,0.1,0.1,0.1,0.1,0.2c0.2,0.5,0.9,1.1,1.1,1.5c0.1,0.2-0.1,0.5,0,0.7c1.5,2.8,3.7,5.6,6.4,7.8c1.7,2,4.4,4.1,7.7,5.9 c3.2,1.7,6.9,3.1,10.3,3.9c2.4,0.6,5.3,0.7,7.1,1.1c2.4,0.5,6.6-0.2,8.7-0.6c12.6-1.9,25.1-10.5,31.4-22.9 C97.2,58.1,97,42.8,91.4,31.1" />
+      </g>
+    </symbol>
+    <symbol id="wordmark" viewBox="-0.24 5.16 70.64 15.24">
+      <path fill="currentColor"
+        d="M9.5508 13.3594 l-2.793 2.959 l5.8594 0 l-0.83984 3.7207 l-12.021 0 l0.73242 -3.2227 l3.252 -3.457 l-0.87891 0 l4.043 -4.2773 l-5.2344 0 l0.84961 -3.7012 l11.377 0 l-0.74219 3.2422 l-4.4922 4.7363 l0.88867 0 z M13.91598125 14.5703 c0.078125 -0.33203 0.18555 -0.625 0.2832 -0.9375 l-1.084 0 c2.3438 -6.377 12.383 -7.0117 11.084 0 l1.0938 0 c-0.019531 0.11719 -0.019531 0.23438 -0.048828 0.36133 l-0.41992 1.6309 l-6.4648 0 c-0.33203 2.4121 4.248 1.6797 4.6973 0.81055 l1.4941 0 l-0.71289 2.7832 c-3.8574 2.2168 -11.357 1.6602 -9.9219 -4.6484 z M20.839881249999998 12.685500000000001 c0.21484 -1.0645 -2.1289 -1.6699 -3.2324 0 c0.0097656 0 3.2324 0.0097656 3.2324 0 z M30.624965625 13.6328 l-1.4453 6.3574 l-4.5801 0 l1.4551 -6.3574 l-0.88867 0 l1.0645 -4.6094 l4.5801 0 l-0.13672 0.52734 c1.2891 -0.6543 2.1973 -0.6543 3.5352 -0.41016 l-0.89844 3.877 l-1.2109 0 c-0.20508 -0.92773 -1.9238 -0.57617 -2.2461 0.14648 l-0.11719 0.46875 l0.88867 0 z M45.947265625 14.541 c-0.81055 3.5547 -3.4082 5.8203 -7.0996 5.8203 c-3.6035 0 -5.2734 -2.168 -4.4336 -5.8203 c0.068359 -0.29297 0.14648 -0.5957 0.26367 -0.86914 l-1.0059 0 c1.0449 -3.0957 3.5156 -4.9707 6.875 -4.9707 c3.457 0 4.9316 2.0215 4.5703 4.9707 l0.98633 0 c-0.029297 0.27344 -0.087891 0.57617 -0.15625 0.86914 z M38.349565625 13.6719 l0.97656 0 c-0.55664 1.4648 -0.66406 3.3789 0.30273 3.3789 c0.88867 0 1.6797 -1.9141 1.7969 -3.3789 l-0.9668 0 c0.078125 -0.91797 -0.10742 -1.6602 -0.68359 -1.6602 c-0.53711 0 -1.0742 0.74219 -1.4258 1.6602 z M56.1620625 13.6719 l0.97656 0 l-0.12695 0.5957 l-5.0391 0 l-1.3281 5.7715 l-4.9121 0 l1.4844 -6.3672 l-0.99609 0 l1.9043 -8.2422 l10.371 0 l-0.85938 3.7012 l-5.459 0 l-0.3418 1.4355 l5.0293 0 z M69.8340625 13.3594 c0.56641 2.0508 -1.1328 4.4727 -2.7051 5.5371 c-3.0859 2.0215 -7.1582 1.6992 -10.313 0.078125 l0.91797 -4.0625 l1.5137 0 c0.19531 2.0996 4.8926 2.9688 5.3711 0.89844 c0.23438 -1.0254 -3.4473 -1.3086 -4.6777 -2.2754 c-0.068359 -0.058594 -0.14648 -0.11719 -0.20508 -0.17578 l-0.89844 0 c-0.97656 -0.91797 -1.0645 -2.1387 -0.78125 -3.4082 c1.1914 -5.2051 8.2617 -5.7227 12.344 -3.6621 l-0.9082 3.9551 l-1.5234 0 c0.097656 -1.4844 -4.3945 -2.5 -4.8145 -0.71289 c-0.2832 1.3867 4.2676 0.97656 5.5273 3.1738 c0.10742 0.19531 0.19531 0.42969 0.25391 0.6543 l0.89844 0 z" />
+    </symbol>
+  </svg>
 
-<header>
-  <div class="bar">
-    <a class="brand" href="#" aria-label="ZeroFS home">
-      <svg class="mark" aria-hidden="true"><use href="#enso"/></svg>
-      <svg class="wm" aria-hidden="true"><use href="#wordmark"/></svg>
-    </a>
-    <nav>
-      <a href="/blog">Blog</a>
-      <a href="https://www.zerofs.net/docs">Docs</a>
-      <a href="https://github.com/Barre/ZeroFS" class="keep gh" aria-label="ZeroFS on GitHub">
-        <svg viewBox="0 0 16 16" width="17" height="17" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="gh-stars">1.9k</span>
+  <header>
+    <div class="bar">
+      <a class="brand" href="#" aria-label="ZeroFS home">
+        <svg class="mark" aria-hidden="true">
+          <use href="#enso" />
+        </svg>
+        <svg class="wm" aria-hidden="true">
+          <use href="#wordmark" />
+        </svg>
       </a>
-      <a href="https://www.zerofs.net/docs/quickstart" class="cta keep">Install</a>
-    </nav>
-  </div>
-</header>
-
-<main>
-
-<div class="hero">
-  <div class="hero-scene" aria-hidden="true">
-    <div class="hero-glow"></div>
-    <div class="enso-tilt">
-      <div class="enso-prec">
-        <svg class="hero-enso"><use href="#enso"/></svg>
-      </div>
+      <nav>
+        <a href="/blog">Blog</a>
+        <a href="https://www.zerofs.net/docs">Docs</a>
+        <a href="https://github.com/Barre/ZeroFS" class="keep gh" aria-label="ZeroFS on GitHub">
+          <svg viewBox="0 0 16 16" width="17" height="17" aria-hidden="true">
+            <path fill="currentColor"
+              d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
+          </svg>
+          <span id="gh-stars">1.9k</span>
+        </a>
+        <a href="https://www.zerofs.net/docs/quickstart" class="cta keep">Install</a>
+      </nav>
     </div>
-    <div class="hero-particles"></div>
-  </div>
-  <div class="wrap">
-    <h1><span class="l"><span class="li">A log-structured</span></span><span class="l"><span class="li">filesystem for S3<span class="dot">.</span></span></span></h1>
-    <p class="lede rv" data-d="550">ZeroFS serves S3-compatible buckets as <strong>POSIX filesystems</strong> over NFS and 9P, or as <strong>raw block devices</strong> over NBD. The engine is <strong>log-structured</strong>: writes go out as immutable objects and compaction reclaims what you delete. Data is compressed and encrypted before upload, and warm reads come from local cache in microseconds.</p>
-    <div class="install rv" data-d="750">
-      <div class="cmd tabbed">
-        <div class="cmd-head">
-          <div class="cmd-tabs" role="tablist" aria-label="Install method">
-            <button type="button" role="tab" aria-selected="true" data-method="apt">apt</button>
-            <button type="button" role="tab" aria-selected="false" data-method="dnf">dnf</button>
-            <button type="button" role="tab" aria-selected="false" data-method="curl">curl</button>
+  </header>
+
+  <main>
+
+    <div class="hero">
+      <div class="hero-scene" aria-hidden="true">
+        <div class="hero-glow"></div>
+        <div class="enso-tilt">
+          <div class="enso-prec">
+            <svg class="hero-enso">
+              <use href="#enso" />
+            </svg>
           </div>
-          <button type="button" class="cmd-copy" id="install-copy" data-copy="">Copy</button>
         </div>
-        <div class="cmd-body" id="install-body"></div>
+        <div class="hero-particles"></div>
       </div>
-      <a class="ghost" href="https://www.zerofs.net/docs/quickstart">
-        <span class="ghost-portal" aria-hidden="true">
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-          <svg><use href="#enso"/></svg>
-        </span>
-        <span class="ghost-noise" aria-hidden="true"></span>
-        <span class="ghost-label"><svg class="ghost-mark" aria-hidden="true"><use href="#enso"/></svg>Quickstart <span class="ghost-arrow">→</span></span>
-      </a>
+      <div class="wrap">
+        <h1><span class="l"><span class="li">A log-structured</span></span><span class="l"><span class="li">filesystem
+              for S3<span class="dot">.</span></span></span></h1>
+        <p class="lede rv" data-d="550">ZeroFS serves S3-compatible buckets as <strong>POSIX filesystems</strong> over
+          NFS and 9P, and as <strong>raw block devices</strong> over NBD. All three servers run in one userspace
+          process. Writes go out as immutable segments, compressed and encrypted before upload. Warm reads come from
+          local cache.</p>
+        <div class="install rv" data-d="750">
+          <div class="cmd tabbed">
+            <div class="cmd-head">
+              <div class="cmd-tabs" role="tablist" aria-label="Install method">
+                <button type="button" role="tab" aria-selected="true" data-method="apt">apt</button>
+                <button type="button" role="tab" aria-selected="false" data-method="dnf">dnf</button>
+                <button type="button" role="tab" aria-selected="false" data-method="curl">curl</button>
+              </div>
+              <button type="button" class="cmd-copy" id="install-copy" data-copy="">Copy</button>
+            </div>
+            <div class="cmd-body" id="install-body"></div>
+          </div>
+          <a class="ghost" href="https://www.zerofs.net/docs/quickstart">
+            <span class="ghost-portal" aria-hidden="true">
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+            </span>
+            <span class="ghost-noise" aria-hidden="true"></span>
+            <span class="ghost-label"><svg class="ghost-mark" aria-hidden="true">
+                <use href="#enso" />
+              </svg>Quickstart <span class="ghost-arrow">→</span></span>
+          </a>
+        </div>
+        <p class="alt-install rv" data-d="950">or via <a href="https://github.com/Barre/ZeroFS#via-docker">Docker</a> ·
+          <a href="https://github.com/Barre/zerofs#github-action">GitHub&nbsp;Action</a> · <a
+            href="https://www.zerofs.net/docs/quickstart#installation">other&nbsp;platforms</a></p>
+      </div>
     </div>
-    <p class="alt-install rv" data-d="950">or via <a href="https://github.com/Barre/ZeroFS#via-docker">Docker</a> · <a href="https://github.com/Barre/zerofs#github-action">GitHub&nbsp;Action</a> · <a href="https://www.zerofs.net/docs/quickstart#installation">other&nbsp;platforms</a></p>
-  </div>
-</div>
 
-<div class="stats">
-  <div class="wrap">
-    <div class="stats-grid">
-      <div class="stat rv"><div class="n"><span data-count="8662" data-sep="1">8,662</span><sup>1</sup></div><div class="d">POSIX suite tests in CI</div></div>
-      <div class="stat rv"><div class="n"><span data-count="1.6" data-dec="1">1.6</span><small>&thinsp;µs</small><sup>2</sup></div><div class="d">Random reads, warm cache</div></div>
-      <div class="stat rv"><div class="n"><span data-count="0.83" data-dec="2">0.83</span><small>&thinsp;ms</small><sup>3</sup></div><div class="d">Mean small-write latency</div></div>
-      <div class="stat rv"><div class="n"><span data-count="16">16</span><small>&thinsp;EiB</small><sup>4</sup></div><div class="d">Maximum filesystem size</div></div>
-    </div>
-    <div class="footnotes">
-      <sup>1</sup> <a href="https://github.com/Barre/pjdfstest_nfs">pjdfstest</a> runs on every change. A few cases needing semantics NFS/9P can't express are excluded; the list is public in the repo.&ensp;
-      <sup>2</sup> SQLite bench, random reads on ZeroFS served from local cache. A raw S3 round-trip is 50–300&thinsp;ms.&ensp;
-      <sup>3</sup> File appends over NFS, <a href="https://www.zerofs.net/docs/zerofs-vs-juicefs">ZeroFS bench suite</a>; data at rest in S3.&ensp;
-      <sup>4</sup> Addressable by design: 64-bit inode and size fields, 32&thinsp;KiB extents.
-    </div>
-  </div>
-</div>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head rv"><span class="idx">01</span><span class="label">Verification</span></div>
-    <h2 class="rv">The test suites run in public CI.</h2>
-    <p class="sec-intro rv">CI runs pjdfstest, xfstests, kernel builds, stress-ng, ZFS scrubs, Jepsen's local-fs suite, and a Jepsen failover suite on every change. The first three run separately over NFS, 9P, and the FUSE client. Each card links to the CI pipeline.</p>
-    <div class="proof-grid">
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>POSIX semantics</h3>
-        <p>The pjdfstest suite runs on every change, once per protocol: permissions, ownership, links, rename behavior. The exclude lists, a few cases per protocol, are published in the repository.</p>
-        <span class="src">pjdfstest workflow →</span>
-      </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>xfstests</h3>
-        <p>The kernel filesystem test suite runs over NFS, 9P, and FUSE in separate workflows. These are the tests ext4 and XFS themselves are validated against.</p>
-        <span class="src">xfstests workflow →</span>
-      </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>ZFS as the end-to-end test</h3>
-        <p>CI builds a ZFS pool on ZeroFS block devices, extracts the Linux kernel source tree onto it, and runs a full scrub. The scrub reports no checksum errors.</p>
-        <span class="src">zfs-test workflow →</span>
-      </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>Kernel builds</h3>
-        <p>CI compiles the Linux kernel on NFS, 9P, and FUSE mounts with <code>make -j$(nproc)</code>. Parallel compilation is the stress test: many processes writing the same tree at once.</p>
-        <span class="src">kernel-compile workflow →</span>
-      </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>stress-ng</h3>
-        <p>Filesystem stressors run against live mounts in CI: access, chdir, chmod, chown, and the rest of the file-handling set, all at once.</p>
-        <span class="src">stress-ng workflow →</span>
-      </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>Model-based checking</h3>
-        <p>Jepsen's local-fs suite drives a 9P mount with random operation histories and checks each against a reference filesystem model. A crash mode kills the server mid-run and verifies the recovered state matches the last fsync.</p>
-        <span class="src">jepsen workflow →</span>
-      </a>
-      <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
-        <h3>Failover under fault injection</h3>
-        <p>A second Jepsen suite runs a leader and standby over MinIO, then kills, restarts, and pauses the leader mid-workload. It confirms every acknowledged write survives the failover and the recovered filesystem stays consistent.</p>
-        <span class="src">jepsen-ha workflow →</span>
-      </a>
-      <a class="proof rv" href="https://asciinema.org/a/728101">
-        <h3>Self-hosting</h3>
-        <p>The Rust toolchain builds ZeroFS on a filesystem that ZeroFS itself is serving. This one is a recorded session rather than a CI job.</p>
-        <span class="src">watch the recording →</span>
-      </a>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head rv"><span class="idx">02</span><span class="label">Protocols</span></div>
-    <h2 class="rv">Files over NFS and 9P, block&nbsp;devices over NBD.</h2>
-    <p class="sec-intro rv">All three servers run in one userspace process against the same bucket. Clients mount it with the NFS and 9P support already in Linux, the NFS clients other systems ship, or <code>nbd-client</code> for block devices.</p>
-    <div class="flow rv" aria-hidden="true">
-      <svg class="flow-d" viewBox="0 0 920 240"><defs><filter id="glowD" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
-        <path id="w-nfs" class="wire" d="M150,48 C280,48 310,120 392,120"/>
-        <path id="w-9p" class="wire" d="M150,120 L392,120"/>
-        <path id="w-nbd" class="wire" d="M150,192 C280,192 310,120 392,120"/>
-        <path id="w-out" class="wire" d="M548,120 L772,120"/>
-        <rect class="node" x="40" y="26" width="110" height="44" rx="10"/>
-        <text class="nodelabel" x="95" y="53" text-anchor="middle">NFS</text>
-        <rect class="node" x="40" y="98" width="110" height="44" rx="10"/>
-        <text class="nodelabel" x="95" y="125" text-anchor="middle">9P</text>
-        <rect class="node" x="40" y="170" width="110" height="44" rx="10"/>
-        <text class="nodelabel" x="95" y="197" text-anchor="middle">NBD</text>
-        <g class="recv recv-zfs">
-          <rect class="node" x="392" y="86" width="156" height="68" rx="14"/>
-          <g transform="translate(414, 106)" color="#f4f3ef"><use href="#enso" width="28" height="28"/></g>
-          <g color="#f4f3ef"><use href="#wordmark" x="452" y="112" width="76" height="16.4"/></g>
-          <rect class="pulse" x="392" y="86" width="156" height="68" rx="14" fill="none" stroke="#4d9fff" stroke-width="1.5" opacity="0" filter="url(#glowD)" pointer-events="none"><animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s" begin="dA1.repeatEvent;dA2.repeatEvent;dA3.repeatEvent"/></rect>
-        </g>
-        <g class="recv recv-s3">
-          <rect class="node" x="772" y="98" width="110" height="44" rx="10"/>
-          <text class="nodelabel" x="827" y="125" text-anchor="middle">S3</text>
-          <rect class="pulse" x="772" y="98" width="110" height="44" rx="10" fill="none" stroke="#4d9fff" stroke-width="1.5" opacity="0" filter="url(#glowD)" pointer-events="none"><animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s" begin="dA4.repeatEvent;dA5.repeatEvent"/></rect>
-        </g>
-        <text class="wirelabel" x="660" y="108" text-anchor="middle">ENCRYPTED OBJECTS</text>
-        <g class="pulse" fill="#4d9fff">
-          <circle r="6" opacity="0.22"><animateMotion dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#w-nfs"/></animateMotion></circle>
-          <circle r="2.5"><animateMotion id="dA1" dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#w-nfs"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.8s" fill="freeze"/><animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite"><mpath href="#w-9p"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.8s" fill="freeze"/><animateMotion id="dA2" dur="2.4s" begin="0.8s" repeatCount="indefinite"><mpath href="#w-9p"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.6s" fill="freeze"/><animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite"><mpath href="#w-nbd"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.6s" fill="freeze"/><animateMotion id="dA3" dur="2.4s" begin="1.6s" repeatCount="indefinite"><mpath href="#w-nbd"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.4s" fill="freeze"/><animateMotion dur="1.8s" begin="0.4s" repeatCount="indefinite"><mpath href="#w-out"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.4s" fill="freeze"/><animateMotion id="dA4" dur="1.8s" begin="0.4s" repeatCount="indefinite"><mpath href="#w-out"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.3s" fill="freeze"/><animateMotion dur="1.8s" begin="1.3s" repeatCount="indefinite"><mpath href="#w-out"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.3s" fill="freeze"/><animateMotion id="dA5" dur="1.8s" begin="1.3s" repeatCount="indefinite"><mpath href="#w-out"/></animateMotion></circle>
-        </g>
-      </svg>
-      <svg class="flow-m" viewBox="0 0 360 490"><defs><filter id="glowM" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
-        <path id="m-nfs" class="wire" d="M60,64 C60,150 110,170 168,210"/>
-        <path id="m-9p" class="wire" d="M180,64 L180,210"/>
-        <path id="m-nbd" class="wire" d="M300,64 C300,150 250,170 192,210"/>
-        <path id="m-out" class="wire" d="M180,278 L180,420"/>
-        <rect class="node" x="10" y="20" width="100" height="44" rx="10"/>
-        <text class="nodelabel" x="60" y="47" text-anchor="middle">NFS</text>
-        <rect class="node" x="130" y="20" width="100" height="44" rx="10"/>
-        <text class="nodelabel" x="180" y="47" text-anchor="middle">9P</text>
-        <rect class="node" x="250" y="20" width="100" height="44" rx="10"/>
-        <text class="nodelabel" x="300" y="47" text-anchor="middle">NBD</text>
-        <g class="recv recv-zfs">
-          <rect class="node" x="102" y="210" width="156" height="68" rx="14"/>
-          <g transform="translate(124, 230)" color="#f4f3ef"><use href="#enso" width="28" height="28"/></g>
-          <g color="#f4f3ef"><use href="#wordmark" x="162" y="236" width="76" height="16.4"/></g>
-          <rect class="pulse" x="102" y="210" width="156" height="68" rx="14" fill="none" stroke="#4d9fff" stroke-width="1.5" opacity="0" filter="url(#glowM)" pointer-events="none"><animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s" begin="mA1.repeatEvent;mA2.repeatEvent;mA3.repeatEvent"/></rect>
-        </g>
-        <g class="recv recv-s3">
-          <rect class="node" x="125" y="420" width="110" height="44" rx="10"/>
-          <text class="nodelabel" x="180" y="447" text-anchor="middle">S3</text>
-          <rect class="pulse" x="125" y="420" width="110" height="44" rx="10" fill="none" stroke="#4d9fff" stroke-width="1.5" opacity="0" filter="url(#glowM)" pointer-events="none"><animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s" begin="mA4.repeatEvent;mA5.repeatEvent"/></rect>
-        </g>
-        <text class="wirelabel" x="194" y="352">ENCRYPTED OBJECTS</text>
-        <g class="pulse" fill="#4d9fff">
-          <circle r="6" opacity="0.22"><animateMotion dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#m-nfs"/></animateMotion></circle>
-          <circle r="2.5"><animateMotion id="mA1" dur="2.4s" begin="0s" repeatCount="indefinite"><mpath href="#m-nfs"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.8s" fill="freeze"/><animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite"><mpath href="#m-9p"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.8s" fill="freeze"/><animateMotion id="mA2" dur="2.4s" begin="0.8s" repeatCount="indefinite"><mpath href="#m-9p"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.6s" fill="freeze"/><animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite"><mpath href="#m-nbd"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.6s" fill="freeze"/><animateMotion id="mA3" dur="2.4s" begin="1.6s" repeatCount="indefinite"><mpath href="#m-nbd"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.4s" fill="freeze"/><animateMotion dur="1.8s" begin="0.4s" repeatCount="indefinite"><mpath href="#m-out"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="0.4s" fill="freeze"/><animateMotion id="mA4" dur="1.8s" begin="0.4s" repeatCount="indefinite"><mpath href="#m-out"/></animateMotion></circle>
-          <circle r="6" opacity="0.22" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.3s" fill="freeze"/><animateMotion dur="1.8s" begin="1.3s" repeatCount="indefinite"><mpath href="#m-out"/></animateMotion></circle>
-          <circle r="2.5" visibility="hidden"><set attributeName="visibility" to="visible" begin="1.3s" fill="freeze"/><animateMotion id="mA5" dur="1.8s" begin="1.3s" repeatCount="indefinite"><mpath href="#m-out"/></animateMotion></circle>
-        </g>
-      </svg>
-    </div>
-    <div class="proto-grid">
-      <div class="proto rv">
-        <span class="tag">File · everywhere</span>
-        <h3>NFS</h3>
-        <p>macOS, Linux, Windows, and the BSDs mount it over their own NFS support, with nothing extra installed on the client. The server stays in userspace.</p>
-        <pre><span class="c"># mounts from any major OS</span>
+    <section>
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">01</span><span class="label">Protocols</span></div>
+        <h2 class="rv">Files over NFS and 9P, block&nbsp;devices over NBD.</h2>
+        <p class="sec-intro rv">The three servers share one process and one bucket. Clients connect with the NFS and 9P
+          support already in the kernel, ZeroFS' own client or <code style="white-space: nowrap">nbd-client</code>.</p>
+        <div class="flow rv" aria-hidden="true">
+          <svg class="flow-d" viewBox="0 0 920 240">
+            <defs>
+              <filter id="glowD" x="-40%" y="-40%" width="180%" height="180%">
+                <feGaussianBlur stdDeviation="2.5" result="b" />
+                <feMerge>
+                  <feMergeNode in="b" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+            <path id="w-nfs" class="wire" d="M150,48 C280,48 310,120 392,120" />
+            <path id="w-9p" class="wire" d="M150,120 L392,120" />
+            <path id="w-nbd" class="wire" d="M150,192 C280,192 310,120 392,120" />
+            <path id="w-out" class="wire" d="M548,120 L772,120" />
+            <rect class="node" x="40" y="26" width="110" height="44" rx="10" />
+            <text class="nodelabel" x="95" y="53" text-anchor="middle">NFS</text>
+            <rect class="node" x="40" y="98" width="110" height="44" rx="10" />
+            <text class="nodelabel" x="95" y="125" text-anchor="middle">9P</text>
+            <rect class="node" x="40" y="170" width="110" height="44" rx="10" />
+            <text class="nodelabel" x="95" y="197" text-anchor="middle">NBD</text>
+            <g class="recv recv-zfs">
+              <rect class="node" x="392" y="86" width="156" height="68" rx="14" />
+              <g transform="translate(414, 106)" color="#f4f3ef">
+                <use href="#enso" width="28" height="28" />
+              </g>
+              <g color="#f4f3ef">
+                <use href="#wordmark" x="452" y="112" width="76" height="16.4" />
+              </g>
+              <rect class="pulse" x="392" y="86" width="156" height="68" rx="14" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowD)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="dA1.repeatEvent;dA2.repeatEvent;dA3.repeatEvent" />
+              </rect>
+            </g>
+            <g class="recv recv-s3">
+              <rect class="node" x="772" y="98" width="110" height="44" rx="10" />
+              <text class="nodelabel" x="827" y="125" text-anchor="middle">S3</text>
+              <rect class="pulse" x="772" y="98" width="110" height="44" rx="10" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowD)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="dA4.repeatEvent;dA5.repeatEvent" />
+              </rect>
+            </g>
+            <text class="wirelabel" x="660" y="108" text-anchor="middle">ENCRYPTED OBJECTS</text>
+            <g class="pulse" fill="#4d9fff">
+              <circle r="6" opacity="0.22">
+                <animateMotion dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#w-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5">
+                <animateMotion id="dA1" dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#w-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#w-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion id="dA2" dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#w-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#w-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion id="dA3" dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#w-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion id="dA4" dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion id="dA5" dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+            </g>
+          </svg>
+          <svg class="flow-m" viewBox="0 0 360 490">
+            <defs>
+              <filter id="glowM" x="-40%" y="-40%" width="180%" height="180%">
+                <feGaussianBlur stdDeviation="2.5" result="b" />
+                <feMerge>
+                  <feMergeNode in="b" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+            <path id="m-nfs" class="wire" d="M60,64 C60,150 110,170 168,210" />
+            <path id="m-9p" class="wire" d="M180,64 L180,210" />
+            <path id="m-nbd" class="wire" d="M300,64 C300,150 250,170 192,210" />
+            <path id="m-out" class="wire" d="M180,278 L180,420" />
+            <rect class="node" x="10" y="20" width="100" height="44" rx="10" />
+            <text class="nodelabel" x="60" y="47" text-anchor="middle">NFS</text>
+            <rect class="node" x="130" y="20" width="100" height="44" rx="10" />
+            <text class="nodelabel" x="180" y="47" text-anchor="middle">9P</text>
+            <rect class="node" x="250" y="20" width="100" height="44" rx="10" />
+            <text class="nodelabel" x="300" y="47" text-anchor="middle">NBD</text>
+            <g class="recv recv-zfs">
+              <rect class="node" x="102" y="210" width="156" height="68" rx="14" />
+              <g transform="translate(124, 230)" color="#f4f3ef">
+                <use href="#enso" width="28" height="28" />
+              </g>
+              <g color="#f4f3ef">
+                <use href="#wordmark" x="162" y="236" width="76" height="16.4" />
+              </g>
+              <rect class="pulse" x="102" y="210" width="156" height="68" rx="14" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowM)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="mA1.repeatEvent;mA2.repeatEvent;mA3.repeatEvent" />
+              </rect>
+            </g>
+            <g class="recv recv-s3">
+              <rect class="node" x="125" y="420" width="110" height="44" rx="10" />
+              <text class="nodelabel" x="180" y="447" text-anchor="middle">S3</text>
+              <rect class="pulse" x="125" y="420" width="110" height="44" rx="10" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowM)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="mA4.repeatEvent;mA5.repeatEvent" />
+              </rect>
+            </g>
+            <text class="wirelabel" x="194" y="352">ENCRYPTED OBJECTS</text>
+            <g class="pulse" fill="#4d9fff">
+              <circle r="6" opacity="0.22">
+                <animateMotion dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#m-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5">
+                <animateMotion id="mA1" dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#m-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#m-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion id="mA2" dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#m-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#m-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion id="mA3" dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#m-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion id="mA4" dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion id="mA5" dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+            </g>
+          </svg>
+        </div>
+        <div class="proto-grid">
+          <div class="proto rv">
+            <h3>NFS</h3>
+            <p>macOS, Linux, Windows, and the BSDs mount it with the NFS clients they ship. NFS COMMIT semantics let
+              fsync return before data reaches S3; use a 9P mount where fsync durability matters.</p>
+            <pre><span class="c"># mounts from any major OS</span>
 mount -t nfs 127.0.0.1:/ /mnt/zerofs</pre>
-      </div>
-      <div class="proto rv">
-        <span class="tag">File · precise</span>
-        <h3>9P</h3>
-        <p>9P follows POSIX more closely than NFS, and fsync returns only after data reaches stable storage. The bundled FUSE client mounts without root and reconnects on its own.</p>
-        <pre><span class="c"># bundled FUSE client, no root</span>
+          </div>
+          <div class="proto rv">
+            <h3>9P</h3>
+            <p>fsync returns only after data reaches stable storage. The bundled FUSE client, <code>zerofs mount</code>,
+              mounts without root and reconnects on its own; it is the recommended Linux mount.</p>
+            <pre><span class="c"># bundled FUSE client, no root</span>
 zerofs mount 127.0.0.1:5564 /mnt/zerofs</pre>
-      </div>
-      <div class="proto rv">
-        <span class="tag">Block · raw</span>
-        <h3>NBD</h3>
-        <p>Raw block devices stored in the bucket hold ext4 filesystems, ZFS pools, or VM boot disks. New devices are picked up at runtime, with no server restart.</p>
-        <pre><span class="c"># attach a block device</span>
+          </div>
+          <div class="proto rv">
+            <h3>NBD</h3>
+            <p>Device files in a <code>.nbd</code> directory attach as raw block devices; ZFS pools and VM boot disks
+              run on them. FLUSH and FUA replies return only after data is durable, so write barriers hold.</p>
+            <pre><span class="c"># attach a block device</span>
 nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
+          </div>
+        </div>
+        <div class="backends rv">
+          <b>Runs on</b><span>Amazon S3</span><span>Google Cloud Storage</span><span>Azure Blob</span><span>Any
+            S3-compatible store</span><span>local disk</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">02</span><span class="label">Testing</span></div>
+        <h2 class="rv">How ZeroFS is tested.</h2>
+        <div class="proof-grid">
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>POSIX semantics</h3>
+            <p>8,662 pjdfstest cases: permissions, ownership, links, rename behavior. A few cases per protocol are
+              excluded where NFS or 9P can't express the semantics (or where we decided to make tradeoffs).
+            </p>
+            <span class="src">pjdfstest workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>xfstests</h3>
+            <p>A standard filesystems test suite.</p>
+            <span class="src">xfstests workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>Kernel builds</h3>
+            <p>The Linux kernel compiles with <code>make -j$(nproc)</code> on NFS, 9P, and FUSE mounts. A parallel build
+              keeps many processes writing the same tree at once.</p>
+            <span class="src">kernel-compile workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>stress-ng</h3>
+            <p>file-handling stressors run concurrently against live NFS, 9P, and FUSE mounts: dentry churn, deep and
+              wide directories, rename, metamix, utime, and more.</p>
+            <span class="src">stress-ng workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>ZFS pool and scrub</h3>
+            <p>CI creates a ZFS pool on ZeroFS block devices, extracts the Linux kernel source onto it, and runs a
+              scrub.</p>
+            <span class="src">zfs-test workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>Jepsen local-fs and HA</h3>
+            <p>The local-fs suite drives a 9P mount with random operation histories checked against a reference model,
+              with a crash mode. The HA suite kills and pauses a leader/standby pair over a local S3 server.</p>
+            <span class="src">jepsen workflows →</span>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section class="term-sec">
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">03</span><span class="label">Geo-distribution</span></div>
+        <h2 class="rv">A ZFS mirror across three S3 regions.</h2>
+        <p class="sec-intro rv">Each instance exposes one region's bucket as a block device; to ZFS they are plain
+          disks.</p>
+        <div class="term rv" role="img" aria-label="Terminal session creating a geo-distributed ZFS pool">
+          <div class="titlebar"><i></i><i></i><i></i><span>global-pool — zsh</span></div>
+          <div class="body">
+            <div><span class="ps1">$</span> nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist <span class="c">#
+                us-east</span></div>
+            <div><span class="ps1">$</span> nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist <span class="c">#
+                eu-west</span></div>
+            <div><span class="ps1">$</span> nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist <span class="c">#
+                ap-southeast</span></div>
+            <div><span class="ps1">$</span> zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2</div>
+            <div><span class="ps1">$</span> zpool status global-pool | grep state</div>
+            <div class="out">&nbsp;state: <span class="ok">ONLINE</span></div>
+          </div>
+        </div>
+        <p class="term-caption rv">When a region is unreachable, <b>the pool degrades and stays online.</b> ZFS
+          resilvers the member when it returns.</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">04</span><span class="label">Engine</span></div>
+        <h2 class="rv">The storage engine.</h2>
+        <div class="feat-grid">
+          <div class="feat rv">
+            <h3>Immutable segments</h3>
+            <p>File data is split into 32&thinsp;KiB extents and packed into immutable segment objects of up to
+              256&thinsp;MiB.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Encryption</h3>
+            <p>XChaCha20-Poly1305 on every extent before upload. The data key is wrapped
+              by a key derived from the password with Argon2id.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Compression</h3>
+            <p>zstd or lz4, applied before encryption. The codec can change at any time without migration; existing
+              data's codec is detected on read.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Caching</h3>
+            <p>Memory and disk tiers hold recently read and written data.</p>
+          </div>
+          <div class="feat rv">
+            <h3>TRIM</h3>
+            <p>TRIM is supported and eventually translates to a reclamation of physical S3 objects.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Checkpoints</h3>
+            <p>Named point-in-time checkpoints. Any checkpoint opens read-only.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Read replicas</h3>
+            <p>One writer, any number of read-only instances against the same bucket. Replicas follow the writer's
+              changes and return EROFS on write.</p>
+          </div>
+          <div class="feat rv">
+            <h3>fsync and failover</h3>
+            <p>Over 9P and NBD, a successful fsync means data is committed to the object store. An optional standby
+              holds acked-but-unflushed writes and takes over in seconds.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="casts">
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">05</span><span class="label">Recordings</span></div>
+        <h2 class="rv">Terminal session recordings.</h2>
+        <div class="tabs rv" role="tablist" aria-label="Demo recordings">
+          <button role="tab" aria-selected="true" data-cast="730946">Kernel build</button>
+          <button role="tab" aria-selected="false" data-cast="728234">ZFS on S3</button>
+          <button role="tab" aria-selected="false" data-cast="728172">Ubuntu boot</button>
+          <button role="tab" aria-selected="false" data-cast="728101">Self-hosting</button>
+        </div>
+        <div class="term cast-frame rv">
+          <div class="titlebar"><i></i><i></i><i></i><span id="cast-title">kernel-build — asciinema</span></div>
+          <div class="body">
+            <div id="cast-player"></div>
+          </div>
+        </div>
+            <p class="shot-caption rv" id="cast-caption"><b>The Linux kernel compiles in 16 seconds</b> on ZFS over a ZeroFS NBD
+              volume.</p>
+            </div
+      </div>
+    </section>
+
+    <section class="shots">
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">06</span><span class="label">Web UI</span></div>
+        <h2 class="rv">One config section adds a web console.</h2>
+        <div class="tabs rv" role="tablist" aria-label="Web UI screenshots">
+          <button role="tab" aria-selected="true" data-shot="files">File manager</button>
+          <button role="tab" aria-selected="false" data-shot="dash">Dashboard</button>
+          <button role="tab" aria-selected="false" data-shot="term">Terminal</button>
+        </div>
+        <div class="browser rv">
+          <div class="chrome"><i></i><i></i><i></i><span class="url">127.0.0.1:8080</span></div>
+          <div class="view">
+            <img id="shot-files" class="active" src="assets/webui_file_manager.webp"
+              alt="ZeroFS web file manager browsing the Linux 6.17 source tree with an inline file preview">
+            <img id="shot-dash" src="assets/webui_dashboard.webp"
+              alt="ZeroFS dashboard with live throughput, IOPS, operation counters, and garbage-collection stats"
+              loading="lazy">
+            <img id="shot-term" src="assets/webui_terminal.webp"
+              alt="Linux VM booting in the browser with its root filesystem mounted from ZeroFS" loading="lazy">
+          </div>
+        </div>
+        <p class="shot-caption rv" id="shot-caption"><b>The file manager speaks 9P over WebSocket.</b> Drag-and-drop
+          uploads work, including entire folders.</p>
+      </div>
+    </section>
+
+    <div class="closer">
+      <div class="wrap">
+        <svg class="rv" aria-hidden="true">
+          <use href="#enso" />
+        </svg>
       </div>
     </div>
-    <div class="backends rv">
-      <b>Runs on</b><span>Amazon S3</span><span>Google Cloud Storage</span><span>Azure Blob</span><span>Any S3-compatible store</span><span>local disk</span>
+
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <span>ZeroFS — dual-licensed <a href="https://www.zerofs.net/docs/licensing">AGPL-3.0 / commercial</a></span>
+      <span><a href="https://github.com/Barre/ZeroFS">GitHub</a> · <a
+          href="https://www.zerofs.net">zerofs.net</a></span>
     </div>
-  </div>
-</section>
+  </footer>
 
-<section class="term-sec">
-  <div class="wrap">
-    <div class="sec-head rv"><span class="idx">03</span><span class="label">Geo-distribution</span></div>
-    <h2 class="rv">A ZFS mirror across three S3 regions.</h2>
-    <p class="sec-intro rv">Each ZeroFS instance exposes one S3 region as a block device. To ZFS they are plain disks, so a mirror that spans continents is set up like any other pool.</p>
-    <div class="term rv" role="img" aria-label="Terminal session creating a geo-distributed ZFS pool">
-      <div class="titlebar"><i></i><i></i><i></i><span>global-pool — zsh</span></div>
-      <div class="body">
-        <div><span class="ps1">$</span> nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist  <span class="c"># us-east</span></div>
-        <div><span class="ps1">$</span> nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist  <span class="c"># eu-west</span></div>
-        <div><span class="ps1">$</span> nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist  <span class="c"># ap-southeast</span></div>
-        <div><span class="ps1">$</span> zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2</div>
-        <div><span class="ps1">$</span> zpool status global-pool | grep state</div>
-        <div class="out">&nbsp;state: <span class="ok">ONLINE</span></div>
-      </div>
-    </div>
-    <p class="term-caption rv">If a region becomes unreachable, the pool degrades and <b>the data stays available from the other two.</b></p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head rv"><span class="idx">04</span><span class="label">Capabilities</span></div>
-    <h2 class="rv">Nine properties of the storage engine.</h2>
-    <div class="feat-grid">
-      <div class="feat rv"><span class="num">04.1</span><h3>Always encrypted</h3><p>Every block is encrypted with XChaCha20-Poly1305 before upload. The data key is wrapped with a key derived from your password using Argon2id. There is no unencrypted mode.</p></div>
-      <div class="feat rv"><span class="num">04.2</span><h3>Compression</h3><p>Data is compressed with zstd or lz4 before encryption. The codec can change at any time without migration, since the codec of existing data is detected on read.</p></div>
-      <div class="feat rv"><span class="num">04.3</span><h3>Caching</h3><p>Configurable memory and disk caches hold recently used blocks. Warm reads return in microseconds. A raw S3 round trip takes 50 to 300 milliseconds.</p></div>
-      <div class="feat rv"><span class="num">04.4</span><h3>Checkpoints</h3><p>Named checkpoints capture the filesystem at a point in time. Any of them can be opened read-only with a single flag at startup.</p></div>
-      <div class="feat rv"><span class="num">04.5</span><h3>Read replicas</h3><p>One instance writes while read-only instances serve the same bucket. Replicas pick up the writer's changes automatically and return EROFS on writes.</p></div>
-      <div class="feat rv"><span class="num">04.6</span><h3>TRIM support</h3><p>Discard from any filesystem or zpool frees the corresponding extents. Compaction repacks the live data and deletes the emptied segments from S3, so freed blocks come off the bill.</p></div>
-      <div class="feat rv"><span class="num">04.7</span><h3>Immutable segments</h3><p>File data is packed into 32&thinsp;KiB extents inside immutable segment objects, addressed by a separate metadata index. Nothing is rewritten in place, so checkpoints and read replicas see a consistent view of the bucket.</p></div>
-      <div class="feat rv"><span class="num">04.8</span><h3>Honest fsync</h3><p>A successful fsync means every acknowledged write is durable in S3. If a failover may have lost unflushed writes, the next fsync returns an error instead of a false success.</p></div>
-      <div class="feat rv"><span class="num">04.9</span><h3>High availability</h3><p>An optional standby tracks the leader over the same bucket and takes over automatically when the leader fails. While the two are connected, the standby also holds writes the leader has acknowledged but not yet flushed, so a failover preserves them.</p></div>
-    </div>
-  </div>
-</section>
-
-<section class="shots">
-  <div class="wrap">
-    <div class="sec-head rv"><span class="idx">05</span><span class="label">Web UI</span></div>
-    <h2 class="rv">One config section adds a web console.</h2>
-    <p class="sec-intro rv">Enable <code>[servers.webui]</code> and the same process serves a console: a file manager running 9P over WebSocket, a dashboard streaming stats over gRPC-web, and a terminal that boots a Linux VM rooted on the mount.</p>
-    <div class="tabs rv" role="tablist" aria-label="Web UI screenshots">
-      <button role="tab" aria-selected="true" data-shot="files">File manager</button>
-      <button role="tab" aria-selected="false" data-shot="dash">Dashboard</button>
-      <button role="tab" aria-selected="false" data-shot="term">Terminal</button>
-    </div>
-    <div class="browser rv">
-      <div class="chrome"><i></i><i></i><i></i><span class="url">127.0.0.1:8080</span></div>
-      <div class="view">
-        <img id="shot-files" class="active" src="assets/webui_file_manager.webp" alt="ZeroFS web file manager browsing the Linux 6.17 source tree with an inline file preview">
-        <img id="shot-dash" src="assets/webui_dashboard.webp" alt="ZeroFS dashboard with live throughput, IOPS, operation counters, and garbage-collection stats" loading="lazy">
-        <img id="shot-term" src="assets/webui_terminal.webp" alt="Linux VM booting in the browser with its root filesystem mounted from ZeroFS" loading="lazy">
-      </div>
-    </div>
-    <p class="shot-caption rv" id="shot-caption"><b>Drag-and-drop uploads</b> work for files and entire folders, written to the bucket over 9P.</p>
-  </div>
-</section>
-
-<section class="casts">
-  <div class="wrap">
-    <div class="sec-head rv"><span class="idx">06</span><span class="label">Recordings</span></div>
-    <h2 class="rv">Four recorded terminal sessions.</h2>
-    <p class="sec-intro rv">These are asciinema recordings of real terminal sessions, rendered as text rather than video. Playback caps idle pauses at two seconds and changes nothing else.</p>
-    <div class="tabs rv" role="tablist" aria-label="Demo recordings">
-      <button role="tab" aria-selected="true" data-cast="730946">Kernel build</button>
-      <button role="tab" aria-selected="false" data-cast="728234">ZFS on S3</button>
-      <button role="tab" aria-selected="false" data-cast="728172">Ubuntu boot</button>
-      <button role="tab" aria-selected="false" data-cast="728101">Self-hosting</button>
-    </div>
-    <div class="term cast-frame rv">
-      <div class="titlebar"><i></i><i></i><i></i><span id="cast-title">kernel-build — asciinema</span></div>
-      <div class="body"><div id="cast-player"></div></div>
-    </div>
-    <p class="shot-caption rv" id="cast-caption"><b>The Linux kernel compiles in 16 seconds</b> on ZFS over a ZeroFS NBD volume.</p>
-  </div>
-</section>
-
-<div class="closer">
-  <div class="wrap">
-    <svg class="rv" aria-hidden="true"><use href="#enso"/></svg>
-    <h2 class="rv">It's a filesystem. It just happens to live in S3.</h2>
-    <div class="install rv">
-      <div class="cmd">
-        <span class="ps1">$</span>
-        <span>curl -sSfL https://sh.zerofs.net | sh</span>
-        <button type="button" data-copy="curl -sSfL https://sh.zerofs.net | sh">Copy</button>
-      </div>
-    </div>
-    <p class="links rv">
-      <a href="https://www.zerofs.net/docs/quickstart">Quickstart</a>
-      <a href="https://www.zerofs.net/docs">Documentation</a>
-      <a href="https://github.com/Barre/ZeroFS">Source</a>
-    </p>
-  </div>
-</div>
-
-</main>
-
-<footer>
-  <div class="wrap">
-    <span>ZeroFS — dual-licensed <a href="https://www.zerofs.net/docs/licensing">AGPL-3.0 / commercial</a></span>
-    <span><a href="https://github.com/Barre/ZeroFS">GitHub</a> · <a href="https://www.zerofs.net">zerofs.net</a></span>
-  </div>
-</footer>
-
-<script>
-document.querySelectorAll("[data-copy]").forEach(btn => {
-  btn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(btn.dataset.copy);
-      const t = btn.textContent; btn.textContent = "Copied";
-      setTimeout(() => { btn.textContent = t; }, 1400);
-    } catch {}
-  });
-});
-
-const INSTALL = {
-  apt: [
-    "curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg",
-    'echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list',
-    "sudo apt update && sudo apt install zerofs",
-  ],
-  dnf: [
-    "curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo",
-    "sudo dnf install zerofs",
-  ],
-  curl: ["curl -sSfL https://sh.zerofs.net | sh"],
-};
-const instBody = document.getElementById("install-body");
-const instCopy = document.getElementById("install-copy");
-const instTabs = document.querySelectorAll(".cmd-tabs button");
-function renderInstall(method) {
-  const lines = INSTALL[method];
-  instBody.replaceChildren(...lines.map(line => {
-    const row = document.createElement("div");
-    row.className = "line";
-    const ps1 = document.createElement("span");
-    ps1.className = "ps1"; ps1.textContent = "$";
-    const txt = document.createElement("span");
-    txt.textContent = line;
-    row.append(ps1, txt);
-    return row;
-  }));
-  instCopy.dataset.copy = lines.join("\n");
-}
-instTabs.forEach(tab => {
-  tab.addEventListener("click", () => {
-    instTabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
-    renderInstall(tab.dataset.method);
-  });
-});
-renderInstall("apt");
-const captions = {
-  files: "<b>Drag-and-drop uploads</b> work for files and entire folders, written to the bucket over 9P.",
-  dash: "<b>Throughput, IOPS, storage usage, and GC counters</b> stream over gRPC-web, updated once a second.",
-  term: "<b>The v86 VM's root filesystem</b> is the ZeroFS instance, mounted over the same 9P WebSocket.",
-};
-const tabs = document.querySelectorAll(".shots .tabs button");
-tabs.forEach(tab => {
-  tab.addEventListener("click", () => {
-    tabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
-    document.querySelectorAll(".browser .view img").forEach(img =>
-      img.classList.toggle("active", img.id === `shot-${tab.dataset.shot}`));
-    document.getElementById("shot-caption").innerHTML = captions[tab.dataset.shot];
-  });
-});
-const io = new IntersectionObserver(entries => {
-  for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
-}, { rootMargin: "0px 0px -8% 0px" });
-document.querySelectorAll(".rv").forEach((el, i) => {
-  el.style.transitionDelay = el.dataset.d ? `${el.dataset.d}ms` : `${Math.min((i % 6) * 70, 350)}ms`;
-  io.observe(el);
-  // the observer's -8% bottom margin strands hero content in the viewport's bottom
-  // strip (e.g. the alt-install line) until the first scroll; reveal what's already on screen
-  if (el.getBoundingClientRect().top < innerHeight) el.classList.add("in");
-});
-
-// asciinema recordings — player lib loads only when the section nears the viewport
-const CASTS = {
-  "730946": ["kernel-build — asciinema", "<b>The Linux kernel compiles in 16 seconds</b> on ZFS over a ZeroFS NBD volume."],
-  "728234": ["zfs-on-s3 — asciinema", "<b>A ZFS pool created directly on ZeroFS block devices</b>, with no intermediate filesystem."],
-  "728172": ["ubuntu-boot — asciinema", "<b>An Ubuntu system boots</b> with its root filesystem served by ZeroFS."],
-  "728101": ["self-hosting — asciinema", "<b>ZeroFS compiling ZeroFS</b>, with the Rust toolchain running on the mount."],
-};
-let castPlayer = null, castLib = null;
-function loadCastLib() {
-  if (castLib) return castLib;
-  const css = document.createElement("link");
-  css.rel = "stylesheet";
-  css.href = "https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.css";
-  document.head.appendChild(css);
-  castLib = new Promise(resolve => {
-    const s = document.createElement("script");
-    s.src = "https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.js";
-    s.onload = resolve;
-    document.head.appendChild(s);
-  });
-  return castLib;
-}
-function showCast(id) {
-  document.getElementById("cast-title").textContent = CASTS[id][0];
-  document.getElementById("cast-caption").innerHTML = CASTS[id][1];
-  loadCastLib().then(() => {
-    if (castPlayer) castPlayer.dispose();
-    castPlayer = AsciinemaPlayer.create(
-      `https://asciinema.org/a/${id}.cast`,
-      document.getElementById("cast-player"),
-      { fit: "width", poster: "npt:0:03", idleTimeLimit: 2, preload: true,
-        terminalFontFamily: '"Geist Mono", monospace' }
-    );
-  });
-}
-const castTabs = document.querySelectorAll(".casts .tabs button");
-castTabs.forEach(tab => {
-  tab.addEventListener("click", () => {
-    castTabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
-    showCast(tab.dataset.cast);
-  });
-});
-const castIO = new IntersectionObserver(entries => {
-  if (!entries.some(e => e.isIntersecting)) return;
-  castIO.disconnect();
-  showCast(document.querySelector('.casts .tabs button[aria-selected="true"]').dataset.cast);
-}, { rootMargin: "1800px 0px" });
-castIO.observe(document.querySelector(".casts"));
-
-// GitHub star count, cached for a day
-(async () => {
-  const el = document.getElementById("gh-stars");
-  const fmt = n => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
-  try {
-    const cached = JSON.parse(localStorage.getItem("gh-stars") || "null");
-    if (cached && Date.now() - cached.t < 864e5) { el.textContent = fmt(cached.n); return; }
-    const r = await fetch("https://api.github.com/repos/Barre/ZeroFS");
-    if (!r.ok) return;
-    const n = (await r.json()).stargazers_count;
-    if (typeof n === "number") {
-      el.textContent = fmt(n);
-      localStorage.setItem("gh-stars", JSON.stringify({ n, t: Date.now() }));
-    }
-  } catch {}
-})();
-
-// header gains a solid background once scrolled past the top
-const hdr = document.querySelector("header");
-const onScroll = () => hdr.classList.toggle("scrolled", scrollY > 24);
-onScroll();
-addEventListener("scroll", onScroll, { passive: true });
-
-// segmented-control glider for tab groups
-document.querySelectorAll(".tabs").forEach(group => {
-  const glider = document.createElement("span");
-  glider.className = "glider";
-  glider.setAttribute("aria-hidden", "true");
-  group.prepend(glider);
-  const move = () => {
-    const active = group.querySelector('button[aria-selected="true"]');
-    if (!active) return;
-    glider.style.width = `${active.offsetWidth}px`;
-    glider.style.transform = `translateX(${active.offsetLeft}px)`;
-  };
-  move();
-  requestAnimationFrame(() => group.classList.add("gliding"));
-  group.addEventListener("click", e => { if (e.target.closest("button")) move(); });
-  window.addEventListener("resize", move);
-  document.fonts?.ready.then(move);
-});
-
-const motionOK = !matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-// hero depth: cursor parallax + scroll recede
-if (motionOK) {
-  const hero = document.querySelector(".hero");
-  const scene = document.querySelector(".hero-scene");
-  const layers = [[".hero-glow", 10], [".enso-tilt", 16], [".hero-particles", 26]]
-    .map(([s, d]) => [scene.querySelector(s), d]);
-  let tx = 0, ty = 0, cx = 0, cy = 0, raf = 0;
-  const tiltEl = scene.querySelector(".enso-tilt");
-  const step = () => {
-    cx += (tx - cx) * 0.06; cy += (ty - cy) * 0.06;
-    for (const [el, d] of layers)
-      el.style.translate = `${(-cx * d).toFixed(2)}px ${(-cy * d).toFixed(2)}px`;
-    tiltEl.style.setProperty("--mtx", `${(-cy * 6).toFixed(2)}deg`);
-    tiltEl.style.setProperty("--mty", `${(cx * 6).toFixed(2)}deg`);
-    raf = (Math.abs(tx - cx) > 0.0004 || Math.abs(ty - cy) > 0.0004)
-      ? requestAnimationFrame(step) : 0;
-  };
-  const kick = () => { if (!raf) raf = requestAnimationFrame(step); };
-  if (matchMedia("(pointer: fine)").matches) {
-    hero.addEventListener("mousemove", e => {
-      const r = hero.getBoundingClientRect();
-      tx = (e.clientX - r.left) / r.width - 0.5;
-      ty = (e.clientY - r.top) / r.height - 0.5;
-      kick();
+  <script>
+    document.querySelectorAll("[data-copy]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(btn.dataset.copy);
+          const t = btn.textContent; btn.textContent = "Copied";
+          setTimeout(() => { btn.textContent = t; }, 1400);
+        } catch { }
+      });
     });
-    hero.addEventListener("mouseleave", () => { tx = ty = 0; kick(); });
-  }
-  const recede = () => {
-    const f = Math.min(1, Math.max(0, scrollY / (hero.offsetHeight * 0.85)));
-    scene.style.opacity = (1 - f * 0.95).toFixed(3);
-    scene.style.translate = `0 ${(scrollY * 0.22).toFixed(1)}px`;
-  };
-  recede();
-  addEventListener("scroll", recede, { passive: true });
-}
 
-// ink-dust particles drifting off the hero enso, trailing smoke (canvas)
-if (motionOK) {
-  const field = document.querySelector(".hero-particles");
-  const cv = document.createElement("canvas");
-  field.appendChild(cv);
-  const ctx = cv.getContext("2d");
-  const DPR = Math.min(devicePixelRatio || 1, 2);
-
-  // same CSS cubic-beziers as before, evaluated by Newton on the x polynomial
-  const cubic = (x1, y1, x2, y2) => {
-    const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
-    const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
-    return x => {
-      x = Math.min(1, Math.max(0, x));
-      let t = x;
-      for (let i = 0; i < 5; i++) {
-        const dd = (3 * ax * t + 2 * bx) * t + cx;
-        if (!dd) break;
-        t -= (((ax * t + bx) * t + cx) * t - x) / dd;
-      }
-      t = Math.min(1, Math.max(0, t));
-      return ((ay * t + by) * t + cy) * t;
+    const INSTALL = {
+      apt: [
+        "curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg",
+        'echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list',
+        "sudo apt update && sudo apt install zerofs",
+      ],
+      dnf: [
+        "curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo",
+        "sudo dnf install zerofs",
+      ],
+      curl: ["curl -sSfL https://sh.zerofs.net | sh"],
     };
-  };
-  const driftE = cubic(.25, .55, .6, 1);
-  const tumbleE = cubic(.15, .8, .3, 1);
-
-  // rasterize the enso glyph once per color, glow baked in (center half of a 2x box)
-  const sprite = color => {
-    const c = document.createElement("canvas");
-    c.width = c.height = 96;
-    const sym = document.getElementById("enso");
-    const img = new Image();
-    img.onload = () => {
-      const g = c.getContext("2d");
-      g.shadowColor = color;
-      g.shadowBlur = 16;
-      g.drawImage(img, 24, 24, 48, 48);
-      g.shadowBlur = 0; // crisp core pass, glow only once
-      g.drawImage(img, 24, 24, 48, 48);
+    const instBody = document.getElementById("install-body");
+    const instCopy = document.getElementById("install-copy");
+    const instTabs = document.querySelectorAll(".cmd-tabs button");
+    function renderInstall(method) {
+      const lines = INSTALL[method];
+      instBody.replaceChildren(...lines.map(line => {
+        const row = document.createElement("div");
+        row.className = "line";
+        const ps1 = document.createElement("span");
+        ps1.className = "ps1"; ps1.textContent = "$";
+        const txt = document.createElement("span");
+        txt.textContent = line;
+        row.append(ps1, txt);
+        return row;
+      }));
+      instCopy.dataset.copy = lines.join("\n");
+    }
+    instTabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        instTabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+        renderInstall(tab.dataset.method);
+      });
+    });
+    renderInstall("apt");
+    const captions = {
+      files: "<b>The file manager speaks 9P over WebSocket.</b> Drag-and-drop uploads work, including entire folders.",
+      dash: "<b>Throughput, IOPS, storage usage, operation counters, and GC stats</b> stream over gRPC-web, updated once a second.",
+      term: "<b>The terminal boots a Linux VM via v86</b>, filesystem served over the same 9P WebSocket. The guest has no network device.",
     };
-    img.src = "data:image/svg+xml;utf8," + encodeURIComponent(
-      `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="${sym.getAttribute("viewBox")}" style="color:${color}">${sym.innerHTML}</svg>`);
-    return c;
-  };
-  const WHITE = "244,243,239", BLUE = "77,159,255";
-  const sprW = sprite(`rgb(${WHITE})`), sprB = sprite(`rgb(${BLUE})`);
+    const tabs = document.querySelectorAll(".shots .tabs button");
+    tabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        tabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+        document.querySelectorAll(".browser .view img").forEach(img =>
+          img.classList.toggle("active", img.id === `shot-${tab.dataset.shot}`));
+        document.getElementById("shot-caption").innerHTML = captions[tab.dataset.shot];
+      });
+    });
+    const io = new IntersectionObserver(entries => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+    }, { rootMargin: "0px 0px -8% 0px" });
+    document.querySelectorAll(".rv").forEach((el, i) => {
+      el.style.transitionDelay = el.dataset.d ? `${el.dataset.d}ms` : `${Math.min((i % 6) * 70, 350)}ms`;
+      io.observe(el);
+      // the observer's -8% bottom margin strands hero content in the viewport's bottom
+      // strip (e.g. the alt-install line) until the first scroll; reveal what's already on screen
+      if (el.getBoundingClientRect().top < innerHeight) el.classList.add("in");
+    });
 
-  const ARC = 7 * Math.PI / 180;
-  const parts = Array.from({ length: 26 }, () => ({
-    a: Math.random() * Math.PI * 2,
-    d: 60 + Math.random() * 130,
-    T: 7 + Math.random() * 8,
-    ph: Math.random(),
-    s: 9 + Math.random() * 10,
-    o: 0.45 + Math.random() * 0.4,
-    tu: (300 + Math.random() * 420) * Math.PI / 180,
-    c: Math.random() < 0.3 ? BLUE : WHITE,
-    p0: 0,
-    hist: [],
-  }));
-
-  let R = 0, r0 = 310;
-  const size = () => {
-    r0 = parseFloat(getComputedStyle(field).getPropertyValue("--r0")) || 310;
-    R = r0 + 230;
-    cv.width = cv.height = Math.round(R * 2 * DPR);
-    cv.style.width = cv.style.height = `${R * 2}px`;
-    cv.style.left = cv.style.top = `${-R}px`;
-    for (const m of parts) m.hist.length = 0;
-  };
-  size();
-  addEventListener("resize", size);
-
-  const TRAIL = 2.4; // seconds of smoke kept behind each mote
-  let vis = true, praf = 0;
-  const frame = () => {
-    praf = vis ? requestAnimationFrame(frame) : 0;
-    const now = performance.now() / 1000;
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    ctx.clearRect(0, 0, R * 2, R * 2);
-    ctx.lineCap = "round";
-
-    for (const m of parts) {
-      const p = (now / m.T + m.ph) % 1;
-      if (p < m.p0) m.hist.length = 0; // wrapped: new life, fresh trail
-      m.p0 = p;
-      const e = driftE(p);
-      const ang = m.a + ARC * e, rad = r0 + m.d * e;
-      const x = R + Math.cos(ang) * rad, y = R + Math.sin(ang) * rad;
-      const al = m.o * (p < 0.12 ? driftE(p / 0.12) : 1 - driftE((p - 0.12) / 0.88));
-      const sc = 1 - 0.65 * e;
-
-      if (!m.hist.length || now - m.hist[m.hist.length - 1].t > 0.09)
-        m.hist.push({ x, y, al, t: now });
-      while (m.hist.length && now - m.hist[0].t > TRAIL) m.hist.shift();
-
-      // smoke ribbon through past positions, drawn as filled variable-width
-      // bands with alpha graded along the chord — one fill per band, so
-      // densely-spaced samples from slow motes cannot stack up opacity
-      const pts = m.hist.concat({ x, y, al, t: now });
-      const n = pts.length;
-      const chx = pts[n - 1].x - pts[0].x, chy = pts[n - 1].y - pts[0].y;
-      const chord = Math.hypot(chx, chy);
-      if (n > 2 && chord > 4) {
-        const ux = chx / chord, uy = chy / chord;
-        const gr = m.s * sc;
-        // smoke, not a comet: each ink parcel drifts sideways at its own
-        // steady pace (tail meanders), the band billows (puffy width), and
-        // everything fades to zero within the glyph radius so the trail
-        // emerges from behind the ring's trailing edge, not its center.
-        // sines are keyed to each parcel's birth time — smooth along the
-        // band, stable across frames.
-        const P = pts.map(q => {
-          const age = Math.min(1, (now - q.t) / TRAIL);
-          const drift = (Math.sin(q.t * 2.1 + m.a * 7) * 0.6 + Math.sin(q.t * 3.7 + m.a * 13) * 0.4)
-            * m.s * 0.9 * Math.pow(age, 1.3);
-          const wx = q.x - uy * drift, wy = q.y + ux * drift;
-          return {
-            x: wx, y: wy, al: q.al, age,
-            puff: 1 + 0.3 * Math.sin(q.t * 3.1 + m.a * 23),
-            hf: Math.min(1, Math.max(0, (Math.hypot(wx - x, wy - y) - gr * 0.45) / (gr * 0.5))),
-          };
-        });
-        const band = (width, alpha) => {
-          const g = ctx.createLinearGradient(P[0].x, P[0].y, P[n - 1].x, P[n - 1].y);
-          ctx.beginPath();
-          const back = [];
-          for (let j = 0; j < n; j++) {
-            const q = P[j];
-            let dx = P[Math.min(n - 1, j + 1)].x - P[Math.max(0, j - 1)].x;
-            let dy = P[Math.min(n - 1, j + 1)].y - P[Math.max(0, j - 1)].y;
-            const dl = Math.hypot(dx, dy) || 1;
-            const hw = width(q) / 2;
-            dx = dx / dl * hw; dy = dy / dl * hw;
-            j ? ctx.lineTo(q.x - dy, q.y + dx) : ctx.moveTo(q.x - dy, q.y + dx);
-            back.push(q.x + dy, q.y - dx);
-            g.addColorStop(
-              Math.min(1, Math.max(0, ((q.x - P[0].x) * ux + (q.y - P[0].y) * uy) / chord)),
-              `rgba(${m.c},${(q.al * q.hf * alpha(1 - q.age)).toFixed(3)})`);
+    // asciinema recordings — player lib loads only when the section nears the viewport
+    const CASTS = {
+      "730946": ["kernel-build — asciinema", "<b>The Linux kernel compiles in 16 seconds</b> on ZFS over a ZeroFS NBD volume."],
+      "728234": ["zfs-on-s3 — asciinema", "<b>zpool create runs directly on ZeroFS block devices</b>; no intermediate filesystem."],
+      "728172": ["ubuntu-boot — asciinema", "<b>Ubuntu boots</b> with its root filesystem served by ZeroFS."],
+      "728101": ["self-hosting — asciinema", "<b>The Rust toolchain builds ZeroFS</b> on a filesystem ZeroFS is serving."],
+    };
+    let castPlayer = null, castLib = null;
+    function loadCastLib() {
+      if (castLib) return castLib;
+      const css = document.createElement("link");
+      css.rel = "stylesheet";
+      css.href = "https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.css";
+      document.head.appendChild(css);
+      castLib = new Promise(resolve => {
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.js";
+        s.onload = resolve;
+        document.head.appendChild(s);
+      });
+      return castLib;
+    }
+    function showCast(id) {
+      document.getElementById("cast-title").textContent = CASTS[id][0];
+      document.getElementById("cast-caption").innerHTML = CASTS[id][1];
+      loadCastLib().then(() => {
+        if (castPlayer) castPlayer.dispose();
+        castPlayer = AsciinemaPlayer.create(
+          `https://asciinema.org/a/${id}.cast`,
+          document.getElementById("cast-player"),
+          {
+            fit: "width", poster: "npt:0:03", idleTimeLimit: 2, preload: true,
+            terminalFontFamily: '"Geist Mono", monospace'
           }
-          for (let j = back.length - 2; j >= 0; j -= 2) ctx.lineTo(back[j], back[j + 1]);
-          ctx.closePath();
-          ctx.fillStyle = g;
-          ctx.fill();
-        };
-        const wb = m.s * sc;
-        band(q => wb * (0.8 + 2.6 * q.age) * q.puff, f => Math.pow(f, 1.5) * 0.075); // halo: billows, lingers
-        band(q => wb * (0.38 + 0.5 * q.age) * q.puff, f => f * f * 0.24); // core: sharp, dies fast
+        );
+      });
+    }
+    const castTabs = document.querySelectorAll(".casts .tabs button");
+    castTabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        castTabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+        showCast(tab.dataset.cast);
+      });
+    });
+    const castIO = new IntersectionObserver(entries => {
+      if (!entries.some(e => e.isIntersecting)) return;
+      castIO.disconnect();
+      showCast(document.querySelector('.casts .tabs button[aria-selected="true"]').dataset.cast);
+    }, { rootMargin: "1800px 0px" });
+    castIO.observe(document.querySelector(".casts"));
+
+    // GitHub star count, cached for a day
+    (async () => {
+      const el = document.getElementById("gh-stars");
+      const fmt = n => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+      try {
+        const cached = JSON.parse(localStorage.getItem("gh-stars") || "null");
+        if (cached && Date.now() - cached.t < 864e5) { el.textContent = fmt(cached.n); return; }
+        const r = await fetch("https://api.github.com/repos/Barre/ZeroFS");
+        if (!r.ok) return;
+        const n = (await r.json()).stargazers_count;
+        if (typeof n === "number") {
+          el.textContent = fmt(n);
+          localStorage.setItem("gh-stars", JSON.stringify({ n, t: Date.now() }));
+        }
+      } catch { }
+    })();
+
+    // header gains a solid background once scrolled past the top
+    const hdr = document.querySelector("header");
+    const onScroll = () => hdr.classList.toggle("scrolled", scrollY > 24);
+    onScroll();
+    addEventListener("scroll", onScroll, { passive: true });
+
+    // segmented-control glider for tab groups
+    document.querySelectorAll(".tabs").forEach(group => {
+      const glider = document.createElement("span");
+      glider.className = "glider";
+      glider.setAttribute("aria-hidden", "true");
+      group.prepend(glider);
+      const move = () => {
+        const active = group.querySelector('button[aria-selected="true"]');
+        if (!active) return;
+        glider.style.width = `${active.offsetWidth}px`;
+        glider.style.transform = `translateX(${active.offsetLeft}px)`;
+      };
+      move();
+      requestAnimationFrame(() => group.classList.add("gliding"));
+      group.addEventListener("click", e => { if (e.target.closest("button")) move(); });
+      window.addEventListener("resize", move);
+      document.fonts?.ready.then(move);
+    });
+
+    const motionOK = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // hero depth: cursor parallax + scroll recede
+    if (motionOK) {
+      const hero = document.querySelector(".hero");
+      const scene = document.querySelector(".hero-scene");
+      const layers = [[".hero-glow", 10], [".enso-tilt", 16], [".hero-particles", 26]]
+        .map(([s, d]) => [scene.querySelector(s), d]);
+      let tx = 0, ty = 0, cx = 0, cy = 0, raf = 0;
+      const tiltEl = scene.querySelector(".enso-tilt");
+      const step = () => {
+        cx += (tx - cx) * 0.06; cy += (ty - cy) * 0.06;
+        for (const [el, d] of layers)
+          el.style.translate = `${(-cx * d).toFixed(2)}px ${(-cy * d).toFixed(2)}px`;
+        tiltEl.style.setProperty("--mtx", `${(-cy * 6).toFixed(2)}deg`);
+        tiltEl.style.setProperty("--mty", `${(cx * 6).toFixed(2)}deg`);
+        raf = (Math.abs(tx - cx) > 0.0004 || Math.abs(ty - cy) > 0.0004)
+          ? requestAnimationFrame(step) : 0;
+      };
+      const kick = () => { if (!raf) raf = requestAnimationFrame(step); };
+      if (matchMedia("(pointer: fine)").matches) {
+        hero.addEventListener("mousemove", e => {
+          const r = hero.getBoundingClientRect();
+          tx = (e.clientX - r.left) / r.width - 0.5;
+          ty = (e.clientY - r.top) / r.height - 0.5;
+          kick();
+        });
+        hero.addEventListener("mouseleave", () => { tx = ty = 0; kick(); });
       }
-
-      // the mote itself, tumbling
-      const ds = m.s * sc;
-      ctx.globalAlpha = al;
-      ctx.translate(x, y);
-      ctx.rotate(m.tu * tumbleE(p));
-      ctx.drawImage(m.c === BLUE ? sprB : sprW, -ds, -ds, ds * 2, ds * 2);
-      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-      ctx.globalAlpha = 1;
+      const recede = () => {
+        const f = Math.min(1, Math.max(0, scrollY / (hero.offsetHeight * 0.85)));
+        scene.style.opacity = (1 - f * 0.95).toFixed(3);
+        scene.style.translate = `0 ${(scrollY * 0.22).toFixed(1)}px`;
+      };
+      recede();
+      addEventListener("scroll", recede, { passive: true });
     }
-  };
-  praf = requestAnimationFrame(frame);
-  new IntersectionObserver(([en]) => {
-    vis = en.isIntersecting;
-    if (vis && !praf) praf = requestAnimationFrame(frame);
-  }).observe(cv);
-}
 
-// cursor spotlight
-if (motionOK && matchMedia("(pointer: fine)").matches) {
-  document.querySelectorAll(".proof, .proto, .feat").forEach(card => {
-    card.addEventListener("mousemove", e => {
-      const r = card.getBoundingClientRect();
-      card.style.setProperty("--mx", `${e.clientX - r.left}px`);
-      card.style.setProperty("--my", `${e.clientY - r.top}px`);
-    });
-  });
-}
+    // ink-dust particles drifting off the hero enso, trailing smoke (canvas)
+    if (motionOK) {
+      const field = document.querySelector(".hero-particles");
+      const cv = document.createElement("canvas");
+      field.appendChild(cv);
+      const ctx = cv.getContext("2d");
+      const DPR = Math.min(devicePixelRatio || 1, 2);
 
-// stat count-up
-if (motionOK) {
-  const fmt = (el, v) => {
-    const dec = +(el.dataset.dec || 0);
-    el.textContent = el.dataset.sep
-      ? Math.round(v).toLocaleString("en-US")
-      : v.toFixed(dec);
-  };
-  const counters = document.querySelectorAll("[data-count]");
-  counters.forEach(el => fmt(el, 0));
-  const cio = new IntersectionObserver(entries => {
-    for (const e of entries) {
-      if (!e.isIntersecting) continue;
-      cio.unobserve(e.target);
-      const el = e.target, target = +el.dataset.count, t0 = performance.now();
-      const dur = 1300;
-      (function tick(t) {
-        const p = Math.min((t - t0) / dur, 1);
-        fmt(el, target * (1 - Math.pow(1 - p, 3)));
-        if (p < 1) requestAnimationFrame(tick);
-      })(t0);
+      // same CSS cubic-beziers as before, evaluated by Newton on the x polynomial
+      const cubic = (x1, y1, x2, y2) => {
+        const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+        const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+        return x => {
+          x = Math.min(1, Math.max(0, x));
+          let t = x;
+          for (let i = 0; i < 5; i++) {
+            const dd = (3 * ax * t + 2 * bx) * t + cx;
+            if (!dd) break;
+            t -= (((ax * t + bx) * t + cx) * t - x) / dd;
+          }
+          t = Math.min(1, Math.max(0, t));
+          return ((ay * t + by) * t + cy) * t;
+        };
+      };
+      const driftE = cubic(.25, .55, .6, 1);
+      const tumbleE = cubic(.15, .8, .3, 1);
+
+      // rasterize the enso glyph once per color, glow baked in (center half of a 2x box)
+      const sprite = color => {
+        const c = document.createElement("canvas");
+        c.width = c.height = 96;
+        const sym = document.getElementById("enso");
+        const img = new Image();
+        img.onload = () => {
+          const g = c.getContext("2d");
+          g.shadowColor = color;
+          g.shadowBlur = 16;
+          g.drawImage(img, 24, 24, 48, 48);
+          g.shadowBlur = 0; // crisp core pass, glow only once
+          g.drawImage(img, 24, 24, 48, 48);
+        };
+        img.src = "data:image/svg+xml;utf8," + encodeURIComponent(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="${sym.getAttribute("viewBox")}" style="color:${color}">${sym.innerHTML}</svg>`);
+        return c;
+      };
+      const WHITE = "244,243,239", BLUE = "77,159,255";
+      const sprW = sprite(`rgb(${WHITE})`), sprB = sprite(`rgb(${BLUE})`);
+
+      const ARC = 7 * Math.PI / 180;
+      const parts = Array.from({ length: 26 }, () => ({
+        a: Math.random() * Math.PI * 2,
+        d: 60 + Math.random() * 130,
+        T: 7 + Math.random() * 8,
+        ph: Math.random(),
+        s: 9 + Math.random() * 10,
+        o: 0.45 + Math.random() * 0.4,
+        tu: (300 + Math.random() * 420) * Math.PI / 180,
+        c: Math.random() < 0.3 ? BLUE : WHITE,
+        p0: 0,
+        hist: [],
+      }));
+
+      let R = 0, r0 = 310;
+      const size = () => {
+        r0 = parseFloat(getComputedStyle(field).getPropertyValue("--r0")) || 310;
+        R = r0 + 230;
+        cv.width = cv.height = Math.round(R * 2 * DPR);
+        cv.style.width = cv.style.height = `${R * 2}px`;
+        cv.style.left = cv.style.top = `${-R}px`;
+        for (const m of parts) m.hist.length = 0;
+      };
+      size();
+      addEventListener("resize", size);
+
+      const TRAIL = 2.4; // seconds of smoke kept behind each mote
+      let vis = true, praf = 0;
+      const frame = () => {
+        praf = vis ? requestAnimationFrame(frame) : 0;
+        const now = performance.now() / 1000;
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        ctx.clearRect(0, 0, R * 2, R * 2);
+        ctx.lineCap = "round";
+
+        for (const m of parts) {
+          const p = (now / m.T + m.ph) % 1;
+          if (p < m.p0) m.hist.length = 0; // wrapped: new life, fresh trail
+          m.p0 = p;
+          const e = driftE(p);
+          const ang = m.a + ARC * e, rad = r0 + m.d * e;
+          const x = R + Math.cos(ang) * rad, y = R + Math.sin(ang) * rad;
+          const al = m.o * (p < 0.12 ? driftE(p / 0.12) : 1 - driftE((p - 0.12) / 0.88));
+          const sc = 1 - 0.65 * e;
+
+          if (!m.hist.length || now - m.hist[m.hist.length - 1].t > 0.09)
+            m.hist.push({ x, y, al, t: now });
+          while (m.hist.length && now - m.hist[0].t > TRAIL) m.hist.shift();
+
+          // smoke ribbon through past positions, drawn as filled variable-width
+          // bands with alpha graded along the chord — one fill per band, so
+          // densely-spaced samples from slow motes cannot stack up opacity
+          const pts = m.hist.concat({ x, y, al, t: now });
+          const n = pts.length;
+          const chx = pts[n - 1].x - pts[0].x, chy = pts[n - 1].y - pts[0].y;
+          const chord = Math.hypot(chx, chy);
+          if (n > 2 && chord > 4) {
+            const ux = chx / chord, uy = chy / chord;
+            const gr = m.s * sc;
+            // smoke, not a comet: each ink parcel drifts sideways at its own
+            // steady pace (tail meanders), the band billows (puffy width), and
+            // everything fades to zero within the glyph radius so the trail
+            // emerges from behind the ring's trailing edge, not its center.
+            // sines are keyed to each parcel's birth time — smooth along the
+            // band, stable across frames.
+            const P = pts.map(q => {
+              const age = Math.min(1, (now - q.t) / TRAIL);
+              const drift = (Math.sin(q.t * 2.1 + m.a * 7) * 0.6 + Math.sin(q.t * 3.7 + m.a * 13) * 0.4)
+                * m.s * 0.9 * Math.pow(age, 1.3);
+              const wx = q.x - uy * drift, wy = q.y + ux * drift;
+              return {
+                x: wx, y: wy, al: q.al, age,
+                puff: 1 + 0.3 * Math.sin(q.t * 3.1 + m.a * 23),
+                hf: Math.min(1, Math.max(0, (Math.hypot(wx - x, wy - y) - gr * 0.45) / (gr * 0.5))),
+              };
+            });
+            const band = (width, alpha) => {
+              const g = ctx.createLinearGradient(P[0].x, P[0].y, P[n - 1].x, P[n - 1].y);
+              ctx.beginPath();
+              const back = [];
+              for (let j = 0; j < n; j++) {
+                const q = P[j];
+                let dx = P[Math.min(n - 1, j + 1)].x - P[Math.max(0, j - 1)].x;
+                let dy = P[Math.min(n - 1, j + 1)].y - P[Math.max(0, j - 1)].y;
+                const dl = Math.hypot(dx, dy) || 1;
+                const hw = width(q) / 2;
+                dx = dx / dl * hw; dy = dy / dl * hw;
+                j ? ctx.lineTo(q.x - dy, q.y + dx) : ctx.moveTo(q.x - dy, q.y + dx);
+                back.push(q.x + dy, q.y - dx);
+                g.addColorStop(
+                  Math.min(1, Math.max(0, ((q.x - P[0].x) * ux + (q.y - P[0].y) * uy) / chord)),
+                  `rgba(${m.c},${(q.al * q.hf * alpha(1 - q.age)).toFixed(3)})`);
+              }
+              for (let j = back.length - 2; j >= 0; j -= 2) ctx.lineTo(back[j], back[j + 1]);
+              ctx.closePath();
+              ctx.fillStyle = g;
+              ctx.fill();
+            };
+            const wb = m.s * sc;
+            band(q => wb * (0.8 + 2.6 * q.age) * q.puff, f => Math.pow(f, 1.5) * 0.075); // halo: billows, lingers
+            band(q => wb * (0.38 + 0.5 * q.age) * q.puff, f => f * f * 0.24); // core: sharp, dies fast
+          }
+
+          // the mote itself, tumbling
+          const ds = m.s * sc;
+          ctx.globalAlpha = al;
+          ctx.translate(x, y);
+          ctx.rotate(m.tu * tumbleE(p));
+          ctx.drawImage(m.c === BLUE ? sprB : sprW, -ds, -ds, ds * 2, ds * 2);
+          ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+          ctx.globalAlpha = 1;
+        }
+      };
+      praf = requestAnimationFrame(frame);
+      new IntersectionObserver(([en]) => {
+        vis = en.isIntersecting;
+        if (vis && !praf) praf = requestAnimationFrame(frame);
+      }).observe(cv);
     }
-  }, { threshold: 0.6 });
-  counters.forEach(el => cio.observe(el));
-}
 
-// terminal line-by-line reveal
-if (motionOK) {
-  const term = document.querySelector(".term-sec .term");
-  const lines = [...document.querySelectorAll(".term-sec .term .body > div")];
-  lines.forEach(l => l.classList.add("line-hidden"));
-  const tio = new IntersectionObserver(entries => {
-    if (!entries.some(e => e.isIntersecting)) return;
-    tio.disconnect();
-    lines.forEach((line, i) => {
-      setTimeout(() => {
-        lines.forEach(l => l.classList.remove("line-active"));
-        line.classList.remove("line-hidden");
-        if (i < lines.length - 1) line.classList.add("line-active");
-      }, 400 + i * 520);
-    });
-  }, { threshold: 0.5 });
-  tio.observe(term);
-}
-</script>
+    // cursor spotlight
+    if (motionOK && matchMedia("(pointer: fine)").matches) {
+      document.querySelectorAll(".proof, .proto, .feat").forEach(card => {
+        card.addEventListener("mousemove", e => {
+          const r = card.getBoundingClientRect();
+          card.style.setProperty("--mx", `${e.clientX - r.left}px`);
+          card.style.setProperty("--my", `${e.clientY - r.top}px`);
+        });
+      });
+    }
+
+    // stat count-up
+    if (motionOK) {
+      const fmt = (el, v) => {
+        const dec = +(el.dataset.dec || 0);
+        el.textContent = el.dataset.sep
+          ? Math.round(v).toLocaleString("en-US")
+          : v.toFixed(dec);
+      };
+      const counters = document.querySelectorAll("[data-count]");
+      counters.forEach(el => fmt(el, 0));
+      const cio = new IntersectionObserver(entries => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          cio.unobserve(e.target);
+          const el = e.target, target = +el.dataset.count, t0 = performance.now();
+          const dur = 1300;
+          (function tick(t) {
+            const p = Math.min((t - t0) / dur, 1);
+            fmt(el, target * (1 - Math.pow(1 - p, 3)));
+            if (p < 1) requestAnimationFrame(tick);
+          })(t0);
+        }
+      }, { threshold: 0.6 });
+      counters.forEach(el => cio.observe(el));
+    }
+
+    // terminal line-by-line reveal
+    if (motionOK) {
+      const term = document.querySelector(".term-sec .term");
+      const lines = [...document.querySelectorAll(".term-sec .term .body > div")];
+      lines.forEach(l => l.classList.add("line-hidden"));
+      const tio = new IntersectionObserver(entries => {
+        if (!entries.some(e => e.isIntersecting)) return;
+        tio.disconnect();
+        lines.forEach((line, i) => {
+          setTimeout(() => {
+            lines.forEach(l => l.classList.remove("line-active"));
+            line.classList.remove("line-hidden");
+            if (i < lines.length - 1) line.classList.add("line-active");
+          }, 400 + i * 520);
+        });
+      }, { threshold: 0.5 });
+      tio.observe(term);
+    }
+  </script>
 </body>
+
 </html>
