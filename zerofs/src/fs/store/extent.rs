@@ -2058,6 +2058,10 @@ mod tests {
     use slatedb::{BlockTransformer, DbBuilder};
 
     async fn make() -> (ExtentStore, Arc<Db>) {
+        make_with_compression(CompressionConfig::Lz4).await
+    }
+
+    async fn make_with_compression(compression: CompressionConfig) -> (ExtentStore, Arc<Db>) {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let bt: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
@@ -2071,7 +2075,7 @@ mod tests {
         );
         let db = Arc::new(Db::new(slatedb, None));
         let key_codec = Arc::new(KeyCodec::new());
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, compression);
         let segments = Arc::new(SegmentStore::new(object_store, codec, 7, None));
         (
             ExtentStore::new(
@@ -2639,6 +2643,46 @@ mod tests {
             1,
             "a read of a sealed segment is one ranged GET"
         );
+    }
+
+    // Not a correctness test: measures single-stream engine-side write
+    // throughput (codec + open-buffer append + seal + commit, no protocol, no
+    // inode lock) against an in-memory object store.
+    //   cargo test --release --lib -- --ignored --nocapture bench_sequential_write
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "throughput measurement, run explicitly in release"]
+    async fn bench_sequential_write_throughput() {
+        for (name, compression) in [
+            ("lz4", CompressionConfig::Lz4),
+            ("zstd(3)", CompressionConfig::Zstd(3)),
+        ] {
+            for (shape, data) in [
+                ("incompressible", incompressible(1, 256 * 1024)),
+                ("zeros", vec![0u8; 256 * 1024]),
+            ] {
+                let (store, db) = make_with_compression(compression).await;
+                let chunk = data.len();
+                let total: usize = 512 * 1024 * 1024;
+                let payload = Bytes::from(data);
+                let start = std::time::Instant::now();
+                let mut size = 0u64;
+                for i in 0..(total / chunk) {
+                    let mut txn = db.new_transaction().unwrap();
+                    let tu = store
+                        .write(&mut txn, 1, (i * chunk) as u64, &payload, size)
+                        .await
+                        .unwrap();
+                    commit(&store, txn).await;
+                    store.apply_tail_update(1, tu);
+                    size += chunk as u64;
+                }
+                let secs = start.elapsed().as_secs_f64();
+                eprintln!(
+                    "engine sequential write [{name}, {shape}, 256 KiB ops]: {:.0} MB/s",
+                    total as f64 / secs / 1e6
+                );
+            }
+        }
     }
 
     // A batch of >= PARALLEL_COMPRESS_MIN_FRAMES frames takes the rayon
