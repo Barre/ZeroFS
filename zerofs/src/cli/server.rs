@@ -789,7 +789,12 @@ pub async fn run_server(
 ) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info"));
+    // Default: ZeroFS's own logs at info, the embedded LSM engine's internals
+    // only at warn and above. The engine's routine story (metadata compaction)
+    // is retold, less verbosely, by the metadata-compaction digest task.
+    // RUST_LOG replaces this entirely (e.g. RUST_LOG='zerofs=trace,slatedb=debug'
+    // for deep debugging).
+    let filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("info,slatedb=warn"));
 
     #[cfg(feature = "tokio-console")]
     {
@@ -871,6 +876,24 @@ pub async fn run_server(
         )
     } else {
         Vec::new()
+    };
+
+    // Metadata compaction digest: at most one line per interval, only when
+    // compaction ran, plus a crossing-only L0 backlog warning. Retells the
+    // story of the engine's per-compaction log lines, which the default
+    // filter drops (see init_logging). Read-write mode only: readers run no
+    // compaction.
+    let digest_handle = match (fs.db.slatedb_metrics(), fs.db.subscribe_status()) {
+        (Some(recorder), Some(status)) => Some(crate::metadata_digest::spawn(
+            recorder,
+            status,
+            settings
+                .lsm
+                .map(|c| c.l0_max_ssts())
+                .unwrap_or(crate::config::LsmConfig::DEFAULT_L0_MAX_SSTS),
+            shutdown.clone(),
+        )),
+        _ => None,
     };
 
     let nfs_handles = start_nfs_servers(
@@ -1050,6 +1073,9 @@ pub async fn run_server(
         let _ = flush_handle.await;
     }
     if let Some(handle) = telemetry_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = digest_handle {
         let _ = handle.await;
     }
     for handle in prometheus_handles {

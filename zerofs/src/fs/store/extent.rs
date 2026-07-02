@@ -144,7 +144,7 @@ enum SegmentDeadVerdict {
 }
 
 /// Human-readable byte size for log lines, e.g. "3.1 GiB". Display-only.
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
     let mut unit = 0;

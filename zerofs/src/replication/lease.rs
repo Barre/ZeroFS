@@ -54,11 +54,21 @@ pub async fn run_lease_from_status(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        if status.borrow().close_reason.is_some() {
-            tracing::error!(
-                "HA: data db closed (fenced by a takeover / deposed); revoking the lease \
-                 and stepping down."
-            );
+        let close_reason = status.borrow().close_reason;
+        if let Some(reason) = close_reason {
+            match reason {
+                slatedb::CloseReason::Fenced => tracing::warn!(
+                    "HA: the metadata store closed: fenced by a newer writer (a standby took \
+                     over); revoking the lease and stepping down"
+                ),
+                slatedb::CloseReason::Clean => {
+                    tracing::info!("HA: the metadata store closed cleanly; revoking the lease")
+                }
+                other => tracing::error!(
+                    "HA: the metadata store closed unexpectedly ({other:?}); revoking the lease \
+                     and stepping down"
+                ),
+            }
             lease.invalidate();
             return;
         }

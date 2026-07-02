@@ -12,6 +12,7 @@ mod frame_codec;
 mod fs;
 mod key_management;
 mod length_checked_object_store;
+mod metadata_digest;
 #[cfg(target_os = "linux")]
 mod mount;
 mod nbd;

@@ -5,6 +5,7 @@ pub mod dedup;
 pub mod frame_codec;
 pub mod fs;
 pub mod length_checked_object_store;
+pub mod metadata_digest;
 pub mod object_store_prefetch;
 pub mod object_trace;
 pub mod replication;
