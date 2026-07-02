@@ -33,6 +33,11 @@ use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 const PARALLEL_EXTENT_OPS: usize = 20;
+
+/// Frames per write batch before pre-compression fans out on rayon. Below this
+/// the rayon dispatch overhead outweighs the parallelism; at or above it (a
+/// ≥256 KiB write) the batch's compression scales across cores.
+const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
 const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
 const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -588,20 +593,49 @@ impl ExtentStore {
                 old_debits.push((loc.segid, loc.byte_len));
             }
         }
+        // Compress every payload before taking the open-segment lock: compression
+        // is the expensive half of the codec and depends only on the plaintext,
+        // while the AEAD binds (segid, frame_index), which exist only under the
+        // lock. Serializing just the AEAD and the buffer append keeps concurrent
+        // writers off each other's compression time. A batch large enough to
+        // amortize the fan-out compresses in parallel on rayon; block_in_place
+        // needs the multi-thread runtime (tests run current-thread), and small
+        // batches stay inline where the fan-out would cost more than it buys.
+        let payloads: Vec<&Bytes> = edits.iter().filter_map(|(_, e)| e.as_ref()).collect();
+        let compressed: Vec<Vec<u8>> = if payloads.len() >= PARALLEL_COMPRESS_MIN_FRAMES
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(|| {
+                use rayon::prelude::*;
+                payloads
+                    .par_iter()
+                    .map(|p| self.codec.compress(p))
+                    .collect::<Result<_, _>>()
+            })
+            .map_err(|_| FsError::IoError)?
+        } else {
+            payloads
+                .iter()
+                .map(|p| self.codec.compress(p))
+                .collect::<Result<_, _>>()
+                .map_err(|_| FsError::IoError)?
+        };
+        let mut compressed = compressed.into_iter();
         {
             let mut open = self.open.lock().unwrap();
             for (extent, edit) in edits {
                 match edit {
-                    Some(plaintext) => {
+                    Some(_) => {
                         let frame_index = open.dir.len() as u32;
                         let segid = open.segid;
-                        let sealed = crate::segment::seal_frame(
+                        let sealed = crate::segment::seal_compressed_frame(
                             &self.codec,
                             segid,
                             frame_index,
                             id,
                             *extent,
-                            plaintext,
+                            compressed.next().expect("one compressed payload per edit"),
                         )
                         .map_err(|_| FsError::IoError)?;
                         let byte_offset = open.buf.len() as u64;
@@ -2605,6 +2639,17 @@ mod tests {
             1,
             "a read of a sealed segment is one ranged GET"
         );
+    }
+
+    // A batch of >= PARALLEL_COMPRESS_MIN_FRAMES frames takes the rayon
+    // pre-compression fan-out (multi-thread runtimes only; the other tests run
+    // current-thread and take the inline branch) and must roundtrip identically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_batch_write_takes_parallel_compression_path() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        let data = incompressible(3, PARALLEL_COMPRESS_MIN_FRAMES * 2 * EXTENT_SIZE);
+        write_and_check(&store, &db, &mut model, 0, &data).await;
     }
 
     #[tokio::test]

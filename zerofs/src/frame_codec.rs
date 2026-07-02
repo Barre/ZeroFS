@@ -74,7 +74,14 @@ impl FrameCodec {
 
     /// Compress then encrypt `plain`, binding `aad`. Returns `[nonce][ct+tag]`.
     pub fn seal(&self, plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
-        let compressed = self.compress(plain)?;
+        self.seal_compressed(self.compress(plain)?, aad)
+    }
+
+    /// Encrypt an already-[`Self::compress`]ed payload, binding `aad`.
+    /// `seal(plain, aad)` is exactly `seal_compressed(compress(plain), aad)`;
+    /// the split exists so callers can run the compression outside a lock whose
+    /// critical section must assign the identifiers the AAD binds.
+    pub fn seal_compressed(&self, compressed: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, CodecError> {
         let mut out = Vec::with_capacity(NONCE_SIZE + compressed.len() + TAG_SIZE);
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         thread_rng().fill_bytes(&mut nonce_bytes);
@@ -109,12 +116,14 @@ impl FrameCodec {
         self.decompress(&compressed)
     }
 
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    /// Compress `data` with the configured codec. Pure: the output depends only
+    /// on the bytes and the configured level, never on shared state, so it can
+    /// run on any thread, outside any lock, and feed [`Self::seal_compressed`].
+    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
         match self.compression {
             CompressionConfig::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
             CompressionConfig::Zstd(level) => {
-                let compressed = zstd::bulk::compress(data, level)
-                    .map_err(|e| CodecError::Compress(e.to_string()))?;
+                let compressed = zstd_compress(data, level)?;
                 // Prepend original size (LE u32) for decompression.
                 let mut result = Vec::with_capacity(4 + compressed.len());
                 result.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -138,12 +147,70 @@ impl FrameCodec {
     }
 }
 
+/// Compress via a thread-local reused zstd context: creating a context per
+/// 32 KiB frame costs more than low-level compression itself. Keyed by level so
+/// codecs at different levels (or a config change) rebuild it; the output is
+/// byte-identical to one-shot `zstd::bulk::compress` at the same level.
+fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>, CodecError> {
+    use std::cell::RefCell;
+    thread_local! {
+        static ZSTD: RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
+            const { RefCell::new(None) };
+    }
+    ZSTD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if !matches!(&*slot, Some((l, _)) if *l == level) {
+            let ctx = zstd::bulk::Compressor::new(level)
+                .map_err(|e| CodecError::Compress(e.to_string()))?;
+            *slot = Some((level, ctx));
+        }
+        slot.as_mut()
+            .expect("compressor installed above")
+            .1
+            .compress(data)
+            .map_err(|e| CodecError::Compress(e.to_string()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn codec() -> FrameCodec {
         FrameCodec::new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Lz4)
+    }
+
+    // seal() must remain exactly seal_compressed(compress(..)): the write path
+    // splits the phases around a lock and both halves must roundtrip together.
+    #[test]
+    fn split_seal_roundtrips_like_fused_seal() {
+        for c in [
+            codec(),
+            FrameCodec::new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Zstd(3)),
+        ] {
+            let plain = vec![9u8; 40_000];
+            let sealed = c
+                .seal_compressed(c.compress(&plain).unwrap(), b"aad")
+                .unwrap();
+            assert_eq!(c.open(&sealed, b"aad").unwrap(), plain);
+            assert!(matches!(
+                c.open(&sealed, b"other"),
+                Err(CodecError::Decrypt)
+            ));
+        }
+    }
+
+    // The reused zstd context must rebuild when the level changes and keep
+    // producing output the (level-agnostic) decompressor accepts.
+    #[test]
+    fn zstd_context_reuse_survives_level_changes() {
+        let a = FrameCodec::new(&[7u8; 32], b"t", CompressionConfig::Zstd(1));
+        let b = FrameCodec::new(&[7u8; 32], b"t", CompressionConfig::Zstd(19));
+        let plain = vec![5u8; 10_000];
+        for c in [&a, &b, &a] {
+            let sealed = c.seal(&plain, b"aad").unwrap();
+            assert_eq!(c.open(&sealed, b"aad").unwrap(), plain);
+        }
     }
 
     #[test]

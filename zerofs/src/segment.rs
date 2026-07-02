@@ -267,6 +267,21 @@ pub(crate) fn seal_frame(
     Ok(codec.seal(plaintext, &frame_aad(segid, frame_index, inode, extent))?)
 }
 
+/// [`seal_frame`] over an already-compressed payload. The write path compresses
+/// outside the open-segment lock (compression is the expensive half of the codec
+/// and is independent of the AAD) and binds `(segid, frame_index)` here, under
+/// the lock that assigns them.
+pub(crate) fn seal_compressed_frame(
+    codec: &FrameCodec,
+    segid: Segid,
+    frame_index: u32,
+    inode: u64,
+    extent: u64,
+    compressed: Vec<u8>,
+) -> Result<Vec<u8>, SegmentError> {
+    Ok(codec.seal_compressed(compressed, &frame_aad(segid, frame_index, inode, extent))?)
+}
+
 /// Seal the segment directory into its AEAD frame. This is the one fallible step
 /// of finalizing, kept separate from [`assemble_segment`] so a caller holding the
 /// live open buffer can run it BEFORE taking/rotating that buffer: on failure the
