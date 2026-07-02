@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use dashmap::DashMap;
 use foyer::{Cache, HybridCache};
 use futures::FutureExt;
 use futures::StreamExt;
@@ -13,6 +12,7 @@ use object_store::{
     PutResult, RenameOptions,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Range;
 use std::sync::Arc;
@@ -25,19 +25,24 @@ const ACCESS_TRACKER_CAPACITY: usize = 8 * 1024;
 const FETCH_WINDOW_MIN: usize = 128 * 1024;
 const FETCH_WINDOW_MAX: usize = 8 * 1024 * 1024;
 const MAX_STREAMS: usize = 4;
-/// On a proven sequential stream, keep this many full windows fetched ahead of the
-/// read so several large GETs stay in flight (a deep read pipeline). At the max
-/// window that's `4 × 8 MiB = 32 MiB` outstanding — well inside the parts cache.
+/// Windows kept fetched ahead of a proven sequential stream, so several large
+/// GETs stay in flight. At the max window that's 32 MiB outstanding, well
+/// inside the parts cache.
 const PREFETCH_DEPTH_WINDOWS: usize = 4;
 
 type PartId = usize;
 
-/// A window fetch shared across concurrent readers whose part falls inside it: the
-/// first miss launches one GET for the whole window and registers under every part
-/// it covers, so an overlapping read joins it instead of issuing its own GET. The
-/// result is `(base part id, full window bytes)` (a follower slices out its part),
-/// with the error `Arc`-wrapped so the output is `Clone` (required by `Shared`).
+/// One window GET shared by every reader whose part falls inside it. Resolves
+/// to `(base part id, window bytes)`; a joiner slices out its part. The error
+/// is Arc-wrapped so the output is `Clone`, which `Shared` requires.
 type SharedFetch = Shared<BoxFuture<'static, Result<(PartId, Bytes), Arc<object_store::Error>>>>;
+
+/// Single-flight registry for all window fetches, demand and prefetch alike:
+/// every part covered by an in-flight GET maps to its shared fetch, so anything
+/// touching those parts joins or trims around it instead of duplicating the
+/// GET. A plain mutex rather than a sharded map so a window can scan and
+/// register its parts atomically; never held across an await.
+type Fetches = Arc<Mutex<HashMap<PartKey, SharedFetch>>>;
 
 #[derive(Clone, Copy)]
 struct Stream {
@@ -86,28 +91,41 @@ impl AccessHistory {
             s.last_end = offset.saturating_add(len);
             s.fetch_window = (s.fetch_window * 2).min(FETCH_WINDOW_MAX);
 
-            // Refill the prefetch frontier to `PREFETCH_DEPTH_WINDOWS` windows ahead of
-            // the read, emitting one AsyncPrefetch per window still missing. Bounded per
-            // access by the depth so one record can't fan out unboundedly. Only once the
-            // window has ramped past the minimum (a stream is proven sequential) and the
-            // frontier is already ahead of the read.
+            // Refill the prefetch frontier to PREFETCH_DEPTH_WINDOWS ahead of the
+            // read, once the stream has proven sequential (window ramped past the
+            // minimum) and the frontier is ahead of the read. These are candidates
+            // only; the caller confirms coverage via note_fetch for the windows it
+            // actually arranged, so a dropped candidate can't leave a phantom hole.
             let mut async_prefetch = Vec::new();
             if s.fetch_window > FETCH_WINDOW_MIN && s.fetched_until > offset {
                 let window = s.fetch_window as u64;
                 let target = offset + PREFETCH_DEPTH_WINDOWS as u64 * window;
-                while s.fetched_until < target && async_prefetch.len() < PREFETCH_DEPTH_WINDOWS {
-                    let start = s.fetched_until;
+                let mut cursor = s.fetched_until;
+                while cursor < target && async_prefetch.len() < PREFETCH_DEPTH_WINDOWS {
                     async_prefetch.push(AsyncPrefetch {
-                        start,
+                        start: cursor,
                         size: s.fetch_window,
                     });
-                    s.fetched_until = start + window;
+                    cursor += window;
                 }
             }
 
             return RecordDecision {
                 fetch_window: s.fetch_window,
                 async_prefetch,
+            };
+        }
+
+        // FUSE readahead pipelines 9P READs, which can land slightly out of
+        // order. Absorb a read a little behind a stream's head without touching
+        // the head or ramping; a genuine backward seek (beyond the slack) still
+        // resets below. Min window on purpose: a straggler's bytes are already
+        // cached or in flight, and a random read that merely lands in the slack
+        // zone must not inherit an 8 MiB window over cold bytes.
+        if self.find_lagging_stream(offset, len).is_some() {
+            return RecordDecision {
+                fetch_window: FETCH_WINDOW_MIN,
+                async_prefetch: Vec::new(),
             };
         }
 
@@ -132,11 +150,18 @@ impl AccessHistory {
         }
     }
 
+    /// Credit a fetch reaching `fetch_end` to every stream it verifiably
+    /// extends. Looser than `find_stream` on purpose: by the time a window GET
+    /// completes under a concurrent pipeline its triggering offset is behind
+    /// the stream head, and requiring `offset >= last_offset` would drop
+    /// exactly the notes that bootstrap the frontier. Sound because a fetch
+    /// starting at or behind the confirmed frontier (or head) leaves no gap up
+    /// to `fetch_end`.
     fn note_fetch(&mut self, offset: u64, fetch_end: u64) {
-        if let Some(i) = self.find_stream(offset)
-            && fetch_end > self.streams[i].fetched_until
-        {
-            self.streams[i].fetched_until = fetch_end;
+        for s in &mut self.streams[..self.len] {
+            if fetch_end > s.fetched_until && offset <= s.fetched_until.max(s.last_end) {
+                s.fetched_until = fetch_end;
+            }
         }
     }
 
@@ -152,11 +177,10 @@ impl AccessHistory {
         min_idx
     }
 
-    /// Match `offset` to a stream: at or past the stream's last request start, and
-    /// within `stride_limit` of where that request ENDED. Measuring the gap from the
-    /// end rather than the start keeps large contiguous requests on their stream —
-    /// back-to-back 1 MiB coalesced frame runs have a start-to-start stride far
-    /// beyond any point-read stride, but a zero end-to-start gap.
+    /// Match `offset` to a stream: at or past its last request start, within
+    /// `stride_limit` of where that request ended. Measured from the end so
+    /// back-to-back 1 MiB coalesced runs stay on their stream: their
+    /// start-to-start stride is huge, their end-to-start gap zero.
     fn find_stream(&self, offset: u64) -> Option<usize> {
         let mut best = None;
         let mut best_dist = u64::MAX;
@@ -167,6 +191,29 @@ impl AccessHistory {
                 if dist < best_dist {
                     best = Some(i);
                     best_dist = dist;
+                }
+            }
+        }
+        best
+    }
+
+    /// Match a read arriving behind a stream's head, within a reorder slack
+    /// scaled by request size. Point reads get no slack, so a small backward
+    /// seek still resets its stream.
+    fn find_lagging_stream(&self, offset: u64, len: u64) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let slack = len.saturating_mul(8);
+        let mut best = None;
+        let mut best_lag = u64::MAX;
+        for i in 0..self.len {
+            let s = &self.streams[i];
+            if offset < s.last_offset {
+                let lag = s.last_offset - offset;
+                if lag <= slack && lag < best_lag {
+                    best = Some(i);
+                    best_lag = lag;
                 }
             }
         }
@@ -201,39 +248,48 @@ pub struct PrefetchingObjectStore {
     parts: HybridCache<PartKey, Bytes>,
     heads: Cache<Path, Arc<CachedHead>>,
     access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
-    in_flight: Arc<DashMap<PartKey, ()>>,
-    /// Single-flight for the read path: a part being fetched right now maps to the
-    /// shared fetch, so a burst of overlapping reads (main read + read-ahead) that
-    /// all miss the same part collapse into one GET instead of one GET each.
-    fetches: Arc<DashMap<PartKey, SharedFetch>>,
+    fetches: Fetches,
 }
 
-struct PrefetchGuard {
-    map: Arc<DashMap<PartKey, ()>>,
-    key: PartKey,
+/// Clonable handles for window fetches, which outlive `&self` (demand fetch
+/// futures and prefetch tasks are `'static`).
+#[derive(Clone)]
+struct FetchCtx {
+    inner: Arc<dyn ObjectStore>,
+    parts: HybridCache<PartKey, Bytes>,
+    heads: Cache<Path, Arc<CachedHead>>,
+    access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
+    fetches: Fetches,
+    part_size_bytes: usize,
 }
 
-impl Drop for PrefetchGuard {
-    fn drop(&mut self) {
-        self.map.remove(&self.key);
-    }
-}
-
-/// Held by the leader of a single-flight window fetch; clears every part slot it
-/// registered on drop, so the slots are released whether the fetch completes or the
-/// awaiting read is cancelled. Followers hold `None` — only the leader owns the
-/// registration.
+/// Held by the leader of a window fetch; clears its registered part slots on
+/// drop, whether the fetch completed or the awaiting read was cancelled.
+/// Joiners hold `None`.
 struct FetchGuard {
-    map: Arc<DashMap<PartKey, SharedFetch>>,
+    map: Fetches,
     keys: Vec<PartKey>,
 }
 
 impl Drop for FetchGuard {
     fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
         for key in &self.keys {
-            self.map.remove(key);
+            map.remove(key);
         }
     }
+}
+
+/// How a window fetch resolves against the registry: lead a new GET, join one
+/// already in flight, or nothing to do.
+enum WindowPlan {
+    Lead {
+        shared: SharedFetch,
+        guard: FetchGuard,
+        end_part: PartId,
+    },
+    Join(SharedFetch),
+    Covered,
 }
 
 impl PrefetchingObjectStore {
@@ -266,8 +322,18 @@ impl PrefetchingObjectStore {
             parts,
             heads,
             access_tracker,
-            in_flight: Arc::new(DashMap::new()),
-            fetches: Arc::new(DashMap::new()),
+            fetches: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn ctx(&self) -> FetchCtx {
+        FetchCtx {
+            inner: self.inner.clone(),
+            parts: self.parts.clone(),
+            heads: self.heads.clone(),
+            access_tracker: self.access_tracker.clone(),
+            fetches: self.fetches.clone(),
+            part_size_bytes: self.part_size_bytes,
         }
     }
 
@@ -337,9 +403,10 @@ impl PrefetchingObjectStore {
                 },
             )
             .await?;
-        let meta = result.meta.clone();
-        let _ = self.save_get_result(location, result).await;
-        Ok(meta)
+        // Save only the head: a backend that ignores `head` (InMemory) hands
+        // back the whole object, which must not bypass the parts discipline.
+        self.save_head(location, &result.meta, &result.attributes);
+        Ok(result.meta)
     }
 
     async fn cached_get_opts(
@@ -379,8 +446,17 @@ impl PrefetchingObjectStore {
         let decision = self.record_access(location, access_offset, access_len);
         let fetch_window = decision.fetch_window;
 
+        // Candidates are contiguous; confirm the frontier only up to the last
+        // one actually covered, so fetched_until never claims a hole.
+        let mut covered_to = None;
         for prefetch in decision.async_prefetch {
-            self.spawn_async_prefetch(location.clone(), prefetch);
+            match self.spawn_async_prefetch(location, prefetch) {
+                Some(end) => covered_to = Some(end),
+                None => break,
+            }
+        }
+        if let Some(end) = covered_to {
+            self.note_fetch(location, access_offset, end);
         }
 
         let (meta, attributes) = self
@@ -388,8 +464,8 @@ impl PrefetchingObjectStore {
             .await?;
         let range = self.canonicalize_range(opts.range.clone(), meta.size)?;
         // Each part's window reaches at least to the request's aligned end, so
-        // a large read is never split just because its bounds aren't
-        // part-aligned; the ramped fetch window applies when larger.
+        // a large read is never split by unaligned bounds; the ramped fetch
+        // window applies when larger.
         let end_part = usize::try_from(range.end.div_ceil(self.part_size_bytes as u64))
             .expect("part id exceeds usize");
         let parts = self.split_range_into_parts(range.clone());
@@ -418,88 +494,150 @@ impl PrefetchingObjectStore {
         })
     }
 
-    fn spawn_async_prefetch(&self, location: Path, prefetch: AsyncPrefetch) {
-        let part_size = self.part_size_bytes;
-        let part_size_u64 = part_size as u64;
+    /// Cover a prefetch window: front-trim past parts already cached or in
+    /// flight, then spawn one GET per remaining gap through the shared
+    /// registry. Returns the offset covered to, or `None` if nothing could be
+    /// arranged (the caller must not advance the frontier past it).
+    fn spawn_async_prefetch(&self, location: &Path, prefetch: AsyncPrefetch) -> Option<u64> {
+        let part_size_u64 = self.part_size_bytes as u64;
+        let window_end = prefetch.start + prefetch.size as u64;
+        let head_size = self.read_head(location).map(|(meta, _)| meta.size);
+
+        // A stream nearing EOF pushes the frontier past the end, and a GET
+        // starting there is unsatisfiable (HTTP 416). Count the window as
+        // covered so the frontier settles past EOF and stops re-emitting it.
+        // A window merely ending past EOF is fine: the backend truncates.
+        if let Some(size) = head_size
+            && prefetch.start >= size
+        {
+            return Some(window_end);
+        }
 
         if !prefetch.start.is_multiple_of(part_size_u64) {
-            return;
+            return None;
         }
 
-        // The frontier has no notion of object length, so a stream nearing EOF
-        // pushes it past the end. A GET starting there is unsatisfiable
-        // (HTTP 416) — drop it. A window merely *ending* past EOF is fine: the
-        // backend truncates it.
-        if let Some((meta, _)) = self.read_head(&location)
-            && prefetch.start >= meta.size
-        {
-            return;
+        let start_part: PartId = (prefetch.start / part_size_u64).try_into().ok()?;
+        let want_parts = prefetch.size.div_ceil(self.part_size_bytes).max(1);
+        let mut end_part = start_part + want_parts;
+        // Clamp the walk at EOF: front-trimming through a cached tail must not
+        // lead a GET starting at or past the object's end (the same HTTP 416).
+        if let Some(size) = head_size {
+            let eof_part: PartId = size.div_ceil(part_size_u64).try_into().ok()?;
+            end_part = end_part.min(eof_part);
         }
 
-        let start_part: PartId = match (prefetch.start / part_size_u64).try_into() {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let key = PartKey::new(&location, start_part);
-        // A read is already fetching a window that covers this part — don't launch an
-        // overlapping read-ahead GET for it.
-        if self.fetches.contains_key(&key) {
-            return;
-        }
-        if self.in_flight.insert(key.clone(), ()).is_some() {
-            return;
-        }
-
-        let guard = PrefetchGuard {
-            map: self.in_flight.clone(),
-            key,
-        };
-        let inner = self.inner.clone();
-        let parts_cache = self.parts.clone();
-        let access_tracker = self.access_tracker.clone();
-        let access_offset = prefetch.start;
-
-        let range = Range {
-            start: prefetch.start,
-            end: prefetch.start + prefetch.size as u64,
-        };
-
-        tokio::spawn(async move {
-            let _guard = guard;
-            if let Ok(Some(_)) = parts_cache.get(&PartKey::new(&location, start_part)).await {
-                return;
+        let ctx = self.ctx();
+        let mut part = start_part;
+        while part < end_part {
+            match Self::plan_window(
+                &ctx,
+                location,
+                part,
+                end_part - part,
+                Some(end_part),
+                prefetch.start,
+            ) {
+                WindowPlan::Covered => break,
+                WindowPlan::Lead {
+                    shared,
+                    guard,
+                    end_part: lead_end,
+                } => {
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        // Errors are contained: the parts stay uncached and a
+                        // demand read fetches them itself.
+                        let _ = shared.await;
+                    });
+                    part = lead_end;
+                }
+                // Fully covered by an in-flight fetch: as good as covered here.
+                WindowPlan::Join(_) => break,
             }
-            let get_result = match inner
-                .get_opts(
-                    &location,
-                    GetOptions {
-                        range: Some(GetRange::Bounded(range.clone())),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            let actual_end = get_result.range.end;
-            let stream = get_result.into_stream();
-            if Self::save_parts_stream_static(
-                &parts_cache,
-                part_size,
-                &location,
-                stream,
-                start_part,
-            )
-            .await
-            .is_ok()
-                && let Some(entry) = access_tracker.get(&location)
-            {
-                let hist = entry.value().clone();
-                hist.lock().unwrap().note_fetch(access_offset, actual_end);
+        }
+        Some(window_end)
+    }
+
+    /// Plan a window of up to `max_parts` from `start_part`, scanning and
+    /// registering under one lock so concurrent planners can't overlap.
+    /// `front_trim` (`Some(needed_end)`) skips leading parts already cached or
+    /// in flight, and refuses to lead past `needed_end`, the last part known
+    /// to exist: beyond it a GET could start at or past EOF. If the skip
+    /// crossed an in-flight fetch, that fetch is joined so a caller needing
+    /// its side effects (the head install) can await it; `Covered` means cache
+    /// alone suffices. A demand caller (`None`) just missed `start_part` and
+    /// joins whatever is registered there, or leads. Led spans are end-trimmed
+    /// at the first covered part; on a cold object nothing trims and a large
+    /// contiguous read stays one GET.
+    fn plan_window(
+        ctx: &FetchCtx,
+        location: &Path,
+        start_part: PartId,
+        max_parts: usize,
+        front_trim: Option<PartId>,
+        access_offset: u64,
+    ) -> WindowPlan {
+        let limit = start_part + max_parts.max(1);
+        let mut map = ctx.fetches.lock().unwrap();
+
+        let covered = |map: &HashMap<PartKey, SharedFetch>, part: PartId| {
+            let key = PartKey::new(location, part);
+            map.contains_key(&key) || ctx.parts.contains(&key)
+        };
+
+        let mut start = start_part;
+        if let Some(needed_end) = front_trim {
+            let mut in_flight = None;
+            while start < limit {
+                let key = PartKey::new(location, start);
+                if let Some(fut) = map.get(&key) {
+                    if in_flight.is_none() {
+                        in_flight = Some(fut.clone());
+                    }
+                } else if !ctx.parts.contains(&key) {
+                    break;
+                }
+                start += 1;
             }
-        });
+            if start >= limit.min(needed_end) {
+                return match in_flight {
+                    Some(fut) => WindowPlan::Join(fut),
+                    None => WindowPlan::Covered,
+                };
+            }
+        } else if let Some(fut) = map.get(&PartKey::new(location, start)) {
+            return WindowPlan::Join(fut.clone());
+        }
+
+        let mut end = start + 1;
+        while end < limit && !covered(&map, end) {
+            end += 1;
+        }
+
+        let fut = Self::fetch_part_window(
+            ctx.clone(),
+            location.clone(),
+            start,
+            end - start,
+            access_offset,
+        )
+        .boxed()
+        .shared();
+        let mut keys = Vec::with_capacity(end - start);
+        for part in start..end {
+            let key = PartKey::new(location, part);
+            map.insert(key.clone(), fut.clone());
+            keys.push(key);
+        }
+        WindowPlan::Lead {
+            shared: fut,
+            guard: FetchGuard {
+                map: ctx.fetches.clone(),
+                keys,
+            },
+            end_part: end,
+        }
     }
 
     async fn maybe_prefetch_range(
@@ -513,6 +651,66 @@ impl PrefetchingObjectStore {
             return Ok((meta, attrs));
         }
 
+        // Head miss on a bounded read: plan the demand window through the
+        // shared registry so concurrent cold readers and in-flight prefetches
+        // share one GET, and cached parts aren't re-fetched after a head
+        // eviction. The window GET installs the head; if others already cover
+        // the window, fall back to a payload-free HEAD. Lead errors aren't
+        // surfaced here: the HEAD and `read_part` report real failures with
+        // the right context.
+        if let Some(GetRange::Bounded(r)) = &opts.range {
+            let aligned = match self.align_get_range(&GetRange::Bounded(r.clone()), fetch_window) {
+                GetRange::Bounded(a) => a,
+                _ => unreachable!("bounded ranges align to bounded"),
+            };
+            let part_size = self.part_size_bytes as u64;
+            let start_part: PartId = (aligned.start / part_size)
+                .try_into()
+                .expect("part id exceeds usize");
+            let end_part: PartId = aligned
+                .end
+                .div_ceil(part_size)
+                .try_into()
+                .expect("part id exceeds usize");
+            // Without the head, only the request's own bytes are known to
+            // exist; once those are covered, resolve the head with a HEAD
+            // below rather than leading the remainder blind (it could start
+            // at EOF).
+            let needed_end: PartId = r
+                .end
+                .div_ceil(part_size)
+                .try_into()
+                .expect("part id exceeds usize");
+            let ctx = self.ctx();
+            match Self::plan_window(
+                &ctx,
+                location,
+                start_part,
+                end_part - start_part,
+                Some(needed_end),
+                access_offset,
+            ) {
+                WindowPlan::Lead { shared, guard, .. } => {
+                    let _guard = guard;
+                    let _ = shared.await;
+                }
+                // Covered by an in-flight fetch whose completion installs the
+                // head; awaiting it beats an extra HEAD round trip.
+                WindowPlan::Join(shared) => {
+                    let _ = shared.await;
+                }
+                WindowPlan::Covered => {}
+            }
+            if let Some((meta, attrs)) = self.read_head(location) {
+                return Ok((meta, attrs));
+            }
+            let meta = self.cached_head(location).await?;
+            let attrs = self.read_head(location).map(|(_, a)| a).unwrap_or_default();
+            return Ok((meta, attrs));
+        }
+
+        // None/Offset/Suffix reads need the object size before parts can be
+        // planned: one direct aligned GET whose payload caches as parts.
         if let Some(range) = &opts.range {
             opts.range = Some(self.align_get_range(range, fetch_window));
         }
@@ -534,19 +732,28 @@ impl PrefetchingObjectStore {
         self.save_head(location, &result.meta, &result.attributes);
 
         let part_size = self.part_size_bytes as u64;
-        let aligned_start = result.range.start.is_multiple_of(part_size);
         let aligned_end =
             result.range.end.is_multiple_of(part_size) || result.range.end == result.meta.size;
-        if !(aligned_start && aligned_end) {
+        if !aligned_end {
             return Ok(());
         }
 
-        let start_part: PartId = (result.range.start / part_size)
+        // An unaligned start (a suffix GET on an unaligned object) still holds
+        // whole parts past the first boundary; skip the partial head rather
+        // than discard the payload, so the demand read behind this GET hits
+        // cache instead of re-fetching the tail.
+        let skip = result.range.start.next_multiple_of(part_size) - result.range.start;
+        let first_full = result.range.start + skip;
+        if first_full >= result.range.end {
+            return Ok(());
+        }
+        let start_part: PartId = (first_full / part_size)
             .try_into()
             .expect("part number exceeds usize");
 
         let stream = result.into_stream();
-        self.save_parts_stream(location, stream, start_part).await
+        self.save_parts_stream(location, stream, start_part, skip as usize)
+            .await
     }
 
     async fn save_parts_stream<S>(
@@ -554,6 +761,7 @@ impl PrefetchingObjectStore {
         location: &Path,
         stream: S,
         start_part_number: PartId,
+        skip_bytes: usize,
     ) -> object_store::Result<()>
     where
         S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
@@ -564,6 +772,7 @@ impl PrefetchingObjectStore {
             location,
             stream,
             start_part_number,
+            skip_bytes,
         )
         .await
     }
@@ -574,6 +783,7 @@ impl PrefetchingObjectStore {
         location: &Path,
         mut stream: S,
         start_part_number: PartId,
+        mut skip: usize,
     ) -> object_store::Result<()>
     where
         S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
@@ -581,26 +791,41 @@ impl PrefetchingObjectStore {
         let mut buffer = BytesMut::new();
         let mut part_number = start_part_number;
 
+        // Owned copies: `split_to(..).freeze()` would share the BytesMut
+        // allocation between neighbouring parts, invisibly to the weigher.
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let mut chunk = chunk?;
+            if skip > 0 {
+                let n = skip.min(chunk.len());
+                chunk = chunk.slice(n..);
+                skip -= n;
+                if chunk.is_empty() {
+                    continue;
+                }
+            }
             buffer.extend_from_slice(&chunk);
             while buffer.len() >= part_size_bytes {
                 let to_write = buffer.split_to(part_size_bytes);
-                parts.insert(PartKey::new(location, part_number), to_write.freeze());
+                parts.insert(
+                    PartKey::new(location, part_number),
+                    Bytes::copy_from_slice(&to_write),
+                );
                 part_number += 1;
             }
         }
 
         if !buffer.is_empty() {
-            parts.insert(PartKey::new(location, part_number), buffer.freeze());
+            parts.insert(
+                PartKey::new(location, part_number),
+                Bytes::copy_from_slice(&buffer),
+            );
         }
         Ok(())
     }
 
-    /// Write-through: populate the parts cache from a just-uploaded object's
-    /// bytes. A single-chunk payload slices zero-copy; multi-chunk
-    /// concatenates once. Inserts are synchronous (foyer flushes to disk in
-    /// the background), so this adds no I/O wait to the put.
+    /// Populate the parts cache from a just-uploaded object's bytes. Inserts
+    /// are synchronous (foyer flushes to disk in the background), so this adds
+    /// no I/O wait to the put.
     fn write_through(&self, location: &Path, payload: PutPayload) {
         let chunks: Vec<Bytes> = payload.into_iter().collect();
         let bytes = match chunks.len() {
@@ -626,8 +851,14 @@ impl PrefetchingObjectStore {
         let mut part_id: PartId = 0;
         while off < bytes.len() {
             let end = (off + ps).min(bytes.len());
-            self.parts
-                .insert(PartKey::new(location, part_id), bytes.slice(off..end));
+            // Owned copy, not `bytes.slice(..)`: a slice keeps the whole
+            // source allocation (a 256 MiB sealed segment) alive while any
+            // one part survives in the cache, and the weigher only sees the
+            // slice length. That was the multi-GB RSS retention bug.
+            self.parts.insert(
+                PartKey::new(location, part_id),
+                Bytes::copy_from_slice(&bytes[off..end]),
+            );
             off = end;
             part_id += 1;
         }
@@ -673,101 +904,113 @@ impl PrefetchingObjectStore {
         fetch_window: usize,
         access_offset: u64,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
-        let inner = self.inner.clone();
-        let part_size_bytes = self.part_size_bytes;
-        let parts = self.parts.clone();
-        let heads = self.heads.clone();
-        let access_tracker = self.access_tracker.clone();
-        let fetches = self.fetches.clone();
+        let ctx = self.ctx();
         Box::pin(async move {
+            let part_size_bytes = ctx.part_size_bytes;
             let key = PartKey::new(&location, part_id);
-            if let Ok(Some(entry)) = parts.get(&key).await {
+            if let Ok(Some(entry)) = ctx.parts.get(&key).await {
                 let bytes = entry.value().clone();
                 if range_in_part.end <= bytes.len() {
                     return Ok(bytes.slice(range_in_part));
                 }
-                parts.remove(&key);
+                ctx.parts.remove(&key);
             }
 
             // Single-flight the miss over the whole window: overlapping reads
-            // whose part lands inside it join the one GET. The leader
-            // registers every covered part and holds a `FetchGuard` that
-            // clears them on drop, so a cancelled read can't strand a slot.
+            // join the one GET. The leader holds a `FetchGuard` so a cancelled
+            // read can't strand registry slots.
             let extra_parts = (fetch_window / part_size_bytes).max(1);
-            let (shared, _guard) = match fetches.entry(key.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(e) => (e.get().clone(), None),
-                dashmap::mapref::entry::Entry::Vacant(e) => {
-                    let fut = Self::fetch_part_window(
-                        inner,
-                        parts,
-                        heads,
-                        access_tracker,
-                        location.clone(),
-                        part_id,
-                        part_size_bytes,
-                        extra_parts,
-                        access_offset,
-                    )
-                    .boxed()
-                    .shared();
-                    e.insert(fut.clone());
-                    let mut keys = Vec::with_capacity(extra_parts);
-                    keys.push(key.clone());
-                    for i in 1..extra_parts {
-                        let k = PartKey::new(&location, part_id + i);
-                        fetches.insert(k.clone(), fut.clone());
-                        keys.push(k);
+            let (shared, guard) =
+                match Self::plan_window(&ctx, &location, part_id, extra_parts, None, access_offset)
+                {
+                    WindowPlan::Join(shared) => (shared, None),
+                    WindowPlan::Lead { shared, guard, .. } => (shared, Some(guard)),
+                    // Unreachable without front-trimming; handle it as a
+                    // direct fetch anyway.
+                    WindowPlan::Covered => {
+                        return Self::fetch_single_part(&ctx, &location, part_id, range_in_part)
+                            .await;
                     }
-                    (
-                        fut,
-                        Some(FetchGuard {
-                            map: fetches.clone(),
-                            keys,
-                        }),
-                    )
+                };
+            let leading = guard.is_some();
+            let _guard = guard;
+            match shared.await {
+                Ok((base, window)) => {
+                    let off = part_id.saturating_sub(base) * part_size_bytes;
+                    if off >= window.len() {
+                        // Window EOF-truncated short of this part.
+                        return Ok(Bytes::new());
+                    }
+                    let part_end = (off + part_size_bytes).min(window.len());
+                    let part_bytes = window.slice(off..part_end);
+                    let end = range_in_part.end.min(part_bytes.len());
+                    let start = range_in_part.start.min(end);
+                    Ok(part_bytes.slice(start..end))
                 }
-            };
-            let (base, window) = shared.await.map_err(|e| object_store::Error::Generic {
-                store: "PrefetchingObjectStore",
-                source: format!("shared part fetch failed: {e}").into(),
-            })?;
-            let off = part_id.saturating_sub(base) * part_size_bytes;
-            if off >= window.len() {
-                return Ok(Bytes::new());
+                Err(e) if leading => Err(object_store::Error::Generic {
+                    store: "PrefetchingObjectStore",
+                    source: format!("shared part fetch failed: {e}").into(),
+                }),
+                // A joined fetch (possibly an async prefetch) failed; its
+                // error must not fail this read. Retry just this part.
+                Err(_) => Self::fetch_single_part(&ctx, &location, part_id, range_in_part).await,
             }
-            let part_end = (off + part_size_bytes).min(window.len());
-            let part_bytes = window.slice(off..part_end);
-            let end = range_in_part.end.min(part_bytes.len());
-            let start = range_in_part.start.min(end);
-            Ok(part_bytes.slice(start..end))
         })
     }
 
-    /// Fetch `window_parts` parts starting at `part_id` in one GET, cache every
-    /// part spanned, and return `(part_id, window bytes)`. `window_parts` comes
-    /// from the caller so the GET's span matches the part slots registered
-    /// under the shared fetch. `access_offset` is the triggering request's
-    /// start offset: the stream tracker keys on request offsets, so crediting
-    /// the aligned window start instead would miss the stream for an unaligned
-    /// read and the prefetch pipeline would never engage.
-    #[allow(clippy::too_many_arguments)]
+    /// Direct one-part GET, bypassing the registry: the fallback when a shared
+    /// fetch this read joined fails.
+    async fn fetch_single_part(
+        ctx: &FetchCtx,
+        location: &Path,
+        part_id: PartId,
+        range_in_part: Range<usize>,
+    ) -> object_store::Result<Bytes> {
+        let part_size_bytes = ctx.part_size_bytes;
+        let range = Range {
+            start: (part_id * part_size_bytes) as u64,
+            end: ((part_id + 1) * part_size_bytes) as u64,
+        };
+        let get_result = ctx
+            .inner
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(range)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let bytes = get_result.bytes().await?;
+        ctx.parts.insert(
+            PartKey::new(location, part_id),
+            Bytes::copy_from_slice(&bytes),
+        );
+        let end = range_in_part.end.min(bytes.len());
+        let start = range_in_part.start.min(end);
+        Ok(bytes.slice(start..end))
+    }
+
+    /// One GET spanning `window_parts` from `part_id`; caches every part and
+    /// resolves to `(part_id, window bytes)`. `access_offset` is the
+    /// triggering request's start: the stream tracker keys on request
+    /// offsets, so crediting the aligned window start instead would miss the
+    /// stream on unaligned reads and the pipeline would never engage.
     async fn fetch_part_window(
-        inner: Arc<dyn ObjectStore>,
-        parts: HybridCache<PartKey, Bytes>,
-        heads: Cache<Path, Arc<CachedHead>>,
-        access_tracker: Cache<Path, Arc<Mutex<AccessHistory>>>,
+        ctx: FetchCtx,
         location: Path,
         part_id: PartId,
-        part_size_bytes: usize,
         window_parts: usize,
         access_offset: u64,
     ) -> Result<(PartId, Bytes), Arc<object_store::Error>> {
+        let part_size_bytes = ctx.part_size_bytes;
         let fetch_start = part_id;
         let fetch_range = Range {
             start: (fetch_start * part_size_bytes) as u64,
             end: ((fetch_start + window_parts) * part_size_bytes) as u64,
         };
-        let get_result = inner
+        let get_result = ctx
+            .inner
             .get_opts(
                 &location,
                 GetOptions {
@@ -782,14 +1025,14 @@ impl PrefetchingObjectStore {
         let actual_end = get_result.range.end;
         let all_bytes = get_result.bytes().await.map_err(Arc::new)?;
 
-        heads.insert(
+        ctx.heads.insert(
             location.clone(),
             Arc::new(CachedHead {
                 meta,
                 attributes: attrs,
             }),
         );
-        if let Some(entry) = access_tracker.get(&location) {
+        if let Some(entry) = ctx.access_tracker.get(&location) {
             entry
                 .value()
                 .clone()
@@ -803,9 +1046,11 @@ impl PrefetchingObjectStore {
                 break;
             }
             let end = ((i + 1) * part_size_bytes).min(all_bytes.len());
-            parts.insert(
+            // Owned copy: a slice would pin the whole window allocation for
+            // as long as any one part survives in the cache.
+            ctx.parts.insert(
                 PartKey::new(&location, fetch_start + i),
-                all_bytes.slice(start..end),
+                Bytes::copy_from_slice(&all_bytes[start..end]),
             );
         }
         Ok((fetch_start, all_bytes))
@@ -940,7 +1185,6 @@ impl ObjectStore for PrefetchingObjectStore {
         &self,
         locations: BoxStream<'static, object_store::Result<Path>>,
     ) -> BoxStream<'static, object_store::Result<Path>> {
-        // Invalidate each successfully deleted path's cached head as it passes.
         let heads = self.heads.clone();
         self.inner
             .delete_stream(locations)
@@ -1242,12 +1486,15 @@ mod tests {
             n <= 3,
             "expected coalescing, got {n} GETs for 16 overlapping reads"
         );
-        assert!(store.fetches.is_empty(), "fetch slots leaked");
+        assert!(
+            store.fetches.lock().unwrap().is_empty(),
+            "fetch slots leaked"
+        );
     }
 
-    // A contiguous read larger than the fetch window whose bounds are not
-    // part-aligned (every coalesced frame run) must reach the object store as ONE
-    // GET: the unaligned tail part must not fall outside the leader's window and
+    // A contiguous read larger than the fetch window with unaligned bounds
+    // (every coalesced frame run) must reach the object store as one GET: the
+    // unaligned tail part must not fall outside the leader's window and
     // trigger a second, overfetching GET.
     #[tokio::test]
     async fn unaligned_large_read_is_one_get() {
@@ -1309,7 +1556,7 @@ mod tests {
         let body: Vec<u8> = (0..2560u32).map(|i| i as u8).collect();
         store.put(&path, body.clone().into()).await.unwrap();
 
-        // The put populated every part — a read needs no object-store GET.
+        // The put populated every part; a read needs no object-store GET.
         for (part_id, range) in [(0usize, 0..1024usize), (1, 1024..2048), (2, 2048..2560)] {
             let entry = store
                 .parts
@@ -1325,8 +1572,8 @@ mod tests {
     async fn warm_object_populates_parts_cache() {
         let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
         let path = Path::from("segments/3b/seg");
-        // 2.5 parts: parts 0 and 1 full, part 2 partial (512). No object-store put —
-        // warm_object caches from bytes held in hand (the multipart-seal case).
+        // 2.5 parts: parts 0 and 1 full, part 2 partial (512). No object-store
+        // put: warm_object caches bytes held in hand (the multipart-seal case).
         let body: Vec<u8> = (0..2560u32).map(|i| i as u8).collect();
         store.warm_object(&path, body.clone().into());
 
@@ -1582,7 +1829,9 @@ mod tests {
         let part_size = 64 * 1024;
         let seq_reads = 7;
         let max_window_parts = FETCH_WINDOW_MAX / part_size;
-        let total_parts = seq_reads + max_window_parts + 4;
+        // Large enough that EOF sits beyond any legitimate prefetch reach, so the
+        // boundedness assertion below is meaningful.
+        let total_parts = seq_reads + (PREFETCH_DEPTH_WINDOWS + 1) * max_window_parts + 8;
         let (store, inner, _dir) = make_store(part_size, 64 * MEM, 4 * DISK).await;
         let path = Path::from("seq");
         let body = vec![0xABu8; part_size * total_parts];
@@ -1627,11 +1876,19 @@ mod tests {
                 .is_some(),
             "part {last_prefetched_part} should be prefetched at max window"
         );
-        let beyond_part = last_prefetched_part + 1;
-        assert!(
-            store.cached_part(&path, beyond_part).await.is_none(),
-            "part {beyond_part} should NOT be prefetched (beyond fetch window)"
-        );
+
+        // The frontier keeps at most PREFETCH_DEPTH_WINDOWS ramped windows
+        // ahead of the last read, and a window fetch overshoots the target by
+        // less than one window; nothing may be cached past that bound.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let bound_part =
+            (next_start as usize + (PREFETCH_DEPTH_WINDOWS + 1) * FETCH_WINDOW_MAX) / part_size;
+        for part in bound_part..total_parts {
+            assert!(
+                store.cached_part(&path, part).await.is_none(),
+                "part {part} cached beyond the prefetch depth bound {bound_part}"
+            );
+        }
     }
 
     #[test]
@@ -1643,6 +1900,27 @@ mod tests {
         h.record(2048, 0);
         assert_eq!(h.record(3072, 0).fetch_window, FETCH_WINDOW_MIN * 8);
         assert_eq!(h.record(1024, 0).fetch_window, FETCH_WINDOW_MIN);
+    }
+
+    // A read absorbed behind a ramped stream's head must not inherit the
+    // stream's window: over cold bytes that would turn a random read landing
+    // in the slack zone into an up-to-8 MiB demand GET.
+    #[test]
+    fn lagging_read_uses_min_window() {
+        let m = 1024 * 1024u64;
+        let mut h = AccessHistory::new(DEFAULT_PART_SIZE_BYTES);
+        for i in 0..8 {
+            h.record(i * m, m);
+        }
+        assert_eq!(h.streams[0].fetch_window, FETCH_WINDOW_MAX);
+
+        // 2 MiB behind the head, within the 8 MiB slack: absorbed, min window.
+        let d = h.record(5 * m, m);
+        assert_eq!(d.fetch_window, FETCH_WINDOW_MIN);
+        assert!(d.async_prefetch.is_empty());
+
+        // The absorption left the head alone: the stream continues ramped.
+        assert_eq!(h.record(8 * m, m).fetch_window, FETCH_WINDOW_MAX);
     }
 
     #[tokio::test]
@@ -1845,6 +2123,34 @@ mod tests {
         assert_eq!(h.streams[0].fetched_until, 4096);
     }
 
+    // A demand window GET completes after concurrent readers have advanced the
+    // stream head past its leader's offset; the note must still credit the
+    // stream, or the frontier never bootstraps and async prefetch stays dead.
+    #[test]
+    fn note_fetch_credits_lagging_window_leader() {
+        let mut h = AccessHistory::new(1024);
+        h.record(0, 1024);
+        h.record(1024, 1024);
+        h.record(2048, 1024);
+        h.note_fetch(0, 16 * 1024);
+        assert_eq!(h.streams[0].fetched_until, 16 * 1024);
+    }
+
+    // The looser matcher must not let one stream's fetch inflate another
+    // stream's frontier (phantom coverage would silence its prefetch).
+    #[test]
+    fn note_fetch_ignores_unrelated_stream() {
+        let mut h = AccessHistory::new(1024);
+        h.record(0, 1024);
+        h.record(1_000_000, 1024);
+        h.note_fetch(1_000_000, 1_016_384);
+        assert_eq!(
+            h.streams[0].fetched_until, 0,
+            "far fetch must not advance the near stream's frontier"
+        );
+        assert_eq!(h.streams[1].fetched_until, 1_016_384);
+    }
+
     #[tokio::test]
     async fn async_prefetch_fills_cache_ahead_of_consumer() {
         let part_size = 64 * 1024;
@@ -1901,37 +2207,49 @@ mod tests {
         );
     }
 
+    // Two overlapping async prefetch windows must collapse onto one backend GET:
+    // the second finds every part registered by the first and does nothing.
     #[tokio::test]
-    async fn spawn_async_prefetch_dedups_via_in_flight() {
+    async fn overlapping_async_prefetches_dedup_to_one_get() {
         let part_size = 1024;
-        let (store, inner, _dir) = make_store(part_size, MEM, DISK).await;
+        let mem = Arc::new(InMemory::new());
         let path = Path::from("dedup");
         let body = vec![0xAAu8; part_size * 32];
-        inner.put(&path, body.clone().into()).await.unwrap();
+        mem.put(&path, body.clone().into()).await.unwrap();
 
-        let start_part = 5;
-        let key = PartKey::new(&path, start_part);
-        store.in_flight.insert(key.clone(), ());
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting: Arc<dyn ObjectStore> = Arc::new(CountingStore {
+            inner: mem,
+            gets: gets.clone(),
+            delay: std::time::Duration::from_millis(50),
+        });
+        let (store, _dir) = store_over(counting, part_size).await;
 
-        store.spawn_async_prefetch(
-            path.clone(),
-            AsyncPrefetch {
-                start: (start_part * part_size) as u64,
-                size: part_size * 4,
-            },
+        let prefetch = AsyncPrefetch {
+            start: (5 * part_size) as u64,
+            size: part_size * 4,
+        };
+        assert_eq!(
+            store.spawn_async_prefetch(&path, prefetch),
+            Some((5 * part_size + 4 * part_size) as u64)
+        );
+        assert_eq!(
+            store.spawn_async_prefetch(&path, prefetch),
+            Some((5 * part_size + 4 * part_size) as u64),
+            "an in-flight window still counts as covered"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        assert!(
-            store.cached_part(&path, start_part).await.is_none(),
-            "duplicate prefetch should have been skipped"
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "second prefetch of the same window must not GET"
         );
-        assert!(store.in_flight.contains_key(&key));
+        assert!(store.cached_part(&path, 5).await.is_some());
     }
 
     #[tokio::test]
-    async fn prefetch_guard_releases_in_flight_on_drop() {
+    async fn fetch_slots_released_after_async_prefetch() {
         let part_size = 1024;
         let (store, inner, _dir) = make_store(part_size, MEM, DISK).await;
         let path = Path::from("guard");
@@ -1940,7 +2258,7 @@ mod tests {
 
         let start_part = 2;
         store.spawn_async_prefetch(
-            path.clone(),
+            &path,
             AsyncPrefetch {
                 start: (start_part * part_size) as u64,
                 size: part_size * 4,
@@ -1948,27 +2266,22 @@ mod tests {
         );
 
         for _ in 0..100 {
-            if !store
-                .in_flight
-                .contains_key(&PartKey::new(&path, start_part))
-            {
+            if store.fetches.lock().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
-            !store
-                .in_flight
-                .contains_key(&PartKey::new(&path, start_part)),
-            "in_flight key should be released after prefetch completes"
+            store.fetches.lock().unwrap().is_empty(),
+            "fetch slots should be released after prefetch completes"
         );
+        assert!(store.cached_part(&path, start_part).await.is_some());
     }
 
     // The async prefetch frontier must stop at EOF. It advances in fixed
-    // windows with no notion of the object's length, so a sequential stream
-    // near the end would otherwise emit windows starting past EOF — GETs the
-    // backend rejects as unsatisfiable (HTTP 416) and that a retrying layer
-    // below would re-send forever.
+    // windows with no notion of object length, so near the end it would
+    // otherwise emit windows starting past EOF: GETs the backend rejects
+    // (HTTP 416) and a retrying layer below would re-send forever.
     #[tokio::test]
     async fn async_prefetch_never_fetches_past_eof() {
         let part_size = 1024;
@@ -2000,6 +2313,857 @@ mod tests {
                     "GET issued past EOF: {b:?} (object is {len} bytes)"
                 );
             }
+        }
+    }
+
+    // A head miss near EOF on a fully cached object must resolve the head with
+    // a HEAD, not lead the demand window's remainder: front-trimming the cached
+    // parts reaches EOF, so that GET would start exactly there (HTTP 416) and
+    // block the read on a doomed round trip.
+    #[tokio::test]
+    async fn head_miss_near_eof_does_not_lead_past_cached_request() {
+        let part_size = 1024;
+        let len = 512 * 1024usize;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("eofhead");
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        // Write-through caches every part but leaves the head invalidated.
+        store.put(&path, body.clone().into()).await.unwrap();
+        ranges.lock().unwrap().clear();
+
+        let (off, end) = (500 * 1024u64, 504 * 1024u64);
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(off..end)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[off as usize..end as usize]);
+
+        let seen = ranges.lock().unwrap().clone();
+        assert!(
+            seen.is_empty(),
+            "fully cached near-EOF read needs no ranged GET, got {seen:?}"
+        );
+        assert!(store.read_head(&path).is_some(), "head restored via HEAD");
+    }
+
+    // A resident tail must not let the async prefetch walk front-trim through
+    // it and lead a GET starting at EOF: with the head known, the walk is
+    // clamped to the object's end.
+    #[tokio::test]
+    async fn cached_tail_prefetch_does_not_get_past_eof() {
+        let part_size = 1024;
+        let len = 4 * FETCH_WINDOW_MIN;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("eoftail");
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        for part_id in (len / 2 / part_size)..(len / part_size) {
+            store.parts.insert(
+                PartKey::new(&path, part_id),
+                Bytes::copy_from_slice(&body[part_id * part_size..(part_id + 1) * part_size]),
+            );
+        }
+        let _ = store.head(&path).await.unwrap();
+
+        // Sequential reads ramp the window and refill the frontier; its later
+        // windows front-trim across the cached tail up to EOF.
+        store.get_range(&path, 0..1024).await.unwrap();
+        store.get_range(&path, 1024..2048).await.unwrap();
+        store.get_range(&path, 2048..3072).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let seen = ranges.lock().unwrap().clone();
+        assert!(!seen.is_empty());
+        for r in &seen {
+            if let GetRange::Bounded(b) = r {
+                assert!(
+                    b.start < len as u64,
+                    "GET issued at/past EOF: {b:?} (object is {len} bytes)"
+                );
+            }
+        }
+    }
+
+    /// Records every bounded GET range and delays each GET, so concurrent
+    /// reads overlap in flight like they do against S3.
+    #[derive(Debug)]
+    struct DelayRecordingStore {
+        inner: Arc<InMemory>,
+        ranges: Arc<std::sync::Mutex<Vec<Range<u64>>>>,
+        delay: std::time::Duration,
+    }
+
+    impl Display for DelayRecordingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "DelayRecordingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for DelayRecordingStore {
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            if let Some(GetRange::Bounded(r)) = &o.range {
+                self.ranges.lock().unwrap().push(r.clone());
+            }
+            tokio::time::sleep(self.delay).await;
+            self.inner.get_opts(l, o).await
+        }
+        async fn put_opts(
+            &self,
+            l: &Path,
+            p: PutPayload,
+            o: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+        async fn rename_opts(
+            &self,
+            f: &Path,
+            t: &Path,
+            o: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(f, t, o).await
+        }
+    }
+
+    /// Stream a 48 MiB object in 1 MiB chunks pulled off a shared counter by
+    /// `concurrency` workers (the shape FUSE readahead + concurrent 9P READs
+    /// produce: mostly in order, several in flight, small reorder) and return
+    /// `(bytes fetched from the backend clamped to EOF, union coverage, GETs,
+    /// final prefetch frontier)`. `warm_head` pre-installs the head, the
+    /// production steady state for segments: without the cold head GETs the
+    /// frontier can only bootstrap from window-fetch completion notes.
+    async fn run_amplification(concurrency: usize, warm_head: bool) -> (u64, u64, usize, u64) {
+        let part = DEFAULT_PART_SIZE_BYTES;
+        let len: u64 = 48 * 1024 * 1024;
+        let chunk: u64 = 1024 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/22/seg");
+        mem.put(&path, vec![0xA5u8; len as usize].into())
+            .await
+            .unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn ObjectStore> = Arc::new(DelayRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+            delay: std::time::Duration::from_millis(15),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let parts = HybridCacheBuilder::new()
+            .with_name("amp-parts")
+            .memory(256 * 1024 * 1024)
+            .with_weighter(|_: &PartKey, v: &Bytes| v.len())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(
+                BlockEngineConfig::new(
+                    foyer::DeviceBuilder::build(
+                        FsDeviceBuilder::new(dir.path()).with_capacity(512 * 1024 * 1024),
+                    )
+                    .unwrap(),
+                )
+                .with_block_size(16 * 1024 * 1024),
+            )
+            .build()
+            .await
+            .unwrap();
+        let store = Arc::new(PrefetchingObjectStore::with_options(backend, parts, part));
+
+        if warm_head {
+            let meta = ObjectMeta {
+                location: path.clone(),
+                last_modified: chrono::Utc::now(),
+                size: len,
+                e_tag: None,
+                version: None,
+            };
+            store.save_head(&path, &meta, &Attributes::default());
+        }
+
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let nchunks = len / chunk;
+        let mut handles = Vec::new();
+        for _ in 0..concurrency {
+            let store = store.clone();
+            let path = path.clone();
+            let next = next.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= nchunks {
+                        break;
+                    }
+                    let off = i * chunk;
+                    let r = store
+                        .get_opts(
+                            &path,
+                            GetOptions {
+                                range: Some(GetRange::Bounded(off..off + chunk)),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let b = r.bytes().await.unwrap();
+                    assert_eq!(b.len() as u64, chunk);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // Let in-flight async prefetches land so their GETs are counted.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut got: Vec<Range<u64>> = ranges.lock().unwrap().clone();
+        let fetched: u64 = got.iter().map(|r| r.end.min(len) - r.start).sum();
+        got.sort_by_key(|r| r.start);
+        let mut union = 0u64;
+        let mut covered_to = 0u64;
+        for r in &got {
+            let s = r.start.max(covered_to);
+            let e = r.end.min(len);
+            if e > s {
+                union += e - s;
+            }
+            covered_to = covered_to.max(e);
+        }
+        let frontier = store
+            .access_tracker
+            .get(&path)
+            .map(|e| {
+                let h = e.value().lock().unwrap();
+                h.streams[..h.len]
+                    .iter()
+                    .map(|s| s.fetched_until)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        (fetched, union, got.len(), frontier)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn serial_sequential_amplification_is_bounded() {
+        let (fetched, union, gets, _) = run_amplification(1, false).await;
+        let amp = fetched as f64 / union as f64;
+        println!("serial: {gets} GETs, amplification {amp:.3}x");
+        assert!(
+            amp <= 1.02,
+            "serial sequential read amplification {amp:.3}x > 1.02x ({fetched} fetched / {union} unique)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_sequential_amplification_is_bounded() {
+        let (fetched, union, gets, _) = run_amplification(6, false).await;
+        let amp = fetched as f64 / union as f64;
+        println!("concurrent: {gets} GETs, amplification {amp:.3}x");
+        assert!(
+            amp <= 1.15,
+            "6-way sequential read amplification {amp:.3}x > 1.15x ({fetched} fetched / {union} unique)"
+        );
+    }
+
+    // Warm head + concurrent readers: the frontier can only bootstrap from
+    // window-fetch completion notes, whose leader offsets lag the stream head.
+    // The pipeline must engage (frontier reaches EOF) and stay within the
+    // amplification bound; a dead pipeline shows amplification 1.00 with a
+    // frozen frontier, which only the frontier assertion catches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn warm_head_concurrent_prefetch_stays_alive() {
+        let len: u64 = 48 * 1024 * 1024;
+        let (fetched, union, gets, frontier) = run_amplification(6, true).await;
+        let amp = fetched as f64 / union as f64;
+        println!("warm-head concurrent: {gets} GETs, amplification {amp:.3}x, frontier {frontier}");
+        assert!(
+            amp <= 1.15,
+            "warm-head 6-way amplification {amp:.3}x > 1.15x ({fetched} fetched / {union} unique)"
+        );
+        assert!(
+            frontier >= len,
+            "prefetch frontier stalled at {frontier} (< {len}): async pipeline never bootstrapped"
+        );
+    }
+
+    // A demand miss on a part covered by an in-flight async prefetch must join
+    // that fetch, not launch a duplicate GET (the demand and prefetch paths
+    // share one registry).
+    #[tokio::test]
+    async fn demand_read_joins_in_flight_async_prefetch() {
+        let part_size = 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("join");
+        let body: Vec<u8> = (0..part_size * 64).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting: Arc<dyn ObjectStore> = Arc::new(CountingStore {
+            inner: mem,
+            gets: gets.clone(),
+            delay: std::time::Duration::from_millis(80),
+        });
+        let (store, _dir) = store_over(counting, part_size).await;
+
+        // Warm the head far from the window under test (a head() against
+        // InMemory would return the whole payload and pre-fill the parts cache).
+        let far = (60 * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(far..far + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+        gets.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Registration is synchronous, so the window is in the registry (and its
+        // GET in flight, held open by the delay) before the read below starts.
+        store.spawn_async_prefetch(
+            &path,
+            AsyncPrefetch {
+                start: 0,
+                size: 16 * part_size,
+            },
+        );
+
+        let off = (3 * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(off..off + part_size as u64)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[3 * part_size..4 * part_size]);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "demand read must join the in-flight prefetch GET"
+        );
+    }
+
+    // A demand window whose tail is already cached must end-trim: fetch only the
+    // missing head, not the whole window over the cached parts.
+    #[tokio::test]
+    async fn mostly_cached_window_is_not_refetched() {
+        let part_size = 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("trim");
+        let body: Vec<u8> = (0..part_size * 256).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        // Warm the head far away, then hand-cache everything the min fetch
+        // window would cover except its first part.
+        let far = (250 * part_size) as u64;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(far..far + 10)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+        for part_id in 1..(FETCH_WINDOW_MIN / part_size) {
+            store.parts.insert(
+                PartKey::new(&path, part_id),
+                Bytes::copy_from_slice(&body[part_id * part_size..(part_id + 1) * part_size]),
+            );
+        }
+        ranges.lock().unwrap().clear();
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..part_size as u64)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[..part_size]);
+
+        let seen = ranges.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![GetRange::Bounded(0..part_size as u64)],
+            "window must be end-trimmed at the first cached part"
+        );
+    }
+
+    // A head eviction mid-stream must not re-GET bytes the parts cache already
+    // holds: the head-miss demand path plans through the shared registry with
+    // front trimming instead of blindly GETting its whole aligned window.
+    #[tokio::test]
+    async fn head_eviction_does_not_refetch_cached_parts() {
+        let part_size = 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("headmiss");
+        let body: Vec<u8> = (0..part_size * 512).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        // First read caches its min window: parts 0..128.
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..1024)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        r.bytes().await.unwrap();
+
+        store.heads.remove(&path);
+        ranges.lock().unwrap().clear();
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(1024..2048)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[1024..2048]);
+
+        let cached_end = (128 * part_size) as u64;
+        let seen = ranges.lock().unwrap().clone();
+        for r in &seen {
+            if let GetRange::Bounded(b) = r {
+                assert!(
+                    b.start >= cached_end,
+                    "head-miss GET {b:?} overlaps the cached span 0..{cached_end}"
+                );
+            }
+        }
+        assert!(
+            store.read_head(&path).is_some(),
+            "window GET must restore the head"
+        );
+    }
+
+    // An async prefetch window whose first part is cached must front-trim and
+    // fetch the uncached remainder, not silently drop the window (which would
+    // leave a hole the frontier claims as covered).
+    #[tokio::test]
+    async fn cached_start_prefetch_window_fetches_remainder() {
+        let part_size = 1024;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("fronttrim");
+        let body: Vec<u8> = (0..part_size * 64).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        let start_part = 8;
+        store.parts.insert(
+            PartKey::new(&path, start_part),
+            Bytes::copy_from_slice(&body[start_part * part_size..(start_part + 1) * part_size]),
+        );
+
+        let covered = store.spawn_async_prefetch(
+            &path,
+            AsyncPrefetch {
+                start: (start_part * part_size) as u64,
+                size: 8 * part_size,
+            },
+        );
+        assert_eq!(covered, Some(((start_part + 8) * part_size) as u64));
+
+        for _ in 0..100 {
+            if store.cached_part(&path, start_part + 7).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for part_id in start_part + 1..start_part + 8 {
+            assert!(
+                store.cached_part(&path, part_id).await.is_some(),
+                "part {part_id} should be fetched by the front-trimmed window"
+            );
+        }
+        let seen = ranges.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![GetRange::Bounded(
+                ((start_part + 1) * part_size) as u64..((start_part + 8) * part_size) as u64
+            )],
+            "prefetch must fetch exactly the uncached remainder"
+        );
+    }
+
+    // A ramped stream must not lend its window to a read landing behind its
+    // head: after eviction such a read (within the reorder slack) fetches its
+    // own min-window span, not the stream's up-to-8 MiB window of cold bytes.
+    #[tokio::test]
+    async fn lagging_read_after_eviction_fetches_min_window() {
+        let part_size = 1024;
+        let len = 12 * 1024 * 1024usize;
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("lag");
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        // Seven 64 KiB sequential reads ramp the stream's window to the max.
+        let chunk = 64 * 1024u64;
+        for i in 0..7u64 {
+            let off = i * chunk;
+            let r = store
+                .get_opts(
+                    &path,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(off..off + chunk)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            r.bytes().await.unwrap();
+        }
+        for _ in 0..200 {
+            if store.fetches.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(store.fetches.lock().unwrap().is_empty());
+        for part_id in 0..len / part_size {
+            store.parts.remove(&PartKey::new(&path, part_id));
+        }
+        ranges.lock().unwrap().clear();
+
+        // 256 KiB behind the 448 KiB head, within the 512 KiB slack of a
+        // 64 KiB read: absorbed by the stream, but the bytes are cold.
+        let off = 2 * chunk;
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(off..off + chunk)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[off as usize..(off + chunk) as usize]);
+
+        // Bound the fetched volume rather than the exact range: a part that
+        // dodged eviction (an in-flight foyer disk write) shifts or splits the
+        // led window, but the total must stay a min window, not the ramped one.
+        let seen = ranges.lock().unwrap().clone();
+        let fetched: u64 = seen
+            .iter()
+            .map(|r| match r {
+                GetRange::Bounded(b) => b.end - b.start,
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            fetched <= FETCH_WINDOW_MIN as u64,
+            "lagging read fetched {fetched} bytes (> min window {FETCH_WINDOW_MIN}): {seen:?}"
+        );
+    }
+
+    // A cold suffix read (the segment-footer pattern) must cost one GET: the
+    // aligned suffix payload's whole parts are cached despite the unaligned
+    // start, so the demand read hits them instead of re-fetching the tail,
+    // and a repeat suffix read is served from cache.
+    #[tokio::test]
+    async fn cold_suffix_read_is_one_get_and_warms_the_tail() {
+        let part_size = 1024;
+        let len = 300 * 1024 + 337; // unaligned length, like a real segment
+        let mem = Arc::new(InMemory::new());
+        let path = Path::from("segments/aa/seg");
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        mem.put(&path, body.clone().into()).await.unwrap();
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = Arc::new(RangeRecordingStore {
+            inner: mem,
+            ranges: ranges.clone(),
+        });
+        let (store, _dir) = store_over(recording, part_size).await;
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Suffix(64)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[len - 64..]);
+        let seen = ranges.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "cold suffix read must be one GET, got {seen:?}"
+        );
+
+        ranges.lock().unwrap().clear();
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Suffix(64)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &body[len - 64..]);
+        let seen = ranges.lock().unwrap().clone();
+        assert!(
+            seen.is_empty(),
+            "warm suffix read must be cache-served, got {seen:?}"
+        );
+    }
+
+    // Regression guard for the RSS pinning bug: cache entries must own their
+    // bytes, never alias the (up to 256 MiB) source allocation warmed in.
+    #[tokio::test]
+    async fn warm_object_parts_own_their_bytes() {
+        let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
+        let path = Path::from("own");
+        let src = Bytes::from((0..2560u32).map(|i| i as u8).collect::<Vec<u8>>());
+        let src_start = src.as_ptr() as usize;
+        let src_end = src_start + src.len();
+        store.warm_object(&path, src.clone());
+
+        for part_id in 0..3 {
+            let bytes = store.cached_part(&path, part_id).await.unwrap();
+            let p = bytes.as_ptr() as usize;
+            assert!(
+                p + bytes.len() <= src_start || p >= src_end,
+                "part {part_id} aliases the warm source allocation"
+            );
+        }
+    }
+
+    /// Serves single-chunk payloads sliced zero-copy from one retained
+    /// allocation, the shape a window GET arrives in when it lands in one
+    /// network chunk, so a test can detect cache entries aliasing the window.
+    #[derive(Debug)]
+    struct SharedAllocStore {
+        data: Bytes,
+    }
+
+    impl Display for SharedAllocStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "SharedAllocStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for SharedAllocStore {
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> object_store::Result<GetResult> {
+            let len = self.data.len() as u64;
+            let meta = ObjectMeta {
+                location: l.clone(),
+                last_modified: chrono::Utc::now(),
+                size: len,
+                e_tag: None,
+                version: None,
+            };
+            if o.head {
+                return Ok(GetResult {
+                    payload: GetResultPayload::Stream(
+                        stream::empty::<object_store::Result<Bytes>>().boxed(),
+                    ),
+                    range: 0..0,
+                    attributes: Attributes::default(),
+                    extensions: Default::default(),
+                    meta,
+                });
+            }
+            let range = match o.range {
+                Some(GetRange::Bounded(r)) => r.start..r.end.min(len),
+                _ => 0..len,
+            };
+            let slice = self.data.slice(range.start as usize..range.end as usize);
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    stream::once(async move { Ok::<_, object_store::Error>(slice) }).boxed(),
+                ),
+                range,
+                attributes: Attributes::default(),
+                extensions: Default::default(),
+                meta,
+            })
+        }
+        async fn put_opts(
+            &self,
+            _: &Path,
+            _: PutPayload,
+            _: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            unimplemented!()
+        }
+        async fn put_multipart_opts(
+            &self,
+            _: &Path,
+            _: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            unimplemented!()
+        }
+        fn delete_stream(
+            &self,
+            _: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!()
+        }
+        fn list(&self, _: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            unimplemented!()
+        }
+        async fn list_with_delimiter(&self, _: Option<&Path>) -> object_store::Result<ListResult> {
+            unimplemented!()
+        }
+        async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> object_store::Result<()> {
+            unimplemented!()
+        }
+        async fn rename_opts(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: RenameOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    // Same pinning guard for the window-fetch path: `GetResult::bytes()` on a
+    // single-chunk payload returns that chunk zero-copy, so without the owned
+    // copy every cached part of the window would alias the backend allocation.
+    #[tokio::test]
+    async fn window_fetch_parts_own_their_bytes() {
+        let part_size = 1024;
+        let data = Bytes::from((0..8192u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        let data_start = data.as_ptr() as usize;
+        let data_end = data_start + data.len();
+        let backend: Arc<dyn ObjectStore> = Arc::new(SharedAllocStore { data: data.clone() });
+        let (store, _dir) = store_over(backend, part_size).await;
+        let path = Path::from("own-window");
+
+        // head is served without payload, so no parts are cached by this.
+        let _ = store.head(&path).await.unwrap();
+
+        let r = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..2048)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let got = r.bytes().await.unwrap();
+        assert_eq!(&got[..], &data[..2048]);
+
+        // The min fetch window spans the whole 8-part object in one GET.
+        for part_id in 0..8 {
+            let bytes = store
+                .cached_part(&path, part_id)
+                .await
+                .expect("cached by the window fetch");
+            assert_eq!(&bytes[..], &data[part_id * 1024..(part_id + 1) * 1024]);
+            let p = bytes.as_ptr() as usize;
+            assert!(
+                p + bytes.len() <= data_start || p >= data_end,
+                "part {part_id} aliases the window GET allocation"
+            );
         }
     }
 }
