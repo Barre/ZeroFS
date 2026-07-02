@@ -540,6 +540,11 @@ impl Segment {
     }
 }
 
+/// Frames per run before decode fans out on rayon; below it the dispatch
+/// overhead outweighs the parallelism (the write path's compression threshold,
+/// mirrored).
+const PARALLEL_OPEN_MIN_FRAMES: usize = 8;
+
 /// Walk the length-prefixed frames packed in `region`, opening each under the
 /// AAD derived from its absolute index and logical block.
 pub(crate) fn read_frames_from_region(
@@ -549,7 +554,9 @@ pub(crate) fn read_frames_from_region(
     first_frame: u32,
     slots: &[(u64, u64)],
 ) -> Result<Vec<Vec<u8>>, SegmentError> {
-    let mut out = Vec::with_capacity(slots.len());
+    // Pass 1, serial by nature: each frame's start is only known from the
+    // previous frame's length prefix. Collect every frame's span and AAD inputs.
+    let mut spans: Vec<(std::ops::Range<usize>, u32, u64, u64)> = Vec::with_capacity(slots.len());
     let mut pos = 0usize;
     for (i, &(inode, extent)) in slots.iter().enumerate() {
         if pos + LEN_PREFIX > region.len() {
@@ -566,11 +573,34 @@ pub(crate) fn read_frames_from_region(
         let fi = first_frame
             .checked_add(i as u32)
             .ok_or(SegmentError::Malformed("frame index overflow"))?;
-        let aad = frame_aad(segid, fi, inode, extent);
-        out.push(codec.open(&region[pos..frame_end], &aad)?);
+        spans.push((pos..frame_end, fi, inode, extent));
         pos = frame_end;
     }
-    Ok(out)
+
+    // Pass 2: the AEAD verify + decompress is a pure function per frame, so a
+    // large coalesced run decodes across cores. block_in_place needs the
+    // multi-thread runtime (current-thread tests decode inline), and with no
+    // runtime at all (unit tests, sync callers) rayon can run directly.
+    let open = |(range, fi, inode, extent): &(std::ops::Range<usize>, u32, u64, u64)| -> Result<Vec<u8>, SegmentError> {
+        Ok(codec.open(
+            &region[range.clone()],
+            &frame_aad(segid, *fi, *inode, *extent),
+        )?)
+    };
+    if spans.len() >= PARALLEL_OPEN_MIN_FRAMES {
+        let parallel = || {
+            use rayon::prelude::*;
+            spans.par_iter().map(open).collect::<Result<Vec<_>, _>>()
+        };
+        return match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(parallel)
+            }
+            Ok(_) => spans.iter().map(open).collect(),
+            Err(_) => parallel(),
+        };
+    }
+    spans.iter().map(open).collect()
 }
 
 #[cfg(test)]
@@ -580,6 +610,27 @@ mod tests {
 
     fn codec() -> FrameCodec {
         FrameCodec::new(&[5u8; 32], SEGMENT_INFO, CompressionConfig::Zstd(3))
+    }
+
+    // A run past PARALLEL_OPEN_MIN_FRAMES decodes on rayon (no tokio runtime in
+    // a plain #[test], so the direct-rayon branch) and must roundtrip with the
+    // per-frame AADs intact and in order.
+    #[test]
+    fn large_run_roundtrips_through_parallel_decode() {
+        let c = codec();
+        let segid = Segid::new(3, 9);
+        let frames: Vec<(u64, u64, Vec<u8>)> = (0..(PARALLEL_OPEN_MIN_FRAMES as u64 * 2))
+            .map(|i| (7, i, vec![i as u8; 32 * 1024]))
+            .collect();
+        let bytes = build(&c, segid, &frames);
+        let seg = Segment::parse(Bytes::from(bytes)).unwrap();
+        let slots: Vec<(u64, u64)> = frames.iter().map(|(ino, ext, _)| (*ino, *ext)).collect();
+        let got = seg
+            .read_range(&c, 0, seg.dir_offset as u32, 0, &slots)
+            .unwrap();
+        for ((_, _, want), got) in frames.iter().zip(&got) {
+            assert_eq!(want, got);
+        }
     }
 
     fn sample_frames() -> Vec<(u64, u64, Vec<u8>)> {
