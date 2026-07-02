@@ -6,7 +6,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-/// Compression algorithm configuration for chunk data.
+/// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionConfig {
@@ -140,6 +140,7 @@ pub struct Settings {
     pub azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcp: Option<GcsConfig>,
+    /// Location of a pre-2.0 volume's separate WAL store.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wal: Option<WalConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default = "default_telemetry")]
@@ -281,7 +282,7 @@ impl ReplicationConfig {
 ///
 /// Every filesystem op is a point lookup gated by per-SST bloom filters and the
 /// SST index, so warming those removes the cold-cache latency cliff a fresh node
-/// or restart otherwise pays on its first reads. The bulk chunk segment is never
+/// or restart otherwise pays on its first reads. The bulk extent segment is never
 /// warmed.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -326,7 +327,7 @@ pub struct StorageConfig {
 pub struct FilesystemConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_size_gb: Option<f64>,
-    /// Compression algorithm for chunk data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
+    /// Compression algorithm for extent data: "zstd-{level}" (default: "zstd-3", level 1-22) or "lz4"
     #[serde(default)]
     pub compression: CompressionConfig,
     /// Treat `fsync` as a no-op: a client fsync/COMMIT returns without forcing a
@@ -353,22 +354,16 @@ pub struct LsmConfig {
     /// Maximum number of SST files in level 0 before triggering compaction
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub l0_max_ssts: Option<usize>,
-    /// Maximum unflushed data before forcing a flush (in gigabytes)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_unflushed_gb: Option<f64>,
     /// Maximum number of concurrent compactions
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_concurrent_compactions: Option<usize>,
     /// Interval in seconds between periodic flushes
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flush_interval_secs: Option<u64>,
-    /// Whether the write-ahead log (WAL) is enabled
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wal_enabled: Option<bool>,
     /// When true, every committed write is durably flushed to object storage
     /// before returning success. Trades per-op latency for zero unflushed data
-    /// in case of a crash. Pair with `wal_enabled = true` for acceptable
-    /// performance.
+    /// in case of a crash. Expensive: the WAL is off, so each write forces a
+    /// full seal + memtable flush.
     ///
     /// This does NOT change POSIX semantics: with `sync_writes = false` (the
     /// default), explicit fsync from clients is still honored and
@@ -377,13 +372,23 @@ pub struct LsmConfig {
     /// buffered until the next flush.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sync_writes: Option<bool>,
+    /// Deprecated, ignored: the WAL is permanently off (sealing correctness
+    /// requires it). Accepted so pre-2.0 configs still parse; never re-emitted.
+    #[serde(default, skip_serializing)]
+    pub wal_enabled: Option<bool>,
+    /// Deprecated, ignored: unflushed-data budgeting went away with the WAL.
+    /// Accepted so pre-2.0 configs still parse; never re-emitted.
+    #[serde(default, skip_serializing)]
+    pub max_unflushed_gb: Option<f64>,
 }
 
 impl LsmConfig {
-    /// Default l0_max_ssts: 64.
-    pub const DEFAULT_L0_MAX_SSTS: usize = 64;
-    /// Default max_unflushed_gb: 1.0 GiB
-    pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;
+    /// Default l0_max_ssts: 256. With the WAL off every `db.flush()` (periodic
+    /// and each fsync) freezes a fresh L0 SST, so L0 must hold a deep backlog
+    /// or flushes stall on compaction. The SSTs are small, bloom-filtered
+    /// metadata, so the point-lookup cost is negligible. Applies to
+    /// `l0_max_ssts_per_key` too.
+    pub const DEFAULT_L0_MAX_SSTS: usize = 256;
     /// Default max_concurrent_compactions: 8
     pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 8;
     /// Default flush_interval_secs: 30 seconds
@@ -391,8 +396,6 @@ impl LsmConfig {
 
     /// Minimum l0_max_ssts to maintain reasonable performance
     pub const MIN_L0_MAX_SSTS: usize = 4;
-    /// Minimum max_unflushed_gb: 0.1 GB (100 MB)
-    pub const MIN_MAX_UNFLUSHED_GB: f64 = 0.1;
     /// Minimum max_concurrent_compactions: 1
     pub const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
     /// Minimum flush_interval_secs: 5 seconds
@@ -402,14 +405,6 @@ impl LsmConfig {
         self.l0_max_ssts
             .unwrap_or(Self::DEFAULT_L0_MAX_SSTS)
             .max(Self::MIN_L0_MAX_SSTS)
-    }
-
-    pub fn max_unflushed_bytes(&self) -> usize {
-        let gb = self
-            .max_unflushed_gb
-            .unwrap_or(Self::DEFAULT_MAX_UNFLUSHED_GB)
-            .max(Self::MIN_MAX_UNFLUSHED_GB);
-        (gb * 1_000_000_000.0) as usize
     }
 
     pub fn max_concurrent_compactions(&self) -> usize {
@@ -422,10 +417,6 @@ impl LsmConfig {
         self.flush_interval_secs
             .unwrap_or(Self::DEFAULT_FLUSH_INTERVAL_SECS)
             .max(Self::MIN_FLUSH_INTERVAL_SECS)
-    }
-
-    pub fn wal_enabled(&self) -> bool {
-        self.wal_enabled.unwrap_or(false)
     }
 
     pub fn sync_writes(&self) -> bool {
@@ -723,6 +714,24 @@ impl Settings {
                  sync_writes flushes after every write, ignore_fsync skips the fsync flush"
             );
         }
+
+        // Deprecated [lsm] keys still parse (an upgrade must not brick startup
+        // on an old config) but no longer do anything; nudge the operator to
+        // drop them.
+        if let Some(lsm) = &self.lsm {
+            if lsm.wal_enabled.is_some() {
+                tracing::warn!(
+                    "[lsm] wal_enabled is deprecated and ignored (the WAL is permanently off); \
+                     remove it from the config"
+                );
+            }
+            if lsm.max_unflushed_gb.is_some() {
+                tracing::warn!(
+                    "[lsm] max_unflushed_gb is deprecated and ignored (it tuned the removed WAL); \
+                     remove it from the config"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -842,7 +851,7 @@ impl Settings {
         toml_string
             .push_str("# If not specified, defaults to 16 EiB, the maximum filesystem size\n");
         toml_string.push_str("#\n");
-        toml_string.push_str("# Compression algorithm for chunk data:\n");
+        toml_string.push_str("# Compression algorithm for extent data:\n");
         toml_string.push_str(
             "#   - \"zstd-{level}\" (default: \"zstd-3\"): Configurable compression (level 1-22)\n",
         );
@@ -863,25 +872,14 @@ impl Settings {
             .push_str("# Advanced performance tuning for the underlying LSM tree storage engine\n");
         toml_string.push_str("# Only modify these if you understand LSM tree behavior\n");
         toml_string.push_str("\n# [lsm]\n");
-        toml_string.push_str("# l0_max_ssts = 64                 # Max SST files in L0 before compaction (default: 64, min: 4)\n");
-        toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
+        toml_string.push_str("# l0_max_ssts = 256                # Max SST files in L0 before compaction (default: 256, min: 4)\n");
         toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
-        toml_string.push_str("# wal_enabled = false              # Whether the write-ahead log (WAL) is enabled (default: false)\n");
         toml_string.push_str("# sync_writes = false              # Flush every write to object storage before returning success (default: false).\n");
         toml_string.push_str("                                   # Does NOT affect POSIX fsync semantics: explicit fsync from clients\n");
         toml_string.push_str("                                   # is always honored. This flag only governs writes between fsync calls. When on,\n");
         toml_string.push_str("                                   # they become durable on return instead of buffered until the next periodic flush.\n");
-        toml_string.push_str("                                   # wal_enabled = true is strongly recommended when this is on.\n");
-
-        toml_string.push_str("\n# Optional separate WAL (Write-Ahead Log) object store\n");
-        toml_string.push_str("# Use a faster/closer store for WAL to improve fsync latency\n");
-        toml_string.push_str(
-            "# This is decided at filesystem creation time and cannot be changed later.\n",
-        );
-        toml_string.push_str("\n# [wal]\n");
-        toml_string.push_str("# url = \"file:///mnt/nvme/zerofs-wal\"\n");
-        toml_string.push_str("# storage_class = \"...\"  # Optional; independent from [storage]. WAL is hot data, normally left on the default.\n");
+        toml_string.push_str("                                   # Expensive: the WAL is off, so each write forces a full seal + memtable flush.\n");
 
         toml_string.push_str(
             "\n# Optional HA replication: a leader + standby pair over one object store, with\n",
@@ -1318,34 +1316,6 @@ role = "witness""#,
     }
 
     #[test]
-    fn test_replication_allows_data_wal_enabled() {
-        // The WAL is permitted under HA: SlateDB fences WAL writes too, so the
-        // fenced manifest is not the only path that contains a deposed leader.
-        let content = base_config_with_replication(
-            r#"[lsm]
-wal_enabled = true
-
-[replication]
-node_id = "n1"
-role = "leader""#,
-        );
-        assert!(write_and_load(&content).is_ok());
-    }
-
-    #[test]
-    fn test_replication_allows_data_wal_disabled() {
-        let content = base_config_with_replication(
-            r#"[lsm]
-wal_enabled = false
-
-[replication]
-node_id = "n1"
-role = "leader""#,
-        );
-        assert!(write_and_load(&content).is_ok());
-    }
-
-    #[test]
     fn test_replication_empty_node_id_rejected() {
         let content = base_config_with_replication(
             r#"[replication]
@@ -1363,6 +1333,76 @@ ignore_fsync = true"#,
         );
         let settings = write_and_load(&content).unwrap();
         assert!(settings.filesystem.unwrap().ignore_fsync);
+    }
+
+    // Pre-2.0 configs set the removed [lsm] wal_enabled / max_unflushed_gb
+    // keys; they must still parse (ignored, with a warning) so an upgrade
+    // doesn't brick startup, and must be dropped on re-serialization.
+    #[test]
+    fn test_deprecated_lsm_keys_parse_and_round_trip() {
+        let content = base_config_with_replication(
+            r#"[lsm]
+wal_enabled = true
+max_unflushed_gb = 2.0
+flush_interval_secs = 30"#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        let lsm = settings.lsm.as_ref().unwrap();
+        assert_eq!(lsm.wal_enabled, Some(true));
+        assert_eq!(lsm.max_unflushed_gb, Some(2.0));
+        assert_eq!(lsm.flush_interval_secs, Some(30));
+
+        // Round-trip: the deprecated keys are never re-emitted, and the
+        // result still parses.
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("wal_enabled"), "got: {serialized}");
+        assert!(
+            !serialized.contains("max_unflushed_gb"),
+            "got: {serialized}"
+        );
+        let reparsed: Settings = toml::from_str(&serialized).unwrap();
+        let lsm = reparsed.lsm.unwrap();
+        assert!(lsm.wal_enabled.is_none());
+        assert!(lsm.max_unflushed_gb.is_none());
+        assert_eq!(lsm.flush_interval_secs, Some(30));
+    }
+
+    // deny_unknown_fields still catches typos: only the two deprecated keys
+    // get a pass.
+    #[test]
+    fn test_unknown_lsm_key_still_rejected() {
+        let content = base_config_with_replication(
+            r#"[lsm]
+wal_enable = true"#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("unknown field"), "got: {err}");
+    }
+
+    // The generated config must not resurrect the deprecated keys, nor
+    // advertise the [wal] section (accepted only for upgraded 1.x volumes;
+    // new volumes never write a WAL).
+    #[test]
+    fn test_generated_config_omits_deprecated_lsm_keys() {
+        let rendered = Settings::render_default_config().unwrap();
+        assert!(!rendered.contains("wal_enabled"));
+        assert!(!rendered.contains("max_unflushed_gb"));
+        assert!(!rendered.contains("[wal]"));
+    }
+
+    // A pre-2.0 config with a custom [wal] location must keep parsing: the
+    // upgraded volume needs it to open (WAL replay / checkpoint references).
+    #[test]
+    fn test_wal_section_still_parses() {
+        let content = base_config_with_replication(
+            r#"[wal]
+url = "file:///mnt/nvme/zerofs-wal""#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        assert_eq!(
+            settings.wal.as_ref().map(|w| w.url.as_str()),
+            Some("file:///mnt/nvme/zerofs-wal")
+        );
     }
 
     #[test]

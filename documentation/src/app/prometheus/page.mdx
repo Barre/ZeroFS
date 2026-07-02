@@ -27,8 +27,10 @@ Multiple bind addresses are supported, following the same pattern as other ZeroF
 
 ```toml
 [prometheus]
-addresses = ["127.0.0.1:9091", "0.0.0.0:9091"]
+addresses = ["127.0.0.1:9091", "[::1]:9091"]  # Dual-stack localhost
 ```
+
+Each entry binds one listener, so the addresses must not overlap. `0.0.0.0:9091` already accepts loopback connections; adding `127.0.0.1:9091` alongside it conflicts on the same port, and the losing bind is logged and dropped.
 
 `addresses` defaults to `127.0.0.1:9091`. An empty `[prometheus]` section is valid and starts the endpoint on that address. When the `[prometheus]` section is absent, no metrics endpoint is started.
 
@@ -66,15 +68,17 @@ Counters that track cumulative operations since server start:
 | --- | --- | --- |
 | `zerofs_tombstones_created_total` | counter | Tombstones created for deleted data |
 | `zerofs_tombstones_processed_total` | counter | Tombstones processed by GC |
-| `zerofs_gc_chunks_deleted_total` | counter | Data chunks reclaimed by GC |
-| `zerofs_gc_runs_total` | counter | Number of GC cycles completed |
+| `zerofs_gc_extents_deleted_total` | counter | Extents reclaimed by GC |
+| `zerofs_gc_runs_total` | counter | Number of GC cycles started |
+
+An extent is the 32 KiB unit of file data, stored as a frame in an immutable segment object. Earlier releases called this unit a chunk and named the metric `zerofs_gc_chunks_deleted_total`. The old series stops appearing after an upgrade; update dashboards and alert rules that reference it.
 
 ### Filesystem State
 
 | Metric | Type | Description |
 | --- | --- | --- |
 | `zerofs_used_bytes` | gauge | Total bytes stored in the filesystem |
-| `zerofs_used_inodes` | gauge | Total active inodes (files, directories, symlinks) |
+| `zerofs_used_inodes` | gauge | Total active inodes (files, directories, symlinks, and special files) |
 
 ### Memory (jemalloc)
 
@@ -90,20 +94,22 @@ Gauges that report the state of the jemalloc allocator:
 
 `zerofs_jemalloc_resident_bytes` tracks the allocator's physical memory footprint. `zerofs_jemalloc_retained_bytes` counts virtual address space kept for reuse and does not consume physical memory, so memory alerts should key on resident, not retained or mapped.
 
-### SlateDB (LSM Engine)
+### Metadata LSM
 
-ZeroFS exposes internal metrics from the SlateDB storage engine. These are prefixed with `slatedb_` and include compaction and storage statistics. The exact metrics depend on the SlateDB version and are discovered at runtime.
+ZeroFS exposes internal metrics from its metadata LSM tree, which holds inode and directory metadata plus per-extent pointers; file content lives in segment objects outside the LSM. These metrics are prefixed with `lsm_` and include compaction and storage statistics. The exact metrics depend on the engine version and are discovered at runtime.
 
-Common SlateDB metrics include:
+Common metadata metrics include:
 
 | Metric | Type | Description |
 | --- | --- | --- |
-| `slatedb_compactor_bytes_compacted` | counter | Total bytes processed by compaction |
-| `slatedb_compactor_running_compactions` | gauge | Number of active compaction tasks |
-| `slatedb_compactor_total_bytes_being_compacted` | gauge | Bytes currently being compacted |
+| `lsm_compactor_bytes_compacted` | counter | Total bytes processed by compaction |
+| `lsm_compactor_running_compactions` | gauge | Number of active compaction tasks |
+| `lsm_compactor_total_bytes_being_compacted` | gauge | Bytes currently being compacted |
+
+Compaction metrics cover metadata compaction only. Segment objects holding file data are not part of the LSM and are never rewritten by it.
 
 <Note>
-SlateDB metrics are only available in read-write mode. Read-only instances do not expose SlateDB metrics.
+The `lsm_`-prefixed metrics are only available in read-write mode; read-only instances do not expose them.
 </Note>
 
 ## Prometheus Scrape Configuration

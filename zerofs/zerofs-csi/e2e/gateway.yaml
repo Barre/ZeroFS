@@ -28,9 +28,6 @@ data:
     url = "file:///store/db"
     encryption_password = "zerofs-e2e-password"
 
-    [lsm]
-    max_unflushed_gb = 0.1
-
     [servers]
 
     [servers.ninep]
@@ -136,9 +133,6 @@ data:
     [storage]
     url = "file:///store/db"
     encryption_password = "zerofs-e2e-password"
-
-    [lsm]
-    max_unflushed_gb = 0.1
 
     [servers]
 

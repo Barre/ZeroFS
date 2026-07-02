@@ -181,8 +181,17 @@
             {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO"}))
 
 (defn make-bucket! [c]
-  (sh! (:mc c) "alias" "set" "j" (str "http://" (:minio-addr c)) (:access-key c) (:secret-key c))
-  (sh! (:mc c) "mb" "--ignore-existing" (str "j/" (:bucket c))))
+  ;; /minio/health/live only reports process liveness, not that the object layer
+  ;; can serve S3 yet, so both the alias check and the bucket create can hit a
+  ;; still-initializing MinIO (503). Retry until the bucket really exists;
+  ;; otherwise the leader launches against a missing bucket and dies with
+  ;; NoSuchBucket. mc mb --ignore-existing is idempotent, so retrying is safe.
+  (await-fn (fn []
+              (sh! (:mc c) "alias" "set" "j" (str "http://" (:minio-addr c))
+                   (:access-key c) (:secret-key c))
+              (let [r (sh! (:mc c) "mb" "--ignore-existing" (str "j/" (:bucket c)))]
+                (or (zero? (:exit r)) (throw+ {:type ::bucket-down :result r}))))
+            {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO bucket"}))
 
 (defn node-cfg-str [c node-key role]
   (let [n (get-in c [:nodes node-key])]

@@ -1,31 +1,36 @@
 export const metadata = {
   title: 'Caching',
   description:
-    'ZeroFS runs a decoded-block cache and a raw-parts cache, each with a memory tier and a disk tier, sized by two configuration keys.',
+    'ZeroFS runs a raw-parts cache for object bytes and a decoded-block cache for metadata, each with a memory tier and a disk tier, sized by two configuration keys.',
 }
 
 # Caching
 
-ZeroFS runs two caches, each with a memory tier and a disk tier: one for decoded blocks, one for raw object parts. Two configuration keys size them. {{ className: 'lead' }}
+ZeroFS runs two caches, each with a memory tier and a disk tier: a raw-parts cache for raw object bytes and a decoded-block cache for metadata. Two configuration keys budget them; each budget is split between the two caches. {{ className: 'lead' }}
 
 ## Cache Layers
 
-The **decoded-block cache** holds database blocks after decryption and decompression. Its memory tier is sized by `cache.memory_size_gb` (optional, defaults to 0.25 GB). Its disk tier lives in `hybrid_cache/` and receives what remains of the disk budget after the raw-parts allocation.
+The **raw-parts cache** holds 128 KiB parts of object bytes as fetched from the object store. Segment objects (file data) and metadata SST objects share its one budget, keyed by path. It is the only cache serving file reads (the RAM-only tail cache below holds file data too, but feeds only write-path splicing), and parts are stored as they exist in the object store: compressed and encrypted. Its memory tier receives what remains of the memory budget after the decoded-block slice. Its disk tier lives in `parts_cache/` and receives what remains of the disk budget after the decoded-block slice.
 
-The **raw-parts cache** holds 128 KiB parts as fetched from the object store. Its memory tier is fixed at 128 MiB and is not configurable. Its disk tier lives in `parts_cache/` and receives the parts share of the disk budget.
+The **decoded-block cache** holds metadata blocks after decryption and decompression. The metadata LSM stores only inode and directory entries plus 32-byte extent pointers, so this cache is small and bounded. Its memory tier receives a quarter of the memory budget, its disk tier lives in `hybrid_cache/` and receives a tenth of the disk budget; both slices are clamped (see the split sections below).
+
+A third, RAM-only **tail cache** holds each inode's most-recently-written extent, 32 MiB total, updated only after the write's transaction commits. A sequential append splices into the cached tail instead of re-reading it.
 
 Both disk tiers sit in a per-bucket directory inside `cache.dir`:
 
 ```
 /var/cache/zerofs/
 └── bucket_550e8400/
-    ├── hybrid_cache/    decoded blocks
-    └── parts_cache/     raw 128 KiB parts
+    ├── hybrid_cache/    decoded metadata blocks
+    └── parts_cache/     raw 128 KiB parts (compressed + encrypted)
 ```
 
 <Note>
-  The disk cache stores decrypted, decompressed blocks. See [Local Cache
-  Directory](/encryption#local-cache-directory) on the encryption page.
+  File data on the local cache disk stays compressed and encrypted: the
+  raw-parts cache stores object bytes as-is. Only the decoded-block tier in
+  `hybrid_cache/` holds plaintext, and it holds metadata blocks only. See
+  [Local Cache Directory](/encryption#local-cache-directory) on the encryption
+  page.
 </Note>
 
 ## Configuration
@@ -33,9 +38,17 @@ Both disk tiers sit in a per-bucket directory inside `cache.dir`:
 <Row>
   <Col>
 
-    `disk_size_gb` is the total disk budget for both disk tiers, not the size of either one. `memory_size_gb` sizes only the decoded-block memory tier.
+    `disk_size_gb` is the total disk budget for both disk tiers, not the size of either one. `memory_size_gb` is likewise the total memory budget for both memory tiers (optional, defaults to 0.25 GB).
 
     Sizes parse as decimal GB (10^9 bytes), so `disk_size_gb = 10.0` is a 10,000,000,000-byte budget.
+
+    `warm_metadata` selects what to load into the decoded-block cache at startup and after metadata compactions. Bulk file data is never warmed.
+
+    | `warm_metadata` | Effect |
+    |---|---|
+    | `off` | No warmup |
+    | `filters_index` (default) | Warms bloom filters and SST indexes of metadata SSTs |
+    | `full` | Also warms metadata data blocks |
 
   </Col>
   <Col>
@@ -52,19 +65,27 @@ Both disk tiers sit in a per-bucket directory inside `cache.dir`:
 
 ## Disk Budget Split
 
-The raw-parts disk tier receives 10% of the disk budget, clamped to between 1 GiB and 10 GiB. The decoded-block disk tier receives the remainder. Each tier has a 1 GiB floor, so the decoded-block disk tier ends up at least 1 GiB smaller than `disk_size_gb`. Budgets below roughly 2 GiB cannot satisfy both floors; the decoded-block tier keeps its 1 GiB and the parts tier shrinks.
+The decoded-block disk tier receives 10% of the disk budget, clamped to between 1 GiB and 16 GiB. The raw-parts disk tier receives the remainder, with a 1 GiB floor. A 100 GiB budget splits into 90 GiB raw-parts + 10 GiB decoded-blocks; a 4096 GiB budget into 4080 GiB + 16 GiB. Budgets below 2 GiB overcommit rather than shrink either side: both floors hold, so a 0.5 GiB budget yields 1 GiB + 1 GiB.
 
 Startup logs the resolved split:
 
 ```
-Cache allocation - Disk: 10.00GB total (8926 MB decoded-blocks + 1073 MB raw-parts), Memory: 2.00GB
+Cache allocation - Disk: 10.00GB total (1073 MB decoded-blocks + 8926 MB raw-parts), Memory: 2.00GB total (500 MB decoded-blocks + 1500 MB raw-parts)
 ```
 
-With `disk_size_gb = 10.0`, 10% of the budget is 1 GB (below the 1 GiB floor) so the parts tier is raised to 1 GiB (1073 MB) and the decoded-block tier receives the remaining 8926 MB.
+With `disk_size_gb = 10.0`, 10% of the budget is 1 GB (below the 1 GiB floor) so the decoded-block tier is raised to 1 GiB (1073 MB) and the raw-parts tier receives the remaining 8926 MB.
+
+## Memory Budget Split
+
+`memory_size_gb` budgets both memory tiers. The decoded-block memory tier receives a quarter of the budget, clamped to between 32 MiB and 2 GiB. The raw-parts memory tier receives the remainder, with a 32 MiB floor. A 1 GiB budget splits into 768 MiB raw-parts + 256 MiB decoded-blocks. Earlier versions gave the raw-parts cache a fixed 128 MiB of RAM outside the configured budget; it now comes out of `memory_size_gb` like everything else.
 
 ## Prefetch
 
-ZeroFS fetches object data in 128 KiB parts. An adaptive readahead layer tracks up to 4 concurrent sequential read streams per object. Each stream's fetch window starts at 128 KiB and doubles on every sequential access, capped at 8 MiB. Once a stream's window has grown past the minimum, the next window is fetched in the background before reads reach it. Fetched parts land in the raw-parts cache.
+ZeroFS fetches object data in 128 KiB parts. An adaptive readahead layer tracks up to 4 concurrent sequential read streams per object. Each stream's fetch window starts at 128 KiB and doubles on every sequential access, capped at 8 MiB. Once a stream's window has grown past the minimum, up to 4 full windows are kept fetched ahead of the read — up to 4 × 8 MiB outstanding at the maximum window. Fetched parts land in the raw-parts cache.
+
+Three behaviors reduce GET counts further. Concurrent misses inside the same window join a single GET instead of each issuing their own. The leading fetch covers at least the whole requested range, so a large coalesced read is one GET even before the window ramps. Uploads populate the cache at write time: single PUTs write through to the parts cache, and sealed segment objects (uploaded as multipart) are warmed with the bytes in hand, so a read after a write needs no GET. One exception: conditional GETs (`if-match`, versioned reads) bypass the cache.
+
+Above the per-object prefetcher, a logical read-ahead follows a file's extents across segment objects. After 2 consecutive sequential reads it prefetches an 8 MiB window ahead of the read, with at most 16 concurrent fetches, and it fires only when the window crosses into a different segment object — within one segment, the per-object prefetcher already covers it.
 
 ## Per-Bucket Cache Isolation
 

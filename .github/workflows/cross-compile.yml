@@ -58,26 +58,6 @@ jobs:
             arch: arm64
             os: ubuntu-latest
             platform: linux
-          - target: armv7-unknown-linux-gnueabihf
-            arch: armv7
-            os: ubuntu-latest
-            platform: linux
-          - target: i686-unknown-linux-gnu
-            arch: i686
-            os: ubuntu-latest
-            platform: linux
-          - target: powerpc64le-unknown-linux-gnu
-            arch: ppc64le
-            os: ubuntu-latest
-            platform: linux
-          - target: s390x-unknown-linux-gnu
-            arch: s390x
-            os: ubuntu-latest
-            platform: linux
-          - target: riscv64gc-unknown-linux-gnu
-            arch: riscv64
-            os: ubuntu-latest
-            platform: linux
           - target: x86_64-apple-darwin
             arch: x86_64
             os: macos-latest
@@ -86,12 +66,17 @@ jobs:
             arch: aarch64
             os: macos-latest
             platform: darwin
+          - target: x86_64-unknown-freebsd
+            arch: amd64
+            os: ubuntu-latest
+            platform: freebsd
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: matrix.platform != 'freebsd'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -125,10 +110,32 @@ jobs:
         run: |
           cargo build --profile ci --features webui --target ${{ matrix.target }}
 
+      - name: Build on FreeBSD
+        if: matrix.platform == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          # The action's 6 GiB default gets rustc OOM-killed during parallel
+          # codegen of the bin crate; the ubuntu-latest host has 16 GiB.
+          mem: 12288
+          prepare: |
+            pkg install -y gmake curl cmake
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          run: |
+            . $HOME/.cargo/env
+            cd zerofs
+            cargo build --profile ci --features webui
+            cp target/ci/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+            rm -rf target/
+
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp zerofs/target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          if [ "${{ matrix.platform }}" = "freebsd" ]; then
+            mv zerofs-${{ matrix.platform }}-${{ matrix.arch }} artifacts/
+          else
+            cp zerofs/target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          fi
           chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Upload artifacts

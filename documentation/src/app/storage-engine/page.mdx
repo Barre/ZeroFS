@@ -1,0 +1,195 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'Storage Engine: Segments and Extents',
+  description:
+    'How ZeroFS stores file data: 32 KiB extents sealed as compressed, encrypted frames inside immutable segment objects, with 32-byte FrameLoc pointers in a metadata LSM tree.',
+}
+
+export const sections = [
+  { title: 'Overview', id: 'overview' },
+  { title: 'On-Object Format', id: 'on-object-format' },
+  { title: 'Write Path', id: 'write-path' },
+  { title: 'Read Path', id: 'read-path' },
+  { title: 'Space Reclamation', id: 'space-reclamation' },
+  { title: 'Design Constants', id: 'design-constants' },
+  { title: 'Configuration', id: 'configuration' },
+]
+
+# Storage Engine: Segments and Extents
+
+ZeroFS stores file contents in immutable segment objects written directly to the object store. An LSM tree on the same object store holds only metadata: inodes, directory entries, and one 32-byte pointer per extent. This page documents the on-object format, the write and read paths, and space reclamation. {{ className: 'lead' }}
+
+## Overview {{ id: 'overview' }}
+
+File data is split into 32 KiB **extents**. Each extent is compressed, then encrypted into a self-describing **frame**. Frames are packed into **segments**: immutable objects written once to the object store and removed only by garbage collection. The two stores divide the work:
+
+| Store | Holds |
+|-------|-------|
+| Segment objects (`segments/…`) | File data: compressed, encrypted frames plus a directory and footer |
+| Metadata LSM tree (on the same object store) | Inodes, directory entries, tombstones, stats; one 32-byte FrameLoc per extent; per-segment live-byte counters |
+
+Segment object keys are `segments/{shard}/{epoch}/{counter}`:
+
+- **epoch** — the writer epoch, a fencing counter bumped on every writer open. Two writer terms can never collide on an object key.
+- **counter** — a per-process sequence number, starting at 0 each open.
+- **shard** — the low byte of the counter, as two hex digits. Consecutive segments round-robin across 256 prefixes, avoiding object-store hot-prefix throttling on a monotonic key tail. Reads resolve exact keys from the FrameLoc, so sharding costs the read path nothing.
+
+<Mermaid chart={`
+graph TB
+    subgraph "ZeroFS Process"
+        WRITE[File write]
+        EXT[Extent store]
+        BUF["Open segment buffer (RAM)"]
+        TXN[Transaction]
+        MEM[LSM memtable]
+
+        WRITE --> EXT
+        EXT -->|sealed frame| BUF
+        EXT -->|32-byte FrameLoc| TXN
+        TXN --> MEM
+    end
+
+    subgraph "Object Store"
+        SEG["Segment objects (segments/shard/epoch/counter)"]
+        SST[Metadata SSTs]
+    end
+
+    BUF -->|"seal: one multipart PUT"| SEG
+    MEM -->|"flush, gated on seal barrier"| SST
+    `} />
+
+A write touches only RAM and the metadata transaction. Object-store requests happen at segment seal and metadata flush, not per write.
+
+## On-Object Format {{ id: 'on-object-format' }}
+
+A segment has three parts, written in order:
+
+```
+[frame_0][frame_1]...[frame_k-1]   packed, no padding
+[directory]                        AEAD-sealed reverse map (GC and recovery only)
+[footer]                           64 bytes, plaintext, written last
+```
+
+Each frame on the wire is `[len: u32 LE][sealed_frame]`. The sealed frame is `[nonce: 24 bytes][ciphertext + tag: 16 bytes]`: the extent is compressed (per the `compression` setting), then encrypted with XChaCha20-Poly1305. The key is derived from the master key via HKDF-SHA256 with the label `zerofs-v1-segment`, domain-separated from the metadata SST-block key. The AEAD associated data binds each frame to its segment ID, frame index, inode, and extent index — a frame cannot be moved to another segment, slot, or logical block without failing authentication.
+
+The **FrameLoc** is the LSM value of an extent key: 32 bytes, little-endian.
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 8 | Segment epoch |
+| 8 | 8 | Segment counter |
+| 16 | 4 | Frame index |
+| 20 | 8 | Byte offset of the frame's length prefix within the segment |
+| 28 | 4 | Byte length: length prefix plus sealed frame |
+
+The **footer** is 64 bytes, fixed layout:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Magic `ZSEG` |
+| 4 | 4 | Version (1) |
+| 8 | 4 | Frame count |
+| 12 | 8 | Directory offset |
+| 20 | 4 | Directory length |
+| 24 | 8 | Sealed epoch |
+| 32 | 8 | Counter |
+| 40 | 8 | Sealed sequence number |
+| 48 | 8 | Total object length |
+| 56 | 4 | CRC32C over directory and footer prefix |
+| 60 | 4 | Reserved, zero |
+
+The CRC32C is a keyless torn-write detector for the directory and footer only; frames carry their own AEAD tags. The directory is a reverse map — one 28-byte entry per frame (byte offset, length, inode, extent index) — sealed as a single AEAD frame. Normal reads never touch it; only garbage collection, segment packing, and standby recovery do.
+
+## Write Path {{ id: 'write-path' }}
+
+1. A file write splits into 32 KiB extents. Partially overwritten extents are read back first, up to 20 in parallel; full overwrites and writes beyond EOF skip the read. A 32 MiB tail cache holds each inode's most recently written extent, so sequential appends do not re-read the tail. All-zero extents become key deletions (holes).
+2. Each non-zero extent is sealed — compressed, encrypted — and appended to an in-RAM open segment buffer. The FrameLoc put and the segment live-byte credits and debits commit in the same transaction as the inode update. No object-store request is issued on the write path.
+3. When the open buffer crosses 256 MiB, it rotates and uploads in the background as one multipart PUT with 8 concurrent parts. At most 4 seals run in flight; this bounds un-uploaded segment RAM to 4 × 256 MiB and backpressures writers. A failed background upload is retried at the next flush.
+
+### The fsync barrier
+
+`fsync` (and every other flush) runs a fixed sequence: drain in-flight seals, re-upload any failed seal, seal the current open buffer, then flush the metadata LSM. If sealing fails, the metadata flush does not run. The invariant: **a durable metadata manifest never references an un-uploaded segment**. A crash between segment upload and metadata flush leaves an orphaned segment object, which garbage collection reclaims — never a durable pointer to a missing object. This invariant is exercised by failpoint crash tests.
+
+The LSM tree's write-ahead log is permanently off and not configurable: a WAL flush is not gated by the seal barrier and could persist a FrameLoc to a segment that was never uploaded.
+
+Flushes are triggered by:
+
+- Client `fsync`, NFS COMMIT, NBD flush
+- The periodic flush every `flush_interval_secs` (default 30 s)
+- Every commit batch when `sync_writes = true`
+- Each segment garbage-collection pass
+- Shutdown
+
+Between flushes, up to 256 MiB of committed writes exist only in the open RAM buffer, plus up to 4 × 256 MiB in sealing buffers. Under [replication](/high-availability), the standby also holds these writes: a frame still in leader RAM ships with the replicated operation, and a promoted standby rebuilds any missing segment objects at takeover. See [Durability & Consistency](/durability) for the guarantee model.
+
+## Read Path {{ id: 'read-path' }}
+
+A point read looks up the extent key, decodes the FrameLoc, and checks the open buffer and sealing map first (read-your-writes without a network round trip). On a miss it issues one ranged GET of exactly the frame's byte span, then decrypts and decompresses. Frames are self-describing; the segment directory is never consulted on reads.
+
+Multi-extent reads scan the extent keyspace and coalesce every maximal run that is contiguous in one segment — same segment, consecutive frame indices, adjacent byte ranges — into a single ranged GET. Missing extents are holes and return zeros. Segment packing re-sorts a file's live extents by (inode, extent index), so a whole-file read of a packed file can be one GET.
+
+Two prefetch layers apply:
+
+- **Logical read-ahead**: after 2 consecutive sequential reads, an 8 MiB window of upcoming extents is prefetched, up to 16 fetches in parallel. It fires only when the window crosses into a different segment object; within one segment the physical layer covers it.
+- **Physical prefetch**: objects are cached in 128 KiB parts; a sequential stream's fetch window ramps from 128 KiB to 8 MiB, kept up to 4 windows deep. Concurrent misses on the same window share one GET.
+
+The parts cache stores raw object bytes: extent data is compressed and encrypted on the local cache disk. Just-sealed segments are inserted into the parts cache from the bytes in hand, so a read after write is served locally. Cache sizing is documented on the [Caching](/caching) page.
+
+## Space Reclamation {{ id: 'space-reclamation' }}
+
+The metadata LSM tracks live bytes per segment. Transactions carry signed deltas; the single-writer commit worker folds them into absolute counters. Overwriting or deleting an extent debits the segment that held its old frame.
+
+A garbage-collection pass runs every 60 s on the writer:
+
+1. **Seal and flush** under the barrier, so the durable view matches memory.
+2. **Scan** the per-segment counters — O(number of segments), not extents — and the streamed `segments/` listing.
+3. **Delete dead segments**: a segment with zero live bytes gets a delete horizon on first sight (at least 60 s in the future, extended 30 s past any ephemeral checkpoint expiry) and is deleted on a later pass, at most 1024 per pass. Every delete is gated by a fail-closed verification that re-reads the segment directory and confirms no extent still points at it; any error skips the delete (a leak, never data loss). Persistent [checkpoints](/checkpoints) protect the segments they can reference.
+4. **Pack fragmented segments**: segments under 50% live or smaller than 1 MiB are repacked into fresh segments targeting 256 MiB, at most 64 sources and 256 MiB per round. Live frames are fetched via coalesced ranged GETs, re-sorted by (inode, extent index) for physical contiguity, sealed durably, then repointed with a conditional swap under the per-inode lock. Drained sources are not deleted in the same pass — they become dead and are removed later, so in-flight reads stay valid. Dense full-size segments are never rewritten.
+
+Directory reads during GC are two ranged GETs — the 64-byte footer suffix, then the directory span — never the whole object.
+
+File data no longer rides LSM compaction. The embedded compactor still runs in `zerofs run`, but rewrites only metadata SSTs. Deleted-file extent pointers are removed by the tombstone sweep described on the [Garbage Collection](/garbage-collection) page; the segment bytes are then reclaimed by the pass above.
+
+## Design Constants {{ id: 'design-constants' }}
+
+The data plane has no tuning knobs. These values are compile-time constants:
+
+| Constant | Value |
+|----------|-------|
+| Extent size | 32 KiB |
+| FrameLoc size | 32 bytes |
+| Segment seal threshold | 256 MiB |
+| Max in-flight seals | 4 |
+| Segment upload concurrency | 8 multipart parts |
+| Parallel extent reads per operation | 20 |
+| Tail cache | 32 MiB |
+| Logical read-ahead window | 8 MiB, after 2 sequential reads, 16 fetches max |
+| Physical part size | 128 KiB |
+| Physical fetch window | 128 KiB to 8 MiB, 4 windows deep |
+| Segment GC interval | 60 s |
+| Dead-segment delete horizon | ≥ 60 s; checkpoint expiry + 30 s; persistent checkpoint margin 300 s |
+| Segment deletes per GC pass | ≤ 1024 |
+| Packing candidates | live < 50%, or size < 1 MiB |
+| Packing target / per-round cap | 256 MiB / 64 segments, 256 MiB |
+
+## Configuration {{ id: 'configuration' }}
+
+The engine responds to these configuration keys:
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `[filesystem] compression` | `zstd-3` | Per-frame codec: `lz4` or `zstd-1` through `zstd-22`. The algorithm is auto-detected on read, so changing it on an existing store is safe; old and new frames coexist. |
+| `[filesystem] ignore_fsync` | `false` | Client fsync returns without a seal and flush. Intended for [HA](/high-availability), where the standby already holds the write. Cannot be combined with `sync_writes`. |
+| `[lsm] flush_interval_secs` | `30` (min 5) | Interval of the periodic barrier-gated flush: seal the open segment, then flush metadata. |
+| `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive: the WAL is off, so each batch waits for a full seal plus memtable flush. |
+| `[lsm] l0_max_ssts` | `256` (min 4) | Level-0 SST backlog for the metadata LSM; also applied per key. |
+| `[lsm] max_concurrent_compactions` | `8` (min 1) | Concurrency of the embedded metadata compactor. |
+
+`[lsm] wal_enabled` and `[lsm] max_unflushed_gb` no longer exist; a configuration that sets either fails to parse. Cache sizing (`[cache] disk_size_gb`, `memory_size_gb`, `warm_metadata`) is covered on the [Caching](/caching) page.
+
+<div className="not-prose">
+  <Button href="/architecture" variant="text" arrow="left">
+    <>Back to Architecture</>
+  </Button>
+</div>

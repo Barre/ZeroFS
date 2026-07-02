@@ -1,10 +1,10 @@
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
-use zerofs::fs::CHUNK_SIZE;
+use zerofs::fs::EXTENT_SIZE;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::errors::FsError;
 use zerofs::fs::inode::{Inode, InodeAttrs, InodeId};
-use zerofs::fs::key_codec::{CHUNK_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
+use zerofs::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
 use zerofs::fs::store::directory::DirScanValue;
 
 const ROOT_INODE_ID: InodeId = 0;
@@ -15,8 +15,8 @@ const ID_SIZE: usize = std::mem::size_of::<InodeId>();
 /// `prefix`-kind key. Returns `None` if the key is too short, lacks the
 /// expected v2 domain prefix, or the kind byte doesn't match.
 fn parse_id(codec: &KeyCodec, prefix: KeyPrefix, key: &[u8]) -> Option<InodeId> {
-    let expected_domain = if prefix == KeyPrefix::Chunk {
-        CHUNK_DOMAIN
+    let expected_domain = if prefix == KeyPrefix::Extent {
+        EXTENT_DOMAIN
     } else {
         META_DOMAIN
     };
@@ -76,11 +76,20 @@ pub enum ConsistencyError {
     StaleTombstone {
         inode_id: InodeId,
     },
-    MissingChunks {
+    MissingExtents {
         inode_id: InodeId,
         file_size: u64,
-        expected_chunks: u64,
-        found_chunks: u64,
+        expected_extents: u64,
+        found_extents: u64,
+    },
+    /// A committed FrameLoc points at a segment the read path can't return: a crash
+    /// between the FrameLoc commit and the segment PUT (seal), or a torn/corrupt
+    /// segment. The seal-before-flush barrier is supposed to make this impossible for
+    /// durable state.
+    UnreadableExtents {
+        inode_id: InodeId,
+        file_size: u64,
+        error: String,
     },
     DirectoryNlinkMismatch {
         inode_id: InodeId,
@@ -92,9 +101,9 @@ pub enum ConsistencyError {
         stored_counter: u64,
         max_inode_id: u64,
     },
-    OrphanedChunk {
+    OrphanedExtent {
         inode_id: InodeId,
-        chunk_count: u64,
+        extent_count: u64,
     },
     DirEntryMissingScan {
         dir_id: InodeId,
@@ -202,15 +211,25 @@ impl std::fmt::Display for ConsistencyError {
                     inode_id
                 )
             }
-            Self::MissingChunks {
+            Self::MissingExtents {
                 inode_id,
                 file_size,
-                expected_chunks,
-                found_chunks,
+                expected_extents,
+                found_extents,
             } => write!(
                 f,
-                "File {} (size={}) missing chunks: expected={}, found={}",
-                inode_id, file_size, expected_chunks, found_chunks
+                "File {} (size={}) missing extents: expected={}, found={}",
+                inode_id, file_size, expected_extents, found_extents
+            ),
+            Self::UnreadableExtents {
+                inode_id,
+                file_size,
+                error,
+            } => write!(
+                f,
+                "File {} (size={}) has unreadable extents (dangling FrameLoc or corrupt \
+                 segment): {}",
+                inode_id, file_size, error
             ),
             Self::DirectoryNlinkMismatch {
                 inode_id,
@@ -230,13 +249,13 @@ impl std::fmt::Display for ConsistencyError {
                 "Inode counter {} is not greater than max inode ID {} (risk of collision)",
                 stored_counter, max_inode_id
             ),
-            Self::OrphanedChunk {
+            Self::OrphanedExtent {
                 inode_id,
-                chunk_count,
+                extent_count,
             } => write!(
                 f,
-                "Found {} orphaned chunks for inode {} (no inode or tombstone exists)",
-                chunk_count, inode_id
+                "Found {} orphaned extents for inode {} (no inode or tombstone exists)",
+                extent_count, inode_id
             ),
             Self::DirEntryMissingScan {
                 dir_id,
@@ -369,7 +388,7 @@ impl<'a> ConsistencyChecker<'a> {
         // (see `tests/failpoints/mod.rs`).
         Self {
             fs,
-            codec: KeyCodec::new(true),
+            codec: KeyCodec::new(),
             report: ConsistencyReport::default(),
             inode_refs: HashMap::new(),
             valid_inodes: HashSet::new(),
@@ -392,9 +411,9 @@ impl<'a> ConsistencyChecker<'a> {
         self.verify_orphan_set_drained();
         self.verify_stats_counters().await?;
         self.verify_tombstones().await?;
-        self.verify_file_chunks().await?;
+        self.verify_file_extents().await?;
         self.verify_inode_counter().await?;
-        self.verify_orphaned_chunks().await?;
+        self.verify_orphaned_extents().await?;
         self.verify_dir_entry_scan_consistency().await?;
         self.verify_orphaned_directory_metadata().await?;
         self.verify_dir_cookie_counters().await?;
@@ -670,7 +689,7 @@ impl<'a> ConsistencyChecker<'a> {
         Ok(())
     }
 
-    async fn verify_file_chunks(&mut self) -> Result<(), FsError> {
+    async fn verify_file_extents(&mut self) -> Result<(), FsError> {
         for &inode_id in &self.valid_inodes.clone() {
             if !self.inode_refs.contains_key(&inode_id) {
                 continue;
@@ -679,11 +698,11 @@ impl<'a> ConsistencyChecker<'a> {
                 if file.size == 0 {
                     continue;
                 }
-                let expected_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
-                let start_key = self.codec.chunk_key(inode_id, 0);
-                let end_key = self.codec.chunk_key(inode_id, expected_chunks);
+                let expected_extents = file.size.div_ceil(EXTENT_SIZE as u64);
+                let start_key = self.codec.extent_key(inode_id, 0);
+                let end_key = self.codec.extent_key(inode_id, expected_extents);
 
-                let mut found_chunks = 0u64;
+                let mut found_extents = 0u64;
                 let stream = match self.fs.db.scan(start_key..end_key).await {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -692,17 +711,32 @@ impl<'a> ConsistencyChecker<'a> {
 
                 while let Some(result) = stream.next().await {
                     if result.is_ok() {
-                        found_chunks += 1;
+                        found_extents += 1;
                     }
                 }
 
-                if found_chunks != expected_chunks {
-                    self.report.errors.push(ConsistencyError::MissingChunks {
+                if found_extents != expected_extents {
+                    self.report.errors.push(ConsistencyError::MissingExtents {
                         inode_id,
                         file_size: file.size,
-                        expected_chunks,
-                        found_chunks,
+                        expected_extents,
+                        found_extents,
                     });
+                }
+
+                // Beyond counting keys, every extent must actually be readable: read
+                // the whole file back through the data plane. A committed FrameLoc
+                // whose segment was never PUT (crash between commit and seal) reads
+                // back as a dangling pointer, and a torn segment fails the per-frame
+                // AEAD — both surface here, not in the key count above.
+                if let Err(e) = self.fs.extent_store.read(inode_id, 0, file.size).await {
+                    self.report
+                        .errors
+                        .push(ConsistencyError::UnreadableExtents {
+                            inode_id,
+                            file_size: file.size,
+                            error: format!("{e:?}"),
+                        });
                 }
             }
         }
@@ -736,9 +770,9 @@ impl<'a> ConsistencyChecker<'a> {
         Ok(())
     }
 
-    async fn verify_orphaned_chunks(&mut self) -> Result<(), FsError> {
+    async fn verify_orphaned_extents(&mut self) -> Result<(), FsError> {
         let codec = &self.codec;
-        let (start, end) = codec.prefix_range(KeyPrefix::Chunk);
+        let (start, end) = codec.prefix_range(KeyPrefix::Extent);
 
         let mut stream = self
             .fs
@@ -751,7 +785,7 @@ impl<'a> ConsistencyChecker<'a> {
 
         while let Some(result) = stream.next().await {
             let (key, _) = result.map_err(|_| FsError::IoError)?;
-            if let Some(inode_id) = parse_id(codec, KeyPrefix::Chunk, &key)
+            if let Some(inode_id) = parse_id(codec, KeyPrefix::Extent, &key)
                 && !self.valid_inodes.contains(&inode_id)
                 && !self.tombstone_inodes.contains(&inode_id)
             {
@@ -759,10 +793,10 @@ impl<'a> ConsistencyChecker<'a> {
             }
         }
 
-        for (inode_id, chunk_count) in orphaned_by_inode {
-            self.report.errors.push(ConsistencyError::OrphanedChunk {
+        for (inode_id, extent_count) in orphaned_by_inode {
+            self.report.errors.push(ConsistencyError::OrphanedExtent {
                 inode_id,
-                chunk_count,
+                extent_count,
             });
         }
 

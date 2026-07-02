@@ -55,7 +55,7 @@ pub fn start(
                     collect_fs_stats(&fs_stats);
                     collect_global_stats(&global_stats);
                     if let Some(ref registry) = slatedb_registry {
-                        collect_slatedb_stats(registry);
+                        collect_lsm_stats(registry);
                     }
                     collect_jemalloc_stats();
                     upkeep_handle.run_upkeep();
@@ -148,8 +148,8 @@ fn collect_fs_stats(stats: &FileSystemStats) {
         .absolute(stats.tombstones_created.load(Ordering::Relaxed));
     counter!("zerofs_tombstones_processed_total")
         .absolute(stats.tombstones_processed.load(Ordering::Relaxed));
-    counter!("zerofs_gc_chunks_deleted_total")
-        .absolute(stats.gc_chunks_deleted.load(Ordering::Relaxed));
+    counter!("zerofs_gc_extents_deleted_total")
+        .absolute(stats.gc_extents_deleted.load(Ordering::Relaxed));
     counter!("zerofs_gc_runs_total").absolute(stats.gc_runs.load(Ordering::Relaxed));
     counter!("zerofs_total_operations").absolute(stats.total_operations.load(Ordering::Relaxed));
 }
@@ -169,10 +169,22 @@ fn collect_jemalloc_stats() {
     gauge!("zerofs_jemalloc_metadata_bytes").set(mem.metadata as f64);
 }
 
-fn collect_slatedb_stats(recorder: &DefaultMetricsRecorder) {
+/// Export name for a metadata-engine metric: the engine registers under
+/// "slatedb.…", but the exported series speak the same vocabulary as the docs
+/// and logs (the metadata LSM), so the prefix becomes "lsm_".
+fn lsm_export_name(name: &str) -> String {
+    format!(
+        "lsm_{}",
+        name.strip_prefix("slatedb.")
+            .unwrap_or(name)
+            .replace('.', "_")
+    )
+}
+
+fn collect_lsm_stats(recorder: &DefaultMetricsRecorder) {
     let snapshot = recorder.snapshot();
     for metric in snapshot.all() {
-        let prom_name = metric.name.replace('.', "_");
+        let prom_name = lsm_export_name(&metric.name);
         match &metric.value {
             MetricValue::Counter(v) => {
                 counter!(prom_name).absolute(*v);
@@ -187,5 +199,21 @@ fn collect_slatedb_stats(recorder: &DefaultMetricsRecorder) {
                 gauge!(prom_name).set(*sum);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lsm_export_name;
+
+    #[test]
+    fn engine_metric_names_export_under_the_lsm_prefix() {
+        assert_eq!(
+            lsm_export_name("slatedb.compactor.bytes_compacted"),
+            "lsm_compactor_bytes_compacted"
+        );
+        // A name without the engine prefix still exports under lsm_: the
+        // recorder holds only metadata-engine metrics.
+        assert_eq!(lsm_export_name("some.other.stat"), "lsm_some_other_stat");
     }
 }

@@ -15,7 +15,9 @@ One read-write instance and any number of read-only instances can run against th
 
     A replica is a normal `zerofs run` process started with the `--read-only` flag. It uses the same `zerofs.toml` as the writer and serves every front end configured there — NFS, 9P, NBD, and the web UI — on its own addresses.
 
-    Replicas need read access to the object store (and to the [separate WAL store](/separate-wal), if one is configured) and the same `encryption_password` as the writer.
+    Replicas need the same `encryption_password` as the writer and object-store credentials that can read everything under the database prefix and write to the metadata store's manifest area. Reads cover metadata LSM objects, the wrapped encryption key object, and the immutable segment objects under `segments/` that hold file content. The only writes are checkpoint records: the reader registers its own checkpoint at startup, renews it while running, and deletes it on clean shutdown — a strictly read-only grant fails at startup. A replica never writes data.
+
+    A replica reads file content the same way the writer does: it resolves each extent's 32-byte pointer from the metadata LSM, then issues exact-range GETs against segment objects. Segment data flows through the replica's own local cache, sized by the replica's `[cache]` section; cached parts stay compressed and encrypted on the replica's disk. See [Storage Engine](/storage-engine) and [Caching](/caching).
 
   </Col>
   <Col>
@@ -33,26 +35,26 @@ One read-write instance and any number of read-only instances can run against th
 
 ## Freshness
 
-A replica does not open the database for writing. It opens a SlateDB `DbReader`, which polls the object store for new manifest files and WAL entries every 10 seconds and replays new WAL entries. The poll interval is a SlateDB default; `zerofs.toml` has no setting for it.
+A replica does not open the database for writing. It opens the metadata store in reader mode, which polls the object store for new manifest files every 10 seconds. The data database's WAL is permanently disabled, so there are no WAL entries to replay: a replica sees exactly the writer's flushed state, and its view advances in whole-manifest steps — each poll adopts the newest flushed manifest. The poll interval is an engine default; `zerofs.toml` has no setting for it.
 
 A write becomes visible on a replica after two delays:
 
-1. The writer persists the write to the object store. Buffered writes get there on client `fsync`, when the periodic flush runs (every 30 seconds by default, `flush_interval_secs` under `[lsm]`), or when buffered data reaches a capacity threshold. See [Durability](/durability).
+1. The writer flushes. A flush seals the open segment and uploads it, then flushes metadata — only flushed data can appear on a replica. Flushes run on client `fsync` (NFS `COMMIT`, NBD flush), when the periodic flush runs (every 30 seconds by default, `flush_interval_secs` under `[lsm]`), after every batch with `sync_writes = true`, and at the start of each segment garbage-collection pass. See [Durability](/durability).
 2. The replica's next poll picks it up, after at most 10 seconds.
 
 Worst-case staleness is therefore the writer's flush delay plus the 10-second poll interval.
 
-The reader registers its own SlateDB checkpoint with a 10-minute lifetime and renews it from the poll task. SlateDB's garbage collector deletes only files that no active manifest or checkpoint references, so the writer does not delete SSTs a replica is still reading. When a replica stops, its checkpoint expires after at most 10 minutes and the writer's garbage collector removes it. Both the lifetime and the poll interval are SlateDB defaults, not configurable in `zerofs.toml`.
+The reader registers its own metadata-store checkpoint with a 10-minute lifetime and renews it from the poll task. The checkpoint pins both halves of the store. The metadata garbage collector deletes only SSTs that no active manifest or checkpoint references, so the writer does not delete SSTs a replica is still reading. The writer's segment garbage collection honors the same checkpoints: a dead segment object is deleted only after a per-segment horizon recorded when a pass first sees it dead — the latest ephemeral-checkpoint expiry known at that moment plus a 30-second clock-skew margin, and never earlier than 60 seconds after first sight. Checkpoints created or renewed after that moment do not extend the horizon; a following replica is protected because it advances its view every poll. When a replica stops, its checkpoint expires after at most 10 minutes and the writer's garbage collection reclaims the SSTs and segments it pinned. Both the lifetime and the poll interval are engine defaults, not configurable in `zerofs.toml`.
 
 ## What a Replica Does Not Run
 
 Maintenance stays on the writer. A read-only instance runs none of the following:
 
-- **SlateDB compaction and garbage collection**: Both attach to the read-write database instance. The writer compacts SSTs and deletes unreferenced files; replicas only read them.
-- **ZeroFS garbage collection**: The background task that reclaims storage from deleted files runs only on the writer.
+- **Metadata compaction and garbage collection**: Both attach to the read-write database instance. The LSM holds only metadata, so its compaction always runs embedded in the writer; there is no standalone compactor process. The writer compacts metadata SSTs and deletes unreferenced files; replicas only read them.
+- **ZeroFS garbage collection**: Tombstone garbage collection, segment garbage collection, and segment compaction run only on the writer. A replica never deletes or repacks segment objects. See [Garbage Collection](/garbage-collection).
 - **The periodic flush**: A replica buffers no writes, so the flush task is not started.
 - **Checkpoint creation**: `zerofs checkpoint create` against a replica's RPC server fails with `Cannot create checkpoints in read-only mode. Start the server without --read-only or --checkpoint flags.`
-- **SlateDB metrics**: The `/metrics` endpoint on a replica serves ZeroFS metrics but omits the `slatedb_`-prefixed series, which come from the read-write engine. See [Prometheus Metrics](/prometheus).
+- **Metadata metrics**: The `/metrics` endpoint on a replica serves ZeroFS metrics but omits the `lsm_`-prefixed series, which come from the read-write engine. See [Prometheus Metrics](/prometheus).
 
 ## Write Semantics
 
@@ -74,14 +76,14 @@ Cannot initialize encryption key in read-only mode. Please initialize the databa
 
 ### Exactly one writer
 
-Only one read-write instance can run against a volume at a time. ZeroFS depends on conditional writes in the object store to fence writers, and a read-write instance verifies this support at startup by writing a probe object and attempting a conditional overwrite. A read-only instance skips the probe.
+Only one read-write instance can run against a volume at a time. ZeroFS depends on conditional writes in the object store to fence writers, and a read-write instance verifies this support at startup by writing a probe object and then attempting a create-only (put-if-absent) write of the same key, which the store must reject as already existing. A read-only instance skips the probe.
 
 ## --read-only vs --checkpoint
 
-Both flags open the database through a SlateDB `DbReader`, and both produce a read-only filesystem. They differ in what they track:
+Both flags open the metadata store in reader mode, and both produce a read-only filesystem. They differ in what they track:
 
-- `--read-only` follows the live head. The reader polls the manifest and WAL, and new writes appear within the staleness bound above.
-- `--checkpoint` pins the reader to a named checkpoint. SlateDB does not poll the manifest or WAL in this mode, so the view never advances.
+- `--read-only` follows the live head. The reader polls the manifest, and new writes appear within the staleness bound above.
+- `--checkpoint` pins the reader to a named checkpoint. The reader does not poll the manifest in this mode, so the view never advances.
 
 The two flags are mutually exclusive; passing both is a startup error.
 

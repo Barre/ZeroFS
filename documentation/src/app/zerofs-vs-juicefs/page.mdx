@@ -2,12 +2,20 @@ import { BenchmarkCharts } from './BenchmarkCharts'
 
 export const metadata = {
   title: 'ZeroFS vs JuiceFS Benchmarks',
-  description: 'Benchmark results for ZeroFS and JuiceFS on Azure D48lds v6 with Cloudflare R2 storage',
+  description: 'August 2025 benchmark results for ZeroFS and JuiceFS on Azure D48lds v6 with Cloudflare R2 storage, measured on the previous chunk-based storage engine',
 }
 
 # ZeroFS vs JuiceFS Benchmarks
 
 Performance comparison conducted on Azure D48lds v6 (48 vCPUs, 96 GiB RAM) with Cloudflare R2 backend. Results published August 2025.
+
+<Note>
+  Historical record. All results on this page were measured on the legacy
+  storage engine, which stored file data as 32 KiB chunks inside the LSM
+  database. The current engine stores file data as extents in immutable segment
+  objects written directly to the object store; write, read, and compaction S3
+  request patterns have changed since.
+</Note>
 
 ## Test Setup
 
@@ -18,7 +26,7 @@ Performance comparison conducted on Azure D48lds v6 (48 vCPUs, 96 GiB RAM) with 
 
 ## Architecture Differences
 
-**ZeroFS**: Stores data and metadata in S3. No separate database.
+**ZeroFS**: Stores data and metadata in S3. No separate database. This still holds under the current engine: file data in immutable segment objects, metadata in an embedded LSM database, both on the same object store.
 
 **JuiceFS**: Stores data in S3 and metadata in a separate database (SQLite, Redis, or TiKV).
 
@@ -123,6 +131,17 @@ Extracting ZFS 2.3.3 source tarball. Tests sequential file creation with varying
 
 Both buckets hold the result of the same workload, measured after all tests completed. R2 bills for stored bytes and for Class A and Class B operations.
 
+<Note>
+  The ZeroFS column reflects the legacy engine, where file data passed
+  through the LSM database's SSTs and compaction. The current engine issues no
+  S3 uploads per write operation: one PUT per segment seal (multipart for full
+  256 MiB seals), whether threshold-triggered or fsync-forced. Partial
+  overwrites of uncached data may still issue read GETs. Reads use exact
+  ranged GETs on immutable segment objects; space is reclaimed with segment GC
+  instead of bulk-data LSM compaction. Bucket size and operation counts under
+  the current engine have not been re-measured.
+</Note>
+
 ## Summary
 
-On this hardware and backend, throughput differences range from 1.17x (empty file creation) to 227x (single file append). JuiceFS failed 92% of data modification operations and 97% of appends, and the compilation workload was aborted after 69 minutes without progress past initial dependencies. The same workload left 7.57 GB in the ZeroFS bucket and 238.99 GB in the JuiceFS bucket.
+On this hardware and backend, throughput differences range from 1.17x (empty file creation) to 227x (single file append). JuiceFS failed 92% of data modification operations and 97% of appends, and the compilation workload was aborted after 69 minutes without progress past initial dependencies. The same workload left 7.57 GB in the ZeroFS bucket and 238.99 GB in the JuiceFS bucket. All figures date from August 2025 and the previous chunk-based storage engine.

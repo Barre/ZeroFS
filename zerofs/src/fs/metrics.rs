@@ -35,7 +35,7 @@ pub struct FileSystemStats {
     // Garbage collection
     pub tombstones_created: AtomicU64,
     pub tombstones_processed: AtomicU64,
-    pub gc_chunks_deleted: AtomicU64,
+    pub gc_extents_deleted: AtomicU64,
     pub gc_runs: AtomicU64,
 
     // Performance
@@ -69,7 +69,7 @@ impl FileSystemStats {
             bytes_written: AtomicU64::new(0),
             tombstones_created: AtomicU64::new(0),
             tombstones_processed: AtomicU64::new(0),
-            gc_chunks_deleted: AtomicU64::new(0),
+            gc_extents_deleted: AtomicU64::new(0),
             gc_runs: AtomicU64::new(0),
             total_operations: AtomicU64::new(0),
             last_snapshot: std::sync::Mutex::new(PreviousSnapshot {
@@ -102,7 +102,7 @@ impl FileSystemStats {
 
         let tombstones_created = self.tombstones_created.load(Ordering::Relaxed);
         let tombstones_processed = self.tombstones_processed.load(Ordering::Relaxed);
-        let gc_chunks = self.gc_chunks_deleted.load(Ordering::Relaxed);
+        let gc_extents = self.gc_extents_deleted.load(Ordering::Relaxed);
         let gc_runs = self.gc_runs.load(Ordering::Relaxed);
 
         let total_ops = self.total_operations.load(Ordering::Relaxed);
@@ -239,10 +239,10 @@ impl FileSystemStats {
             )),
         ]);
         table.add_row(vec![
-            Cell::new("  Chunks deleted"),
+            Cell::new("  Extents deleted"),
             Cell::new(format!(
                 "{} (in {} runs)",
-                gc_chunks.to_formatted_string(&Locale::en),
+                gc_extents.to_formatted_string(&Locale::en),
                 gc_runs.to_formatted_string(&Locale::en)
             )),
         ]);

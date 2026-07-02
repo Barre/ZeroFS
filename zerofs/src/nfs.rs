@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use zerofs::fs::CHUNK_SIZE;
+use zerofs::fs::EXTENT_SIZE;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
     fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, writeverf3,
@@ -383,10 +383,10 @@ impl NFSFileSystem for NFSAdapter {
             obj_attributes: obj_attr,
             rtmax: 1024 * 1024,
             rtpref: 1024 * 1024,
-            rtmult: CHUNK_SIZE as u32,
+            rtmult: EXTENT_SIZE as u32,
             wtmax: 1024 * 1024,
             wtpref: 1024 * 1024,
-            wtmult: CHUNK_SIZE as u32,
+            wtmult: EXTENT_SIZE as u32,
             dtpref: 1024 * 1024,
             maxfilesize,
             time_delta: nfstime3 {

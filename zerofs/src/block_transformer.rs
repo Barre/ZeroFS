@@ -1,45 +1,33 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use chacha20poly1305::{
-    Key, XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadInPlace, KeyInit},
-};
-use hkdf::Hkdf;
-use rand::{RngCore, thread_rng};
-use sha2::Sha256;
 use slatedb::BlockTransformer;
 use std::sync::Arc;
 
 use crate::config::CompressionConfig;
+use crate::frame_codec::{CodecError, FrameCodec};
 use crate::task::spawn_blocking_named;
 
-const NONCE_SIZE: usize = 24;
-const TAG_SIZE: usize = 16;
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// HKDF info label for the SST block-encryption subkey. Preserves the historical
+/// key derivation so existing data still decodes.
+const ENCRYPTION_INFO: &[u8] = b"zerofs-v1-encryption";
 
-/// Payloads at or below this size are transformed inline on the runtime
-/// thread: testing has shown that a spawn_blocking handoff costs ~25us p50 (~30-37us added per op),
-/// while the transform of a 32KiB block runs 1.4-64us for the cheap
-/// compression configs.
+/// Payloads at or below this size are transformed inline on the runtime thread:
+/// a spawn_blocking handoff costs ~25us p50 (~30-37us added per op), while the
+/// transform of a 32KiB block runs 1.4-64us for the cheap compression configs.
 const INLINE_MAX_LEN: usize = 64 * 1024;
 
 /// Block transformer that handles compression and encryption for SlateDB.
 ///
-/// This implements SlateDB's `BlockTransformer` trait to provide transparent
-/// compression and encryption at the SST block level. The transformation
-/// pipeline is:
+/// Implements SlateDB's `BlockTransformer` to provide transparent compression
+/// and encryption at the SST block level, delegating to [`FrameCodec`] with an
+/// empty AAD (the historical wire format):
 ///
 /// - Write path: compress -> encrypt
 /// - Read path: decrypt -> decompress
 ///
 /// Format: `[nonce (24 bytes)][compressed + encrypted data + AEAD tag]`
 pub struct ZeroFsBlockTransformer {
-    inner: Arc<TransformerInner>,
-}
-
-struct TransformerInner {
-    cipher: XChaCha20Poly1305,
-    compression: CompressionConfig,
+    codec: Arc<FrameCodec>,
 }
 
 impl ZeroFsBlockTransformer {
@@ -48,17 +36,8 @@ impl ZeroFsBlockTransformer {
     /// The encryption key is derived from the master key using HKDF-SHA256 with
     /// the info string "zerofs-v1-encryption".
     pub fn new(master_key: &[u8; 32], compression: CompressionConfig) -> Self {
-        let hk = Hkdf::<Sha256>::new(None, master_key);
-
-        let mut encryption_key = [0u8; 32];
-        hk.expand(b"zerofs-v1-encryption", &mut encryption_key)
-            .expect("valid length");
-
         Self {
-            inner: Arc::new(TransformerInner {
-                cipher: XChaCha20Poly1305::new(Key::from_slice(&encryption_key)),
-                compression,
-            }),
+            codec: Arc::new(FrameCodec::new(master_key, ENCRYPTION_INFO, compression)),
         }
     }
 
@@ -68,91 +47,26 @@ impl ZeroFsBlockTransformer {
     }
 }
 
-impl TransformerInner {
-    /// Whether encoding is cheap enough to run inline.
-    fn encode_is_cheap(&self) -> bool {
-        match self.compression {
-            CompressionConfig::Lz4 => true,
-            CompressionConfig::Zstd(level) => level <= 12,
-        }
-    }
-
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
-        match self.compression {
-            CompressionConfig::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
-            CompressionConfig::Zstd(level) => {
-                let compressed = zstd::bulk::compress(data, level)
-                    .map_err(|e| slatedb::Error::data(format!("Zstd compression failed: {}", e)))?;
-                // Prepend original size as little-endian u32 for decompression
-                let size = data.len() as u32;
-                let mut result = Vec::with_capacity(4 + compressed.len());
-                result.extend_from_slice(&size.to_le_bytes());
-                result.extend_from_slice(&compressed);
-                Ok(result)
-            }
-        }
-    }
-
-    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
-        // Auto-detect compression algorithm based on magic bytes
-        // Zstd format: [u32 size][zstd data with magic at offset 4]
-        if data.len() >= 8 && data[4..8] == ZSTD_MAGIC {
-            let size = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-            zstd::bulk::decompress(&data[4..], size)
-                .map_err(|e| slatedb::Error::data(format!("Zstd decompression failed: {}", e)))
-        } else {
-            // LZ4 compressed (also has size prepended by lz4_flex)
-            lz4_flex::decompress_size_prepended(data)
-                .map_err(|e| slatedb::Error::data(format!("LZ4 decompression failed: {}", e)))
-        }
-    }
-
-    fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
-        let mut nonce_bytes = [0u8; NONCE_SIZE];
-        thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
-
-        // Format: [nonce][ciphertext][tag]
-        let mut result = Vec::with_capacity(NONCE_SIZE + data.len() + TAG_SIZE);
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(data);
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(nonce, b"", &mut result[NONCE_SIZE..])
-            .map_err(|e| slatedb::Error::data(format!("Encryption failed: {}", e)))?;
-        result.extend_from_slice(tag.as_slice());
-        Ok(result)
-    }
-
-    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
-        if data.len() < NONCE_SIZE {
-            return Err(slatedb::Error::data(
-                "Invalid ciphertext: too short".to_string(),
-            ));
-        }
-
-        let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
-        let nonce = XNonce::from_slice(nonce_bytes);
-
-        self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| slatedb::Error::data(format!("Decryption failed: {}", e)))
-    }
+fn to_slatedb_err(e: CodecError) -> slatedb::Error {
+    slatedb::Error::data(e.to_string())
 }
 
 #[async_trait]
 impl BlockTransformer for ZeroFsBlockTransformer {
     /// Encode a block: compress then encrypt.
     async fn encode(&self, data: Bytes) -> Result<Bytes, slatedb::Error> {
-        if data.len() <= INLINE_MAX_LEN && self.inner.encode_is_cheap() {
-            let compressed = self.inner.compress(&data)?;
-            return Ok(Bytes::from(self.inner.encrypt(&compressed)?));
+        if data.len() <= INLINE_MAX_LEN && self.codec.encode_is_cheap() {
+            return Ok(Bytes::from(
+                self.codec
+                    .seal(data.as_ref(), b"")
+                    .map_err(to_slatedb_err)?,
+            ));
         }
-        let inner = Arc::clone(&self.inner);
+        let codec = Arc::clone(&self.codec);
         spawn_blocking_named("block-encode", move || {
-            let compressed = inner.compress(&data)?;
-            let encrypted = inner.encrypt(&compressed)?;
-            Ok(Bytes::from(encrypted))
+            Ok(Bytes::from(
+                codec.seal(data.as_ref(), b"").map_err(to_slatedb_err)?,
+            ))
         })
         .map_err(|e| slatedb::Error::data(format!("Failed to spawn block-encode task: {}", e)))?
         .await
@@ -162,14 +76,17 @@ impl BlockTransformer for ZeroFsBlockTransformer {
     /// Decode a block: decrypt then decompress.
     async fn decode(&self, data: Bytes) -> Result<Bytes, slatedb::Error> {
         if data.len() <= INLINE_MAX_LEN {
-            let decrypted = self.inner.decrypt(&data)?;
-            return Ok(Bytes::from(self.inner.decompress(&decrypted)?));
+            return Ok(Bytes::from(
+                self.codec
+                    .open(data.as_ref(), b"")
+                    .map_err(to_slatedb_err)?,
+            ));
         }
-        let inner = Arc::clone(&self.inner);
+        let codec = Arc::clone(&self.codec);
         spawn_blocking_named("block-decode", move || {
-            let decrypted = inner.decrypt(&data)?;
-            let decompressed = inner.decompress(&decrypted)?;
-            Ok(Bytes::from(decompressed))
+            Ok(Bytes::from(
+                codec.open(data.as_ref(), b"").map_err(to_slatedb_err)?,
+            ))
         })
         .map_err(|e| slatedb::Error::data(format!("Failed to spawn block-decode task: {}", e)))?
         .await
@@ -280,6 +197,7 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     use super::*;
+    use crate::frame_codec::ZSTD_MAGIC;
     use proptest::prelude::*;
 
     thread_local! {

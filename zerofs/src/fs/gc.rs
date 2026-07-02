@@ -1,10 +1,12 @@
 use crate::db::Db;
-use crate::fs::CHUNK_SIZE;
+use crate::fs::EXTENT_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
-use crate::fs::store::{ChunkStore, TombstoneStore};
+use crate::fs::store::{ExtentStore, TombstoneStore};
 use crate::task::{spawn_named, spawn_named_on};
 use bytes::Bytes;
+use chrono::Utc;
+use slatedb::admin::Admin;
 use slatedb::config::WriteOptions;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,28 +19,117 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
-const MAX_CHUNKS_PER_ROUND: usize = 10_000;
+const MAX_EXTENTS_PER_ROUND: usize = 10_000;
 const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
+/// Interval between segment reclamation passes. Purely a responsiveness knob:
+/// deletion safety rides on the per-segment delete horizon. Kept at/above the
+/// periodic flush cadence (~30s) so the pass's seal+flush is a near no-op.
+const SEGMENT_GC_INTERVAL_SECS: u64 = 60;
+
+/// Floor the delete horizon this far past now, so reclamation still covers the
+/// writer's own in-flight reads when no checkpoint is pinning a view.
+const INFLIGHT_FLOOR_SECS: i64 = 60;
+
+/// Margin past a checkpoint's `expire_time` (the reader's wall clock) before
+/// its pinned segments may be deleted, covering clock skew and the reader
+/// finishing its last read.
+const CLOCK_SKEW_MARGIN_SECS: i64 = 30;
+
+/// Cadence of the slow orphan sweep, the only `list("segments")`. Gated by a
+/// persisted wall-clock timestamp so it holds across restarts. Coarse on
+/// purpose: it exists only to reclaim counter-less orphan objects, which are
+/// rare; the fast reclaim covers everything else.
+const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 pub struct GarbageCollector {
     db: Arc<Db>,
     tombstone_store: TombstoneStore,
-    chunk_store: ChunkStore,
+    extent_store: ExtentStore,
     stats: Arc<FileSystemStats>,
+    /// Read-only admin for listing active checkpoints, which gate segment
+    /// reclamation. `None` disables the check (tests).
+    checkpoint_admin: Option<Admin>,
 }
 
 impl GarbageCollector {
     pub fn new(
         db: Arc<Db>,
         tombstone_store: TombstoneStore,
-        chunk_store: ChunkStore,
+        extent_store: ExtentStore,
         stats: Arc<FileSystemStats>,
+        checkpoint_admin: Option<Admin>,
     ) -> Self {
         Self {
             db,
             tombstone_store,
-            chunk_store,
+            extent_store,
             stats,
+            checkpoint_admin,
+        }
+    }
+
+    /// Reclaim dead segment objects, unless a checkpoint pins an older manifest
+    /// (whose view may still reference segments dead in the current view).
+    async fn maybe_reclaim_segments(&self) {
+        // The gate runs inside reclaim_segments_gated, after its durable
+        // barrier — see that method for the checkpoint race this ordering
+        // closes. `floor` is sampled there too, so it covers in-flight reads
+        // relative to the actual scan time.
+        let checkpoint_admin = &self.checkpoint_admin;
+        let gate = move || async move {
+            let floor = Utc::now() + chrono::Duration::seconds(INFLIGHT_FLOOR_SECS);
+            match checkpoint_admin {
+                Some(admin) => match admin.list_checkpoints(None).await {
+                    Ok(cps) => {
+                        // Wait out the latest-expiring ephemeral checkpoint:
+                        // until then it may still reference a just-superseded
+                        // segment.
+                        let horizon = cps
+                            .iter()
+                            .filter_map(|c| c.expire_time)
+                            .max()
+                            .map(|e| {
+                                (e + chrono::Duration::seconds(CLOCK_SKEW_MARGIN_SECS)).max(floor)
+                            })
+                            .unwrap_or(floor);
+                        // A persistent checkpoint (no expiry) can't be timed
+                        // out; its presence pauses all deletion and compaction
+                        // (see reclaim_segments_gated).
+                        let protect_before = cps
+                            .iter()
+                            .filter(|c| c.expire_time.is_none())
+                            .map(|c| c.create_time)
+                            .min();
+                        if let Some(created) = protect_before {
+                            info!(
+                                "segment GC: persistent checkpoint present (earliest created {created}); segment deletion and compaction paused while one exists"
+                            );
+                        }
+                        Ok(Some((horizon, protect_before)))
+                    }
+                    Err(e) => {
+                        tracing::warn!("segment GC skipped: cannot list checkpoints: {}", e);
+                        Ok(None)
+                    }
+                },
+                None => Ok(Some((floor, None))),
+            }
+        };
+        // reclaim_segments_gated emits its own per-pass summary at info.
+        if let Err(e) = self.extent_store.reclaim_segments_gated(gate).await {
+            tracing::error!("segment GC failed: {:?}", e);
+        }
+    }
+
+    /// Drive the slow orphan sweep. The timestamp gate lives in
+    /// [`ExtentStore::sweep_orphans_if_due`]; this just supplies the interval
+    /// and logs the outcome.
+    async fn maybe_sweep_orphans(&self) {
+        let interval = chrono::Duration::seconds(ORPHAN_SWEEP_INTERVAL_SECS);
+        match self.extent_store.sweep_orphans_if_due(interval).await {
+            Ok(Some(n)) => info!("slow orphan sweep reclaimed {} orphan(s)", n),
+            Ok(None) => {} // not yet due this tick
+            Err(e) => tracing::error!("slow orphan sweep failed: {:?}", e),
         }
     }
 
@@ -47,6 +138,39 @@ impl GarbageCollector {
         shutdown: CancellationToken,
         runtime: Option<tokio::runtime::Handle>,
     ) -> JoinHandle<()> {
+        // Segment reclamation runs on its own task: `run()` drains its whole
+        // backlog before returning, so sharing a loop would let a large
+        // tombstone backlog starve reclamation. Runs once immediately, then
+        // every interval.
+        {
+            let gc = Arc::clone(&self);
+            let shutdown = shutdown.clone();
+            let reclaim = async move {
+                info!("Starting segment reclamation task");
+                loop {
+                    gc.maybe_reclaim_segments().await;
+                    // Right after the fast reclaim so no in-flight compaction can
+                    // leave a not-yet-credited packed segment eligible.
+                    gc.maybe_sweep_orphans().await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            SEGMENT_GC_INTERVAL_SECS,
+                        )) => {}
+                    }
+                }
+            };
+            // Detached: the task stops on the shutdown token, not on its handle.
+            match &runtime {
+                Some(rt) => {
+                    spawn_named_on("segment-gc", reclaim, rt);
+                }
+                None => {
+                    spawn_named("segment-gc", reclaim);
+                }
+            }
+        }
+
         let fut = async move {
             info!("Starting garbage collection task (runs continuously)");
             loop {
@@ -84,7 +208,7 @@ impl GarbageCollector {
 
         loop {
             let mut tombstones_to_update: Vec<(Bytes, u64, usize, bool)> = Vec::new();
-            let mut chunks_deleted_this_round = 0;
+            let mut extents_deleted_this_round = 0;
             let mut tombstones_completed_this_round = 0;
             let mut tombstones_processed_this_round = 0;
             let mut found_incomplete_tombstones = false;
@@ -92,7 +216,7 @@ impl GarbageCollector {
             let iter = self.tombstone_store.list().await?;
             futures::pin_mut!(iter);
 
-            let mut chunks_remaining_in_round = MAX_CHUNKS_PER_ROUND;
+            let mut extents_remaining_in_round = MAX_EXTENTS_PER_ROUND;
 
             while let Some(result) = futures::StreamExt::next(&mut iter).await {
                 let entry = result?;
@@ -112,57 +236,44 @@ impl GarbageCollector {
                     continue;
                 }
 
-                if chunks_remaining_in_round == 0 {
+                if extents_remaining_in_round == 0 {
                     found_incomplete_tombstones = true;
                     break;
                 }
 
-                let total_chunks = entry.remaining_size.div_ceil(CHUNK_SIZE as u64) as usize;
-                let chunks_to_delete = total_chunks.min(chunks_remaining_in_round);
-                let start_chunk = total_chunks.saturating_sub(chunks_to_delete);
+                let total_extents = entry.remaining_size.div_ceil(EXTENT_SIZE as u64) as usize;
+                let extents_to_delete = total_extents.min(extents_remaining_in_round);
+                let start_extent = total_extents.saturating_sub(extents_to_delete);
 
-                let is_final_batch = chunks_to_delete == total_chunks;
+                let is_final_batch = extents_to_delete == total_extents;
                 if !is_final_batch {
                     found_incomplete_tombstones = true;
                 }
                 tombstones_to_update.push((
                     entry.key,
                     entry.remaining_size,
-                    start_chunk,
+                    start_extent,
                     is_final_batch,
                 ));
 
-                let mut txn = self.db.new_transaction()?;
-                self.chunk_store.delete_range(
-                    &mut txn,
-                    entry.inode_id,
-                    start_chunk as u64,
-                    total_chunks as u64,
-                );
-
-                if chunks_to_delete > 0 {
-                    self.db
-                        .write_with_options(
-                            txn.into_inner(),
-                            &WriteOptions {
-                                await_durable: false,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .map_err(|_| FsError::IoError)?;
+                if extents_to_delete > 0 {
+                    // Under the inode's write lock so it serializes with the
+                    // compaction repoint (which takes the same lock).
+                    self.extent_store
+                        .delete_extents(entry.inode_id, start_extent as u64, total_extents as u64)
+                        .await?;
 
                     #[cfg(feature = "failpoints")]
-                    fail_point!(fp::GC_AFTER_CHUNK_DELETE);
+                    fail_point!(fp::GC_AFTER_EXTENT_DELETE);
 
-                    chunks_deleted_this_round += chunks_to_delete;
-                    chunks_remaining_in_round -= chunks_to_delete;
+                    extents_deleted_this_round += extents_to_delete;
+                    extents_remaining_in_round -= extents_to_delete;
 
                     if is_final_batch {
                         tombstones_completed_this_round += 1;
                     }
 
-                    if chunks_deleted_this_round % 1000 == 0 {
+                    if extents_deleted_this_round % 1000 == 0 {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -171,12 +282,12 @@ impl GarbageCollector {
             if !tombstones_to_update.is_empty() {
                 let mut txn = self.db.new_transaction()?;
 
-                for (key, old_size, start_chunk, delete_tombstone) in tombstones_to_update {
+                for (key, old_size, start_extent, delete_tombstone) in tombstones_to_update {
                     if delete_tombstone {
                         self.tombstone_store.remove(&mut txn, &key);
                     } else {
-                        let remaining_chunks = start_chunk;
-                        let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
+                        let remaining_extents = start_extent;
+                        let remaining_size = (remaining_extents as u64) * (EXTENT_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
                         self.tombstone_store
                             .update(&mut txn, &key, actual_remaining);
@@ -202,15 +313,15 @@ impl GarbageCollector {
                     .fetch_add(tombstones_completed_this_round, Ordering::Relaxed);
             }
 
-            if chunks_deleted_this_round > 0 || tombstones_completed_this_round > 0 {
+            if extents_deleted_this_round > 0 || tombstones_completed_this_round > 0 {
                 self.stats
-                    .gc_chunks_deleted
-                    .fetch_add(chunks_deleted_this_round as u64, Ordering::Relaxed);
+                    .gc_extents_deleted
+                    .fetch_add(extents_deleted_this_round as u64, Ordering::Relaxed);
 
                 tracing::debug!(
-                    "GC: processed {} tombstones, deleted {} chunks",
+                    "GC: processed {} tombstones, deleted {} extents",
                     tombstones_completed_this_round,
-                    chunks_deleted_this_round,
+                    extents_deleted_this_round,
                 );
             }
 
@@ -229,6 +340,7 @@ impl GarbageCollector {
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
+    use crate::fs::key_codec::KeyCodec;
     use crate::fs::store::tombstone::TombstoneEntry;
 
     fn no_wait() -> WriteOptions {
@@ -242,8 +354,9 @@ mod tests {
         GarbageCollector::new(
             Arc::clone(&fs.db),
             fs.tombstone_store.clone(),
-            fs.chunk_store.clone(),
+            fs.extent_store.clone(),
             Arc::clone(&fs.stats),
+            None,
         )
     }
 
@@ -257,18 +370,18 @@ mod tests {
         out
     }
 
-    // The core sweep: a tombstone for a deleted file's chunks is reclaimed — every
-    // chunk deleted, the tombstone removed, and the stats counters advanced.
+    // The core sweep: a tombstone for a deleted file's extents is reclaimed — every
+    // extent deleted, the tombstone removed, and the stats counters advanced.
     #[tokio::test]
-    async fn gc_deletes_chunks_and_removes_the_tombstone() {
+    async fn gc_deletes_extents_and_removes_the_tombstone() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let gc = gc_for(&fs).await;
 
         let inode_id = 4242u64;
-        let size = (CHUNK_SIZE * 3) as u64;
+        let size = (EXTENT_SIZE * 3) as u64;
 
         let mut txn = fs.db.new_transaction().unwrap();
-        fs.chunk_store
+        fs.extent_store
             .write(
                 &mut txn,
                 inode_id,
@@ -279,15 +392,14 @@ mod tests {
             .await
             .unwrap();
         fs.tombstone_store.add(&mut txn, inode_id, size);
-        fs.db
-            .write_with_options(txn.into_inner(), &no_wait())
-            .await
-            .unwrap();
+        // The write staged seg-count deltas; commit through the worker (their sole
+        // writer) rather than dropping them via into_inner.
+        fs.write_coordinator.commit(txn).await.unwrap();
 
         for idx in 0..3 {
             assert!(
-                fs.chunk_store.get(inode_id, idx).await.unwrap().is_some(),
-                "chunk {idx} should exist before GC"
+                fs.extent_store.get(inode_id, idx).await.unwrap().is_some(),
+                "extent {idx} should exist before GC"
             );
         }
 
@@ -295,20 +407,20 @@ mod tests {
 
         for idx in 0..3 {
             assert!(
-                fs.chunk_store.get(inode_id, idx).await.unwrap().is_none(),
-                "chunk {idx} must be reclaimed by GC"
+                fs.extent_store.get(inode_id, idx).await.unwrap().is_none(),
+                "extent {idx} must be reclaimed by GC"
             );
         }
         assert!(
             tombstones(&fs.tombstone_store).await.is_empty(),
             "tombstone must be removed"
         );
-        assert_eq!(fs.stats.gc_chunks_deleted.load(Ordering::Relaxed), 3);
+        assert_eq!(fs.stats.gc_extents_deleted.load(Ordering::Relaxed), 3);
         assert_eq!(fs.stats.tombstones_processed.load(Ordering::Relaxed), 1);
         assert!(fs.stats.gc_runs.load(Ordering::Relaxed) >= 1);
     }
 
-    // A zero-remaining-size tombstone (its chunks already gone) is just removed.
+    // A zero-remaining-size tombstone (its extents already gone) is just removed.
     #[tokio::test]
     async fn gc_removes_a_zero_size_tombstone() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
@@ -324,7 +436,7 @@ mod tests {
         gc.run().await.unwrap();
 
         assert!(tombstones(&fs.tombstone_store).await.is_empty());
-        assert_eq!(fs.stats.gc_chunks_deleted.load(Ordering::Relaxed), 0);
+        assert_eq!(fs.stats.gc_extents_deleted.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -334,7 +446,60 @@ mod tests {
 
         gc.run().await.unwrap();
 
-        assert_eq!(fs.stats.gc_chunks_deleted.load(Ordering::Relaxed), 0);
+        assert_eq!(fs.stats.gc_extents_deleted.load(Ordering::Relaxed), 0);
         assert!(fs.stats.gc_runs.load(Ordering::Relaxed) >= 1);
+    }
+
+    // The persisted timestamp gates the slow orphan sweep on a wall-clock cadence: a
+    // recent timestamp defers it (the timestamp is left untouched); a stale one fires
+    // it and advances the timestamp. Observed via the stored timestamp, so it doesn't
+    // depend on an actual orphan being present.
+    #[tokio::test]
+    async fn orphan_sweep_timestamp_gate_defers_then_fires() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let gc = gc_for(&fs).await;
+        let key = KeyCodec::new().last_orphan_sweep_key();
+
+        let read = |fs: &ZeroFS, key: Bytes| {
+            let db = Arc::clone(&fs.db);
+            async move {
+                db.get_bytes(&key)
+                    .await
+                    .unwrap()
+                    .and_then(|b| KeyCodec::decode_u64(&b))
+                    .unwrap()
+            }
+        };
+        let seed = |fs: &ZeroFS, key: Bytes, secs: u64| {
+            let db = Arc::clone(&fs.db);
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                txn.put_bytes(&key, KeyCodec::encode_u64(secs));
+                db.write_with_options(txn.into_inner(), &no_wait())
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // A recent sweep: within the interval, so the gate defers and leaves the
+        // timestamp exactly as seeded.
+        let recent = Utc::now().timestamp() as u64;
+        seed(&fs, key.clone(), recent).await;
+        gc.maybe_sweep_orphans().await;
+        assert_eq!(
+            read(&fs, key.clone()).await,
+            recent,
+            "a recent timestamp must defer the sweep (timestamp untouched)"
+        );
+
+        // A stale sweep (older than the interval): the gate fires and advances the
+        // timestamp to ~now.
+        let stale = (Utc::now().timestamp() - (ORPHAN_SWEEP_INTERVAL_SECS + 60)) as u64;
+        seed(&fs, key.clone(), stale).await;
+        gc.maybe_sweep_orphans().await;
+        assert!(
+            read(&fs, key.clone()).await > stale,
+            "a stale timestamp must trigger a sweep and advance the timestamp"
+        );
     }
 }

@@ -13,12 +13,6 @@ case "$OS-$ARCH" in
     linux-aarch64|linux-arm64)
         BINARY_NAME="zerofs-linux-arm64-pgo"
         ;;
-    linux-armv7*)
-        BINARY_NAME="zerofs-linux-armv7-pgo"
-        ;;
-    linux-i686)
-        BINARY_NAME="zerofs-linux-i686-pgo"
-        ;;
     darwin-x86_64|darwin-amd64)
         BINARY_NAME="zerofs-darwin-x86_64-pgo"
         ;;

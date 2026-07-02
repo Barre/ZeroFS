@@ -146,9 +146,8 @@ mod tests {
     }
 
     /// Read every stats shard directly from the db, decode it, and sum.
-    /// `new_in_memory` builds v2-segmented volumes, hence `KeyCodec::new(true)`.
     async fn persisted_shard_totals(fs: &ZeroFS) -> (u64, u64) {
-        let codec = KeyCodec::new(true);
+        let codec = KeyCodec::new();
         let mut bytes = 0u64;
         let mut inodes = 0u64;
         for i in 0..STATS_SHARDS {
@@ -466,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_stage_and_publish_delta() {
-        let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new(true)));
+        let stats = FileSystemGlobalStats::new(Arc::new(KeyCodec::new()));
         let shard = stats.shard_of(7);
 
         // Staging alone must not change the visible counters.
@@ -940,7 +939,7 @@ mod tests {
         let slatedb = Arc::new(
             DbBuilder::new(Path::from("test_slatedb"), object_store.clone())
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
@@ -951,7 +950,12 @@ mod tests {
             u64::MAX,
             None,
             false,
-            true,
+            object_store.clone(),
+            crate::frame_codec::FrameCodec::new(
+                &test_key,
+                crate::segment::SEGMENT_INFO,
+                CompressionConfig::default(),
+            ),
         )
         .await
         .unwrap();

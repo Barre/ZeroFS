@@ -39,12 +39,29 @@ encryption_password = "your-secure-password"  # Encryption password
 addresses = ["127.0.0.1:2049"]
 ```
 
-Three tables are required: `[cache]`, `[storage]`, and `[servers]`. A file missing any of them fails to parse — omitting `[servers]` reports `missing field servers`. Each `[servers.*]` subsection is optional, and an empty `[servers]` table is valid: it parses and starts no servers.
+Three tables are required: `[cache]`, `[storage]`, and `[servers]`. A file missing any of them fails to parse — omitting `[servers]` reports `missing field servers`. Each `[servers.*]` subsection is optional. An empty `[servers]` table parses, but `zerofs run` then exits with `No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled.` At least one subsection must start a listener: for 9P, NBD, and RPC a `unix_socket` alone counts, and a `[servers.webui]` section counts in Web-UI-enabled builds.
 
 Two parsing rules apply to the whole file:
 
 - **Unknown keys are rejected.** A misspelled key aborts startup with a parse error naming the key. The exception is the free-form backend tables `[aws]`, `[azure]`, and `[gcp]` — see [Backend Option Tables](#backend-option-tables).
-- **Sizes are decimal gigabytes.** All `*_gb` keys (`cache.disk_size_gb`, `cache.memory_size_gb`, `filesystem.max_size_gb`, `lsm.max_unflushed_gb`) are interpreted as 10⁹ bytes, not GiB. Fractional values are accepted: `0.5` is 500 MB.
+- **Sizes are decimal gigabytes.** All `*_gb` keys (`cache.disk_size_gb`, `cache.memory_size_gb`, `filesystem.max_size_gb`) are interpreted as 10⁹ bytes, not GiB. Fractional values are accepted: `0.5` is 500 MB.
+
+<Note>
+Upgrading from a pre-segment release: the `[lsm]` keys `wal_enabled` and `max_unflushed_gb` are removed. A configuration file that still sets either fails to parse at startup; delete both keys. See [LSM Tree Performance Tuning](#lsm-tree-performance-tuning).
+</Note>
+
+## Cache
+
+The `[cache]` table is required. ZeroFS runs two caches, each with a memory and a disk tier: a decoded-block cache for metadata and a raw-parts cache for object bytes. Both disk tiers live under `dir`, inside a per-bucket subdirectory: `bucket_<8hex>/hybrid_cache/` and `bucket_<8hex>/parts_cache/` — see [Caching](/caching) for the layout. File data in the parts cache is stored as fetched from the object store: compressed and encrypted.
+
+| Key | Required | Default | Description |
+| --- | --- | --- | --- |
+| `dir` | yes | — | Directory holding both disk tiers. Supports [environment variable substitution](#environment-variable-substitution). |
+| `disk_size_gb` | yes | — | Total disk budget for both disk tiers, in decimal GB. |
+| `memory_size_gb` | no | `0.25` | Total memory budget for both memory tiers, in decimal GB. |
+| `warm_metadata` | no | `"filters_index"` | Startup warm-up: `"off"`, `"filters_index"` (metadata SST bloom filters and indexes), or `"full"` (also metadata data blocks). File data is never warmed. |
+
+See [Caching](/caching) for how the two budgets are split between the tiers.
 
 ## Storage Backends
 
@@ -68,7 +85,7 @@ Full `https://` URLs are routed by host suffix. Hosts ending in `amazonaws.com` 
 A scheme selects the backend only. Credentials come from the `[aws]`, `[azure]`, or `[gcp]` table regardless of which alias is used.
 
 <Note>
-`memory:///` keeps all data in process memory: the store starts empty, everything is lost when the process exits, and it cannot be shared with a standalone compaction worker. Use it for throwaway testing only.
+`memory:///` keeps all data in process memory: the store starts empty and everything is lost when the process exits. Use it for throwaway testing only.
 </Note>
 
 ### AWS S3
@@ -142,10 +159,10 @@ service_account = "/path/to/service-account-key.json"
 ```
 
 <Note>
-GCS authentication follows Google's Application Default Credentials (ADC) chain:
-1. If running on a GCP VM or GKE pod with an attached service account, credentials are automatically discovered via the metadata service
-2. Otherwise, uses `GOOGLE_APPLICATION_CREDENTIALS` environment variable or `[gcp]` config section
-3. Falls back to gcloud CLI credentials if available
+GCS credentials resolve in this order:
+1. Explicit service-account credentials from the `[gcp]` section (`service_account` path or `service_account_key`)
+2. An Application Default Credentials file: the `application_credentials` key, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable, or the gcloud CLI's `~/.config/gcloud/application_default_credentials.json`
+3. The VM/GKE metadata service, as the last fallback — this is why no `[gcp]` section is needed on GCP with an attached service account
 </Note>
 
 ### Local Filesystem
@@ -158,16 +175,16 @@ encryption_password = "secure-password-here"
 # No additional backend configuration needed
 ```
 
-### Backend Option Tables
+### Backend Option Tables {{ id: 'backend-option-tables' }}
 
-`[aws]`, `[azure]`, and `[gcp]` are free-form key-value tables, not fixed schemas. At startup, each key is lowercased, prefixed with `aws_`, `azure_`, or `google_`, and forwarded to the object_store builder for the storage URL's backend. Any configuration key that builder accepts works — for example `session_token`, `virtual_hosted_style_request`, or `skip_signature` under `[aws]`, and `sas_token` under `[azure]`. The full key lists are in the object_store documentation: [`AmazonS3ConfigKey`](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html), [`AzureConfigKey`](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html), [`GoogleConfigKey`](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html).
+`[aws]`, `[azure]`, and `[gcp]` are free-form key-value tables, not fixed schemas. At startup, each key is lowercased, prefixed with `aws_`, `azure_`, or `google_`, and forwarded to the object_store builder for the storage URL's backend. Any configuration key that builder accepts works — for example `session_token`, `virtual_hosted_style_request`, or `skip_signature` under `[aws]`, and `storage_sas_token` under `[azure]` (forwarded as `azure_storage_sas_token`). The full key lists are in the object_store documentation: [`AmazonS3ConfigKey`](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html), [`AzureConfigKey`](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html), [`GoogleConfigKey`](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html).
 
 Two rules apply:
 
 - **Every value must be a TOML string.** `allow_http = "true"`, not `allow_http = true`. A non-string value fails at startup with `Failed to parse config file`.
 - **Unknown keys are dropped without warning.** A misspelled key — `secret_acess_key` — produces no configuration error and surfaces later as an authentication or connection failure. Check key spelling before debugging credentials.
 
-The same rules apply to the `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` tables used with a [separate WAL store](#separate-wal-object-store). Values in all of these tables support [environment variable substitution](#environment-variable-substitution).
+The same rules apply to the `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` tables under the legacy [`[wal]` section](#separate-wal-object-store). Values in all of these tables support [environment variable substitution](#environment-variable-substitution).
 
 ### Storage Class
 
@@ -182,19 +199,19 @@ storage_class = "..."  # provider-specific value, e.g. a single-zone hot class
 
 Because the value is verbatim, it must be valid for your backend; a value the backend does not recognize — an S3 class name on Azure, for example — is rejected by the store on the first write. Omit the field to use the account/bucket default. The typical use is selecting a cheaper single-zone / reduced-redundancy **hot** or higher performance class where your provider offers one.
 
-Server-side copies cannot carry a storage class: objects written via copy land in the bucket or account default class regardless of this setting. `[wal]` has its own independent `storage_class` and does not inherit this one — see [Separate WAL Object Store](#separate-wal-object-store).
+Server-side copies cannot carry a storage class: objects written via copy land in the bucket or account default class regardless of this setting. The legacy `[wal]` section has its own independent `storage_class` — see [Separate WAL Object Store](#separate-wal-object-store).
 
 <Warning>
-ZeroFS reads SSTs and the manifest continuously, so `storage_class` must be a hot, instant-access tier:
+ZeroFS reads segment objects, SSTs, and the manifest continuously, so `storage_class` must be a hot, instant-access tier:
 
-- **Archive** tiers (S3 `GLACIER`/`DEEP_ARCHIVE`, Azure `Archive`) require a restore before objects can be read. ZeroFS cannot read SSTs or the manifest behind a restore step, so the volume becomes unusable. Never set an archive class.
+- **Archive** tiers (S3 `GLACIER`/`DEEP_ARCHIVE`, Azure `Archive`) require a restore before objects can be read. ZeroFS cannot read segment objects, SSTs, or the manifest behind a restore step, so the volume becomes unusable. Never set an archive class.
 - **Infrequent-access** tiers work but charge a per-GB retrieval fee on every read, so for ZeroFS's constant reads they usually cost **more**, not less.
 </Warning>
 
 
 ## Network Services
 
-The `[servers]` table is required; each subsection below is optional. A server runs only when its section is present, and an empty `[servers]` table starts no servers.
+The `[servers]` table is required; each subsection below is optional. A server runs only when its section is present. An empty `[servers]` table is not runnable: `zerofs run` exits with `No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled.`
 
 `addresses` is a list of socket addresses. Each entry binds one listener, so multiple entries serve the same filesystem on multiple addresses. IPv6 addresses use brackets:
 
@@ -240,7 +257,7 @@ addresses = ["127.0.0.1:7000"]
 unix_socket = "/tmp/zerofs.rpc.sock"
 ```
 
-The admin endpoint for `zerofs checkpoint`, `zerofs flush`, `zerofs monitor`, `zerofs fatrace`, and `zerofs otrace`. These commands read the same configuration file, try the Unix socket first if the socket file exists, then each address in order. Without a `[servers.rpc]` section, they exit with `RPC server not configured in config file`. See [Monitoring](/monitoring) and [Checkpoints](/checkpoints).
+The admin endpoint for `zerofs checkpoint`, `zerofs flush`, `zerofs monitor`, `zerofs fatrace`, and `zerofs otrace`. These commands read the same configuration file, try the Unix socket first if the socket file exists, then each configured address in turn (the order is not defined). Without a `[servers.rpc]` section, they exit with `RPC server not configured in config file`. See [Monitoring](/monitoring) and [Checkpoints](/checkpoints).
 
 ### Web UI
 
@@ -280,7 +297,7 @@ When the quota is reached, write operations return `ENOSPC` (No space left on de
 
 ## Compression
 
-ZeroFS compresses file data (chunks) before encryption. The default is tuned for object storage, where network and storage cost dominate local CPU:
+ZeroFS compresses each 32 KiB extent of file data before encrypting it; the resulting frames are packed into segment objects on the object store. The default is tuned for object storage, where network and storage cost dominate local CPU:
 
 ```toml
 [filesystem]
@@ -301,36 +318,35 @@ You can change the compression algorithm at any time without migration:
 
 - **New writes** use the currently configured algorithm
 - **Existing data** remains readable regardless of how it was compressed
-- Compression format is auto-detected per-chunk when reading
+- Compression format is auto-detected per-frame when reading
 
 
 ## LSM Tree Performance Tuning
 
-ZeroFS uses an LSM (Log-Structured Merge) tree as its underlying storage engine. For advanced performance tuning, you can configure LSM parameters:
+ZeroFS keeps metadata — inodes, directory entries, and the per-extent frame pointers — in an LSM (Log-Structured Merge) tree database. File contents live in immutable segment objects written directly to the object store; the data plane has no user-facing tuning keys. The `[lsm]` section tunes the metadata store, though `flush_interval_secs` and `sync_writes` also govern when buffered file data is sealed and uploaded. See [Architecture](/architecture).
 
 ```toml
 [lsm]
-l0_max_ssts = 64                 # Max SST files in L0 before compaction
-max_unflushed_gb = 1.0           # Max unflushed data before forcing flush (in GB)
+l0_max_ssts = 256                # Max SST files in L0 before compaction
 max_concurrent_compactions = 8   # Max concurrent compaction operations
 flush_interval_secs = 30         # Interval between periodic flushes (in seconds)
-wal_enabled = false              # Whether the write-ahead log is enabled
-sync_writes = false              # Make every write durable on return (HA mode)
+sync_writes = false              # Make every write durable on return
 ```
 
 ### Parameters
 
-- **`l0_max_ssts`** (default: 64, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
+- **`l0_max_ssts`** (default: 256, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. The same value applies per key. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
 
-- **`max_unflushed_gb`** (default: 1.0, min: 0.1): Maximum amount of unflushed data (in gigabytes) before forcing a flush to storage. Supports fractional values like `0.5` for 500 MB. Larger values improve write batching but increase memory usage.
+- **`max_concurrent_compactions`** (default: 8, min: 1): Maximum number of metadata compaction operations that can run concurrently. Compaction always runs embedded in `zerofs run`; there is no separate compactor process.
 
-- **`max_concurrent_compactions`** (default: 8, min: 1): Maximum number of compaction operations that can run concurrently. Higher values can improve throughput on systems with many CPU cores and high network throughput but increase memory usage.
+- **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Each flush first seals the open segment buffer, uploading buffered file data, then flushes the metadata store. Between flushes, up to 256 MiB of committed writes can sit in the in-memory open segment. `fsync` calls from clients (9P fsync, NFS COMMIT, NBD flush) always trigger an immediate flush regardless of this interval, unless `[filesystem] ignore_fsync = true`, which makes `fsync` a no-op — see [High Availability](#high-availability).
 
-- **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Lower values flush more frequently. Higher values improve write throughput by batching more data before flushing. Note that `fsync` calls on NBD and 9P always trigger an immediate flush regardless of this interval.
+- **`sync_writes`** (default: `false`): When enabled, every write is durably flushed before returning success, eliminating the "in-memory unflushed" window between fsync calls. This does **not** change POSIX fsync semantics: with the default `false`, explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs writes *between* fsync calls. Expensive: each coalesced batch forces a segment seal plus a memtable flush (concurrent writes still merge into a single batch and a single flush). Rejected in combination with `[filesystem] ignore_fsync`. See the [Eliminating the Durability Window](/durability#eliminating-the-durability-window) section for guidance on when to enable.
 
-- **`wal_enabled`** (default: `false`): Controls the write-ahead log (WAL). Can be changed at any time without data loss. Without WAL, each `fsync` flushes the memtable and produces a small SST, leading to compaction churn. With WAL, fsyncs write to the WAL instead, so the memtable keeps growing and flushes produce properly-sized SSTs. Enable WAL for fsync-heavy workloads to reduce compaction overhead.
+Two keys from earlier releases are gone, and setting either fails config parsing:
 
-- **`sync_writes`** (default: `false`): When enabled, every write is durably flushed before returning success, eliminating the "in-memory unflushed" window between fsync calls. This does **not** change POSIX fsync semantics: with the default `false`, explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs writes *between* fsync calls. Trades per-op latency (one round-trip per concurrent batch, since concurrent writes still coalesce) for zero unflushed data on crash. Pair with `wal_enabled = true`, without the WAL, every write blocks on a memtable->L0 SST flush. See the [Eliminating the Durability Window](/durability#eliminating-the-durability-window) section for guidance on when to enable.
+- **`wal_enabled`**: removed. The write-ahead log is permanently off and cannot be enabled.
+- **`max_unflushed_gb`**: removed. The unflushed-metadata ceiling is fixed internally at 1 GiB.
 
 <Note>
 These are advanced settings. The defaults suit most workloads. Change them only in response to a specific, observed performance problem.
@@ -340,26 +356,13 @@ These are advanced settings. The defaults suit most workloads. Change them only 
 
 Consider tuning these parameters if you're experiencing:
 
-- **High write latency**: Increase `max_unflushed_gb` to batch more writes
 - **High read latency**: Decrease `l0_max_ssts` to reduce read amplification
 - **CPU / Network underutilization**: Increase `max_concurrent_compactions` on high-core systems
-- **Memory pressure**: Decrease `max_unflushed_gb` to reduce memory usage
+- **Too-frequent background flushes**: Increase `flush_interval_secs`; the crash-loss window for un-`fsync`'d writes grows accordingly
 
 ## Separate WAL Object Store
 
-By default the WAL is written to the same object store as everything else. You can point it at a separate, lower-latency store to reduce fsync latency. See [Separate WAL Store](/separate-wal) for details.
-
-```toml
-[wal]
-url = "file:///mnt/nvme/zerofs-wal"
-# storage_class = "..."  # Optional, independent from [storage]
-```
-
-The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. It also has its own optional `storage_class` (see [Storage Class](#storage-class)); it does not inherit the one from `[storage]`. Since the WAL is hot, frequently-rewritten data, it is normally left on the default tier.
-
-<Note>
-Whether you use a separate WAL store is decided at filesystem creation time and cannot be changed later.
-</Note>
+ZeroFS no longer writes a WAL: it is permanently disabled and cannot be enabled. The `[wal]` section from earlier releases — `url`, `storage_class`, and the `[wal.aws]`, `[wal.azure]`, `[wal.gcp]` credential blocks — still parses, but with the WAL off it has no effect on writes or `fsync` latency. Omit it from new configurations.
 
 ## Multiple Instances
 
@@ -384,7 +387,7 @@ peers = ["10.0.0.2:9000"]             # the other node's replication_listen
 | `replication_listen` | standby; both recommended | `host:port` this node receives the leader's ships and heartbeats on. |
 | `peers` | both recommended | The other node's `replication_listen`. |
 
-Set both `replication_listen` and `peers` on every node so either can lead after a role swap; ZeroFS warns at startup on an asymmetric config. The data-database WAL (`[lsm] wal_enabled`) is allowed under replication and makes `fsync` cheaper. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
+Set both `replication_listen` and `peers` on every node so either can lead after a role swap; ZeroFS warns at startup on an asymmetric config. Acknowledged writes that have not been `fsync`'d survive failover: the leader ships them to the standby, which rebuilds any missing segment objects at takeover. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
 
 ## Complete Examples
 
@@ -473,10 +476,8 @@ max_size_gb = 500.0            # Optional: limit filesystem size
 compression = "zstd-3"         # Optional: "zstd-{1-22}" (default: "zstd-3") or "lz4"
 
 [lsm]
-l0_max_ssts = 128              
-max_unflushed_gb = 2.0        
-max_concurrent_compactions = 16  
-flush_interval_secs = 60      
+max_concurrent_compactions = 16  # More parallel metadata compaction
+flush_interval_secs = 60         # Fewer, larger periodic flushes
 
 [aws]
 access_key_id = "your-key"
@@ -552,14 +553,12 @@ zerofs run -c zerofs.toml
 To change the encryption password:
 
 ```bash
-# Change password interactively
+# Reads the new password from stdin: type one line and press Enter, or pipe it
 zerofs change-password --config zerofs.toml
-
-# The command will:
-# 1. Prompt for the new password
-# 2. Update encrypted data with the new password
-# 3. You'll need to update the config file manually
+echo "newpassword" | zerofs change-password -c zerofs.toml
 ```
+
+The command reads exactly one line from stdin and re-wraps the stored encryption key with the new password. File data is not re-encrypted.
 
 <Note>
 After changing the password, update the `encryption_password` field in your configuration file.

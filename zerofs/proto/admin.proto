@@ -181,7 +181,7 @@ message StatsSnapshot {
     uint64 bytes_written = 14;
     uint64 tombstones_created = 15;
     uint64 tombstones_processed = 16;
-    uint64 gc_chunks_deleted = 17;
+    uint64 gc_extents_deleted = 17;
     uint64 gc_runs = 18;
     uint64 total_operations = 19;
     uint64 used_bytes = 20;

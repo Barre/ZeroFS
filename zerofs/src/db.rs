@@ -116,6 +116,10 @@ pub struct StatsDelta {
 pub struct Transaction {
     ops: Vec<TxOp>,
     stats_deltas: Vec<StatsDelta>,
+    /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`),
+    /// aggregated by the commit worker into one absolute `(live, total)` per
+    /// segment. Same lock-free pattern as `stats_deltas`.
+    seg_deltas: Vec<(Bytes, (i64, i64))>,
     op_id: crate::dedup::OpId,
 }
 
@@ -124,6 +128,7 @@ impl Transaction {
         Self {
             ops: Vec::new(),
             stats_deltas: Vec::new(),
+            seg_deltas: Vec::new(),
             op_id: [0u8; 16],
         }
     }
@@ -164,6 +169,21 @@ impl Transaction {
         std::mem::take(&mut self.stats_deltas)
     }
 
+    /// Record live/total byte adjustments for a segment's counter (`segcount_key`),
+    /// materialized as an absolute `(live, total)` by the commit worker. A frame
+    /// write credits both (`+len, +len`); an overwrite/delete debits live only
+    /// (`-len, 0`), keeping `total` monotonic. All-zero deltas drop.
+    pub fn add_seg_delta(&mut self, segcount_key: &Bytes, live_delta: i64, total_delta: i64) {
+        if live_delta != 0 || total_delta != 0 {
+            self.seg_deltas
+                .push((segcount_key.clone(), (live_delta, total_delta)));
+        }
+    }
+
+    pub fn take_seg_deltas(&mut self) -> Vec<(Bytes, (i64, i64))> {
+        std::mem::take(&mut self.seg_deltas)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
@@ -171,7 +191,16 @@ impl Transaction {
     /// Replay this transaction's ops into `target`. SlateDB's `WriteBatch`
     /// already dedupes per key, so calling this on multiple transactions
     /// produces one merged batch with last-write-wins per key.
+    ///
+    /// Only `ops` are applied — `seg_deltas` are the WriteCoordinator worker's job
+    /// (the sole segcount writer, which drains them first). The assert catches any
+    /// path that would commit a seg-delta-bearing txn directly and silently lose it.
     pub fn apply_to(self, target: &mut WriteBatch) {
+        debug_assert!(
+            self.seg_deltas.is_empty(),
+            "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
+             WriteCoordinator, not into_inner/apply_to"
+        );
         for op in self.ops {
             match op {
                 TxOp::Put(k, v) => target.put_bytes(k, v),
@@ -185,6 +214,11 @@ impl Transaction {
     /// standby reproduces the merged batch's last-write-wins result.
     pub fn apply_to_collecting(self, target: &mut WriteBatch) -> Vec<crate::replication::ReplOp> {
         use crate::replication::ReplOp;
+        debug_assert!(
+            self.seg_deltas.is_empty(),
+            "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
+             WriteCoordinator, not apply_to_collecting"
+        );
         let mut ops = Vec::with_capacity(self.ops.len());
         for op in self.ops {
             match op {
@@ -230,6 +264,12 @@ pub struct Db {
     /// the instant its manifest poll sees a newer writer, and a closed db must
     /// reject ops with the "not leader" signal a failover client re-routes on.
     status: Option<tokio::sync::watch::Receiver<slatedb::DbStatus>>,
+    /// Flush barrier. Every commit takes a read lock; the seal+flush durability
+    /// sequence (flush coordinator, segment reclaim) takes the write lock. This
+    /// keeps the flush from durably capturing a `FrameLoc` whose segment is still
+    /// the un-PUT open buffer: a commit that overlaps a flush lands *after* it, so
+    /// its pointer is never in the flushed set referencing an un-sealed segment.
+    flush_barrier: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Db {
@@ -243,6 +283,7 @@ impl Db {
             metrics_recorder,
             lease: None,
             status,
+            flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -252,7 +293,14 @@ impl Db {
             metrics_recorder: None,
             lease: None,
             status: None,
+            flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
         }
+    }
+
+    /// The flush barrier (see the field). The seal+flush durability sequence holds
+    /// the *write* lock across `seal_open()` + `flush()`; commits hold a read lock.
+    pub fn flush_barrier(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.flush_barrier)
     }
 
     /// Attach the HA leader lease; reads/writes are then refused while it is
@@ -429,6 +477,9 @@ impl Db {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
         self.check_lease()?;
+        // Read side of the flush barrier: a commit overlapping a seal+flush waits
+        // for it, so its pointer lands after the flush, never in the flushed set.
+        let _flush_guard = self.flush_barrier.read().await;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => match db.write_with_options(batch, options).await {
@@ -456,6 +507,7 @@ impl Db {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
+        let _flush_guard = self.flush_barrier.read().await;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
@@ -514,8 +566,8 @@ impl Db {
     /// tests that assert the cache effect of a single warm.
     ///
     /// Best-effort and side-effect-only: a per-SST failure is counted, not
-    /// propagated. A no-op on volumes without the metadata segment (legacy
-    /// unsegmented layout) or without a block cache. Not lease-gated.
+    /// propagated. A no-op on a volume with no metadata segment yet (a fresh DB
+    /// before its first flush) or without a block cache. Not lease-gated.
     #[cfg(test)]
     pub async fn warm_metadata(&self, warm_data: bool) -> WarmStats {
         let targets = Self::warm_targets(warm_data);

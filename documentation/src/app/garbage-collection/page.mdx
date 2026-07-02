@@ -1,22 +1,26 @@
 export const metadata = {
   title: 'Garbage Collection',
   description:
-    'How ZeroFS reclaims space after deletion: tombstone GC, LSM compaction, and SlateDB object garbage collection.',
+    'How ZeroFS reclaims space after deletion: tombstone GC deletes extent pointers, segment GC deletes and repacks segment objects, and metadata compaction cleans the LSM.',
 }
 
 # Garbage Collection
 
-Deleting a file is immediate at the filesystem level: the unlink transaction commits and the file is gone from the namespace. The bytes in the bucket are reclaimed later, by three background stages that each run on their own schedule. A bucket that shrinks minutes or hours after a deletion is operating normally. {{ className: 'lead' }}
+Deleting a file is immediate at the filesystem level: the unlink transaction commits and the file is gone from the namespace. The bytes in the bucket are reclaimed later, by background stages that each run on their own schedule. File contents live in immutable segment objects under `segments/`; reclamation ends when segment GC deletes those objects. A bucket that shrinks minutes after a deletion is operating normally. {{ className: 'lead' }}
 
 ## What Deletion Does
 
 <Row>
   <Col>
 
-    Unlink removes the inode in a single transaction. What happens to the file's data chunks depends on the file's size:
+    Unlink removes the inode in a single transaction. What happens to the file's extents depends on the file's size:
 
-    - Files of 10 chunks or fewer (320 KiB at the 32 KiB chunk size) have their chunk keys deleted in the same transaction.
-    - Larger files leave a **tombstone**: a record of the file's remaining size. The chunks stay in place until the garbage collector processes the tombstone.
+    - Files of 10 extents or fewer (320 KiB at the 32 KiB extent size) have their extent keys deleted in the same transaction.
+    - Larger files leave a **tombstone**: a record of the file's remaining size. The extents stay in place until the garbage collector processes the tombstone.
+
+    If the file is still open, the unlink only detaches the inode from the namespace and records it as an orphan; the same small-file/tombstone decision runs when the last handle closes.
+
+    Deleting an extent key removes a 32-byte pointer (a FrameLoc) from the metadata store and debits the live-byte counter of the segment that holds the extent's frame. It does not touch the segment object; the data bytes stay in the bucket until segment GC removes or repacks the segment.
 
     Renaming over an existing file deletes the replaced file through the same path. In both cases the operation returns before any space is reclaimed.
 
@@ -24,13 +28,17 @@ Deleting a file is immediate at the filesystem level: the unlink transaction com
   <Col>
 
     ```text {{ title: 'Deletion decision' }}
-    file size <= 10 chunks (320 KiB)
-      -> chunk keys deleted in the
+    file size <= 10 extents (320 KiB)
+      -> extent keys deleted in the
          unlink transaction
 
-    file size  > 10 chunks
+    file size  > 10 extents
       -> tombstone written;
-         chunks remain until GC
+         extents remain until GC
+
+    file still open at unlink
+      -> inode orphaned; decision
+         deferred to last close
     ```
 
   </Col>
@@ -38,11 +46,11 @@ Deleting a file is immediate at the filesystem level: the unlink transaction com
 
 ## The Reclamation Pipeline
 
-Immediate deletion does not mean immediate compaction, and does not mean immediate garbage collection of objects. Space is reclaimed by three stages. Each is eventual, and none is triggered by the deletion itself:
+File contents are packed as encrypted frames into immutable segment objects; the metadata LSM holds one 32-byte pointer per extent and a live-byte counter per segment. Space returns in two stages for file data and one for metadata. Each is eventual, and none is triggered by the deletion itself:
 
-1. **Tombstone GC** deletes the file's chunk keys from the LSM tree. This writes delete markers; the data bytes still sit inside existing immutable SSTs in the bucket.
-2. **Compaction** rewrites those SSTs, merging levels and carrying forward only live entries. This is the point at which deleted blocks are physically removed. Deletion does not schedule or accelerate compaction.
-3. **Object garbage collection** deletes SSTs that compaction has superseded from the bucket. Only at this stage does the bucket's billed size drop.
+1. **Tombstone GC** deletes the file's extent pointer keys and debits each source segment's live-byte counter. No object is deleted; the segment objects still hold the frames.
+2. **Segment GC** deletes segment objects whose live-byte counter has reached zero and repacks fragmented ones. This is where the bucket's billed size for file data drops.
+3. **Metadata compaction and object GC** rewrite and delete metadata SSTs. The SSTs hold only metadata — inodes, directories, extent pointers, counters — so this stage reclaims metadata space, not file data.
 
 <Note>
   A delay between deleting files and the bucket shrinking is normal operation,
@@ -54,11 +62,13 @@ Immediate deletion does not mean immediate compaction, and does not mean immedia
 <Row>
   <Col>
 
-    The read-write instance runs a continuous background task that drains the tombstone queue. Each pass processes the queue in rounds of up to 10,000 chunks across up to 10,000 tombstones; rounds repeat back to back until the queue is empty, and the task then sleeps 10 seconds before the next pass.
+    The read-write instance runs a continuous background task that drains the tombstone queue. Each pass processes the queue in rounds of up to 10,000 extents across up to 10,000 tombstones; rounds repeat back to back until the queue is empty, and the task then sleeps 10 seconds before the next pass.
 
-    Large files are collected tail-first: each round deletes chunks from the end of the file and updates the tombstone's remaining size. A partially collected file is a valid intermediate state, and an interrupted pass resumes from the recorded remaining size.
+    Large files are collected tail-first: each round deletes extents from the end of the file and updates the tombstone's remaining size. A partially collected file is a valid intermediate state, and an interrupted pass resumes from the recorded remaining size.
 
-    After this stage, the chunk keys carry delete markers in the LSM tree. The bucket holds the same bytes it held before.
+    Each delete runs under the per-inode write lock and, in the same transaction, debits the live-byte counter of every removed frame's source segment. Those counters are how the next stage finds dead and fragmented segments.
+
+    After this stage, the extent pointers are gone from the metadata store. The bucket holds the same segment objects it held before.
 
   </Col>
   <Col>
@@ -67,8 +77,9 @@ Immediate deletion does not mean immediate compaction, and does not mean immedia
     loop:
       round:
         process up to 10,000 tombstones
-        delete up to 10,000 chunk keys
+        delete up to 10,000 extent keys
         (tail-first per file)
+        debit segment live-byte counters
       if queue not empty: next round
       else: sleep 10 s, start next pass
     ```
@@ -76,29 +87,63 @@ Immediate deletion does not mean immediate compaction, and does not mean immedia
   </Col>
 </Row>
 
-## Stage 2: Compaction
+## Stage 2: Segment GC
 
-SSTs are immutable: once written, an SST is never modified in place. Writes and deletes accumulate as new entries in new SSTs, so the LSM tree holds overlapping data across levels — older versions of keys, deleted entries, and the delete markers that shadow them.
+The writer runs a dedicated segment GC task: one pass at startup, then one every 60 seconds. A pass begins by sealing the open segment buffer and flushing the metadata store under the flush barrier, so the durable view matches the in-memory view; a segment GC pass is therefore also a flush trigger.
 
-Compaction merges a set of SSTs into new SSTs, keeping the live version of each key and dropping deleted and superseded entries. A coordinator in the writer process polls for eligible work every 1 second and decides whether a compaction runs via a size-tiered scheduler from the sizes and counts of accumulated SSTs, not by deletions; the work is executed by an embedded worker or, with `--no-compactor`, by [standalone workers](/standalone-compactor). Until compaction rewrites the SSTs that contain a deleted file's chunks, those bytes remain in the bucket.
+The pass then reads every per-segment live-byte counter in one scan; it lists nothing on the object store. Only segments sealed before the pass are eligible. Two actions follow:
 
-## Stage 3: Object Garbage Collection
+**Dead-segment deletion.** A segment whose counter is zero is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment — a leaked segment is preferred to lost data. The object DELETE is the point where the bucket's billed size drops.
 
-Compaction writes new objects and leaves the superseded ones in the bucket. SlateDB's object garbage collector, running in the writer process, deletes them. It scans four object directories — WAL, manifest, compacted SSTs, and compaction state — every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old.
+**Segment compaction.** Segments that are fragmented (live bytes below 50% of the object size) or small (below 1 MiB) are repacked: their live frames are fetched with coalesced ranged GETs, sorted by (inode, extent) so a file's data becomes physically contiguous, and sealed into new segments of up to 256 MiB. Each relocated extent is repointed with a conditional swap under the per-inode write lock, so a concurrent overwrite always wins. Drained sources are not deleted in the same pass — they become dead and a later pass removes them, which keeps in-flight reads of the old locations valid. Dense full-size segments are never rewritten.
 
-This is the only stage that removes objects from the bucket. The bucket's billed size drops here and nowhere earlier.
+| Parameter | Value |
+|-----------|-------|
+| Pass interval | 60 s, first pass at startup |
+| Delete-horizon floor | now + 60 s |
+| Fragmentation threshold | live bytes < 50% of object size |
+| Small-segment threshold | < 1 MiB |
+| Repack target size | 256 MiB |
+| Compaction budget per pass | 64 segments, 256 MiB |
+| Minimum payoff to compact | 1 MiB freed, or 64 MiB of live bytes gathered |
+| Segment deletes per pass | 1,024 |
+| Orphan sweep interval | 24 h wall-clock, persisted across restarts |
+
+A pass issues a 64-byte footer GET plus a directory GET per segment it verifies or repacks, and one DELETE per dead segment; a pass that repacks additionally issues the coalesced ranged GETs for the live frames and one PUT per packed segment. No pass lists the object store, so steady-state GC traffic is proportional to the garbage produced, not to the data owned.
+
+**Orphan sweep.** A segment object with no counter at all — a crash between sealing an object and the commit that would have credited it, or a repack whose relocated extents were all overwritten before the repoint — is invisible to the counter scan. A slow sweep reclaims these: once every 24 hours of wall-clock time (the last-run timestamp is persisted, so frequent restarts cannot postpone it), it streams one LIST of `segments/`, issued per shard prefix with bounded concurrency, and point-checks each listed object's counter. Counter-less objects pass the same directory verification as dead segments and are deleted after the same style of horizon, capped at 1,024 per sweep. This is the only object listing in the system, and orphans are rare.
+
+### Checkpoints Delay Reclamation
+
+[Checkpoints](/checkpoints) pin segment objects:
+
+- An ephemeral checkpoint — including a read replica's auto-renewed reader checkpoint — pushes the delete horizon to its expiry time plus a 30-second clock-skew margin, never below the 60-second floor.
+- A persistent checkpoint cannot be timed out. While one exists, segment deletion and compaction are paused entirely; the counters keep tracking garbage and reclamation catches up once the checkpoint is deleted. The orphan sweep is unaffected, because no manifest — and therefore no checkpoint — ever references an orphan.
+- If the checkpoint list cannot be read, the pass is skipped. Reclamation fails closed.
+
+## Stage 3: Metadata Compaction and Object GC
+
+The metadata LSM holds only inodes, directory entries, tombstones, extent pointers, and segment counters. Its compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process — metadata compaction always runs inside `zerofs run`.
+
+The metadata store's object garbage collector, also in the writer process, scans four object directories — WAL, manifest, compacted SSTs, and compaction state — every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
 
 ## Where Reclamation Runs
 
-| Instance | Tombstone GC | Compaction | Object deletion |
-|----------|--------------|------------|-----------------|
+| Instance | Tombstone GC | Segment GC | Metadata compaction + object GC |
+|----------|--------------|------------|---------------------------------|
 | Read-write | yes | yes | yes |
-| Read-write with `--no-compactor` | yes | no | yes |
-| Standalone worker | no | yes | no |
 | Read-only mount | no | no | no |
 | Checkpoint mount | no | no | no |
 
-A [standalone worker](/standalone-compactor) rewrites SSTs but never deletes objects; both scheduling and object deletion stay with the writer. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run none of the three stages. The bucket shrinks only while the read-write instance is running.
+All reclamation runs in the writer process. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run no stage, but their checkpoints delay segment reclamation as described above. The bucket shrinks only while the read-write instance is running.
+
+## Crash Safety
+
+- A crash after a compaction seal but before the repoint leaves the source segments in place and readable; the packed segment is an orphan with no references, and a later pass deletes it.
+- A crash between a segment DELETE and the drop of its counter key leaks one stale counter key, nothing else.
+- A counter that under-counts leads to a skipped delete (the fail-closed directory verification), never to a deleted live segment.
+
+These paths are exercised by failpoint crash tests that abort the operation at each injection point, reopen the filesystem, and verify consistency.
 
 ## Observability
 
@@ -108,17 +153,17 @@ The [Prometheus endpoint](/prometheus) exports four counters for tombstone GC:
 |--------|---------|
 | `zerofs_tombstones_created_total` | Tombstones created by deletions |
 | `zerofs_tombstones_processed_total` | Tombstones fully collected |
-| `zerofs_gc_chunks_deleted_total` | Chunk keys deleted by GC |
+| `zerofs_gc_extents_deleted_total` | Extent keys deleted by GC |
 | `zerofs_gc_runs_total` | GC passes started |
 
-`zerofs_tombstones_created_total` minus `zerofs_tombstones_processed_total` is the tombstone backlog; a gap that grows over time means deletions are outpacing collection. Files of 10 chunks or fewer never create tombstones, so a small-file workload shows no tombstone activity. The monitor dashboard (`zerofs monitor`) and the [web UI](/web-ui) display the same counters.
+All four counters count from process start. Within one run, `zerofs_tombstones_created_total` minus `zerofs_tombstones_processed_total` approximates the tombstone backlog; a gap that grows over time means deletions are outpacing collection. Files of 10 extents or fewer never create tombstones, so a small-file workload shows no tombstone activity. The monitor dashboard (`zerofs monitor`) and the [web UI](/web-ui) display the same counters.
 
-Compaction and object garbage collection have no ZeroFS-level metrics; their effect is visible as the bucket's object count and size.
+Segment GC exports no Prometheus counters. Each pass logs one info-level summary line: segment count, total and live bytes, reclaimable bytes, segments deleted, and frames relocated. Its effect is otherwise visible as the bucket's object count and size under `segments/`.
 
 ## NBD TRIM
 
-TRIM on an [NBD device](/nbd-devices) enters the pipeline at stage 2, skipping tombstones: the discard transaction deletes fully covered chunk keys directly and zeroes the covered portion of partially covered chunks (a chunk that becomes all zeroes is also deleted). Compaction and object garbage collection then reclaim the space on their own schedules.
+TRIM on an [NBD device](/nbd-devices) skips tombstones: the discard transaction deletes the pointer keys of fully covered extents and zeroes the covered portion of partially covered extents (an extent that becomes all zeroes is also deleted). The same transaction debits the source segments' live-byte counters; segment GC then reclaims the space on its own schedule.
 
 ## Configuration
 
-None of the values on this page are configurable. The 10-chunk small-file threshold, the 10,000-chunk and 10,000-tombstone round limits, the 10-second sleep between GC passes, and the 1-minute object GC interval and minimum age are fixed.
+None of the values on this page are configurable. The 10-extent small-file threshold, the 10,000-extent and 10,000-tombstone round limits, the 10-second sleep between tombstone GC passes, the 60-second segment GC interval, the delete-horizon margins, the segment compaction thresholds and budgets, and the 1-minute object GC interval and minimum age are all fixed.

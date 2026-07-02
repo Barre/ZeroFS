@@ -17,13 +17,21 @@ use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
-use crate::fs::store::InodeStore;
+use crate::fs::store::{ExtentStore, InodeStore};
 use crate::task::spawn_named;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+
+/// Concurrency for the per-segment `segcount` base reads in [`stage_seg_deltas`].
+const PARALLEL_SEGCOUNT_READS: usize = 16;
+
+/// One segment's staged counter update read: (segcount key, `(live_delta,
+/// total_delta)` netted for this batch, `(current_live, current_total)` base).
+type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
@@ -41,7 +49,7 @@ struct WorkerContext {
     global_stats: Arc<FileSystemGlobalStats>,
     sync_writes: bool,
     /// Present on a leader with a standby: each batch is shipped and durably
-    /// acked here BEFORE it is applied (commit-then-apply). `None` for a
+    /// acked here before it is applied (commit-then-apply). `None` for a
     /// single-node or a solo (post-failover) node, which applies directly.
     replicator: Option<Arc<crate::replication::Replicator>>,
     /// Idempotency cache: applied op-ids are recorded here atomically with the
@@ -50,6 +58,9 @@ struct WorkerContext {
     /// This leader's durability lineage token, written as the Solo taint on the
     /// first downgrade to Solo (see the taint write in `worker_loop`).
     lineage_token: u64,
+    /// The data plane, to attach un-PUT segments' bytes to replicated extent writes
+    /// so the standby can materialize them on takeover.
+    extent_store: ExtentStore,
 }
 
 impl WriteCoordinator {
@@ -64,6 +75,7 @@ impl WriteCoordinator {
         replicator: Option<Arc<crate::replication::Replicator>>,
         dedup: Arc<crate::dedup::DedupCache>,
         lineage_token: u64,
+        extent_store: ExtentStore,
     ) -> Self {
         // Capture synchronously: the spawned task starts later, by which point
         // callers may already have bumped `next_id`. If we captured inside the
@@ -80,6 +92,7 @@ impl WriteCoordinator {
             replicator,
             dedup,
             lineage_token,
+            extent_store,
         };
         spawn_named("commit-worker", worker_loop(ctx, receiver, initial_counter));
         Self { sender }
@@ -92,6 +105,77 @@ impl WriteCoordinator {
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
+
+    /// A weak handle for the data plane's GC/compaction paths, so their
+    /// seg-delta-bearing txns route through this single writer.
+    pub fn downgrade(&self) -> WeakWriteCoordinator {
+        WeakWriteCoordinator(self.sender.downgrade())
+    }
+}
+
+/// A weak handle to the commit worker held by `ExtentStore`. Weak (not a sender
+/// clone) so it can't keep the worker's receiver alive: the worker owns an
+/// `ExtentStore` clone, so a strong sender there would be a cycle the channel
+/// could never close.
+#[derive(Clone)]
+pub struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<(Transaction, Reply)>);
+
+impl WeakWriteCoordinator {
+    pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
+        let sender = self.0.upgrade().ok_or(FsError::IoError)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender.send((txn, reply_tx)).map_err(|_| FsError::IoError)?;
+        reply_rx.await.map_err(|_| FsError::IoError)?
+    }
+}
+
+/// Materialize per-segment `(live, total)` deltas as absolute `segcount`
+/// values: aggregate per key, RMW-read the current value, write the new
+/// absolute into `batch`, and return the `(key, value)` pairs so a replicating
+/// caller can ship them. `total` only ever credits (a debit carries
+/// `total_delta == 0`). Correctness rests on the caller being the sole writer
+/// of these keys, so the RMW never races.
+pub(crate) async fn stage_seg_deltas(
+    db: &Db,
+    deltas: impl IntoIterator<Item = (bytes::Bytes, (i64, i64))>,
+    batch: &mut WriteBatch,
+) -> Result<Vec<(bytes::Bytes, bytes::Bytes)>, FsError> {
+    let mut agg: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
+    for (k, (dl, dt)) in deltas {
+        let e = agg.entry(k).or_insert((0, 0));
+        e.0 = e.0.saturating_add(dl);
+        e.1 = e.1.saturating_add(dt);
+    }
+    // Read each segment's base concurrently: a large overwrite can touch many
+    // old segments, and a serial RMW would be O(#segments) round trips. Still
+    // race-free — this worker is the keys' sole writer. A failed read — or a
+    // present-but-undecodable value — must fail the batch, not default to 0:
+    // an undercounted live segment is one GC can delete (data loss). Only a
+    // genuinely absent key starts at 0.
+    let bases: Vec<SegBase> = stream::iter(agg)
+        .map(|(key, net)| async move {
+            match db.get_bytes(&key).await {
+                Ok(None) => Ok((key, net, (0, 0))),
+                Ok(Some(b)) => KeyCodec::decode_segcount(&b)
+                    .map(|base| (key, net, base))
+                    .ok_or(FsError::IoError),
+                Err(_) => Err(FsError::IoError),
+            }
+        })
+        .buffer_unordered(PARALLEL_SEGCOUNT_READS)
+        .try_collect()
+        .await?;
+
+    let mut out = Vec::with_capacity(bases.len());
+    for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
+        let live = (cur_live as i128 + net_live as i128).max(0) as u64;
+        // `total` is monotonic: clamp to at least its current value.
+        let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
+        let val = KeyCodec::encode_segcount(live, total);
+        batch.put_bytes(key.clone(), val.clone());
+        out.push((key, val));
+    }
+    Ok(out)
 }
 
 async fn worker_loop(
@@ -119,6 +203,8 @@ async fn worker_loop(
         let mut replies = Vec::with_capacity(batch.len());
         let mut any_ops = false;
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
+        // Per-segment (live, total) deltas, aggregated per key across the batch.
+        let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
         // Op-ids carried by this batch's transactions, recorded on apply.
         let mut batch_op_ids: Vec<crate::dedup::OpId> = Vec::new();
         for (mut txn, reply) in batch {
@@ -137,6 +223,13 @@ async fn worker_loop(
                 entry.0 = entry.0.saturating_add(delta.bytes);
                 entry.1 = entry.1.saturating_add(delta.inodes);
             }
+            // Segment counter deltas: aggregate per key before apply_to consumes the
+            // txn (apply_to merges only the ops and drops the deltas).
+            for (key, (dl, dt)) in txn.take_seg_deltas() {
+                let e = seg_map.entry(key).or_default();
+                e.0 = e.0.saturating_add(dl);
+                e.1 = e.1.saturating_add(dt);
+            }
             if replicating {
                 repl_ops.extend(txn.apply_to_collecting(&mut merged));
             } else {
@@ -149,7 +242,8 @@ async fn worker_loop(
         // last emission. See the module doc for why this value is always a safe
         // upper bound on every inode id in this batch.
         let current = ctx.inode_store.next_id();
-        if current > last_emitted_counter {
+        let counter_staged = current > last_emitted_counter;
+        if counter_staged {
             let counter_key = ctx.key_codec.system_counter_key();
             let counter_value = KeyCodec::encode_counter(current);
             if replicating {
@@ -180,7 +274,46 @@ async fn worker_loop(
             any_ops = true;
         }
 
-        // Commit-then-apply: ship and await the standby's durable ack BEFORE
+        // Segment live-byte counters: this single worker is their sole writer, so an
+        // absolute RMW off the DB (memtable-consistent, never a cold 0 for a segment
+        // touched this session) is exact and lock-free.
+        let seg_abs = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await {
+            Ok(v) => v,
+            Err(e) => {
+                // A segcount base read failed; committing with a guessed base
+                // risks data loss (see stage_seg_deltas). Abort the whole batch
+                // before shipping or committing. If the dropped batch staged a
+                // counter emission, `last_emitted_counter` is now ahead of
+                // anything persisted and no later batch would re-emit it
+                // (`current > last_emitted_counter` stays false), so a restart
+                // could re-allocate ids that already own durable inode
+                // records. Burn one id: `next_id` moves past the watermark and
+                // the next committed batch emits a covering value.
+                if counter_staged {
+                    ctx.inode_store.allocate();
+                }
+                for reply in replies {
+                    let _ = reply.send(Err(e));
+                }
+                continue;
+            }
+        };
+        if !seg_abs.is_empty() {
+            any_ops = true;
+            if replicating {
+                for (key, val) in seg_abs {
+                    repl_ops.push(crate::replication::ReplOp::Put(key, val));
+                }
+            }
+        }
+
+        // Attach the sealed bytes of any still-un-PUT segment an extent write
+        // points at, so the standby can materialize it on takeover.
+        if replicating {
+            repl_ops = ctx.extent_store.enrich_repl_ops(repl_ops);
+        }
+
+        // Commit-then-apply: ship and await the standby's durable ack before
         // applying, so a visible write is always replicated. `ship` returns None
         // when solo (no standby, or just downgraded); a solo write is still valid,
         // just single-node durable until the standby returns.
@@ -194,7 +327,7 @@ async fn worker_loop(
         };
 
         // HA: stamp this data db with the highest shipped batch seqno, flushed
-        // ATOMICALLY with the batch. On takeover a promoted standby prunes its
+        // atomically with the batch. On takeover a promoted standby prunes its
         // buffered tail to this watermark, so a batch already flushed here is
         // never replayed (replaying a stale batch would regress monotonic
         // counters and double-count stats against the newer db state). Local
@@ -207,12 +340,12 @@ async fn worker_loop(
         }
 
         // SlateDB rejects empty WriteBatches. A batch can be empty when every
-        // queued txn was a no-op (e.g. a sub-chunk trim against a fully sparse
-        // region produces no chunk writes) and no inode was allocated. Reply
+        // queued txn was a no-op (e.g. a sub-extent trim against a fully sparse
+        // region produces no extent writes) and no inode was allocated. Reply
         // Ok without touching the db; there's nothing to make durable either.
         let mut result: Result<(), FsError> = Ok(());
 
-        // First Solo batch: durably taint this lineage BEFORE acking any Solo write.
+        // First Solo batch: durably taint this lineage before acking any Solo write.
         // A takeover reads the taint and regenerates the lineage token, so these
         // un-shipped writes' later fsync fails honestly instead of matching a
         // carried-forward token. One flush per leader, gated by `taint_written`. If
@@ -284,6 +417,13 @@ async fn worker_loop(
             result = ctx.flush_coordinator.flush().await;
         }
 
+        // Same watermark hole as the seg-delta abort above, for the failures
+        // below it (lost lease, taint flush): a failed batch may have dropped
+        // its staged counter emission. Burning an id when the counter may not
+        // have been applied is always safe — over-emission only wastes ids.
+        if counter_staged && result.is_err() {
+            ctx.inode_store.allocate();
+        }
         for reply in replies {
             let _ = reply.send(result);
         }
@@ -301,17 +441,15 @@ mod tests {
     }
 
     fn codec() -> KeyCodec {
-        // `new_in_memory` creates v2-segmented volumes.
-        KeyCodec::new(true)
+        KeyCodec::new()
     }
 
     #[tokio::test]
     async fn commits_single_transaction() {
         let fs = make_fs().await;
         let mut txn = Transaction::new();
-        // Use a real codec-built key so the segment extractor (when v2 is
-        // enabled by `new_in_memory`) accepts it.
-        let key = codec().chunk_key(1, 0);
+        // Use a real codec-built key so the segment extractor accepts it.
+        let key = codec().extent_key(1, 0);
         txn.put_bytes(&key, Bytes::from_static(b"value"));
         fs.write_coordinator.commit(txn).await.unwrap();
         let v = fs.db.get_bytes(&key).await.unwrap();
@@ -326,7 +464,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0u64..32 {
             let c = coord.clone();
-            let k = codec.chunk_key(1, i);
+            let k = codec.extent_key(1, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
                 txn.put_bytes(&k, Bytes::from(vec![1u8; 8]));
@@ -337,7 +475,7 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..32 {
-            let v = fs.db.get_bytes(&codec.chunk_key(1, i)).await.unwrap();
+            let v = fs.db.get_bytes(&codec.extent_key(1, i)).await.unwrap();
             assert!(v.is_some());
         }
     }
@@ -350,7 +488,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0u64..16 {
             let c = coord.clone();
-            let k = codec.chunk_key(2, i);
+            let k = codec.extent_key(2, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
                 txn.put_bytes(&k, Bytes::from(vec![2u8; 8]));
@@ -361,10 +499,10 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..16 {
-            let v = fs.db.get_bytes(&codec.chunk_key(2, i)).await.unwrap();
+            let v = fs.db.get_bytes(&codec.extent_key(2, i)).await.unwrap();
             assert!(
                 v.is_some(),
-                "chunk {i} not durable after sync_writes commit"
+                "extent {i} not durable after sync_writes commit"
             );
         }
     }
@@ -372,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn empty_transaction_is_noop_not_fatal() {
         // SlateDB rejects empty WriteBatches with "empty write batch not
-        // allowed". A no-op txn (e.g. sub-chunk trim on a fully sparse range)
+        // allowed". A no-op txn (e.g. sub-extent trim on a fully sparse range)
         // must short-circuit before reaching the db.
         let fs = make_fs().await;
         let txn = Transaction::new();
@@ -391,7 +529,7 @@ mod tests {
 
         // A commit that doesn't allocate any inode.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().chunk_key(3, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().extent_key(3, 0), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after = fs.db.get_bytes(&counter_key).await.unwrap();
@@ -403,13 +541,82 @@ mod tests {
         // Now allocate and commit; counter must advance on disk.
         let _id = fs.inode_store.allocate();
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().chunk_key(3, 1), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().extent_key(3, 1), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after_allocate = fs.db.get_bytes(&counter_key).await.unwrap();
         assert_ne!(
             after, after_allocate,
             "counter key should advance after allocate"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_segcount_value_fails_the_batch() {
+        let fs = make_fs().await;
+        let codec = codec();
+        let seg_key = codec.segcount_key(1, 1);
+        // Five bytes: neither the 16-byte encoding nor the legacy 8-byte one.
+        fs.db
+            .put_with_options(
+                &seg_key,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(7, 0), Bytes::from_static(b"v"));
+        txn.add_seg_delta(&seg_key, 5, 5);
+        fs.write_coordinator
+            .commit(txn)
+            .await
+            .expect_err("a corrupt segcount base must abort the batch, not default to 0");
+    }
+
+    #[tokio::test]
+    async fn counter_reemitted_after_aborted_batch() {
+        let fs = make_fs().await;
+        let codec = codec();
+        let seg_key = codec.segcount_key(1, 2);
+        // Corrupt segcount base so the seg-delta-bearing batch aborts.
+        fs.db
+            .put_with_options(
+                &seg_key,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Allocate so the aborting batch stages a counter emission, then lose
+        // that batch (and the staged counter put) to the segcount abort.
+        let id = fs.inode_store.allocate();
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(id, 0), Bytes::from_static(b"v"));
+        txn.add_seg_delta(&seg_key, 5, 5);
+        fs.write_coordinator.commit(txn).await.unwrap_err();
+
+        // A later batch with no new allocation must still emit a counter
+        // covering `id` (via the id burned on abort); otherwise a restart
+        // would hand out `id` again over this batch's durable records.
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(id, 1), Bytes::from_static(b"w"));
+        fs.write_coordinator.commit(txn).await.unwrap();
+
+        let persisted = fs
+            .db
+            .get_bytes(&codec.system_counter_key())
+            .await
+            .unwrap()
+            .map(|b| KeyCodec::decode_counter(&b).unwrap())
+            .unwrap_or(0);
+        assert!(
+            persisted > id,
+            "persisted counter {persisted} must cover allocated id {id}"
         );
     }
 
@@ -430,7 +637,7 @@ mod tests {
         for k in 0..TASKS {
             let c = coord.clone();
             let inode_id = SHARD as u64 + 100 * k;
-            let key = codec.chunk_key(inode_id, 0);
+            let key = codec.extent_key(inode_id, 0);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
                 txn.put_bytes(&key, Bytes::from_static(b"x"));
@@ -478,7 +685,7 @@ mod tests {
         for k in 0..TASKS {
             let c = coord.clone();
             let inode_id = SHARD as u64 + 100 * k;
-            let key = codec.chunk_key(inode_id, 1);
+            let key = codec.extent_key(inode_id, 1);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
                 txn.put_bytes(&key, Bytes::from_static(b"y"));
