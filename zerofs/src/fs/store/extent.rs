@@ -1202,7 +1202,7 @@ impl ExtentStore {
     /// Reclaim object-store space: delete fully-dead segments and compact the
     /// most-fragmented ones, driven entirely off the local `segcount` scan.
     /// Returns (segments deleted, frames relocated).
-    #[cfg(test)]
+    #[allow(dead_code)] // failpoints + tests
     pub async fn reclaim_segments(
         &self,
         delete_horizon: DateTime<Utc>,
