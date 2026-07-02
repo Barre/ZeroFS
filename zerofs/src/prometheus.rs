@@ -148,8 +148,8 @@ fn collect_fs_stats(stats: &FileSystemStats) {
         .absolute(stats.tombstones_created.load(Ordering::Relaxed));
     counter!("zerofs_tombstones_processed_total")
         .absolute(stats.tombstones_processed.load(Ordering::Relaxed));
-    counter!("zerofs_gc_chunks_deleted_total")
-        .absolute(stats.gc_chunks_deleted.load(Ordering::Relaxed));
+    counter!("zerofs_gc_extents_deleted_total")
+        .absolute(stats.gc_extents_deleted.load(Ordering::Relaxed));
     counter!("zerofs_gc_runs_total").absolute(stats.gc_runs.load(Ordering::Relaxed));
     counter!("zerofs_total_operations").absolute(stats.total_operations.load(Ordering::Relaxed));
 }

@@ -9,7 +9,7 @@ export const metadata = {
 `zerofs-csi` exposes a ZeroFS filesystem to Kubernetes as dynamically provisioned persistent volumes. A ZeroFS gateway — a leader/standby pair — backs a StorageClass; each volume is a directory on that filesystem, and pods mount their directory over 9P. {{ className: 'lead' }}
 
 <Note>
-The driver registers as `csi.zerofs.net`. It provisions mount volumes only (no block mode) and passes the CSI conformance suite (csi-sanity v5.4.0). Manifests live in [`zerofs/zerofs-csi/deploy/`](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-csi/deploy) and are applied unmodified by the project's k3s end-to-end CI.
+The driver registers as `csi.zerofs.net`. It provisions mount volumes only (no block mode) and passes csi-sanity v5.4.0 (one spec requiring per-volume capacity tracking is skipped — capacity is not enforced, see [Limitations](#limitations)). Manifests live in [`zerofs/zerofs-csi/deploy/`](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-csi/deploy); the project's k3s end-to-end CI applies the driver manifests as-is, overriding only the container image (the gateway it tests against is a CI-specific manifest).
 </Note>
 
 ## How It Works
@@ -17,7 +17,7 @@ The driver registers as `csi.zerofs.net`. It provisions mount volumes only (no b
 ZeroFS is single-writer per bucket/prefix, so the driver shares one gateway across all volumes of a StorageClass rather than running an instance per volume. The gateway is a leader/standby pair: a leader serves the filesystem while a standby replicates it and takes over within seconds if the leader fails, with at most one node writing at any time (see [High Availability](/high-availability)).
 
 - Two single-replica StatefulSets run `zerofs run` against one bucket. The leader serves 9P to the nodes and a gRPC admin API to the controller; the standby receives the leader's writes and stands ready. Writer-epoch fencing guarantees a single writer, so a deposed leader cannot split-brain against the one that replaced it.
-- The controller plugin translates `CreateVolume` into a `CreateDirectory` call for `/volumes/pvc-<uuid>` on the admin API, and `DeleteVolume` into `RemoveDirectory`. It points at both nodes and provisions against whichever is leading; a standby is not serving, so it is skipped. Removal renames the directory into a trash area and returns immediately; a background task deletes the contents and the [garbage collector](/garbage-collection) reclaims the chunks.
+- The controller plugin translates `CreateVolume` into a `CreateDirectory` call for `/volumes/pvc-<uuid>` on the admin API, and `DeleteVolume` into `RemoveDirectory`. It points at both nodes and provisions against whichever is leading; a standby is not serving, so it is skipped. Removal renames the directory into a trash area and returns immediately; a background task deletes the contents and the [garbage collector](/garbage-collection) reclaims the extents.
 - The node plugin publishes a volume by spawning `zerofs mount <both-gateways> <target> --aname /volumes/pvc-<uuid>` — the userspace 9P client described in [9P File Access](/9p-access), attached directly to the volume's directory. The attach is rooted at that directory: the mount cannot name anything above it, and `..` at its root resolves to itself.
 
 Each published volume is its own `zerofs mount` process pointed at both nodes, so mounts inherit the client's failover behavior: when the leader fails over (or a node restarts), the client follows the serving node, operations block through the takeover gap, then resume on the same open file handles. A failover does not invalidate existing mounts.
@@ -73,7 +73,7 @@ kubectl apply -f $DEPLOY/storageclass-example.yaml
 | `gateway` | yes | Both nodes' 9P addresses, comma-separated, e.g. `zerofs-gateway-a.zerofs.svc:5564,zerofs-gateway-b.zerofs.svc:5564`. The mount follows the serving leader. |
 | `volumesRoot` | no | Directory holding the volume directories (default `/volumes`) |
 
-Each parameter is a comma-separated list of the pair's node addresses; the data-plane mount and the controller each probe the list and follow the serving leader, rerouting on failover.
+`adminEndpoint` and `gateway` each carry the pair's node addresses, comma-separated; the data-plane mount and the controller probe the list and follow the serving leader, rerouting on failover.
 
 `DeleteVolume` receives no StorageClass parameters — the CSI specification gives it only the volume id and secrets — so the StorageClass must also reference a Secret carrying `adminEndpoint` through `csi.storage.k8s.io/provisioner-secret-name` and `-namespace`. The example includes it.
 

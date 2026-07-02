@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 /// Durable set of inodes that were unlinked while a 9P fid still held them
 /// open (POSIX open-unlink). Membership means: the namespace entry is gone and
-/// nlink==0, but the inode record + chunks are intentionally kept alive so the
+/// nlink==0, but the inode record + extents are intentionally kept alive so the
 /// open fid can keep reading/writing. The entry is removed in the same
 /// transaction that finally reclaims the inode (last clunk, or startup drain).
 #[derive(Clone)]

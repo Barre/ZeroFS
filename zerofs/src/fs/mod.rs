@@ -18,11 +18,13 @@ use self::key_codec::KeyCodec;
 use self::lock_manager::KeyedLockManager;
 use self::metrics::FileSystemStats;
 use self::stats::{FileSystemGlobalStats, StatsShardData};
-use self::store::{ChunkStore, DirectoryStore, InodeStore, OrphanStore, TombstoneStore};
+use self::store::{DirectoryStore, ExtentStore, InodeStore, OrphanStore, TombstoneStore};
 use self::tracing::{AccessTracer, FileOperation};
 use self::write_coordinator::WriteCoordinator;
 use crate::db::{Db, SlateDbHandle};
+use crate::frame_codec::FrameCodec;
 use crate::object_trace::ObjectTracer;
+use crate::segment_store::SegmentStore;
 use slatedb::config::{PutOptions, WriteOptions};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
@@ -73,7 +75,7 @@ pub fn get_current_time() -> (u64, u32) {
     (now.as_secs(), now.subsec_nanos())
 }
 
-pub const CHUNK_SIZE: usize = 32 * 1024;
+pub const EXTENT_SIZE: usize = 32 * 1024;
 pub const STATS_SHARDS: usize = 100;
 pub const SMALL_FILE_TOMBSTONE_THRESHOLD: usize = 10;
 pub const NAME_MAX: usize = 255;
@@ -92,7 +94,7 @@ pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
 #[derive(Clone)]
 pub struct ZeroFS {
     pub db: Arc<Db>,
-    pub chunk_store: ChunkStore,
+    pub extent_store: ExtentStore,
     pub directory_store: DirectoryStore,
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
@@ -193,7 +195,8 @@ impl ZeroFS {
         max_bytes: u64,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
         sync_writes: bool,
-        use_segment_layout: bool,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        segment_codec: FrameCodec,
     ) -> anyhow::Result<Self> {
         Self::new_with_slatedb_and_lease(
             slatedb,
@@ -201,12 +204,14 @@ impl ZeroFS {
             metrics_recorder,
             sync_writes,
             false,
-            use_segment_layout,
             None,
             None,
             Arc::new(crate::dedup::DedupCache::new(65_536)),
             false, // single-node / test: never a live takeover, always regenerate
             ObjectTracer::new(),
+            object_store,
+            segment_codec,
+            None,
         )
         .await
     }
@@ -221,7 +226,6 @@ impl ZeroFS {
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
         sync_writes: bool,
         ignore_fsync: bool,
-        use_segment_layout: bool,
         lease: Option<Arc<crate::replication::Lease>>,
         replicator: Option<Arc<crate::replication::Replicator>>,
         dedup: Arc<crate::dedup::DedupCache>,
@@ -230,9 +234,12 @@ impl ZeroFS {
         // Decides whether the durability lineage carries forward (resolve_lineage_token).
         is_live_takeover: bool,
         object_tracer: ObjectTracer,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        segment_codec: FrameCodec,
+        segment_warm: Option<crate::segment_store::SegmentWarmHook>,
     ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
-        let key_codec = Arc::new(KeyCodec::new(use_segment_layout));
+        let key_codec = Arc::new(KeyCodec::new());
 
         // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
         // open). Used as a fresh, never-reused lineage token whenever the durability
@@ -310,7 +317,27 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
-        let chunk_store = ChunkStore::new(db.clone(), key_codec.clone());
+        let segment_store = Arc::new(SegmentStore::new(
+            object_store,
+            segment_codec,
+            writer_epoch,
+            segment_warm,
+        ));
+        let extent_store = ExtentStore::new(
+            db.clone(),
+            key_codec.clone(),
+            segment_store,
+            lock_manager.clone(),
+        );
+        // The flush path seals the open data-plane segment before flushing the
+        // manifest, so a durable manifest never references an un-PUT segment.
+        flush_coordinator.set_sealer({
+            let es = extent_store.clone();
+            Arc::new(move || {
+                let es = es.clone();
+                Box::pin(async move { es.seal_open().await })
+            })
+        });
         let directory_store = DirectoryStore::new(db.clone(), key_codec.clone());
         let inode_store = InodeStore::new(db.clone(), key_codec.clone(), next_inode_id);
         let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
@@ -332,13 +359,18 @@ impl ZeroFS {
             replicator,
             dedup.clone(),
             lineage_token,
+            extent_store.clone(),
         );
+
+        // Route the data plane's GC/compaction seg-count txns through the single
+        // commit worker (its sole writer). Weak, so it can't keep the worker alive.
+        extent_store.set_coordinator(write_coordinator.downgrade());
 
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let fs = Self {
             db: db.clone(),
-            chunk_store,
+            extent_store,
             directory_store,
             inode_store,
             tombstone_store,
@@ -470,20 +502,26 @@ impl ZeroFS {
 
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
-            DbBuilder::new(db_path, object_store)
+            DbBuilder::new(db_path, object_store.clone())
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await?,
         );
 
+        let segment_codec = crate::frame_codec::FrameCodec::new(
+            &test_key,
+            crate::segment::SEGMENT_INFO,
+            CompressionConfig::default(),
+        );
         Self::new_with_slatedb(
             SlateDbHandle::ReadWrite(slatedb),
             u64::MAX,
             None,
             sync_writes,
-            true,
+            object_store,
+            segment_codec,
         )
         .await
     }
@@ -505,9 +543,9 @@ impl ZeroFS {
 
         let db_path = Path::from("test_slatedb");
         let reader = Arc::new(
-            DbReader::builder(db_path, object_store)
+            DbReader::builder(db_path, object_store.clone())
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await?,
@@ -518,7 +556,12 @@ impl ZeroFS {
             u64::MAX,
             None,
             false,
-            true,
+            object_store,
+            crate::frame_codec::FrameCodec::new(
+                &test_key,
+                crate::segment::SEGMENT_INFO,
+                CompressionConfig::default(),
+            ),
         )
         .await
     }
@@ -614,15 +657,17 @@ impl ZeroFS {
     }
 
     /// Reclaim a single deferred-orphan inode `id`: delete its inode record,
-    /// its chunks (small files) or add a tombstone (large files), subtract its
+    /// its extents (small files) or add a tombstone (large files), subtract its
     /// stats, and remove its orphan-set entry.
     async fn reclaim_orphan_inode(&self, id: InodeId) -> Result<(), FsError> {
         match self.inode_store.get(id).await {
             Ok(Inode::File(file)) if file.nlink == 0 => {
                 let mut txn = self.db.new_transaction()?;
-                let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
-                if total_chunks as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
-                    self.chunk_store.delete_range(&mut txn, id, 0, total_chunks);
+                let total_extents = file.size.div_ceil(EXTENT_SIZE as u64);
+                if total_extents as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
+                    self.extent_store
+                        .delete_range(&mut txn, id, 0, total_extents)
+                        .await?;
                 } else {
                     self.tombstone_store.add(&mut txn, id, file.size);
                     self.stats
@@ -797,12 +842,12 @@ impl ZeroFS {
                 let mut txn = self.db.new_transaction()?;
 
                 let tail_update = self
-                    .chunk_store
+                    .extent_store
                     .write(&mut txn, id, offset, data, old_size)
                     .await?;
 
                 #[cfg(feature = "failpoints")]
-                fail_point!(fp::WRITE_AFTER_CHUNK);
+                fail_point!(fp::WRITE_AFTER_EXTENT);
 
                 file.size = new_size;
                 let (now_sec, now_nsec) = get_current_time();
@@ -837,7 +882,7 @@ impl ZeroFS {
 
                 // Only after the commit is durable: a cache ahead of the store
                 // would splice later writes onto bytes that never landed.
-                self.chunk_store.apply_tail_update(id, tail_update);
+                self.extent_store.apply_tail_update(id, tail_update);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_COMMIT);
@@ -1076,7 +1121,7 @@ impl ZeroFS {
                 }
 
                 let read_len = std::cmp::min(count as u64, file.size - offset);
-                let result_bytes = self.chunk_store.read(id, offset, read_len).await?;
+                let result_bytes = self.extent_store.read(id, offset, read_len).await?;
                 let eof = offset + read_len >= file.size;
 
                 self.stats
@@ -1132,9 +1177,9 @@ impl ZeroFS {
 
         let mut txn = self.db.new_transaction()?;
 
-        self.chunk_store
+        self.extent_store
             .zero_range(&mut txn, id, offset, length, file.size)
-            .await;
+            .await?;
 
         self.write_coordinator.commit(txn).await.inspect_err(|e| {
             error!("Failed to commit trim batch: {}", e);
@@ -2022,12 +2067,12 @@ impl ZeroFS {
 
                         let mut txn = self.db.new_transaction()?;
 
-                        self.chunk_store
+                        self.extent_store
                             .truncate(&mut txn, id, old_size, new_size)
                             .await?;
 
                         #[cfg(feature = "failpoints")]
-                        fail_point!(fp::TRUNCATE_AFTER_CHUNKS);
+                        fail_point!(fp::TRUNCATE_AFTER_EXTENTS);
 
                         let parent_name_for_update = file.parent.zip(file.name.clone());
 
@@ -2601,7 +2646,7 @@ impl ZeroFS {
                 let (now_sec, now_nsec) = get_current_time();
 
                 // Set when the last link is dropped but a 9P fid still holds
-                // the inode open: the inode + chunks are kept and recorded in
+                // the inode open: the inode + extents are kept and recorded in
                 // the durable orphan set, and the stats subtraction is deferred
                 // to reclaim (the storage is still live). The namespace effect
                 // (entry gone, nlink=0) is committed as durably as ever.
@@ -2633,11 +2678,12 @@ impl ZeroFS {
                             #[cfg(feature = "failpoints")]
                             fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
                         } else {
-                            let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
+                            let total_extents = file.size.div_ceil(EXTENT_SIZE as u64);
 
-                            if total_chunks as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
-                                self.chunk_store
-                                    .delete_range(&mut txn, file_id, 0, total_chunks);
+                            if total_extents as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
+                                self.extent_store
+                                    .delete_range(&mut txn, file_id, 0, total_extents)
+                                    .await?;
                             } else {
                                 self.tombstone_store.add(&mut txn, file_id, file.size);
 
@@ -3044,11 +3090,12 @@ impl ZeroFS {
                         self.orphan_store.add(&mut txn, target_id);
                         target_deferred = true;
                     } else {
-                        let total_chunks = file.size.div_ceil(CHUNK_SIZE as u64);
+                        let total_extents = file.size.div_ceil(EXTENT_SIZE as u64);
 
-                        if total_chunks as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
-                            self.chunk_store
-                                .delete_range(&mut txn, target_id, 0, total_chunks);
+                        if total_extents as usize <= SMALL_FILE_TOMBSTONE_THRESHOLD {
+                            self.extent_store
+                                .delete_range(&mut txn, target_id, 0, total_extents)
+                                .await?;
                         } else {
                             self.tombstone_store.add(&mut txn, target_id, file.size);
                             self.stats
@@ -3381,43 +3428,33 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_inode_key_generation() {
+    #[test]
+    fn test_inode_key_generation() {
         use crate::fs::key_codec::{KeyCodec, KeyPrefix};
-        let codec = KeyCodec::new(false);
-        // v1 layout: [PREFIX_INODE | inode_id(8 bytes BE)]
-        let key0 = codec.inode_key(0);
-        assert_eq!(key0[0], u8::from(KeyPrefix::Inode));
-        assert_eq!(&key0[1..9], &0u64.to_be_bytes());
-
-        let key42 = codec.inode_key(42);
-        assert_eq!(key42[0], u8::from(KeyPrefix::Inode));
-        assert_eq!(&key42[1..9], &42u64.to_be_bytes());
-
-        let key999 = codec.inode_key(999);
-        assert_eq!(key999[0], u8::from(KeyPrefix::Inode));
-        assert_eq!(&key999[1..9], &999u64.to_be_bytes());
+        let codec = KeyCodec::new();
+        // Segmented layout: [b"meta" | PREFIX_INODE | inode_id(8 BE)].
+        let ko = codec.kind_offset(KeyPrefix::Inode);
+        let io = codec.id_offset(KeyPrefix::Inode);
+        for id in [0u64, 42, 999] {
+            let key = codec.inode_key(id);
+            assert_eq!(key[ko], u8::from(KeyPrefix::Inode));
+            assert_eq!(&key[io..io + 8], &id.to_be_bytes());
+        }
     }
 
-    #[tokio::test]
-    async fn test_chunk_key_generation() {
+    #[test]
+    fn test_extent_key_generation() {
         use crate::fs::key_codec::{KeyCodec, KeyPrefix};
-        let codec = KeyCodec::new(false);
-        // v1 layout: [PREFIX_CHUNK | inode_id(8 bytes BE) | chunk_index(8 bytes BE)]
-        let key = codec.chunk_key(1, 0);
-        assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
-        assert_eq!(&key[1..9], &1u64.to_be_bytes());
-        assert_eq!(&key[9..17], &0u64.to_be_bytes());
-
-        let key = codec.chunk_key(42, 10);
-        assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
-        assert_eq!(&key[1..9], &42u64.to_be_bytes());
-        assert_eq!(&key[9..17], &10u64.to_be_bytes());
-
-        let key = codec.chunk_key(999, 999);
-        assert_eq!(key[0], u8::from(KeyPrefix::Chunk));
-        assert_eq!(&key[1..9], &999u64.to_be_bytes());
-        assert_eq!(&key[9..17], &999u64.to_be_bytes());
+        let codec = KeyCodec::new();
+        // Segmented layout: [b"extent" | PREFIX_EXTENT | inode(8 BE) | index(8 BE)].
+        let ko = codec.kind_offset(KeyPrefix::Extent);
+        let io = codec.id_offset(KeyPrefix::Extent);
+        for (ino, idx) in [(1u64, 0u64), (42, 10), (999, 999)] {
+            let key = codec.extent_key(ino, idx);
+            assert_eq!(key[ko], u8::from(KeyPrefix::Extent));
+            assert_eq!(&key[io..io + 8], &ino.to_be_bytes());
+            assert_eq!(&key[io + 8..io + 16], &idx.to_be_bytes());
+        }
     }
 
     #[tokio::test]
@@ -3451,7 +3488,7 @@ mod tests {
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), object_store.clone())
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
@@ -3463,7 +3500,12 @@ mod tests {
             u64::MAX,
             None,
             false,
-            true,
+            object_store.clone(),
+            crate::frame_codec::FrameCodec::new(
+                &test_key,
+                crate::segment::SEGMENT_INFO,
+                CompressionConfig::default(),
+            ),
         )
         .await
         .unwrap();
@@ -3541,7 +3583,7 @@ mod tests {
         assert_eq!(fattr.size, 0);
 
         // Check that the file was added to the directory
-        let entry_key = KeyCodec::new(true).dir_entry_key(0, b"test.txt");
+        let entry_key = KeyCodec::new().dir_entry_key(0, b"test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -3657,7 +3699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_write_partial_chunks() {
+    async fn test_process_write_partial_extents() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
@@ -3696,7 +3738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_write_across_chunks() {
+    async fn test_process_write_across_extents() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
@@ -3704,8 +3746,8 @@ mod tests {
             .await
             .unwrap();
 
-        let chunk_size = CHUNK_SIZE;
-        let data = vec![b'X'; chunk_size * 2 + 1024];
+        let extent_size = EXTENT_SIZE;
+        let data = vec![b'X'; extent_size * 2 + 1024];
 
         let fattr = fs
             .write(
@@ -3750,7 +3792,7 @@ mod tests {
             .unwrap();
 
         // Check that the file was removed from the directory
-        let entry_key = KeyCodec::new(true).dir_entry_key(0, b"test.txt");
+        let entry_key = KeyCodec::new().dir_entry_key(0, b"test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap();
         assert!(entry_data.is_none());
 
@@ -3811,10 +3853,10 @@ mod tests {
             .unwrap();
 
         // Check old entry is gone and new entry exists
-        let old_entry_key = KeyCodec::new(true).dir_entry_key(0, b"old.txt");
+        let old_entry_key = KeyCodec::new().dir_entry_key(0, b"old.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
-        let new_entry_key = KeyCodec::new(true).dir_entry_key(0, b"new.txt");
+        let new_entry_key = KeyCodec::new().dir_entry_key(0, b"new.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -3858,11 +3900,11 @@ mod tests {
             .unwrap();
 
         // Check that file1.txt no longer exists
-        let old_entry_key = KeyCodec::new(true).dir_entry_key(0, b"file1.txt");
+        let old_entry_key = KeyCodec::new().dir_entry_key(0, b"file1.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check that file2.txt exists and has file1's content
-        let new_entry_key = KeyCodec::new(true).dir_entry_key(0, b"file2.txt");
+        let new_entry_key = KeyCodec::new().dir_entry_key(0, b"file2.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -3915,11 +3957,11 @@ mod tests {
         .unwrap();
 
         // Check file removed from dir1
-        let old_entry_key = KeyCodec::new(true).dir_entry_key(dir1_id, b"file.txt");
+        let old_entry_key = KeyCodec::new().dir_entry_key(dir1_id, b"file.txt");
         assert!(fs.db.get_bytes(&old_entry_key).await.unwrap().is_none());
 
         // Check file added to dir2
-        let new_entry_key = KeyCodec::new(true).dir_entry_key(dir2_id, b"moved.txt");
+        let new_entry_key = KeyCodec::new().dir_entry_key(dir2_id, b"moved.txt");
         let entry_data = fs.db.get_bytes(&new_entry_key).await.unwrap().unwrap();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&entry_data[..8]);
@@ -4045,7 +4087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_beyond_truncated_chunk() {
+    async fn test_read_beyond_truncated_extent() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
         let (file_id, _) = fs
@@ -4085,27 +4127,27 @@ mod tests {
             .await
             .unwrap();
 
-        // Small sequential appends that cross chunk boundaries, so the tail chunk
+        // Small sequential appends that cross extent boundaries, so the tail extent
         // fills and rolls over repeatedly: every append into a partially-filled
-        // chunk takes the cached-tail splice path instead of re-reading.
+        // extent takes the cached-tail splice path instead of re-reading.
         let step = 5000usize;
-        let total = CHUNK_SIZE * 3 + 1234;
+        let total = EXTENT_SIZE * 3 + 1234;
         let mut expected = Vec::with_capacity(total);
         let mut offset = 0u64;
         while expected.len() < total {
             let n = step.min(total - expected.len());
-            let chunk: Vec<u8> = (0..n)
+            let extent: Vec<u8> = (0..n)
                 .map(|i| ((offset as usize + i) % 251) as u8)
                 .collect();
             fs.write(
                 &(&test_auth()).into(),
                 file_id,
                 offset,
-                &Bytes::copy_from_slice(&chunk),
+                &Bytes::copy_from_slice(&extent),
             )
             .await
             .unwrap();
-            expected.extend_from_slice(&chunk);
+            expected.extend_from_slice(&extent);
             offset += n as u64;
         }
 
@@ -4124,7 +4166,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Build a partial tail chunk; this populates the tail cache.
+        // Build a partial tail extent; this populates the tail cache.
         let a = vec![b'A'; 1000];
         fs.write(
             &(&test_auth()).into(),
@@ -4135,7 +4177,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Shrink into that chunk. truncate must drop the cache, else the next
+        // Shrink into that extent. truncate must drop the cache, else the next
         // append splices onto the stale pre-truncate bytes.
         fs.setattr(
             &test_creds(),
@@ -4185,7 +4227,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Partial tail in chunk 0 -> cache holds chunk 0.
+        // Partial tail in extent 0 -> cache holds extent 0.
         let a = vec![b'A'; 1000];
         fs.write(
             &(&test_auth()).into(),
@@ -4196,9 +4238,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Write far past EOF, leaving a hole. The target chunk is beyond_eof, so it
-        // must build on zeros, never on the cached chunk-0 bytes.
-        let far = 6 * CHUNK_SIZE as u64 + 500;
+        // Write far past EOF, leaving a hole. The target extent is beyond_eof, so it
+        // must build on zeros, never on the cached extent-0 bytes.
+        let far = 6 * EXTENT_SIZE as u64 + 500;
         let b = vec![b'B'; 100];
         fs.write(
             &(&test_auth()).into(),
@@ -4209,21 +4251,21 @@ mod tests {
         .await
         .unwrap();
 
-        // The bytes before the far write within its own chunk are part of the hole:
+        // The bytes before the far write within its own extent are part of the hole:
         // must be zeros, not the cached 'A's.
         let (lead, _) = fs
-            .read_file(&(&test_auth()).into(), file_id, 6 * CHUNK_SIZE as u64, 500)
+            .read_file(&(&test_auth()).into(), file_id, 6 * EXTENT_SIZE as u64, 500)
             .await
             .unwrap();
         assert_eq!(
             lead,
             vec![0u8; 500],
-            "hole chunk must not inherit cached bytes"
+            "hole extent must not inherit cached bytes"
         );
 
         // The hole between the two writes reads as zeros.
         let (hole, _) = fs
-            .read_file(&(&test_auth()).into(), file_id, 3 * CHUNK_SIZE as u64, 256)
+            .read_file(&(&test_auth()).into(), file_id, 3 * EXTENT_SIZE as u64, 256)
             .await
             .unwrap();
         assert_eq!(hole, vec![0u8; 256]);
@@ -4240,8 +4282,8 @@ mod tests {
             .unwrap();
         assert_eq!(tail, b);
 
-        // Back-fill into the old chunk 0; it must read chunk 0 from the store (the
-        // cache moved to the far chunk), not splice onto a stale entry.
+        // Back-fill into the old extent 0; it must read extent 0 from the store (the
+        // cache moved to the far extent), not splice onto a stale entry.
         let c = vec![b'C'; 100];
         fs.write(
             &(&test_auth()).into(),

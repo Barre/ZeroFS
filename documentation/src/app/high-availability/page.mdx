@@ -22,9 +22,9 @@ ZeroFS high availability runs two nodes over one object store: a leader that ser
 
 ## Why replication {{ id: 'why' }}
 
-ZeroFS keeps the filesystem in a log-structured database on object storage. Object storage is durable but slow and metered per request: a single PUT costs tens of milliseconds and is billed individually. Writing every filesystem write as its own object would make every write that slow and that expensive.
+ZeroFS stores the filesystem on object storage: metadata in a log-structured database, file contents as frames packed into immutable segment objects. Object storage is durable but slow and metered per request: a single PUT costs tens of milliseconds and is billed individually. Writing every filesystem write as its own object would make every write that slow and that expensive.
 
-ZeroFS instead accumulates writes in an in-memory memtable and flushes them to object storage in batches: on `fsync`, on a size threshold, and on a periodic timer (see [Durability and Consistency](/durability)). This is the standard memtable-and-flush model. It is why `write()` returns before the data reaches object storage, and why `fsync()` is the call that forces it there.
+ZeroFS instead buffers writes in memory and uploads them in batches: metadata accumulates in a memtable, file data in an open segment buffer. A flush seals the open segment into an immutable segment object, then flushes the metadata that points into it. Flushes happen on `fsync`, on a periodic timer (default 30 s), and before each segment garbage-collection (segment-reclamation) pass (see [Durability and Consistency](/durability)). This is why `write()` returns before the data reaches object storage, and why `fsync()` is the call that forces it there.
 
 For a single node, two consequences follow:
 
@@ -45,7 +45,7 @@ graph TB
         S["Standby<br/>holds the tail, ready to take over"]
     end
     subgraph Store["Object storage"]
-        D["Data: ZeroFS SSTs + manifest"]
+        D["Metadata SSTs + manifest<br/>+ immutable data segments"]
     end
     C -->|reads and writes| L
     C -.->|reroute on failover| S
@@ -54,13 +54,15 @@ graph TB
     S ==>|take over: open as writer, epoch-fence the old leader| D
 `} />
 
-**One writer at a time.** ZeroFS is single-writer per database. Exactly one node, the leader, holds the data-database writer; the standby does not write to it until it takes over. At startup a node asks its peer who is active rather than trusting its configured role, so the two never both open as writer from a cold start.
+**One writer at a time.** ZeroFS is single-writer per database. Exactly one node, the leader, holds the data-database writer; the standby does not write to it until it takes over. At startup a node asks its peer who is active rather than trusting its configured role, so a restarting node defers to a live peer instead of fencing it; if the peers cannot reach each other, both may attempt to open as writer and the epoch fence (below) guarantees at most one commits.
 
-**Safety is writer-epoch fencing.** Opening the database as writer performs a conditional manifest update that bumps a `writer_epoch` and fences any previous writer: the old writer's next manifest write fails. At most one node can ever commit durable state, regardless of timing. A fenced leader's in-flight SST files become unreferenced orphans that garbage collection reclaims; they never overwrite referenced data. On its first failed write a fenced leader stops. This is the hard guarantee, and it does not depend on clocks or timeouts.
+**Safety is writer-epoch fencing.** Opening the database as writer performs a conditional manifest update that bumps a `writer_epoch` and fences any previous writer: the old writer's next manifest write fails. At most one node can ever commit durable state, regardless of timing. A fenced leader's in-flight SST files and segment objects become unreferenced orphans that garbage collection reclaims; they never overwrite referenced data. Segment objects are keyed by writer epoch, so two writer terms can never write the same object key. On its first failed write a fenced leader stops. This is the hard guarantee, and it does not depend on clocks or timeouts.
 
 **Heartbeats and failover.** The leader streams heartbeats, each tagged with its writer epoch, to the standby. The standby tracks liveness; if heartbeats stop for the takeover TTL (about two seconds), it takes over: it opens the data database as writer, which epoch-fences the old leader, replays its buffered tail, and begins serving. Heartbeats from a deposed leader carry a lower epoch and are ignored, so a returning zombie cannot keep the standby from taking over. When a deposed leader contacts a standby that still holds an un-replayed tail, the standby takes over at once instead of waiting out the gap.
 
-**Semi-synchronous replication, commit then apply.** For each write the leader ships it to the standby and waits for the standby's acknowledgment before applying it locally and acknowledging the client. Anything a client can read has therefore already been replicated, so the standby is never missing a write a client has seen. The standby keeps not-yet-applied writes in a tail buffer and replays them when it takes over.
+**Semi-synchronous replication, commit then apply.** For each write the leader ships it to the standby and waits for the standby's acknowledgment before applying it locally and acknowledging the client. Anything a client can read has therefore already been replicated, so the standby is never missing a write a client has seen. The standby keeps not-yet-applied writes in an in-memory tail buffer, pruned as the leader's flushes confirm batches durable, and replays them in order when it takes over.
+
+**File data ships as frames.** A replicated file write carries a 32-byte pointer into an immutable segment object on the shared object store. While that segment is still the leader's un-uploaded in-RAM buffer, the leader ships the sealed frame bytes (compressed and encrypted) alongside the pointer; once a segment is uploaded, the pointer alone ships and the standby reads the object from shared storage. On takeover, the promoted standby rebuilds any segment objects the old leader never uploaded from the shipped frames, at their original byte offsets, before serving. The rebuild first checks the object store, so a segment the old leader did upload is never overwritten. This is how un-`fsync`'d acknowledged writes survive failover for file contents.
 
 **Connected and Solo.** The leader ships while the standby is reachable (Connected). If the standby is down or slow, the leader degrades to Solo and keeps serving, with writes single-node-durable as on a standalone node, instead of blocking on an absent replica. It re-establishes shipping when the standby returns. Solo trades the replication of un-`fsync`'d writes for availability; fencing still prevents split-brain.
 
@@ -129,7 +131,7 @@ sequenceDiagram
     S-->>C: ESTALE: the new leader never received the write
 `} />
 
-**The lease.** A node serves only while its lease is valid. The lease tracks SlateDB's view of the database: renewed while it is open, and revoked the instant SlateDB closes it. A takeover bumps the writer epoch, and SlateDB's manifest poll closes the deposed leader's database as soon as it observes that newer epoch. So a deposed leader steps down, answering clients with a "not the leader" signal, within one manifest-poll interval of the takeover: it learns from the poll, so even an idle, read-only deposed leader stops without having to attempt a write first. Fencing is the hard guarantee against split-brain writes; the lease, riding the same epoch the poll observes, extends that to reads.
+**The lease.** A node serves only while its lease is valid. The lease tracks the metadata store's view of the database: renewed while the database is open, and revoked the instant it closes. A takeover bumps the writer epoch, and the deposed leader's manifest poll closes its database as soon as it observes that newer epoch. So a deposed leader steps down, answering clients with a "not the leader" signal, within one manifest-poll interval of the takeover: it learns from the poll, so even an idle, read-only deposed leader stops without having to attempt a write first. Fencing is the hard guarantee against split-brain writes; the lease, riding the same epoch the poll observes, extends that to reads.
 
 **Client failover.** A ZeroFS client connects to every node address, finds the one currently serving as leader, and reroutes when that node stops serving, whether the connection dropped, an operation timed out, or the node replied "not the leader". Retried mutating operations carry a stable operation id that the leader deduplicates, so rerouting a non-idempotent operation (`mkdir`, `rename`, and so on) never applies it twice. A write whose acknowledgment is lost to a failover is therefore not left ambiguous: the client retries it, deduplication keeps the retry exactly-once, and the call returns a definitive result instead of a timeout. See [Client access](#clients).
 
@@ -156,7 +158,7 @@ sequenceDiagram
     L--xS: heartbeats stop
     Note over S: no heartbeat for the takeover TTL (~2s)
     S->>O: open as writer, CAS bumps writer epoch and fences the old leader
-    S->>S: replay buffered tail
+    S->>S: replay buffered tail, rebuild un-uploaded segments
     Note over S: now serving as the new leader
 
     C->>L: in-flight write
@@ -234,7 +236,7 @@ peers = ["10.0.0.1:9000"]
 
 **Configure a balanced pair.** Set both `replication_listen` and `peers` on every node, so either node can lead after a role swap. A node with only one of the two works for its initial role but cannot fully participate after a failover: a promoted standby with no `peers` has nowhere to ship, and a leader with no `replication_listen` cannot receive once it is demoted. ZeroFS logs a warning at startup when a node is configured asymmetrically.
 
-**The WAL is supported under HA.** The write-ahead log is off by default; enabling it (`[lsm] wal_enabled = true`) is allowed with replication and makes `fsync` cheaper, a WAL append rather than a full memtable-to-SST flush (see [Durability and Consistency](/durability)). It stays safe because the WAL is fenced on the same writer epoch as the manifest, so a deposed leader cannot inject WAL writes into the promoted leader, and the replication tail reconciles with WAL recovery on takeover.
+**There is no WAL.** The write-ahead log is permanently off and not configurable; the former `[lsm] wal_enabled` key no longer exists, and a config that sets it fails to parse. A WAL flush is not gated by the segment seal barrier, so it could make an extent pointer durable while the segment it points into is still an un-uploaded buffer. Protection for un-`fsync`'d acked writes comes from semi-synchronous frame shipping instead (see [Durability and Consistency](/durability)).
 
 **`fsync` can be made a no-op.** Setting `[filesystem] ignore_fsync = true` returns from a client `fsync`/COMMIT without forcing a flush to object storage. Under HA this trades the per-`fsync` flush for replication: an acknowledged write is already on the standby via semi-sync, so a single-node failure is survived without it. The cost is object-store durability: a write that has not yet reached a background flush is lost if both nodes die together, or, in Solo mode, if the one node crashes. It is off by default, and rejected alongside `[lsm] sync_writes` (which flushes every write regardless).
 
@@ -270,7 +272,7 @@ Gate pod readiness on the replication port, not 9P: a standby binds the replicat
 
 - **Two nodes, one standby.** This is availability through failover, not write scale-out. There is a single writer; adding nodes does not spread writes across them. For read scale-out, see [Read Replicas](/read-replicas).
 - **Crash failover is bounded, not instant.** On a crash the standby waits out the takeover TTL (about two seconds) before promoting. Clients absorb that window by blocking and retrying, so applications see added latency rather than errors.
-- **The standby must keep up.** If it cannot, the leader runs Solo and un-`fsync`'d writes are not replicated until the standby recovers. Fencing still holds, so this is a durability-window trade, never a correctness one.
+- **The standby must keep up.** The tail buffer, including shipped frame bytes, is held in the standby's RAM and pruned as the leader's flushes make batches durable. If the standby cannot keep up, the leader runs Solo and un-`fsync`'d writes are not replicated until the standby recovers. Fencing still holds, so this is a durability-window trade, never a correctness one.
 - **Advisory locks do not survive a failover.** POSIX byte-range locks (`fcntl`, 9P `Tlock`) are per-server in-memory state and are not replicated: locks work normally on the leader but are dropped on a failover (the promoted node starts with an empty lock table). They are advisory (they do not gate reads or writes), so this does not corrupt data. An application that needs mutual exclusion across a failover must fence at the resource it protects rather than rely on the lock; advisory locks are not a safe distributed mutex across a failover, which is true of networked file locks generally, not just ZeroFS.
 
 <div className="not-prose">

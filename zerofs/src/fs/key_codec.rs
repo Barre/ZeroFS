@@ -4,25 +4,22 @@ use bytes::Bytes;
 
 // Key layout for the underlying LSM.
 //
-// Two on-disk layouts coexist:
-//   v1 (legacy, pre-segments): [kind: 1] + [id: 8] + ...
-//   v2 (segmented):            [b"meta" | b"chunk"] + [kind: 1] + [id: 8] + ...
+// Every key is [b"meta" | b"extent"] + [kind: 1] + [id: 8] + ...
 //
-// V2 prepends a domain prefix that slatedb's segment extractor matches on
-// (RFC-0024). All metadata kinds route into the `b"meta"` segment; chunks
-// route into `b"chunk"`. Each segment is an independent LSM tree, so
-// metadata churn and bulk-data compaction never share an L0 list or
-// compaction lifecycle. Metadata/chunk isolation is therefore structural
-// in v2, not lexicographic.
+// The leading domain prefix is what slatedb's segment extractor routes on:
+// all metadata kinds land in the `b"meta"` segment, bulk extent pointers in
+// `b"extent"`. Each segment is an independent LSM tree, so metadata churn and
+// bulk-data compaction never share an L0 list or compaction lifecycle.
+// Metadata/extent isolation is structural, not lexicographic.
 //
-// Within a single segment, kind-byte values still determine block-level
-// adjacency. A `lookup()` touches both INODE and DIR_ENTRY: with kind
-// bytes 0x01/0x02 adjacent, their entries land in neighbouring blocks of
-// the same meta-segment SST, so the read can reuse the same block-cache
-// index/filter entries. Similarly, DIR_ENTRY/DIR_SCAN/DIR_COOKIE (0x02
-// /0x03/0x04) are kept adjacent for directory operations.
+// Within the meta segment, kind-byte values determine block-level adjacency.
+// A `lookup()` touches both INODE and DIR_ENTRY: with kind bytes 0x01/0x02
+// adjacent, their entries land in neighbouring blocks of the same meta-segment
+// SST, so the read can reuse the same block-cache index/filter entries.
+// Similarly, DIR_ENTRY/DIR_SCAN/DIR_COOKIE (0x02/0x03/0x04) are kept adjacent
+// for directory operations.
 //
-// Kind byte assignments (one byte each, both layouts):
+// Kind byte assignments (one byte each):
 //   0x01 INODE         hot metadata, point-keyed by inode_id
 //   0x02 DIR_ENTRY     hot metadata, lookup by (dir_id, name)
 //   0x03 DIR_SCAN      hot metadata, ordered scan by (dir_id, cookie)
@@ -31,12 +28,8 @@ use bytes::Bytes;
 //   0x06 SYSTEM        rare config (e.g. next-inode counter)
 //   0x07 TOMBSTONE     deferred-deletion entries, scanned only by GC
 //   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
-//   0xFE CHUNK         bulk file data — the only kind in the chunk segment
-//
-// V1 keeps the same kind bytes but no domain prefix, so every kind shares
-// a single LSM tree. The 0xFE/0x01..0x07 gap that used to isolate chunks
-// from metadata via lexicographic distance is vestigial under v2: chunks
-// are now in their own segment regardless of byte value.
+//   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
+//   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
 const PREFIX_DIR_ENTRY: u8 = 0x02;
@@ -46,7 +39,8 @@ const PREFIX_STATS: u8 = 0x05;
 const PREFIX_SYSTEM: u8 = 0x06;
 const PREFIX_TOMBSTONE: u8 = 0x07;
 const PREFIX_ORPHAN: u8 = 0x08;
-const PREFIX_CHUNK: u8 = 0xFE;
+const PREFIX_SEGCOUNT: u8 = 0x09;
+const PREFIX_EXTENT: u8 = 0xFE;
 
 const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
@@ -64,18 +58,22 @@ const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
 // the lineage token (taint == stored lineage => the lineage may be missing acked
 // Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
 const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
+// Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
+// orphan sweep. Persisted (not process-uptime) so the ~12h sweep cadence holds
+// across restarts (see gc.rs maybe_sweep_orphans).
+const SYSTEM_ORPHAN_SWEEP_SUBTYPE: u8 = 0x05;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
-/// v2 domain prefix for any metadata kind.
+/// Domain prefix for any metadata kind.
 pub const META_DOMAIN: &[u8] = b"meta";
-/// v2 domain prefix for bulk chunk data.
-pub const CHUNK_DOMAIN: &[u8] = b"chunk";
+/// Domain prefix for bulk extent data.
+pub const EXTENT_DOMAIN: &[u8] = b"extent";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyPrefix {
     Inode,
-    Chunk,
+    Extent,
     DirEntry,
     DirScan,
     Tombstone,
@@ -83,6 +81,7 @@ pub enum KeyPrefix {
     Stats,
     System,
     DirCookie,
+    SegCount,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -91,7 +90,7 @@ impl TryFrom<u8> for KeyPrefix {
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
         match byte {
             PREFIX_INODE => Ok(Self::Inode),
-            PREFIX_CHUNK => Ok(Self::Chunk),
+            PREFIX_EXTENT => Ok(Self::Extent),
             PREFIX_DIR_ENTRY => Ok(Self::DirEntry),
             PREFIX_DIR_SCAN => Ok(Self::DirScan),
             PREFIX_TOMBSTONE => Ok(Self::Tombstone),
@@ -99,6 +98,7 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_STATS => Ok(Self::Stats),
             PREFIX_SYSTEM => Ok(Self::System),
             PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
+            PREFIX_SEGCOUNT => Ok(Self::SegCount),
             _ => Err(()),
         }
     }
@@ -108,7 +108,7 @@ impl From<KeyPrefix> for u8 {
     fn from(prefix: KeyPrefix) -> Self {
         match prefix {
             KeyPrefix::Inode => PREFIX_INODE,
-            KeyPrefix::Chunk => PREFIX_CHUNK,
+            KeyPrefix::Extent => PREFIX_EXTENT,
             KeyPrefix::DirEntry => PREFIX_DIR_ENTRY,
             KeyPrefix::DirScan => PREFIX_DIR_SCAN,
             KeyPrefix::Tombstone => PREFIX_TOMBSTONE,
@@ -116,6 +116,7 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::Stats => PREFIX_STATS,
             KeyPrefix::System => PREFIX_SYSTEM,
             KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
+            KeyPrefix::SegCount => PREFIX_SEGCOUNT,
         }
     }
 }
@@ -124,7 +125,7 @@ impl KeyPrefix {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Inode => "INODE",
-            Self::Chunk => "CHUNK",
+            Self::Extent => "EXTENT",
             Self::DirEntry => "DIR_ENTRY",
             Self::DirScan => "DIR_SCAN",
             Self::Tombstone => "TOMBSTONE",
@@ -132,12 +133,13 @@ impl KeyPrefix {
             Self::Stats => "STATS",
             Self::System => "SYSTEM",
             Self::DirCookie => "DIR_COOKIE",
+            Self::SegCount => "SEGCOUNT",
         }
     }
 
     fn domain(self) -> &'static [u8] {
         match self {
-            KeyPrefix::Chunk => CHUNK_DOMAIN,
+            KeyPrefix::Extent => EXTENT_DOMAIN,
             _ => META_DOMAIN,
         }
     }
@@ -151,27 +153,20 @@ pub enum ParsedKey {
     Unknown,
 }
 
-/// Per-volume key encoder/decoder. The `use_segment_layout` flag is set
-/// once at DB open time based on whether the volume was created with
-/// segment-oriented compaction enabled (RFC-0024); it never changes for
-/// the life of a DB handle.
-#[derive(Debug, Clone)]
-pub struct KeyCodec {
-    use_segment_layout: bool,
-}
+/// Per-volume key encoder/decoder. Stateless: every volume uses the segmented
+/// layout, a `b"meta"`/`b"extent"` domain prefix that the slatedb segment
+/// extractor routes on.
+#[derive(Debug, Clone, Default)]
+pub struct KeyCodec;
 
 impl KeyCodec {
-    pub fn new(use_segment_layout: bool) -> Self {
-        Self { use_segment_layout }
+    pub fn new() -> Self {
+        Self
     }
 
     /// Number of bytes the domain prefix contributes for `prefix`.
     pub fn domain_len(&self, prefix: KeyPrefix) -> usize {
-        if self.use_segment_layout {
-            prefix.domain().len()
-        } else {
-            0
-        }
+        prefix.domain().len()
     }
 
     /// Byte offset where the kind byte lives for `prefix`.
@@ -188,9 +183,7 @@ impl KeyCodec {
 
     /// Push the domain prefix (if any) plus the kind byte onto `key`.
     fn push_prefix(&self, key: &mut Vec<u8>, prefix: KeyPrefix) {
-        if self.use_segment_layout {
-            key.extend_from_slice(prefix.domain());
-        }
+        key.extend_from_slice(prefix.domain());
         key.push(u8::from(prefix));
     }
 
@@ -199,9 +192,9 @@ impl KeyCodec {
         self.id_offset(KeyPrefix::Inode) + U64_SIZE
     }
 
-    /// Total bytes in a complete chunk key.
-    pub fn chunk_key_size(&self) -> usize {
-        self.id_offset(KeyPrefix::Chunk) + U64_SIZE * 2
+    /// Total bytes in a complete extent key.
+    pub fn extent_key_size(&self) -> usize {
+        self.id_offset(KeyPrefix::Extent) + U64_SIZE * 2
     }
 
     /// Total bytes in a complete tombstone key.
@@ -221,29 +214,79 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn chunk_key(&self, inode_id: InodeId, chunk_index: u64) -> Bytes {
-        let mut key = Vec::with_capacity(self.chunk_key_size());
-        self.push_prefix(&mut key, KeyPrefix::Chunk);
+    pub fn extent_key(&self, inode_id: InodeId, extent_index: u64) -> Bytes {
+        let mut key = Vec::with_capacity(self.extent_key_size());
+        self.push_prefix(&mut key, KeyPrefix::Extent);
         key.extend_from_slice(&inode_id.to_be_bytes());
-        key.extend_from_slice(&chunk_index.to_be_bytes());
+        key.extend_from_slice(&extent_index.to_be_bytes());
         Bytes::from(key)
     }
 
-    pub fn parse_chunk_key(&self, key: &[u8]) -> Option<u64> {
-        let expected = self.chunk_key_size();
+    pub fn parse_extent_key(&self, key: &[u8]) -> Option<u64> {
+        let expected = self.extent_key_size();
         if key.len() != expected {
             return None;
         }
-        let kind_off = self.kind_offset(KeyPrefix::Chunk);
-        if self.use_segment_layout && !key.starts_with(CHUNK_DOMAIN) {
+        let kind_off = self.kind_offset(KeyPrefix::Extent);
+        if !key.starts_with(EXTENT_DOMAIN) {
             return None;
         }
-        if key[kind_off] != PREFIX_CHUNK {
+        if key[kind_off] != PREFIX_EXTENT {
             return None;
         }
-        let chunk_off = self.id_offset(KeyPrefix::Chunk) + U64_SIZE;
-        let chunk_bytes: [u8; U64_SIZE] = key[chunk_off..expected].try_into().ok()?;
-        Some(u64::from_be_bytes(chunk_bytes))
+        let extent_off = self.id_offset(KeyPrefix::Extent) + U64_SIZE;
+        let extent_bytes: [u8; U64_SIZE] = key[extent_off..expected].try_into().ok()?;
+        Some(u64::from_be_bytes(extent_bytes))
+    }
+
+    /// `(inode_id, extent_index)` for an extent key, for the HA standby rebuilding a
+    /// shipped segment's directory on takeover.
+    pub fn parse_extent_key_full(&self, key: &[u8]) -> Option<(InodeId, u64)> {
+        let expected = self.extent_key_size();
+        if key.len() != expected {
+            return None;
+        }
+        let kind_off = self.kind_offset(KeyPrefix::Extent);
+        if !key.starts_with(EXTENT_DOMAIN) {
+            return None;
+        }
+        if key[kind_off] != PREFIX_EXTENT {
+            return None;
+        }
+        let id_off = self.id_offset(KeyPrefix::Extent);
+        let inode = u64::from_be_bytes(key[id_off..id_off + U64_SIZE].try_into().ok()?);
+        let extent = u64::from_be_bytes(key[id_off + U64_SIZE..expected].try_into().ok()?);
+        Some((inode, extent))
+    }
+
+    /// Key for a segment's live-byte counter, keyed by its `(epoch, counter)` segid.
+    /// Big-endian id so a prefix scan visits segments in creation order (like every
+    /// other id key); the value is `(live, total)` via [`Self::encode_segcount`].
+    pub fn segcount_key(&self, epoch: u64, counter: u64) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::SegCount) + U64_SIZE * 2);
+        self.push_prefix(&mut key, KeyPrefix::SegCount);
+        key.extend_from_slice(&epoch.to_be_bytes());
+        key.extend_from_slice(&counter.to_be_bytes());
+        Bytes::from(key)
+    }
+
+    /// `(epoch, counter)` of a segcount key, for the reclaim / rebuild keyspace scan.
+    pub fn parse_segcount_key(&self, key: &[u8]) -> Option<(u64, u64)> {
+        let id_off = self.id_offset(KeyPrefix::SegCount);
+        if key.len() != id_off + U64_SIZE * 2
+            || !key.starts_with(META_DOMAIN)
+            || key[self.kind_offset(KeyPrefix::SegCount)] != PREFIX_SEGCOUNT
+        {
+            return None;
+        }
+        let epoch = u64::from_be_bytes(key[id_off..id_off + U64_SIZE].try_into().ok()?);
+        let counter = u64::from_be_bytes(key[id_off + U64_SIZE..].try_into().ok()?);
+        Some((epoch, counter))
+    }
+
+    /// Half-open `[start, end)` covering every segcount key, for a full scan.
+    pub fn segcount_prefix_range(&self) -> (Bytes, Bytes) {
+        self.prefix_range(KeyPrefix::SegCount)
     }
 
     pub fn dir_entry_key(&self, dir_id: InodeId, name: &[u8]) -> Bytes {
@@ -349,6 +392,15 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
+    /// Key for the last-orphan-sweep wall-clock timestamp (epoch seconds, a u64 via
+    /// [`Self::encode_u64`]).
+    pub fn last_orphan_sweep_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
+        self.push_prefix(&mut key, KeyPrefix::System);
+        key.push(SYSTEM_ORPHAN_SWEEP_SUBTYPE);
+        Bytes::from(key)
+    }
+
     pub fn encode_u64(value: u64) -> Bytes {
         Bytes::copy_from_slice(&value.to_le_bytes())
     }
@@ -358,6 +410,33 @@ impl KeyCodec {
             return None;
         }
         Some(u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?))
+    }
+
+    /// Encode a segment counter value: `live` bytes (decrements as frames die) and
+    /// `total` bytes (cumulative frame bytes ever appended, monotonic). The GC reads
+    /// `live/total` as the segment's live fraction straight from this value, so the
+    /// fast reclaim path never has to list the object to get its size.
+    pub fn encode_segcount(live: u64, total: u64) -> Bytes {
+        let mut b = [0u8; U64_SIZE * 2];
+        b[..U64_SIZE].copy_from_slice(&live.to_le_bytes());
+        b[U64_SIZE..].copy_from_slice(&total.to_le_bytes());
+        Bytes::copy_from_slice(&b)
+    }
+
+    /// Decode a segment counter value. A legacy 8-byte value (live only, pre-`total`)
+    /// decodes as `(live, live)`: it treats the whole segment as live until its
+    /// counter is next rewritten, which is the safe (over-count) direction.
+    pub fn decode_segcount(data: &[u8]) -> Option<(u64, u64)> {
+        if data.len() == U64_SIZE * 2 {
+            let live = u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?);
+            let total = u64::from_le_bytes(data[U64_SIZE..].try_into().ok()?);
+            Some((live, total))
+        } else if data.len() == U64_SIZE {
+            let live = u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?);
+            Some((live, live))
+        } else {
+            None
+        }
     }
 
     /// Returns `(writer_epoch, seqno)`.
@@ -421,24 +500,19 @@ impl KeyCodec {
     }
 
     /// Decode the kind byte from a stored key. Returns `None` if the key
-    /// is too short, lacks the expected domain prefix (v2), or carries a
-    /// kind byte we don't recognize.
+    /// is too short, lacks the expected domain prefix, or carries a kind
+    /// byte we don't recognize.
     fn peek_kind(&self, key: &[u8]) -> Option<KeyPrefix> {
-        if self.use_segment_layout {
-            // v2: dispatch on the leading domain prefix to determine which
-            // kind byte to read.
-            if let Some(rest) = key.strip_prefix(CHUNK_DOMAIN) {
-                let kind = KeyPrefix::try_from(*rest.first()?).ok()?;
-                return (kind == KeyPrefix::Chunk).then_some(kind);
-            }
-            if let Some(rest) = key.strip_prefix(META_DOMAIN) {
-                let kind = KeyPrefix::try_from(*rest.first()?).ok()?;
-                return (kind != KeyPrefix::Chunk).then_some(kind);
-            }
-            None
-        } else {
-            KeyPrefix::try_from(*key.first()?).ok()
+        // Dispatch on the leading domain prefix to pick which kind byte to read.
+        if let Some(rest) = key.strip_prefix(EXTENT_DOMAIN) {
+            let kind = KeyPrefix::try_from(*rest.first()?).ok()?;
+            return (kind == KeyPrefix::Extent).then_some(kind);
         }
+        if let Some(rest) = key.strip_prefix(META_DOMAIN) {
+            let kind = KeyPrefix::try_from(*rest.first()?).ok()?;
+            return (kind != KeyPrefix::Extent).then_some(kind);
+        }
+        None
     }
 
     pub fn encode_counter(value: u64) -> Bytes {
@@ -489,8 +563,8 @@ impl KeyCodec {
     }
 
     /// Half-open `[start, end)` range covering every key of `prefix`.
-    /// In v2, `end` is the prefix bytes followed by the kind-byte successor,
-    /// so the range stays within the domain segment.
+    /// `end` is the prefix bytes followed by the kind-byte successor, so the
+    /// range stays within the domain segment.
     pub fn prefix_range(&self, prefix: KeyPrefix) -> (Bytes, Bytes) {
         let mut start = Vec::with_capacity(self.id_offset(prefix));
         self.push_prefix(&mut start, prefix);
@@ -507,82 +581,88 @@ impl KeyCodec {
 mod tests {
     use super::*;
 
-    fn v1() -> KeyCodec {
-        KeyCodec::new(false)
-    }
-    fn v2() -> KeyCodec {
-        KeyCodec::new(true)
-    }
-
     #[test]
     fn test_dir_scan_parsing() {
-        for codec in [v1(), v2()] {
-            let dir_id = 10u64;
-            let cookie = 42u64;
-            let key = codec.dir_scan_key(dir_id, cookie);
+        let codec = KeyCodec::new();
+        let dir_id = 10u64;
+        let cookie = 42u64;
+        let key = codec.dir_scan_key(dir_id, cookie);
 
-            match codec.parse_key(&key) {
-                ParsedKey::DirScan {
-                    cookie: parsed_cookie,
-                } => {
-                    assert_eq!(parsed_cookie, cookie);
-                }
-                _ => panic!(
-                    "Failed to parse dir scan key (segment_layout={})",
-                    codec.use_segment_layout
-                ),
+        match codec.parse_key(&key) {
+            ParsedKey::DirScan {
+                cookie: parsed_cookie,
+            } => {
+                assert_eq!(parsed_cookie, cookie);
             }
+            _ => panic!("Failed to parse dir scan key"),
         }
     }
 
     #[test]
     fn test_tombstone_parsing() {
-        for codec in [v1(), v2()] {
-            let timestamp = 123456u64;
-            let inode_id = 789u64;
-            let key = codec.tombstone_key(timestamp, inode_id);
+        let codec = KeyCodec::new();
+        let timestamp = 123456u64;
+        let inode_id = 789u64;
+        let key = codec.tombstone_key(timestamp, inode_id);
 
-            match codec.parse_key(&key) {
-                ParsedKey::Tombstone {
-                    inode_id: parsed_id,
-                } => {
-                    assert_eq!(parsed_id, inode_id);
-                }
-                _ => panic!(
-                    "Failed to parse tombstone key (segment_layout={})",
-                    codec.use_segment_layout
-                ),
+        match codec.parse_key(&key) {
+            ParsedKey::Tombstone {
+                inode_id: parsed_id,
+            } => {
+                assert_eq!(parsed_id, inode_id);
             }
+            _ => panic!("Failed to parse tombstone key"),
         }
     }
 
     #[test]
-    fn test_chunk_parsing() {
-        for codec in [v1(), v2()] {
-            let inode_id = 7u64;
-            let chunk_index = 99u64;
-            let key = codec.chunk_key(inode_id, chunk_index);
-            assert_eq!(codec.parse_chunk_key(&key), Some(chunk_index));
-        }
+    fn test_extent_parsing() {
+        let codec = KeyCodec::new();
+        let inode_id = 7u64;
+        let extent_index = 99u64;
+        let key = codec.extent_key(inode_id, extent_index);
+        assert_eq!(codec.parse_extent_key(&key), Some(extent_index));
     }
 
     #[test]
-    fn test_v2_layout_routing() {
-        let codec = v2();
+    fn test_layout_routing() {
+        let codec = KeyCodec::new();
         let inode_key = codec.inode_key(0);
         assert!(inode_key.starts_with(META_DOMAIN));
         assert_eq!(inode_key[META_DOMAIN.len()], PREFIX_INODE);
 
-        let chunk_key = codec.chunk_key(0, 0);
-        assert!(chunk_key.starts_with(CHUNK_DOMAIN));
-        assert_eq!(chunk_key[CHUNK_DOMAIN.len()], PREFIX_CHUNK);
+        let extent_key = codec.extent_key(0, 0);
+        assert!(extent_key.starts_with(EXTENT_DOMAIN));
+        assert_eq!(extent_key[EXTENT_DOMAIN.len()], PREFIX_EXTENT);
 
         let tombstone = codec.tombstone_key(0, 0);
         assert!(tombstone.starts_with(META_DOMAIN));
 
-        // No metadata key should be misrouted into the chunk domain.
-        assert!(!inode_key.starts_with(CHUNK_DOMAIN));
-        assert!(!tombstone.starts_with(CHUNK_DOMAIN));
+        // No metadata key should be misrouted into the extent domain.
+        assert!(!inode_key.starts_with(EXTENT_DOMAIN));
+        assert!(!tombstone.starts_with(EXTENT_DOMAIN));
+    }
+
+    #[test]
+    fn segcount_key_roundtrips_and_orders() {
+        let codec = KeyCodec::new();
+        for (e, c) in [(0u64, 0u64), (5, 0x23b), (7, 255), (u64::MAX, u64::MAX)] {
+            let k = codec.segcount_key(e, c);
+            assert_eq!(k.len(), META_DOMAIN.len() + 1 + 16);
+            assert!(k.starts_with(META_DOMAIN));
+            assert_eq!(k[META_DOMAIN.len()], PREFIX_SEGCOUNT);
+            assert_eq!(codec.parse_segcount_key(&k), Some((e, c)));
+        }
+        // Big-endian id => creation-order scan.
+        assert!(codec.segcount_key(5, 10).as_ref() < codec.segcount_key(5, 11).as_ref());
+        assert!(codec.segcount_key(5, u64::MAX).as_ref() < codec.segcount_key(6, 0).as_ref());
+        // The prefix range brackets every segcount key and excludes other kinds.
+        let (start, end) = codec.segcount_prefix_range();
+        let sc = codec.segcount_key(9, 9);
+        assert!(sc.as_ref() >= start.as_ref() && sc.as_ref() < end.as_ref());
+        let ino = codec.inode_key(9);
+        assert!(!(ino.as_ref() >= start.as_ref() && ino.as_ref() < end.as_ref()));
+        assert_eq!(codec.parse_segcount_key(&ino), None);
     }
 
     #[test]
@@ -615,15 +695,30 @@ mod tests {
         assert_eq!(KeyCodec::decode_ha_seqno(&[]), None);
 
         // The HA-seqno key is distinct from the inode counter (both System-prefixed).
-        for v2 in [false, true] {
-            let codec = KeyCodec::new(v2);
-            assert_ne!(codec.ha_seqno_key(), codec.system_counter_key());
+        let codec = KeyCodec::new();
+        assert_ne!(codec.ha_seqno_key(), codec.system_counter_key());
+    }
+
+    #[test]
+    fn last_orphan_sweep_key_is_distinct_system_key() {
+        let codec = KeyCodec::new();
+        let k = codec.last_orphan_sweep_key();
+        assert!(k.starts_with(META_DOMAIN));
+        assert_eq!(k[codec.kind_offset(KeyPrefix::System)], PREFIX_SYSTEM);
+        // Must not alias any other System-subtyped key.
+        for other in [
+            codec.system_counter_key(),
+            codec.ha_seqno_key(),
+            codec.lineage_key(),
+            codec.taint_key(),
+        ] {
+            assert_ne!(k, other);
         }
     }
 
     #[test]
     fn test_invalid_key_parsing() {
-        let codec = v1();
+        let codec = KeyCodec::new();
         assert!(matches!(codec.parse_key(&[]), ParsedKey::Unknown));
         assert!(matches!(codec.parse_key(&[0xFF]), ParsedKey::Unknown));
         assert!(matches!(
@@ -640,28 +735,23 @@ mod prop_tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn codecs() -> [KeyCodec; 2] {
-        [KeyCodec::new(false), KeyCodec::new(true)]
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         // Big-endian id encoding is the reason lexicographic key order matches
-        // numeric order; every range scan (chunk reads, dir listing, GC) leans on
+        // numeric order; every range scan (extent reads, dir listing, GC) leans on
         // it. The prose comments assert this layout; nothing tested it until now.
         #[test]
-        fn chunk_key_roundtrips_and_orders(
+        fn extent_key_roundtrips_and_orders(
             a in (any::<u64>(), any::<u64>()),
             b in (any::<u64>(), any::<u64>()),
         ) {
-            for codec in codecs() {
-                let ka = codec.chunk_key(a.0, a.1);
-                let kb = codec.chunk_key(b.0, b.1);
-                prop_assert_eq!(codec.parse_chunk_key(&ka), Some(a.1));
-                prop_assert_eq!(codec.parse_chunk_key(&kb), Some(b.1));
-                prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
-            }
+            let codec = KeyCodec::new();
+            let ka = codec.extent_key(a.0, a.1);
+            let kb = codec.extent_key(b.0, b.1);
+            prop_assert_eq!(codec.parse_extent_key(&ka), Some(a.1));
+            prop_assert_eq!(codec.parse_extent_key(&kb), Some(b.1));
+            prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
         }
 
         #[test]
@@ -669,16 +759,15 @@ mod prop_tests {
             a in (any::<u64>(), any::<u64>()),
             b in (any::<u64>(), any::<u64>()),
         ) {
-            for codec in codecs() {
-                let ka = codec.tombstone_key(a.0, a.1);
-                let kb = codec.tombstone_key(b.0, b.1);
-                match codec.parse_key(&ka) {
-                    ParsedKey::Tombstone { inode_id } => prop_assert_eq!(inode_id, a.1),
-                    other => prop_assert!(false, "expected Tombstone, got {:?}", other),
-                }
-                // Ordered by (timestamp, inode_id): GC scans tombstones in time order.
-                prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
+            let codec = KeyCodec::new();
+            let ka = codec.tombstone_key(a.0, a.1);
+            let kb = codec.tombstone_key(b.0, b.1);
+            match codec.parse_key(&ka) {
+                ParsedKey::Tombstone { inode_id } => prop_assert_eq!(inode_id, a.1),
+                other => prop_assert!(false, "expected Tombstone, got {:?}", other),
             }
+            // Ordered by (timestamp, inode_id): GC scans tombstones in time order.
+            prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
         }
 
         #[test]
@@ -686,54 +775,50 @@ mod prop_tests {
             a in (any::<u64>(), any::<u64>()),
             b in (any::<u64>(), any::<u64>()),
         ) {
-            for codec in codecs() {
-                let ka = codec.dir_scan_key(a.0, a.1);
-                let kb = codec.dir_scan_key(b.0, b.1);
-                match codec.parse_key(&ka) {
-                    ParsedKey::DirScan { cookie } => prop_assert_eq!(cookie, a.1),
-                    other => prop_assert!(false, "expected DirScan, got {:?}", other),
-                }
-                prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
+            let codec = KeyCodec::new();
+            let ka = codec.dir_scan_key(a.0, a.1);
+            let kb = codec.dir_scan_key(b.0, b.1);
+            match codec.parse_key(&ka) {
+                ParsedKey::DirScan { cookie } => prop_assert_eq!(cookie, a.1),
+                other => prop_assert!(false, "expected DirScan, got {:?}", other),
             }
+            prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
         }
 
         // A resume key must land exactly on the next cookie, so a paged scan
         // continues strictly after `cookie` with no skipped or repeated entry.
         #[test]
         fn dir_scan_resume_is_next_cookie(dir in any::<u64>(), cookie in 0u64..u64::MAX) {
-            for codec in codecs() {
-                let resume = codec.dir_scan_resume_key(dir, cookie);
-                prop_assert_eq!(&resume, &codec.dir_scan_key(dir, cookie + 1));
-                prop_assert!(resume.as_ref() > codec.dir_scan_key(dir, cookie).as_ref());
-            }
+            let codec = KeyCodec::new();
+            let resume = codec.dir_scan_resume_key(dir, cookie);
+            prop_assert_eq!(&resume, &codec.dir_scan_key(dir, cookie + 1));
+            prop_assert!(resume.as_ref() > codec.dir_scan_key(dir, cookie).as_ref());
         }
 
         #[test]
         fn orphan_key_roundtrips(ino in any::<u64>()) {
-            for codec in codecs() {
-                match codec.parse_key(&codec.orphan_key(ino)) {
-                    ParsedKey::Orphan { inode_id } => prop_assert_eq!(inode_id, ino),
-                    other => prop_assert!(false, "expected Orphan, got {:?}", other),
-                }
+            let codec = KeyCodec::new();
+            match codec.parse_key(&codec.orphan_key(ino)) {
+                ParsedKey::Orphan { inode_id } => prop_assert_eq!(inode_id, ino),
+                other => prop_assert!(false, "expected Orphan, got {:?}", other),
             }
         }
 
-        // parse_chunk_key must reject every non-chunk key, including ones that share
-        // the chunk key's byte length (v1 tombstone and chunk keys are both 17 bytes,
-        // separated only by the kind byte).
+        // parse_extent_key must reject every non-extent key, including any that
+        // happens to match the extent key's byte length (only the domain/kind
+        // bytes distinguish them).
         #[test]
-        fn non_chunk_keys_never_parse_as_chunk(
+        fn non_extent_keys_never_parse_as_extent(
             ino in any::<u64>(),
             x in any::<u64>(),
             name in prop::collection::vec(any::<u8>(), 0..40),
         ) {
-            for codec in codecs() {
-                prop_assert_eq!(codec.parse_chunk_key(&codec.inode_key(ino)), None);
-                prop_assert_eq!(codec.parse_chunk_key(&codec.tombstone_key(x, ino)), None);
-                prop_assert_eq!(codec.parse_chunk_key(&codec.orphan_key(ino)), None);
-                prop_assert_eq!(codec.parse_chunk_key(&codec.dir_scan_key(ino, x)), None);
-                prop_assert_eq!(codec.parse_chunk_key(&codec.dir_entry_key(ino, &name)), None);
-            }
+            let codec = KeyCodec::new();
+            prop_assert_eq!(codec.parse_extent_key(&codec.inode_key(ino)), None);
+            prop_assert_eq!(codec.parse_extent_key(&codec.tombstone_key(x, ino)), None);
+            prop_assert_eq!(codec.parse_extent_key(&codec.orphan_key(ino)), None);
+            prop_assert_eq!(codec.parse_extent_key(&codec.dir_scan_key(ino, x)), None);
+            prop_assert_eq!(codec.parse_extent_key(&codec.dir_entry_key(ino, &name)), None);
         }
 
         #[test]
@@ -751,21 +836,20 @@ mod prop_tests {
             );
         }
 
-        // The half-open prefix range must contain every chunk key and no metadata
-        // key, so a chunk-domain scan can never read (or GC) metadata.
+        // The half-open prefix range must contain every extent key and no metadata
+        // key, so an extent-domain scan can never read (or GC) metadata.
         #[test]
-        fn prefix_range_isolates_chunks(ino in any::<u64>(), idx in any::<u64>(), x in any::<u64>()) {
-            for codec in codecs() {
-                let (start, end) = codec.prefix_range(KeyPrefix::Chunk);
-                let chunk = codec.chunk_key(ino, idx);
-                prop_assert!(chunk.as_ref() >= start.as_ref() && chunk.as_ref() < end.as_ref());
+        fn prefix_range_isolates_extents(ino in any::<u64>(), idx in any::<u64>(), x in any::<u64>()) {
+            let codec = KeyCodec::new();
+            let (start, end) = codec.prefix_range(KeyPrefix::Extent);
+            let extent = codec.extent_key(ino, idx);
+            prop_assert!(extent.as_ref() >= start.as_ref() && extent.as_ref() < end.as_ref());
 
-                let meta = codec.tombstone_key(x, ino);
-                prop_assert!(
-                    !(meta.as_ref() >= start.as_ref() && meta.as_ref() < end.as_ref()),
-                    "a metadata key leaked into the chunk prefix range"
-                );
-            }
+            let meta = codec.tombstone_key(x, ino);
+            prop_assert!(
+                !(meta.as_ref() >= start.as_ref() && meta.as_ref() < end.as_ref()),
+                "a metadata key leaked into the extent prefix range"
+            );
         }
     }
 }

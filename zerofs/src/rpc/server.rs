@@ -422,7 +422,7 @@ impl AdminService for AdminRpcServer {
                 bytes_written: fs_stats.bytes_written.load(Ordering::Relaxed),
                 tombstones_created: fs_stats.tombstones_created.load(Ordering::Relaxed),
                 tombstones_processed: fs_stats.tombstones_processed.load(Ordering::Relaxed),
-                gc_chunks_deleted: fs_stats.gc_chunks_deleted.load(Ordering::Relaxed),
+                gc_extents_deleted: fs_stats.gc_extents_deleted.load(Ordering::Relaxed),
                 gc_runs: fs_stats.gc_runs.load(Ordering::Relaxed),
                 total_operations: fs_stats.total_operations.load(Ordering::Relaxed),
                 used_bytes,
@@ -699,7 +699,7 @@ mod tests {
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), Arc::clone(&object_store))
                 .with_block_transformer(block_transformer)
-                .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
                 .build()
                 .await
@@ -707,9 +707,20 @@ mod tests {
         );
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
         let fs = Arc::new(
-            ZeroFS::new_with_slatedb(db_handle.clone(), u64::MAX, None, false, true)
-                .await
-                .unwrap(),
+            ZeroFS::new_with_slatedb(
+                db_handle.clone(),
+                u64::MAX,
+                None,
+                false,
+                Arc::clone(&object_store),
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
+            )
+            .await
+            .unwrap(),
         );
         fs.start_reclaim_drainer();
         let checkpoint_manager = Arc::new(CheckpointManager::new(
@@ -718,6 +729,17 @@ mod tests {
             object_store,
             None,
         ));
+        {
+            let fc = fs.flush_coordinator.clone();
+            checkpoint_manager.set_pre_flush(Arc::new(move || {
+                let fc = fc.clone();
+                Box::pin(async move {
+                    fc.flush()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("seal+flush failed: {:?}", e))
+                })
+            }));
+        }
         (fs, checkpoint_manager)
     }
 

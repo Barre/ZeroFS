@@ -64,23 +64,14 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
             None
         };
 
-    let segments_enabled = crate::segment_extractor::should_enable_segments(
-        &object_store,
-        &db_path,
-        wal_object_store.as_ref(),
-    )
-    .await?;
-
     let opened = super::server::build_slatedb(
         object_store,
         &cache_config,
         actual_db_path,
         super::server::DatabaseMode::ReadWrite,
         settings.lsm,
-        false, // don't disable compactor
         block_transformer,
         wal_object_store,
-        segments_enabled,
         None, // debug command never participates in replication
     )
     .await?;
@@ -134,10 +125,10 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
                 let inode_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
                 println!("inode_id={}", inode_id);
             }
-            KeyPrefix::Chunk if key.len() == 17 => {
+            KeyPrefix::Extent if key.len() == 17 => {
                 let inode_id = u64::from_be_bytes(key[1..9].try_into().unwrap());
-                let chunk_index = u64::from_be_bytes(key[9..17].try_into().unwrap());
-                println!("inode_id={}, chunk_index={}", inode_id, chunk_index);
+                let extent_index = u64::from_be_bytes(key[9..17].try_into().unwrap());
+                println!("inode_id={}, extent_index={}", inode_id, extent_index);
             }
             KeyPrefix::DirEntry if key.len() > 9 => {
                 let dir_id = u64::from_be_bytes(key[1..9].try_into().unwrap());

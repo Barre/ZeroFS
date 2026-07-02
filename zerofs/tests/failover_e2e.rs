@@ -67,7 +67,7 @@ async fn e2e_gate() -> tokio::sync::SemaphorePermit<'static> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_config_wal(
+fn write_config(
     path: &Path,
     data_dir: &Path,
     cache_dir: &Path,
@@ -77,7 +77,6 @@ fn write_config_wal(
     rpc_sock: &Path,
     peers: Option<&str>,
     replication_listen: Option<&str>,
-    wal: bool,
 ) {
     let peers_line = match peers {
         Some(p) => format!("peers = [\"{p}\"]\n"),
@@ -86,11 +85,6 @@ fn write_config_wal(
     let listen_line = match replication_listen {
         Some(l) => format!("replication_listen = \"{l}\"\n"),
         None => String::new(),
-    };
-    let lsm_line = if wal {
-        "[lsm]\nwal_enabled = true\n\n"
-    } else {
-        ""
     };
     // Short HA timing for a fast test; still valid (heartbeat < lease,
     // takeover > lease + 2s guard band).
@@ -112,7 +106,7 @@ unix_socket = "{ninep}"
 [servers.rpc]
 unix_socket = "{rpc}"
 
-{lsm_line}[replication]
+[replication]
 node_id = "{node_id}"
 role = "{role}"
 {peers_line}{listen_line}
@@ -125,32 +119,6 @@ enabled = false
         rpc = rpc_sock.display(),
     );
     std::fs::write(path, cfg).unwrap();
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_config(
-    path: &Path,
-    data_dir: &Path,
-    cache_dir: &Path,
-    node_id: &str,
-    role: &str,
-    ninep_sock: &Path,
-    rpc_sock: &Path,
-    peers: Option<&str>,
-    replication_listen: Option<&str>,
-) {
-    write_config_wal(
-        path,
-        data_dir,
-        cache_dir,
-        node_id,
-        role,
-        ninep_sock,
-        rpc_sock,
-        peers,
-        replication_listen,
-        false,
-    )
 }
 
 fn spawn(config_path: &Path) -> Node {
@@ -630,7 +598,7 @@ async fn failover_client_reroutes_around_a_fenced_but_alive_leader() {
 /// the object store) must survive the leader bouncing: the returning leader must
 /// defer so the standby takes over and replays the tail, instead of re-taking and
 /// dropping it. Symmetric config so the returning leader can defer and follow.
-async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
+async fn unflushed_op_survives_a_leader_restart_case() {
     use ninep_client::{ClientError, NOFID, NinePClient, Target};
 
     let dir = tempfile::tempdir().unwrap();
@@ -642,7 +610,7 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
 
     let a_repl = format!("127.0.0.1:{}", free_port());
     let b_repl = format!("127.0.0.1:{}", free_port());
-    write_config_wal(
+    write_config(
         &l_cfg,
         &data_dir,
         &dir.path().join("cache-l"),
@@ -652,9 +620,8 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
         &dir.path().join("a-rpc.sock"),
         Some(&b_repl),
         Some(&a_repl),
-        wal,
     );
-    write_config_wal(
+    write_config(
         &s_cfg,
         &data_dir,
         &dir.path().join("cache-s"),
@@ -664,7 +631,6 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
         &dir.path().join("b-rpc.sock"),
         Some(&a_repl),
         Some(&b_repl),
-        wal,
     );
 
     let standby = spawn(&s_cfg);
@@ -698,7 +664,7 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
     // Restart with a fresh cache dir: a SIGKILL can leave the local cache torn,
     // which is orthogonal to the leadership behavior under test here.
     let l_cfg2 = dir.path().join("leader2.toml");
-    write_config_wal(
+    write_config(
         &l_cfg2,
         &data_dir,
         &dir.path().join("cache-l2"),
@@ -708,7 +674,6 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
         &dir.path().join("a-rpc.sock"),
         Some(&b_repl),
         Some(&a_repl),
-        wal,
     );
     let _leader2 = spawn(&l_cfg2); // restarts as role=leader
 
@@ -729,19 +694,124 @@ async fn unflushed_op_survives_a_leader_restart_case(wal: bool) {
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
 async fn unflushed_op_survives_a_leader_restart() {
     let _e2e_permit = e2e_gate().await;
-    unflushed_op_survives_a_leader_restart_case(false).await;
+    unflushed_op_survives_a_leader_restart_case().await;
 }
 
-// Same no-loss guarantee with the data-db WAL enabled. This is the gate for the
-// prune-watermark / WAL interaction: an un-fsync'd op shipped to the standby tail
-// must survive even though the WAL makes batches durable on append, which advances
-// the leader's durable seqno and thus the tail prune. A promoted standby that
-// failed to recover the leader's WAL would lose it.
+// Segment data plane: an un-fsync'd file write's extent bytes live in the
+// leader's un-PUT open segment. The leader ships those bytes alongside the
+// FrameLoc, so on takeover the standby materializes the segment and the data
+// reads back. Without the byte-shipping the replayed FrameLoc would resolve to a
+// missing object (404 -> EIO). Same leader-restart shape as the mkdir case.
+async fn unflushed_file_write_survives_failover_case() {
+    use ninep_client::{NOFID, NinePClient, Target};
+    const O_CREAT_RDWR: u32 = 0x42; // O_CREAT | O_RDWR
+    const O_RDONLY: u32 = 0;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let l_9p = dir.path().join("leader-9p.sock");
+    let s_9p = dir.path().join("standby-9p.sock");
+    let l_cfg = dir.path().join("leader.toml");
+    let s_cfg = dir.path().join("standby.toml");
+    let a_repl = format!("127.0.0.1:{}", free_port());
+    let b_repl = format!("127.0.0.1:{}", free_port());
+    write_config(
+        &l_cfg,
+        &data_dir,
+        &dir.path().join("cache-l"),
+        "node-a",
+        "leader",
+        &l_9p,
+        &dir.path().join("a-rpc.sock"),
+        Some(&b_repl),
+        Some(&a_repl),
+    );
+    write_config(
+        &s_cfg,
+        &data_dir,
+        &dir.path().join("cache-s"),
+        "node-b",
+        "standby",
+        &s_9p,
+        &dir.path().join("b-rpc.sock"),
+        Some(&a_repl),
+        Some(&b_repl),
+    );
+
+    let standby = spawn(&s_cfg);
+    let mut leader = spawn(&l_cfg);
+    assert!(
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
+        "leader 9P never came up"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
+
+    let client = NinePClient::connect_multi(
+        vec![Target::Unix(l_9p.clone()), Target::Unix(s_9p.clone())],
+        256 * 1024,
+    )
+    .await
+    .expect("connect lands on the leader");
+    client
+        .attach(1, NOFID, "root", "/", 0)
+        .await
+        .expect("attach");
+
+    // Un-fsync'd file write: committed + shipped, but the extent's segment is still
+    // the leader's un-PUT open buffer (data < seal threshold, no fsync, no 30s
+    // periodic flush within the test window).
+    let data: Vec<u8> = (0..5000u32)
+        .map(|i| i.wrapping_mul(2654435761) as u8)
+        .collect();
+    client.walk(1, 10, &[]).await.expect("clone root");
+    client
+        .lcreate(10, b"f", O_CREAT_RDWR, 0o644, 0)
+        .await
+        .expect("lcreate f");
+    client.write(10, 0, &data).await.expect("write f");
+
+    // Bounce the leader fast; the standby takes over, replays the tail, and
+    // materializes the un-PUT segment from the shipped frame bytes.
+    leader.child.kill().expect("kill leader");
+    leader.child.wait().expect("reap leader");
+    let l_cfg2 = dir.path().join("leader2.toml");
+    write_config(
+        &l_cfg2,
+        &data_dir,
+        &dir.path().join("cache-l2"),
+        "node-a",
+        "leader",
+        &l_9p,
+        &dir.path().join("a-rpc.sock"),
+        Some(&b_repl),
+        Some(&a_repl),
+    );
+    let _leader2 = spawn(&l_cfg2);
+
+    // Read back through the failover client: the data must be intact — not EIO, and
+    // not zeros from a missing segment.
+    client
+        .walk(1, 20, &[b"f"])
+        .await
+        .expect("walk to f after failover");
+    client.lopen(20, O_RDONLY).await.expect("open f");
+    let got = client
+        .read(20, 0, data.len() as u32)
+        .await
+        .expect("read f after failover");
+    assert_eq!(
+        got, data,
+        "un-fsync'd file data must survive failover via the standby-materialized segment"
+    );
+
+    drop(standby);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn unflushed_op_survives_a_leader_restart_wal() {
+async fn unflushed_file_write_survives_failover() {
     let _e2e_permit = e2e_gate().await;
-    unflushed_op_survives_a_leader_restart_case(true).await;
+    unflushed_file_write_survives_failover_case().await;
 }
 
 /// A FROZEN leader (SIGSTOP keeps its TCP connection open, so the clean-crash
@@ -1212,7 +1282,7 @@ async fn flushed_metadata_survives_writer_sigkill_fresh_cache() {
 // by the other after a reopen, an aead failure surfacing as the jepsen-class
 // "error transforming block". With the conditional-create key init they converge on
 // one key and all three durable states survive kill-both.
-async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
+async fn connected_killboth_case(reuse_cache: bool) {
     use ninep_client::{NOFID, NinePClient, Target};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1224,7 +1294,7 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
     let cache_l = dir.path().join("cache-l");
     let a_repl = format!("127.0.0.1:{}", free_port());
     let b_repl = format!("127.0.0.1:{}", free_port());
-    write_config_wal(
+    write_config(
         &l_cfg,
         &data_dir,
         &cache_l,
@@ -1234,9 +1304,8 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
         &dir.path().join("a-rpc.sock"),
         Some(&b_repl),
         Some(&a_repl),
-        wal,
     );
-    write_config_wal(
+    write_config(
         &s_cfg,
         &data_dir,
         &dir.path().join("cache-s"),
@@ -1246,7 +1315,6 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
         &dir.path().join("b-rpc.sock"),
         Some(&a_repl),
         Some(&b_repl),
-        wal,
     );
 
     let mut standby = spawn(&s_cfg);
@@ -1284,7 +1352,7 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
     } else {
         dir.path().join("cache-l2")
     };
-    write_config_wal(
+    write_config(
         &l_cfg2,
         &data_dir,
         &cache_l2,
@@ -1294,7 +1362,6 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
         &dir.path().join("a-rpc.sock"),
         Some(&b_repl),
         Some(&a_repl),
-        wal,
     );
     let _leader2 = spawn(&l_cfg2);
     assert!(
@@ -1330,21 +1397,12 @@ async fn connected_killboth_case(reuse_cache: bool, wal: bool) {
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
 async fn flushed_metadata_survives_connected_killboth_reused_cache() {
     let _e2e_permit = e2e_gate().await;
-    connected_killboth_case(true, false).await;
+    connected_killboth_case(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
 async fn flushed_metadata_survives_connected_killboth_fresh_cache() {
     let _e2e_permit = e2e_gate().await;
-    connected_killboth_case(false, false).await;
-}
-
-// Crash-recovery (kill-both) with the data-db WAL enabled under HA: the reopened
-// leader recovers from the store and WAL, and the fsync'd state must survive intact.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn flushed_metadata_survives_connected_killboth_wal() {
-    let _e2e_permit = e2e_gate().await;
-    connected_killboth_case(false, true).await;
+    connected_killboth_case(false).await;
 }

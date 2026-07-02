@@ -124,7 +124,8 @@ export HTTPS_PROXY='http://proxy.company.com:8080'
 <CodeGroup>
 
 ```bash {{ title: 'Cache Directory Issues' }}
-# Error: Failed to create cache directory
+# Error: creating foyer hybrid cache dir at <path>
+#    or: creating parts cache dir at <path>
 # Solution: Check permissions and disk space
 
 # Verify cache directory from config
@@ -146,18 +147,19 @@ touch /var/cache/zerofs/test && rm /var/cache/zerofs/test
 ```
 
 ```bash {{ title: 'Cache Size Errors' }}
-# Error: Invalid cache size
-# Solution: Use positive number for GB in config
+# Error: Failed to parse config file: zerofs.toml: TOML parse error ...
+#        invalid type: string "50GB", expected f64
+# Solution: Use a bare number for GB in config
 
 # Correct format in zerofs.toml:
 # [cache]
 # dir = "/var/cache/zerofs"
 # disk_size_gb = 50.0           # Correct
 # memory_size_gb = 2.0          # Correct
+# disk_size_gb = 50             # Also correct: integers parse as floats
 
-# Wrong formats:
-# disk_size_gb = "50GB"         # Don't include unit
-# disk_size_gb = 50             # Should be float
+# Wrong format:
+# disk_size_gb = "50GB"         # No quotes, no unit
 ```
 
 </CodeGroup>
@@ -172,7 +174,7 @@ Startup fails with:
 Storage provider does not support conditional writes. PutMode::Create succeeded when it should have failed. This feature is required for fencing in ZeroFS.
 ```
 
-Before every read-write open, ZeroFS writes a probe object named `.zerofs_compatibility_test_<uuid>` to the database path and attempts a second, create-only write to the same key. The store must reject the second write with an already-exists error. A store that accepts it lacks put-if-not-exists support, which fencing requires, so ZeroFS refuses to start. A message starting with `Storage provider precondition check failed` means the probe itself returned an unexpected error; the underlying store error follows the colon.
+Before every read-write server start (`zerofs run` without `--read-only`/`--checkpoint`), ZeroFS writes a probe object named `.zerofs_compatibility_test_<uuid>` to the database path and attempts a second, create-only write to the same key. The store must reject the second write with an already-exists error. A store that accepts it lacks put-if-not-exists support, which fencing requires, so ZeroFS refuses to start. A message starting with `Storage provider precondition check failed` means the probe itself returned an unexpected error; the underlying store error follows the colon.
 
 For S3-compatible stores without conditional put support, set `conditional_put` to a Redis URL:
 
@@ -182,6 +184,57 @@ conditional_put = "redis://localhost:6379"
 ```
 
 See the Conditional Put Support section under [Storage Backends](/configuration#storage-backends) for configuration and [Conditional Writes and Fencing](/durability#conditional-writes-and-fencing) for the fencing model.
+
+### Config Parse Fails on `wal_enabled` or `max_unflushed_gb`
+
+After an upgrade, startup fails with an unknown-field error pointing at the offending line:
+
+```
+Failed to parse config file: zerofs.toml: TOML parse error at line 10, column 1
+   |
+10 | wal_enabled = true
+   | ^^^^^^^^^^^
+unknown field `wal_enabled`, expected one of `l0_max_ssts`, `max_concurrent_compactions`, `flush_interval_secs`, `sync_writes`
+```
+
+The `[lsm]` section rejects keys it does not define, and two keys were removed:
+
+| Removed key | Reason |
+|---|---|
+| `wal_enabled` | The WAL is permanently off. It is not configurable. |
+| `max_unflushed_gb` | Replaced by a fixed internal 1 GiB ceiling. |
+
+Delete the keys from the config file. Neither has a replacement setting.
+
+### Volume from an Earlier Release Refused on Open
+
+Startup fails with:
+
+```
+segment extractor configuration mismatch (persisted: Some("zerofs-meta-chunk-v1"), configured: Some("zerofs-meta-extent-v1"))
+```
+
+ZeroFS stamps a key-layout name into the database manifest at creation and checks it on every open. This release writes and requires `zerofs-meta-extent-v1`. Volumes created before file contents moved into segment objects carry the previous name `zerofs-meta-chunk-v1`, or no name at all (`persisted: None`), and are refused. The check prevents opening a database whose existing keys the configured layout would misroute.
+
+This release contains no migration tool for these volumes. They remain readable and writable by the release that created them.
+
+### `compactor` Subcommand and `--no-compactor` Flag Not Recognized
+
+Scripts or systemd units from an earlier release fail with:
+
+```
+error: unrecognized subcommand 'compactor'
+```
+
+or:
+
+```
+error: unexpected argument '--no-compactor' found
+```
+
+The standalone compaction worker no longer exists. Metadata compaction always runs inside `zerofs run`, and space reclamation for file data is handled by the in-process segment garbage collector. Remove `zerofs compactor` service units and the `--no-compactor` flag; no replacement invocation is needed.
+
+Related output change for scripts: `zerofs debug list-keys` prints file-data keys as `extent_index` where earlier releases printed `chunk_index`.
 
 ## Configuration Issues
 

@@ -36,6 +36,12 @@ fn to_repl_ops(ops: Vec<ProtoOp>) -> Vec<ReplOp> {
         .map(|o| {
             if o.delete {
                 ReplOp::Delete(Bytes::from(o.key))
+            } else if !o.frame.is_empty() {
+                ReplOp::PutFrame(
+                    Bytes::from(o.key),
+                    Bytes::from(o.value),
+                    Bytes::from(o.frame),
+                )
             } else {
                 ReplOp::Put(Bytes::from(o.key), Bytes::from(o.value))
             }
@@ -50,11 +56,19 @@ fn to_proto_ops(ops: &[ReplOp]) -> Vec<ProtoOp> {
                 key: k.to_vec(),
                 value: v.to_vec(),
                 delete: false,
+                frame: Vec::new(),
+            },
+            ReplOp::PutFrame(k, v, f) => ProtoOp {
+                key: k.to_vec(),
+                value: v.to_vec(),
+                delete: false,
+                frame: f.to_vec(),
             },
             ReplOp::Delete(k) => ProtoOp {
                 key: k.to_vec(),
                 value: Vec::new(),
                 delete: true,
+                frame: Vec::new(),
             },
         })
         .collect()
@@ -119,6 +133,16 @@ impl ReplicationService for ReplicationReceiver {
         request: Request<ReplicateRequest>,
     ) -> Result<Response<ReplicateResponse>, Status> {
         let req = request.into_inner();
+        // Once this node has promoted (it is now the writer), it must never accept
+        // a ship: a deposed leader that shares the same writer epoch (its fence in
+        // the object store hasn't bitten yet) would otherwise be accepted here,
+        // recorded into dedup, and buffered into an already-replayed tail — the old
+        // leader would then ack that write as "replicated" moments before it dies,
+        // losing an acked write and falsely deduping the client's retry. Being the
+        // writer is the authoritative signal that any other term is deposed.
+        if self.leading.load(Ordering::Acquire) {
+            return Ok(Response::new(ReplicateResponse { accepted: false }));
+        }
         // Reject a deposed leader: a ship whose epoch is below the highest seen.
         let prev = self
             .highest_epoch
@@ -154,8 +178,13 @@ impl ReplicationService for ReplicationReceiver {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let mut stream = request.into_inner();
         // A beat from a deposed leader (epoch below the highest seen) is ignored,
-        // so a zombie cannot keep the standby from taking over.
+        // so a zombie cannot keep the standby from taking over. Once this node is
+        // itself the writer, ignore all beats: a same-epoch zombie must not keep
+        // this node's liveness view ticking (it is deposed by our promotion).
         while let Some(beat) = stream.message().await? {
+            if self.leading.load(Ordering::Acquire) {
+                continue;
+            }
             let prev = self
                 .highest_epoch
                 .fetch_max(beat.writer_epoch, Ordering::AcqRel);
@@ -276,12 +305,19 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn spawn_receiver(buffer: Arc<Mutex<TailBuffer>>) -> String {
+        spawn_receiver_with_leading(buffer, Arc::new(AtomicBool::new(false))).await
+    }
+
+    async fn spawn_receiver_with_leading(
+        buffer: Arc<Mutex<TailBuffer>>,
+        leading: Arc<AtomicBool>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = ReplicationReceiver::new(
             buffer,
             Arc::new(crate::dedup::DedupCache::new(64)),
-            Arc::new(AtomicBool::new(false)),
+            leading,
             None,
         )
         .into_server();
@@ -421,7 +457,7 @@ mod tests {
         for (_seqno, ops) in buf.batches_in_order() {
             for op in ops {
                 match op {
-                    ReplOp::Put(k, v) => {
+                    ReplOp::Put(k, v) | ReplOp::PutFrame(k, v, _) => {
                         state.insert(k.to_vec(), v.to_vec());
                     }
                     ReplOp::Delete(k) => {
@@ -435,6 +471,46 @@ mod tests {
             Some(b"new".as_ref()),
             "the post-restart (epoch 6) write must win, but a stale epoch-5 batch at a \
              higher seqno replayed last and clobbered it (cross-term seqno collision)"
+        );
+    }
+
+    // Repro: a standby promotes (leading=true), then a deposed leader that shares
+    // the same writer epoch (its object-store fence hasn't bitten yet) re-ships.
+    // A leader must NEVER accept a ship: doing so would let the zombie ack an
+    // acked-but-lost write and poison this node's dedup. Being the writer is the
+    // authoritative "every other term is deposed" signal.
+    #[tokio::test]
+    async fn promoted_node_rejects_equal_epoch_zombie_ship() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let leading = Arc::new(AtomicBool::new(false));
+        let endpoint = spawn_receiver_with_leading(buffer.clone(), leading.clone()).await;
+        let sender = loop {
+            match ReplicationSender::connect(endpoint.clone()).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+
+        // Before promotion, an epoch-7 ship is accepted and buffered.
+        assert!(sender.ship(1, &[put(b"a", b"1")], &[], 0, 7).await.unwrap());
+        assert_eq!(buffer.lock().await.len(), 1);
+
+        // This node promotes (opens the db as writer at a new epoch).
+        leading.store(true, Ordering::Release);
+
+        // The deposed leader (still epoch 7) re-ships: it must be rejected, and
+        // nothing must enter the tail or dedup.
+        assert!(
+            !sender
+                .ship(2, &[put(b"b", b"2")], &[[9u8; 16]], 0, 7)
+                .await
+                .unwrap(),
+            "a promoted node must reject an equal-epoch zombie's ship"
+        );
+        assert_eq!(
+            buffer.lock().await.len(),
+            1,
+            "a rejected zombie ship must not buffer into the promoted node's tail"
         );
     }
 }

@@ -5,8 +5,16 @@ use serde::{Deserialize, Serialize};
 use slatedb::admin::Admin;
 use slatedb::config::{CheckpointOptions, CheckpointScope};
 use slatedb::object_store::path::Path;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
+
+/// Seal the data-plane open segment and flush the metadata memtable under the
+/// flush barrier, so a subsequent durable-scope checkpoint captures only
+/// already-sealed state (never a FrameLoc whose segment is still in RAM).
+pub type PreCheckpointFlush =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointInfo {
@@ -18,6 +26,9 @@ pub struct CheckpointInfo {
 pub struct CheckpointManager {
     db_handle: SlateDbHandle,
     admin: Admin,
+    /// Set once at bring-up (see [`PreCheckpointFlush`]); unset in tests, which
+    /// checkpoint durable state as-is.
+    pre_flush: Arc<OnceLock<PreCheckpointFlush>>,
 }
 
 impl CheckpointManager {
@@ -32,7 +43,17 @@ impl CheckpointManager {
             admin_builder = admin_builder.with_wal_object_store(wal_store);
         }
         let admin = admin_builder.build();
-        Self { db_handle, admin }
+        Self {
+            db_handle,
+            admin,
+            pre_flush: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Install the pre-checkpoint seal+flush hook (first call wins). Wired at
+    /// bring-up to the filesystem's flush coordinator.
+    pub fn set_pre_flush(&self, hook: PreCheckpointFlush) {
+        let _ = self.pre_flush.set(hook);
     }
 
     pub async fn create_checkpoint(&self, name: &str) -> Result<CheckpointInfo> {
@@ -61,9 +82,23 @@ impl CheckpointManager {
             return Err(anyhow!("A checkpoint with name '{}' already exists", name));
         }
 
+        // Seal the open data-plane segment and flush the metadata memtable under
+        // the flush barrier before checkpointing. `CheckpointScope::All` would
+        // freeze+flush the memtable itself, durably publishing any FrameLoc whose
+        // segment is still only in the RAM open buffer (a dangling pointer the
+        // checkpoint would pin forever). Instead we make the latest writes durable
+        // through the seal-gated flush, then checkpoint `Durable` scope, which
+        // captures only the already-durable manifest (no memtable freeze), so a
+        // concurrent un-sealed write is excluded rather than corrupted.
+        if let Some(pre_flush) = self.pre_flush.get() {
+            pre_flush()
+                .await
+                .map_err(|e| anyhow!("Failed to seal+flush before checkpoint: {}", e))?;
+        }
+
         let result = db
             .create_checkpoint(
-                CheckpointScope::All,
+                CheckpointScope::Durable,
                 &CheckpointOptions {
                     lifetime: None,
                     source: None,

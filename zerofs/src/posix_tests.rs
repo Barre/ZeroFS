@@ -534,26 +534,26 @@ mod tests {
             .await
             .unwrap();
 
-        let chunk_size = 128 * 1024;
-        let test_data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
+        let extent_size = 128 * 1024;
+        let test_data: Vec<u8> = (0..extent_size).map(|i| (i % 256) as u8).collect();
 
         fs.write(&auth, file_id, 0, &bytes::Bytes::from(test_data.clone()))
             .await
             .unwrap();
 
         let (data1, _) = fs
-            .read_file(&auth, file_id, 0, chunk_size as u32)
+            .read_file(&auth, file_id, 0, extent_size as u32)
             .await
             .unwrap();
         assert_eq!(data1, test_data);
 
-        let offset = chunk_size as u64 - 100;
+        let offset = extent_size as u64 - 100;
         let (data2, _) = fs.read_file(&auth, file_id, offset, 200).await.unwrap();
         assert_eq!(data2.len(), 100);
         assert_eq!(&data2[..], &test_data[offset as usize..]);
 
         let (data3, eof) = fs
-            .read_file(&auth, file_id, chunk_size as u64, 100)
+            .read_file(&auth, file_id, extent_size as u64, 100)
             .await
             .unwrap();
         assert_eq!(data3.len(), 0);
@@ -1362,10 +1362,10 @@ mod tests {
                 SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota"),
-                        object_store,
+                        object_store.clone(),
                     )
                     .with_block_transformer(block_transformer)
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_segment_extractor(Arc::new(
                         crate::segment_extractor::ZeroFsSegmentExtractor,
                     ))
@@ -1376,7 +1376,12 @@ mod tests {
                 1_000_000,
                 None,
                 false,
-                true,
+                object_store,
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),
@@ -1427,10 +1432,10 @@ mod tests {
                 SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota_setattr"),
-                        object_store,
+                        object_store.clone(),
                     )
                     .with_block_transformer(block_transformer)
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_segment_extractor(Arc::new(
                         crate::segment_extractor::ZeroFsSegmentExtractor,
                     ))
@@ -1441,7 +1446,12 @@ mod tests {
                 1_000_000,
                 None,
                 false,
-                true,
+                object_store,
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),
@@ -1489,10 +1499,10 @@ mod tests {
                 SlateDbHandle::ReadWrite(Arc::new(
                     slatedb::DbBuilder::new(
                         slatedb::object_store::path::Path::from("test_quota_over"),
-                        object_store,
+                        object_store.clone(),
                     )
                     .with_block_transformer(block_transformer)
-                    .with_filter_policies(crate::fs::filter_policy::filter_policies(true))
+                    .with_filter_policies(crate::fs::filter_policy::filter_policies())
                     .with_segment_extractor(Arc::new(
                         crate::segment_extractor::ZeroFsSegmentExtractor,
                     ))
@@ -1503,7 +1513,12 @@ mod tests {
                 1_000_000,
                 None,
                 false,
-                true,
+                object_store,
+                crate::frame_codec::FrameCodec::new(
+                    &test_key,
+                    crate::segment::SEGMENT_INFO,
+                    CompressionConfig::default(),
+                ),
             )
             .await
             .unwrap(),

@@ -27,7 +27,7 @@ ZeroFS serves S3-compatible buckets as **POSIX filesystems over NFS and 9P**, an
 - **NBD Server** - Access as raw block devices for ZFS, databases, or any filesystem
 - **Web UI** - File manager, real-time monitoring, and in-browser terminal
 - **Always Encrypted** - Data is compressed (zstd or LZ4), then encrypted with XChaCha20-Poly1305 before upload; there is no unencrypted mode
-- **Local Cache** - Warm cached random reads in 1.6 µs (SQLite bench); a raw S3 round trip is 50–300 ms
+- **Local Cache** - Warm cached random reads in 1.6 µs (SQLite bench, July 2025); a raw S3 round trip is 50–300 ms
 - **High Availability** - Optional leader/standby replication with automatic failover; a connected standby preserves writes that were acknowledged but not yet flushed to object storage
 - **Backends** - AWS S3, Google Cloud Storage, Azure Blob, any S3-compatible store, or local disk
 
@@ -35,7 +35,7 @@ ZeroFS serves S3-compatible buckets as **POSIX filesystems over NFS and 9P**, an
 
 ZeroFS runs the [pjdfstest_nfs](https://github.com/Barre/pjdfstest_nfs) suite in CI on every change — 8,662 tests covering POSIX filesystem operations including file operations, permissions, and ownership — once per protocol: [NFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [9P](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and [FUSE](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml). A few cases per protocol are excluded; the lists are published in [`.github/`](https://github.com/Barre/ZeroFS/tree/main/.github).
 
-CI also runs Jepsen's [local-fs](https://github.com/jepsen-io/local-fs) suite against a 9P mount, via [a workflow](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml) that assembles it. It generates random filesystem-operation histories and checks each against a reference model, shrinking any divergence to a minimal failing case. A second mode injects a crash: it kills the server mid-run, dropping the un-fsynced memtable, and verifies the state recovered from the object store is consistent with the last fsync.
+CI also runs Jepsen's [local-fs](https://github.com/jepsen-io/local-fs) suite against a 9P mount, via [a workflow](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml) that assembles it. It generates random filesystem-operation histories and checks each against a reference model, shrinking any divergence to a minimal failing case. A second mode injects a crash: it kills the server mid-run, dropping all un-fsynced state, and verifies the state recovered from the object store is consistent with the last fsync.
 
 CI also exercises HA: the same local-fs model-checker runs with leader-to-standby failovers injected, and a separate [classic-Jepsen suite](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml) runs a leader/standby pair over MinIO under a nemesis that kills the leader, the standby, or both, or pauses MinIO, checking that no acknowledged write is lost, resurrected, or corrupted across a failover.
 
@@ -110,7 +110,7 @@ The terminal runs a Linux VM in the browser using [v86](https://github.com/copy/
 
 ## Architecture
 
-The NFS, 9P, and NBD servers and the Web UI run in one userspace process and share a single filesystem layer. Data passes through encryption and caching and is stored in S3 as an LSM tree. The [architecture documentation](https://www.zerofs.net/architecture) covers protocol choice and filesystem limits.
+The NFS, 9P, and NBD servers and the Web UI run in one userspace process and share a single filesystem layer. File contents are split into 32 KiB extents; each extent is compressed, encrypted, and packed as a frame into immutable segment objects (up to 256 MiB) written directly to the object store. Metadata — inodes, directory entries, and one 32-byte pointer per extent — lives in an LSM-tree database on the same object store. The [architecture documentation](https://www.zerofs.net/architecture) covers protocol choice and filesystem limits.
 
 ```mermaid
 
@@ -128,25 +128,29 @@ graph TB
         NBDD[NBD Server]
         WEBUI[Web UI]
         VFS[Virtual Filesystem]
-        ENC[Encryption Manager]
-        CACHE[Cache Manager]
+        SEG[Segment Store<br/>file data as compressed, encrypted frames]
+        SLATE[LSM tree<br/>metadata + 32-byte extent pointers]
+        CACHE[Local Cache]
         
         NFSD --> VFS
         P9D --> VFS
         NBDD --> VFS
         WEBUI --> VFS
-        VFS --> ENC
-        ENC --> CACHE
+        VFS --> SEG
+        VFS --> SLATE
+        SEG --> CACHE
+        SLATE --> CACHE
     end
     
     subgraph "Storage Backend"
-        SLATE[SlateDB]
-        LSM[LSM Tree]
+        SEGOBJ[Immutable segment objects<br/>segments/shard/epoch/counter]
+        SSTS[Metadata SSTs + manifest]
         S3[S3 Object Store]
         
-        CACHE --> SLATE
-        SLATE --> LSM
-        LSM --> S3
+        CACHE --> SEGOBJ
+        CACHE --> SSTS
+        SEGOBJ --> S3
+        SSTS --> S3
     end
     
     NFS --> NFSD
@@ -157,7 +161,7 @@ graph TB
 
 ## High Availability
 
-A `[replication]` section runs a leader and a standby backed by the same object store, so there is no second copy of the data to provision. The standby semi-synchronously replicates the leader's not-yet-flushed writes and takes over automatically, in seconds, if the leader fails, keeping the filesystem available through a node failure. A connected standby holds every acknowledged write, so failover preserves data that was acknowledged but not yet flushed, not only what has been `fsync`'d. When a failure does cross that line and drops un-`fsync`'d writes, a later `fsync` over them returns an error rather than reporting a false success: a successful `fsync` always means the data is durable, never a silent loss. SlateDB's writer-epoch fencing prevents split-brain: a deposed leader cannot commit. The [high availability documentation](https://www.zerofs.net/high-availability) covers the design, guarantees, and configuration.
+A `[replication]` section runs a leader and a standby backed by the same object store, so there is no second copy of the data to provision. The standby semi-synchronously replicates the leader's not-yet-flushed writes and takes over automatically, in seconds, if the leader fails, keeping the filesystem available through a node failure. A connected standby holds every acknowledged write, so failover preserves data that was acknowledged but not yet flushed, not only what has been `fsync`'d. When a failure does cross that line and drops un-`fsync`'d writes, a later `fsync` over them returns an error rather than reporting a false success: a successful `fsync` always means the data is durable, never a silent loss. Writer-epoch fencing prevents split-brain: a deposed leader cannot commit. The [high availability documentation](https://www.zerofs.net/high-availability) covers the design, guarantees, and configuration.
 
 ## Quick Start
 
@@ -236,7 +240,7 @@ The configuration file has sections for:
 - **Cache** - Local disk and memory cache
 - **Storage** - S3/Azure/GCS/local backend URL and encryption password
 - **Servers** - NFS, 9P, NBD, RPC, and web UI listeners
-- **LSM tuning** - Write-ahead log, compaction, and flush settings
+- **LSM tuning** - Metadata compaction and flush settings
 - **Cloud credentials** - AWS, Azure, or GCS authentication
 
 `[cache]`, `[storage]`, and `[servers]` are required; the other sections are optional.
@@ -268,10 +272,6 @@ unix_socket = "/tmp/zerofs.9p.sock"  # Optional
 addresses = ["127.0.0.1:10809"]
 unix_socket = "/tmp/zerofs.nbd.sock"  # Optional
 
-[lsm]
-wal_enabled = false  # WAL reduces compaction churn from frequent fsyncs (default: false)
-                     # Enable for fsync-heavy workloads to reduce compaction overhead
-
 [aws]
 access_key_id = "${AWS_ACCESS_KEY_ID}"
 secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
@@ -284,6 +284,8 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 # storage_account_name = "${AZURE_STORAGE_ACCOUNT_NAME}"
 # storage_account_key = "${AZURE_STORAGE_ACCOUNT_KEY}"
 ```
+
+The optional `[lsm]` section accepts exactly four keys: `l0_max_ssts` (default 256), `max_concurrent_compactions` (default 8), `flush_interval_secs` (default 30), and `sync_writes` (default false). Unknown keys fail config parsing. The former `wal_enabled` and `max_unflushed_gb` keys were removed — delete them from older configs.
 
 ### Environment Variable Substitution
 
@@ -317,11 +319,11 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 
 > **Storage class:** Set `storage_class` under `[storage]` to write all objects with a specific class/tier. The value is passed through verbatim and is honored by all three cloud backends via their own headers: S3 `x-amz-storage-class`, GCS `x-goog-storage-class`, and Azure `x-ms-access-tier`. Because it's verbatim, it must be valid for your backend — an S3 class name on Azure, for example, is rejected on the first write. Omit it to use the account/bucket default (typically `STANDARD`/`Hot`). The typical use is selecting a cheaper single-zone / reduced-redundancy *hot* class where your provider offers one.
 >
-> **Use a hot, standard-access class.** ZeroFS reads SSTs and the manifest continuously, so colder tiers are a poor fit:
+> **Use a hot, standard-access class.** ZeroFS reads segment objects, SSTs, and the manifest continuously, so colder tiers are a poor fit:
 > - **Archive** tiers (S3 `GLACIER`/`DEEP_ARCHIVE`, Azure `Archive`) require a restore before read and will render the volume unusable — never use them.
 > - **Infrequent-access** tiers (S3 `STANDARD_IA`/`ONEZONE_IA`, GCS `NEARLINE`/`COLDLINE`) work but charge a per-GB retrieval fee on every read, so for ZeroFS's constant reads they usually cost *more*, not less.
 >
-> The `[wal]` section has its own `storage_class` (see below); it does not inherit the one from `[storage]`, so WAL writes stay on the default unless you set it explicitly. Server-side copies cannot carry a class and land in the bucket default.
+> Server-side copies cannot carry a class and land in the bucket default.
 
 #### Microsoft Azure
 ```toml
@@ -489,7 +491,7 @@ The dashboard shows:
 - **IOPS** - Read/write operations per second
 - **Storage Usage** - Current disk usage with capacity gauge
 - **Operation Counters** - File, directory, and link operations since startup
-- **Garbage Collection** - Tombstone and chunk cleanup stats (see [Garbage Collection](https://www.zerofs.net/garbage-collection))
+- **Garbage Collection** - Tombstone and extent cleanup stats (see [Garbage Collection](https://www.zerofs.net/garbage-collection))
 
 The monitor connects to the running ZeroFS instance via RPC and streams stats at 250 ms intervals by default. Use `--interval` to adjust the refresh rate in milliseconds; the server clamps intervals below 250 ms.
 
@@ -497,51 +499,11 @@ Requires the RPC server to be configured (see [Checkpoints](#checkpoints) for RP
 
 The same RPC API also serves `zerofs fatrace` (per-operation filesystem tracing), `zerofs otrace` (per-request object-store tracing), and `zerofs flush` (on-demand flush of buffered writes); see the [Monitoring documentation](https://www.zerofs.net/monitoring).
 
-### Standalone Compactor
+### Write-Ahead Log
 
-ZeroFS uses an LSM (Log-Structured Merge) tree as its storage engine. Compaction is a background process that merges sorted data files (SSTs) to reclaim space from deleted/updated data and improve read performance by reducing the number of files to search. This process is CPU and I/O intensive.
+ZeroFS does not write a WAL, and this is not configurable: `fsync` durability comes from sealing the open segment to the object store and then flushing metadata, both under a single flush barrier. A separate low-latency WAL store therefore no longer affects fsync latency.
 
-Compaction is split into a **coordinator** (schedules compactions and commits their results; bound to the read-write database, so it runs only on the current leader) and **workers** (stateless processes that execute the scheduled jobs). By default `zerofs run` runs the coordinator with an embedded worker, so a single node compacts itself. For demanding workloads you can disable the embedded worker and offload execution to one or more standalone workers:
-
-**Keep the coordinator on the writer, but offload execution:**
-
-```bash
-zerofs run -c zerofs.toml --no-compactor
-```
-
-This keeps the coordinator scheduling and committing, but disables its embedded worker. At least one standalone worker must then be running, or compaction never executes.
-
-**Start one or more standalone workers** (on the same or different machines):
-
-```bash
-zerofs compactor -c zerofs.toml
-```
-
-Workers are stateless and claim jobs from the shared object store, so you can run as many as you want to scale compaction throughput. All instances access the same object storage backend.
-
-**When to offload compaction:**
-
-- **Horizontal scaling**: Run multiple workers to increase aggregate compaction throughput beyond a single node.
-- **Reduce egress costs**: Run workers in the same region/zone as your S3 bucket. Compaction reads and writes large amounts of data - keeping it in the same zone avoids cross-region data transfer fees while your main server can run anywhere.
-- **Isolate resource usage**: Compaction competes with user requests for CPU and I/O. Offloading it prevents latency spikes during heavy compaction.
-- **Cost optimization**: Run workers on cheaper spot/preemptible instances since they're stateless and can be safely interrupted.
-
-Workers use the same configuration file and respect `[lsm].max_concurrent_compactions` for parallelism.
-
-### Separate WAL Object Store
-
-Every `fsync` writes to the WAL, so fsync latency equals the latency of the WAL's backing store. By default the WAL goes to the same S3 bucket as everything else. You can point it at a separate, lower-latency store instead such as local NVMe, S3 Express One Zone, a nearby S3-compatible service, etc.
-
-```toml
-[wal]
-url = "file:///mnt/nvme/zerofs-wal"
-```
-
-The `[wal]` section supports its own `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` credential blocks, independent from the main storage credentials. It also has its own optional `storage_class` (same values as `[storage]`); since the WAL is hot, frequently-rewritten data, it is usually left on the default `STANDARD` tier. If no `[wal]` section is present, the WAL is written to the main object store.
-
-Whether you use a separate WAL store is decided at filesystem creation time. The underlying storage engine records this in its manifest, so you cannot add or remove a separate WAL store on an existing filesystem.
-
-You can move the WAL to a different location by updating the `[wal]` URL and credentials, but you must manually migrate the WAL files from the old store to the new one before starting ZeroFS.
+The `[wal]` section (URL, `[wal.aws]`/`[wal.azure]`/`[wal.gcp]` credential blocks, `storage_class`) is still parsed and accepted for existing configurations, but the engine writes no WAL data.
 
 ### Encryption
 
@@ -573,21 +535,26 @@ Changing the password re-wraps only the DEK; file data is not re-encrypted. Afte
 
 #### What's Encrypted vs What's Not
 
-Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to a block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
+Encryption runs on two paths, both XChaCha20-Poly1305 under subkeys derived from the same master key:
+
+- **File data**: each 32 KiB extent is compressed, then encrypted as a frame. The frame's authenticated data binds it to its segment ID, frame index, inode, and extent index, so a ciphertext cannot be moved to another segment, slot, or logical block. Frames are packed into immutable segment objects.
+- **Metadata**: ZeroFS hands each encoded metadata SST block (containing keys, values, and the block's internal index) to a block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 **Encrypted at rest:**
-- All file contents (in 32 KiB chunks).
+- All file contents (one frame per 32 KiB extent).
 - File metadata values (permissions, timestamps, ownership, directory-entry payloads, etc.).
-- All keys *inside* data blocks (inode IDs, directory entry names, chunk indices), since each block is encrypted as a unit.
+- All keys *inside* metadata blocks (inode IDs, directory entry names, extent indices), since each block is encrypted as a unit.
 - SST index blocks (block offsets + per-block first-key markers) and bloom filter blocks.
+- Each segment's internal directory (an AEAD-sealed frame used only by GC and recovery).
 
 **Visible in plaintext on the object store:**
-- Per-SST `first_key` and `last_key` written into the SST footer's flatbuffer (`SsTableInfo`). For a directory-entry SST this leaks the lexicographically-first and -last `(dir_id, filename)` pair the file contains, not every filename in the SST, but enough that an attacker walking SST footers can sample some directory contents.
-- The SlateDB manifest: SST IDs, segment prefixes (the strings `"meta"` and `"chunk"`), object sizes, checkpoint pointers, format version.
+- Per-SST `first_entry` and `last_entry` (the SST's first and last keys) written into the SST footer's flatbuffer (`SsTableInfo`). For a directory-entry SST this leaks the lexicographically-first and -last `(dir_id, filename)` pair the file contains, not every filename in the SST, but enough that an attacker walking SST footers can sample some directory contents.
+- The metadata store's manifest: SST IDs, key-domain prefixes (the strings `"meta"` and `"extent"`), object sizes, checkpoint pointers, format version.
 - SST blob IDs, sizes, and counts (anything visible to an S3 LIST).
+- Segment object keys (`segments/<shard>/<epoch>/<counter>`) and sizes, plus each segment's fixed 64-byte plaintext footer: frame count, directory offset/length, epoch, counter, sequence number, total length, CRC32C.
 
 **Local cache directory (`[cache] dir`):**
-ZeroFS's on-disk block cache stores **decrypted, decompressed** SST blocks. Encryption is at the block transformer; once a block is fetched from object storage and decrypted, the plaintext form is what gets cached locally so subsequent reads don't pay the decrypt + decompress cost. Treat the cache directory as containing sensitive data and protect it with normal filesystem permissions (or place it on an encrypted volume) if local-disk confidentiality matters to your threat model.
+File data on the local cache disk stays encrypted. The raw-parts cache (`parts_cache/`, the bulk of the disk budget and the only cache for file data) stores object bytes as they exist on the object store: compressed and encrypted. Only the decoded-block cache (`hybrid_cache/`) holds plaintext, and it holds metadata blocks only, cached after decryption so metadata reads don't pay the decrypt + decompress cost. Protect the cache directory with normal filesystem permissions (or place it on an encrypted volume) if local-disk metadata confidentiality matters to your threat model.
 
 For the key architecture, the plaintext sidecar objects (`zerofs.key`, `.zerofs_bucket_id`, the startup compatibility probe), and password handling, see the [Encryption documentation](https://www.zerofs.net/encryption).
 
@@ -613,7 +580,7 @@ zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
 
 Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions. (This assumes the client and server share a uid namespace, and the server trusts the uid it's told). Use `--access owner|root|all` to choose who may reach the mount in the first place.
 
-Writeback caching is on by default. Writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only and message size).
+Writeback caching is on by default. Writes are buffered and flushed asynchronously, similar to mounting the kernel client with `cache=mmap`. Pass `--writeback false` to write through synchronously instead. Run `zerofs mount --help` for the rest (read-only, message size, relaxed-consistency, and subtree mounts via `--aname`).
 
 ### Kernel 9P client
 
@@ -696,7 +663,7 @@ The handshake advertises FLUSH, FUA, and multi-connection support. FLUSH and FUA
 
 ### TRIM/Discard Support
 
-ZeroFS NBD devices support TRIM operations, which delete the corresponding chunks from the LSM-tree database backed by S3:
+ZeroFS NBD devices support TRIM operations, which free the corresponding extents in the S3-backed store:
 
 ```bash
 # Manual TRIM
@@ -710,7 +677,7 @@ zpool set autotrim=on mypool
 zpool trim mypool
 ```
 
-When blocks are trimmed, ZeroFS deletes the corresponding chunks from the LSM tree; compaction then reclaims the space in S3.
+When blocks are trimmed, ZeroFS deletes the corresponding extent pointers from the metadata database and debits each affected segment's live-byte counter; the segment garbage collector (a pass every 60 seconds) then deletes dead segment objects and repacks fragmented ones, reclaiming the space in S3.
 
 ### NBD Device Management
 
@@ -938,12 +905,14 @@ readseq      :       0.941 micros/op;
 readrand100K :       1.596 micros/op;
 ```
 
+These results are from July 2025 and predate the current segment storage engine; they have not been re-run against it.
+
 A raw S3 round trip takes 50–300 ms. The gap comes from:
 
-- Multi-layered cache: Memory block cache, metadata cache, and configurable disk cache (see [Caching](https://www.zerofs.net/caching))
+- Multi-layered cache: Memory and disk tiers for both raw object parts and decoded metadata blocks (see [Caching](https://www.zerofs.net/caching))
 - Compression: Reduces data transfer and increases effective cache capacity
 - Parallel prefetching: Overlaps S3 requests to hide latency
-- Write-ahead log (WAL): When enabled, absorbs fsyncs without flushing the memtable, preventing small SST files and reducing compaction churn. Disabled by default; see [Configuration](https://www.zerofs.net/configuration)
+- Write-through caching: Sealed segments warm the local cache at upload time, and each inode's most recent writes are served from memory, so re-reads of fresh data skip S3
 
 <p align="center">
   <a href="https://asciinema.org/a/ovxTV0zTpjE1xcxn5CXehCTTN" target="_blank">View SQLite Benchmark Demo</a>
@@ -964,9 +933,8 @@ A raw S3 round trip takes 50–300 ms. The gap comes from:
 - Metadata stored in S3 object headers or separate metadata objects
 
 **ZeroFS:**
-- Uses SlateDB, a log-structured merge-tree (LSM) database
-- Files are chunked into 32 KiB blocks
-- Inodes and file data stored as key-value pairs
+- Splits files into 32 KiB extents; each extent is compressed, encrypted, and packed into immutable segment objects (up to 256 MiB) on S3
+- Stores metadata in a log-structured merge-tree (LSM) database: inodes, directory entries, and one 32-byte pointer per extent
 - Metadata is first-class data in the database
 
 ### 2. **Performance Characteristics**
@@ -978,10 +946,10 @@ A raw S3 round trip takes 50–300 ms. The gap comes from:
 - No real atomic operations across multiple files
 
 **ZeroFS:**
-- Small random I/O maps to key-value reads and writes
-- Partial file updates rewrite only the affected 32 KiB chunks
+- Small random I/O operates on 32 KiB extents, never whole objects
+- Partial file updates rewrite only the affected 32 KiB extents
 - Directory listings are prefix scans over the LSM's sorted keys
-- Atomic batch operations through SlateDB's WriteBatch
+- Atomic batch operations through the LSM's atomic write batches
 
 ### 3. **Data Layout**
 
@@ -994,15 +962,19 @@ s3://bucket/
 └── .metadata/ (optional metadata storage)
 ```
 
-**ZeroFS Layout (in SlateDB):**
+**ZeroFS Layout:**
 ```
-Key-Value Store:
+LSM tree (metadata):
 ├── inode:0 → {type: directory, ...}
 ├── direntry:0/"file1.txt" → inode 1
 ├── inode:1 → {type: file, size: 1024, ...}
-├── chunk:1/0 → [first 32K of file data]
-├── chunk:1/1 → [second 32K of file data]
+├── extent:1/0 → 32-byte pointer {epoch, counter, frame 0, offset, len}
+├── extent:1/1 → 32-byte pointer {epoch, counter, frame 1, offset, len}
 └── next_inode_id → 2
+
+Object store (file data):
+└── segments/<shard>/<epoch>/<counter>
+    (immutable; one compressed + encrypted frame per 32 KiB extent)
 ```
 
 ### 4. **Cost Model**
@@ -1013,8 +985,9 @@ Key-Value Store:
 - LIST operations can be costly for large directories
 
 **ZeroFS:**
-- Costs amortized through SlateDB's compaction
-- Small updates are batched before upload
+- No per-write S3 uploads: frames buffer in RAM and upload as one multipart PUT per 256 MiB segment, or per fsync (unaligned overwrites of uncached data may first read the old 32 KiB extent)
+- Reads are exact-range GETs; contiguous extents in one segment coalesce into a single GET
+- Space reclamation is segment garbage collection (delete dead segments, repack fragmented ones), not full-data rewrites
 
 ## GitHub Action
 
@@ -1042,7 +1015,7 @@ ZeroFS has the following theoretical limits:
 
 These limits come from the filesystem design:
 - Inode IDs and file sizes are stored as 64-bit integers
-- File data is split into 32 KiB chunks with 64-bit indexing
+- File data is split into 32 KiB extents with 64-bit indexing
 
 In practice, S3 provider limits, performance with billions of objects, and storage cost take effect long before these values. The [architecture documentation](https://www.zerofs.net/architecture) covers these limits and how `df` reports filesystem size under each protocol.
 
