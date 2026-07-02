@@ -10,9 +10,9 @@ ZeroFS runs two caches, each with a memory tier and a disk tier: a raw-parts cac
 
 ## Cache Layers
 
-The **raw-parts cache** holds 128 KiB parts of object bytes as fetched from the object store. Segment objects (file data) and SlateDB SST objects share its one budget, keyed by path. It is the only cache serving file reads (the RAM-only tail cache below holds file data too, but feeds only write-path splicing), and parts are stored as they exist in the object store: compressed and encrypted. Its memory tier receives what remains of the memory budget after the decoded-block slice. Its disk tier lives in `parts_cache/` and receives what remains of the disk budget after the decoded-block slice.
+The **raw-parts cache** holds 128 KiB parts of object bytes as fetched from the object store. Segment objects (file data) and metadata SST objects share its one budget, keyed by path. It is the only cache serving file reads (the RAM-only tail cache below holds file data too, but feeds only write-path splicing), and parts are stored as they exist in the object store: compressed and encrypted. Its memory tier receives what remains of the memory budget after the decoded-block slice. Its disk tier lives in `parts_cache/` and receives what remains of the disk budget after the decoded-block slice.
 
-The **decoded-block cache** holds metadata blocks after decryption and decompression. SlateDB stores only metadata — inode and directory entries plus 32-byte extent pointers — so this cache is small and bounded. Its memory tier receives a quarter of the memory budget, its disk tier lives in `hybrid_cache/` and receives a tenth of the disk budget; both slices are clamped (see the split sections below).
+The **decoded-block cache** holds metadata blocks after decryption and decompression. The metadata LSM stores only inode and directory entries plus 32-byte extent pointers, so this cache is small and bounded. Its memory tier receives a quarter of the memory budget, its disk tier lives in `hybrid_cache/` and receives a tenth of the disk budget; both slices are clamped (see the split sections below).
 
 A third, RAM-only **tail cache** holds each inode's most-recently-written extent, 32 MiB total, updated only after the write's transaction commits. A sequential append splices into the cached tail instead of re-reading it.
 

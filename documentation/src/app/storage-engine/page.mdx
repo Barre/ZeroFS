@@ -3,7 +3,7 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Storage Engine: Segments and Extents',
   description:
-    'How ZeroFS stores file data: 32 KiB extents sealed as compressed, encrypted frames inside immutable segment objects, with 32-byte FrameLoc pointers in SlateDB.',
+    'How ZeroFS stores file data: 32 KiB extents sealed as compressed, encrypted frames inside immutable segment objects, with 32-byte FrameLoc pointers in a metadata LSM tree.',
 }
 
 export const sections = [
@@ -18,7 +18,7 @@ export const sections = [
 
 # Storage Engine: Segments and Extents
 
-ZeroFS stores file contents in immutable segment objects written directly to the object store. SlateDB holds only metadata: inodes, directory entries, and one 32-byte pointer per extent. This page documents the on-object format, the write and read paths, and space reclamation. {{ className: 'lead' }}
+ZeroFS stores file contents in immutable segment objects written directly to the object store. An LSM tree on the same object store holds only metadata: inodes, directory entries, and one 32-byte pointer per extent. This page documents the on-object format, the write and read paths, and space reclamation. {{ className: 'lead' }}
 
 ## Overview {{ id: 'overview' }}
 
@@ -27,7 +27,7 @@ File data is split into 32 KiB **extents**. Each extent is compressed, then encr
 | Store | Holds |
 |-------|-------|
 | Segment objects (`segments/…`) | File data: compressed, encrypted frames plus a directory and footer |
-| SlateDB (LSM on the same object store) | Inodes, directory entries, tombstones, stats; one 32-byte FrameLoc per extent; per-segment live-byte counters |
+| Metadata LSM tree (on the same object store) | Inodes, directory entries, tombstones, stats; one 32-byte FrameLoc per extent; per-segment live-byte counters |
 
 Segment object keys are `segments/{shard}/{epoch}/{counter}`:
 
@@ -42,7 +42,7 @@ graph TB
         EXT[Extent store]
         BUF["Open segment buffer (RAM)"]
         TXN[Transaction]
-        MEM[SlateDB memtable]
+        MEM[LSM memtable]
 
         WRITE --> EXT
         EXT -->|sealed frame| BUF
@@ -73,7 +73,7 @@ A segment has three parts, written in order:
 
 Each frame on the wire is `[len: u32 LE][sealed_frame]`. The sealed frame is `[nonce: 24 bytes][ciphertext + tag: 16 bytes]`: the extent is compressed (per the `compression` setting), then encrypted with XChaCha20-Poly1305. The key is derived from the master key via HKDF-SHA256 with the label `zerofs-v1-segment`, domain-separated from the metadata SST-block key. The AEAD associated data binds each frame to its segment ID, frame index, inode, and extent index — a frame cannot be moved to another segment, slot, or logical block without failing authentication.
 
-The **FrameLoc** is the SlateDB value of an extent key: 32 bytes, little-endian.
+The **FrameLoc** is the LSM value of an extent key: 32 bytes, little-endian.
 
 | Offset | Size | Field |
 |--------|------|-------|
@@ -109,9 +109,9 @@ The CRC32C is a keyless torn-write detector for the directory and footer only; f
 
 ### The fsync barrier
 
-`fsync` (and every other flush) runs a fixed sequence: drain in-flight seals, re-upload any failed seal, seal the current open buffer, then flush SlateDB. If sealing fails, the metadata flush does not run. The invariant: **a durable metadata manifest never references an un-uploaded segment**. A crash between segment upload and metadata flush leaves an orphaned segment object, which garbage collection reclaims — never a durable pointer to a missing object. This invariant is exercised by failpoint crash tests.
+`fsync` (and every other flush) runs a fixed sequence: drain in-flight seals, re-upload any failed seal, seal the current open buffer, then flush the metadata LSM. If sealing fails, the metadata flush does not run. The invariant: **a durable metadata manifest never references an un-uploaded segment**. A crash between segment upload and metadata flush leaves an orphaned segment object, which garbage collection reclaims — never a durable pointer to a missing object. This invariant is exercised by failpoint crash tests.
 
-SlateDB's write-ahead log is permanently off and not configurable: a WAL flush is not gated by the seal barrier and could persist a FrameLoc to a segment that was never uploaded.
+The LSM tree's write-ahead log is permanently off and not configurable: a WAL flush is not gated by the seal barrier and could persist a FrameLoc to a segment that was never uploaded.
 
 Flushes are triggered by:
 
@@ -138,7 +138,7 @@ The parts cache stores raw object bytes: extent data is compressed and encrypted
 
 ## Space Reclamation {{ id: 'space-reclamation' }}
 
-SlateDB tracks live bytes per segment. Transactions carry signed deltas; the single-writer commit worker folds them into absolute counters. Overwriting or deleting an extent debits the segment that held its old frame.
+The metadata LSM tracks live bytes per segment. Transactions carry signed deltas; the single-writer commit worker folds them into absolute counters. Overwriting or deleting an extent debits the segment that held its old frame.
 
 A garbage-collection pass runs every 60 s on the writer:
 
@@ -149,7 +149,7 @@ A garbage-collection pass runs every 60 s on the writer:
 
 Directory reads during GC are two ranged GETs — the 64-byte footer suffix, then the directory span — never the whole object.
 
-File data no longer rides LSM compaction. SlateDB compaction still runs, embedded in `zerofs run`, but rewrites only metadata SSTs. Deleted-file extent pointers are removed by the tombstone sweep described on the [Garbage Collection](/garbage-collection) page; the segment bytes are then reclaimed by the pass above.
+File data no longer rides LSM compaction. The embedded compactor still runs in `zerofs run`, but rewrites only metadata SSTs. Deleted-file extent pointers are removed by the tombstone sweep described on the [Garbage Collection](/garbage-collection) page; the segment bytes are then reclaimed by the pass above.
 
 ## Design Constants {{ id: 'design-constants' }}
 

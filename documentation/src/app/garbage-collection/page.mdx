@@ -46,11 +46,11 @@ Deleting a file is immediate at the filesystem level: the unlink transaction com
 
 ## The Reclamation Pipeline
 
-File contents are packed as encrypted frames into immutable segment objects; the metadata store (SlateDB) holds one 32-byte pointer per extent and a live-byte counter per segment. Space returns in two stages for file data and one for metadata. Each is eventual, and none is triggered by the deletion itself:
+File contents are packed as encrypted frames into immutable segment objects; the metadata LSM holds one 32-byte pointer per extent and a live-byte counter per segment. Space returns in two stages for file data and one for metadata. Each is eventual, and none is triggered by the deletion itself:
 
 1. **Tombstone GC** deletes the file's extent pointer keys and debits each source segment's live-byte counter. No object is deleted; the segment objects still hold the frames.
 2. **Segment GC** deletes segment objects whose live-byte counter has reached zero and repacks fragmented ones. This is where the bucket's billed size for file data drops.
-3. **Metadata compaction and object GC** rewrite and delete SlateDB SSTs. The SSTs hold only metadata — inodes, directories, extent pointers, counters — so this stage reclaims metadata space, not file data.
+3. **Metadata compaction and object GC** rewrite and delete metadata SSTs. The SSTs hold only metadata — inodes, directories, extent pointers, counters — so this stage reclaims metadata space, not file data.
 
 <Note>
   A delay between deleting files and the bucket shrinking is normal operation,
@@ -120,9 +120,9 @@ A pass issues one streamed LIST of `segments/`, a 64-byte footer GET plus a dire
 
 ## Stage 3: Metadata Compaction and Object GC
 
-SlateDB holds only metadata: inodes, directory entries, tombstones, extent pointers, and segment counters. Its LSM compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process — metadata compaction always runs inside `zerofs run`.
+The metadata LSM holds only inodes, directory entries, tombstones, extent pointers, and segment counters. Its compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process — metadata compaction always runs inside `zerofs run`.
 
-SlateDB's object garbage collector, also in the writer process, scans four object directories — WAL, manifest, compacted SSTs, and compaction state — every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
+The metadata store's object garbage collector, also in the writer process, scans four object directories — WAL, manifest, compacted SSTs, and compaction state — every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
 
 ## Where Reclamation Runs
 

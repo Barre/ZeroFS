@@ -3,7 +3,7 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Architecture',
   description:
-    'How ZeroFS is layered: NFS, 9P, and NBD servers over a shared filesystem core, with file data in immutable segment objects on S3 and metadata in SlateDB. Covers protocol choice and filesystem limits.',
+    'How ZeroFS is layered: NFS, 9P, and NBD servers over a shared filesystem core, with file data in immutable segment objects on S3 and metadata in an LSM tree. Covers protocol choice and filesystem limits.',
 }
 
 export const sections = [
@@ -19,7 +19,7 @@ This page describes how ZeroFS is structured: the protocol servers, the shared f
 
 ## System Overview {{ id: 'system-overview' }}
 
-The NFS, 9P, and NBD servers run in one userspace process and share a single filesystem layer. Below that layer, storage splits into two planes. Metadata — inodes, directories, extent pointers — lives in SlateDB, an LSM tree on the object store. File contents do not pass through the LSM: they are packed into immutable segment objects written directly to the object store. Both planes read through one shared raw-parts cache:
+The NFS, 9P, and NBD servers run in one userspace process and share a single filesystem layer. Below that layer, storage splits into two planes. Metadata — inodes, directories, extent pointers — lives in an LSM tree on the object store. File contents do not pass through the LSM: they are packed into immutable segment objects written directly to the object store. Both planes read through one shared raw-parts cache:
 
 <Mermaid chart={`
 graph TB
@@ -41,7 +41,7 @@ graph TB
     end
 
     subgraph "Metadata Plane"
-        SLATE[SlateDB LSM<br/>inodes, directories,<br/>extent pointers]
+        SLATE[Metadata LSM tree<br/>inodes, directories,<br/>extent pointers]
     end
 
     subgraph "Data Plane"
@@ -82,7 +82,7 @@ Segments are written once and never modified. The shard is the low byte of the c
 
 ### Metadata Plane
 
-SlateDB stores metadata only; file bytes never enter the LSM:
+The LSM tree stores metadata only; file bytes never enter it:
 
 | Record | Contents |
 |--------|----------|
@@ -91,7 +91,7 @@ SlateDB stores metadata only; file bytes never enter the LSM:
 | Segment counters | Live bytes per segment; input to garbage collection |
 | Tombstones, orphans, statistics | Deferred deletion and accounting |
 
-SlateDB also provides writer fencing — a monotonic writer epoch that doubles as the epoch in segment object keys — plus the manifest that anchors durability, checkpoints, and read replicas. Its write-ahead log is permanently disabled: metadata becomes durable only through the flush barrier, which seals and uploads the open segment first. A durable manifest therefore never references a segment that is not in the object store.
+The LSM tree also provides writer fencing — a monotonic writer epoch that doubles as the epoch in segment object keys — plus the manifest that anchors durability, checkpoints, and read replicas. Its write-ahead log is permanently disabled: metadata becomes durable only through the flush barrier, which seals and uploads the open segment first. A durable manifest therefore never references a segment that is not in the object store.
 
 ### Read Path
 

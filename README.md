@@ -110,7 +110,7 @@ The terminal runs a Linux VM in the browser using [v86](https://github.com/copy/
 
 ## Architecture
 
-The NFS, 9P, and NBD servers and the Web UI run in one userspace process and share a single filesystem layer. File contents are split into 32 KiB extents; each extent is compressed, encrypted, and packed as a frame into immutable segment objects (up to 256 MiB) written directly to the object store. Metadata — inodes, directory entries, and one 32-byte pointer per extent — lives in SlateDB, an LSM-tree database on the same object store. The [architecture documentation](https://www.zerofs.net/architecture) covers protocol choice and filesystem limits.
+The NFS, 9P, and NBD servers and the Web UI run in one userspace process and share a single filesystem layer. File contents are split into 32 KiB extents; each extent is compressed, encrypted, and packed as a frame into immutable segment objects (up to 256 MiB) written directly to the object store. Metadata — inodes, directory entries, and one 32-byte pointer per extent — lives in an LSM-tree database on the same object store. The [architecture documentation](https://www.zerofs.net/architecture) covers protocol choice and filesystem limits.
 
 ```mermaid
 
@@ -129,7 +129,7 @@ graph TB
         WEBUI[Web UI]
         VFS[Virtual Filesystem]
         SEG[Segment Store<br/>file data as compressed, encrypted frames]
-        SLATE[SlateDB<br/>metadata + 32-byte extent pointers]
+        SLATE[LSM tree<br/>metadata + 32-byte extent pointers]
         CACHE[Local Cache]
         
         NFSD --> VFS
@@ -161,7 +161,7 @@ graph TB
 
 ## High Availability
 
-A `[replication]` section runs a leader and a standby backed by the same object store, so there is no second copy of the data to provision. The standby semi-synchronously replicates the leader's not-yet-flushed writes and takes over automatically, in seconds, if the leader fails, keeping the filesystem available through a node failure. A connected standby holds every acknowledged write, so failover preserves data that was acknowledged but not yet flushed, not only what has been `fsync`'d. When a failure does cross that line and drops un-`fsync`'d writes, a later `fsync` over them returns an error rather than reporting a false success: a successful `fsync` always means the data is durable, never a silent loss. SlateDB's writer-epoch fencing prevents split-brain: a deposed leader cannot commit. The [high availability documentation](https://www.zerofs.net/high-availability) covers the design, guarantees, and configuration.
+A `[replication]` section runs a leader and a standby backed by the same object store, so there is no second copy of the data to provision. The standby semi-synchronously replicates the leader's not-yet-flushed writes and takes over automatically, in seconds, if the leader fails, keeping the filesystem available through a node failure. A connected standby holds every acknowledged write, so failover preserves data that was acknowledged but not yet flushed, not only what has been `fsync`'d. When a failure does cross that line and drops un-`fsync`'d writes, a later `fsync` over them returns an error rather than reporting a false success: a successful `fsync` always means the data is durable, never a silent loss. Writer-epoch fencing prevents split-brain: a deposed leader cannot commit. The [high availability documentation](https://www.zerofs.net/high-availability) covers the design, guarantees, and configuration.
 
 ## Quick Start
 
@@ -538,7 +538,7 @@ Changing the password re-wraps only the DEK; file data is not re-encrypted. Afte
 Encryption runs on two paths, both XChaCha20-Poly1305 under subkeys derived from the same master key:
 
 - **File data**: each 32 KiB extent is compressed, then encrypted as a frame. The frame's authenticated data binds it to its segment ID, frame index, inode, and extent index, so a ciphertext cannot be moved to another segment, slot, or logical block. Frames are packed into immutable segment objects.
-- **Metadata**: ZeroFS hands each encoded SlateDB SST block (containing keys, values, and the block's internal index) to a block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
+- **Metadata**: ZeroFS hands each encoded metadata SST block (containing keys, values, and the block's internal index) to a block transformer, which compresses then encrypts the whole block. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 **Encrypted at rest:**
 - All file contents (one frame per 32 KiB extent).
@@ -549,7 +549,7 @@ Encryption runs on two paths, both XChaCha20-Poly1305 under subkeys derived from
 
 **Visible in plaintext on the object store:**
 - Per-SST `first_entry` and `last_entry` (the SST's first and last keys) written into the SST footer's flatbuffer (`SsTableInfo`). For a directory-entry SST this leaks the lexicographically-first and -last `(dir_id, filename)` pair the file contains, not every filename in the SST, but enough that an attacker walking SST footers can sample some directory contents.
-- The SlateDB manifest: SST IDs, key-domain prefixes (the strings `"meta"` and `"extent"`), object sizes, checkpoint pointers, format version.
+- The metadata store's manifest: SST IDs, key-domain prefixes (the strings `"meta"` and `"extent"`), object sizes, checkpoint pointers, format version.
 - SST blob IDs, sizes, and counts (anything visible to an S3 LIST).
 - Segment object keys (`segments/<shard>/<epoch>/<counter>`) and sizes, plus each segment's fixed 64-byte plaintext footer: frame count, directory offset/length, epoch, counter, sequence number, total length, CRC32C.
 
@@ -934,7 +934,7 @@ A raw S3 round trip takes 50–300 ms. The gap comes from:
 
 **ZeroFS:**
 - Splits files into 32 KiB extents; each extent is compressed, encrypted, and packed into immutable segment objects (up to 256 MiB) on S3
-- Stores metadata in SlateDB, a log-structured merge-tree (LSM) database: inodes, directory entries, and one 32-byte pointer per extent
+- Stores metadata in a log-structured merge-tree (LSM) database: inodes, directory entries, and one 32-byte pointer per extent
 - Metadata is first-class data in the database
 
 ### 2. **Performance Characteristics**
@@ -949,7 +949,7 @@ A raw S3 round trip takes 50–300 ms. The gap comes from:
 - Small random I/O operates on 32 KiB extents, never whole objects
 - Partial file updates rewrite only the affected 32 KiB extents
 - Directory listings are prefix scans over the LSM's sorted keys
-- Atomic batch operations through SlateDB's WriteBatch
+- Atomic batch operations through the LSM's atomic write batches
 
 ### 3. **Data Layout**
 
@@ -964,7 +964,7 @@ s3://bucket/
 
 **ZeroFS Layout:**
 ```
-SlateDB (metadata):
+LSM tree (metadata):
 ├── inode:0 → {type: directory, ...}
 ├── direntry:0/"file1.txt" → inode 1
 ├── inode:1 → {type: file, size: 1024, ...}

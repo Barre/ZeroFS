@@ -61,7 +61,7 @@ There are two encryption domains.
 
 **File contents** never enter the LSM. Each 32 KiB extent is compressed, then encrypted as a self-describing frame — wire format `[nonce: 24][ciphertext + tag: 16]`, with a random 24-byte nonce per frame — and packed into immutable segment objects at `segments/<shard>/<epoch>/<counter>`. Each frame's AAD binds it to its segment ID, frame index, inode, and extent index, so a ciphertext frame cannot be spliced into another segment, slot, file, or offset. Under [replication](/high-availability), frames shipped to a standby for not-yet-uploaded segments are the already-sealed ciphertext bytes, not plaintext.
 
-**Metadata** (inodes, directory entries, per-extent pointers) lives in SlateDB. Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block with an empty AAD — byte-identical to the historical SST block format, so existing SSTs still decode. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
+**Metadata** (inodes, directory entries, per-extent pointers) lives in the LSM tree. Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block with an empty AAD — byte-identical to the historical SST block format, so existing SSTs still decode. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 <Row>
   <Col>
@@ -256,7 +256,7 @@ addresses = ["127.0.0.1:10809"]
 
 ## Security Architecture
 
-File data and metadata take separate paths to the object store. Both are compressed then encrypted; only metadata passes through SlateDB.
+File data and metadata take separate paths to the object store. Both are compressed then encrypted; only metadata passes through the LSM tree.
 
 <Mermaid chart={`
 graph TB
@@ -266,7 +266,7 @@ graph TB
     subgraph ZEROFS["ZeroFS"]
         FRAME[Frame Codec<br/>compress then encrypt<br/>XChaCha20-Poly1305]
         SEGBUF[Open Segment Buffer<br/>sealed frames, in RAM]
-        SLATE[SlateDB<br/>Metadata LSM]
+        SLATE[Metadata LSM]
         BT[Block Transformer<br/>compress then encrypt<br/>XChaCha20-Poly1305]
 
         FRAME --> SEGBUF

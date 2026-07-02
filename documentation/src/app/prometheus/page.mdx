@@ -94,11 +94,11 @@ Gauges that report the state of the jemalloc allocator:
 
 `zerofs_jemalloc_resident_bytes` tracks the allocator's physical memory footprint. `zerofs_jemalloc_retained_bytes` counts virtual address space kept for reuse and does not consume physical memory, so memory alerts should key on resident, not retained or mapped.
 
-### SlateDB (Metadata LSM)
+### Metadata LSM
 
-ZeroFS exposes internal metrics from SlateDB, its metadata store. SlateDB holds inode and directory metadata plus per-extent pointers; file content lives in segment objects outside the LSM. These metrics are prefixed with `slatedb_` and include compaction and storage statistics. The exact metrics depend on the SlateDB version and are discovered at runtime.
+ZeroFS exposes internal metrics from its metadata LSM tree, which holds inode and directory metadata plus per-extent pointers; file content lives in segment objects outside the LSM. These metrics are prefixed with `slatedb_` and include compaction and storage statistics. The exact metrics depend on the engine version and are discovered at runtime.
 
-Common SlateDB metrics include:
+Common metadata metrics include:
 
 | Metric | Type | Description |
 | --- | --- | --- |
@@ -109,7 +109,7 @@ Common SlateDB metrics include:
 Compaction metrics cover metadata compaction only. Segment objects holding file data are not part of the LSM and are never rewritten by it.
 
 <Note>
-SlateDB metrics are only available in read-write mode. Read-only instances do not expose SlateDB metrics.
+The `slatedb_`-prefixed metrics are only available in read-write mode; read-only instances do not expose them.
 </Note>
 
 ## Prometheus Scrape Configuration
