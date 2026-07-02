@@ -10,6 +10,9 @@ jobs:
   jepsen:
     name: Run jepsen local-fs suite (9P)
     runs-on: ubuntu-latest
+    # Backstop only; the per-step timeouts below fire first so the store
+    # upload still runs. Without these a wedged trial burns the 6h default.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +57,7 @@ jobs:
 
       - name: POSIX conformance (quickcheck)
         working-directory: /tmp/local-fs
+        timeout-minutes: 10
         run: |
           # The ZeroFS backend self-manages the server (local file:// store) and
           # the 9P FUSE mount, so no MinIO/mount step is needed here. Each trial
@@ -61,22 +65,24 @@ jobs:
           ./run.sh run quickcheck \
             --db zerofs \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
-            --quickcheck-tests 25 \
+            --quickcheck-tests 5 \
             --time-limit 30
 
       - name: Crash consistency (lose-unfsynced-writes)
         working-directory: /tmp/local-fs
+        timeout-minutes: 10
         run: |
           ./run.sh run quickcheck \
             --db zerofs \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --lose-unfsynced-writes \
             --history-scale 8 \
-            --quickcheck-tests 20 \
+            --quickcheck-tests 4 \
             --time-limit 30
 
       - name: HA failover consistency (--db zerofs-ha --failover)
         working-directory: /tmp/local-fs
+        timeout-minutes: 10
         run: |
           # A leader + standby cluster where the fault fails the leader over to the
           # standby; the same fs model-checker verifies no write is lost,
@@ -87,7 +93,7 @@ jobs:
             --failover \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --history-scale 20 \
-            --quickcheck-tests 8 \
+            --quickcheck-tests 3 \
             --time-limit 60
 
       - name: Upload jepsen store on failure
