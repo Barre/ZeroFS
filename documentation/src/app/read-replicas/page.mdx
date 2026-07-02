@@ -54,7 +54,7 @@ Maintenance stays on the writer. A read-only instance runs none of the following
 - **ZeroFS garbage collection**: Tombstone garbage collection, segment garbage collection, and segment compaction run only on the writer. A replica never deletes or repacks segment objects. See [Garbage Collection](/garbage-collection).
 - **The periodic flush**: A replica buffers no writes, so the flush task is not started.
 - **Checkpoint creation**: `zerofs checkpoint create` against a replica's RPC server fails with `Cannot create checkpoints in read-only mode. Start the server without --read-only or --checkpoint flags.`
-- **Metadata metrics**: The `/metrics` endpoint on a replica serves ZeroFS metrics but omits the `slatedb_`-prefixed series, which come from the read-write engine. See [Prometheus Metrics](/prometheus).
+- **Metadata metrics**: The `/metrics` endpoint on a replica serves ZeroFS metrics but omits the `lsm_`-prefixed series, which come from the read-write engine. See [Prometheus Metrics](/prometheus).
 
 ## Write Semantics
 
