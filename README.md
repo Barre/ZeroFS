@@ -7,9 +7,8 @@
 <div align="center">
 
 ![GitHub Release](https://img.shields.io/github/v/release/barre/zerofs)
-![GitHub License](https://img.shields.io/github/license/barre/zerofs)
 
-**[Documentation](https://www.zerofs.net)** | **[Quickstart](https://www.zerofs.net/quickstart)** | **[ZeroFS vs AWS EFS](https://www.zerofs.net/zerofs-vs-aws-efs)**
+**[Documentation](https://www.zerofs.net)** | **[Quickstart](https://www.zerofs.net/quickstart)**
 
 </div>
 
