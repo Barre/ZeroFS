@@ -169,22 +169,6 @@ The standby repeats this with three ZeroFS instances in three other regions. Dev
 - **Flush latency**: A flush seals the open in-memory segment and uploads it as one immutable segment object, then flushes metadata. Extents are compressed and encrypted into frames as they are written, so sealing only appends the segment directory and footer. It also waits for any in-flight background segment uploads. Flush latency therefore follows the main object store's PUT latency. The SLOG above keeps that off the commit path: commits wait on the local log device, and the pool flushes the ZeroFS devices at transaction-group sync.
 - **Storage-level read replicas**: A ZeroFS [read replica](/read-replicas) exposes the same filesystem read-only from another instance. It does not replace a PostgreSQL standby, which needs a writable data directory and receives changes through PostgreSQL replication.
 
-### Measured Performance
-
-<Note>
-  Historical record. These results were measured on the previous chunk-based storage engine;
-  the current segment-based engine has not been re-benchmarked.
-</Note>
-
-pgbench 16.9 against PostgreSQL on a ZFS pool of ZeroFS NBD devices with an NVMe L2ARC, on a single 16 GB host — 50 clients, 15 threads, 100,000 transactions per client, scaling factor 50:
-
-| Workload | Throughput | Average latency |
-|----------|-----------|-----------------|
-| TPC-B-style read/write (pgbench default) | 53,041 TPS | 0.943 ms |
-| Select-only | 413,436 TPS | 0.121 ms |
-
-At scaling factor 50 the working set fits in the local cache tiers, so reads come from the L2ARC and the ZeroFS caches; reads that miss both go to S3 at object-store latency. The benchmark host runs a single node without replication; in the topology above, ZFS writes every block to all three mirror members and commits also wait for the standby's acknowledgment.
-
 <div className="not-prose">
   <Button href="/" variant="text" arrow="left">
     <>Back to documentation home</>
