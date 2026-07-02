@@ -375,8 +375,8 @@ pub struct LsmConfig {
 
 impl LsmConfig {
     /// Default l0_max_ssts: 256. With the WAL off every `db.flush()` (periodic
-    /// + each fsync) freezes a fresh L0 SST, so L0 must hold a deep backlog or
-    /// flushes stall on compaction. The SSTs are small, bloom-filtered
+    /// and each fsync) freezes a fresh L0 SST, so L0 must hold a deep backlog
+    /// or flushes stall on compaction. The SSTs are small, bloom-filtered
     /// metadata, so the point-lookup cost is negligible. Applies to
     /// `l0_max_ssts_per_key` too.
     pub const DEFAULT_L0_MAX_SSTS: usize = 256;
