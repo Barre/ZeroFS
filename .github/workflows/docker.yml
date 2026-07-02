@@ -5,7 +5,14 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  # Releases are immutable, so a failed tag run can't be re-triggered by
+  # re-pushing the tag. Dispatch with a tag input rebuilds that release's
+  # images from the current workflow definition.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and push (e.g. v2.0.0)"
+        required: false
 
 env:
   REGISTRY: ghcr.io
@@ -35,12 +42,14 @@ jobs:
       - name: Download PGO builds
         run: |
           # Determine which release to download
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            # Use the specific tag
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${TAG}/zerofs-pgo-multiplatform.tar.gz"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
             DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${TAG}/zerofs-pgo-multiplatform.tar.gz"
           else
-            # For PRs and workflow_dispatch, use latest
+            # For PRs and tagless dispatches, use latest
             DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-pgo-multiplatform.tar.gz"
           fi
 
@@ -69,6 +78,8 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
@@ -78,7 +89,7 @@ jobs:
           context: .
           file: ./Dockerfile.multiarch
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.tag != '') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
