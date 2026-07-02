@@ -91,9 +91,9 @@ File contents are packed as encrypted frames into immutable segment objects; the
 
 The writer runs a dedicated segment GC task: one pass at startup, then one every 60 seconds. A pass begins by sealing the open segment buffer and flushing the metadata store under the flush barrier, so the durable view matches the in-memory view; a segment GC pass is therefore also a flush trigger.
 
-The pass then reads every per-segment live-byte counter in one scan and streams a listing of `segments/`. Only segments sealed before the pass are eligible. Two actions follow:
+The pass then reads every per-segment live-byte counter in one scan; it lists nothing on the object store. Only segments sealed before the pass are eligible. Two actions follow:
 
-**Dead-segment deletion.** A segment whose counter is zero or absent is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment — a leaked segment is preferred to lost data. The object DELETE is the point where the bucket's billed size drops.
+**Dead-segment deletion.** A segment whose counter is zero is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment — a leaked segment is preferred to lost data. The object DELETE is the point where the bucket's billed size drops.
 
 **Segment compaction.** Segments that are fragmented (live bytes below 50% of the object size) or small (below 1 MiB) are repacked: their live frames are fetched with coalesced ranged GETs, sorted by (inode, extent) so a file's data becomes physically contiguous, and sealed into new segments of up to 256 MiB. Each relocated extent is repointed with a conditional swap under the per-inode write lock, so a concurrent overwrite always wins. Drained sources are not deleted in the same pass — they become dead and a later pass removes them, which keeps in-flight reads of the old locations valid. Dense full-size segments are never rewritten.
 
@@ -107,15 +107,18 @@ The pass then reads every per-segment live-byte counter in one scan and streams 
 | Compaction budget per pass | 64 segments, 256 MiB |
 | Minimum payoff to compact | 1 MiB freed, or 64 MiB of live bytes gathered |
 | Segment deletes per pass | 1,024 |
+| Orphan sweep interval | 24 h wall-clock, persisted across restarts |
 
-A pass issues one streamed LIST of `segments/`, a 64-byte footer GET plus a directory GET per segment it verifies or repacks, and one DELETE per dead segment; a pass that repacks additionally issues the coalesced ranged GETs for the live frames and one PUT per packed segment.
+A pass issues a 64-byte footer GET plus a directory GET per segment it verifies or repacks, and one DELETE per dead segment; a pass that repacks additionally issues the coalesced ranged GETs for the live frames and one PUT per packed segment. No pass lists the object store, so steady-state GC traffic is proportional to the garbage produced, not to the data owned.
+
+**Orphan sweep.** A segment object with no counter at all — a crash between sealing an object and the commit that would have credited it, or a repack whose relocated extents were all overwritten before the repoint — is invisible to the counter scan. A slow sweep reclaims these: once every 24 hours of wall-clock time (the last-run timestamp is persisted, so frequent restarts cannot postpone it), it streams one LIST of `segments/`, issued per shard prefix with bounded concurrency, and point-checks each listed object's counter. Counter-less objects pass the same directory verification as dead segments and are deleted after the same style of horizon, capped at 1,024 per sweep. This is the only object listing in the system, and orphans are rare.
 
 ### Checkpoints Delay Reclamation
 
 [Checkpoints](/checkpoints) pin segment objects:
 
 - An ephemeral checkpoint — including a read replica's auto-renewed reader checkpoint — pushes the delete horizon to its expiry time plus a 30-second clock-skew margin, never below the 60-second floor.
-- A persistent checkpoint cannot be timed out. While one exists, segment compaction is paused and segments whose object timestamp is at or before the checkpoint's creation time plus a 300-second margin are neither deleted nor compacted. Newer garbage is still reclaimed.
+- A persistent checkpoint cannot be timed out. While one exists, segment deletion and compaction are paused entirely; the counters keep tracking garbage and reclamation catches up once the checkpoint is deleted. The orphan sweep is unaffected, because no manifest — and therefore no checkpoint — ever references an orphan.
 - If the checkpoint list cannot be read, the pass is skipped. Reclamation fails closed.
 
 ## Stage 3: Metadata Compaction and Object GC

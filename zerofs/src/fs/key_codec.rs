@@ -59,7 +59,7 @@ const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
 // Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
 const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
 // Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
-// orphan sweep. Persisted (not process-uptime) so the ~12h sweep cadence holds
+// orphan sweep. Persisted (not process-uptime) so the daily sweep cadence holds
 // across restarts (see gc.rs maybe_sweep_orphans).
 const SYSTEM_ORPHAN_SWEEP_SUBTYPE: u8 = 0x05;
 

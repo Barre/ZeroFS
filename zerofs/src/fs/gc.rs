@@ -38,19 +38,13 @@ const INFLIGHT_FLOOR_SECS: i64 = 60;
 /// slower clock can't have a segment deleted out from under it.
 const CLOCK_SKEW_MARGIN_SECS: i64 = 30;
 
-/// Margin past a persistent checkpoint's create time before a segment's object
-/// mtime is considered safely newer than the pin (and thus reclaimable). Larger
-/// than the expiry margin: this gates deletion of data a snapshot may reference,
-/// so err well on the safe side of clock skew between the writer and the store.
-const CHECKPOINT_SKEW_MARGIN_SECS: i64 = 300;
-
 /// Cadence of the slow orphan sweep (the only `list("segments")`). Gated by a
 /// persisted wall-clock timestamp, not process uptime, so it fires on this interval
 /// across restarts. Coarse on purpose: the fast reclaim runs entirely off the local
 /// segcount scan; this sweep exists only to reclaim counter-less orphan objects (a
 /// crash between sealing an object and its crediting commit, or a compaction whose
 /// repoints all lost the CAS), which are rare.
-const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 12 * 60 * 60;
+const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 pub struct GarbageCollector {
     db: Arc<Db>,
@@ -109,19 +103,18 @@ impl GarbageCollector {
                             })
                             .unwrap_or(floor);
                         // A persistent checkpoint (no expiry — backup / pinned reader)
-                        // pins a view that can't be timed out. Rather than pausing all
-                        // reclamation, protect segments that could predate the earliest
-                        // such checkpoint (by object mtime + a generous margin) and
-                        // reclaim newer garbage.
+                        // pins a view that can't be timed out; while one exists the
+                        // pass pauses all deletion and compaction (see
+                        // reclaim_segments_gated). Only its presence matters; the
+                        // timestamp is logged for the operator.
                         let protect_before = cps
                             .iter()
                             .filter(|c| c.expire_time.is_none())
                             .map(|c| c.create_time)
-                            .min()
-                            .map(|t| t + chrono::Duration::seconds(CHECKPOINT_SKEW_MARGIN_SECS));
-                        if let Some(pb) = protect_before {
+                            .min();
+                        if let Some(created) = protect_before {
                             info!(
-                                "segment GC: persistent checkpoint present; protecting segments created before {pb}, reclaiming newer garbage"
+                                "segment GC: persistent checkpoint present (earliest created {created}); segment deletion and compaction paused while one exists"
                             );
                         }
                         Ok(Some((horizon, protect_before)))

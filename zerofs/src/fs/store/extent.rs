@@ -1551,7 +1551,7 @@ impl ExtentStore {
     /// directory verify. Per-object counter point-gets keep RAM O(1) over the
     /// listing; only the small orphan set (capped per pass) is buffered.
     ///
-    /// For the slow (~12h) cadence: the LIST + per-object point-get is O(#segments)
+    /// For the slow (daily) cadence: the LIST + per-object point-get is O(#segments)
     /// object-store work, the price of finding counter-less objects the local scan
     /// can't. The caller runs it after the fast reclaim, never concurrently, so no
     /// in-flight compaction can leave a not-yet-credited packed segment eligible.
