@@ -1178,8 +1178,13 @@ mod tests {
         async fn open(store: Arc<dyn ObjectStore>, cache: Arc<FoyerHybridCache>) -> slatedb::Db {
             // Small L0s so the 8k rows freeze into several SSTs, exercising the
             // warm fan-out over more than one SST.
+            // No compactor: the 4 setup L0s meet the default compaction
+            // threshold, and a background compaction racing into a measured
+            // window charges its GETs there (and un-warms the cache by
+            // swapping the manifest to fresh SSTs).
             let settings = slatedb::config::Settings {
                 l0_sst_size_bytes: 64 * 1024,
+                compactor_options: None,
                 ..Default::default()
             };
             slatedb::DbBuilder::new(slatedb::object_store::path::Path::from("db"), store)
