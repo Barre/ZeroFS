@@ -580,11 +580,15 @@ secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 
 Substitution applies to these keys only; all other values are taken literally:
 
-- `url` and `encryption_password` under `[storage]`
+- `url`, `encryption_password`, and `storage_class` under `[storage]`
 - `dir` under `[cache]`
-- `url` under `[wal]`
+- `url` and `storage_class` under `[wal]`
 - `unix_socket` under `[servers.ninep]`, `[servers.nbd]`, and `[servers.rpc]`
+- `addresses` under `[servers.nfs]`, `[servers.ninep]`, `[servers.nbd]`, `[servers.rpc]`, `[servers.webui]`, and `[prometheus]`
 - every value in `[aws]`, `[azure]`, and `[gcp]`, including their `[wal.*]` variants
+- `node_id`, `replication_listen`, and `peers` under `[replication]`
+
+For array values (`peers` and the `addresses` lists) each entry is expanded independently, so `peers = ["${PEER_A}", "${PEER_B}"]` substitutes each element on its own; a single variable is not split into multiple entries. Expansion runs on the whole string before an `addresses` entry is parsed as a socket address, so the host, the port, or the entire value may come from a variable: `addresses = ["${POD_IP}:2049"]` and `addresses = ["${BIND_ADDR}"]` are both valid.
 
 If a referenced variable is unset, the configuration fails to load with `Failed to expand environment variable`. A literal `$` in an expandable value — an encryption password, for example — must be written `$$`.
 
