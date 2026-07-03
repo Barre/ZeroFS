@@ -92,7 +92,11 @@ pub struct WalConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub url: String,
     /// Object storage class/tier for WAL writes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_string"
+    )]
     pub storage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
@@ -199,15 +203,20 @@ impl<'de> Deserialize<'de> for ReplicationRole {
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     /// This node's stable identity within the pair.
+    #[serde(deserialize_with = "deserialize_expandable_string")]
     pub node_id: String,
     /// Role: "leader" or "standby".
     pub role: ReplicationRole,
     /// Peer address(es). On a leader, the standby's `replication_listen`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_expandable_string_vec")]
     pub peers: Vec<String>,
     /// Address this node listens on for the replication stream (a standby
     /// receives the leader's ships here).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_string",
+        default
+    )]
     pub replication_listen: Option<String>,
 }
 
@@ -318,7 +327,11 @@ pub struct StorageConfig {
     pub encryption_password: String,
     /// Object storage class/tier for data writes, passed through verbatim as the
     /// per-backend tiering header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_string"
+    )]
     pub storage_class: Option<String>,
 }
 
@@ -442,7 +455,10 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WebUIConfig {
-    #[serde(default = "default_webui_addresses")]
+    #[serde(
+        default = "default_webui_addresses",
+        deserialize_with = "deserialize_expandable_socket_addrs"
+    )]
     pub addresses: HashSet<SocketAddr>,
     pub uid: u32,
     pub gid: u32,
@@ -460,14 +476,22 @@ fn default_webui_addresses() -> HashSet<SocketAddr> {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NfsConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_socket_addrs",
+        default
+    )]
     pub addresses: Option<HashSet<SocketAddr>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NinePConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_socket_addrs",
+        default
+    )]
     pub addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -480,7 +504,11 @@ pub struct NinePConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NbdConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_socket_addrs",
+        default
+    )]
     pub addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -493,7 +521,11 @@ pub struct NbdConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RpcConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_expandable_socket_addrs",
+        default
+    )]
     pub addresses: Option<HashSet<SocketAddr>>,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -521,7 +553,10 @@ fn default_telemetry() -> Option<TelemetryConfig> {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PrometheusConfig {
-    #[serde(default = "default_prometheus_addresses")]
+    #[serde(
+        default = "default_prometheus_addresses",
+        deserialize_with = "deserialize_expandable_socket_addrs"
+    )]
     pub addresses: HashSet<SocketAddr>,
 }
 
@@ -618,6 +653,82 @@ where
             e
         ))),
     }
+}
+
+fn deserialize_optional_expandable_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    opt.map(|s| match shellexpand::env(&s) {
+        Ok(expanded) => Ok(expanded.into_owned()),
+        Err(e) => Err(serde::de::Error::custom(format!(
+            "Failed to expand environment variable: {}",
+            e
+        ))),
+    })
+    .transpose()
+}
+
+fn deserialize_expandable_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let items = Vec::<String>::deserialize(deserializer)?;
+    items
+        .into_iter()
+        .map(|s| match shellexpand::env(&s) {
+            Ok(expanded) => Ok(expanded.into_owned()),
+            Err(e) => Err(serde::de::Error::custom(format!(
+                "Failed to expand environment variable: {}",
+                e
+            ))),
+        })
+        .collect()
+}
+
+/// Expand `${VAR}` in each entry, then parse to a `SocketAddr`. Bind addresses
+/// deserialize straight to `SocketAddr`, so without this a templated value like
+/// `"${POD_IP}:2049"` would fail to parse before it could be expanded.
+fn expand_socket_addrs<E>(raw: Vec<String>) -> Result<HashSet<SocketAddr>, E>
+where
+    E: de::Error,
+{
+    let mut set = HashSet::with_capacity(raw.len());
+    for s in raw {
+        let expanded = shellexpand::env(&s).map_err(|e| {
+            de::Error::custom(format!("Failed to expand environment variable: {}", e))
+        })?;
+        let addr = expanded.parse::<SocketAddr>().map_err(|e| {
+            de::Error::custom(format!(
+                "invalid socket address {expanded:?} (expected host:port): {e}"
+            ))
+        })?;
+        set.insert(addr);
+    }
+    Ok(set)
+}
+
+fn deserialize_expandable_socket_addrs<'de, D>(
+    deserializer: D,
+) -> Result<HashSet<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    expand_socket_addrs(Vec::<String>::deserialize(deserializer)?)
+}
+
+fn deserialize_optional_expandable_socket_addrs<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashSet<SocketAddr>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer)?
+        .map(expand_socket_addrs)
+        .transpose()
 }
 
 fn deserialize_expandable_path<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
@@ -946,6 +1057,10 @@ impl Settings {
              #   encryption_password = \"${{ZEROFS_PASSWORD}}\"\n\
              #   dir = \"${{HOME}}/.cache/zerofs\"\n\
              #   access_key_id = \"${{AWS_ACCESS_KEY_ID}}\"\n\
+             #   peers = [\"${{PEER_A_ADDR}}\", \"${{PEER_B_ADDR}}\"]\n\
+             # \n\
+             # In array values (e.g. [replication] peers) each entry is expanded on\n\
+             # its own; a single variable is not split into multiple entries.\n\
              #\n\
              # All referenced environment variables must be set, or the config will fail to load.\n\
              #\n\
@@ -962,6 +1077,8 @@ impl Settings {
              #   addresses = [\"0.0.0.0:2049\"]                    # All IPv4 interfaces\n\
              #   addresses = [\"[::]:2049\"]                       # All IPv6 interfaces\n\
              #   addresses = [\"127.0.0.1:2049\", \"[::1]:2049\"]  # Both IPv4 and IPv6 localhost\n\
+             #   addresses = [\"${{POD_IP}}:2049\"]                # env vars are expanded before the address is parsed,\n\
+             #                                                  # so the host, the port, or the whole value may come from one\n\
              #\n\
              # ============================================================================\n\
              # CLOUD STORAGE\n\
@@ -1511,5 +1628,169 @@ peers = ["127.0.0.1:5600", ""]"#,
         );
         let err = format!("{:#}", write_and_load(&content).unwrap_err());
         assert!(err.contains("empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn test_replication_node_id_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_NODE_ID", "my-node");
+        }
+
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "${ZEROFS_TEST_NODE_ID}"
+role = "leader""#,
+        );
+        let repl = write_and_load(&content).unwrap().replication.unwrap();
+        assert_eq!(repl.node_id, "my-node");
+    }
+
+    #[test]
+    fn test_replication_listen_and_peers_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_LISTEN", "10.0.0.1:9000");
+            env::set_var("ZEROFS_TEST_PEER", "10.0.0.2:9000");
+        }
+
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+replication_listen = "${ZEROFS_TEST_LISTEN}"
+peers = ["${ZEROFS_TEST_PEER}"]"#,
+        );
+        let repl = write_and_load(&content).unwrap().replication.unwrap();
+        assert_eq!(repl.replication_listen.as_deref(), Some("10.0.0.1:9000"));
+        assert_eq!(repl.peers, vec!["10.0.0.2:9000".to_string()]);
+    }
+
+    #[test]
+    fn test_storage_class_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_STORAGE_CLASS", "INTELLIGENT_TIERING");
+        }
+
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+storage_class = "${ZEROFS_TEST_STORAGE_CLASS}"
+
+[servers]
+"#;
+        let settings = write_and_load(content).unwrap();
+        assert_eq!(
+            settings.storage.storage_class.as_deref(),
+            Some("INTELLIGENT_TIERING")
+        );
+    }
+
+    #[test]
+    fn test_server_addresses_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_NFS_ADDR", "0.0.0.0:2049");
+            env::set_var("ZEROFS_TEST_PROM_ADDR", "0.0.0.0:9091");
+        }
+
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["${ZEROFS_TEST_NFS_ADDR}"]
+
+[prometheus]
+addresses = ["${ZEROFS_TEST_PROM_ADDR}"]
+"#;
+        let settings = write_and_load(content).unwrap();
+        let nfs = settings.servers.nfs.unwrap().addresses.unwrap();
+        assert!(nfs.contains(&"0.0.0.0:2049".parse().unwrap()));
+        let prom = settings.prometheus.unwrap().addresses;
+        assert!(prom.contains(&"0.0.0.0:9091".parse().unwrap()));
+    }
+
+    // Expansion runs on the whole string before it is parsed, so a variable can
+    // supply just the host (or just the port) with the rest written literally.
+    #[test]
+    fn test_address_partial_env_var_expansion() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_HOST", "10.0.0.7");
+            env::set_var("ZEROFS_TEST_PORT", "2049");
+        }
+
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["${ZEROFS_TEST_HOST}:2049", "127.0.0.1:${ZEROFS_TEST_PORT}"]
+"#;
+        let nfs = write_and_load(content)
+            .unwrap()
+            .servers
+            .nfs
+            .unwrap()
+            .addresses
+            .unwrap();
+        assert!(nfs.contains(&"10.0.0.7:2049".parse().unwrap()));
+        assert!(nfs.contains(&"127.0.0.1:2049".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_address_invalid_after_expansion_rejected() {
+        unsafe {
+            env::set_var("ZEROFS_TEST_BAD_ADDR", "not-an-address");
+        }
+
+        let content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "test"
+
+[servers.nfs]
+addresses = ["${ZEROFS_TEST_BAD_ADDR}"]
+"#;
+        let err = format!("{:#}", write_and_load(content).unwrap_err());
+        assert!(err.contains("socket address"), "got: {err}");
+    }
+
+    // The generated config serializes its default addresses as SocketAddr
+    // strings; they must re-parse through the expandable-address deserializer.
+    #[test]
+    fn test_generated_config_round_trips() {
+        unsafe {
+            env::set_var("ZEROFS_PASSWORD", "pw");
+            env::set_var("AWS_ACCESS_KEY_ID", "key");
+            env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+        }
+        let rendered = Settings::render_default_config().unwrap();
+        let settings = write_and_load(&rendered).unwrap();
+        assert!(
+            settings
+                .servers
+                .nfs
+                .unwrap()
+                .addresses
+                .unwrap()
+                .contains(&"127.0.0.1:2049".parse().unwrap())
+        );
     }
 }
