@@ -400,6 +400,29 @@
                  n)))
        (into (sorted-set))))
 
+(defn classify-add-error
+  "Classify an IOException from the add path (create temp, rename into place,
+  read back) as indeterminate (:info) or determinate (:fail). ENOENT and EEXIST
+  are indeterminate: a resent create/rename re-executes when no surviving node
+  holds its op-id (e.g. two takeovers inside one retry window), and re-executing
+  an ALREADY-APPLIED rename fails exactly this way (source temp gone / target
+  present). The NIO two-path exceptions Files/move throws for those errnos carry
+  a null reason -- their message is just \"src -> dst\" -- so they must be
+  classified by class; the message patterns remain as a fallback for the
+  single-path java.io exceptions (e.g. the read-back's FileNotFoundException)."
+  [e]
+  (let [msg (str (.getMessage e))]
+    (cond
+      (instance? java.nio.file.FileAlreadyExistsException e)
+      {:type :info :error :retried-create}
+      (instance? java.nio.file.NoSuchFileException e)
+      {:type :info :error :not-durable-here}
+      (re-find #"(?i)file exists" msg)
+      {:type :info :error :retried-create}
+      (re-find #"(?i)no such file|not found" msg)
+      {:type :info :error :not-durable-here}
+      :else {:type :fail :error msg})))
+
 ;; `counter` assigns globally-unique add values; `live` maps each worker (process)
 ;; to the values it has added and not yet removed, so a remove only ever targets a
 ;; value this same worker added, so no concurrent add/remove of one value. Both are
@@ -448,13 +471,7 @@
                      (assoc op :type :ok :value v)
                      (assoc op :type :info :value v :error :content-not-durable-here))
                    (catch java.io.IOException e
-                     (let [msg (str (.getMessage e))]
-                       (cond
-                         (re-find #"(?i)file exists" msg)
-                         (assoc op :type :info :value v :error :retried-create)
-                         (re-find #"(?i)no such file|not found" msg)
-                         (assoc op :type :info :value v :error :not-durable-here)
-                         :else (assoc op :type :fail :value v :error msg)))))))
+                     (merge op {:value v} (classify-add-error e))))))
         ;; Remove one of THIS worker's live values (none queued -> nothing to do).
         :remove (if-let [v (first (get @live (:process op)))]
                   (let [f (io/file (subdir dir v) (str v))]
