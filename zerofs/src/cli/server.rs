@@ -395,6 +395,30 @@ pub(crate) async fn build_block_hybrid(
     Ok(Arc::new(FoyerHybridCache::new_with_cache(hybrid)))
 }
 
+/// Block size of the parts disk cache: foyer's eviction/reclaim unit, and the
+/// max cacheable entry size.
+const PARTS_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Disk-engine knobs for the parts cache, scaled to the device.
+struct PartsEngineKnobs {
+    flushers: usize,
+    clean_block_threshold: usize,
+    submit_queue_bytes: usize,
+    buffer_pool_bytes: usize,
+}
+
+fn parts_engine_knobs(disk_bytes: usize) -> PartsEngineKnobs {
+    let blocks = disk_bytes / PARTS_BLOCK_SIZE;
+    let flushers = (blocks / 8).clamp(1, 4);
+
+    PartsEngineKnobs {
+        flushers,
+        clean_block_threshold: (blocks / 64).clamp(flushers, 8),
+        submit_queue_bytes: (disk_bytes / 4).clamp(16 * 1024 * 1024, 1024 * 1024 * 1024),
+        buffer_pool_bytes: flushers * PARTS_BLOCK_SIZE,
+    }
+}
+
 pub(crate) async fn build_parts_hybrid(
     cache_root: &std::path::Path,
     memory_bytes: usize,
@@ -408,6 +432,9 @@ pub(crate) async fn build_parts_hybrid(
     tokio::fs::create_dir_all(&parts_root)
         .await
         .with_context(|| format!("creating parts cache dir at {}", parts_root.display()))?;
+
+    let knobs = parts_engine_knobs(disk_bytes);
+
     HybridCacheBuilder::new()
         .with_name("zerofs-object-prefetch-parts")
         .memory(memory_bytes)
@@ -423,7 +450,12 @@ pub(crate) async fn build_parts_hybrid(
                     .build()
                     .map_err(|e| foyer_build_error("parts foyer device build failed", e))?,
             )
-            .with_block_size(64 * 1024 * 1024),
+            .with_block_size(PARTS_BLOCK_SIZE)
+            .with_submit_queue_size_threshold(knobs.submit_queue_bytes)
+            .with_flushers(knobs.flushers)
+            .with_reclaimers(knobs.flushers)
+            .with_clean_block_threshold(knobs.clean_block_threshold)
+            .with_buffer_pool_size(knobs.buffer_pool_bytes),
         )
         .build()
         .await
@@ -1120,6 +1152,30 @@ mod tests {
         assert_eq!(split_disk_budget(4096 * gib), (4080 * gib, 16 * gib));
         // Tiny budgets still floor each side at 1 GiB.
         assert_eq!(split_disk_budget(gib / 2), (gib, gib));
+    }
+
+    #[test]
+    fn parts_engine_knobs_scale_with_device() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let large = parts_engine_knobs(583 * gib);
+        assert_eq!(large.flushers, 4);
+        assert_eq!(large.clean_block_threshold, 8);
+        assert_eq!(large.submit_queue_bytes, gib);
+        assert_eq!(large.buffer_pool_bytes, 256 * mib);
+
+        let floor = parts_engine_knobs(gib);
+        assert_eq!(floor.flushers, 2);
+        assert_eq!(floor.clean_block_threshold, 2);
+        assert_eq!(floor.submit_queue_bytes, 256 * mib);
+        assert_eq!(floor.buffer_pool_bytes, 128 * mib);
+
+        // Degenerate device (below one block): everything at its floor.
+        let tiny = parts_engine_knobs(mib);
+        assert_eq!(tiny.flushers, 1);
+        assert_eq!(tiny.clean_block_threshold, 1);
+        assert_eq!(tiny.submit_queue_bytes, 16 * mib);
+        assert_eq!(tiny.buffer_pool_bytes, 64 * mib);
     }
 
     #[test]
