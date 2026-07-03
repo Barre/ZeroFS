@@ -138,6 +138,8 @@ pub struct Settings {
     pub filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lsm: Option<LsmConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub gc: Option<GcConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,6 +436,85 @@ impl LsmConfig {
 
     pub fn sync_writes(&self) -> bool {
         self.sync_writes.unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GcConfig {
+    /// Seconds between segment-GC passes while the filesystem is active. The
+    /// ceiling of the adaptive cadence: the loop never sleeps longer. Values
+    /// below the ~30 s flush cadence make a busy pass's barrier seal real
+    /// sub-1-MiB segments — each itself future GC work.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub interval_secs: Option<u64>,
+    /// Seconds between passes while a saturated backlog meets an idle store
+    /// (no reads, no writes since the previous pass). A fast pass performs a
+    /// full reclamation round plus roughly two small bookkeeping PUTs of
+    /// fixed overhead (the previous pass's own commits flushing); total
+    /// fast-mode work is bounded by the backlog. Setting it equal to
+    /// interval_secs disables adaptation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub idle_interval_secs: Option<u64>,
+    /// Whether reads steer compaction (nominations, seam heat, chain repacks).
+    /// The counter-driven policy and the tail scrub are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub read_directed: Option<bool>,
+    /// Tail-scrub floor: a write-cold segment more than this percent dead —
+    /// but not dead enough for normal compaction candidacy — is repacked with
+    /// leftover pass budget. The space-amplification dial: worst-case overhead
+    /// on write-cold data is 1/(1 - floor/100) of live bytes, bought at up to
+    /// (100 - floor)/floor bytes rewritten per byte reclaimed. 0 disables the
+    /// scrub; 50 empties the band, same effect.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tail_scrub_min_dead_percent: Option<u64>,
+}
+
+impl GcConfig {
+    /// Default interval_secs: 60 seconds, the historical fixed cadence.
+    pub const DEFAULT_INTERVAL_SECS: u64 = 60;
+    /// Default idle_interval_secs: 5 seconds (~12x drain while idle).
+    pub const DEFAULT_IDLE_INTERVAL_SECS: u64 = 5;
+    /// Default read_directed: true.
+    pub const DEFAULT_READ_DIRECTED: bool = true;
+    /// Default tail_scrub_min_dead_percent: 5 (1.053x worst-case space
+    /// amplification at up to 19x rewrite per reclaimed byte; the request-cost
+    /// break-even on S3 is near 1.5%, so 5 is the write-amplification choice).
+    pub const DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT: u64 = 5;
+
+    /// Minimum interval_secs: each pass runs a flush barrier, so the LSM
+    /// flush floor applies.
+    pub const MIN_INTERVAL_SECS: u64 = LsmConfig::MIN_FLUSH_INTERVAL_SECS;
+    /// Minimum idle_interval_secs: below ~1 s the pass's barrier round-trips
+    /// stop amortizing.
+    pub const MIN_IDLE_INTERVAL_SECS: u64 = 1;
+
+    pub fn interval_secs(&self) -> u64 {
+        self.interval_secs
+            .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
+            .max(Self::MIN_INTERVAL_SECS)
+    }
+
+    pub fn idle_interval_secs(&self) -> u64 {
+        self.idle_interval_secs
+            .unwrap_or(Self::DEFAULT_IDLE_INTERVAL_SECS)
+            .max(Self::MIN_IDLE_INTERVAL_SECS)
+            .min(self.interval_secs())
+    }
+
+    pub fn read_directed(&self) -> bool {
+        self.read_directed.unwrap_or(Self::DEFAULT_READ_DIRECTED)
+    }
+
+    /// `None` = scrub disabled (configured 0).
+    pub fn tail_scrub_min_dead_percent(&self) -> Option<u64> {
+        match self.tail_scrub_min_dead_percent {
+            Some(0) => None,
+            v => Some(
+                v.unwrap_or(Self::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT)
+                    .clamp(1, 50),
+            ),
+        }
     }
 }
 
@@ -913,6 +994,7 @@ impl Settings {
             },
             filesystem: None,
             lsm: None,
+            gc: None,
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
@@ -991,6 +1073,26 @@ impl Settings {
         toml_string.push_str("                                   # is always honored. This flag only governs writes between fsync calls. When on,\n");
         toml_string.push_str("                                   # they become durable on return instead of buffered until the next periodic flush.\n");
         toml_string.push_str("                                   # Expensive: the WAL is off, so each write forces a full seal + memtable flush.\n");
+
+        toml_string
+            .push_str("\n# Optional segment garbage-collection tuning. Governs the segment\n");
+        toml_string
+            .push_str("# reclamation loop only — not the tombstone sweep or LSM compaction.\n");
+        toml_string.push_str("\n# [gc]\n");
+        toml_string.push_str("# interval_secs = 60               # Pass interval while the store is active (default: 60, min: 5).\n");
+        toml_string.push_str("#                                  # Below the ~30 s flush cadence, busy passes seal sub-1-MiB segments.\n");
+        toml_string.push_str("# idle_interval_secs = 5           # Pass interval while a saturated backlog meets an idle store\n");
+        toml_string.push_str("#                                  # (default: 5, min: 1, capped at interval_secs; equal = adaptation off).\n");
+        toml_string.push_str("#                                  # A fast pass runs a full reclamation round plus ~2 small PUTs of\n");
+        toml_string.push_str("#                                  # overhead; total fast-mode work is bounded by the backlog.\n");
+        toml_string.push_str("# read_directed = true             # Reads steer compaction: nominations, seam heat, chain repacks\n");
+        toml_string.push_str("#                                  # (default: true). Counter-driven reclamation is unaffected.\n");
+        toml_string.push_str("# tail_scrub_min_dead_percent = 5  # Repack write-cold segments more than this % dead that normal\n");
+        toml_string.push_str("#                                  # candidacy would strand forever (default: 5, range 1-50; 0 disables\n");
+        toml_string.push_str("#                                  # the scrub).\n");
+        toml_string.push_str("#                                  # Space overhead on write-cold data is capped at 1/(1 - floor/100)\n");
+        toml_string.push_str("#                                  # of live bytes, paid with up to (100-floor)/floor bytes rewritten\n");
+        toml_string.push_str("#                                  # per byte reclaimed, using leftover pass budget only.\n");
 
         toml_string.push_str(
             "\n# Optional HA replication: a leader + standby pair over one object store, with\n",
@@ -1450,6 +1552,48 @@ ignore_fsync = true"#,
         );
         let settings = write_and_load(&content).unwrap();
         assert!(settings.filesystem.unwrap().ignore_fsync);
+    }
+
+    #[test]
+    fn gc_section_parses_defaults_and_clamps() {
+        // Absent section: every accessor returns the historical behavior.
+        let gc: GcConfig = toml::from_str("").unwrap();
+        assert_eq!(gc.interval_secs(), GcConfig::DEFAULT_INTERVAL_SECS);
+        assert_eq!(
+            gc.idle_interval_secs(),
+            GcConfig::DEFAULT_IDLE_INTERVAL_SECS
+        );
+        assert!(gc.read_directed());
+        assert_eq!(
+            gc.tail_scrub_min_dead_percent(),
+            Some(GcConfig::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT)
+        );
+
+        // Out-of-range values clamp silently
+        let gc: GcConfig = toml::from_str(
+            "interval_secs = 2\nidle_interval_secs = 30\n\
+             tail_scrub_min_dead_percent = 90\nread_directed = false\n",
+        )
+        .unwrap();
+        assert_eq!(gc.interval_secs(), GcConfig::MIN_INTERVAL_SECS);
+        assert_eq!(gc.idle_interval_secs(), GcConfig::MIN_INTERVAL_SECS);
+        assert_eq!(gc.tail_scrub_min_dead_percent(), Some(50));
+        assert!(!gc.read_directed());
+
+        // 0 is off, not a clamp to the most aggressive floor.
+        let gc: GcConfig = toml::from_str("tail_scrub_min_dead_percent = 0").unwrap();
+        assert_eq!(gc.tail_scrub_min_dead_percent(), None);
+
+        // A [gc] table parses as part of Settings.
+        let content = base_config_with_replication(
+            r#"[gc]
+interval_secs = 120
+tail_scrub_min_dead_percent = 10"#,
+        );
+        let settings = write_and_load(&content).unwrap();
+        let gc = settings.gc.unwrap();
+        assert_eq!(gc.interval_secs(), 120);
+        assert_eq!(gc.tail_scrub_min_dead_percent(), Some(10));
     }
 
     // Pre-2.0 configs set the removed [lsm] wal_enabled / max_unflushed_gb
