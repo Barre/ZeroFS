@@ -702,7 +702,13 @@ pub async fn build_slatedb(
                 let worker = Some(slatedb::config::CompactionWorkerOptions {
                     max_sst_size: 256 * 1024 * 1024,
                     max_fetch_tasks: 2,
-                    bytes_to_fetch: 16 * 1024 * 1024,
+                    bytes_to_fetch: 8 * 1024 * 1024,
+                    // Metadata-only DB now that chunks live outside SlateDB, so
+                    // compactions are small. Match the 2-job coordinator cap: the
+                    // 256MiB max_sst_size floor keeps a compaction single-range
+                    // until its input tops 512MiB, so only a rare large one splits
+                    // into a second sub-range instead of running single-threaded.
+                    max_subcompactions: 2,
                     ..Default::default()
                 });
                 let compactor = CompactorBuilder::new(db_path, compactor_object_store)

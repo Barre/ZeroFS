@@ -328,7 +328,7 @@ ZeroFS keeps metadata — inodes, directory entries, and the per-extent frame po
 ```toml
 [lsm]
 l0_max_ssts = 256                # Max SST files in L0 before compaction
-max_concurrent_compactions = 8   # Max concurrent compaction operations
+max_concurrent_compactions = 2   # Max concurrent compaction operations
 flush_interval_secs = 30         # Interval between periodic flushes (in seconds)
 sync_writes = false              # Make every write durable on return
 ```
@@ -337,7 +337,7 @@ sync_writes = false              # Make every write durable on return
 
 - **`l0_max_ssts`** (default: 256, min: 4): Maximum number of SST (Sorted String Table) files allowed in level 0 before triggering compaction. The same value applies per key. Lower values reduce read amplification but increase write amplification. Higher values do the opposite.
 
-- **`max_concurrent_compactions`** (default: 8, min: 1): Maximum number of metadata compaction operations that can run concurrently. Compaction always runs embedded in `zerofs run`; there is no separate compactor process.
+- **`max_concurrent_compactions`** (default: 2, min: 1): Maximum number of metadata compaction operations that can run concurrently. The store holds only metadata (file contents are immutable segment objects), so compactions are small and seldom pile up; a low cap keeps object-store request and CPU use down. Compaction always runs embedded in `zerofs run`; there is no separate compactor process.
 
 - **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Each flush first seals the open segment buffer, uploading buffered file data, then flushes the metadata store. Between flushes, up to 256 MiB of committed writes can sit in the in-memory open segment. `fsync` calls from clients (9P fsync, NFS COMMIT, NBD flush) always trigger an immediate flush regardless of this interval, unless `[filesystem] ignore_fsync = true`, which makes `fsync` a no-op — see [High Availability](#high-availability).
 

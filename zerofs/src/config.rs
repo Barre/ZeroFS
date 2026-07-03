@@ -402,9 +402,9 @@ impl LsmConfig {
     /// metadata, so the point-lookup cost is negligible. Applies to
     /// `l0_max_ssts_per_key` too.
     pub const DEFAULT_L0_MAX_SSTS: usize = 256;
-    /// Default max_concurrent_compactions: 8
-    pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 8;
-    /// Default flush_interval_secs: 30 seconds
+    /// Default max_concurrent_compactions
+    pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 2;
+    /// Default flush_interval_sec
     pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 
     /// Minimum l0_max_ssts to maintain reasonable performance
@@ -984,7 +984,7 @@ impl Settings {
         toml_string.push_str("# Only modify these if you understand LSM tree behavior\n");
         toml_string.push_str("\n# [lsm]\n");
         toml_string.push_str("# l0_max_ssts = 256                # Max SST files in L0 before compaction (default: 256, min: 4)\n");
-        toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
+        toml_string.push_str("# max_concurrent_compactions = 2   # Max concurrent compaction operations (default: 2, min: 1)\n");
         toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
         toml_string.push_str("# sync_writes = false              # Flush every write to object storage before returning success (default: false).\n");
         toml_string.push_str("                                   # Does NOT affect POSIX fsync semantics: explicit fsync from clients\n");
