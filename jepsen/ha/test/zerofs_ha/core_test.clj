@@ -40,3 +40,27 @@
                     {:type :info :f :remove :value 1}        ; might have removed -> indeterminate
                     {:type :ok   :f :read   :value (sorted-set)}])]  ; absent, but that's allowed
       (is (true? (:valid? r))))))
+
+(deftest add-error-classification
+  (testing "ENOENT/EEXIST from the rename are indeterminate: a resent rename whose
+            original applied re-executes exactly this way. The NIO two-path
+            exceptions carry a null reason (message is just \"src -> dst\", no
+            errno text), so classification must not depend on the message"
+    (is (= {:type :info :error :not-durable-here}
+           (core/classify-add-error
+            (java.nio.file.NoSuchFileException. "/mnt/d1/.tmp-9" "/mnt/d1/9" nil))))
+    (is (= {:type :info :error :retried-create}
+           (core/classify-add-error
+            (java.nio.file.FileAlreadyExistsException. "/mnt/d1/.tmp-9" "/mnt/d1/9" nil)))))
+  (testing "single-path java.io exceptions still classify by message text"
+    (is (= {:type :info :error :not-durable-here}
+           (core/classify-add-error
+            (java.io.FileNotFoundException. "/mnt/d1/9 (No such file or directory)"))))
+    (is (= {:type :info :error :retried-create}
+           (core/classify-add-error
+            (java.io.IOException. "File exists")))))
+  (testing "other IO errors stay determinate failures"
+    (is (= :fail (:type (core/classify-add-error
+                         (java.io.IOException. "Bad file descriptor")))))
+    (is (= :fail (:type (core/classify-add-error
+                         (java.io.IOException. "Input/output error")))))))
