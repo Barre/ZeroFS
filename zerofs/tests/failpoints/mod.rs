@@ -909,6 +909,7 @@ async fn test_crash_gc_after_extent_delete() {
         fs.extent_store.clone(),
         Arc::clone(&fs.stats),
         None,
+        zerofs::fs::gc::GcTuning::default(),
     ));
     let handle = tokio::task::spawn(async move { gc.run().await });
     let _ = handle.await;
@@ -955,6 +956,7 @@ async fn test_crash_gc_after_tombstone_update() {
         fs.extent_store.clone(),
         Arc::clone(&fs.stats),
         None,
+        zerofs::fs::gc::GcTuning::default(),
     ));
     let handle = tokio::task::spawn(async move { gc.run().await });
     let _ = handle.await;
@@ -3082,7 +3084,7 @@ async fn test_crash_compact_after_seal_before_repoint() {
     let segids = fs.extent_store.list_segments().await.unwrap();
     fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "panic").unwrap();
     let es = fs.extent_store.clone();
-    let handle = tokio::task::spawn(async move { es.compact_segments(&segids).await });
+    let handle = tokio::task::spawn(async move { es.compact_segments(&segids, &[]).await });
     let _ = handle.await;
     fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
     drop(fs);

@@ -1,8 +1,11 @@
+use crate::config::GcConfig;
 use crate::db::Db;
 use crate::fs::EXTENT_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
-use crate::fs::store::{ExtentStore, TombstoneStore};
+use crate::fs::store::{
+    ExtentStore, PassOutcome, PassStatus, QUIESCENT_AFTER_DEFAULT, TombstoneStore,
+};
 use crate::task::{spawn_named, spawn_named_on};
 use bytes::Bytes;
 use chrono::Utc;
@@ -10,6 +13,7 @@ use slatedb::admin::Admin;
 use slatedb::config::WriteOptions;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -21,10 +25,6 @@ use fp::fail_point;
 
 const MAX_EXTENTS_PER_ROUND: usize = 10_000;
 const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
-/// Interval between segment reclamation passes. Purely a responsiveness knob:
-/// deletion safety rides on the per-segment delete horizon. Kept at/above the
-/// periodic flush cadence (~30s) so the pass's seal+flush is a near no-op.
-const SEGMENT_GC_INTERVAL_SECS: u64 = 60;
 
 /// Floor the delete horizon this far past now, so reclamation still covers the
 /// writer's own in-flight reads when no checkpoint is pinning a view.
@@ -41,6 +41,98 @@ const CLOCK_SKEW_MARGIN_SECS: i64 = 30;
 /// rare; the fast reclaim covers everything else.
 const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
+/// Resolved segment-GC tuning
+#[derive(Debug, Clone, Copy)]
+pub struct GcTuning {
+    /// Pass interval while the store is active.
+    pub interval: Duration,
+    /// Pass interval while a saturated backlog meets an idle store.
+    pub idle_interval: Duration,
+    /// Whether reads feed compaction at all (nominations, seam heat, chains).
+    pub read_directed: bool,
+    /// Tail-scrub floor, percent dead; `None` = scrub off.
+    pub tail_min_dead_percent: Option<u64>,
+    /// How long the open counter must sit unchanged before the whole store
+    /// counts as write-cold.
+    pub quiescent_after: Duration,
+}
+
+impl Default for GcTuning {
+    fn default() -> Self {
+        GcConfig::default().into()
+    }
+}
+
+impl From<GcConfig> for GcTuning {
+    fn from(c: GcConfig) -> Self {
+        Self {
+            interval: Duration::from_secs(c.interval_secs()),
+            idle_interval: Duration::from_secs(c.idle_interval_secs()),
+            read_directed: c.read_directed(),
+            tail_min_dead_percent: c.tail_scrub_min_dead_percent(),
+            quiescent_after: QUIESCENT_AFTER_DEFAULT,
+        }
+    }
+}
+
+/// Sampled activity counters for the idle test.
+#[derive(Debug, Clone, Copy)]
+struct Activity {
+    bytes_read: u64,
+    bytes_written: u64,
+    write_ops: u64,
+    read_ops: u64,
+    total_ops: u64,
+    internal_mutations: u64,
+}
+
+impl Activity {
+    fn sample(stats: &FileSystemStats) -> Self {
+        Self {
+            bytes_read: stats.bytes_read.load(Ordering::Relaxed),
+            bytes_written: stats.bytes_written.load(Ordering::Relaxed),
+            write_ops: stats.write_operations.load(Ordering::Relaxed),
+            read_ops: stats.read_operations.load(Ordering::Relaxed),
+            total_ops: stats.total_operations.load(Ordering::Relaxed),
+            internal_mutations: stats.tombstones_created.load(Ordering::Relaxed)
+                + stats.tombstones_processed.load(Ordering::Relaxed)
+                + stats.gc_extents_deleted.load(Ordering::Relaxed)
+                + stats.files_deleted.load(Ordering::Relaxed),
+        }
+    }
+
+    fn idle_since(&self, prev: &Self) -> bool {
+        let d_read_bytes = self.bytes_read.saturating_sub(prev.bytes_read);
+        let d_write_bytes = self.bytes_written.saturating_sub(prev.bytes_written);
+        let d_write_ops = self.write_ops.saturating_sub(prev.write_ops);
+        let d_read_ops = self.read_ops.saturating_sub(prev.read_ops);
+        let d_total = self.total_ops.saturating_sub(prev.total_ops);
+        let d_meta_commits = d_total
+            .saturating_sub(d_read_ops)
+            .saturating_sub(d_write_ops);
+        let d_internal = self
+            .internal_mutations
+            .saturating_sub(prev.internal_mutations);
+        d_read_bytes == 0
+            && d_write_bytes == 0
+            && d_write_ops == 0
+            && d_meta_commits == 0
+            && d_internal == 0
+    }
+}
+
+/// Fast only when a completed pass left actionable backlog and the window
+/// was idle.
+fn next_delay(outcome: Option<PassOutcome>, idle: bool, tuning: &GcTuning) -> Duration {
+    match outcome {
+        Some(PassOutcome {
+            status: PassStatus::Completed { saturated: true },
+            ..
+        }) if idle => tuning.idle_interval,
+        _ => tuning.interval,
+    }
+}
+
 pub struct GarbageCollector {
     db: Arc<Db>,
     tombstone_store: TombstoneStore,
@@ -49,6 +141,7 @@ pub struct GarbageCollector {
     /// Read-only admin for listing active checkpoints, which gate segment
     /// reclamation. `None` disables the check (tests).
     checkpoint_admin: Option<Admin>,
+    tuning: GcTuning,
 }
 
 impl GarbageCollector {
@@ -58,6 +151,7 @@ impl GarbageCollector {
         extent_store: ExtentStore,
         stats: Arc<FileSystemStats>,
         checkpoint_admin: Option<Admin>,
+        tuning: GcTuning,
     ) -> Self {
         Self {
             db,
@@ -65,14 +159,16 @@ impl GarbageCollector {
             extent_store,
             stats,
             checkpoint_admin,
+            tuning,
         }
     }
 
     /// Reclaim dead segment objects, unless a checkpoint pins an older manifest
     /// (whose view may still reference segments dead in the current view).
-    async fn maybe_reclaim_segments(&self) {
+    /// `keep_going` approves continuing a multi-batch drain mid-pass.
+    async fn maybe_reclaim_segments(&self, keep_going: impl Fn() -> bool) -> Option<PassOutcome> {
         // The gate runs inside reclaim_segments_gated, after its durable
-        // barrier — see that method for the checkpoint race this ordering
+        // barrier, see that method for the checkpoint race this ordering
         // closes. `floor` is sampled there too, so it covers in-flight reads
         // relative to the actual scan time.
         let checkpoint_admin = &self.checkpoint_admin;
@@ -92,9 +188,9 @@ impl GarbageCollector {
                                 (e + chrono::Duration::seconds(CLOCK_SKEW_MARGIN_SECS)).max(floor)
                             })
                             .unwrap_or(floor);
-                        // A persistent checkpoint (no expiry) can't be timed
-                        // out; its presence pauses all deletion and compaction
-                        // (see reclaim_segments_gated).
+                        // A persistent checkpoint can't be timed out; its
+                        // presence pauses all deletion and compaction (see
+                        // reclaim_segments_gated).
                         let protect_before = cps
                             .iter()
                             .filter(|c| c.expire_time.is_none())
@@ -116,8 +212,21 @@ impl GarbageCollector {
             }
         };
         // reclaim_segments_gated emits its own per-pass summary at info.
-        if let Err(e) = self.extent_store.reclaim_segments_gated(gate).await {
-            tracing::error!("segment GC failed: {:?}", e);
+        match self
+            .extent_store
+            .reclaim_segments_gated(
+                gate,
+                self.tuning.tail_min_dead_percent,
+                self.tuning.quiescent_after,
+                keep_going,
+            )
+            .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                tracing::error!("segment GC failed: {:?}", e);
+                None
+            }
         }
     }
 
@@ -133,43 +242,77 @@ impl GarbageCollector {
         }
     }
 
+    /// Spawns both GC loops
     pub fn start(
         self: Arc<Self>,
         shutdown: CancellationToken,
         runtime: Option<tokio::runtime::Handle>,
-    ) -> JoinHandle<()> {
-        // Segment reclamation runs on its own task: `run()` drains its whole
-        // backlog before returning, so sharing a loop would let a large
-        // tombstone backlog starve reclamation. Runs once immediately, then
-        // every interval.
-        {
+    ) -> Vec<JoinHandle<()>> {
+        // Read replicas and checkpoint mounts never start GC, so reads never
+        // track nominations there; `read_directed = false` works the same way.
+        if self.tuning.read_directed {
+            self.extent_store.enable_nominations();
+        }
+
+        let reclaim_handle = {
             let gc = Arc::clone(&self);
             let shutdown = shutdown.clone();
             let reclaim = async move {
                 info!("Starting segment reclamation task");
+                let mut prev: Option<Activity> = None;
+                let mut was_fast = false;
                 loop {
-                    gc.maybe_reclaim_segments().await;
+                    // Batch approval: exactly as idle as pass start, no seal
+                    // in flight, not shutting down. The first batch always
+                    // runs, so busy stores keep the single-round shape; a
+                    // client op ends a drain within one batch.
+                    let pass_base = Activity::sample(&gc.stats);
+                    let keep_going = || {
+                        !shutdown.is_cancelled()
+                            && gc.extent_store.seals_quiet()
+                            && Activity::sample(&gc.stats).idle_since(&pass_base)
+                    };
+                    let outcome = gc.maybe_reclaim_segments(keep_going).await;
+                    // Shutdown must not wait out the orphan sweep's daily
+                    // LIST; the final flush waits on this task.
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
                     // Right after the fast reclaim so no in-flight compaction can
                     // leave a not-yet-credited packed segment eligible.
                     gc.maybe_sweep_orphans().await;
+                    // The window spans the pass, so mid-pass ops read as
+                    // busy; the first decision after startup is always base.
+                    let sample = Activity::sample(&gc.stats);
+                    let idle = prev.is_some_and(|p| sample.idle_since(&p))
+                        && gc.extent_store.seals_quiet();
+                    prev = Some(sample);
+                    let delay = next_delay(outcome, idle, &gc.tuning);
+                    let fast = delay == gc.tuning.idle_interval && delay != gc.tuning.interval;
+                    if fast != was_fast {
+                        info!(
+                            "segment GC: cadence {} ({})",
+                            if fast { "fast" } else { "base" },
+                            if fast {
+                                "saturated backlog, idle store"
+                            } else {
+                                "backlog drained, store active, or pass not completed"
+                            }
+                        );
+                        was_fast = fast;
+                    }
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(
-                            SEGMENT_GC_INTERVAL_SECS,
-                        )) => {}
+                        _ = tokio::time::sleep(delay) => {}
                     }
                 }
             };
-            // Detached: the task stops on the shutdown token, not on its handle.
+            // Stops on the shutdown token; the handle is awaited at shutdown.
             match &runtime {
-                Some(rt) => {
-                    spawn_named_on("segment-gc", reclaim, rt);
-                }
-                None => {
-                    spawn_named("segment-gc", reclaim);
-                }
+                Some(rt) => spawn_named_on("segment-gc", reclaim, rt),
+                None => spawn_named("segment-gc", reclaim),
             }
-        }
+        };
 
         let fut = async move {
             info!("Starting garbage collection task (runs continuously)");
@@ -196,11 +339,12 @@ impl GarbageCollector {
             }
         };
 
-        if let Some(rt) = runtime {
+        let tombstone_handle = if let Some(rt) = runtime {
             spawn_named_on("gc", fut, &rt)
         } else {
             spawn_named("gc", fut)
-        }
+        };
+        vec![reclaim_handle, tombstone_handle]
     }
 
     pub async fn run(&self) -> Result<(), FsError> {
@@ -341,12 +485,129 @@ mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::key_codec::KeyCodec;
+    use crate::fs::store::ChainOutcome;
     use crate::fs::store::tombstone::TombstoneEntry;
 
     fn no_wait() -> WriteOptions {
         WriteOptions {
             await_durable: false,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cadence_is_fast_only_for_saturated_idle_completed_passes() {
+        let t = GcTuning::default();
+        let done = |saturated| {
+            Some(PassOutcome {
+                deleted: 0,
+                relocated: 0,
+                status: PassStatus::Completed { saturated },
+                chains: ChainOutcome::default(),
+            })
+        };
+        let with = |status| {
+            Some(PassOutcome {
+                deleted: 0,
+                relocated: 0,
+                status,
+                chains: ChainOutcome::default(),
+            })
+        };
+        assert_eq!(next_delay(done(true), true, &t), t.idle_interval);
+        assert_eq!(next_delay(done(true), false, &t), t.interval);
+        assert_eq!(next_delay(done(false), true, &t), t.interval);
+        assert_eq!(next_delay(with(PassStatus::Pinned), true, &t), t.interval);
+        assert_eq!(next_delay(with(PassStatus::Skipped), true, &t), t.interval);
+        assert_eq!(next_delay(None, true, &t), t.interval, "errors back off");
+    }
+
+    #[test]
+    fn idle_requires_strictly_no_reads_writes_or_metadata_commits() {
+        let base = Activity {
+            bytes_read: 100,
+            bytes_written: 100,
+            write_ops: 10,
+            read_ops: 50,
+            total_ops: 60,
+            internal_mutations: 7,
+        };
+        // Nothing moved: idle.
+        assert!(base.idle_since(&base));
+        // Lookup/readdir noise (read + total in lockstep, no bytes): idle =
+        // a monitoring agent must not pin GC at the base interval.
+        let lookups = Activity {
+            read_ops: 55,
+            total_ops: 65,
+            ..base
+        };
+        assert!(lookups.idle_since(&base));
+        // A data read can mint seam heat: not idle.
+        let data_read = Activity {
+            bytes_read: 101,
+            read_ops: 51,
+            total_ops: 61,
+            ..base
+        };
+        assert!(!data_read.idle_since(&base));
+        // A data write: not idle.
+        let write = Activity {
+            bytes_written: 164,
+            write_ops: 11,
+            total_ops: 61,
+            ..base
+        };
+        assert!(!write.idle_since(&base));
+        // A metadata-only commit (setattr bumps only total_operations) still
+        // dirties the memtable; a fast pass would flush it as a tiny L0 SST.
+        let setattr = Activity {
+            total_ops: 61,
+            ..base
+        };
+        assert!(!setattr.idle_since(&base));
+        // The store's own tombstone-GC / orphan-reclaim commits dirty the
+        // memtable while every foreground counter sits still — a post-unlink
+        // drain must not read as idle.
+        let internal = Activity {
+            internal_mutations: 8,
+            ..base
+        };
+        assert!(!internal.idle_since(&base));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn idle_iff_only_lookup_traffic(
+            lookups in 0u64..100,
+            read_bytes in 0u64..3,
+            write_bytes in 0u64..3,
+            write_ops in 0u64..3,
+            meta_commits in 0u64..3,
+            internal in 0u64..3,
+        ) {
+            let prev = Activity {
+                bytes_read: 1000,
+                bytes_written: 1000,
+                write_ops: 10,
+                read_ops: 50,
+                total_ops: 70,
+                internal_mutations: 5,
+            };
+            let data_read_ops = read_bytes.min(1); // a data read is also a read op
+            let cur = Activity {
+                bytes_read: prev.bytes_read + read_bytes,
+                bytes_written: prev.bytes_written + write_bytes,
+                write_ops: prev.write_ops + write_ops,
+                read_ops: prev.read_ops + lookups + data_read_ops,
+                total_ops: prev.total_ops + lookups + data_read_ops + write_ops + meta_commits,
+                internal_mutations: prev.internal_mutations + internal,
+            };
+            let expect = read_bytes == 0
+                && write_bytes == 0
+                && write_ops == 0
+                && meta_commits == 0
+                && internal == 0;
+            proptest::prop_assert_eq!(cur.idle_since(&prev), expect);
         }
     }
 
@@ -357,6 +618,7 @@ mod tests {
             fs.extent_store.clone(),
             Arc::clone(&fs.stats),
             None,
+            GcTuning::default(),
         )
     }
 
