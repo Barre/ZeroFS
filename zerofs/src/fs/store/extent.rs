@@ -1237,20 +1237,27 @@ impl ExtentStore {
         id: InodeId,
         edits: &[(u64, Option<Bytes>)],
     ) -> Result<(), FsError> {
-        // Prior FrameLoc per edited extent: an overwrite/hole debits the old
-        // segment's live counter (absent = pure append). The caller's inode
-        // write lock serialises this against a concurrent write.
         let mut old_debits: Vec<(Segid, u32)> = Vec::with_capacity(edits.len());
-        for (extent, _) in edits {
-            let key = self.key_codec.extent_key(id, *extent);
-            if let Some(enc) = self
+        if let (Some(min), Some(max)) = (
+            edits.iter().map(|(e, _)| *e).min(),
+            edits.iter().map(|(e, _)| *e).max(),
+        ) {
+            let edited: HashSet<u64> = edits.iter().map(|(e, _)| *e).collect();
+            let start_key = self.key_codec.extent_key(id, min);
+            let end_key = self.key_codec.extent_key(id, max.saturating_add(1));
+            let mut stream = self
                 .db
-                .get_bytes(&key)
+                .scan(start_key..end_key)
                 .await
-                .map_err(|_| FsError::IoError)?
-                && let Some(loc) = FrameLoc::decode(&enc)
-            {
-                old_debits.push((loc.segid, loc.byte_len));
+                .map_err(|_| FsError::IoError)?;
+            while let Some(result) = stream.next().await {
+                let (key, value) = result.map_err(|_| FsError::IoError)?;
+                if let Some(extent_idx) = self.key_codec.parse_extent_key(&key)
+                    && edited.contains(&extent_idx)
+                    && let Some(loc) = FrameLoc::decode(&value)
+                {
+                    old_debits.push((loc.segid, loc.byte_len));
+                }
             }
         }
         // Compress before taking the open-segment lock: compression is the
@@ -3206,6 +3213,56 @@ mod tests {
         store.delete_range(&mut txn, inode, 0, 2).await.unwrap();
         commit(&store, txn).await;
         assert_eq!(segcount_of(&store, &db, seg).await, 0);
+    }
+
+    // The debit scan must find and debit *every* prior frame of a multi-extent
+    // overwrite, not just the range endpoints: a missed debit over-counts live
+    // bytes (a space leak), a double debit under-counts (GC could drop a live
+    // segment). Fresh-write and single-extent-overwrite tests never make the
+    // scan return more than one key, so cover the multi-key case explicitly.
+    #[tokio::test]
+    async fn segcount_debits_every_extent_of_a_multi_extent_overwrite() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+
+        // Four full extents into the open segment.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(vec![1u8; 4 * EXTENT_SIZE]),
+                0,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        let seg = frameloc_of(&store, &db, inode, 0).await.unwrap().segid;
+        assert_eq!(
+            segcount_of(&store, &db, seg).await,
+            live_bytes(&store, &db, inode, 0..4, seg).await,
+        );
+
+        // Overwrite all four in one write: the scan returns four keys, and each
+        // superseded frame must be debited. The counter then equals only the
+        // four live (current) frames; any missed or extra debit breaks equality.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(vec![2u8; 4 * EXTENT_SIZE]),
+                4 * EXTENT_SIZE as u64,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        assert_eq!(
+            segcount_of(&store, &db, seg).await,
+            live_bytes(&store, &db, inode, 0..4, seg).await,
+        );
     }
 
     // `total` is the cumulative-appended-bytes denominator: credited with every frame,
