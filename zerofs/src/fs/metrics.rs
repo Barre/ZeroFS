@@ -254,3 +254,106 @@ impl FileSystemStats {
         tracing::debug!("\n{}", self.report());
     }
 }
+
+/// One reclaim pass's numbers, mirroring the `segment GC:` summary log line.
+/// Handed to [`SegmentGcStats::record_pass`] so the metric names live next to
+/// the exporter, not the reclaim path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentGcPass {
+    // Whole-store footprint from the pass's scan (exported as gauges).
+    pub segment_count: u64,
+    pub appended_bytes: u64,
+    pub live_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub awaiting_delete: u64,
+    pub awaiting_delete_bytes: u64,
+    pub candidate_backlog: u64,
+    pub chains_deferred: u64,
+    pub saturated: bool,
+
+    // Work done this pass (accumulated into counters).
+    pub segments_deleted: u64,
+    pub deleted_bytes: u64,
+    pub segments_compacted: u64,
+    pub segments_packed: u64,
+    pub frames_relocated: u64,
+    pub compaction_freed_bytes: u64,
+    pub batches: u64,
+    pub tail_scrubbed: u64,
+    pub chains_packed: u64,
+    pub nominations: u64,
+    pub nominations_dropped: u64,
+    pub hot_seams: u64,
+}
+
+/// Segment-GC / reclaim metrics, bridged to Prometheus by `crate::prometheus`.
+///
+/// Counters accumulate across passes; gauges hold the most recent pass's
+/// whole-store footprint (a gauge is meaningful between passes, a counter is
+/// not). The reclaim task is the sole writer, so `Relaxed` is enough.
+#[derive(Default)]
+pub struct SegmentGcStats {
+    // Counters
+    pub passes: AtomicU64,
+    pub segments_deleted: AtomicU64,
+    pub deleted_bytes: AtomicU64,
+    pub segments_compacted: AtomicU64,
+    pub segments_packed: AtomicU64,
+    pub frames_relocated: AtomicU64,
+    pub compaction_freed_bytes: AtomicU64,
+    pub batches: AtomicU64,
+    pub tail_scrubbed: AtomicU64,
+    pub chains_packed: AtomicU64,
+    pub nominations: AtomicU64,
+    pub nominations_dropped: AtomicU64,
+    pub hot_seams: AtomicU64,
+    pub orphans_reclaimed: AtomicU64,
+
+    // Gauges (last pass)
+    pub segment_count: AtomicU64,
+    pub appended_bytes: AtomicU64,
+    pub live_bytes: AtomicU64,
+    pub reclaimable_bytes: AtomicU64,
+    pub awaiting_delete: AtomicU64,
+    pub awaiting_delete_bytes: AtomicU64,
+    pub candidate_backlog: AtomicU64,
+    pub chains_deferred: AtomicU64,
+    pub saturated: AtomicU64,
+}
+
+impl SegmentGcStats {
+    pub fn record_pass(&self, p: &SegmentGcPass) {
+        use Ordering::Relaxed;
+        self.passes.fetch_add(1, Relaxed);
+        self.segments_deleted.fetch_add(p.segments_deleted, Relaxed);
+        self.deleted_bytes.fetch_add(p.deleted_bytes, Relaxed);
+        self.segments_compacted
+            .fetch_add(p.segments_compacted, Relaxed);
+        self.segments_packed.fetch_add(p.segments_packed, Relaxed);
+        self.frames_relocated.fetch_add(p.frames_relocated, Relaxed);
+        self.compaction_freed_bytes
+            .fetch_add(p.compaction_freed_bytes, Relaxed);
+        self.batches.fetch_add(p.batches, Relaxed);
+        self.tail_scrubbed.fetch_add(p.tail_scrubbed, Relaxed);
+        self.chains_packed.fetch_add(p.chains_packed, Relaxed);
+        self.nominations.fetch_add(p.nominations, Relaxed);
+        self.nominations_dropped
+            .fetch_add(p.nominations_dropped, Relaxed);
+        self.hot_seams.fetch_add(p.hot_seams, Relaxed);
+
+        self.segment_count.store(p.segment_count, Relaxed);
+        self.appended_bytes.store(p.appended_bytes, Relaxed);
+        self.live_bytes.store(p.live_bytes, Relaxed);
+        self.reclaimable_bytes.store(p.reclaimable_bytes, Relaxed);
+        self.awaiting_delete.store(p.awaiting_delete, Relaxed);
+        self.awaiting_delete_bytes
+            .store(p.awaiting_delete_bytes, Relaxed);
+        self.candidate_backlog.store(p.candidate_backlog, Relaxed);
+        self.chains_deferred.store(p.chains_deferred, Relaxed);
+        self.saturated.store(p.saturated as u64, Relaxed);
+    }
+
+    pub fn record_orphans_reclaimed(&self, n: u64) {
+        self.orphans_reclaimed.fetch_add(n, Ordering::Relaxed);
+    }
+}

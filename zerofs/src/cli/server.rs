@@ -907,6 +907,7 @@ pub async fn run_server(
             prometheus_config,
             Arc::clone(&fs.stats),
             Arc::clone(&fs.global_stats),
+            fs.extent_store.segment_gc_stats(),
             slatedb_registry,
             shutdown.clone(),
         )

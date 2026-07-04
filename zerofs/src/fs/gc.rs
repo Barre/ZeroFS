@@ -236,7 +236,12 @@ impl GarbageCollector {
     async fn maybe_sweep_orphans(&self) {
         let interval = chrono::Duration::seconds(ORPHAN_SWEEP_INTERVAL_SECS);
         match self.extent_store.sweep_orphans_if_due(interval).await {
-            Ok(Some(n)) => info!("slow orphan sweep reclaimed {} orphan(s)", n),
+            Ok(Some(n)) => {
+                info!("slow orphan sweep reclaimed {} orphan(s)", n);
+                self.extent_store
+                    .segment_gc_stats()
+                    .record_orphans_reclaimed(n as u64);
+            }
             Ok(None) => {} // not yet due this tick
             Err(e) => tracing::error!("slow orphan sweep failed: {:?}", e),
         }
