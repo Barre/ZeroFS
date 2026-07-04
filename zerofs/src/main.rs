@@ -61,12 +61,6 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install `ring` as the process-wide rustls crypto provider. We build rustls
-    // without aws-lc-rs (it doesn't cross-compile to all our release targets), so
-    // reqwest — pulled by object_store with `rustls-no-provider` — has no bundled
-    // provider and needs the default set explicitly before any TLS connection.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let cli = cli::Cli::parse_args();
 
     match cli.command {

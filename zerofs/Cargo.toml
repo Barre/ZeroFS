@@ -19,7 +19,7 @@ members = ["ninep-proto", "ninep-client", "zerofs-csi", "zerofs-client", "zerofs
 # same release, so the version the driver reports (GetPluginInfo) must not
 # drift from zerofs's.
 [workspace.package]
-version = "2.0.2"
+version = "2.0.3"
 
 [profile.release]
 lto = true
@@ -56,11 +56,8 @@ webui = ["dep:rust-embed", "dep:axum", "dep:tonic-web", "dep:tower-http"]
 
 [dependencies]
 ninep-proto = { path = "ninep-proto" }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 console-subscriber = { version = "0.5", optional = true }
-# default-features = false drops slatedb's default `aws` feature, which would
-# pull `object_store/aws` (and thus aws-lc-rs); we re-add `foyer` (the cache we
-# use) and keep our crypto provider on `ring`. See the object_store dep below.
 slatedb = { git = "https://github.com/Barre/slatedb.git", rev = "9fd0ffa6fa9ce8f359dd55f57a15010efa717b3c", default-features = false, features = [
     "wal_disable",
     "foyer",
@@ -77,26 +74,14 @@ async-trait = "0.1"
 backon = { version = "1.5", features = ["tokio-sleep"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Use the `*-base` provider features + `ring` instead of the `aws`/`azure`/`gcp`
-# bundles, which hard-wire the aws-lc-rs crypto backend. aws-lc-rs builds AWS-LC's
-# C code, which doesn't cross-compile to all our release targets (s390x/ppc64le/
-# riscv64). `ring` is pure-Rust-friendly and is what shipped before the 0.14 bump.
 object_store = { version = "0.14.0", default-features = false, features = [
     "fs",
-    "aws-base",
-    "azure-base",
-    "gcp-base",
-    "reqwest",
-    "ring",
-] }
-# object_store's transitive reqwest 0.13 otherwise pulls rustls with the aws-lc-rs
-# provider. This renamed dep only injects `rustls-no-provider` (no bundled crypto)
-# into that same reqwest, and the `rustls` dep selects `ring` as the provider.
-reqwest_ring = { package = "reqwest", version = "0.13", default-features = false, features = [
-    "rustls-no-provider",
+    "aws",
+    "azure",
+    "gcp",
 ] }
 rustls = { version = "0.23", default-features = false, features = [
-    "ring",
+    "aws_lc_rs",
     "std",
     "tls12",
     "logging",
