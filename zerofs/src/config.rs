@@ -1076,8 +1076,7 @@ impl Settings {
 
         toml_string
             .push_str("\n# Optional segment garbage-collection tuning. Governs the segment\n");
-        toml_string
-            .push_str("# reclamation loop only — not the tombstone sweep or LSM compaction.\n");
+        toml_string.push_str("# reclamation loop.\n");
         toml_string.push_str("\n# [gc]\n");
         toml_string.push_str("# interval_secs = 60               # Pass interval while the store is active (default: 60, min: 5).\n");
         toml_string.push_str("#                                  # Below the ~30 s flush cadence, busy passes seal sub-1-MiB segments.\n");

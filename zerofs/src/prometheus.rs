@@ -1,5 +1,5 @@
 use crate::config::PrometheusConfig;
-use crate::fs::metrics::FileSystemStats;
+use crate::fs::metrics::{FileSystemStats, SegmentGcStats};
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::task::spawn_named;
 use metrics::{counter, gauge};
@@ -20,6 +20,7 @@ pub fn start(
     config: &PrometheusConfig,
     fs_stats: Arc<FileSystemStats>,
     global_stats: Arc<FileSystemGlobalStats>,
+    segment_gc_stats: Arc<SegmentGcStats>,
     slatedb_registry: Option<Arc<DefaultMetricsRecorder>>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
@@ -54,6 +55,7 @@ pub fn start(
                 _ = interval.tick() => {
                     collect_fs_stats(&fs_stats);
                     collect_global_stats(&global_stats);
+                    collect_segment_gc_stats(&segment_gc_stats);
                     if let Some(ref registry) = slatedb_registry {
                         collect_lsm_stats(registry);
                     }
@@ -158,6 +160,46 @@ fn collect_global_stats(stats: &FileSystemGlobalStats) {
     let (used_bytes, used_inodes) = stats.get_totals();
     gauge!("zerofs_used_bytes").set(used_bytes as f64);
     gauge!("zerofs_used_inodes").set(used_inodes as f64);
+}
+
+fn collect_segment_gc_stats(stats: &SegmentGcStats) {
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+
+    counter!("zerofs_segment_gc_passes_total").absolute(load(&stats.passes));
+    counter!("zerofs_segment_gc_segments_deleted_total").absolute(load(&stats.segments_deleted));
+    counter!("zerofs_segment_gc_deleted_bytes_total").absolute(load(&stats.deleted_bytes));
+    counter!("zerofs_segment_gc_segments_compacted_total")
+        .absolute(load(&stats.segments_compacted));
+    counter!("zerofs_segment_gc_segments_packed_total").absolute(load(&stats.segments_packed));
+    counter!("zerofs_segment_gc_frames_relocated_total").absolute(load(&stats.frames_relocated));
+    counter!("zerofs_segment_gc_compaction_freed_bytes_total")
+        .absolute(load(&stats.compaction_freed_bytes));
+    counter!("zerofs_segment_gc_batches_total").absolute(load(&stats.batches));
+    counter!("zerofs_segment_gc_tail_scrubbed_total").absolute(load(&stats.tail_scrubbed));
+    counter!("zerofs_segment_gc_chains_packed_total").absolute(load(&stats.chains_packed));
+    counter!("zerofs_segment_gc_nominations_total").absolute(load(&stats.nominations));
+    counter!("zerofs_segment_gc_nominations_dropped_total")
+        .absolute(load(&stats.nominations_dropped));
+    counter!("zerofs_segment_gc_hot_seams_total").absolute(load(&stats.hot_seams));
+    counter!("zerofs_segment_gc_orphans_reclaimed_total").absolute(load(&stats.orphans_reclaimed));
+
+    let appended = load(&stats.appended_bytes);
+    let reclaimable = load(&stats.reclaimable_bytes);
+    gauge!("zerofs_segment_count").set(load(&stats.segment_count) as f64);
+    gauge!("zerofs_segment_appended_bytes").set(appended as f64);
+    gauge!("zerofs_segment_live_bytes").set(load(&stats.live_bytes) as f64);
+    gauge!("zerofs_segment_reclaimable_bytes").set(reclaimable as f64);
+    gauge!("zerofs_segment_dead_ratio").set(if appended > 0 {
+        reclaimable as f64 / appended as f64
+    } else {
+        0.0
+    });
+    gauge!("zerofs_segment_gc_awaiting_delete").set(load(&stats.awaiting_delete) as f64);
+    gauge!("zerofs_segment_gc_awaiting_delete_bytes")
+        .set(load(&stats.awaiting_delete_bytes) as f64);
+    gauge!("zerofs_segment_gc_candidate_backlog").set(load(&stats.candidate_backlog) as f64);
+    gauge!("zerofs_segment_gc_chains_deferred").set(load(&stats.chains_deferred) as f64);
+    gauge!("zerofs_segment_gc_saturated").set(load(&stats.saturated) as f64);
 }
 
 fn collect_jemalloc_stats() {

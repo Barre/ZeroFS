@@ -18,6 +18,7 @@ use crate::frame_codec::FrameCodec;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
+use crate::fs::metrics::{SegmentGcPass, SegmentGcStats};
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
 use crate::segment::{DirEntry, FrameLoc, Segid};
@@ -828,6 +829,9 @@ pub struct ExtentStore {
     /// unset in the extent unit tests, where `commit_via_coordinator` is the sole
     /// segcount writer and commits directly.
     coordinator: Arc<std::sync::OnceLock<crate::fs::write_coordinator::WeakWriteCoordinator>>,
+    /// Reclaim/compaction counters and footprint gauges, bridged to Prometheus.
+    /// Written only by the segment-GC task (see `reclaim_segments_gated`).
+    segment_gc_stats: Arc<SegmentGcStats>,
 }
 
 impl ExtentStore {
@@ -869,7 +873,13 @@ impl ExtentStore {
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
             seal_threshold: SEAL_THRESHOLD,
             coordinator: Arc::new(std::sync::OnceLock::new()),
+            segment_gc_stats: Arc::new(SegmentGcStats::default()),
         }
+    }
+
+    /// Reclaim/compaction metrics holder, for the Prometheus bridge.
+    pub fn segment_gc_stats(&self) -> Arc<SegmentGcStats> {
+        Arc::clone(&self.segment_gc_stats)
     }
 
     /// Inject the commit worker's weak handle so this store's GC/compaction
@@ -2489,6 +2499,29 @@ impl ExtentStore {
             dead_pct,
             action
         );
+        self.segment_gc_stats.record_pass(&SegmentGcPass {
+            segment_count: scanned as u64,
+            appended_bytes: total_appended,
+            live_bytes: total_live,
+            reclaimable_bytes: reclaimable,
+            awaiting_delete: awaiting as u64,
+            awaiting_delete_bytes: awaiting_bytes,
+            candidate_backlog: candidate_backlog as u64,
+            chains_deferred: chains.deferred as u64,
+            saturated,
+            segments_deleted: deleted as u64,
+            deleted_bytes,
+            segments_compacted: compacted_segments as u64,
+            segments_packed: packed_segments as u64,
+            frames_relocated: frames_relocated as u64,
+            compaction_freed_bytes: freed_total,
+            batches: batches as u64,
+            tail_scrubbed: tail_selected as u64,
+            chains_packed: chains.packed as u64,
+            nominations: nominated.len() as u64,
+            nominations_dropped: nom_dropped,
+            hot_seams: hot_pairs.len() as u64,
+        });
         Ok(PassOutcome {
             deleted,
             relocated: frames_relocated,
@@ -3871,6 +3904,17 @@ mod tests {
         let (deleted, _) = store.reclaim_segments(Utc::now(), None).await.unwrap();
         assert_eq!(deleted, 1, "the superseded segment must be reclaimed");
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
+
+        // The pass populated the Prometheus-bridged stats holder: the delete is
+        // counted, and the scan's footprint gauges reflect the surviving segment.
+        let m = store.segment_gc_stats();
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(m.passes.load(Relaxed) >= 1);
+        assert_eq!(m.segments_deleted.load(Relaxed), 1);
+        assert!(m.deleted_bytes.load(Relaxed) > 0);
+        assert!(m.segment_count.load(Relaxed) >= 1);
+        assert!(m.appended_bytes.load(Relaxed) > 0);
+        assert!(m.live_bytes.load(Relaxed) > 0);
 
         // Live data still reads after GC, and a second reclaim is a no-op.
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[2u8; 1000]);

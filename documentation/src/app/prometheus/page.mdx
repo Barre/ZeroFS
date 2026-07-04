@@ -73,6 +73,48 @@ Counters that track cumulative operations since server start:
 
 An extent is the 32 KiB unit of file data, stored as a frame in an immutable segment object. Earlier releases called this unit a chunk and named the metric `zerofs_gc_chunks_deleted_total`. The old series stops appearing after an upgrade; update dashboards and alert rules that reference it.
 
+The metrics above cover the tombstone sweep that reclaims a deleted file's extents. Segment reclamation and compaction, which recover dead space inside the immutable segment objects that hold file data, are reported separately below.
+
+### Segment Footprint
+
+Gauges reporting the on-store segment footprint as of the last reclaim scan. These are the store-wide totals from which dead space is derived; between passes they hold their last value.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_segment_count` | gauge | Segment objects scanned |
+| `zerofs_segment_appended_bytes` | gauge | Bytes appended across all segments (excludes segment framing, so it slightly exceeds on-store bytes) |
+| `zerofs_segment_live_bytes` | gauge | Referenced (live) bytes across all segments |
+| `zerofs_segment_reclaimable_bytes` | gauge | Dead bytes recoverable by deletion or compaction (appended minus live) |
+| `zerofs_segment_dead_ratio` | gauge | Reclaimable over appended, from 0 to 1 |
+
+### Segment Reclamation and Compaction
+
+Counters accumulate across reclaim passes since server start; the gauges hold the last pass's backlog. A reclaim pass deletes fully-dead segments, compacts fragmented and small ones, repacks read-hot seams and the write-cold tail, and reclaims counter-less orphan objects.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `zerofs_segment_gc_passes_total` | counter | Reclaim passes run |
+| `zerofs_segment_gc_segments_deleted_total` | counter | Fully-dead segment objects deleted |
+| `zerofs_segment_gc_deleted_bytes_total` | counter | Bytes freed by deleting dead segments |
+| `zerofs_segment_gc_segments_compacted_total` | counter | Live segments consumed (repacked) by compaction |
+| `zerofs_segment_gc_segments_packed_total` | counter | Segment objects written as compaction output |
+| `zerofs_segment_gc_frames_relocated_total` | counter | Extent frames rewritten during compaction |
+| `zerofs_segment_gc_compaction_freed_bytes_total` | counter | Dead bytes reclaimed by compaction |
+| `zerofs_segment_gc_batches_total` | counter | Compaction batches run |
+| `zerofs_segment_gc_tail_scrubbed_total` | counter | Write-cold tail segments repacked by the scrub |
+| `zerofs_segment_gc_chains_packed_total` | counter | Read-hot seam chains fully repacked |
+| `zerofs_segment_gc_nominations_total` | counter | Read-directed compaction nominations drained |
+| `zerofs_segment_gc_nominations_dropped_total` | counter | Nominations dropped (segment gone or no longer fragmented) |
+| `zerofs_segment_gc_hot_seams_total` | counter | Hot cross-segment read seams observed |
+| `zerofs_segment_gc_orphans_reclaimed_total` | counter | Counter-less orphan objects reclaimed by the slow sweep |
+| `zerofs_segment_gc_awaiting_delete` | gauge | Dead segments waiting out their delete horizon |
+| `zerofs_segment_gc_awaiting_delete_bytes` | gauge | Bytes held by segments awaiting deletion |
+| `zerofs_segment_gc_candidate_backlog` | gauge | Fragmented or small segments awaiting compaction |
+| `zerofs_segment_gc_chains_deferred` | gauge | Read-hot seam chains deferred to a later pass |
+| `zerofs_segment_gc_saturated` | gauge | 1 when the last pass left actionable backlog (fast cadence engaged), else 0 |
+
+Read-directed compaction (nominations, hot seams, chains, tail scrub) only runs on the read-write leader. Read replicas and checkpoint mounts run no reclaim, so these series stay flat there.
+
 ### Filesystem State
 
 | Metric | Type | Description |
