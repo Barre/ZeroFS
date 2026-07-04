@@ -323,7 +323,7 @@ You can change the compression algorithm at any time without migration:
 
 ## LSM Tree Performance Tuning
 
-ZeroFS keeps metadata — inodes, directory entries, and the per-extent frame pointers — in an LSM (Log-Structured Merge) tree database. File contents live in immutable segment objects written directly to the object store; the data plane has no user-facing tuning keys. The `[lsm]` section tunes the metadata store, though `flush_interval_secs` and `sync_writes` also govern when buffered file data is sealed and uploaded. See [Architecture](/architecture).
+ZeroFS keeps metadata (inodes, directory entries, and the per-extent frame pointers) in an LSM (Log-Structured Merge) tree database that sits in the object store. File contents live in immutable segment objects written directly to the object store; this data path has no user-facing tuning keys, though the `[gc]` section described below tunes the loop that reclaims segment space. The `[lsm]` section tunes the metadata store, though `flush_interval_secs` and `sync_writes` also govern when buffered file data is sealed and uploaded. See [Architecture](/architecture).
 
 ```toml
 [lsm]
@@ -359,6 +359,28 @@ Consider tuning these parameters if you're experiencing:
 - **High read latency**: Decrease `l0_max_ssts` to reduce read amplification
 - **CPU / Network underutilization**: Increase `max_concurrent_compactions` on high-core systems
 - **Too-frequent background flushes**: Increase `flush_interval_secs`; the crash-loss window for un-`fsync`'d writes grows accordingly
+
+## Segment Garbage Collection
+
+The `[gc]` section tunes the segment reclamation loop described under [Garbage Collection](/garbage-collection) and not the tombstone sweep, the orphan sweep, or the metadata compaction above.
+
+```toml
+[gc]
+interval_secs = 60               # Pass interval while the store is active
+idle_interval_secs = 5           # Pass interval while draining backlog on an idle store
+read_directed = true             # Reads steer compaction (nominations, seams, chains)
+tail_scrub_min_dead_percent = 5  # Repack write-cold segments above this % dead (0 = off)
+```
+
+### Parameters
+
+- **`interval_secs`** (default: 60, min: 5): Seconds between segment GC passes while the filesystem is active. The ceiling of the adaptive cadence — the loop never sleeps longer. Deletion safety does not depend on this value (it rides on the per-segment delete horizon); only reclamation responsiveness does. Values below the ~30-second flush cadence make a busy pass's barrier seal real sub-1-MiB segments, which are themselves future GC work.
+
+- **`idle_interval_secs`** (default: 5, min: 1, capped at `interval_secs`): Seconds between passes while the previous pass hit a work budget with actionable backlog remaining *and* the store was completely idle since that pass. A fast pass performs real reclamation — up to 32 back-to-back batches of 256 MiB compaction while the store stays idle mid-pass, plus 1,024 deletes and roughly two small bookkeeping PUTs of fixed overhead — so this interval paces idleness re-checks rather than capping drain throughput; total fast-mode work is bounded by the backlog. Setting it equal to `interval_secs` disables adaptation entirely.
+
+- **`read_directed`** (default: `true`): Whether reads steer compaction — the nomination priority, seam statistics, and chain repacks described under [Read-Directed Compaction](/read-directed-compaction). Turning it off stops all read-side recording; counter-driven reclamation and the tail scrub are unaffected.
+
+- **`tail_scrub_min_dead_percent`** (default: 5, range: 1–50; 0 disables the tail scrub): The tail-scrub floor. A write-cold segment more than this percent dead — but not dead enough for normal compaction candidacy — is repacked with leftover pass budget, most-dead-first. This caps the space overhead of write-cold data at 1/(1 − floor/100) of its live bytes (about 1.05× at the default), paid with up to (100 − floor)/floor bytes rewritten per byte reclaimed (19× at the default; the ratio improves as segments get deader, and the most-dead-first order takes the cheapest reclaim first). Raise it on request-billed or churn-sensitive backends; 50 empties the candidacy band, and 0 turns the scrub off entirely. On upgrade, a store with an accumulated 5–49%-dead tail works it off once — rate-limited to 256 MiB of live bytes per batch, batching only while the store is idle — and goes quiet.
 
 ## Separate WAL Object Store
 

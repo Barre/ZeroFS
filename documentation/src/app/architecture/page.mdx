@@ -103,7 +103,7 @@ One raw-parts cache (memory + disk, 128 KiB parts) sits below both planes and ho
 
 ### Space Reclamation
 
-Reclamation runs in-process on the writer; there is no separate compactor process. A segment GC pass runs every 60 seconds: it deletes segments with zero live bytes and repacks fragmented ones, re-sorting live extents by file and offset so they become physically contiguous. Metadata LSM compaction is always embedded in `zerofs run`. See [Garbage Collection](/garbage-collection).
+Reclamation runs in-process on the writer. A segment GC pass runs every 60 seconds, or every 5 seconds while a saturated backlog meets an idle store. Each pass deletes segments with zero live bytes and repacks fragmented ones, re-sorting live extents by file and offset so they become physically contiguous. Metadata LSM compaction is embedded in `zerofs run` as well. See [Garbage Collection](/garbage-collection).
 
 ## Choosing a Protocol {{ id: 'choosing-a-protocol' }}
 
