@@ -766,9 +766,6 @@ pub struct InitResult {
     pub heartbeat_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
-/// The ZeroFS logo (enso ring + wordmark), rendered from assets/readme_logo.png
-/// into braille (U+2800) cells. Written straight to stderr before tracing starts
-/// so it heads the log unadorned.
 const STARTUP_BANNER: &str = r#"
 ⠀⠀⠀⠀⠀⣠⣴⣶⣿⣿⣿⣿⣿⣷⣶⣤⣄
 ⠀⠀⢀⣴⣿⣿⣿⠿⠛⠛⠋⠉⠙⠻⠿⣿⣿⣿⣦⡀
@@ -986,12 +983,14 @@ pub async fn run_server(
     }
 
     let gc_handle = if !db_mode.is_read_only() {
+        let tuning = crate::fs::gc::GcTuning::from(settings.gc.unwrap_or_default());
         let gc = Arc::new(GarbageCollector::new(
             Arc::clone(&fs.db),
             fs.tombstone_store.clone(),
             fs.extent_store.clone(),
             Arc::clone(&fs.stats),
             gc_admin,
+            tuning,
         ));
         Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
     } else {
@@ -1065,8 +1064,15 @@ pub async fn run_server(
     }
 
     info!("Waiting for background tasks to exit...");
-    if let Some(gc_handle) = gc_handle {
-        let _ = gc_handle.await;
+    if let Some(gc_handles) = gc_handle {
+        for handle in gc_handles {
+            if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+                .await
+                .is_err()
+            {
+                info!("a GC task is still mid-pass after 15s; proceeding to the final flush");
+            }
+        }
     }
     let _ = stats_handle.await;
     if let Some(flush_handle) = flush_handle {
