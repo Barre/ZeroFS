@@ -1,0 +1,117 @@
+import { Mermaid } from '@/components/Mermaid'
+
+export const metadata = {
+  title: 'Read-Directed Compaction',
+  description:
+    'How reads steer segment GC: reads leave small in-memory hints about bad layout, and each GC pass uses them to prioritize planned compaction and to repack scattered co-read data.',
+}
+
+# Read-Directed Compaction
+
+[Segment GC](/garbage-collection) selects its work by scanning per-segment live-byte counters, which record dead space but nothing about read activity. Read-directed compaction adds that signal: each read leaves a small in-memory hint about the layout it resolved, and every GC pass consults those hints when it selects work. Reads do not compact anything directly. {{ className: 'lead' }}
+
+## What the Counter Scan Misses
+
+Two layout problems do not show up in a counter scan:
+
+- **Heat.** Two segments can be equally fragmented while one is read constantly and the other has not been read in weeks. The counter scan cannot distinguish them.
+- **Scatter.** A file's data can be spread across many segments, or scattered within one, so that a single read needs several fetches. If those segments are large and mostly live, the counter scan never selects them, however many reads pay for the extra fetches.
+
+A read observes both directly, when it resolves which segment holds each byte. That observation is what the hints record.
+
+## What Reads Record
+
+<Row>
+  <Col>
+
+    **Nominations.** A read that had to fetch from two or more segment objects records their IDs. The hint means: these segments were read together, and merging them would have made this read cheaper. At most 16 per read, into a set of 1,024 (oldest evicted).
+
+    **Seams.** A read that fetches *adjacent file bytes* from two different places records that boundary: either two segments, or two distant positions inside one segment (an *internal* seam). The count is keyed on the pair of segment IDs and increments at most once per GC pass, in a table of 4,096 pairs.
+
+    A seam counted in **two different passes** is **hot**: a recurring read is paying for it. A single pass over the data, such as a backup or a checksum run, crosses each seam once and cannot make one hot.
+
+  </Col>
+  <Col>
+
+    <Mermaid chart={`
+graph LR
+    subgraph f["file — adjacent extents"]
+        e5["extent 5"] --- e6["extent 6"]
+    end
+    subgraph s12["segment 12"]
+        f7["frame 7"]
+    end
+    subgraph s47["segment 47"]
+        f0["frame 0"]
+    end
+    e5 --> f7
+    e6 --> f0
+    `} />
+
+    A cross-segment seam: records pair (12, 47).
+
+    <Mermaid chart={`
+graph LR
+    subgraph f["file — adjacent extents"]
+        e5["extent 5"] --- e6["extent 6"]
+    end
+    subgraph s12["segment 12"]
+        f2["frame 2"] -. … .- f41["frame 41"]
+    end
+    e5 --> f2
+    e6 --> f41
+    `} />
+
+    An internal seam: records pair (12, 12).
+
+  </Col>
+</Row>
+
+Recording costs one mutex acquisition per qualifying read. Reads served in a single contiguous fetch record nothing, and neither do reads served from the in-RAM write buffers or by the prefetcher. [Read-only and checkpoint mounts](/read-replicas) record nothing at all — they run no GC — and the check there is one atomic load.
+
+Every hint lives in process memory. A restart loses them all; the only cost is scheduling quality, since the counter scan still decides what gets compacted.
+
+## Nominations
+
+Each pass empties the nomination set and checks every entry against the scan. A nominated segment the scan already qualified for compaction (under 50% live, or under 1 MiB) jumps the queue. One the scan did not qualify is dropped.
+
+Jumping the queue is bounded. Nominated segments may take at most half the pass budget: 32 segments and 128 MiB of live bytes. The other half is always spent on the most-fragmented segments, so nominations cannot starve reclaim.
+
+Everything a pass selects is packed together and sorted by (inode, extent). Segments nominated by the same read therefore come out merged, with each file's data contiguous.
+
+Nominations create no work: every segment they promote was already scheduled for compaction. Only the timing changes. Fragmentation that reads are paying for is repaired within about a minute rather than at its place in the backlog, and the repack reads its inputs from a still-warm [cache](/caching). The cost is symmetric: during a deep backlog with heavy reads, purely cold garbage drains at up to half speed.
+
+## Hot Seams
+
+A hot seam is the only signal that can *create* compaction work, so a repack must pass three checks:
+
+1. **Heat.** The seam was crossed in two different passes. Thirty minutes without a crossing and the count is dropped; a later crossing starts over from one.
+2. **Write-cold.** Every involved segment was sealed at least 30 seals ago in this process, or the whole store has been write-idle for 5 minutes. Data still being written is never repacked because it would only scatter again. A freshly repacked segment carries a fresh seal counter, so while writes continue it cannot be repacked again until 30 more seals pass.
+3. **Budget.** Seam repacks share the same half-budget reserve as nominations. A group that does not fit this pass waits whole; one bigger than the entire reserve packs at least two seam-joined segments per pass and finishes over several passes. A single segment whose live bytes alone exceed the reserve is never repacked, and its seams persist.
+
+When all three hold, the segments joined by hot seams are repacked together and sorted by (inode, extent). The co-read data becomes contiguous and the seams are gone; reads stop crossing them, and the counts age out.
+
+An internal seam is the one-segment case: the segment is rewritten once, its scattered frames regrouped — a fetch-per-frame read becomes one fetch.
+
+<Note>
+  This is the only way a fully live dense segment is ever rewritten. A dense
+  segment carrying dead bytes above the scrub floor is reclaimed instead by
+  the tail scrub on the [Garbage Collection](/garbage-collection) page, once
+  write-cold.
+</Note>
+
+One interaction with the [adaptive GC cadence](/garbage-collection): fast idle passes cannot inflate heat, because they run only while the store is idle and an idle store performs no reads. A read arriving mid-drain can supply a seam's second episode, but only once, because that same read ends the idle window; the write-cold check still applies.
+
+## Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Nomination set | 1,024 segments, 16 per read, oldest evicted |
+| Priority reserve per pass | 32 segments / 128 MiB live (half the compaction budget) |
+| Seam table | 4,096 pairs, 16 per read; new pairs dropped at capacity |
+| Hot threshold | crossed in 2 distinct passes |
+| Seam staleness | 30 minutes without a crossing |
+| Write-cold distance | sealed ≥ 30 seal rotations before the open segment, current process only |
+| Store quiescence | no seal for 5 minutes |
+
+The whole mechanism switches off with `read_directed = false` in the [`[gc]` configuration section](/configuration); the individual thresholds are fixed.

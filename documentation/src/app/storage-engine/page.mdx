@@ -140,12 +140,12 @@ The parts cache stores raw object bytes: extent data is compressed and encrypted
 
 The metadata LSM tracks live bytes per segment. Transactions carry signed deltas; the single-writer commit worker folds them into absolute counters. Overwriting or deleting an extent debits the segment that held its old frame.
 
-A garbage-collection pass runs every 60 s on the writer:
+A garbage-collection pass runs on the writer — every 60 seconds while the store is active, every 5 seconds while a budget-saturated backlog meets a completely idle store (both intervals configurable, see `[gc]` under [Configuration](/configuration)):
 
 1. **Seal and flush** under the barrier, so the durable view matches memory.
-2. **Scan** the per-segment counters — O(number of segments), not extents — and the streamed `segments/` listing.
+2. **Scan** the per-segment counters — O(number of segments), not extents. No pass lists the object store; the only listing is the daily orphan sweep.
 3. **Delete dead segments**: a segment with zero live bytes gets a delete horizon on first sight (at least 60 s in the future, extended 30 s past any ephemeral checkpoint expiry) and is deleted on a later pass, at most 1024 per pass. Every delete is gated by a fail-closed verification that re-reads the segment directory and confirms no extent still points at it; any error skips the delete (a leak, never data loss). Persistent [checkpoints](/checkpoints) protect the segments they can reference.
-4. **Pack fragmented segments**: segments under 50% live or smaller than 1 MiB are repacked into fresh segments targeting 256 MiB, at most 64 sources and 256 MiB per round. Live frames are fetched via coalesced ranged GETs, re-sorted by (inode, extent index) for physical contiguity, sealed durably, then repointed with a conditional swap under the per-inode lock. Drained sources are not deleted in the same pass — they become dead and are removed later, so in-flight reads stay valid. Dense full-size segments are never rewritten.
+4. **Pack fragmented segments**: segments under 50% live or smaller than 1 MiB are repacked into fresh segments targeting 256 MiB, at most 64 sources and 256 MiB per round. Live frames are fetched via coalesced ranged GETs, re-sorted by (inode, extent index) for physical contiguity, sealed durably, then repointed with a conditional swap under the per-inode lock. Drained sources are not deleted in the same pass — they become dead and are removed later, so in-flight reads stay valid. Leftover round budget is spent scrubbing the tail: write-cold segments above the scrub floor (default 5%) of dead bytes that neither predicate would ever select — without this, dead space in never-touched-again segments would be stranded permanently. A dense segment with no dead bytes is rewritten by exactly one path: a hot-seam chain repack ([Read-Directed Compaction](/read-directed-compaction)).
 
 Directory reads during GC are two ranged GETs — the 64-byte footer suffix, then the directory span — never the whole object.
 
@@ -153,7 +153,7 @@ File data no longer rides LSM compaction. The embedded compactor still runs in `
 
 ## Design Constants {{ id: 'design-constants' }}
 
-The data plane has no tuning knobs. These values are compile-time constants:
+Apart from the four `[gc]` keys ([Configuration](/configuration)), these values are compile-time constants:
 
 | Constant | Value |
 |----------|-------|
@@ -167,10 +167,11 @@ The data plane has no tuning knobs. These values are compile-time constants:
 | Logical read-ahead window | 8 MiB, after 2 sequential reads, 16 fetches max |
 | Physical part size | 128 KiB |
 | Physical fetch window | 128 KiB to 8 MiB, 4 windows deep |
-| Segment GC interval | 60 s |
+| Segment GC interval | adaptive: 60 s base / 5 s saturated-and-idle (configurable) |
 | Dead-segment delete horizon | ≥ 60 s; checkpoint expiry + 30 s; persistent checkpoint margin 300 s |
 | Segment deletes per GC pass | ≤ 1024 |
 | Packing candidates | live < 50%, or size < 1 MiB |
+| Tail-scrub band | dead > floor (default 5%, configurable) and write-cold |
 | Packing target / per-round cap | 256 MiB / 64 segments, 256 MiB |
 
 ## Configuration {{ id: 'configuration' }}
@@ -185,6 +186,10 @@ The engine responds to these configuration keys:
 | `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive: the WAL is off, so each batch waits for a full seal plus memtable flush. |
 | `[lsm] l0_max_ssts` | `256` (min 4) | Level-0 SST backlog for the metadata LSM; also applied per key. |
 | `[lsm] max_concurrent_compactions` | `8` (min 1) | Concurrency of the embedded metadata compactor. |
+| `[gc] interval_secs` | `60` (min 5) | Segment GC pass interval while the store is active; the ceiling of the adaptive cadence. |
+| `[gc] idle_interval_secs` | `5` (min 1, ≤ interval) | Pass interval while a saturated backlog meets an idle store; equal to `interval_secs` disables adaptation. |
+| `[gc] read_directed` | `true` | Reads steer compaction: nominations, seam heat, chain repacks ([Read-Directed Compaction](/read-directed-compaction)). |
+| `[gc] tail_scrub_min_dead_percent` | `5` (1–50) | Tail-scrub floor; caps write-cold space overhead at 1/(1 − floor/100). 50 disables the scrub. |
 
 `[lsm] wal_enabled` and `[lsm] max_unflushed_gb` no longer exist; a configuration that sets either fails to parse. Cache sizing (`[cache] disk_size_gb`, `memory_size_gb`, `warm_metadata`) is covered on the [Caching](/caching) page.
 

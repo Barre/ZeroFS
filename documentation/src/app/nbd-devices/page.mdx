@@ -168,8 +168,7 @@ zpool trim mypool
 
 When blocks are trimmed:
 1. ZeroFS deletes the extent pointers from the metadata store and debits each affected segment's live-byte counter
-2. Segment garbage collection, every 60 seconds, deletes segments with no live bytes and repacks fragmented ones (live data below 50%, or segments under 1 MiB)
-3. Freed segments come off the bill
+2. Segment garbage collection: every 60 seconds, or every 5 seconds while a saturated backlog meets an idle store. The task deletes segments with no live bytes and repacks fragmented ones (live data below 50%, or segments under 1 MiB). Write-cold segments above the scrub floor of dead bytes are repacked with leftover budget.
 
 See [Garbage Collection](/garbage-collection) for the full reclamation pipeline.
 
