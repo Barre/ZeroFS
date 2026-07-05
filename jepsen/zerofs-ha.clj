@@ -23,7 +23,7 @@
         work (str dir ".zerofs")]
     {:mount      dir
      :work       work
-     :store      (str work "/store")     ; shared by both nodes
+     :store      (str "s3://zerofs-jepsen/run-" (java.util.UUID/randomUUID))
      :mount-log  (str work "/mount.log")
      :mount-pid  (str work "/mount.pid")
      :nodes      {:a {:cache  (str work "/cache-a")
@@ -49,8 +49,13 @@
          "disk_size_gb = 1.0\n"
          "memory_size_gb = 0.25\n\n"
          "[storage]\n"
-         "url = \"file://" store "\"\n"
+         "url = \"" store "\"\n"
          "encryption_password = \"" password "\"\n\n"
+         "[aws]\n"
+         "endpoint = \"http://127.0.0.1:9000\"\n"
+         "access_key_id = \"minioadmin\"\n"
+         "secret_access_key = \"minioadmin\"\n"
+         "allow_http = \"true\"\n\n"
          "[servers.ninep]\n"
          "addresses = [\"127.0.0.1:" (ninep-port port node-key) "\"]\n\n"
          "[replication]\n"
@@ -161,7 +166,7 @@
   db/DB
   (setup! [this _test _node]
     (info "Setting up ZeroFS HA cluster at" mount)
-    (sh :mkdir :-p work store
+    (sh :mkdir :-p work
         (get-in this [:nodes :a :cache]) (get-in this [:nodes :b :cache]) mount)
     (start-cluster! this)
     (info "ZeroFS HA cluster ready at" mount))
