@@ -134,10 +134,11 @@ const NOMINATE_MIN_FANOUT: usize = 2;
 const NOMINATE_PER_CALL_CAP: usize = 16;
 /// Nomination set bound; oldest evicted.
 const NOMINATION_SET_CAP: usize = 1024;
-/// Heat reserve (nominations + chains): at most half a round. Nominations
-/// skew high-live; unreserved they would starve the most-dead candidates.
+/// Heat-reserve slot cap (nominations + chains): at most half a round.
+/// Nominations skew high-live; unreserved they would starve the most-dead
+/// candidates. The byte half of the reserve is `round_bytes / 2`, runtime since
+/// the round budget is configurable (`compact_round_max_mib`).
 const NOMINATED_MAX_PER_ROUND: usize = MAX_COMPACT_SEGMENTS_PER_ROUND / 2;
-const NOMINATED_MAX_LIVE_PER_ROUND: u64 = MAX_COMPACT_BYTES_PER_ROUND / 2;
 
 /// Distinct passes a seam must be crossed in to become hot. Pair-keyed and
 /// once-per-pass: a one-time sequential scan crosses each boundary once and
@@ -559,6 +560,9 @@ pub struct PassOutcome {
     pub status: PassStatus,
     /// Hot-seam chain disposition, same counts as the summary line.
     pub chains: ChainOutcome,
+    /// Store-wide dead-space percent at scan time (0 on a skipped pass). The
+    /// cadence uses it to keep a busy store draining while the backlog is large.
+    pub dead_percent: u64,
 }
 
 /// Per-pass chain accounting: assembled, how many packed, and the rest by
@@ -612,7 +616,12 @@ fn select_round(
     mut tail: Vec<SegStat>,
     tail_min_dead_percent: Option<u64>,
     ctx: ColdCtx,
+    // Per-round live-byte budget (config `compact_round_max_mib`); the heat
+    // reserve is half. Raising it lets over-reserve seams pack, at proportional
+    // gather RAM. Slot caps stay fixed.
+    round_bytes: u64,
 ) -> RoundSelection {
+    let reserve_bytes = round_bytes / 2;
     candidates.sort_by_key(|&(_, size, live_b)| live_permille(live_b, size));
     let mut sel = RoundSelection {
         selected: Vec::new(),
@@ -645,10 +654,9 @@ fn select_round(
             continue;
         }
         let chain_live: u64 = members.iter().map(|(_, _, l)| l).sum();
-        let fits_alone =
-            members.len() <= NOMINATED_MAX_PER_ROUND && chain_live <= NOMINATED_MAX_LIVE_PER_ROUND;
+        let fits_alone = members.len() <= NOMINATED_MAX_PER_ROUND && chain_live <= reserve_bytes;
         let fits_now = sel.reserve_slots + members.len() <= NOMINATED_MAX_PER_ROUND
-            && sel.reserve_live + chain_live <= NOMINATED_MAX_LIVE_PER_ROUND;
+            && sel.reserve_live + chain_live <= reserve_bytes;
         if !fits_now && fits_alone {
             sel.chains_deferred += 1; // whole chain waits for a freer pass
             continue;
@@ -656,9 +664,7 @@ fn select_round(
         let mut fit = 0usize;
         let (mut fit_slots, mut fit_live) = (sel.reserve_slots, sel.reserve_live);
         for &(_, _, live_b) in members {
-            if fit_slots >= NOMINATED_MAX_PER_ROUND
-                || fit_live + live_b > NOMINATED_MAX_LIVE_PER_ROUND
-            {
+            if fit_slots >= NOMINATED_MAX_PER_ROUND || fit_live + live_b > reserve_bytes {
                 break;
             }
             fit_slots += 1;
@@ -688,12 +694,12 @@ fn select_round(
             };
             let pair_live = members[a].2 + members[b].2;
             if sel.reserve_slots + 2 > NOMINATED_MAX_PER_ROUND
-                || sel.reserve_live + pair_live > NOMINATED_MAX_LIVE_PER_ROUND
+                || sel.reserve_live + pair_live > reserve_bytes
             {
                 // Squeezed out by reserve contention: retry under a fresh
                 // reserve. A pair too big even for a fresh reserve is
-                // unpackable by this compactor.
-                if pair_live <= NOMINATED_MAX_LIVE_PER_ROUND {
+                // unpackable at this round budget (raise compact_round_max_mib).
+                if pair_live <= reserve_bytes {
                     sel.chains_deferred += 1;
                 } else {
                     sel.chains_unpackable += 1;
@@ -725,7 +731,7 @@ fn select_round(
         }
         if !(nominated.contains(&segid)
             && sel.reserve_slots < NOMINATED_MAX_PER_ROUND
-            && sel.reserve_live + live_b <= NOMINATED_MAX_LIVE_PER_ROUND)
+            && sel.reserve_live + live_b <= reserve_bytes)
         {
             rest.push(cand);
             continue;
@@ -736,9 +742,7 @@ fn select_round(
 
     // Pass 2: fragmentation rank fills the rest of the round.
     for (segid, size, live_b) in rest {
-        if sel.selected.len() >= MAX_COMPACT_SEGMENTS_PER_ROUND
-            || sel.sel_live >= MAX_COMPACT_BYTES_PER_ROUND
-        {
+        if sel.selected.len() >= MAX_COMPACT_SEGMENTS_PER_ROUND || sel.sel_live >= round_bytes {
             sel.saturated = true; // actionable candidates cut by the budget
             break;
         }
@@ -762,7 +766,7 @@ fn select_round(
                 continue;
             }
             if sel.selected.len() >= MAX_COMPACT_SEGMENTS_PER_ROUND
-                || sel.sel_live + live_b > MAX_COMPACT_BYTES_PER_ROUND
+                || sel.sel_live + live_b > round_bytes
             {
                 sel.saturated = true; // tail cut by budget
                 break;
@@ -1983,7 +1987,8 @@ impl ExtentStore {
                 move || std::future::ready(Ok(Some((delete_horizon, protect_before)))),
                 Some(TAIL_SCRUB_DEFAULT_PERCENT),
                 QUIESCENT_AFTER_DEFAULT,
-                || false,
+                |_| false,
+                MAX_COMPACT_BYTES_PER_ROUND,
             )
             .await?;
         Ok((outcome.deleted, outcome.relocated))
@@ -2004,7 +2009,10 @@ impl ExtentStore {
             move || std::future::ready(Ok(Some((delete_horizon, protect_before)))),
             tail_min_dead_percent,
             quiescent_after,
-            keep_going,
+            // Tests drive the drain purely via keep_going; the batch count (the
+            // production throughput floor) is ignored here.
+            move |_batches| keep_going(),
+            MAX_COMPACT_BYTES_PER_ROUND,
         )
         .await
     }
@@ -2022,21 +2030,29 @@ impl ExtentStore {
     /// no pass 3); `quiescent_after` is how long the open counter must sit
     /// unchanged before the whole store counts as write-cold.
     ///
-    /// `keep_going`, polled between batches, approves continuing a
-    /// multi-batch drain; `|| false` gives the historical one-round pass.
+    /// `keep_going(batches_done)`, polled between batches, approves continuing a
+    /// multi-batch drain; `|_| false` gives the historical one-round pass. The
+    /// batch count lets the caller run a throughput floor before it starts
+    /// gating on foreground idleness (see the segment-GC loop).
+    ///
+    /// `round_bytes` (config `compact_round_max_mib`) is the per-round live-byte
+    /// budget: the selection cap, the heat reserve (half), and the plaintext
+    /// gather RAM cap. Raising it packs over-reserve seams and lifts dead-space
+    /// throughput per batch, at proportional gather RAM.
     pub async fn reclaim_segments_gated<F, Fut, K>(
         &self,
         gate: F,
         tail_min_dead_percent: Option<u64>,
         quiescent_after: Duration,
         keep_going: K,
+        round_bytes: u64,
     ) -> Result<PassOutcome, FsError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<
                 Output = Result<Option<(DateTime<Utc>, Option<DateTime<Utc>>)>, FsError>,
             >,
-        K: Fn() -> bool,
+        K: Fn(usize) -> bool,
     {
         // The seal makes the flushed manifest reference only PUT segments; the
         // flush makes "dead in the in-memory view" mean "dead in the durable view".
@@ -2058,6 +2074,7 @@ impl ExtentStore {
                     relocated: 0,
                     status: PassStatus::Skipped,
                     chains: ChainOutcome::default(),
+                    dead_percent: 0,
                 });
             }
         };
@@ -2364,6 +2381,7 @@ impl ExtentStore {
                 remaining_tail.clone(),
                 tail_min_dead_percent,
                 cold_ctx,
+                round_bytes,
             );
             chains_deferred += sel.chains_deferred;
             chains_warm += sel.chains_warm;
@@ -2386,7 +2404,7 @@ impl ExtentStore {
             }
             batches += 1;
             let (n, p, consumed) = self
-                .compact_segments(&sel.selected, &sel.chain_groups)
+                .compact_segments(&sel.selected, &sel.chain_groups, round_bytes)
                 .await?;
             let consumed_ids = &sel.selected[..consumed];
             frames_relocated += n;
@@ -2423,7 +2441,7 @@ impl ExtentStore {
             remaining_tail.retain(|(s, _, _)| !consumed_set.contains(s));
             saturated_work = sel.saturated;
             let drained = !sel.saturated && pending.is_empty();
-            if drained || batches >= MAX_BATCHES_PER_PASS || !keep_going() {
+            if drained || batches >= MAX_BATCHES_PER_PASS || !keep_going(batches) {
                 // Drained, capped, or no longer idle; a cut with work
                 // remaining stays saturated, so the cadence follows up.
                 break;
@@ -2531,6 +2549,7 @@ impl ExtentStore {
                 PassStatus::Completed { saturated }
             },
             chains,
+            dead_percent: dead_pct,
         })
     }
 
@@ -2750,6 +2769,9 @@ impl ExtentStore {
         &self,
         segids: &[Segid],
         atomic_prefix: &[usize],
+        // Plaintext gather RAM cap (config `compact_round_max_mib`); a leading
+        // atomic group is still gathered whole, so this bounds RAM to one group.
+        round_bytes: u64,
     ) -> Result<(usize, usize, usize), FsError> {
         debug_assert!(atomic_prefix.iter().sum::<usize>() <= segids.len());
         // Gather still-live frames across all sources, tagged with their source
@@ -2773,7 +2795,7 @@ impl ExtentStore {
             // stopped mid-way would 1:1-repack a chain prefix that dissolves
             // no seam, so the cap never splits one; if it trips at a group
             // boundary the whole gather stops (`consumed` stays a prefix).
-            if gathered >= MAX_COMPACT_BYTES_PER_ROUND {
+            if gathered >= round_bytes {
                 break;
             }
             let group_end = (consumed + group_sizes.next().unwrap_or(1)).min(segids.len());
@@ -3357,7 +3379,10 @@ mod tests {
         assert!(segcount_of(&store, &db, seg_a).await > 0);
         assert!(segcount_of(&store, &db, seg_b).await > 0);
 
-        store.compact_segments(&[seg_a, seg_b], &[]).await.unwrap();
+        store
+            .compact_segments(&[seg_a, seg_b], &[], MAX_COMPACT_BYTES_PER_ROUND)
+            .await
+            .unwrap();
 
         // Sources drain to zero; the extents now point at one packed segment that
         // holds exactly their live bytes.
@@ -3970,7 +3995,10 @@ mod tests {
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 2);
 
         // Compact S: extents 0,2 relocate; extent 1 (already moved off S) is skipped.
-        let (swapped, packed, consumed) = store.compact_segments(&[s], &[]).await.unwrap();
+        let (swapped, packed, consumed) = store
+            .compact_segments(&[s], &[], MAX_COMPACT_BYTES_PER_ROUND)
+            .await
+            .unwrap();
         assert_eq!(consumed, 1);
         assert_eq!(
             swapped, 2,
@@ -4123,7 +4151,10 @@ mod tests {
         assert_eq!(s.len(), 1);
 
         // Compact -> frames regrouped by (inode, extent); drop the drained source.
-        store.compact_segments(&s, &[]).await.unwrap();
+        store
+            .compact_segments(&s, &[], MAX_COMPACT_BYTES_PER_ROUND)
+            .await
+            .unwrap();
         store.reclaim_segments(Utc::now(), None).await.unwrap();
 
         // File A's three extents are now contiguous, so the whole-file read is a
@@ -4278,6 +4309,7 @@ mod tests {
                 cutoff: SEL_CUTOFF,
                 quiescent: true,
             },
+            MAX_COMPACT_BYTES_PER_ROUND,
         );
         assert!(sel.selected.is_empty(), "a 1:1 prefix repack must not run");
         assert!(sel.chain_groups.is_empty());
@@ -4307,10 +4339,54 @@ mod tests {
                 cutoff: SEL_CUTOFF,
                 quiescent: true,
             },
+            MAX_COMPACT_BYTES_PER_ROUND,
         );
         assert_eq!(sel.selected, vec![b.0, c.0], "exactly the (B, C) pair");
         assert_eq!(sel.chain_groups, vec![2]);
         assert_eq!(sel.chains_deferred, 0);
+    }
+
+    /// A raised round budget packs a seam whose cheapest edge pair is over the
+    /// default reserve: same chain, unpackable at the default 256 MiB round
+    /// (128 MiB reserve), packed at a 512 MiB round (256 MiB reserve).
+    #[test]
+    fn raised_round_budget_packs_an_over_reserve_seam() {
+        // The only edge pair carries 200 MiB live: over the 128 MiB default
+        // reserve, within a 256 MiB one.
+        let a = (Segid::new(SEL_EPOCH, 100), 100 << 20, 100 << 20);
+        let b = (Segid::new(SEL_EPOCH, 101), 100 << 20, 100 << 20);
+        let chain = [HotChain {
+            members: vec![a, b],
+            edges: vec![(0, 1)],
+        }];
+        let ctx = ColdCtx {
+            cur_epoch: SEL_EPOCH,
+            cutoff: SEL_CUTOFF,
+            quiescent: true,
+        };
+        let pick = |round_bytes| {
+            select_round(
+                Vec::new(),
+                &HashSet::new(),
+                &chain,
+                Vec::new(),
+                Some(5),
+                ctx,
+                round_bytes,
+            )
+        };
+
+        let sel = pick(MAX_COMPACT_BYTES_PER_ROUND);
+        assert!(
+            sel.selected.is_empty(),
+            "over-reserve at the default budget"
+        );
+        assert_eq!(sel.chains_unpackable, 1);
+
+        let sel = pick(512 << 20);
+        assert_eq!(sel.selected, vec![a.0, b.0], "the pair packs at 512 MiB");
+        assert_eq!(sel.chain_groups, vec![2]);
+        assert_eq!(sel.chains_unpackable, 0);
     }
 
     /// A chain squeezed under two members by reserve CONTENTION (an earlier
@@ -4348,6 +4424,7 @@ mod tests {
                 cutoff: SEL_CUTOFF,
                 quiescent: true,
             },
+            MAX_COMPACT_BYTES_PER_ROUND,
         );
         let eaten: Vec<Segid> = eater.members.iter().map(|&(s, _, _)| s).collect();
         assert_eq!(sel.selected, eaten, "only the first chain admitted");
@@ -4863,6 +4940,52 @@ mod tests {
             outcome.status,
             PassStatus::Completed { saturated: true },
             "a cut with work remaining stays saturated"
+        );
+    }
+
+    /// Throughput floor: under load (keep_going reporting the store busy past
+    /// the floor, as the production closure does when idle_since is false), a
+    /// pass still drains exactly `floor` batches, then stops with the remainder
+    /// saturated. Driven through reclaim_segments_gated directly, since
+    /// reclaim_segments_tuned discards the batch count.
+    #[tokio::test]
+    async fn throughput_floor_drains_floor_batches_under_load() {
+        const FLOOR: usize = 2;
+        let (store, db) = make().await;
+        // More than FLOOR full (slot-capped) batches of gate-clearing work.
+        let n = 3 * MAX_COMPACT_SEGMENTS_PER_ROUND as u64;
+        for i in 0..n {
+            write_extent(&store, &db, i, &incompressible(i as usize, EXTENT_SIZE)).await;
+            store.seal_open().await.unwrap();
+        }
+        let polls = std::cell::Cell::new(0u32);
+        let outcome = store
+            .reclaim_segments_gated(
+                || std::future::ready(Ok(Some((Utc::now(), None::<DateTime<Utc>>)))),
+                Some(TAIL_SCRUB_DEFAULT_PERCENT),
+                QUIESCENT_AFTER_DEFAULT,
+                |batches| {
+                    polls.set(polls.get() + 1);
+                    batches < FLOOR // below the floor push through; at it, "busy" stops us
+                },
+                MAX_COMPACT_BYTES_PER_ROUND,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.relocated,
+            FLOOR * MAX_COMPACT_SEGMENTS_PER_ROUND,
+            "exactly FLOOR batches ran before the load gate stopped the drain"
+        );
+        assert_eq!(
+            polls.get(),
+            FLOOR as u32,
+            "polled once per completed batch, stopping at the floor"
+        );
+        assert_eq!(
+            outcome.status,
+            PassStatus::Completed { saturated: true },
+            "a full batch remained past the floor, so the pass stays saturated"
         );
     }
 
@@ -5818,7 +5941,9 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
         #[test]
-        fn select_round_invariants(raw in sel_world_raw()) {
+        fn select_round_invariants(raw in sel_world_raw(), round_mib in 64u64..=4096) {
+            // The configurable per-round budget (compact_round_max_mib range).
+            let round_bytes = round_mib << 20;
             let w = build_sel_world(raw);
             let sel = select_round(
                 w.candidates.clone(),
@@ -5831,6 +5956,7 @@ mod tests {
                     cutoff: SEL_CUTOFF,
                     quiescent: w.quiescent,
                 },
+                round_bytes,
             );
 
             // Stats lookup over all inputs (overlap entries agree by construction).
@@ -5846,9 +5972,9 @@ mod tests {
             // budget keeps the one-candidate overshoot envelope.
             prop_assert!(sel.selected.len() <= MAX_COMPACT_SEGMENTS_PER_ROUND);
             prop_assert!(sel.reserve_slots <= NOMINATED_MAX_PER_ROUND);
-            prop_assert!(sel.reserve_live <= NOMINATED_MAX_LIVE_PER_ROUND);
+            prop_assert!(sel.reserve_live <= round_bytes / 2);
             let max_live = stats.values().map(|&(_, l)| l).max().unwrap_or(0);
-            prop_assert!(sel.sel_live <= MAX_COMPACT_BYTES_PER_ROUND.saturating_add(max_live));
+            prop_assert!(sel.sel_live <= round_bytes.saturating_add(max_live));
 
             // No duplicates; conservation; sums match the inputs.
             let uniq: HashSet<&Segid> = sel.selected.iter().collect();
@@ -5913,8 +6039,8 @@ mod tests {
                     "pass-0 admission neither prefix nor hot-edge pair"
                 );
                 let chain_live: u64 = members.iter().map(|&(_, _, l)| l).sum();
-                let fits_alone = members.len() <= NOMINATED_MAX_PER_ROUND
-                    && chain_live <= NOMINATED_MAX_LIVE_PER_ROUND;
+                let fits_alone =
+                    members.len() <= NOMINATED_MAX_PER_ROUND && chain_live <= round_bytes / 2;
                 if fits_alone {
                     // All-or-nothing (modulo members that are also candidates,
                     // which later passes may select on their own merit).
@@ -6051,6 +6177,7 @@ mod tests {
                     cutoff: SEL_CUTOFF,
                     quiescent: w.quiescent,
                 },
+                round_bytes,
             );
             prop_assert_eq!(sel, again);
         }
@@ -6060,7 +6187,11 @@ mod tests {
         // either admits something or is unpackable and must not set the
         // flag (phantom saturation would spin the fast cadence forever).
         #[test]
-        fn lone_chain_on_a_fresh_reserve_never_defers(raw in sel_world_raw()) {
+        fn lone_chain_on_a_fresh_reserve_never_defers(
+            raw in sel_world_raw(),
+            round_mib in 64u64..=4096,
+        ) {
+            let round_bytes = round_mib << 20;
             let w = build_sel_world(raw);
             for chain in &w.chains {
                 let sel = select_round(
@@ -6074,6 +6205,7 @@ mod tests {
                         cutoff: SEL_CUTOFF,
                         quiescent: w.quiescent,
                     },
+                    round_bytes,
                 );
                 if sel.selected.is_empty() {
                     prop_assert_eq!(sel.chains_deferred, 0, "lone chain deferred on a fresh reserve");
