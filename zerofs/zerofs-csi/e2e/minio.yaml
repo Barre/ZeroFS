@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: zerofs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio
+          args: ["server", "/data"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: minioadmin
+            - name: MINIO_ROOT_PASSWORD
+              value: minioadmin
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: zerofs
+spec:
+  selector:
+    app: minio
+  ports:
+    - port: 9000
+      targetPort: 9000
+---
+# Create the bucket the gateway config expects, retrying until MinIO is up.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-mkbucket
+  namespace: zerofs
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc
+          command:
+            - sh
+            - -c
+            - |
+              until mc alias set m http://minio.zerofs.svc.cluster.local:9000 minioadmin minioadmin; do
+                sleep 2
+              done
+              mc mb --ignore-existing m/zerofs-csi

@@ -1,11 +1,9 @@
 # e2e variant of deploy/gateway-example.yaml: same names, labels and ports, so
 # deploy/storageclass-example.yaml applies verbatim. Differences from the deploy
 # manifest:
-#   - file:// storage on a hostPath shared by both nodes (no S3). The two nodes
-#     replicate over ONE store; on a single-node test cluster both pods mount
-#     the same hostPath, and the data survives a leader pod deletion (which the
-#     failover test depends on).
-#   - cache is a per-pod emptyDir (the store is shared, the cache must not be).
+#   - S3 storage on an in-cluster MinIO (minio.yaml), shared by both nodes. The
+#     two nodes replicate over one store (one bucket prefix), and the data
+#     survives a leader pod deletion (which the failover test depends on).
 #   - the locally imported image.
 apiVersion: v1
 kind: Namespace
@@ -25,8 +23,14 @@ data:
     disk_size_gb = 1.0
 
     [storage]
-    url = "file:///store/db"
+    url = "s3://zerofs-csi/db"
     encryption_password = "zerofs-e2e-password"
+
+    [aws]
+    endpoint = "http://minio.zerofs.svc.cluster.local:9000"
+    access_key_id = "minioadmin"
+    secret_access_key = "minioadmin"
+    allow_http = "true"
 
     [servers]
 
@@ -103,18 +107,12 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/zerofs
-            - name: store
-              mountPath: /store
             - name: cache
               mountPath: /cache
       volumes:
         - name: config
           configMap:
             name: zerofs-gateway-a-config
-        - name: store
-          hostPath:
-            path: /var/lib/zerofs-e2e-ha
-            type: DirectoryOrCreate
         - name: cache
           emptyDir: {}
 ---
@@ -131,8 +129,14 @@ data:
     disk_size_gb = 1.0
 
     [storage]
-    url = "file:///store/db"
+    url = "s3://zerofs-csi/db"
     encryption_password = "zerofs-e2e-password"
+
+    [aws]
+    endpoint = "http://minio.zerofs.svc.cluster.local:9000"
+    access_key_id = "minioadmin"
+    secret_access_key = "minioadmin"
+    allow_http = "true"
 
     [servers]
 
@@ -206,17 +210,11 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/zerofs
-            - name: store
-              mountPath: /store
             - name: cache
               mountPath: /cache
       volumes:
         - name: config
           configMap:
             name: zerofs-gateway-b-config
-        - name: store
-          hostPath:
-            path: /var/lib/zerofs-e2e-ha
-            type: DirectoryOrCreate
         - name: cache
           emptyDir: {}
