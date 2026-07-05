@@ -362,16 +362,41 @@
 
 (defn cleanup-temps!
   "Delete leftover .tmp-* files (adds whose rename a fault interrupted) so the final
-  statfs/read see only real set files."
+  statfs/read see only real set files. Retries in a bounded loop, re-listing each
+  round, since one best-effort pass can miss a temp a just-restarted node is still
+  materializing or whose delete transiently failed."
   [dir]
-  (->> (file-seq (io/file dir))
-       (filter #(and (.isFile %) (.startsWith (.getName %) ".tmp-")))
-       (run! #(.delete %))))
+  (loop [attempt 0]
+    (let [temps (->> (file-seq (io/file dir))
+                     (filter #(and (.isFile %) (.startsWith (.getName %) ".tmp-")))
+                     vec)]
+      (when (seq temps)
+        (run! #(.delete %) temps)
+        (when (< attempt 20)
+          (Thread/sleep 100)
+          (recur (inc attempt)))))))
 
 (defn read-set
   "Integers currently present as files anywhere under dir."
   [dir]
   (into (sorted-set) (map second) (integer-files dir)))
+
+(defn count-all-inodes
+  "Every inode the tree holds: all directories + regular files, temps and the sync
+  sentinel included. This is what the usage stats count, so comparing its growth to
+  the statfs used-inode growth stays exact even when an interrupted-rename temp
+  survives (a real inode `read-set`, being integer-names only, deliberately skips)."
+  [dir]
+  (count (file-seq (io/file dir))))
+
+(defn non-integer-files
+  "Names of regular files that aren't integer-named (leftover .tmp-* temps, the sync
+  sentinel): surfaced on a statfs mismatch so the extra inode is identifiable."
+  [dir]
+  (->> (file-seq (io/file dir))
+       (filter #(.isFile %))
+       (remove #(try (Long/parseLong (.getName %)) (catch Exception _ nil)))
+       (mapv #(.getName %))))
 
 (defn statfs-used-inodes
   "Inodes the filesystem's usage stats account for, via statfs (`files - ffree`).
@@ -442,12 +467,16 @@
     ;; (caught by the outer job timeout), not data loss. Writes stay bounded: during
     ;; an outage a FUSE op blocks until recovery and would wedge the run -> :info.
     (if (= :read (:f op))
-      ;; read carries three signals on one op so the set checker only sees :add/
+      ;; read carries several signals on one op so the set checker only sees :add/
       ;; :remove/:read: :value = the live name set; :used-inodes = statfs accounting;
-      ;; :corrupt = files whose content != name.
+      ;; :all-inodes = the real inode census (for the statfs check, robust to a leftover
+      ;; temp); :non-integer = those temps/sentinel by name (diagnostic); :corrupt =
+      ;; files whose content != name.
       (try (assoc op :type :ok
                   :value (read-set dir)
                   :used-inodes (statfs-used-inodes dir)
+                  :all-inodes (count-all-inodes dir)
+                  :non-integer (non-integer-files dir)
                   :corrupt (corrupt-files dir))
            (catch java.io.IOException e
              (assoc op :type :fail :error (.getMessage e))))
@@ -840,29 +869,40 @@
          :resurrected       (vec (take 50 resurrected))}))))
 
 (defn statfs-checker
-  "The growth in statfs-reported used inodes (a baseline read on the empty fs vs
-  the final read, after temp cleanup) must equal the number of files in the final
-  live set: every live file is one inode, adds increment and removes decrement, so
-  the net equals the final count. A takeover that regressed the usage stats /
-  inode-id allocator, or mishandled a delete's decrement, mis-counts here even when
-  `ls` (the set checker) still passes."
+  "The growth in statfs-reported used inodes (a baseline read on the empty fs vs the
+  final read, after temp cleanup) must equal the growth in the tree's actual inode
+  census: every created file/dir is one inode, adds increment and removes decrement,
+  so the two move together. A takeover that regressed the usage stats / inode-id
+  allocator, or mishandled a delete's decrement, breaks the equality even when `ls`
+  (the set checker) still passes.
+
+  The census (not the integer-set size) is the reference on purpose: a fault can leave
+  an interrupted-rename `.tmp-` behind, which is a real inode statfs correctly counts
+  but `read-set` (integer names only) skips. Counting against the set size would then
+  false-fail on a perfectly consistent fs; counting against the census does not, while
+  still catching a genuine stats/allocator drift (used-inodes != census)."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
       (let [reads (->> history
                        (filter #(and (= :ok (:type %)) (= :read (:f %))))
                        vec)
-            baseline (some-> (first reads) :used-inodes)
-            final    (some-> (last reads) :used-inodes)
-            n        (some-> (last reads) :value count)]
-        (if (or (nil? baseline) (nil? final) (nil? n) (< (count reads) 2))
+            baseline    (some-> (first reads) :used-inodes)
+            final       (some-> (last reads) :used-inodes)
+            census-base (some-> (first reads) :all-inodes)
+            census-fin  (some-> (last reads) :all-inodes)
+            n           (some-> (last reads) :value count)]
+        (if (or (nil? baseline) (nil? final) (nil? census-base) (nil? census-fin)
+                (< (count reads) 2))
           {:valid? :unknown
            :reason "need a baseline read (empty fs) and a final read"}
-          {:valid?        (= (- final baseline) n)
-           :baseline-used baseline
-           :final-used    final
-           :inodes-grew   (- final baseline)
-           :files-in-set  n})))))
+          {:valid?               (= (- final baseline) (- census-fin census-base))
+           :baseline-used        baseline
+           :final-used           final
+           :inodes-grew          (- final baseline)
+           :census-grew          (- census-fin census-base)
+           :files-in-set         n
+           :leftover-non-integer (some-> (last reads) :non-integer)})))))
 
 (defn content-checker
   "No CLEANLY-added file may have content that disagrees with its name: catches
