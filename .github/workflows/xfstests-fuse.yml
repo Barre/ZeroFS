@@ -75,10 +75,30 @@ jobs:
           HELPER
           sudo chmod +x /sbin/mount.fuse.zerofs
 
-      - name: Create ZeroFS data directories
+      - name: Start MinIO
         run: |
-          mkdir -p ${{ github.workspace }}/zerofs-test-data
-          mkdir -p ${{ github.workspace }}/zerofs-scratch-data
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # The TEST and SCRATCH instances share one bucket under distinct prefixes.
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
           mkdir -p /tmp/zerofs-cache-test
           mkdir -p /tmp/zerofs-cache-scratch
 
@@ -92,8 +112,14 @@ jobs:
           memory_size_gb = 1.0
 
           [storage]
-          url = "file://${{ github.workspace }}/zerofs-test-data"
+          url = "s3://zerofs-test/test"
           encryption_password = "test-password-123"
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
 
           [servers.ninep]
           unix_socket = "/tmp/zerofs-test.9p.sock"
@@ -129,8 +155,14 @@ jobs:
           memory_size_gb = 1.0
 
           [storage]
-          url = "file://${{ github.workspace }}/zerofs-scratch-data"
+          url = "s3://zerofs-test/scratch"
           encryption_password = "test-password-123"
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
 
           [servers.ninep]
           unix_socket = "/tmp/zerofs-scratch.9p.sock"

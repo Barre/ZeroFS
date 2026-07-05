@@ -75,7 +75,6 @@ The `url` field under `[storage]` accepts the following schemes. The same parser
 | `gs://` | Google Cloud Storage | `gs://bucket/path` |
 | `azure://` | Azure Blob Storage | `azure://container/path` |
 | `abfs://`, `abfss://` | Azure Blob Storage | `abfss://container@account.dfs.core.windows.net/path` |
-| `file://` | Local filesystem | `file:///path/to/storage` |
 | `memory://` | In-memory store, testing only | `memory:///` |
 
 `az://` and `adl://` also parse as Azure aliases. `adl://container/path` and the bare `abfs://container/path` form behave like `azure://container/path`. In the `az://` form, the host is used as the container name and the first path segment is excluded from the object path; use `azure://` instead.
@@ -164,16 +163,6 @@ GCS credentials resolve in this order:
 2. An Application Default Credentials file: the `application_credentials` key, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable, or the gcloud CLI's `~/.config/gcloud/application_default_credentials.json`
 3. The VM/GKE metadata service, as the last fallback — this is why no `[gcp]` section is needed on GCP with an attached service account
 </Note>
-
-### Local Filesystem
-
-```toml
-[storage]
-url = "file:///path/to/storage"
-encryption_password = "secure-password-here"
-
-# No additional backend configuration needed
-```
 
 ### Backend Option Tables {{ id: 'backend-option-tables' }}
 
