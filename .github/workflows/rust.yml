@@ -69,7 +69,7 @@ jobs:
           disk_size_gb = 1.0
 
           [storage]
-          url = "file://$WORK/data"
+          url = "memory:///"
           encryption_password = "ci-example"
 
           [servers]

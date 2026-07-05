@@ -47,7 +47,7 @@ jobs:
           disk_size_gb = 1.0
 
           [storage]
-          url = "file:///tmp/sanity/data"
+          url = "memory:///"
           encryption_password = "csi-sanity-ci"
 
           [servers]
