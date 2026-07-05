@@ -48,8 +48,14 @@ jobs:
           docker save zerofs:e2e | sudo k3s ctr images import -
           docker save zerofs-csi:e2e | sudo k3s ctr images import -
 
+      - name: Deploy MinIO
+        run: |
+          kubectl apply -f zerofs/zerofs-csi/e2e/minio.yaml
+          kubectl -n zerofs rollout status deploy/minio --timeout=120s
+          kubectl -n zerofs wait --for=condition=complete job/minio-mkbucket --timeout=120s
+
       # The gateway is an HA leader/standby pair (two StatefulSets over one
-      # shared file:// store). Readiness is gated on the replication port, which
+      # shared MinIO store). Readiness is gated on the replication port, which
       # both roles bind early; the standby binds 9P only after it takes over.
       - name: Deploy gateway
         run: |
