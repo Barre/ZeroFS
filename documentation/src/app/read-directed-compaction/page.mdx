@@ -75,7 +75,7 @@ Every hint lives in process memory. A restart loses them all; the only cost is s
 
 Each pass empties the nomination set and checks every entry against the scan. A nominated segment the scan already qualified for compaction (under 50% live, or under 1 MiB) jumps the queue. One the scan did not qualify is dropped.
 
-Jumping the queue is bounded. Nominated segments may take at most half the pass budget: 32 segments and 128 MiB of live bytes. The other half is always spent on the most-fragmented segments, so nominations cannot starve reclaim.
+Jumping the queue is bounded. Nominated segments may take at most half the pass budget: 32 segments and half the per-round byte budget (128 MiB of live bytes at the default). The other half is always spent on the most-fragmented segments, so nominations cannot starve reclaim.
 
 Everything a pass selects is packed together and sorted by (inode, extent). Segments nominated by the same read therefore come out merged, with each file's data contiguous.
 
@@ -87,7 +87,7 @@ A hot seam is the only signal that can *create* compaction work, so a repack mus
 
 1. **Heat.** The seam was crossed in two different passes. Thirty minutes without a crossing and the count is dropped; a later crossing starts over from one.
 2. **Write-cold.** Every involved segment was sealed at least 30 seals ago in this process, or the whole store has been write-idle for 5 minutes. Data still being written is never repacked because it would only scatter again. A freshly repacked segment carries a fresh seal counter, so while writes continue it cannot be repacked again until 30 more seals pass.
-3. **Budget.** Seam repacks share the same half-budget reserve as nominations. A group that does not fit this pass waits whole; one bigger than the entire reserve packs at least two seam-joined segments per pass and finishes over several passes. A single segment whose live bytes alone exceed the reserve is never repacked, and its seams persist.
+3. **Budget.** Seam repacks share the same half-budget reserve as nominations: half the per-round compaction budget, 128 MiB of live bytes at the default. A group that does not fit this pass waits whole; one bigger than the entire reserve packs at least two seam-joined segments per pass and finishes over several passes. A cheapest seam pair, or a single internal-seam segment, whose live bytes exceed the reserve is *over-reserve*: it is not repacked at the default budget and its seams persist until [`compact_round_max_mib`](/configuration) is raised, which lifts the reserve at proportional gather RAM.
 
 When all three hold, the segments joined by hot seams are repacked together and sorted by (inode, extent). The co-read data becomes contiguous and the seams are gone; reads stop crossing them, and the counts age out.
 
@@ -107,11 +107,11 @@ One interaction with the [adaptive GC cadence](/garbage-collection): fast idle p
 | Parameter | Value |
 |-----------|-------|
 | Nomination set | 1,024 segments, 16 per read, oldest evicted |
-| Priority reserve per pass | 32 segments / 128 MiB live (half the compaction budget) |
+| Priority reserve per pass | 32 segments / half the round budget (128 MiB live by default, tracks `compact_round_max_mib`) |
 | Seam table | 4,096 pairs, 16 per read; new pairs dropped at capacity |
 | Hot threshold | crossed in 2 distinct passes |
 | Seam staleness | 30 minutes without a crossing |
 | Write-cold distance | sealed ≥ 30 seal rotations before the open segment, current process only |
 | Store quiescence | no seal for 5 minutes |
 
-The whole mechanism switches off with `read_directed = false` in the [`[gc]` configuration section](/configuration); the individual thresholds are fixed.
+The whole mechanism switches off with `read_directed = false` in the [`[gc]` configuration section](/configuration). The seam and nomination counts are fixed; the byte reserve is half the configurable per-round compaction budget (`compact_round_max_mib`).

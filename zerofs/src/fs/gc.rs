@@ -4,7 +4,7 @@ use crate::fs::EXTENT_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
 use crate::fs::store::{
-    ExtentStore, PassOutcome, PassStatus, QUIESCENT_AFTER_DEFAULT, TombstoneStore,
+    ChainOutcome, ExtentStore, PassOutcome, PassStatus, QUIESCENT_AFTER_DEFAULT, TombstoneStore,
 };
 use crate::task::{spawn_named, spawn_named_on};
 use bytes::Bytes;
@@ -48,6 +48,18 @@ pub struct GcTuning {
     pub interval: Duration,
     /// Pass interval while a saturated backlog meets an idle store.
     pub idle_interval: Duration,
+    /// Pass interval while the store is active but its dead backlog is large
+    /// (>= `busy_backlog_dead_percent`). `>= interval` disables the tier.
+    pub busy_backlog_interval: Duration,
+    /// Dead-space percent at or above which `busy_backlog_interval` applies.
+    pub busy_backlog_dead_percent: u64,
+    /// Compaction batches a pass runs before it gates continuation on
+    /// foreground idleness (the busy-store throughput floor).
+    pub min_batches_per_pass: usize,
+    /// Per-round live-byte budget (selection cap, half-reserve for heat, and
+    /// plaintext gather RAM cap). Raising it packs over-reserve seams and lifts
+    /// per-batch dead-space throughput, at proportional gather RAM.
+    pub round_bytes: u64,
     /// Whether reads feed compaction at all (nominations, seam heat, chains).
     pub read_directed: bool,
     /// Tail-scrub floor, percent dead; `None` = scrub off.
@@ -68,6 +80,10 @@ impl From<GcConfig> for GcTuning {
         Self {
             interval: Duration::from_secs(c.interval_secs()),
             idle_interval: Duration::from_secs(c.idle_interval_secs()),
+            busy_backlog_interval: Duration::from_secs(c.busy_backlog_interval_secs()),
+            busy_backlog_dead_percent: c.busy_backlog_dead_percent(),
+            min_batches_per_pass: c.min_batches_per_pass(),
+            round_bytes: c.compact_round_bytes(),
             read_directed: c.read_directed(),
             tail_min_dead_percent: c.tail_scrub_min_dead_percent(),
             quiescent_after: QUIESCENT_AFTER_DEFAULT,
@@ -121,15 +137,168 @@ impl Activity {
     }
 }
 
-/// Fast only when a completed pass left actionable backlog and the window
-/// was idle.
-fn next_delay(outcome: Option<PassOutcome>, idle: bool, tuning: &GcTuning) -> Duration {
-    match outcome {
-        Some(PassOutcome {
-            status: PassStatus::Completed { saturated: true },
-            ..
-        }) if idle => tuning.idle_interval,
-        _ => tuning.interval,
+/// The cadence tier the planner picked, coarsest to finest drain rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Base interval: nothing pressing, or an active store with a small backlog.
+    Base,
+    /// Active store, large backlog (dead space or reserve-deferred seams): drain
+    /// faster than base without waiting for the store to go idle.
+    Drain,
+    /// Idle store with backlog: fastest drain.
+    Fast,
+}
+
+impl Tier {
+    fn label(self) -> &'static str {
+        match self {
+            Tier::Base => "base",
+            Tier::Drain => "drain",
+            Tier::Fast => "fast",
+        }
+    }
+}
+
+/// The finished pass distilled to what the cadence/budget decision reads. Built
+/// from a [`PassOutcome`] plus the post-pass idle sample.
+#[derive(Debug, Clone, Copy)]
+struct GcState {
+    /// Ran to a classification (not Skipped/Pinned).
+    completed: bool,
+    /// Actionable backlog remains.
+    saturated: bool,
+    /// Store-wide dead space at scan time.
+    dead_percent: u64,
+    /// Hot-seam disposition. `chains.deferred` are packable seams squeezed out
+    /// of this pass's reserve that a fresh pass would take.
+    chains: ChainOutcome,
+    /// No foreground activity across the pass window.
+    idle: bool,
+}
+
+impl GcState {
+    fn after(outcome: &PassOutcome, idle: bool) -> Self {
+        let (completed, saturated) = match outcome.status {
+            PassStatus::Completed { saturated } => (true, saturated),
+            PassStatus::Skipped | PassStatus::Pinned => (false, false),
+        };
+        Self {
+            completed,
+            saturated,
+            dead_percent: outcome.dead_percent,
+            chains: outcome.chains,
+            idle,
+        }
+    }
+}
+
+/// The next pass's shape: when to run it, how hard, and why.
+#[derive(Debug, Clone)]
+struct GcPlan {
+    /// Sleep before the next pass.
+    next_interval: Duration,
+    /// Batches the next pass runs before it starts yielding to foreground load.
+    min_batches: usize,
+    tier: Tier,
+    /// The decision, for the log.
+    reason: String,
+}
+
+impl GcPlan {
+    /// A base-cadence plan with the configured floor and a given reason.
+    fn base(tuning: &GcTuning, reason: &str) -> Self {
+        Self {
+            next_interval: tuning.interval,
+            min_batches: tuning.min_batches_per_pass,
+            tier: Tier::Base,
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Pre-first-pass plan.
+    fn initial(tuning: &GcTuning) -> Self {
+        Self::base(tuning, "startup")
+    }
+}
+
+/// Turn a finished pass into the next pass's plan: the single place the cadence
+/// and budget knobs combine. Store-free, so the policy is unit-testable.
+///
+/// Cadence tiers (all need a completed, saturated pass):
+/// - idle store: `idle_interval` (Fast);
+/// - active store, and (dead space >= `busy_backlog_dead_percent` OR
+///   reserve-deferred seams remain): `busy_backlog_interval` (Drain);
+/// - else: `interval` (Base).
+///
+/// The seam trigger fires only on `chains.deferred` (packable seams a fresh
+/// reserve would take), never on over-reserve (`unpackable`) or `warm` seams: a
+/// faster cadence cannot pack a seam that overflows even a fresh reserve, nor
+/// one still being written, so those wait on the reserve/round-budget dials and
+/// on write-coldness respectively.
+fn plan_next(state: &GcState, tuning: &GcTuning) -> GcPlan {
+    let min_batches = tuning.min_batches_per_pass;
+    let c = &state.chains;
+
+    let (interval, tier, why) = if !state.completed {
+        (
+            tuning.interval,
+            Tier::Base,
+            "pass not completed".to_string(),
+        )
+    } else if !state.saturated {
+        (tuning.interval, Tier::Base, "backlog drained".to_string())
+    } else if state.idle {
+        (
+            tuning.idle_interval,
+            Tier::Fast,
+            "saturated backlog, store idle".to_string(),
+        )
+    } else {
+        let tier_enabled = tuning.busy_backlog_interval < tuning.interval;
+        let dead_trigger = state.dead_percent >= tuning.busy_backlog_dead_percent;
+        let seam_trigger = c.deferred > 0;
+        let mut parts: Vec<String> = Vec::new();
+        if dead_trigger {
+            parts.push(format!("{}% dead", state.dead_percent));
+        }
+        if seam_trigger {
+            parts.push(format!("{} seams deferred", c.deferred));
+        }
+        if tier_enabled && (dead_trigger || seam_trigger) {
+            (
+                tuning.busy_backlog_interval,
+                Tier::Drain,
+                format!("{}, store active", parts.join(" + ")),
+            )
+        } else if dead_trigger || seam_trigger {
+            // Backlog is large but the drain tier is off (interval == base).
+            (
+                tuning.interval,
+                Tier::Base,
+                format!("{}, store active, drain tier disabled", parts.join(" + ")),
+            )
+        } else {
+            (
+                tuning.interval,
+                Tier::Base,
+                format!("{}% dead, store active, small backlog", state.dead_percent),
+            )
+        }
+    };
+
+    // Over-reserve seams never pack at any cadence; append the count so a Base
+    // pass stuck on them shows why. The reason is the why alone; tier, interval,
+    // and batch count are separate log fields.
+    let over_reserve = if c.unpackable > 0 {
+        format!("; {} seams over-reserve", c.unpackable)
+    } else {
+        String::new()
+    };
+    GcPlan {
+        next_interval: interval,
+        min_batches,
+        tier,
+        reason: format!("{why}{over_reserve}"),
     }
 }
 
@@ -166,7 +335,10 @@ impl GarbageCollector {
     /// Reclaim dead segment objects, unless a checkpoint pins an older manifest
     /// (whose view may still reference segments dead in the current view).
     /// `keep_going` approves continuing a multi-batch drain mid-pass.
-    async fn maybe_reclaim_segments(&self, keep_going: impl Fn() -> bool) -> Option<PassOutcome> {
+    async fn maybe_reclaim_segments(
+        &self,
+        keep_going: impl Fn(usize) -> bool,
+    ) -> Option<PassOutcome> {
         // The gate runs inside reclaim_segments_gated, after its durable
         // barrier, see that method for the checkpoint race this ordering
         // closes. `floor` is sampled there too, so it covers in-flight reads
@@ -219,6 +391,7 @@ impl GarbageCollector {
                 self.tuning.tail_min_dead_percent,
                 self.tuning.quiescent_after,
                 keep_going,
+                self.tuning.round_bytes,
             )
             .await
         {
@@ -263,19 +436,35 @@ impl GarbageCollector {
             let gc = Arc::clone(&self);
             let shutdown = shutdown.clone();
             let reclaim = async move {
-                info!("Starting segment reclamation task");
+                let t = &gc.tuning;
+                info!(
+                    "Starting segment reclamation task (round budget {} MiB, floor {} batch(es); cadence base {}s / drain {}s (>= {}% dead) / idle {}s)",
+                    t.round_bytes >> 20,
+                    t.min_batches_per_pass,
+                    t.interval.as_secs(),
+                    t.busy_backlog_interval.as_secs(),
+                    t.busy_backlog_dead_percent,
+                    t.idle_interval.as_secs(),
+                );
                 let mut prev: Option<Activity> = None;
-                let mut was_fast = false;
+                // The planner owns cadence + budget; `plan` carries the next
+                // pass's floor forward. The first pass uses the initial floor.
+                let mut plan = GcPlan::initial(&gc.tuning);
                 loop {
-                    // Batch approval: exactly as idle as pass start, no seal
-                    // in flight, not shutting down. The first batch always
-                    // runs, so busy stores keep the single-round shape; a
-                    // client op ends a drain within one batch.
+                    // Batch approval: no seal in flight, not shutting down, and
+                    // (past the throughput floor) as idle as pass start. A busy
+                    // store still drains `plan.min_batches` batches; beyond the
+                    // floor a client op ends the drain within one batch.
                     let pass_base = Activity::sample(&gc.stats);
-                    let keep_going = || {
+                    let floor = plan.min_batches;
+                    let keep_going = |batches: usize| {
+                        // Shutdown and an in-flight seal (RAM safety) hard-stop
+                        // every batch. Foreground idleness only gates batches
+                        // past the throughput floor.
                         !shutdown.is_cancelled()
                             && gc.extent_store.seals_quiet()
-                            && Activity::sample(&gc.stats).idle_since(&pass_base)
+                            && (batches < floor
+                                || Activity::sample(&gc.stats).idle_since(&pass_base))
                     };
                     let outcome = gc.maybe_reclaim_segments(keep_going).await;
                     // Shutdown must not wait out the orphan sweep's daily
@@ -292,23 +481,22 @@ impl GarbageCollector {
                     let idle = prev.is_some_and(|p| sample.idle_since(&p))
                         && gc.extent_store.seals_quiet();
                     prev = Some(sample);
-                    let delay = next_delay(outcome, idle, &gc.tuning);
-                    let fast = delay == gc.tuning.idle_interval && delay != gc.tuning.interval;
-                    if fast != was_fast {
-                        info!(
-                            "segment GC: cadence {} ({})",
-                            if fast { "fast" } else { "base" },
-                            if fast {
-                                "saturated backlog, idle store"
-                            } else {
-                                "backlog drained, store active, or pass not completed"
-                            }
-                        );
-                        was_fast = fast;
-                    }
+                    plan = match outcome {
+                        Some(o) => plan_next(&GcState::after(&o, idle), &gc.tuning),
+                        // Reclaim errored or was skipped (already logged); back off at base.
+                        None => GcPlan::base(&gc.tuning, "reclaim skipped or errored"),
+                    };
+                    info!(
+                        tier = plan.tier.label(),
+                        "segment GC plan: next {}s, {} batch{}: {}",
+                        plan.next_interval.as_secs(),
+                        plan.min_batches,
+                        if plan.min_batches == 1 { "" } else { "es" },
+                        plan.reason,
+                    );
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(delay) => {}
+                        _ = tokio::time::sleep(plan.next_interval) => {}
                     }
                 }
             };
@@ -490,7 +678,6 @@ mod tests {
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::key_codec::KeyCodec;
-    use crate::fs::store::ChainOutcome;
     use crate::fs::store::tombstone::TombstoneEntry;
 
     fn no_wait() -> WriteOptions {
@@ -500,31 +687,185 @@ mod tests {
         }
     }
 
+    /// A completed pass with the given saturation, dead%, and deferred-seam
+    /// count; idle as passed. `chains.deferred` also drives `saturated` in the
+    /// real pass, so tests set them consistently.
+    fn state(saturated: bool, dead_percent: u64, deferred: usize, idle: bool) -> GcState {
+        GcState {
+            completed: true,
+            saturated,
+            dead_percent,
+            chains: ChainOutcome {
+                deferred,
+                ..Default::default()
+            },
+            idle,
+        }
+    }
+
     #[test]
-    fn cadence_is_fast_only_for_saturated_idle_completed_passes() {
+    fn cadence_tiers_by_idle_saturation_and_backlog() {
         let t = GcTuning::default();
-        let done = |saturated| {
-            Some(PassOutcome {
-                deleted: 0,
-                relocated: 0,
-                status: PassStatus::Completed { saturated },
-                chains: ChainOutcome::default(),
-            })
+        assert!(
+            t.busy_backlog_interval < t.interval,
+            "tier enabled by default"
+        );
+        let hi = t.busy_backlog_dead_percent;
+        let plan = |s: GcState| plan_next(&s, &t);
+
+        // Idle + saturated: fastest, regardless of dead%.
+        let p = plan(state(true, 0, 0, true));
+        assert_eq!((p.tier, p.next_interval), (Tier::Fast, t.idle_interval));
+        // Busy + saturated + large dead backlog: drain tier.
+        let p = plan(state(true, hi, 0, false));
+        assert_eq!(
+            (p.tier, p.next_interval),
+            (Tier::Drain, t.busy_backlog_interval)
+        );
+        // Busy + saturated + small backlog: base.
+        let p = plan(state(true, hi - 1, 0, false));
+        assert_eq!((p.tier, p.next_interval), (Tier::Base, t.interval));
+        // Not saturated: base even when idle.
+        let p = plan(state(false, hi, 0, true));
+        assert_eq!((p.tier, p.next_interval), (Tier::Base, t.interval));
+    }
+
+    // The seam trigger: reserve-deferred seams drain faster even with little
+    // dead space, but over-reserve (unpackable) seams do not (no cadence packs
+    // them).
+    #[test]
+    fn deferred_seams_trigger_drain_but_over_reserve_seams_do_not() {
+        let t = GcTuning::default();
+        // Low dead%, but a packable seam was squeezed out: drain.
+        let p = plan_next(&state(true, 0, 3, false), &t);
+        assert_eq!(p.tier, Tier::Drain);
+        assert!(p.reason.contains("3 seams deferred"), "{}", p.reason);
+
+        // Low dead%, only over-reserve seams (not saturated, deferred == 0): base.
+        let mut s = state(false, 0, 0, false);
+        s.chains.assembled = 59;
+        s.chains.unpackable = 59;
+        let p = plan_next(&s, &t);
+        assert_eq!(p.tier, Tier::Base);
+        assert!(p.reason.contains("59 seams over-reserve"), "{}", p.reason);
+    }
+
+    // Status → (completed, saturated) mapping, and error/skip back off to base.
+    #[test]
+    fn plan_maps_pass_status_and_backs_off_on_skip() {
+        let t = GcTuning::default();
+        let outcome = |status| PassOutcome {
+            deleted: 0,
+            relocated: 0,
+            status,
+            chains: ChainOutcome::default(),
+            dead_percent: t.busy_backlog_dead_percent + 10,
         };
-        let with = |status| {
-            Some(PassOutcome {
-                deleted: 0,
-                relocated: 0,
-                status,
-                chains: ChainOutcome::default(),
-            })
-        };
-        assert_eq!(next_delay(done(true), true, &t), t.idle_interval);
-        assert_eq!(next_delay(done(true), false, &t), t.interval);
-        assert_eq!(next_delay(done(false), true, &t), t.interval);
-        assert_eq!(next_delay(with(PassStatus::Pinned), true, &t), t.interval);
-        assert_eq!(next_delay(with(PassStatus::Skipped), true, &t), t.interval);
-        assert_eq!(next_delay(None, true, &t), t.interval, "errors back off");
+        // Skipped/Pinned are not "completed": base even when idle with dead space.
+        for status in [PassStatus::Skipped, PassStatus::Pinned] {
+            let p = plan_next(&GcState::after(&outcome(status), true), &t);
+            assert_eq!(p.tier, Tier::Base);
+        }
+        // Completed + saturated + idle maps through to Fast.
+        let p = plan_next(
+            &GcState::after(&outcome(PassStatus::Completed { saturated: true }), true),
+            &t,
+        );
+        assert_eq!(p.tier, Tier::Fast);
+    }
+
+    // Equal busy-backlog and base intervals disable the middle tier: a busy,
+    // dirty store falls back to the base interval.
+    #[test]
+    fn busy_backlog_tier_disabled_when_interval_equals_base() {
+        let mut t = GcTuning::default();
+        t.busy_backlog_interval = t.interval;
+        let p = plan_next(&state(true, t.busy_backlog_dead_percent + 10, 5, false), &t);
+        assert_eq!((p.tier, p.next_interval), (Tier::Base, t.interval));
+    }
+
+    proptest::proptest! {
+        // plan_next is pure, so one property covers the whole tier lattice: over
+        // arbitrary states and config-realistic tunings, tier and interval agree
+        // with the exact tier conditions, the cadence never exceeds base, and an
+        // incomplete or drained pass never accelerates.
+        #[test]
+        fn plan_next_invariants(
+            completed in proptest::bool::ANY,
+            saturated in proptest::bool::ANY,
+            idle in proptest::bool::ANY,
+            dead_percent in 0u64..=100,
+            dead_thresh in 0u64..=100,
+            deferred in 0usize..=50,
+            warm in 0usize..=50,
+            unpackable in 0usize..=50,
+            assembled in 0usize..=150,
+            packed in 0usize..=150,
+            interval_s in GcConfig::MIN_INTERVAL_SECS..=600,
+            idle_raw in 1u64..=600,
+            busy_raw in GcConfig::MIN_INTERVAL_SECS..=600,
+            min_batches in 1usize..=64,
+        ) {
+            // Build a tuning respecting the same relations From<GcConfig> guarantees:
+            // idle_interval <= interval, busy_backlog_interval in [MIN, interval].
+            let idle_interval = Duration::from_secs(idle_raw.min(interval_s).max(1));
+            let busy_backlog_interval =
+                Duration::from_secs(busy_raw.min(interval_s).max(GcConfig::MIN_INTERVAL_SECS));
+            let interval = Duration::from_secs(interval_s);
+            let tuning = GcTuning {
+                interval,
+                idle_interval,
+                busy_backlog_interval,
+                busy_backlog_dead_percent: dead_thresh,
+                min_batches_per_pass: min_batches,
+                round_bytes: 256 << 20,
+                read_directed: true,
+                tail_min_dead_percent: None,
+                quiescent_after: Duration::from_secs(300),
+            };
+            let st = GcState {
+                completed,
+                saturated,
+                dead_percent,
+                chains: ChainOutcome { assembled, packed, deferred, warm, unpackable },
+                idle,
+            };
+            let p = plan_next(&st, &tuning);
+
+            // Budget floor passes through verbatim; cadence is one of the three tiers.
+            proptest::prop_assert_eq!(p.min_batches, min_batches);
+            proptest::prop_assert!(
+                p.next_interval == idle_interval
+                    || p.next_interval == busy_backlog_interval
+                    || p.next_interval == interval
+            );
+            proptest::prop_assert!(p.next_interval <= interval, "never sleeps longer than base");
+
+            // Tier <-> interval agree.
+            match p.tier {
+                Tier::Fast => proptest::prop_assert_eq!(p.next_interval, idle_interval),
+                Tier::Drain => proptest::prop_assert_eq!(p.next_interval, busy_backlog_interval),
+                Tier::Base => proptest::prop_assert_eq!(p.next_interval, interval),
+            }
+
+            // Exact tier conditions.
+            let want_fast = completed && saturated && idle;
+            let tier_enabled = busy_backlog_interval < interval;
+            let want_drain = completed && saturated && !idle && tier_enabled
+                && (dead_percent >= dead_thresh || deferred > 0);
+            proptest::prop_assert_eq!(p.tier == Tier::Fast, want_fast);
+            proptest::prop_assert_eq!(p.tier == Tier::Drain, want_drain);
+            proptest::prop_assert_eq!(p.tier == Tier::Base, !(want_fast || want_drain));
+
+            // Safety: an incomplete or drained pass never accelerates.
+            if !(completed && saturated) {
+                proptest::prop_assert_eq!(p.tier, Tier::Base);
+            }
+
+            // The reason is populated and deterministic (pure function).
+            proptest::prop_assert!(!p.reason.is_empty());
+            proptest::prop_assert_eq!(&p.reason, &plan_next(&st, &tuning).reason);
+        }
     }
 
     #[test]

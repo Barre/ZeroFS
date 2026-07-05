@@ -111,7 +111,7 @@ Counters accumulate across reclaim passes since server start; the gauges hold th
 | `zerofs_segment_gc_awaiting_delete_bytes` | gauge | Bytes held by segments awaiting deletion |
 | `zerofs_segment_gc_candidate_backlog` | gauge | Fragmented or small segments awaiting compaction |
 | `zerofs_segment_gc_chains_deferred` | gauge | Read-hot seam chains deferred to a later pass |
-| `zerofs_segment_gc_saturated` | gauge | 1 when the last pass left actionable backlog (fast cadence engaged), else 0 |
+| `zerofs_segment_gc_saturated` | gauge | 1 when the last pass left actionable backlog (an accelerated cadence tier may engage), else 0 |
 
 Read-directed compaction (nominations, hot seams, chains, tail scrub) only runs on the read-write leader. Read replicas and checkpoint mounts run no reclaim, so these series stay flat there.
 

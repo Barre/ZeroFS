@@ -3084,7 +3084,8 @@ async fn test_crash_compact_after_seal_before_repoint() {
     let segids = fs.extent_store.list_segments().await.unwrap();
     fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "panic").unwrap();
     let es = fs.extent_store.clone();
-    let handle = tokio::task::spawn(async move { es.compact_segments(&segids, &[]).await });
+    let handle =
+        tokio::task::spawn(async move { es.compact_segments(&segids, &[], 256 << 20).await });
     let _ = handle.await;
     fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
     drop(fs);
