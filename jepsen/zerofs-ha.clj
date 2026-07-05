@@ -1,5 +1,5 @@
 (ns jepsen.local-fs.db.zerofs-ha
-  "HA ZeroFS: leader + standby over one shared file:// store, mounted
+  "HA ZeroFS: leader + standby over one shared S3 (MinIO) store, mounted
   multi-target so the FUSE client re-routes on failover. The fault is a leader
   FAILOVER (kill leader, standby promotes, full-restart to canonical roles).
   Semi-sync acks every write to the standby before acking, so failover loses no

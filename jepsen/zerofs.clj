@@ -33,7 +33,7 @@
      :mount-pid  (str work "/mount.pid")}))
 
 (defn config-str
-  "The ZeroFS config TOML for a local-store, 9P-only server."
+  "The ZeroFS config TOML for an S3-backed, 9P-only server."
   [{:keys [store cache password port]}]
   (str "[cache]\n"
        "dir = \"" cache "\"\n"
@@ -152,7 +152,7 @@
 
   LoseUnfsyncedWrites
   ; Crash the server, losing the un-fsynced (memtable-resident) tail, then bring
-  ; it back from the on-disk store. The mount is torn down and re-established so
+  ; it back from the object store. The mount is torn down and re-established so
   ; no client-side state can mask the loss.
   (lose-unfsynced-writes! [this]
     (info "Losing un-fsynced writes: killing ZeroFS server at" mount)

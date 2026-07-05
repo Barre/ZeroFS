@@ -83,9 +83,10 @@ jobs:
         working-directory: /tmp/local-fs
         timeout-minutes: 10
         run: |
-          # The ZeroFS backend self-manages the server (local file:// store) and
-          # the 9P FUSE mount, so no MinIO/mount step is needed here. Each trial
-          # is a full setup/teardown; --quickcheck-tests bounds CI time.
+          # The ZeroFS backend self-manages the server (against the MinIO started
+          # above) and the 9P FUSE mount, so no separate mount step is needed
+          # here. Each trial is a full setup/teardown; --quickcheck-tests bounds
+          # CI time.
           ./run.sh run quickcheck \
             --db zerofs \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
