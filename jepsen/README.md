@@ -13,8 +13,8 @@ upstream `local-fs` at a pinned commit and applies the glue on top:
 
 | file              | what it is |
 |-------------------|------------|
-| `zerofs.clj`      | The single-node ZeroFS backend (`--db zerofs`), copied to `src/jepsen/local_fs/db/zerofs.clj`. Boots a ZeroFS server against a local `file://` object store and mounts it over 9P with `zerofs mount`. |
-| `zerofs-ha.clj`   | The HA backend (`--db zerofs-ha`), copied to `src/jepsen/local_fs/db/zerofs_ha.clj`. Boots a leader + standby over one shared `file://` store, mounted multi-target so the FUSE client re-routes on failover. Its fault is `:failover` (kill leader → standby promotes → full-restart to canonical roles), exposed via the `Failover` protocol. |
+| `zerofs.clj`      | The single-node ZeroFS backend (`--db zerofs`), copied to `src/jepsen/local_fs/db/zerofs.clj`. Boots a ZeroFS server against an S3 object store (a per-run MinIO prefix) and mounts it over 9P with `zerofs mount`. |
+| `zerofs-ha.clj`   | The HA backend (`--db zerofs-ha`), copied to `src/jepsen/local_fs/db/zerofs_ha.clj`. Boots a leader + standby over one shared S3 store (a per-run MinIO prefix), mounted multi-target so the FUSE client re-routes on failover. Its fault is `:failover` (kill leader → standby promotes → full-restart to canonical roles), exposed via the `Failover` protocol. |
 | `local-fs.patch`  | The delta to upstream `local_fs.clj` / `shell/{workload,checker,client}.clj` / `db/core.clj`: register `:zerofs` and `:zerofs-ha`, add the `--zerofs-*`, `--quickcheck-tests`, `--history-scale` and `--failover` CLI options, emit `:lose-unfsynced-writes`/`:failover` only on request, add the `Failover` protocol and model `:failover` as a global flush (no loss) rather than a crash, give the slow fault ops a longer op-timeout, and make `quickcheck` exit non-zero on a failing case (so CI can gate). |
 | `run.sh`          | Wrapper that puts GNU coreutils first on `PATH` (the client parses coreutils error *strings*, which differ on uutils) and execs `lein`. |
 
@@ -30,8 +30,11 @@ Pinned upstream commit: **`0921306efc27d89a72b9041daaf9f854c57ac980`**
 - **Write-through mount (`--writeback false`, the default).** The FUSE client
   then holds no un-fsynced page cache, so the only place un-fsynced writes live
   is the server's memtable, which is what makes the crash fault meaningful.
-- **`file://` object store.** Self-contained; no S3/MinIO. It persists on local
-  disk across a server restart, which the crash fault relies on.
+- **S3 store on MinIO, not `file://`.** ZeroFS fences via conditional writes
+  (If-Match / If-None-Match), which the `file://` backend doesn't implement but
+  MinIO does. The store still persists across a server restart, which the crash
+  fault relies on; each run gets a fresh `s3://zerofs-jepsen/run-<uuid>` prefix
+  so trials don't see each other's files.
 
 ## Running locally
 
@@ -48,6 +51,14 @@ cp jepsen/zerofs-ha.clj /tmp/local-fs/src/jepsen/local_fs/db/zerofs_ha.clj
 git -C /tmp/local-fs apply "$PWD/jepsen/local-fs.patch"
 cp jepsen/run.sh /tmp/local-fs/
 
+# The glue points every run at s3://zerofs-jepsen/run-<uuid> on a local MinIO
+# (127.0.0.1:9000); start one and make the bucket first.
+docker run -d --name minio -p 9000:9000 \
+  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+  minio/minio server /data
+mc alias set myminio http://localhost:9000 minioadmin minioadmin
+mc mb myminio/zerofs-jepsen
+
 cd /tmp/local-fs
 # POSIX conformance, no faults:
 ./run.sh run quickcheck --db zerofs \
@@ -55,7 +66,7 @@ cd /tmp/local-fs
   --quickcheck-tests 200 --time-limit 60
 
 # Crash consistency: the same run plus the fault that SIGKILLs the server and
-# recovers from the on-disk store.
+# recovers from the object store.
 ./run.sh run quickcheck --db zerofs \
   --zerofs-bin "$OLDPWD/zerofs/target/debug/zerofs" \
   --lose-unfsynced-writes --quickcheck-tests 200 --time-limit 60
@@ -75,7 +86,7 @@ with `./run.sh serve` (http://localhost:8080).
 ## Crash consistency (`--lose-unfsynced-writes`)
 
 The fault is a server **SIGKILL + restart**: it drops the memtable (the
-un-fsynced tail), then recovers from the on-disk store (a graceful stop would
+un-fsynced tail), then recovers from the object store (a graceful stop would
 flush on exit and defeat it).
 
 This requires the checker model to match ZeroFS rather than lazyfs. The stock
@@ -90,7 +101,7 @@ deterministic.
 
 ## HA failover (`--db zerofs-ha --failover`)
 
-`zerofs-ha` runs a leader + standby over one shared `file://` store, mounted
+`zerofs-ha` runs a leader + standby over one shared S3 store (MinIO), mounted
 multi-target. The `:failover` fault kills the leader; the standby promotes
 (replaying and flushing the semi-synced tail to the shared store before it
 serves), then `failover!` full-restarts to the canonical `a=leader / b=standby`
