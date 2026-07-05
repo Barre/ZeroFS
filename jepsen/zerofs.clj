@@ -22,7 +22,9 @@
         work (str dir ".zerofs")]
     {:mount      dir
      :work       work
-     :store      (str work "/store")
+     ; A fresh MinIO prefix per run isolates trials (MinIO has no per-run wipe,
+     ; unlike the old file:// store that teardown's rm -rf cleaned).
+     :store      (str "s3://zerofs-jepsen/run-" (java.util.UUID/randomUUID))
      :cache      (str work "/cache")
      :config     (str work "/config.toml")
      :server-log (str work "/server.log")
@@ -39,8 +41,14 @@
        "memory_size_gb = 0.25\n"
        "\n"
        "[storage]\n"
-       "url = \"file://" store "\"\n"
+       "url = \"" store "\"\n"
        "encryption_password = \"" password "\"\n"
+       "\n"
+       "[aws]\n"
+       "endpoint = \"http://127.0.0.1:9000\"\n"
+       "access_key_id = \"minioadmin\"\n"
+       "secret_access_key = \"minioadmin\"\n"
+       "allow_http = \"true\"\n"
        "\n"
        "[servers.ninep]\n"
        "addresses = [\"127.0.0.1:" port "\"]\n"
@@ -109,7 +117,7 @@
   db/DB
   (setup! [this test node]
     (info "Setting up ZeroFS at" mount)
-    (sh :mkdir :-p work store cache mount)
+    (sh :mkdir :-p work cache mount)
     (spit config (config-str this))
     ; Start the server
     (daemon-start! bin server-pid server-log ["run" "-c" config])
