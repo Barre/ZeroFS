@@ -16,7 +16,7 @@ Deleting a file is immediate at the filesystem level: the unlink transaction com
     Unlink removes the inode in a single transaction. What happens to the file's extents depends on the file's size:
 
     - Files of 10 extents or fewer (320 KiB at the 32 KiB extent size) have their extent keys deleted in the same transaction.
-    - Larger files leave a **tombstone**: a record of the file's remaining size. The extents stay in place until the garbage collector processes the tombstone.
+    - Larger files leave a **tombstone**, a record of the file's remaining size. The extents stay in place until the garbage collector processes the tombstone.
 
     If the file is still open, the unlink only detaches the inode from the namespace and records it as an orphan; the same small-file/tombstone decision runs when the last handle closes.
 
@@ -50,7 +50,7 @@ File contents are packed as encrypted frames into immutable segment objects; the
 
 1. **Tombstone GC** deletes the file's extent pointer keys and debits each source segment's live-byte counter. No object is deleted; the segment objects still hold the frames.
 2. **Segment GC** deletes segment objects whose live-byte counter has reached zero and repacks fragmented ones. This is where the bucket's billed size for file data drops.
-3. **Metadata compaction and object GC** rewrite and delete metadata SSTs. The SSTs hold only metadata — inodes, directories, extent pointers, counters — so this stage reclaims metadata space, not file data.
+3. **Metadata compaction and object GC** rewrite and delete metadata SSTs. The SSTs hold only metadata (inodes, directories, extent pointers, counters), so this stage reclaims metadata space, not file data.
 
 <Note>
   A delay between deleting files and the bucket shrinking is normal operation,
@@ -93,9 +93,9 @@ The writer runs a dedicated segment GC task: one pass at startup, then one per i
 
 The pass then reads every per-segment live-byte counter in one scan; it lists nothing on the object store. Only segments sealed before the pass are eligible. Two actions follow:
 
-**Dead-segment deletion.** A segment whose counter is zero is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment — a leaked segment is preferred to lost data. The object DELETE is the point where the bucket's billed size drops.
+**Dead-segment deletion.** A segment whose counter is zero is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment, since a leaked segment is preferred to lost data. The object DELETE is the point where the bucket's billed size drops.
 
-**Segment compaction.** Segments that are fragmented (live bytes below 50% of the object size) or small (below 1 MiB) are repacked: their live frames are fetched with coalesced ranged GETs, sorted by (inode, extent) so a file's data becomes physically contiguous, and sealed into new segments of up to 256 MiB. Drained sources are not deleted in the same pass: they become dead and a later pass removes them, which keeps in-flight reads of the old locations valid. Candidates that recent reads fanned out across are selected first, up to half the per-pass budget; the rest is filled most-fragmented-first. A dense segment with no dead bytes is rewritten by exactly one path: a hot-seam chain repack, described under [Read-Directed Compaction](/read-directed-compaction); one carrying dead bytes above the scrub floor falls to the tail scrub below once write-cold.
+**Segment compaction.** Segments that are fragmented (live bytes below 50% of the object size) or small (below 1 MiB) are repacked: their live frames are fetched with coalesced ranged GETs, sorted by (inode, extent) so a file's data becomes physically contiguous, and sealed into new segments of up to 256 MiB. Drained sources are not deleted in the same pass: they become dead and a later pass removes them, which keeps in-flight reads of the old locations valid. Candidates that recent reads fanned out across are selected first, up to half the per-pass budget; the rest is filled most-fragmented-first. A dense segment with no dead bytes is rewritten by exactly one path, a hot-seam chain repack, described under [Read-Directed Compaction](/read-directed-compaction); one carrying dead bytes above the scrub floor falls to the tail scrub below once write-cold.
 
 | Parameter | Value |
 |-----------|-------|
@@ -114,21 +114,21 @@ A pass issues a 64-byte footer GET plus a directory GET per segment it verifies 
 
 **Tail scrubbing.** The two candidacy rules above leave a band of dead space unreclaimed: a segment between the scrub floor (default 5%) and 50% dead that is never written again stays above the fragmentation threshold indefinitely, so a store whose files were each about 20% deleted would reclaim nothing from it. Pass budget left over after deletion and compaction is spent repacking such segments, most-dead-first, but only when they are write-cold: sealed at least 30 seal rotations before the current open segment within the current process's lifetime, or the whole store write-quiescent for 5 minutes (the only path by which data sealed before the last restart qualifies). The scrub consumes only budget that deletion and compaction did not use, so it runs mostly during idle periods; after an upgrade, a store with an accumulated tail works it off over the following passes.
 
-**Orphan sweep.** A segment object with no counter at all — a crash between sealing an object and the commit that would have credited it, or a repack whose relocated extents were all overwritten before the repoint — is invisible to the counter scan. A slow sweep reclaims these: once every 24 hours of wall-clock time (the last-run timestamp is persisted, so frequent restarts cannot postpone it), it streams one LIST of `segments/`, issued per shard prefix with bounded concurrency, and point-checks each listed object's counter. Counter-less objects pass the same directory verification as dead segments and are deleted after the same style of horizon, capped at 1,024 per sweep. This is the only object listing in the system, and orphans are rare.
+**Orphan sweep.** A segment object with no counter at all (from a crash between sealing an object and the commit that would have credited it, or a repack whose relocated extents were all overwritten before the repoint) is invisible to the counter scan. A slow sweep reclaims these: once every 24 hours of wall-clock time (the last-run timestamp is persisted, so frequent restarts cannot postpone it), it streams one LIST of `segments/`, issued per shard prefix with bounded concurrency, and point-checks each listed object's counter. Counter-less objects pass the same directory verification as dead segments and are deleted after the same style of horizon, capped at 1,024 per sweep. This is the only object listing in the system, and orphans are rare.
 
 ### Checkpoints Delay Reclamation
 
 [Checkpoints](/checkpoints) pin segment objects:
 
-- An ephemeral checkpoint — including a read replica's auto-renewed reader checkpoint — pushes the delete horizon to its expiry time plus a 30-second clock-skew margin, never below the 60-second floor.
-- A persistent checkpoint cannot be timed out. While one exists, segment deletion and compaction are paused entirely; the counters keep tracking garbage and reclamation catches up once the checkpoint is deleted. The orphan sweep is unaffected, because no manifest — and therefore no checkpoint — ever references an orphan.
+- An ephemeral checkpoint (including a read replica's auto-renewed reader checkpoint) pushes the delete horizon to its expiry time plus a 30-second clock-skew margin, never below the 60-second floor.
+- A persistent checkpoint cannot be timed out. While one exists, segment deletion and compaction are paused entirely; the counters keep tracking garbage and reclamation catches up once the checkpoint is deleted. The orphan sweep is unaffected, because no manifest, and therefore no checkpoint, ever references an orphan.
 - If the checkpoint list cannot be read, the pass is skipped. Reclamation fails closed.
 
 ## Stage 3: Metadata Compaction and Object GC
 
-The metadata LSM holds only inodes, directory entries, tombstones, extent pointers, and segment counters. Its compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process — metadata compaction always runs inside `zerofs run`.
+The metadata LSM holds only inodes, directory entries, tombstones, extent pointers, and segment counters. Its compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process; metadata compaction always runs inside `zerofs run`.
 
-The metadata store's object garbage collector, also in the writer process, scans four object directories — WAL, manifest, compacted SSTs, and compaction state — every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
+The metadata store's object garbage collector, also in the writer process, scans four object directories (WAL, manifest, compacted SSTs, and compaction state) every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
 
 ## Where Reclamation Runs
 

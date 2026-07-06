@@ -6,10 +6,10 @@ export const metadata = {
 
 # Kubernetes CSI Driver
 
-`zerofs-csi` exposes a ZeroFS filesystem to Kubernetes as dynamically provisioned persistent volumes. A ZeroFS gateway — a leader/standby pair — backs a StorageClass; each volume is a directory on that filesystem, and pods mount their directory over 9P. {{ className: 'lead' }}
+`zerofs-csi` exposes a ZeroFS filesystem to Kubernetes as dynamically provisioned persistent volumes. A ZeroFS gateway (a leader/standby pair) backs a StorageClass; each volume is a directory on that filesystem, and pods mount their directory over 9P. {{ className: 'lead' }}
 
 <Note>
-The driver registers as `csi.zerofs.net`. It provisions mount volumes only (no block mode) and passes csi-sanity v5.4.0 (one spec requiring per-volume capacity tracking is skipped — capacity is not enforced, see [Limitations](#limitations)). Manifests live in [`zerofs/zerofs-csi/deploy/`](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-csi/deploy); the project's k3s end-to-end CI applies the driver manifests as-is, overriding only the container image (the gateway it tests against is a CI-specific manifest).
+The driver registers as `csi.zerofs.net`. It provisions mount volumes only (no block mode) and passes csi-sanity v5.4.0 (one spec requiring per-volume capacity tracking is skipped; capacity is not enforced, see [Limitations](#limitations)). Manifests live in [`zerofs/zerofs-csi/deploy/`](https://github.com/Barre/ZeroFS/tree/main/zerofs/zerofs-csi/deploy); the project's k3s end-to-end CI applies the driver manifests as-is, overriding only the container image (the gateway it tests against is a CI-specific manifest).
 </Note>
 
 ## How It Works
@@ -18,7 +18,7 @@ ZeroFS is single-writer per bucket/prefix, so the driver shares one gateway acro
 
 - Two single-replica StatefulSets run `zerofs run` against one bucket. The leader serves 9P to the nodes and a gRPC admin API to the controller; the standby receives the leader's writes and stands ready. Writer-epoch fencing guarantees a single writer, so a deposed leader cannot split-brain against the one that replaced it.
 - The controller plugin translates `CreateVolume` into a `CreateDirectory` call for `/volumes/pvc-<uuid>` on the admin API, and `DeleteVolume` into `RemoveDirectory`. It points at both nodes and provisions against whichever is leading; a standby is not serving, so it is skipped. Removal renames the directory into a trash area and returns immediately; a background task deletes the contents and the [garbage collector](/garbage-collection) reclaims the extents.
-- The node plugin publishes a volume by spawning `zerofs mount <both-gateways> <target> --aname /volumes/pvc-<uuid>` — the userspace 9P client described in [9P File Access](/9p-access), attached directly to the volume's directory. The attach is rooted at that directory: the mount cannot name anything above it, and `..` at its root resolves to itself.
+- The node plugin publishes a volume by spawning `zerofs mount <both-gateways> <target> --aname /volumes/pvc-<uuid>`, the userspace 9P client described in [9P File Access](/9p-access), attached directly to the volume's directory. The attach is rooted at that directory: the mount cannot name anything above it, and `..` at its root resolves to itself.
 
 Each published volume is its own `zerofs mount` process pointed at both nodes, so mounts inherit the client's failover behavior: when the leader fails over (or a node restarts), the client follows the serving node, operations block through the takeover gap, then resume on the same open file handles. A failover does not invalidate existing mounts.
 
@@ -48,7 +48,7 @@ kubectl apply -f gateway-example.yaml
 Each node is configured like any other ZeroFS instance (see [Configuration](/configuration)) plus a `[replication]` section naming its role and its peer; sizing the [cache](/caching) is the main throughput lever for everything mounted through it. The two nodes must share the same storage url and encryption password.
 
 <Note>
-Pod readiness is gated on the replication port, not 9P. A standby binds the replication port early — to receive the leader's writes and answer heartbeats — but binds 9P only once it takes over, so a 9P readiness probe would drop the standby from its Service and cut off the leader's replication. The example StatefulSets are configured this way.
+Pod readiness is gated on the replication port, not 9P. A standby binds the replication port early (to receive the leader's writes and answer heartbeats) but binds 9P only once it takes over, so a 9P readiness probe would drop the standby from its Service and cut off the leader's replication. The example StatefulSets are configured this way.
 </Note>
 
 ### 2. The driver
@@ -75,7 +75,7 @@ kubectl apply -f $DEPLOY/storageclass-example.yaml
 
 `adminEndpoint` and `gateway` each carry the pair's node addresses, comma-separated; the data-plane mount and the controller probe the list and follow the serving leader, rerouting on failover.
 
-`DeleteVolume` receives no StorageClass parameters — the CSI specification gives it only the volume id and secrets — so the StorageClass must also reference a Secret carrying `adminEndpoint` through `csi.storage.k8s.io/provisioner-secret-name` and `-namespace`. The example includes it.
+`DeleteVolume` receives no StorageClass parameters (the CSI specification gives it only the volume id and secrets), so the StorageClass must also reference a Secret carrying `adminEndpoint` through `csi.storage.k8s.io/provisioner-secret-name` and `-namespace`. The example includes it.
 
 One StorageClass per gateway. Several StorageClasses, each with its own gateway pair, bucket, and encryption password, can coexist in one cluster.
 
@@ -99,14 +99,14 @@ spec:
 Creating the claim provisions the directory; scheduling a pod that uses it mounts the directory at the pod's `mountPath`. There is no attach step (`attachRequired: false`), so pods start as soon as the node plugin has the mount up.
 
 <Note>
-Requested capacity is recorded on the PV but not enforced — every volume shares the gateway filesystem. Cap total usage with the gateway's `max_size_gb` ([Configuration](/configuration)).
+Requested capacity is recorded on the PV but not enforced; every volume shares the gateway filesystem. Cap total usage with the gateway's `max_size_gb` ([Configuration](/configuration)).
 </Note>
 
 ## Failure Behavior
 
-- **Leader failover** — when the leader fails, the standby takes over within seconds (bounded by the takeover TTL), epoch-fencing the old leader. Published mounts block through the gap and resume on the same open file handles, following the new leader without a remount; the controller's next provisioning call routes to it too. Writer-epoch fencing prevents the deposed leader from writing after the takeover. This is the same model documented under [High Availability](/high-availability); the data-plane client behavior is [Client access](/high-availability#clients).
-- **Node plugin restart** — the FUSE clients are children of the node plugin container, so a restart breaks the published mounts on that node until the affected pods are recreated. The DaemonSet therefore uses an `OnDelete` update strategy: upgrades are deliberate, per-node, coordinated with draining.
-- **Node loss** — volume directories live on the gateway, so rescheduled pods mount the same data from any other node.
+- **Leader failover**: when the leader fails, the standby takes over within seconds (bounded by the takeover TTL), epoch-fencing the old leader. Published mounts block through the gap and resume on the same open file handles, following the new leader without a remount; the controller's next provisioning call routes to it too. Writer-epoch fencing prevents the deposed leader from writing after the takeover. This is the same model documented under [High Availability](/high-availability); the data-plane client behavior is [Client access](/high-availability#clients).
+- **Node plugin restart**: the FUSE clients are children of the node plugin container, so a restart breaks the published mounts on that node until the affected pods are recreated. The DaemonSet therefore uses an `OnDelete` update strategy: upgrades are deliberate, per-node, coordinated with draining.
+- **Node loss**: volume directories live on the gateway, so rescheduled pods mount the same data from any other node.
 
 The pair is two nodes, one standby: availability through failover, not write scale-out. See [High Availability](/high-availability) for the replication model, guarantees, and limits.
 
@@ -114,8 +114,8 @@ The pair is two nodes, one standby: availability through failover, not write sca
 
 None of the gateway ports is authenticated; the trust boundary is network reachability, the same model as NFS with `AUTH_SYS`. Each must be restricted to its legitimate clients:
 
-- **9P (5564)** is the data plane. The attach aname is namespacing, not authentication: any client that reaches this port can attach to any directory, including another volume's or the filesystem root. Pods never speak 9P themselves — they see only a kernel mountpoint — so this port is open to the node plugins.
-- **Admin RPC (7000)** is a root-equivalent control plane. It runs every call as uid 0 and can trash any volume (`RemoveDirectory`). Its only client is the controller, so it is locked to the controller pod alone — the tightest of the rules.
+- **9P (5564)** is the data plane. The attach aname is namespacing, not authentication: any client that reaches this port can attach to any directory, including another volume's or the filesystem root. Pods never speak 9P themselves (they see only a kernel mountpoint), so this port is open to the node plugins.
+- **Admin RPC (7000)** is a root-equivalent control plane. It runs every call as uid 0 and can trash any volume (`RemoveDirectory`). Its only client is the controller, so it is locked to the controller pod alone.
 - **Replication (9000)** is the leader → standby stream, heartbeats, and role discovery. Its only clients are the gateway pods themselves, so it is open just to them (each node ships to the other).
 
 [`networkpolicy-example.yaml`](https://github.com/Barre/ZeroFS/blob/main/zerofs/zerofs-csi/deploy/networkpolicy-example.yaml) ships in the deploy bundle and enforces all three. Apply it alongside the gateway (adapt the labels to your manifests):
@@ -156,7 +156,7 @@ A NetworkPolicy is a no-op on a CNI that does not enforce them (vanilla flannel,
 - **Capacity is not enforced.** PVC sizes are labels; the gateway's `max_size_gb` caps the filesystem as a whole.
 - **No per-volume snapshots.** [Checkpoints](/checkpoints) cover the whole gateway filesystem, not one volume directory.
 - **StorageClass `mountOptions` are rejected.** The mount takes no pass-through options; a capability carrying them fails with `InvalidArgument` rather than being silently ignored.
-- **Mount volumes only.** `volumeMode: Block` is not supported and not planned. A workload that wants a fixed-size disk image can create one inside its filesystem volume — `truncate -s 10G /data/disk.img` — and consume it directly (e.g. a file-backed VM disk) or, given sufficient privilege, attach it as a loop device. A first-class block volume would only add a raw device in exchange for giving up the filesystem's `ReadWriteMany` and reconnect-tolerant recovery.
+- **Mount volumes only.** `volumeMode: Block` is not supported and not planned. A workload that wants a fixed-size disk image can create one inside its filesystem volume (`truncate -s 10G /data/disk.img`) and consume it directly (e.g. a file-backed VM disk) or, given sufficient privilege, attach it as a loop device. A first-class block volume would only add a raw device in exchange for giving up the filesystem's `ReadWriteMany` and reconnect-tolerant recovery.
 
 ---
 

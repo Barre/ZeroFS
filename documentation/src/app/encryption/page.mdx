@@ -19,7 +19,7 @@ ZeroFS encrypts all data with XChaCha20-Poly1305. There is no unencrypted mode. 
 
     1. **Data Encryption Key (DEK)**: A 256-bit key that encrypts your data
     2. **Key Encryption Key (KEK)**: Derived from your password using Argon2id
-    3. **Encrypted DEK Storage**: The KEK-wrapped DEK is a standalone object, `zerofs.key`, at the database path on the object store — not a record inside the database
+    3. **Encrypted DEK Storage**: The KEK-wrapped DEK is a standalone object, `zerofs.key`, at the database path on the object store, not a record inside the database
 
     The `zerofs.key` object is bincode-serialized and holds the Argon2id salt, a 24-byte nonce, a plaintext version field, and the wrapped DEK. `zerofs change-password` rewrites it in place: the DEK is re-wrapped, the data itself is not re-encrypted.
 
@@ -59,9 +59,9 @@ ZeroFS encrypts all data with XChaCha20-Poly1305. There is no unencrypted mode. 
 
 There are two encryption domains.
 
-**File contents** never enter the LSM. Each 32 KiB extent is compressed, then encrypted as a self-describing frame — wire format `[nonce: 24][ciphertext + tag: 16]`, with a random 24-byte nonce per frame — and packed into immutable segment objects at `segments/<shard>/<epoch>/<counter>`. Each frame's AAD binds it to its segment ID, frame index, inode, and extent index, so a ciphertext frame cannot be spliced into another segment, slot, file, or offset. Under [replication](/high-availability), frames shipped to a standby for not-yet-uploaded segments are the already-sealed ciphertext bytes, not plaintext.
+**File contents** never enter the LSM. Each 32 KiB extent is compressed, then encrypted as a self-describing frame (wire format `[nonce: 24][ciphertext + tag: 16]`, with a random 24-byte nonce per frame) and packed into immutable segment objects at `segments/<shard>/<epoch>/<counter>`. Each frame's AAD binds it to its segment ID, frame index, inode, and extent index, so a ciphertext frame cannot be spliced into another segment, slot, file, or offset. Under [replication](/high-availability), frames shipped to a standby for not-yet-uploaded segments are the already-sealed ciphertext bytes, not plaintext.
 
-**Metadata** (inodes, directory entries, per-extent pointers) lives in the LSM tree. Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block with an empty AAD — byte-identical to the historical SST block format, so existing SSTs still decode. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
+**Metadata** (inodes, directory entries, per-extent pointers) lives in the LSM tree. Encryption applies at the SST block level: ZeroFS hands each encoded block (containing keys, values, and the block's internal index) to its block transformer, which compresses then encrypts the whole block with an empty AAD, byte-identical to the historical SST block format, so existing SSTs still decode. Decryption happens once per block on read; comparisons inside a block run on plaintext keys in memory, so there's no per-key encryption overhead.
 
 <Row>
   <Col>
@@ -96,7 +96,7 @@ There are two encryption domains.
         SST IDs, key-domain prefixes (`"meta"`, `"extent"`), the extractor name `zerofs-meta-extent-v1`, object sizes, checkpoint pointers, format version
       </Property>
       <Property name="Segment Footer & Frame Sizes" type="plaintext">
-        Every segment object ends with a fixed 64-byte plaintext footer: magic `ZSEG`, version, frame count, directory offset and length, sealed epoch, counter, sealed sequence number, total length, and a CRC32C. The CRC32C is keyless torn-write detection, not authentication — integrity comes from the per-frame AEAD tags. The plaintext `u32` length prefix before each frame reveals per-extent compressed sizes.
+        Every segment object ends with a fixed 64-byte plaintext footer: magic `ZSEG`, version, frame count, directory offset and length, sealed epoch, counter, sealed sequence number, total length, and a CRC32C. The CRC32C is keyless torn-write detection, not authentication; integrity comes from the per-frame AEAD tags. The plaintext `u32` length prefix before each frame reveals per-extent compressed sizes.
       </Property>
       <Property name="Object Metadata" type="plaintext">
         SST and segment object names, sizes, and counts (anything visible to an S3 LIST). A segment key encodes its writer epoch and segment counter.
@@ -196,13 +196,13 @@ ZeroFS validates the password before opening the database or loading the encrypt
 
 ### Changing the Password
 
-`zerofs change-password` reads exactly one line from stdin and trims surrounding whitespace. There is no interactive prompt, and terminal input is echoed — pipe the password instead of typing it:
+`zerofs change-password` reads exactly one line from stdin and trims surrounding whitespace. There is no interactive prompt, and terminal input is echoed, so pipe the password instead of typing it:
 
 ```bash
 printf '%s\n' "$NEW_PASSWORD" | zerofs change-password --config zerofs.toml
 ```
 
-This form suits feeding from a secret manager. The command re-wraps the DEK inside `zerofs.key`; data is not re-encrypted. If the configured current password is still `CHANGEME`, the command fails with `Current password is still the default. Please update your config file first` — set a real password in the config before changing it. After a successful change, update the config file or environment variable yourself; ZeroFS does not modify the config.
+This form suits feeding from a secret manager. The command re-wraps the DEK inside `zerofs.key`; data is not re-encrypted. If the configured current password is still `CHANGEME`, the command fails with `Current password is still the default. Please update your config file first`; set a real password in the config before changing it. After a successful change, update the config file or environment variable yourself; ZeroFS does not modify the config.
 
 ### Secure Password Practices
 

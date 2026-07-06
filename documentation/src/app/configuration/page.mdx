@@ -39,11 +39,11 @@ encryption_password = "your-secure-password"  # Encryption password
 addresses = ["127.0.0.1:2049"]
 ```
 
-Three tables are required: `[cache]`, `[storage]`, and `[servers]`. A file missing any of them fails to parse — omitting `[servers]` reports `missing field servers`. Each `[servers.*]` subsection is optional. An empty `[servers]` table parses, but `zerofs run` then exits with `No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled.` At least one subsection must start a listener: for 9P, NBD, and RPC a `unix_socket` alone counts, and a `[servers.webui]` section counts in Web-UI-enabled builds.
+Three tables are required: `[cache]`, `[storage]`, and `[servers]`. A file missing any of them fails to parse; omitting `[servers]` reports `missing field servers`. Each `[servers.*]` subsection is optional. An empty `[servers]` table parses, but `zerofs run` then exits with `No servers configured. At least one server (NFS, 9P, NBD, or RPC) must be enabled.` At least one subsection must start a listener: for 9P, NBD, and RPC a `unix_socket` alone counts, and a `[servers.webui]` section counts in Web-UI-enabled builds.
 
 Two parsing rules apply to the whole file:
 
-- **Unknown keys are rejected.** A misspelled key aborts startup with a parse error naming the key. The exception is the free-form backend tables `[aws]`, `[azure]`, and `[gcp]` — see [Backend Option Tables](#backend-option-tables).
+- **Unknown keys are rejected.** A misspelled key aborts startup with a parse error naming the key. The exception is the free-form backend tables `[aws]`, `[azure]`, and `[gcp]`; see [Backend Option Tables](#backend-option-tables).
 - **Sizes are decimal gigabytes.** All `*_gb` keys (`cache.disk_size_gb`, `cache.memory_size_gb`, `filesystem.max_size_gb`) are interpreted as 10⁹ bytes, not GiB. Fractional values are accepted: `0.5` is 500 MB.
 
 <Note>
@@ -52,7 +52,7 @@ Upgrading from a pre-segment release: the `[lsm]` keys `wal_enabled` and `max_un
 
 ## Cache
 
-The `[cache]` table is required. ZeroFS runs two caches, each with a memory and a disk tier: a decoded-block cache for metadata and a raw-parts cache for object bytes. Both disk tiers live under `dir`, inside a per-bucket subdirectory: `bucket_<8hex>/hybrid_cache/` and `bucket_<8hex>/parts_cache/` — see [Caching](/caching) for the layout. File data in the parts cache is stored as fetched from the object store: compressed and encrypted.
+The `[cache]` table is required. ZeroFS runs two caches, each with a memory and a disk tier: a decoded-block cache for metadata and a raw-parts cache for object bytes. Both disk tiers live under `dir`, inside a per-bucket subdirectory: `bucket_<8hex>/hybrid_cache/` and `bucket_<8hex>/parts_cache/`; see [Caching](/caching) for the layout. File data in the parts cache is stored as fetched from the object store: compressed and encrypted.
 
 | Key | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -161,17 +161,17 @@ service_account = "/path/to/service-account-key.json"
 GCS credentials resolve in this order:
 1. Explicit service-account credentials from the `[gcp]` section (`service_account` path or `service_account_key`)
 2. An Application Default Credentials file: the `application_credentials` key, the `GOOGLE_APPLICATION_CREDENTIALS` environment variable, or the gcloud CLI's `~/.config/gcloud/application_default_credentials.json`
-3. The VM/GKE metadata service, as the last fallback — this is why no `[gcp]` section is needed on GCP with an attached service account
+3. The VM/GKE metadata service, as the last fallback; this is why no `[gcp]` section is needed on GCP with an attached service account
 </Note>
 
 ### Backend Option Tables {{ id: 'backend-option-tables' }}
 
-`[aws]`, `[azure]`, and `[gcp]` are free-form key-value tables, not fixed schemas. At startup, each key is lowercased, prefixed with `aws_`, `azure_`, or `google_`, and forwarded to the object_store builder for the storage URL's backend. Any configuration key that builder accepts works — for example `session_token`, `virtual_hosted_style_request`, or `skip_signature` under `[aws]`, and `storage_sas_token` under `[azure]` (forwarded as `azure_storage_sas_token`). The full key lists are in the object_store documentation: [`AmazonS3ConfigKey`](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html), [`AzureConfigKey`](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html), [`GoogleConfigKey`](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html).
+`[aws]`, `[azure]`, and `[gcp]` are free-form key-value tables, not fixed schemas. At startup, each key is lowercased, prefixed with `aws_`, `azure_`, or `google_`, and forwarded to the object_store builder for the storage URL's backend. Any configuration key that builder accepts works, for example `session_token`, `virtual_hosted_style_request`, or `skip_signature` under `[aws]`, and `storage_sas_token` under `[azure]` (forwarded as `azure_storage_sas_token`). The full key lists are in the object_store documentation: [`AmazonS3ConfigKey`](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html), [`AzureConfigKey`](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html), [`GoogleConfigKey`](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html).
 
 Two rules apply:
 
 - **Every value must be a TOML string.** `allow_http = "true"`, not `allow_http = true`. A non-string value fails at startup with `Failed to parse config file`.
-- **Unknown keys are dropped without warning.** A misspelled key — `secret_acess_key` — produces no configuration error and surfaces later as an authentication or connection failure. Check key spelling before debugging credentials.
+- **Unknown keys are dropped without warning.** A misspelled key such as `secret_acess_key` produces no configuration error and surfaces later as an authentication or connection failure. Check key spelling before debugging credentials.
 
 The same rules apply to the `[wal.aws]`, `[wal.azure]`, and `[wal.gcp]` tables under the legacy [`[wal]` section](#separate-wal-object-store). Values in all of these tables support [environment variable substitution](#environment-variable-substitution).
 
@@ -186,9 +186,9 @@ encryption_password = "secure-password-here"
 storage_class = "..."  # provider-specific value, e.g. a single-zone hot class
 ```
 
-Because the value is verbatim, it must be valid for your backend; a value the backend does not recognize — an S3 class name on Azure, for example — is rejected by the store on the first write. Omit the field to use the account/bucket default. The typical use is selecting a cheaper single-zone / reduced-redundancy **hot** or higher performance class where your provider offers one.
+Because the value is verbatim, it must be valid for your backend; a value the backend does not recognize (an S3 class name on Azure, for example) is rejected by the store on the first write. Omit the field to use the account/bucket default. The typical use is selecting a cheaper single-zone / reduced-redundancy **hot** or higher performance class where your provider offers one.
 
-Server-side copies cannot carry a storage class: objects written via copy land in the bucket or account default class regardless of this setting. The legacy `[wal]` section has its own independent `storage_class` — see [Separate WAL Object Store](#separate-wal-object-store).
+Server-side copies cannot carry a storage class: objects written via copy land in the bucket or account default class regardless of this setting. The legacy `[wal]` section has its own independent `storage_class`; see [Separate WAL Object Store](#separate-wal-object-store).
 
 <Warning>
 ZeroFS reads segment objects, SSTs, and the manifest continuously, so `storage_class` must be a hot, instant-access tier:
@@ -328,7 +328,7 @@ sync_writes = false              # Make every write durable on return
 
 - **`max_concurrent_compactions`** (default: 2, min: 1): Maximum number of metadata compaction operations that can run concurrently. The store holds only metadata (file contents are immutable segment objects), so compactions are small and seldom pile up; a low cap keeps object-store request and CPU use down. Compaction always runs embedded in `zerofs run`; there is no separate compactor process.
 
-- **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Each flush first seals the open segment buffer, uploading buffered file data, then flushes the metadata store. Between flushes, up to 256 MiB of committed writes can sit in the in-memory open segment. `fsync` calls from clients (9P fsync, NFS COMMIT, NBD flush) always trigger an immediate flush regardless of this interval, unless `[filesystem] ignore_fsync = true`, which makes `fsync` a no-op — see [High Availability](#high-availability).
+- **`flush_interval_secs`** (default: 30, min: 5): Interval in seconds between periodic background flushes to durable storage. Each flush first seals the open segment buffer, uploading buffered file data, then flushes the metadata store. Between flushes, up to 256 MiB of committed writes can sit in the in-memory open segment. `fsync` calls from clients (9P fsync, NFS COMMIT, NBD flush) always trigger an immediate flush regardless of this interval, unless `[filesystem] ignore_fsync = true`, which makes `fsync` a no-op; see [High Availability](#high-availability).
 
 - **`sync_writes`** (default: `false`): When enabled, every write is durably flushed before returning success, eliminating the "in-memory unflushed" window between fsync calls. This does **not** change POSIX fsync semantics: with the default `false`, explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs writes *between* fsync calls. Expensive: each coalesced batch forces a segment seal plus a memtable flush (concurrent writes still merge into a single batch and a single flush). Rejected in combination with `[filesystem] ignore_fsync`. See the [Eliminating the Durability Window](/durability#eliminating-the-durability-window) section for guidance on when to enable.
 
@@ -367,9 +367,9 @@ tail_scrub_min_dead_percent = 5  # Repack write-cold segments above this % dead 
 
 ### Parameters
 
-- **`interval_secs`** (default: 60, min: 5): Seconds between segment GC passes while the filesystem is active. The ceiling of the adaptive cadence — the loop never sleeps longer. Deletion safety does not depend on this value (it rides on the per-segment delete horizon); only reclamation responsiveness does. Values below the ~30-second flush cadence make a busy pass's barrier seal real sub-1-MiB segments, which are themselves future GC work.
+- **`interval_secs`** (default: 60, min: 5): Seconds between segment GC passes while the filesystem is active. The ceiling of the adaptive cadence: the loop never sleeps longer. Deletion safety does not depend on this value (it rides on the per-segment delete horizon); only reclamation responsiveness does. Values below the ~30-second flush cadence make a busy pass's barrier seal real sub-1-MiB segments, which are themselves future GC work.
 
-- **`idle_interval_secs`** (default: 5, min: 1, capped at `interval_secs`): Seconds between passes while the previous pass hit a work budget with actionable backlog remaining *and* the store was completely idle since that pass. A fast pass performs real reclamation — up to 32 back-to-back batches of the per-round compaction budget while the store stays idle mid-pass, plus 1,024 deletes and roughly two small bookkeeping PUTs of fixed overhead — so this interval paces idleness re-checks rather than capping drain throughput; total fast-mode work is bounded by the backlog. Setting it equal to `interval_secs` disables only the idle acceleration tier; the independent busy-backlog drain tier still accelerates an active store.
+- **`idle_interval_secs`** (default: 5, min: 1, capped at `interval_secs`): Seconds between passes while the previous pass hit a work budget with actionable backlog remaining *and* the store was completely idle since that pass. A fast pass performs real reclamation (up to 32 back-to-back batches of the per-round compaction budget while the store stays idle mid-pass, plus 1,024 deletes and roughly two small bookkeeping PUTs of fixed overhead), so this interval paces idleness re-checks rather than capping drain throughput; total fast-mode work is bounded by the backlog. Setting it equal to `interval_secs` disables only the idle acceleration tier; the independent busy-backlog drain tier still accelerates an active store.
 
 - **`busy_backlog_interval_secs`** (default: 15, min: 5, capped at `interval_secs`): Seconds between passes while the store is *active* but its dead backlog is large, the dead space at or above `busy_backlog_dead_percent`, or reserve-deferred hot seams remain. This is the middle cadence tier: it lets a loaded, dirty store keep draining without waiting the full base interval. Setting it equal to `interval_secs` disables the tier (a busy store then uses the base interval regardless of backlog).
 
@@ -379,13 +379,13 @@ tail_scrub_min_dead_percent = 5  # Repack write-cold segments above this % dead 
 
 - **`compact_round_max_mib`** (default: 256, range: 64–4096): Per-round compaction budget in MiB, the heat reserve for nominations and hot seams (half the budget), and the plaintext gather RAM cap. Raising it packs hot seams whose cheapest pair exceeds the reserve (the *over-reserve* chains that otherwise never repack; see [Read-Directed Compaction](/read-directed-compaction)) and lifts dead-space throughput per batch. The cost is peak gather RAM of roughly this many MiB per batch (more for a highly compressible seam, which is gathered whole), so treat it as a RAM dial.
 
-- **`read_directed`** (default: `true`): Whether reads steer compaction — the nomination priority, seam statistics, and chain repacks described under [Read-Directed Compaction](/read-directed-compaction). Turning it off stops all read-side recording; counter-driven reclamation and the tail scrub are unaffected.
+- **`read_directed`** (default: `true`): Whether reads steer compaction: the nomination priority, seam statistics, and chain repacks described under [Read-Directed Compaction](/read-directed-compaction). Turning it off stops all read-side recording; counter-driven reclamation and the tail scrub are unaffected.
 
-- **`tail_scrub_min_dead_percent`** (default: 5, range: 1–50; 0 disables the tail scrub): The tail-scrub floor. A write-cold segment more than this percent dead — but not dead enough for normal compaction candidacy — is repacked with leftover pass budget, most-dead-first. This caps the space overhead of write-cold data at 1/(1 − floor/100) of its live bytes (about 1.05× at the default), paid with up to (100 − floor)/floor bytes rewritten per byte reclaimed (19× at the default; the ratio improves as segments get deader, and the most-dead-first order takes the cheapest reclaim first). Raise it on request-billed or churn-sensitive backends; 50 empties the candidacy band, and 0 turns the scrub off entirely. On upgrade, a store with an accumulated 5–49%-dead tail works it off once — rate-limited to one round budget of live bytes per batch (256 MiB by default), batching only while the store is idle — and goes quiet.
+- **`tail_scrub_min_dead_percent`** (default: 5, range: 1–50; 0 disables the tail scrub): The tail-scrub floor. A write-cold segment more than this percent dead, but not dead enough for normal compaction candidacy, is repacked with leftover pass budget, most-dead-first. This caps the space overhead of write-cold data at 1/(1 − floor/100) of its live bytes (about 1.05× at the default), paid with up to (100 − floor)/floor bytes rewritten per byte reclaimed (19× at the default; the ratio improves as segments get deader, and the most-dead-first order takes the cheapest reclaim first). Raise it on request-billed or churn-sensitive backends; 50 empties the candidacy band, and 0 turns the scrub off entirely. On upgrade, a store with an accumulated 5–49%-dead tail works it off once, rate-limited to one round budget of live bytes per batch (256 MiB by default) and batching only while the store is idle, then goes quiet.
 
 ## Separate WAL Object Store
 
-ZeroFS no longer writes a WAL: it is permanently disabled and cannot be enabled. The `[wal]` section from earlier releases — `url`, `storage_class`, and the `[wal.aws]`, `[wal.azure]`, `[wal.gcp]` credential blocks — still parses, but with the WAL off it has no effect on writes or `fsync` latency. Omit it from new configurations.
+ZeroFS no longer writes a WAL: it is permanently disabled and cannot be enabled. The `[wal]` section from earlier releases (`url`, `storage_class`, and the `[wal.aws]`, `[wal.azure]`, `[wal.gcp]` credential blocks) still parses, but with the WAL off it has no effect on writes or `fsync` latency. Omit it from new configurations.
 
 ## Multiple Instances
 
@@ -613,12 +613,9 @@ Substitution applies to these keys only; all other values are taken literally:
 
 For array values (`peers` and the `addresses` lists) each entry is expanded independently, so `peers = ["${PEER_A}", "${PEER_B}"]` substitutes each element on its own; a single variable is not split into multiple entries. Expansion runs on the whole string before an `addresses` entry is parsed as a socket address, so the host, the port, or the entire value may come from a variable: `addresses = ["${POD_IP}:2049"]` and `addresses = ["${BIND_ADDR}"]` are both valid.
 
-If a referenced variable is unset, the configuration fails to load with `Failed to expand environment variable`. A literal `$` in an expandable value — an encryption password, for example — must be written `$$`.
+If a referenced variable is unset, the configuration fails to load with `Failed to expand environment variable`. A literal `$` in an expandable value (an encryption password, for example) must be written `$$`.
 
-This is useful for:
-- Keeping secrets out of configuration files
-- Using the same config across environments
-- Integration with secret management systems
+This keeps secrets out of configuration files and lets the same file serve several environments.
 
 ## System Integration
 

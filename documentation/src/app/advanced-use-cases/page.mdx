@@ -20,7 +20,7 @@ Run one ZeroFS instance per region and mirror their NBD devices in a single ZFS 
 <CodeGroup>
 
 ```toml {{ title: 'US East Config' }}
-# zerofs-us-east.toml — runs on 10.0.1.5
+# zerofs-us-east.toml, runs on 10.0.1.5
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 50.0
@@ -42,7 +42,7 @@ addresses = ["10.0.1.5:10809"]
 ```
 
 ```toml {{ title: 'EU West Config' }}
-# zerofs-eu-west.toml — runs on 10.0.2.5
+# zerofs-eu-west.toml, runs on 10.0.2.5
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 50.0
@@ -64,7 +64,7 @@ addresses = ["10.0.2.5:10809"]
 ```
 
 ```toml {{ title: 'Asia Pacific Config' }}
-# zerofs-asia.toml — runs on 10.0.3.5
+# zerofs-asia.toml, runs on 10.0.3.5
 [cache]
 dir = "/var/cache/zerofs"
 disk_size_gb = 50.0
@@ -139,7 +139,7 @@ The two setups above compose into a storage layer for PostgreSQL: each database 
 
 ### Reference Topology
 
-Clients connect through a proxy (HAProxy or PgBouncer) to a primary/standby pair using PostgreSQL synchronous replication. Each node owns its own pool: a 3-way ZFS mirror of NBD devices, each device served by a ZeroFS instance backed by a different S3 region — six instances and six regions for the pair. The two layers cover different failures: synchronous replication covers node failure, and the proxy redirects connections when the primary fails; the mirror covers region and object-store failure — the pool stays online with one member unreachable and resilvers the device when it returns.
+Clients connect through a proxy (HAProxy or PgBouncer) to a primary/standby pair using PostgreSQL synchronous replication. Each node owns its own pool: a 3-way ZFS mirror of NBD devices, each device served by a ZeroFS instance backed by a different S3 region: six instances and six regions for the pair. The two layers cover different failures: synchronous replication covers node failure, and the proxy redirects connections when the primary fails; the mirror covers region and object-store failure, staying online with one member unreachable and resilvering the device when it returns.
 
 Build one node's pool from the three instances configured above, then add local devices as in the tiered setup:
 
@@ -165,7 +165,7 @@ The standby repeats this with three ZeroFS instances in three other regions. Dev
 ### Durability Path
 
 - **Commit flow**: PostgreSQL fsyncs its write-ahead log on commit. ZFS turns that into a synchronous write absorbed by the SLOG and issues flush commands to the pool's devices.
-- **Flush semantics**: ZeroFS advertises NBD flush and FUA support, and both a flush command and a FUA-flagged write return only after buffered data is durably persisted — the same flush path that serves `fsync` over 9P. See [Durability &amp; Consistency](/durability).
+- **Flush semantics**: ZeroFS advertises NBD flush and FUA support, and both a flush command and a FUA-flagged write return only after buffered data is durably persisted, the same flush path that serves `fsync` over 9P. See [Durability &amp; Consistency](/durability).
 - **Flush latency**: A flush seals the open in-memory segment and uploads it as one immutable segment object, then flushes metadata. Extents are compressed and encrypted into frames as they are written, so sealing only appends the segment directory and footer. It also waits for any in-flight background segment uploads. Flush latency therefore follows the main object store's PUT latency. The SLOG above keeps that off the commit path: commits wait on the local log device, and the pool flushes the ZeroFS devices at transaction-group sync.
 - **Storage-level read replicas**: A ZeroFS [read replica](/read-replicas) exposes the same filesystem read-only from another instance. It does not replace a PostgreSQL standby, which needs a writable data directory and receives changes through PostgreSQL replication.
 

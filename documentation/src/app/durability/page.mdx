@@ -10,7 +10,7 @@ This document describes the durability and consistency guarantees provided by Ze
 
 ## Overview
 
-ZeroFS implements a transactional storage model on object storage. File contents live as compressed, encrypted frames inside immutable segment objects written directly to the object store. Metadata — inodes, directory entries, and one 32-byte `FrameLoc` pointer per 32 KiB extent — lives in an LSM-tree database. This architecture provides three properties:
+ZeroFS implements a transactional storage model on object storage. File contents live as compressed, encrypted frames inside immutable segment objects written directly to the object store. Metadata (inodes, directory entries, and one 32-byte `FrameLoc` pointer per 32 KiB extent) lives in an LSM-tree database. This architecture provides three properties:
 
 1. **Write Atomicity**: All filesystem operations are atomic at the transaction level
 2. **Strict Ordering**: Operations are totally ordered and this order is preserved across crashes
@@ -94,7 +94,7 @@ ZeroFS provides a total order over all write operations. This order is preserved
     db.write(merged).await;
     ```
 
-    Per-inode locks (covering files and directories) serialize operations that observe each other's state; global statistics and per-segment counters are folded by the single commit worker itself, which is their sole writer. If operation A completes before operation B begins, B's transaction is sent strictly after A's commit returned — and therefore lands in a strictly later batch. The visibility of B implies the visibility of A.
+    Per-inode locks (covering files and directories) serialize operations that observe each other's state; global statistics and per-segment counters are folded by the single commit worker itself, which is their sole writer. If operation A completes before operation B begins, B's transaction is sent strictly after A's commit returned, and therefore lands in a strictly later batch. The visibility of B implies the visibility of A.
 
     ### Formal Property
 
@@ -141,7 +141,7 @@ ZeroFS requires no recovery procedure after unexpected termination.
 
     **Self-Describing State**: The database manifest describes the complete set of valid SST files. On startup, ZeroFS reads the manifest and has immediate access to the latest consistent state.
 
-    **Seal-Before-Manifest Ordering**: A flush uploads the open segment before the metadata flush that references it. A durable manifest never points at a missing segment object. A crash between the two steps leaves only an orphaned segment, later reclaimed by segment GC — never a dangling pointer.
+    **Seal-Before-Manifest Ordering**: A flush uploads the open segment before the metadata flush that references it. A durable manifest never points at a missing segment object. A crash between the two steps leaves only an orphaned segment, later reclaimed by segment GC, never a dangling pointer.
 
     **No Write-Ahead Log**: The WAL is permanently disabled and not configurable. A WAL flush is not gated by the seal barrier: it could make a `FrameLoc` pointer durable while the segment it points at is still the un-uploaded in-RAM buffer. With the WAL off, the barrier-gated flush is the only path that makes metadata durable, and startup has no log to replay.
 
@@ -231,9 +231,9 @@ ZeroFS follows standard POSIX durability semantics. Write operations are buffere
 
 A successful `fsync` is verified: it means every write the descriptor acknowledged before it is durable on object storage. Acknowledged file data lives in the in-RAM open segment buffer, and its metadata in the memtable, until the next flush, so a crash before that flush loses them. ZeroFS does not let that loss pass silently. A `fsync` issued after a restart, over writes made before it, returns a stale-handle error (`ESTALE`) rather than a false success.
 
-Each acknowledged write is tagged with a durability *lineage token* naming the current unbroken durable lineage. A restart reopens the database and, with no way to prove it inherited the un-flushed buffers, regenerates the token. A `fsync` presents the token its writes were made under; if the database has since regenerated, the tokens differ and the `fsync` fails. The first `fsync` after a write is the binding promise, so a failure is an honest report of loss: redo the writes and `fsync` again.
+Each acknowledged write is tagged with a durability *lineage token* naming the current unbroken durable lineage. A restart reopens the database and, with no way to prove it inherited the un-flushed buffers, regenerates the token. A `fsync` presents the token its writes were made under; if the database has since regenerated, the tokens differ and the `fsync` fails. The first `fsync` after a write is the durability boundary, so a failure reports real loss: redo the writes and `fsync` again.
 
-This holds on a single node and under replication alike. With a replicated standby a clean failover can prove it inherited the writes — the standby receives un-flushed extent frames over replication and materializes their segments at takeover — and keeps the token, so the `fsync` succeeds transparently; the failover cases are diagrammed in [High availability](/high-availability). The check is per descriptor and matches POSIX: it covers the whole file across every open handle, speaks for no other file, and verifies data, metadata, directory entries, and `rename`.
+This holds on a single node and under replication alike. With a replicated standby a clean failover can prove it inherited the writes (the standby receives un-flushed extent frames over replication and materializes their segments at takeover) and keeps the token, so the `fsync` succeeds transparently; the failover cases are diagrammed in [High availability](/high-availability). The check is per descriptor and matches POSIX: it covers the whole file across every open handle, speaks for no other file, and verifies data, metadata, directory entries, and `rename`.
 
 ## Eliminating the Durability Window
 
@@ -354,7 +354,7 @@ For each failpoint, the test suite:
 2. Aborts the operation at the injection point and tears down the filesystem instance, discarding all in-memory state
 3. Restarts the filesystem from object storage
 4. Runs the full consistency checker
-5. Verifies either complete rollback or complete commit—never partial state
+5. Verifies either complete rollback or complete commit, never partial state
 
 This verifies that the atomicity and ordering guarantees hold at each injected crash point.
 
@@ -402,8 +402,8 @@ This test validates data integrity through multiple filesystem layers and across
 
 | Test Suite | Protocol | Coverage |
 |------------|----------|----------|
-| Unit tests | — | Core filesystem logic |
-| Failpoint crash tests | — | Crash consistency at each operation stage |
+| Unit tests | n/a | Core filesystem logic |
+| Failpoint crash tests | n/a | Crash consistency at each operation stage |
 | Jepsen (local-fs) | 9P | Model-based correctness, crash consistency |
 | pjdfstest | NFS, 9P, FUSE | POSIX compliance |
 | stress-ng | NFS, 9P, FUSE | Concurrent operations under load |

@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://www.zerofs.net">
-    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/readme_logo.png" alt="ZeroFS Logo" width="500">
+    <img src="https://www.zerofs.net/assets/readme_hero.jpg" alt="ZeroFS: a log-structured filesystem for S3" width="820">
   </a>
 </p>
 
@@ -12,9 +12,18 @@
 
 </div>
 
-# ZeroFS — A log-structured filesystem for S3
+# ZeroFS is a log-structured filesystem for S3
 
-ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as raw block devices over NBD. All three servers run in one userspace process. Data is compressed and encrypted before upload.
+ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as raw block devices over NBD. All three servers run in a single userspace process. Data is compressed and encrypted before upload.
+
+ZeroFS differentiates itself from other "filesystem on S3" projects by:
+
+- Being POSIX-conformant
+- Reaching near-raw-S3 throughput on large files, and scaling to workloads of millions of small files
+- Requiring no external database service (everything is stored on S3)
+- Being well tested (in CI we run [pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [kernel builds](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and more)
+
+
 
 | | |
 |---|---|
@@ -29,7 +38,7 @@ ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as
 
 ## Quick Start
 
-### apt / dnf (recommended, amd64/arm64)
+### apt / dnf
 
 ```bash
 # Debian / Ubuntu
@@ -68,7 +77,7 @@ docker run --rm -v "$PWD/zerofs.toml:/zerofs.toml" \
   ghcr.io/barre/zerofs:latest run -c /zerofs.toml
 ```
 
-The container runs as UID 1001, not root; a bind-mounted cache directory must be writable by UID 1001. To reach the servers from the host, bind addresses to `0.0.0.0` and map a port per enabled server: 2049 (NFS), 5564 (9P), 10809 (NBD).
+The container runs as UID 1001. A bind-mounted cache directory must be writable by UID 1001. To reach the servers from the host, bind addresses to `0.0.0.0` and map a port per enabled server: 2049 (NFS), 5564 (9P), 10809 (NBD).
 
 ### Running
 
@@ -81,11 +90,13 @@ zerofs run -c zerofs.toml
 
 ## Testing
 
-- **[pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — 8,662 POSIX cases ([pjdfstest_nfs](https://github.com/Barre/pjdfstest_nfs)), once per protocol: NFS, 9P, FUSE. Per-protocol exclude lists are in [`.github/`](https://github.com/Barre/ZeroFS/tree/main/.github).
-- **[xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — the standard filesystem regression suite, over NFS, 9P, and FUSE.
-- **[Kernel build](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — the Linux kernel compiles with `make -j$(nproc)` on NFS, 9P, and FUSE mounts.
-- **[stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — file-handling stressors run concurrently against live mounts.     - **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
-- **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.                                                                                                               - **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)** — a leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across failover. The local-fs model checker also runs with failovers injected.
+- **[pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: 8,662 POSIX cases ([pjdfstest_nfs](https://github.com/Barre/pjdfstest_nfs)), once per protocol: NFS, 9P, FUSE. Per-protocol exclude lists are in [`.github/`](https://github.com/Barre/ZeroFS/tree/main/.github).
+- **[xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: the standard filesystem regression suite, over NFS, 9P, and FUSE.
+- **[Kernel build](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: the Linux kernel compiles with `make -j$(nproc)` on NFS, 9P, and FUSE mounts.
+- **[stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: file-handling stressors run concurrently against live mounts.
+- **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
+- **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.
+- **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across failover. The local-fs model checker also runs with failovers injected.
 
 ## Web UI
 
@@ -109,7 +120,8 @@ The file manager speaks 9P over WebSocket. Drag-and-drop uploads work, including
 
 The dashboard streams stats over gRPC-web, plus a file access tracer.
 
-<p align="center">                                                                     <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Terminal"
+<p align="center">
+    <img src="https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/terminal.png" alt="ZeroFS Web UI Terminal"
   width="700">
 </p>
 
@@ -187,7 +199,8 @@ encryption_password = "${ZEROFS_PASSWORD}"
 [filesystem]
 max_size_gb = 100.0     # Optional; writes past the quota return ENOSPC (default 16 EiB)
 compression = "zstd-3"  # Optional: "zstd-{1-22}" (default "zstd-3") or "lz4"
-                                                                   [servers.nfs]
+
+[servers.nfs]
 addresses = ["127.0.0.1:2049"]
 
 [servers.ninep]
