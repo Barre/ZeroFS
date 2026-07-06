@@ -1,3 +1,10 @@
+# Deployed before the gateway, so this file creates the shared namespace
+# (gateway.yaml also declares it; kubectl apply is idempotent).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerofs
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
