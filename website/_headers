@@ -1,0 +1,3 @@
+# Content-hashed Next.js assets never change under a given URL.
+/docs/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable
