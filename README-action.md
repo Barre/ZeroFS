@@ -20,8 +20,8 @@ This GitHub Action provides persistent volumes backed by S3-compatible storage f
 | `object-store-url` | Object store URL (e.g. s3://bucket/path) | Yes | - |
 | `encryption-password` | Password for filesystem encryption | Yes | - |
 | `mount-path` | Path where the volume should be mounted | No | `/mnt/zerofs` |
-| `cache-dir` | Directory for SlateDB disk cache | No | `/tmp/zerofs-cache` |
-| `cache-size-gb` | SlateDB disk cache size in GB | No | `1` |
+| `cache-dir` | Directory for the disk cache | No | `/tmp/zerofs-cache` |
+| `cache-size-gb` | Disk cache size in GB | No | `1` |
 | `memory-cache-size-gb` | ZeroFS in-memory cache size in GB | No | `0.25` |
 | `aws-access-key-id` | AWS access key ID (for S3) | No | - |
 | `aws-secret-access-key` | AWS secret access key (for S3) | No | - |
