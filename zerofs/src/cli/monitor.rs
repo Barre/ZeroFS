@@ -87,11 +87,11 @@ impl MonitorApp {
                 push_ring(&mut self.write_iops, write_ops);
                 push_ring(&mut self.total_ops, total as u64);
 
-                self.rate_base = Some(snapshot);
+                self.rate_base = Some(snapshot.clone());
                 self.rate_base_time = Some(now);
             }
         } else {
-            self.rate_base = Some(snapshot);
+            self.rate_base = Some(snapshot.clone());
             self.rate_base_time = Some(now);
         }
 
@@ -198,6 +198,7 @@ fn ui(f: &mut Frame, app: &MonitorApp) {
         Constraint::Fill(1),   // throughput chart
         Constraint::Fill(1),   // IOPS chart
         Constraint::Length(3), // sparkline + storage row
+        Constraint::Length(6), // segment space row
         Constraint::Length(5), // counters row
         Constraint::Length(3), // memory row
         Constraint::Length(1), // footer
@@ -230,20 +231,23 @@ fn ui(f: &mut Frame, app: &MonitorApp) {
     render_total_ops_sparkline(f, app, row3[0]);
     render_storage_gauge(f, app, row3[1]);
 
+    // Segment space row
+    render_segment_space(f, app, outer[4]);
+
     // Counters row
-    let row4 = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(outer[4]);
-    render_operations(f, app, row4[0]);
-    render_gc_stats(f, app, row4[1]);
+    let row5 = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(outer[5]);
+    render_operations(f, app, row5[0]);
+    render_gc_stats(f, app, row5[1]);
 
     // Memory row
-    render_memory_stats(f, app, outer[5]);
+    render_memory_stats(f, app, outer[6]);
 
     // Footer
     let footer = Paragraph::new("Press q to quit")
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, outer[5]);
+    f.render_widget(footer, outer[7]);
 }
 
 fn render_throughput_chart(f: &mut Frame, app: &MonitorApp, area: Rect) {
@@ -398,7 +402,7 @@ fn render_storage_gauge(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let gauge = Gauge::default()
         .block(
             Block::bordered()
-                .title(" Storage ")
+                .title(" Storage (Logical) ")
                 .title_style(Style::default().fg(Color::Yellow).bold()),
         )
         .gauge_style(Style::default().fg(color))
@@ -479,6 +483,201 @@ fn render_gc_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
             .title_style(Style::default().fg(Color::Yellow).bold()),
     );
     f.render_widget(para, area);
+}
+
+fn render_segment_space(f: &mut Frame, app: &MonitorApp, area: Rect) {
+    let block = Block::bordered()
+        .title(" Segment Space (Physical) ")
+        .title_style(Style::default().fg(Color::Yellow).bold());
+
+    let seg = match app.current.as_ref().and_then(|s| s.segment_gc.as_ref()) {
+        Some(s) if s.has_run => s,
+        _ => {
+            let p = Paragraph::new("warming up (no reclaim pass yet)")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block);
+            f.render_widget(p, area);
+            return;
+        }
+    };
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(1), // live / dead / awaiting bar
+        Constraint::Length(1), // footprint totals
+        Constraint::Length(1), // cadence posture + reason
+        Constraint::Length(1), // last-pass activity
+    ])
+    .split(inner);
+
+    // Bar: live (green) | dead trapped in live segments (red) | fully dead,
+    // awaiting the delete horizon (yellow). The three sum to appended bytes.
+    let appended = seg.appended_bytes.max(1);
+    let awaiting = seg.awaiting_delete_bytes.min(seg.reclaimable_bytes);
+    let dead_trapped = seg.reclaimable_bytes.saturating_sub(awaiting);
+    let width = rows[0].width as u64;
+    let live_w = (seg.live_bytes.saturating_mul(width) / appended) as usize;
+    let dead_w = (dead_trapped.saturating_mul(width) / appended) as usize;
+    let await_w = (awaiting.saturating_mul(width) / appended) as usize;
+    // Flooring leftover goes to live. Live is a quiet light-shade track; only
+    // the reclaimable bytes render as solid blocks, so a healthy store recedes
+    // and dead space stands out.
+    let slack = (width as usize).saturating_sub(live_w + dead_w + await_w);
+    let bar = Line::from(vec![
+        Span::styled("░".repeat(live_w + slack), Style::default().fg(Color::Gray)),
+        Span::styled("█".repeat(dead_w), Style::default().fg(Color::Red)),
+        Span::styled("█".repeat(await_w), Style::default().fg(Color::Yellow)),
+    ]);
+    f.render_widget(Paragraph::new(bar), rows[0]);
+
+    // Numbers match the bar's three disjoint bands (live + dead + deleting =
+    // appended); the percentage is the whole reclaimable fraction (dead +
+    // deleting), the one headline health figure.
+    let dead_pct = seg
+        .reclaimable_bytes
+        .saturating_mul(100)
+        .checked_div(appended)
+        .unwrap_or(0);
+    // Live splits into what is durable on the object store and what is still in
+    // the RAM write buffer (open segment + in-flight seals). Shown only while
+    // unflushed data exists; a fully-flushed store just reads "N live".
+    let unflushed = seg.unflushed_bytes.min(seg.live_bytes);
+    let durable = seg.live_bytes.saturating_sub(unflushed);
+    let mut totals = vec![
+        Span::styled(
+            format!(
+                "{} segs",
+                seg.segment_count.to_formatted_string(&Locale::en)
+            ),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("   "),
+    ];
+    if unflushed > 0 {
+        totals.push(Span::styled(
+            format!("{} durable", format_bytes_human(durable)),
+            Style::default().fg(Color::Gray),
+        ));
+        totals.push(Span::raw(" + "));
+        totals.push(Span::styled(
+            format!("{} unflushed", format_bytes_human(unflushed)),
+            Style::default().fg(Color::Cyan),
+        ));
+    } else {
+        totals.push(Span::styled(
+            format!("{} live", format_bytes_human(seg.live_bytes)),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    totals.push(Span::raw("   "));
+    totals.push(Span::styled(
+        format!("{} dead", format_bytes_human(dead_trapped)),
+        Style::default().fg(Color::Red),
+    ));
+    // The fully-dead subset, shown only while it exists so a store that isn't
+    // deleting never carries a puzzling "0 B" band.
+    if awaiting > 0 {
+        totals.push(Span::raw("   "));
+        totals.push(Span::styled(
+            format!("{} deleting", format_bytes_human(awaiting)),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    totals.push(Span::raw("   "));
+    totals.push(Span::styled(
+        format!("{}% reclaimable", dead_pct),
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(Line::from(totals)), rows[1]);
+
+    // Cadence posture + the GC planner's own reason for it.
+    let (tier_label, tier_color) = match seg.tier {
+        3 => ("FAST", Color::Green),
+        2 => ("DRAIN", Color::Yellow),
+        1 => ("BASE", Color::Cyan),
+        _ => ("—", Color::DarkGray),
+    };
+    let posture = Line::from(vec![
+        Span::styled("● ", Style::default().fg(tier_color)),
+        Span::styled(
+            format!("{tier_label}  "),
+            Style::default().fg(tier_color).bold(),
+        ),
+        Span::styled(seg.reason.clone(), Style::default().fg(Color::Gray)),
+    ]);
+    f.render_widget(Paragraph::new(posture), rows[2]);
+
+    f.render_widget(Paragraph::new(segment_activity_line(seg)), rows[3]);
+}
+
+/// Compose the last-pass activity line: what the pass did, then a note on
+/// what the cadence still has queued.
+fn segment_activity_line(seg: &proto::SegmentGcStatus) -> Line<'static> {
+    if seg.pinned {
+        return Line::from(Span::styled(
+            "checkpoint held: reclaim and compaction paused until it is released",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    if seg.last_deleted > 0 {
+        parts.push(Span::styled(
+            format!(
+                "reclaimed {} seg (~{})",
+                seg.last_deleted,
+                format_bytes_human(seg.last_deleted_bytes)
+            ),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if seg.last_chains_assembled > 0 && seg.last_chains_packed > 0 {
+        parts.push(Span::styled(
+            format!(
+                "merged {}/{} seams",
+                seg.last_chains_packed, seg.last_chains_assembled
+            ),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if seg.last_frames_relocated > 0 {
+        parts.push(Span::styled(
+            format!(
+                "compacted {} frames",
+                seg.last_frames_relocated.to_formatted_string(&Locale::en)
+            ),
+            Style::default().fg(Color::Blue),
+        ));
+    }
+
+    // When the pass did work, that's the whole line. When it did nothing, say
+    // what's pending so a quiet store still reads as on-track rather than blank:
+    // `candidate_backlog` (fragmented segments the cadence will compact) is the
+    // real "work waiting" signal. Only shown on an empty pass, so an active line
+    // stays short and the reason line above already frames the backlog.
+    if parts.is_empty() {
+        let note = if seg.candidate_backlog > 0 {
+            format!("{} segments queued for compaction", seg.candidate_backlog)
+        } else if seg.awaiting_delete > 0 {
+            format!(
+                "{} segments deleting after the safety window",
+                seg.awaiting_delete
+            )
+        } else {
+            "nothing to reclaim".to_string()
+        };
+        parts.push(Span::styled(note, Style::default().fg(Color::DarkGray)));
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, p) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  ·  "));
+        }
+        spans.push(p);
+    }
+    Line::from(spans)
 }
 
 fn render_memory_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
@@ -565,5 +764,234 @@ fn format_ops(ops: f64) -> String {
         format!("{:.1}k", ops / 1_000.0)
     } else {
         format!("{:.0}", ops)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn draw(seg: proto::SegmentGcStatus) -> Terminal<TestBackend> {
+        let mut app = MonitorApp::new();
+        app.current = Some(proto::StatsSnapshot {
+            segment_gc: Some(seg),
+            ..Default::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+        terminal
+            .draw(|f| render_segment_space(f, &app, f.area()))
+            .unwrap();
+        terminal
+    }
+
+    fn render(seg: proto::SegmentGcStatus) -> String {
+        let terminal = draw(seg);
+        let out = format!("{}", terminal.backend());
+        println!("{out}");
+        out
+    }
+
+    /// Count the live/dead/awaiting cells in the bar row (inner y = 0, buffer
+    /// y = 1, inside the top border). Live is the gray track, dead is red,
+    /// awaiting-delete is yellow.
+    fn bar_bands(seg: proto::SegmentGcStatus) -> (usize, usize, usize) {
+        let terminal = draw(seg);
+        let buf = terminal.backend().buffer();
+        let (mut live, mut dead, mut awaiting) = (0, 0, 0);
+        for x in 0..buf.area().width {
+            match buf.cell((x, 1u16)).map(|c| c.fg) {
+                Some(Color::Gray) => live += 1,
+                Some(Color::Red) => dead += 1,
+                Some(Color::Yellow) => awaiting += 1,
+                _ => {}
+            }
+        }
+        (live, dead, awaiting)
+    }
+
+    #[test]
+    fn bar_bands_are_proportional() {
+        // 40G live / 13G dead-in-live / 2G awaiting of 55G, over a 98-wide
+        // inner area: 71/23/3 by floor, the 1-cell floor slack going to live.
+        let (live, dead, awaiting) = bar_bands(proto::SegmentGcStatus {
+            has_run: true,
+            appended_bytes: 55 * GIB,
+            live_bytes: 40 * GIB,
+            reclaimable_bytes: 15 * GIB,
+            awaiting_delete_bytes: 2 * GIB,
+            tier: 1,
+            reason: "x".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(live + dead + awaiting, 98, "bar fills the inner width");
+        assert_eq!((live, dead, awaiting), (72, 23, 3));
+    }
+
+    #[test]
+    fn draining_while_merging_seams_and_reclaiming() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            segment_count: 412,
+            appended_bytes: 55 * GIB,
+            live_bytes: 40 * GIB,
+            reclaimable_bytes: 15 * GIB,
+            awaiting_delete: 6,
+            awaiting_delete_bytes: 2 * GIB,
+            candidate_backlog: 58,
+            chains_deferred: 3,
+            last_deleted: 3,
+            last_deleted_bytes: 640 * 1024 * 1024,
+            last_frames_relocated: 12_000,
+            last_chains_packed: 2,
+            last_chains_assembled: 5,
+            last_hot_seams: 37,
+            tier: 2,
+            read_directed: true,
+            reason: "23% dead + 3 seams deferred, store active".to_string(),
+            ..Default::default()
+        });
+        assert!(out.contains("412 segs"), "{out}");
+        assert!(out.contains("DRAIN"), "{out}");
+        assert!(out.contains("reclaimed 3 seg"), "{out}");
+        assert!(out.contains("merged 2/5 seams"), "{out}");
+        assert!(out.contains("compacted 12,000 frames"), "{out}");
+        // Active pass shows work done, not the backlog note (keeps it short).
+        assert!(!out.contains("queued for compaction"), "{out}");
+        // Totals label the reclaimable bands clearly, never bare "awaiting".
+        assert!(out.contains("deleting"), "{out}");
+        assert!(out.contains("reclaimable"), "{out}");
+        assert!(!out.contains("awaiting"), "{out}");
+    }
+
+    /// A bulk delete parks fully-dead segments for the safety window. Both the
+    /// totals band and the activity note must say what "260 / 61.5 GB" means.
+    #[test]
+    fn bulk_delete_reads_as_deleting_with_units() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            segment_count: 500,
+            appended_bytes: 100 * GIB,
+            live_bytes: 30 * GIB,
+            reclaimable_bytes: 70 * GIB,
+            awaiting_delete: 260,
+            awaiting_delete_bytes: 61 * GIB + 512 * 1024 * 1024,
+            candidate_backlog: 0,
+            last_deleted: 0,
+            last_frames_relocated: 0,
+            read_directed: true,
+            tier: 3,
+            reason: "saturated backlog, store idle".to_string(),
+            ..Default::default()
+        });
+        assert!(!out.contains("awaiting"), "{out}");
+        assert!(out.contains("61.5 GB deleting"), "{out}");
+        assert!(
+            out.contains("260 segments deleting after the safety window"),
+            "{out}"
+        );
+    }
+
+    /// Deferred seams and dead space in live segments are normal. The activity
+    /// line must not manufacture alarm; the cadence "why" lives in the reason
+    /// line, and a fragmented backlog reads as calmly queued.
+    #[test]
+    fn quiet_pass_reads_as_queued_not_broken() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            appended_bytes: 10 * GIB,
+            live_bytes: 6 * GIB,
+            reclaimable_bytes: 4 * GIB,
+            candidate_backlog: 12,
+            chains_deferred: 4,
+            last_chains_assembled: 4,
+            last_chains_packed: 0,
+            last_deleted: 0,
+            last_frames_relocated: 0,
+            read_directed: true,
+            tier: 2,
+            reason: "40% dead, store active".to_string(),
+            ..Default::default()
+        });
+        assert!(out.contains("12 segments queued for compaction"), "{out}");
+        assert!(!out.contains("trapped"), "{out}");
+        assert!(!out.contains("stuck"), "{out}");
+    }
+
+    // Live splits into durable-on-store vs still-in-RAM while there is a
+    // write-back buffer; a fully-flushed store shows a plain "N live".
+    #[test]
+    fn unflushed_splits_the_live_band() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            segment_count: 12,
+            appended_bytes: 50 * GIB,
+            live_bytes: 40 * GIB,
+            reclaimable_bytes: 10 * GIB,
+            unflushed_bytes: 512 * 1024 * 1024,
+            tier: 1,
+            read_directed: true,
+            reason: "backlog drained".to_string(),
+            ..Default::default()
+        });
+        assert!(out.contains("durable"), "{out}");
+        assert!(out.contains("unflushed"), "{out}");
+        assert!(!out.contains("40.0 GB live"), "{out}");
+    }
+
+    #[test]
+    fn fully_flushed_store_shows_plain_live() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            live_bytes: 40 * GIB,
+            appended_bytes: 40 * GIB,
+            unflushed_bytes: 0,
+            tier: 1,
+            reason: "backlog drained".to_string(),
+            ..Default::default()
+        });
+        assert!(out.contains("40.0 GB live"), "{out}");
+        assert!(!out.contains("unflushed"), "{out}");
+        assert!(!out.contains("durable"), "{out}");
+    }
+
+    #[test]
+    fn checkpoint_pin_is_the_only_called_out_block() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            appended_bytes: 10 * GIB,
+            live_bytes: 6 * GIB,
+            reclaimable_bytes: 4 * GIB,
+            candidate_backlog: 9,
+            pinned: true,
+            tier: 1,
+            reason: "backlog drained".to_string(),
+            ..Default::default()
+        });
+        assert!(out.contains("checkpoint held"), "{out}");
+        assert!(!out.contains("queued"), "{out}");
+    }
+
+    #[test]
+    fn nothing_to_reclaim_reads_calm() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: true,
+            read_directed: true,
+            tier: 1,
+            reason: "backlog drained".to_string(),
+            ..Default::default()
+        });
+        assert!(out.contains("nothing to reclaim"), "{out}");
+    }
+
+    #[test]
+    fn warming_up_before_first_pass() {
+        let out = render(proto::SegmentGcStatus {
+            has_run: false,
+            ..Default::default()
+        });
+        assert!(out.contains("warming up"), "{out}");
     }
 }

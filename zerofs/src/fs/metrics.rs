@@ -1,6 +1,7 @@
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use num_format::{Locale, ToFormattedString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 const MB_IN_BYTES: f64 = 1_048_576.0;
@@ -255,21 +256,32 @@ impl FileSystemStats {
     }
 }
 
+/// Whole-store footprint from a one-time scan, used to seed the monitor's
+/// segment gauges at open. After seeding they are maintained incrementally off
+/// the commit path (see [`SegmentGcStats::apply_footprint_delta`]); this scan is
+/// also the ground truth the incremental path is tested against.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentFootprint {
+    pub segment_count: u64,
+    pub appended_bytes: u64,
+    pub live_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
 /// One reclaim pass's numbers, mirroring the `segment GC:` summary log line.
 /// Handed to [`SegmentGcStats::record_pass`] so the metric names live next to
 /// the exporter, not the reclaim path.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SegmentGcPass {
-    // Whole-store footprint from the pass's scan (exported as gauges).
-    pub segment_count: u64,
-    pub appended_bytes: u64,
-    pub live_bytes: u64,
-    pub reclaimable_bytes: u64,
+    // Delete-horizon / backlog gauges (footprint is maintained incrementally,
+    // see `apply_footprint_delta`, not recorded from the pass scan).
     pub awaiting_delete: u64,
     pub awaiting_delete_bytes: u64,
     pub candidate_backlog: u64,
     pub chains_deferred: u64,
     pub saturated: bool,
+    /// Reclaim + compaction paused by a persistent checkpoint pin.
+    pub pinned: bool,
 
     // Work done this pass (accumulated into counters).
     pub segments_deleted: u64,
@@ -281,6 +293,7 @@ pub struct SegmentGcPass {
     pub batches: u64,
     pub tail_scrubbed: u64,
     pub chains_packed: u64,
+    pub chains_assembled: u64,
     pub nominations: u64,
     pub nominations_dropped: u64,
     pub hot_seams: u64,
@@ -319,6 +332,22 @@ pub struct SegmentGcStats {
     pub candidate_backlog: AtomicU64,
     pub chains_deferred: AtomicU64,
     pub saturated: AtomicU64,
+
+    // Last-pass activity + cadence posture, for the `monitor` status line.
+    pub last_deleted: AtomicU64,
+    pub last_deleted_bytes: AtomicU64,
+    pub last_frames_relocated: AtomicU64,
+    pub last_chains_packed: AtomicU64,
+    pub last_chains_assembled: AtomicU64,
+    pub last_hot_seams: AtomicU64,
+    pub pinned: AtomicBool,
+    /// False until the first reclaim pass populates the gauges above.
+    pub has_run: AtomicBool,
+    /// Cadence tier of the last plan: 0 none, 1 base, 2 drain, 3 fast.
+    pub tier: AtomicU8,
+    pub read_directed: AtomicBool,
+    /// The GC planner's own plain-language reason for the current cadence.
+    pub reason: Mutex<String>,
 }
 
 impl SegmentGcStats {
@@ -341,19 +370,88 @@ impl SegmentGcStats {
             .fetch_add(p.nominations_dropped, Relaxed);
         self.hot_seams.fetch_add(p.hot_seams, Relaxed);
 
-        self.segment_count.store(p.segment_count, Relaxed);
-        self.appended_bytes.store(p.appended_bytes, Relaxed);
-        self.live_bytes.store(p.live_bytes, Relaxed);
-        self.reclaimable_bytes.store(p.reclaimable_bytes, Relaxed);
+        // segment_count / appended / live / reclaimable are NOT stored here:
+        // they are maintained incrementally off the commit path (seeded once at
+        // open, see `apply_footprint_delta`). Writing the pass's start-of-scan
+        // snapshot would clobber deltas applied during the pass (e.g. this
+        // pass's own deletions). The reclaim-owned gauges below still stand.
         self.awaiting_delete.store(p.awaiting_delete, Relaxed);
         self.awaiting_delete_bytes
             .store(p.awaiting_delete_bytes, Relaxed);
         self.candidate_backlog.store(p.candidate_backlog, Relaxed);
         self.chains_deferred.store(p.chains_deferred, Relaxed);
         self.saturated.store(p.saturated as u64, Relaxed);
+
+        self.last_deleted.store(p.segments_deleted, Relaxed);
+        self.last_deleted_bytes.store(p.deleted_bytes, Relaxed);
+        self.last_frames_relocated
+            .store(p.frames_relocated, Relaxed);
+        self.last_chains_packed.store(p.chains_packed, Relaxed);
+        self.last_chains_assembled
+            .store(p.chains_assembled, Relaxed);
+        self.last_hot_seams.store(p.hot_seams, Relaxed);
+        self.pinned.store(p.pinned, Relaxed);
+        self.has_run.store(true, Relaxed);
     }
 
     pub fn record_orphans_reclaimed(&self, n: u64) {
         self.orphans_reclaimed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record the cadence planner's decision (tier + reason) for `monitor`.
+    /// `tier`: 1 base, 2 drain, 3 fast.
+    pub fn record_plan(&self, tier: u8, read_directed: bool, reason: &str) {
+        self.tier.store(tier, Ordering::Relaxed);
+        self.read_directed.store(read_directed, Ordering::Relaxed);
+        if let Ok(mut r) = self.reason.lock() {
+            r.clear();
+            r.push_str(reason);
+        }
+    }
+
+    /// Seed the footprint gauges from a one-time scan at store open. After this,
+    /// they are maintained incrementally by [`Self::apply_footprint_delta`].
+    pub fn seed_footprint(&self, f: &SegmentFootprint) {
+        use Ordering::Relaxed;
+        self.segment_count.store(f.segment_count, Relaxed);
+        self.appended_bytes.store(f.appended_bytes, Relaxed);
+        self.live_bytes.store(f.live_bytes, Relaxed);
+        self.reclaimable_bytes.store(f.reclaimable_bytes, Relaxed);
+        self.has_run.store(true, Relaxed);
+    }
+
+    /// Fold one commit's (or one reclaim deletion's) net counter change into the
+    /// footprint gauges. Called off the commit path with the exact deltas
+    /// `stage_seg_deltas` computed, so the gauges track writes and deletes in
+    /// real time without a scan. Deletions pass negative `d_segments`/`d_appended`.
+    pub fn apply_footprint_delta(&self, d_segments: i64, d_appended: i64, d_live: i64) {
+        apply_i64(&self.segment_count, d_segments);
+        apply_i64(&self.appended_bytes, d_appended);
+        apply_i64(&self.live_bytes, d_live);
+        self.recompute_reclaimable();
+        self.has_run.store(true, Ordering::Relaxed);
+    }
+
+    /// reclaimable = appended - live, kept as its own gauge so the Prometheus
+    /// and RPC readers stay unchanged. Not atomic with the two summands, but a
+    /// transient off-by-a-batch on a display gauge is harmless.
+    fn recompute_reclaimable(&self) {
+        use Ordering::Relaxed;
+        let appended = self.appended_bytes.load(Relaxed);
+        let live = self.live_bytes.load(Relaxed);
+        self.reclaimable_bytes
+            .store(appended.saturating_sub(live), Relaxed);
+    }
+}
+
+/// Creation always precedes deletion, so it never actually underflows, but clamp anyway rather than wrap.
+fn apply_i64(a: &AtomicU64, d: i64) {
+    use Ordering::Relaxed;
+    if d >= 0 {
+        a.fetch_add(d as u64, Relaxed);
+    } else {
+        let _ = a.fetch_update(Relaxed, Relaxed, |cur| {
+            Some(cur.saturating_sub(d.unsigned_abs()))
+        });
     }
 }

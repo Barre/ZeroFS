@@ -24,6 +24,8 @@ Each command takes `-c` with the same configuration file and reads the connectio
 
 ## zerofs monitor
 
+![The zerofs monitor dashboard](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/monitor_command.png)
+
 <Row>
   <Col>
 
@@ -32,6 +34,7 @@ Each command takes `-c` with the same configuration file and reads the connectio
     - **I/O throughput and IOPS charts**: separate read and write series; rates are computed over windows of one second or one refresh interval, whichever is longer, and the latest 120 samples are kept
     - **Total operations sparkline**: operations per second across all operation types
     - **Storage gauge**: used bytes against the configured capacity, plus the inode count
+    - **Segment space**: the extent segment store's footprint, as a bar and figures. Live data splits into the part durable on the object store and the part still buffered in RAM (unflushed), shown next to dead bytes, bytes in fully-dead segments being deleted, the segment count, and the reclaimable percentage. A status line reports the reclamation GC's cadence tier (base, drain, or fast), the reason for it, and what the last pass did or has queued
     - **Operation counters**: files, directories, and links created, deleted, and renamed since server start
     - **Garbage collection counters**: tombstones created and processed, extents deleted, and GC runs since server start
     - **jemalloc memory**: allocated, resident, retained, and metadata bytes of the server process, plus a fragmentation percentage (resident minus allocated, relative to allocated)
@@ -208,7 +211,7 @@ grpcurl -plaintext \
   127.0.0.1:7000 zerofs.admin.AdminService/StreamStats
 ```
 
-This prints one JSON `StatsSnapshot` per second: operation counters, bytes read and written, GC activity, used bytes and inodes against the configured maximum, and jemalloc memory statistics. For consumers that read `StatsSnapshot` by field name, the GC deletion counter is `gc_extents_deleted` (field 17, formerly `gc_chunks_deleted`).
+This prints one JSON `StatsSnapshot` per second: operation counters, bytes read and written, GC activity, used bytes and inodes against the configured maximum, jemalloc memory statistics, and a `segment_gc` message carrying the extent segment footprint (segment count, live, dead, and unflushed bytes) and reclamation-GC status. For consumers that read `StatsSnapshot` by field name, the GC deletion counter is `gc_extents_deleted` (field 17, formerly `gc_chunks_deleted`).
 
 <div className="not-prose">
   <Button href="/prometheus" variant="text" arrow="right">

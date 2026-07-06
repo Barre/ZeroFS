@@ -447,6 +447,7 @@ impl GarbageCollector {
                     t.idle_interval.as_secs(),
                 );
                 let mut prev: Option<Activity> = None;
+                let seg_stats = gc.extent_store.segment_gc_stats();
                 // The planner owns cadence + budget; `plan` carries the next
                 // pass's floor forward. The first pass uses the initial floor.
                 let mut plan = GcPlan::initial(&gc.tuning);
@@ -486,6 +487,12 @@ impl GarbageCollector {
                         // Reclaim errored or was skipped (already logged); back off at base.
                         None => GcPlan::base(&gc.tuning, "reclaim skipped or errored"),
                     };
+                    let tier_code = match plan.tier {
+                        Tier::Base => 1,
+                        Tier::Drain => 2,
+                        Tier::Fast => 3,
+                    };
+                    seg_stats.record_plan(tier_code, gc.tuning.read_directed, &plan.reason);
                     info!(
                         tier = plan.tier.label(),
                         "segment GC plan: next {}s, {} batch{}: {}",

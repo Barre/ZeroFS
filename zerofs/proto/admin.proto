@@ -193,4 +193,33 @@ message StatsSnapshot {
     uint64 jemalloc_mapped = 25;
     uint64 jemalloc_retained = 26;
     uint64 jemalloc_metadata = 27;
+    // Extent segment-store footprint + GC posture (empty until the first pass).
+    SegmentGcStatus segment_gc = 28;
+}
+
+message SegmentGcStatus {
+    bool has_run = 1;
+    // Whole-store footprint from the last reclaim pass's scan.
+    uint64 segment_count = 2;
+    uint64 appended_bytes = 3;
+    uint64 live_bytes = 4;
+    uint64 reclaimable_bytes = 5;
+    uint64 awaiting_delete = 6;
+    uint64 awaiting_delete_bytes = 7;
+    uint64 candidate_backlog = 8;
+    uint64 chains_deferred = 9;
+    bool saturated = 10;
+    // What the last pass did.
+    uint64 last_deleted = 11;
+    uint64 last_deleted_bytes = 12;
+    uint64 last_frames_relocated = 13;
+    uint64 last_chains_packed = 14;
+    uint64 last_chains_assembled = 15;
+    uint64 last_hot_seams = 16;
+    bool pinned = 17;
+    // Cadence posture: tier (0 none, 1 base, 2 drain, 3 fast) + the GC's reason.
+    uint32 tier = 18;
+    bool read_directed = 19;
+    string reason = 20;
+    uint64 unflushed_bytes = 21;
 }

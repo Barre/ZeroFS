@@ -18,7 +18,7 @@ use crate::frame_codec::FrameCodec;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
-use crate::fs::metrics::{SegmentGcPass, SegmentGcStats};
+use crate::fs::metrics::{SegmentFootprint, SegmentGcPass, SegmentGcStats};
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
 use crate::segment::{DirEntry, FrameLoc, Segid};
@@ -886,6 +886,62 @@ impl ExtentStore {
         Arc::clone(&self.segment_gc_stats)
     }
 
+    /// One-time footprint scan: sums the segcount rows into the aggregate the
+    /// monitor gauges track. Used to seed those gauges at open (after which they
+    /// are maintained incrementally off the commit path) and as the ground data
+    /// the incremental path is tested against.
+    pub async fn sample_footprint(&self) -> Result<SegmentFootprint, FsError> {
+        let (sc_start, sc_end) = self.key_codec.segcount_prefix_range();
+        let mut stream = self.db.scan(sc_start..sc_end).await.map_err(|e| {
+            error!("segment footprint scan failed: {}", e);
+            FsError::IoError
+        })?;
+        let (mut segment_count, mut live_bytes, mut appended_bytes) = (0u64, 0u64, 0u64);
+        while let Some(result) = stream.next().await {
+            let (key, value) = result.map_err(|_| FsError::IoError)?;
+            if self.key_codec.parse_segcount_key(&key).is_none() {
+                continue;
+            }
+            let Some((live, total)) = KeyCodec::decode_segcount(&value) else {
+                continue;
+            };
+            segment_count += 1;
+            live_bytes += live;
+            appended_bytes += total;
+        }
+        Ok(SegmentFootprint {
+            segment_count,
+            appended_bytes,
+            live_bytes,
+            reclaimable_bytes: appended_bytes.saturating_sub(live_bytes),
+        })
+    }
+
+    /// Seed the monitor footprint gauges from a one-time scan. Call at store
+    /// open, before writes begin, so the incremental deltas start from the
+    /// existing on-store footprint.
+    pub async fn seed_footprint(&self) -> Result<(), FsError> {
+        let f = self.sample_footprint().await?;
+        self.segment_gc_stats.seed_footprint(&f);
+        Ok(())
+    }
+
+    /// Bytes held in RAM, not yet PUT to the object store: the open write
+    /// buffer plus any sealed segments whose PUT is still in flight. This is
+    /// the write-back buffer, the recently-written data a crash would lose
+    /// without a flush. Read fresh (it is volatile); cheap in-memory lengths.
+    pub fn unflushed_bytes(&self) -> u64 {
+        let open = self.open.lock().unwrap().buf.len() as u64;
+        let sealing: u64 = self
+            .sealing
+            .lock()
+            .unwrap()
+            .values()
+            .map(|b| b.len() as u64)
+            .sum();
+        open + sealing
+    }
+
     /// Inject the commit worker's weak handle so this store's GC/compaction
     /// seg-delta txns route through the single writer. Idempotent.
     pub fn set_coordinator(&self, coord: crate::fs::write_coordinator::WeakWriteCoordinator) {
@@ -913,7 +969,8 @@ impl ExtentStore {
         }
         let deltas = txn.take_seg_deltas();
         let mut batch = txn.into_inner();
-        crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
+        let (_, footprint_delta) =
+            crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
         self.db
             .write_with_options(
                 batch,
@@ -924,6 +981,13 @@ impl ExtentStore {
             )
             .await
             .map_err(|_| FsError::IoError)?;
+        // Committed: fold the batch's net footprint into the monitor gauges,
+        // mirroring the write coordinator's apply on its own path.
+        self.segment_gc_stats.apply_footprint_delta(
+            footprint_delta.d_segments,
+            footprint_delta.d_appended,
+            footprint_delta.d_live,
+        );
         Ok(())
     }
 
@@ -2255,6 +2319,9 @@ impl ExtentStore {
 
         let mut deleted = 0;
         let mut freed_counters: Vec<Segid> = Vec::new();
+        // Total bytes of every dropped counter (deleted segments plus leaked
+        // counters), to debit from the monitor's incremental footprint gauges.
+        let mut freed_appended = 0u64;
         for (segid, size) in to_delete {
             // Fail-closed: a segment is deleted only once its directory confirms no
             // frame is still referenced. Sound because an eligible segment can never
@@ -2274,6 +2341,7 @@ impl ExtentStore {
                     // counter drop left the counter behind; drop it so it stops
                     // re-appearing as dead each pass.
                     freed_counters.push(segid);
+                    freed_appended += size;
                     continue;
                 }
                 SegmentDeadVerdict::Reclaim => {}
@@ -2297,17 +2365,24 @@ impl ExtentStore {
                 human_bytes(size)
             );
             freed_counters.push(segid);
+            freed_appended += size;
             deleted_bytes += size;
             deleted += 1;
         }
         // Drop the counters of deleted segments, else one segcount key leaks
         // per segment ever created.
         if !freed_counters.is_empty() {
+            let dropped = freed_counters.len() as i64;
             let mut txn = self.db.new_transaction()?;
             for segid in &freed_counters {
                 txn.delete_bytes(&self.key_codec.segcount_key(segid.epoch, segid.counter));
             }
             self.commit_via_coordinator(txn).await?;
+            // Committed: debit the dropped counters from the footprint gauges.
+            // The freed segments are dead (live == 0), so only segment_count and
+            // appended fall; reclaimable falls with appended.
+            self.segment_gc_stats
+                .apply_footprint_delta(-dropped, -(freed_appended as i64), 0);
         }
 
         // Chains from hot pairs whose both endpoints are scan-seen live —
@@ -2518,15 +2593,12 @@ impl ExtentStore {
             action
         );
         self.segment_gc_stats.record_pass(&SegmentGcPass {
-            segment_count: scanned as u64,
-            appended_bytes: total_appended,
-            live_bytes: total_live,
-            reclaimable_bytes: reclaimable,
             awaiting_delete: awaiting as u64,
             awaiting_delete_bytes: awaiting_bytes,
             candidate_backlog: candidate_backlog as u64,
             chains_deferred: chains.deferred as u64,
             saturated,
+            pinned,
             segments_deleted: deleted as u64,
             deleted_bytes,
             segments_compacted: compacted_segments as u64,
@@ -2536,6 +2608,7 @@ impl ExtentStore {
             batches: batches as u64,
             tail_scrubbed: tail_selected as u64,
             chains_packed: chains.packed as u64,
+            chains_assembled: chains.assembled as u64,
             nominations: nominated.len() as u64,
             nominations_dropped: nom_dropped,
             hot_seams: hot_pairs.len() as u64,
@@ -3944,6 +4017,108 @@ mod tests {
         // Live data still reads after GC, and a second reclaim is a no-op.
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[2u8; 1000]);
         assert_eq!(store.reclaim_segments(Utc::now(), None).await.unwrap().0, 0);
+    }
+
+    // The footprint gauges are maintained incrementally off the commit path, so
+    // they must track writes and overwrites with no reclaim pass, and always
+    // agree with an authoritative scan of the same state.
+    #[tokio::test]
+    async fn footprint_gauges_track_writes_incrementally() {
+        let (store, db) = make().await;
+        let inode: InodeId = 1;
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = store.segment_gc_stats();
+        assert_eq!(m.appended_bytes.load(Relaxed), 0);
+        assert_eq!(m.segment_count.load(Relaxed), 0);
+
+        // Write 3 extents: appended + live grow, all live, no reclaim pass.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(vec![7u8; 3 * EXTENT_SIZE]),
+                0,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        let appended = m.appended_bytes.load(Relaxed);
+        assert!(appended > 0);
+        assert_eq!(m.live_bytes.load(Relaxed), appended, "all live");
+        assert_eq!(m.reclaimable_bytes.load(Relaxed), 0);
+        assert_eq!(m.segment_count.load(Relaxed), 1);
+        // The incremental gauges match an authoritative scan of the same state.
+        let f = store.sample_footprint().await.unwrap();
+        assert_eq!(f.appended_bytes, appended);
+        assert_eq!(f.live_bytes, m.live_bytes.load(Relaxed));
+        assert_eq!(f.segment_count, 1);
+
+        // Overwrite extent 0: a new frame is appended and the old one becomes
+        // dead weight, visible immediately with no reclaim pass.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .write(
+                &mut txn,
+                inode,
+                0,
+                &Bytes::from(vec![2u8; EXTENT_SIZE]),
+                3 * EXTENT_SIZE as u64,
+            )
+            .await
+            .unwrap();
+        commit(&store, txn).await;
+        assert!(
+            m.appended_bytes.load(Relaxed) > appended,
+            "new frame appended"
+        );
+        assert!(m.reclaimable_bytes.load(Relaxed) > 0, "old frame now dead");
+        assert!(m.live_bytes.load(Relaxed) < m.appended_bytes.load(Relaxed));
+        let f = store.sample_footprint().await.unwrap();
+        assert_eq!(f.appended_bytes, m.appended_bytes.load(Relaxed));
+        assert_eq!(f.live_bytes, m.live_bytes.load(Relaxed));
+        assert_eq!(f.reclaimable_bytes, m.reclaimable_bytes.load(Relaxed));
+    }
+
+    // Reclaiming a dead segment must debit its bytes and count from the gauges,
+    // so freed space shows up without waiting for a re-seed. B is large and
+    // fully live (above SMALL_SEGMENT_BYTES, 0% dead) so the pass compacts
+    // nothing and only deletes the dead segment A.
+    #[tokio::test]
+    async fn footprint_gauges_drop_when_a_segment_is_reclaimed() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        let big = 48 * EXTENT_SIZE; // ~1.5 MiB > SMALL_SEGMENT_BYTES
+        write_and_check(&store, &db, &mut model, 0, &incompressible(1, big)).await;
+        store.seal_open().await.unwrap();
+        // Overwrite the whole range: segment A becomes fully dead, B is segment 2.
+        write_and_check(&store, &db, &mut model, 0, &incompressible(2, big)).await;
+        store.seal_open().await.unwrap();
+
+        use std::sync::atomic::Ordering::Relaxed;
+        let m = store.segment_gc_stats();
+        let appended_before = m.appended_bytes.load(Relaxed);
+        assert_eq!(m.segment_count.load(Relaxed), 2);
+        assert!(m.reclaimable_bytes.load(Relaxed) > 0, "segment A is dead");
+
+        let (deleted, relocated) = store.reclaim_segments(Utc::now(), None).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            relocated, 0,
+            "B is large and fully live: nothing to compact"
+        );
+
+        assert!(
+            m.appended_bytes.load(Relaxed) < appended_before,
+            "A's bytes debited"
+        );
+        assert_eq!(m.segment_count.load(Relaxed), 1);
+        // Still consistent with a fresh scan of the post-reclaim state.
+        let f = store.sample_footprint().await.unwrap();
+        assert_eq!(f.appended_bytes, m.appended_bytes.load(Relaxed));
+        assert_eq!(f.segment_count, m.segment_count.load(Relaxed));
+        assert_eq!(f.live_bytes, m.live_bytes.load(Relaxed));
     }
 
     #[tokio::test]

@@ -466,6 +466,32 @@ ls -la /mnt/zerofs/
   </Button>
 </div>
 
+## Watch the Filesystem
+
+With the server running, `zerofs monitor` opens a live dashboard in the terminal: read and write throughput and IOPS, operation counters, garbage collection, the segment store's footprint (durable on the store versus still buffered in RAM), and process memory.
+
+![The zerofs monitor dashboard](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/monitor_command.png)
+
+The dashboard reads from the admin RPC server. The `zerofs init` template enables it; if you wrote the configuration by hand, add a `[servers.rpc]` section:
+
+```toml
+[servers.rpc]
+addresses = ["127.0.0.1:7000"]
+```
+
+```bash
+# Refreshes every 250 ms by default; press q to quit
+zerofs monitor -c zerofs.toml
+```
+
+For per-operation tracing, `zerofs fatrace` prints one line per filesystem operation and `zerofs otrace` one line per object-store request.
+
+<div className="not-prose">
+  <Button href="/monitoring" variant="text" arrow="right">
+    Monitoring and tracing
+  </Button>
+</div>
+
 ## Next Steps
 
 The filesystem is mounted and storing its data in S3. From here:
