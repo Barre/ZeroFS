@@ -7,3 +7,6 @@ TODO.md
 __pycache__
 jepsen/ha/store
 jepsen/ha/.lein-failures
+
+# generated site (documentation static export assembled by scripts/build-site.sh)
+website/docs

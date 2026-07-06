@@ -5,7 +5,6 @@ import { Providers } from '@/app/providers'
 import { Layout } from '@/components/Layout'
 import { type Section } from '@/components/SectionProvider'
 import PlausibleProvider from 'next-plausible'
-import { Analytics } from "@vercel/analytics/next"
 import '@/styles/tailwind.css'
 import '@/styles/mermaid.css'
 
@@ -75,7 +74,6 @@ export default async function RootLayout({
             <Layout allSections={allSections}>{children}</Layout>
           </div>
         </Providers>
-        <Analytics />
       </body>
     </html>
   )
