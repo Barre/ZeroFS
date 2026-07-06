@@ -129,17 +129,29 @@ impl WeakWriteCoordinator {
     }
 }
 
+/// The net whole-store footprint change of one staged batch, folded into the
+/// monitor's segment gauges once the batch commits. `stage_seg_deltas` has the
+/// old and new absolute counter values in hand, so it reports the exact deltas
+/// for free, which is what lets the gauges track writes without a scan.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SegFootprintDelta {
+    /// New segments first credited in this batch (a counter going from absent to nonzero).
+    pub d_segments: i64,
+    pub d_appended: i64,
+    pub d_live: i64,
+}
+
 /// Materialize per-segment `(live, total)` deltas as absolute `segcount`
 /// values: aggregate per key, RMW-read the current value, write the new
 /// absolute into `batch`, and return the `(key, value)` pairs so a replicating
-/// caller can ship them. `total` only ever credits (a debit carries
-/// `total_delta == 0`). Correctness rests on the caller being the sole writer
-/// of these keys, so the RMW never races.
+/// caller can ship them, plus the batch's net footprint delta. `total` only
+/// ever credits (a debit carries `total_delta == 0`). Correctness rests on the
+/// caller being the sole writer of these keys, so the RMW never races.
 pub(crate) async fn stage_seg_deltas(
     db: &Db,
     deltas: impl IntoIterator<Item = (bytes::Bytes, (i64, i64))>,
     batch: &mut WriteBatch,
-) -> Result<Vec<(bytes::Bytes, bytes::Bytes)>, FsError> {
+) -> Result<(Vec<(bytes::Bytes, bytes::Bytes)>, SegFootprintDelta), FsError> {
     let mut agg: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
     for (k, (dl, dt)) in deltas {
         let e = agg.entry(k).or_insert((0, 0));
@@ -167,15 +179,26 @@ pub(crate) async fn stage_seg_deltas(
         .await?;
 
     let mut out = Vec::with_capacity(bases.len());
+    let mut fd = SegFootprintDelta::default();
     for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
         let live = (cur_live as i128 + net_live as i128).max(0) as u64;
         // `total` is monotonic: clamp to at least its current value.
         let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
+        // Exact contribution to the whole-store footprint, post-clamp. A
+        // counter going from absent/zero to a first credit is a new segment.
+        // Saturating so a display gauge can never panic the commit worker.
+        fd.d_live = fd.d_live.saturating_add(live as i64 - cur_live as i64);
+        fd.d_appended = fd
+            .d_appended
+            .saturating_add(total as i64 - cur_total as i64);
+        fd.d_segments = fd
+            .d_segments
+            .saturating_add((cur_total == 0 && total > 0) as i64);
         let val = KeyCodec::encode_segcount(live, total);
         batch.put_bytes(key.clone(), val.clone());
         out.push((key, val));
     }
-    Ok(out)
+    Ok((out, fd))
 }
 
 async fn worker_loop(
@@ -277,7 +300,8 @@ async fn worker_loop(
         // Segment live-byte counters: this single worker is their sole writer, so an
         // absolute RMW off the DB (memtable-consistent, never a cold 0 for a segment
         // touched this session) is exact and lock-free.
-        let seg_abs = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await {
+        let (seg_abs, footprint_delta) = match stage_seg_deltas(&ctx.db, seg_map, &mut merged).await
+        {
             Ok(v) => v,
             Err(e) => {
                 // A segcount base read failed; committing with a guessed base
@@ -407,6 +431,13 @@ async fn worker_loop(
             for shard in &staged {
                 ctx.global_stats.publish(shard);
             }
+            // Same durability point as the stats publish: fold this batch's net
+            // segment footprint into the monitor gauges now that it is committed.
+            ctx.extent_store.segment_gc_stats().apply_footprint_delta(
+                footprint_delta.d_segments,
+                footprint_delta.d_appended,
+                footprint_delta.d_live,
+            );
         }
 
         // In sync_writes mode, force a flush after the batch is committed so

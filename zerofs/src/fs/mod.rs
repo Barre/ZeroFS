@@ -329,6 +329,10 @@ impl ZeroFS {
             segment_store,
             lock_manager.clone(),
         );
+        // Seed the monitor's segment footprint gauges from the existing on-store
+        // segments before any write; from here they are maintained incrementally
+        // off the commit path, so the panel never scans to stay current.
+        extent_store.seed_footprint().await?;
         // The flush path seals the open data-plane segment before flushing the
         // manifest, so a durable manifest never references an un-PUT segment.
         flush_coordinator.set_sealer({
