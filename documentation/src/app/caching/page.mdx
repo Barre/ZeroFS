@@ -81,11 +81,11 @@ With `disk_size_gb = 10.0`, 10% of the budget is 1 GB (below the 1 GiB floor) so
 
 ## Prefetch
 
-ZeroFS fetches object data in 128 KiB parts. An adaptive readahead layer tracks up to 4 concurrent sequential read streams per object. Each stream's fetch window starts at 128 KiB and doubles on every sequential access, capped at 8 MiB. Once a stream's window has grown past the minimum, up to 4 full windows are kept fetched ahead of the read — up to 4 × 8 MiB outstanding at the maximum window. Fetched parts land in the raw-parts cache.
+ZeroFS fetches object data in 128 KiB parts. An adaptive readahead layer tracks up to 4 concurrent sequential read streams per object. Each stream's fetch window starts at 128 KiB and doubles on every sequential access, capped at 8 MiB. Once a stream's window has grown past the minimum, up to 4 full windows are kept fetched ahead of the read, up to 4 × 8 MiB outstanding at the maximum window. Fetched parts land in the raw-parts cache.
 
 Three behaviors reduce GET counts further. Concurrent misses inside the same window join a single GET instead of each issuing their own. The leading fetch covers at least the whole requested range, so a large coalesced read is one GET even before the window ramps. Uploads populate the cache at write time: single PUTs write through to the parts cache, and sealed segment objects (uploaded as multipart) are warmed with the bytes in hand, so a read after a write needs no GET. One exception: conditional GETs (`if-match`, versioned reads) bypass the cache.
 
-Above the per-object prefetcher, a logical read-ahead follows a file's extents across segment objects. After 2 consecutive sequential reads it prefetches an 8 MiB window ahead of the read, with at most 16 concurrent fetches, and it fires only when the window crosses into a different segment object — within one segment, the per-object prefetcher already covers it.
+Above the per-object prefetcher, a logical read-ahead follows a file's extents across segment objects. After 2 consecutive sequential reads it prefetches an 8 MiB window ahead of the read, with at most 16 concurrent fetches, and it fires only when the window crosses into a different segment object; within one segment, the per-object prefetcher already covers it.
 
 ## Per-Bucket Cache Isolation
 

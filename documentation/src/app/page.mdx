@@ -30,7 +30,12 @@ ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as
 
 ## What ZeroFS does {{ anchor: false }}
 
-ZeroFS keeps primary data in S3 rather than on local disk. Every block is compressed, then encrypted with XChaCha20-Poly1305 before upload; there is no unencrypted mode. The maximum filesystem size is 16 EiB. Databases, code builds, and VM boot disks run directly against the bucket. {{ className: 'lead' }}
+ZeroFS stores your files in S3 and uses local disk only as a cache, so databases, code builds, and VM boot disks run directly against the bucket. It differs from other "filesystem on S3" projects in a few ways: {{ className: 'lead' }}
+
+- **POSIX-conformant**, verified against pjdfstest and xfstests.
+- **Near-raw-S3 throughput on large files**, and scales to workloads of millions of small files.
+- **No external database service**; all state, data and metadata alike, lives in the bucket.
+- **Encrypted before upload**: every block is compressed, then encrypted with XChaCha20-Poly1305, with no unencrypted mode.
 
 <div className="not-prose">
   <Button href="/encryption" variant="text" arrow="right">

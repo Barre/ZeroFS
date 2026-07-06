@@ -35,7 +35,7 @@ A read observes both directly, when it resolves which segment holds each byte. T
 
     <Mermaid chart={`
 graph LR
-    subgraph f["file — adjacent extents"]
+    subgraph f["file: adjacent extents"]
         e5["extent 5"] --- e6["extent 6"]
     end
     subgraph s12["segment 12"]
@@ -52,7 +52,7 @@ graph LR
 
     <Mermaid chart={`
 graph LR
-    subgraph f["file — adjacent extents"]
+    subgraph f["file: adjacent extents"]
         e5["extent 5"] --- e6["extent 6"]
     end
     subgraph s12["segment 12"]
@@ -67,7 +67,7 @@ graph LR
   </Col>
 </Row>
 
-Recording costs one mutex acquisition per qualifying read. Reads served in a single contiguous fetch record nothing, and neither do reads served from the in-RAM write buffers or by the prefetcher. [Read-only and checkpoint mounts](/read-replicas) record nothing at all — they run no GC — and the check there is one atomic load.
+Recording costs one mutex acquisition per qualifying read. Reads served in a single contiguous fetch record nothing, and neither do reads served from the in-RAM write buffers or by the prefetcher. [Read-only and checkpoint mounts](/read-replicas) record nothing at all (they run no GC), and the check there is one atomic load.
 
 Every hint lives in process memory. A restart loses them all; the only cost is scheduling quality, since the counter scan still decides what gets compacted.
 
@@ -91,7 +91,7 @@ A hot seam is the only signal that can *create* compaction work, so a repack mus
 
 When all three hold, the segments joined by hot seams are repacked together and sorted by (inode, extent). The co-read data becomes contiguous and the seams are gone; reads stop crossing them, and the counts age out.
 
-An internal seam is the one-segment case: the segment is rewritten once, its scattered frames regrouped — a fetch-per-frame read becomes one fetch.
+An internal seam is the one-segment case: the segment is rewritten once, its scattered frames regrouped, so a fetch-per-frame read becomes one fetch.
 
 <Note>
   This is the only way a fully live dense segment is ever rewritten. A dense

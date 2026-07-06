@@ -13,55 +13,55 @@
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-  width: 1200px; height: 630px; overflow: hidden; position: relative;
+  width: 1200px; height: 440px; overflow: hidden; position: relative;
   background: #0a0a09;
   font-family: "Schibsted Grotesk", sans-serif;
   -webkit-font-smoothing: antialiased;
+  display: flex; align-items: center; justify-content: center;
 }
 .grid {
   position: absolute; inset: 0;
   background-image:
     linear-gradient(to right, rgba(255,255,255,0.022) 1px, transparent 1px),
     linear-gradient(to bottom, rgba(255,255,255,0.022) 1px, transparent 1px);
-  background-size: 88px 88px;
-  -webkit-mask-image: radial-gradient(ellipse 90% 80% at 60% 30%, #000 30%, transparent 75%);
+  background-size: 72px 72px;
+  -webkit-mask-image: radial-gradient(ellipse 78% 74% at 50% 46%, #000 28%, transparent 78%);
 }
 .glow {
-  position: absolute; left: 870px; top: 315px;
-  width: 900px; height: 900px;
+  position: absolute; left: 50%; top: 47%;
+  width: 1180px; height: 1180px;
   transform: translate(-50%, -50%);
-  background: radial-gradient(circle closest-side, transparent 42%, rgba(168,199,250,0.05) 55%, rgba(255,255,255,0.10) 65%, rgba(120,160,255,0.05) 79%, transparent 97%);
-  filter: blur(40px);
+  background: radial-gradient(circle closest-side, transparent 42%, rgba(168,199,250,0.05) 55%, rgba(255,255,255,0.09) 65%, rgba(120,160,255,0.05) 79%, transparent 97%);
+  filter: blur(48px);
 }
 .glow::before {
   content: ""; position: absolute; inset: -30%;
   background: radial-gradient(circle, transparent 46%, rgba(0,0,0,0.7) 64%, transparent 88%);
 }
 .ring {
-  position: absolute; left: 870px; top: 315px;
-  width: 700px; height: 700px;
+  position: absolute; left: 50%; top: 47%;
+  width: 760px; height: 760px;
   transform: translate(-50%, -50%);
-  color: #d6d3cb; opacity: 0.2;
+  color: #d6d3cb; opacity: 0.1;
 }
 .grain {
   position: absolute; inset: 0; opacity: 0.5;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='gn'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.05 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23gn)'/%3E%3C/svg%3E");
 }
-.lockup { position: absolute; left: 64px; top: 56px; display: flex; align-items: center; gap: 14px; color: #f4f3ef; }
-.lockup .mark { width: 40px; height: 40px; filter: drop-shadow(0 0 12px rgba(255,255,255,0.18)); }
-.lockup .wm { width: 96px; height: 20.7px; }
-h1 {
-  position: absolute; left: 64px; top: 212px;
-  font-weight: 800; font-size: 84px; line-height: 1.02; letter-spacing: -0.038em;
-  background: linear-gradient(180deg, #fff 55%, rgba(255,255,255,0.62));
+.hero {
+  position: relative; z-index: 2;
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+}
+.lockup { display: flex; align-items: center; gap: 22px; color: #f4f3ef; }
+.lockup .mark { width: 92px; height: 92px; filter: drop-shadow(0 0 16px rgba(255,255,255,0.20)); }
+.lockup .wm { width: 214px; height: 46.1px; }
+.tag {
+  margin-top: 36px;
+  font-weight: 700; font-size: 45px; line-height: 1.04; letter-spacing: -0.03em;
+  background: linear-gradient(180deg, #fff 58%, rgba(255,255,255,0.6));
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
-h1 .dot { -webkit-text-fill-color: #4d9fff; }
-.sub {
-  position: absolute; left: 64px; bottom: 56px;
-  font-family: "Geist Mono", monospace; font-size: 14px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: #6e6c64;
-}
+.tag .dot { -webkit-text-fill-color: #4d9fff; }
 </style>
 </head>
 <body>
@@ -70,11 +70,12 @@ h1 .dot { -webkit-text-fill-color: #4d9fff; }
 <div class="glow"></div>
 <svg class="ring"><use href="#enso"/></svg>
 <div class="grain"></div>
-<div class="lockup">
-  <svg class="mark"><use href="#enso"/></svg>
-  <svg class="wm"><use href="#wordmark"/></svg>
+<div class="hero">
+  <div class="lockup">
+    <svg class="mark"><use href="#enso"/></svg>
+    <svg class="wm"><use href="#wordmark"/></svg>
+  </div>
+  <div class="tag">A log-structured filesystem for S3<span class="dot">.</span></div>
 </div>
-<h1>A log-structured<br>filesystem for S3<span class="dot">.</span></h1>
-<div class="sub">NFS · 9P · NBD on any S3-compatible bucket</div>
 </body>
 </html>

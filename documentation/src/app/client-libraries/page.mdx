@@ -10,7 +10,7 @@ ZeroFS ships official client libraries for Python, TypeScript/Node, and Go. They
 All three wrap one Rust core ([`zerofs-client`](https://crates.io/crates/zerofs-client)) compiled to a native library, so they share its behavior exactly: the same connection targets, the same fast-path extensions, the same reconnect and cancellation semantics. They connect to the same `[servers.ninep]` endpoint a [9P mount](/9p-access) uses, with the same trusted-network model: a client asserts its uid at connect time and the server trusts it.
 
 <Note>
-The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`) returns only after data reaches stable storage. Use them when you want filesystem operations from an application without a mount point. Like `zerofs mount`.
+The libraries connect over 9P, the same as a mount, so `fsync` (`File.sync_all`) returns only after data reaches stable storage, the same durability `zerofs mount` gives. Use them when you want filesystem operations from an application without a mount point.
 </Note>
 
 ## Installation
@@ -244,25 +244,25 @@ A pull-based listing cursor plus `openat`-style child operations. **Child names 
 
 ### Types
 
-**`OpenOptions`** — `read` (false), `write` (false), `create` (false), `create_new` (false), `truncate` (false), `mode` (0o644). `create_new` is the atomic exclusive create: it fails unless this call creates the file. In TypeScript, build it with the `openOptions(...)` helper so the defaults apply.
+**`OpenOptions`**: `read` (false), `write` (false), `create` (false), `create_new` (false), `truncate` (false), `mode` (0o644). `create_new` is the atomic exclusive create: it fails unless this call creates the file. In TypeScript, build it with the `openOptions(...)` helper so the defaults apply.
 
-**`ConnectOptions`** — `uid` (process euid), `gid` (process egid), `uname` (`$USER`, informational), `aname` (`""`, the default export), `msize` (1 MiB; the server clamps to 10 MiB), `connect_timeout_ms` (30000; null waits indefinitely).
+**`ConnectOptions`**: `uid` (process euid), `gid` (process egid), `uname` (`$USER`, informational), `aname` (`""`, the default export), `msize` (1 MiB; the server clamps to 10 MiB), `connect_timeout_ms` (30000; null waits indefinitely).
 
-**`SetAttrs`** — optional `mode`, `uid`, `gid`, `size`, `atime`, `mtime`. An all-empty `SetAttrs` is a no-op; `atime`/`mtime` are `SetTime`.
+**`SetAttrs`**: optional `mode`, `uid`, `gid`, `size`, `atime`, `mtime`. An all-empty `SetAttrs` is a no-op; `atime`/`mtime` are `SetTime`.
 
-**`SetTime`** — `Now` (the server clock) or `At { time }` (an explicit timestamp).
+**`SetTime`**: `Now` (the server clock) or `At { time }` (an explicit timestamp).
 
-**`NodeKind`** — `Fifo`, `Socket`, `BlockDevice { major, minor }`, or `CharDevice { major, minor }`.
+**`NodeKind`**: `Fifo`, `Socket`, `BlockDevice { major, minor }`, or `CharDevice { major, minor }`.
 
-**`FileType`** — `File`, `Dir`, `Symlink`, `Fifo`, `Socket`, `CharDevice`, `BlockDevice`, `Unknown`.
+**`FileType`**: `File`, `Dir`, `Symlink`, `Fifo`, `Socket`, `CharDevice`, `BlockDevice`, `Unknown`.
 
-**`Metadata`** — `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, and `atime`/`mtime`/`ctime` timestamps. `btime` and `data_version` are reserved (servers currently report 0).
+**`Metadata`**: `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, and `atime`/`mtime`/`ctime` timestamps. `btime` and `data_version` are reserved (servers currently report 0).
 
-**`DirEntry`** — `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (present only when readdirplus is negotiated; null otherwise).
+**`DirEntry`**: `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (present only when readdirplus is negotiated; null otherwise).
 
-**`StatFs`** — `block_size`, `blocks`, `blocks_free`, `blocks_available`, `files`, `files_free`, `filesystem_id`, `max_name_len`.
+**`StatFs`**: `block_size`, `blocks`, `blocks_free`, `blocks_available`, `files`, `files_free`, `filesystem_id`, `max_name_len`.
 
-**`Capabilities`** — `extensions_v1`, `extensions_v2`, `msize`, `max_read_chunk`, `max_write_chunk`. A live snapshot that can change across reconnects.
+**`Capabilities`**: `extensions_v1`, `extensions_v2`, `msize`, `max_read_chunk`, `max_write_chunk`. A live snapshot that can change across reconnects.
 
 ## Idiomatic additions
 

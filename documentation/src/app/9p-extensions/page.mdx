@@ -141,7 +141,7 @@ Tfsyncdur    fid[4] datasync[4] token[8]
              -> Rlerror(ESTALE)   otherwise
 ```
 
-This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it is what lets the bundled client keep fsync honest through a [high-availability](/high-availability) failover. A server with `ignore_fsync` set never offers level 4, so a client that asks for verified durability is never silently downgraded to a hollow success.
+This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it is what lets the bundled client verify fsync durability through a [high-availability](/high-availability) failover. A server with `ignore_fsync` set never offers level 4, so a client that asks for verified durability is never silently downgraded to an unverified success.
 
 ## Message reference {{ id: 'message-reference' }}
 

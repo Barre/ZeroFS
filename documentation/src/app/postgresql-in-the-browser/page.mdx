@@ -14,7 +14,7 @@ export const sections = [
 
 # PostgreSQL in the Browser
 
-The ZeroFS [Web UI](/web-ui) terminal boots a Linux VM inside the browser — a minimal BusyBox initramfs — and mounts ZeroFS at `/mnt` over 9P. The mount gets POSIX semantics, so PostgreSQL can run inside it with its data directory on S3. {{ className: 'lead' }}
+The ZeroFS [Web UI](/web-ui) terminal boots a Linux VM inside the browser (a minimal BusyBox initramfs) and mounts ZeroFS at `/mnt` over 9P. The mount gets POSIX semantics, so PostgreSQL can run inside it with its data directory on S3. {{ className: 'lead' }}
 
 This is a demonstration, not a deployment recommendation.
 
@@ -57,14 +57,14 @@ sequenceDiagram
     WS-->>V: binary frame
     V-->>K: virtio-9p completion
     K-->>PG: bytes written
-    Note over Z,S3: later — on fsync or when the buffer reaches 256 MiB
+    Note over Z,S3: later, on fsync or when the buffer reaches 256 MiB
     Z->>S3: PUT segment object
     S3-->>Z: OK
 `} />
 
 PostgreSQL sees a local filesystem. The Linux kernel sees a 9P fileserver. ZeroFS sees an ordinary 9P client.
 
-The write acknowledgment does not wait on S3. ZeroFS compresses and encrypts each 32 KiB extent into a frame inside an in-RAM segment buffer; the buffer is uploaded as one immutable segment object when it reaches 256 MiB or when an fsync forces a seal. PostgreSQL's own `fsync` of its WAL arrives as a 9P `Tfsync`, which seals and uploads the open segment before returning — see [Durability & Consistency](/durability).
+The write acknowledgment does not wait on S3. ZeroFS compresses and encrypts each 32 KiB extent into a frame inside an in-RAM segment buffer; the buffer is uploaded as one immutable segment object when it reaches 256 MiB or when an fsync forces a seal. PostgreSQL's own `fsync` of its WAL arrives as a 9P `Tfsync`, which seals and uploads the open segment before returning (see [Durability & Consistency](/durability)).
 
 ## Why it works {{ id: 'why-it-works' }}
 
@@ -85,7 +85,7 @@ gid = 1000
 
 Start ZeroFS, open `http://127.0.0.1:8080`, and switch to the terminal tab. The VM boots in a few seconds and drops you into a shell at `/mnt`.
 
-The VM ships with BusyBox; it does not include PostgreSQL. The v86 guest is a 32-bit x86 machine, so PostgreSQL must be a static 32-bit x86 (i386) build. Place the binaries on the ZeroFS filesystem from any other client (NFS, 9P, or the Web UI file manager). Since `/mnt` is your S3 bucket, anything you put there is visible to the VM — the guest mounts with `cache=loose`, so a just-added file may need a moment or a fresh directory listing to appear.
+The VM ships with BusyBox; it does not include PostgreSQL. The v86 guest is a 32-bit x86 machine, so PostgreSQL must be a static 32-bit x86 (i386) build. Place the binaries on the ZeroFS filesystem from any other client (NFS, 9P, or the Web UI file manager). Since `/mnt` is your S3 bucket, anything you put there is visible to the VM; the guest mounts with `cache=loose`, so a just-added file may need a moment or a fresh directory listing to appear.
 
 ```bash
 # From another machine or the file manager, copy a static 32-bit x86
@@ -112,7 +112,7 @@ The data is in S3. Close the tab, reopen it, start PostgreSQL again, and the row
 
 A 128 MB VM inside a JavaScript x86 emulator is not a replacement for a database server; emulation keeps the performance ceiling low.
 
-PostgreSQL is one example. Anything else that assumes a POSIX filesystem — a compiler, a mail server — runs the same way: booted in a browser tab, with its data persisted to S3.
+PostgreSQL is one example. Anything else that assumes a POSIX filesystem, a compiler or a mail server, runs the same way: booted in a browser tab, with its data persisted to S3.
 
 ---
 

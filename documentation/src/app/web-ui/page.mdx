@@ -16,7 +16,7 @@ export const sections = [
 
 # Web UI
 
-ZeroFS includes a web interface compiled into the binary — a file manager, a live dashboard, and a terminal that boots a Linux VM in the browser with the ZeroFS filesystem mounted inside it. {{ className: 'lead' }}
+ZeroFS includes a web interface compiled into the binary: a file manager, a live dashboard, and a terminal that boots a Linux VM in the browser with the ZeroFS filesystem mounted inside it. {{ className: 'lead' }}
 
 ## Configuration {{ id: 'configuration' }}
 
@@ -29,7 +29,7 @@ gid = 1000
 
 `uid` and `gid` control the POSIX identity used for all file operations from the Web UI. Files created through the browser are owned by this user and group, and permission checks apply accordingly. Both fields are required.
 
-Open `http://127.0.0.1:8080` after starting ZeroFS. All assets are embedded in the binary. Prebuilt release binaries and the Docker image include the Web UI; a plain `cargo build` does not — see [Building with the Web UI](/quickstart#installation).
+Open `http://127.0.0.1:8080` after starting ZeroFS. All assets are embedded in the binary. Prebuilt release binaries and the Docker image include the Web UI; a plain `cargo build` does not (see [Building with the Web UI](/quickstart#installation)).
 
 ## File Manager {{ id: 'file-manager' }}
 
@@ -39,7 +39,7 @@ Tabs, drag-and-drop uploads (folders too), file previews, search.
 
 ### Previews and Editing
 
-File type is detected from magic bytes in the first 16 KB. Text files open in a Monaco editor; Ctrl+S (or the save button) writes the buffer back over 9P. Text files over 5 MB and images or PDFs over 50 MB open in a hex viewer instead. Video and audio do not play inline — download to view.
+File type is detected from magic bytes in the first 16 KB. Text files open in a Monaco editor; Ctrl+S (or the save button) writes the buffer back over 9P. Text files over 5 MB and images or PDFs over 50 MB open in a hex viewer instead. Video and audio do not play inline; download to view.
 
 ### Properties
 
@@ -51,7 +51,7 @@ Ctrl+F searches the current directory, recursing at most 10 levels deep. A plain
 
 ### Transfers
 
-Downloading a folder reads every file into browser memory and zips it client-side, so folder downloads are bounded by what the tab can hold in memory. Recursive delete is a client-side walk with live progress and cancel. Dragging selected entries onto another tab issues 9P renames — a move, not a copy.
+Downloading a folder reads every file into browser memory and zips it client-side, so folder downloads are bounded by what the tab can hold in memory. Recursive delete is a client-side walk with live progress and cancel. Dragging selected entries onto another tab issues 9P renames: a move, not a copy.
 
 ## Dashboard {{ id: 'dashboard' }}
 
@@ -65,7 +65,7 @@ The tracer keeps the most recent 1000 events. Pausing discards events that arriv
 
 The file manager does not use a REST API. It speaks 9P, the same binary protocol the Linux kernel speaks when you `mount -t 9p`. The transport is a WebSocket instead of TCP; the messages on the wire are identical.
 
-We already had a 9P server that handles permissions, streaming, renames, and directory listings. Building a REST API on top would have meant reimplementing all of that, so instead we wrote a [9P client in TypeScript](https://github.com/Barre/zerofs/tree/main/webui/src/lib/ninep) and pointed it at a WebSocket.
+The 9P server already handles permissions, streaming, renames, and directory listings, so the UI reuses it directly through a [9P client in TypeScript](https://github.com/Barre/zerofs/tree/main/webui/src/lib/ninep) over a WebSocket rather than a REST layer that would reimplement the same logic.
 
 When you open the UI, the browser connects to `/ws/9p`. The server upgrades the connection and hands it to the same `NinePHandler` that serves other clients over TCP. From that point on, the browser is another 9P session.
 
@@ -106,19 +106,19 @@ sh → kernel 9P → virtio-9p (v86) → WebSocket → ZeroFS → S3
 
 The VM has 128 MB of RAM and drops you into a shell at `/mnt`.
 
-The guest has no network device — files move in and out only through the mounted filesystem. This is why the [PostgreSQL in the browser](/postgresql-in-the-browser) demo copies binaries in through another mount. The guest mounts with `cache=loose`, so writes from other clients can appear stale in the shell, and shell writes can appear stale to other clients. The VM reboots automatically when the 9P WebSocket reconnects, for example after a ZeroFS restart.
+The guest has no network device; files move in and out only through the mounted filesystem. This is why the [PostgreSQL in the browser](/postgresql-in-the-browser) demo copies binaries in through another mount. The guest mounts with `cache=loose`, so writes from other clients can appear stale in the shell, and shell writes can appear stale to other clients. The VM reboots automatically when the 9P WebSocket reconnects, for example after a ZeroFS restart.
 
 ## Security Considerations {{ id: 'security-considerations' }}
 
 <Warning>
 The Web UI has no authentication on any route.
 
-- `/ws/9p` hands the connection to the same 9P handler that serves TCP clients. All operations run as the configured `uid`/`gid` — full read/write access to the filesystem.
-- The gRPC-web endpoint exposes the complete `AdminService`: `CreateCheckpoint`, `ListCheckpoints`, `DeleteCheckpoint`, `GetCheckpointInfo`, `WatchFileAccess`, `WatchObjectAccess`, `Flush`, `StreamStats`, `CreateDirectory`, and `RemoveDirectory` — including methods the UI itself never calls.
+- `/ws/9p` hands the connection to the same 9P handler that serves TCP clients. All operations run as the configured `uid`/`gid`, with full read/write access to the filesystem.
+- The gRPC-web endpoint exposes the complete `AdminService`: `CreateCheckpoint`, `ListCheckpoints`, `DeleteCheckpoint`, `GetCheckpointInfo`, `WatchFileAccess`, `WatchObjectAccess`, `Flush`, `StreamStats`, `CreateDirectory`, and `RemoveDirectory`, including methods the UI itself never calls.
 - CORS on the gRPC-web routes reflects any request Origin and allows all headers, so a web page on any site can issue admin RPCs from a visitor's browser if that browser can reach the port.
 - The `/ws/9p` WebSocket performs no Origin check, and WebSocket connections are not subject to CORS.
 
-`addresses` defaults to `127.0.0.1:8080`. Binding to a non-loopback address exposes all of the above to that network. Keep the bind address on loopback or a trusted network, restrict access with firewall rules, use an SSH tunnel for remote access, or front the Web UI with a reverse proxy that adds authentication and TLS — the proxy must pass WebSocket upgrades for `/ws/9p`.
+`addresses` defaults to `127.0.0.1:8080`. Binding to a non-loopback address exposes all of the above to that network. Keep the bind address on loopback or a trusted network, restrict access with firewall rules, use an SSH tunnel for remote access, or front the Web UI with a reverse proxy that adds authentication and TLS (the proxy must pass WebSocket upgrades for `/ws/9p`).
 </Warning>
 
 ---

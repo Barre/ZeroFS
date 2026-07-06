@@ -267,7 +267,7 @@ url = "s3://bucket/path"
 encryption_password = "correct-password"
 
 # Values undergo environment variable expansion.
-# Write a literal $ as $$ — this sets the password to p@$w0rd!
+# Write a literal $ as $$; this sets the password to p@$w0rd!
 encryption_password = 'p@$$w0rd!'
 
 # Or use environment variable substitution:
@@ -325,7 +325,7 @@ object store returned a short body; re-fetching
 
 ZeroFS checks the body of every object store read against the length the store reported. When the body comes back shorter, ZeroFS discards it and fetches again rather than return truncated data. There is no retry limit: the read blocks until a full body arrives, with backoff starting at 100 ms, doubling per attempt, and capping at 800 ms. The warning fields report the object `location`, the `expected` and `received` byte counts, and the `attempt` number.
 
-Repeated warnings for the same object mean something between ZeroFS and the storage backend truncates responses — a proxy or the provider itself. Reads recover without intervention once full responses arrive.
+Repeated warnings for the same object mean something between ZeroFS and the storage backend truncates responses, either a proxy or the provider itself. Reads recover without intervention once full responses arrive.
 
 ### Process Exits with a Fatal Write Error
 
@@ -335,7 +335,7 @@ The process exits with code 1 after logging:
 Fatal write error, exiting: <underlying error>
 ```
 
-Any failed write to the database terminates the process: after a write failure, the database state is unknown, and a restart rebuilds from the last committed state. Run ZeroFS under a supervisor that restarts it — the systemd unit under [System Integration](/configuration#system-integration) in the configuration guide sets `Restart=always`.
+Any failed write to the database terminates the process: after a write failure, the database state is unknown, and a restart rebuilds from the last committed state. Run ZeroFS under a supervisor that restarts it; the systemd unit under [System Integration](/configuration#system-integration) in the configuration guide sets `Restart=always`.
 
 The text after the colon is the underlying storage error. Diagnose that error; the exit is the recovery mechanism, not the fault.
 
