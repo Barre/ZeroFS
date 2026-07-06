@@ -19,7 +19,8 @@ ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as
 ZeroFS differentiates itself from other "filesystem on S3" projects by:
 
 - Being POSIX-conformant
-- Reaching near-raw-S3 throughput on large files, and scaling to workloads of millions of small files
+- Reaching near-raw-S3 throughput on large files, and scaling to workloads of hundreds of millions of small files
+- Handling tens of thousands of requests per second
 - Requiring no external database service (everything is stored on S3)
 - Being well tested (in CI we run [pjdfstest](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [xfstests](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [kernel builds](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), [Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml), and more)
 
