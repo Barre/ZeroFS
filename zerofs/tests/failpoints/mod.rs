@@ -3157,7 +3157,11 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
     // The overwrite's commit now lands, still pointing into the source segment.
     fs.write_coordinator.commit(txn2).await.unwrap();
     let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
-    assert_eq!(&data[..], &vec![2u8; 4096][..], "overwrite visible pre-repoint");
+    assert_eq!(
+        &data[..],
+        &vec![2u8; 4096][..],
+        "overwrite visible pre-repoint"
+    );
 
     fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
     handle.await.unwrap().unwrap();
@@ -3168,6 +3172,48 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
         &vec![2u8; 4096][..],
         "repoint reverted an acked overwrite to the gathered stale frame"
     );
+}
+
+/// Reclaim classifies deadness from the durable view, and this harness runs the
+/// production SlateDB config (WAL off, size-freeze off), where durable rows come
+/// only from the barrier's own flush. A dead segment must still be deleted in
+/// one pass here proving the durable scan sees barrier-flushed deaths while
+/// a kill committed after the barrier must defer and not delete.
+#[tokio::test]
+async fn test_reclaim_deletes_from_the_durable_view_without_a_wal() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx: _ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"f.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    // Segment A (superseded), then segment B holding the live copy.
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 4096]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![2u8; 4096]))
+        .await
+        .unwrap();
+    fs.flush_coordinator.flush().await.unwrap();
+    assert_eq!(fs.extent_store.list_segments().await.unwrap().len(), 2);
+
+    let (deleted, _) = fs.extent_store.reclaim_now().await.unwrap();
+    assert_eq!(
+        deleted, 1,
+        "the durable scan must see the barrier-flushed death and delete in one pass"
+    );
+    assert_eq!(fs.extent_store.list_segments().await.unwrap().len(), 1);
+    let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
+    assert_eq!(&data[..], &vec![2u8; 4096][..]);
 }
 
 /// Crash mid-reclaim, after a dead segment's object is deleted but before its
