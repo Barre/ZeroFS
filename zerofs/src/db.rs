@@ -349,9 +349,22 @@ impl Db {
     }
 
     pub async fn get_bytes(&self, key: &Bytes) -> Result<Option<Bytes>> {
+        self.get_bytes_at(key, DurabilityLevel::Memory).await
+    }
+
+    /// Point read seeing only object-storage-durable data.
+    pub async fn get_bytes_durable(&self, key: &Bytes) -> Result<Option<Bytes>> {
+        self.get_bytes_at(key, DurabilityLevel::Remote).await
+    }
+
+    async fn get_bytes_at(
+        &self,
+        key: &Bytes,
+        durability_filter: DurabilityLevel,
+    ) -> Result<Option<Bytes>> {
         self.check_lease()?;
         let read_options = ReadOptions {
-            durability_filter: DurabilityLevel::Memory,
+            durability_filter,
             cache_blocks: true,
             ..Default::default()
         };

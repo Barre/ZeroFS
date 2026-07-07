@@ -2784,6 +2784,13 @@ impl ExtentStore {
     /// forward map. Fail-closed: a read error, or any frame the forward map still
     /// points here, returns [`SegmentDeadVerdict::Keep`]. Sound because an eligible
     /// segment can never regain a reference, so the verdict is permanent.
+    ///
+    /// Each pointer is checked in both the in-memory and the durable view: the
+    /// delete is irreversible, and a reference can hide from either view alone —
+    /// a committed-but-unflushed reference exists only in memory, while a durable
+    /// reference is masked in memory by an unflushed overwrite (the undercount
+    /// case this verify exists to catch, where a crash after the delete would
+    /// leave the durable pointer dangling).
     async fn verify_segment_reclaimable(&self, segid: Segid) -> SegmentDeadVerdict {
         let dir = match self.segments.read_directory(segid).await {
             Ok(d) => d,
@@ -2793,20 +2800,20 @@ impl ExtentStore {
         };
         // Unique extents the directory names (an extent can recur across rewrites).
         let want: HashSet<(InodeId, u64)> = dir.iter().map(|e| (e.inode, e.extent)).collect();
-        // Any extent whose current FrameLoc still points here means the segment is
-        // live; a point-read error is treated as still-referenced (fail-closed).
+        // A FrameLoc pointing here in either view means the segment is live; a
+        // point-read error is treated as still-referenced (fail-closed).
+        let points_here = |enc: Result<Option<Bytes>, anyhow::Error>| match enc {
+            Ok(Some(enc)) => FrameLoc::decode(&enc).is_some_and(|loc| loc.segid == segid),
+            Ok(None) => false,
+            Err(_) => true,
+        };
         let still_referenced = stream::iter(want)
             .map(|(inode, extent)| {
                 let store = self.clone();
                 async move {
                     let key = store.key_codec.extent_key(inode, extent);
-                    match store.db.get_bytes(&key).await {
-                        Ok(Some(enc)) => {
-                            FrameLoc::decode(&enc).is_some_and(|loc| loc.segid == segid)
-                        }
-                        Ok(None) => false,
-                        Err(_) => true,
-                    }
+                    points_here(store.db.get_bytes(&key).await)
+                        || points_here(store.db.get_bytes_durable(&key).await)
                 }
             })
             .buffer_unordered(PARALLEL_EXTENT_OPS)
@@ -3510,6 +3517,61 @@ mod tests {
         );
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
+    }
+
+    // The verify checks the durable view too: a durable pointer masked in memory
+    // by an unflushed overwrite must keep the segment (a crash before the flush
+    // would revive that pointer over a deleted object). WAL off + no size-freeze,
+    // as production, so only explicit flushes make rows durable and the overwrite
+    // deterministically stays memory-only.
+    #[tokio::test]
+    async fn directory_verify_keeps_a_durably_referenced_segment_masked_by_an_unflushed_overwrite()
+    {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let bt: Arc<dyn BlockTransformer> =
+            ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            l0_sst_size_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let slatedb = Arc::new(
+            DbBuilder::new(Path::from("t"), object_store.clone())
+                .with_settings(settings)
+                .with_block_transformer(bt)
+                .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let db = Arc::new(Db::new(slatedb, None));
+        let store = make_store(object_store, db.clone(), CompressionConfig::Lz4, 7);
+
+        // Extent 0 -> segment S, durable.
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &[1u8; 1000]).await;
+        store.seal_open().await.unwrap();
+        db.flush().await.unwrap();
+        let seg = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+
+        // Overwrite extent 0: the memory view moves the pointer off S, the
+        // durable view still references it.
+        write_and_check(&store, &db, &mut model, 0, &[2u8; 1000]).await;
+        assert!(
+            matches!(
+                store.verify_segment_reclaimable(seg).await,
+                SegmentDeadVerdict::Keep
+            ),
+            "a durable reference must keep the segment while the overwrite is unflushed"
+        );
+
+        // Flushed, both views agree the pointer moved: reclaimable.
+        store.seal_open().await.unwrap();
+        db.flush().await.unwrap();
+        assert!(matches!(
+            store.verify_segment_reclaimable(seg).await,
+            SegmentDeadVerdict::Reclaim
+        ));
     }
 
     // A dead segment whose `segcount` counter is entirely ABSENT (a compaction whose
