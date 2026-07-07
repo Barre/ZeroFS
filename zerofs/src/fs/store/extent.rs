@@ -2207,6 +2207,11 @@ impl ExtentStore {
         // the slow orphan sweep owns those. Every delete is still
         // directory-verified below.
         //
+        // Read at the durable (object-storage) level, not the in-memory view: a
+        // delete removes the object irreversibly and at once, but a segment's
+        // death (the overwrite/trim debit driving `live` to 0) is only durable
+        // once flushed.
+        //
         // Stream the scan, keeping only dead segids plus a bounded candidate
         // set, so per-pass RAM is O(dead + cap), not O(#segments).
         let (sc_start, sc_end) = self.key_codec.segcount_prefix_range();
@@ -2216,7 +2221,7 @@ impl ExtentStore {
         let mut scanned = 0usize;
         let mut total_live = 0u64;
         let mut total_appended = 0u64;
-        let mut stream = self.db.scan(sc_start..sc_end).await.map_err(|e| {
+        let mut stream = self.db.scan_durable(sc_start..sc_end).await.map_err(|e| {
             error!("GC segcount scan failed: {}", e);
             FsError::IoError
         })?;

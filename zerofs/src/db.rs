@@ -371,9 +371,25 @@ impl Db {
         &self,
         range: R,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        self.scan_at(range, DurabilityLevel::Memory).await
+    }
+
+    /// Scan seeing only object-storage-durable data.
+    pub async fn scan_durable<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
+        self.scan_at(range, DurabilityLevel::Remote).await
+    }
+
+    async fn scan_at<R: slatedb::ByteRangeBounds + Send>(
+        &self,
+        range: R,
+        durability_filter: DurabilityLevel,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<(Bytes, Bytes)>> + Send + '_>>> {
         self.check_lease()?;
         let scan_options = ScanOptions {
-            durability_filter: DurabilityLevel::Memory,
+            durability_filter,
             read_ahead_bytes: 4 * 1024 * 1024,
             cache_blocks: true,
             max_fetch_tasks: 4,
