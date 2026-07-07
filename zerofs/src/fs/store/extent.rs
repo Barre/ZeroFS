@@ -196,8 +196,8 @@ type CompactRun = (u64, u32, u32, Vec<(InodeId, u64)>);
 /// A segment as the segcount scan saw it: (segid, total bytes, live bytes).
 type SegStat = (Segid, u64, u64);
 
-/// One packed batch awaiting seal: frames and their source segids.
-type PackBatch = (Vec<(InodeId, u64, Bytes)>, Vec<Segid>);
+/// One packed batch awaiting seal: frames and their gathered source locations.
+type PackBatch = (Vec<(InodeId, u64, Bytes)>, Vec<FrameLoc>);
 
 /// Write-cold inputs, computed once per pass after the barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2847,9 +2847,10 @@ impl ExtentStore {
         round_bytes: u64,
     ) -> Result<(usize, usize, usize), FsError> {
         debug_assert!(atomic_prefix.iter().sum::<usize>() <= segids.len());
-        // Gather still-live frames across all sources, tagged with their source
-        // segid and on-store size.
-        let mut frames: Vec<(InodeId, u64, Segid, u32, Bytes)> = Vec::new();
+        // Gather still-live frames across all sources, tagged with the exact
+        // source FrameLoc the liveness read resolved (the repoint CAS's expected
+        // value).
+        let mut frames: Vec<(InodeId, u64, FrameLoc, Bytes)> = Vec::new();
         let mut gathered: u64 = 0;
         let mut consumed = 0usize;
         // Gather each live (inode, extent) at most once: an extent rewritten K times
@@ -2891,7 +2892,7 @@ impl ExtentStore {
         // segment (consecutive frame index + adjacent bytes), collapsing its reads
         // to a single ranged GET instead of one per scattered run. Sequential inode
         // ids also cluster same-directory files into the same/adjacent segments.
-        frames.sort_by_key(|(inode, extent, _, _, _)| (*inode, *extent));
+        frames.sort_by_key(|(inode, extent, _, _)| (*inode, *extent));
 
         // Cut into target-sized batches by SOURCE on-store bytes, never
         // between file-adjacent extents unless a single run alone exceeds the
@@ -2900,7 +2901,7 @@ impl ExtentStore {
         // candidacy and be rewritten again.
         let metas: Vec<(InodeId, u64, u64)> = frames
             .iter()
-            .map(|&(inode, extent, _, len, _)| (inode, extent, len as u64))
+            .map(|&(inode, extent, loc, _)| (inode, extent, loc.byte_len as u64))
             .collect();
         let mut bounds = plan_batches(&metas, PACK_TARGET_BYTES, PACK_CUT_SLACK_BYTES);
         if bounds.len() > 1 {
@@ -2917,7 +2918,7 @@ impl ExtentStore {
             let mut batch = Vec::with_capacity(end - prev);
             let mut batch_src = Vec::with_capacity(end - prev);
             for _ in prev..end {
-                let (inode, extent, src, _, bytes) = iter.next().expect("bounds within frames");
+                let (inode, extent, src, bytes) = iter.next().expect("bounds within frames");
                 batch.push((inode, extent, bytes));
                 batch_src.push(src);
             }
@@ -2939,13 +2940,13 @@ impl ExtentStore {
     }
 
     /// Gather one source segment's still-live frames for [`Self::compact_segments`]:
-    /// append them to `frames` (tagged with source segid and on-store size),
+    /// append them to `frames` (tagged with the resolved source [`FrameLoc`]),
     /// growing `seen` and the plaintext `gathered` total.
     async fn gather_source(
         &self,
         segid: Segid,
         seen: &mut HashSet<(InodeId, u64)>,
-        frames: &mut Vec<(InodeId, u64, Segid, u32, Bytes)>,
+        frames: &mut Vec<(InodeId, u64, FrameLoc, Bytes)>,
         gathered: &mut u64,
     ) -> Result<(), FsError> {
         let dir = self
@@ -2995,10 +2996,11 @@ impl ExtentStore {
         // into runs, then read the runs in parallel — one ranged GET per run
         // instead of one per frame.
         live.sort_by_key(|(_, _, loc)| loc.frame_index);
-        // Source on-store size per slot, carried through to the batch cut.
-        let store_len: HashMap<(InodeId, u64), u32> = live
+        // Resolved location per slot, carried through to the batch cut and the
+        // repoint CAS.
+        let loc_of: HashMap<(InodeId, u64), FrameLoc> = live
             .iter()
-            .map(|&(inode, extent, loc)| ((inode, extent), loc.byte_len))
+            .map(|&(inode, extent, loc)| ((inode, extent), loc))
             .collect();
         let mut runs: Vec<CompactRun> = Vec::new();
         for (inode, extent, loc) in live {
@@ -3043,17 +3045,18 @@ impl ExtentStore {
         for (inode, extent, bytes) in read.into_iter().flatten() {
             seen.insert((inode, extent));
             *gathered += bytes.len() as u64;
-            frames.push((inode, extent, segid, store_len[&(inode, extent)], bytes));
+            frames.push((inode, extent, loc_of[&(inode, extent)], bytes));
         }
         Ok(())
     }
 
     /// Seal one packed batch into a new segment and repoint the extents that still
-    /// reference their source frame. `src[i]` is the source segid of `batch[i]`.
+    /// reference their source frame. `src[i]` is the gathered source [`FrameLoc`]
+    /// of `batch[i]`, the swap's expected value.
     async fn seal_and_repoint(
         &self,
         batch: &[(InodeId, u64, Bytes)],
-        src: &[Segid],
+        src: &[FrameLoc],
     ) -> Result<usize, FsError> {
         let new_locs = self
             .segments
@@ -3069,7 +3072,7 @@ impl ExtentStore {
 
         // Group by inode so each conditional swap is taken under that inode's write
         // lock (excludes a concurrent foreground write to the same extent).
-        let mut by_inode: HashMap<InodeId, Vec<(u64, Segid, FrameLoc)>> = HashMap::new();
+        let mut by_inode: HashMap<InodeId, Vec<(u64, FrameLoc, FrameLoc)>> = HashMap::new();
         for (i, (inode, extent, new_loc)) in new_locs.into_iter().enumerate() {
             by_inode
                 .entry(inode)
@@ -3082,7 +3085,7 @@ impl ExtentStore {
             let _guard = self.lock_manager.acquire(inode).await;
             let mut txn = self.db.new_transaction()?;
             let mut any = false;
-            for (extent, old_segid, new_loc) in items {
+            for (extent, old_loc, new_loc) in items {
                 let key = self.key_codec.extent_key(inode, extent);
                 if let Some(enc) = self
                     .db
@@ -3090,14 +3093,19 @@ impl ExtentStore {
                     .await
                     .map_err(|_| FsError::IoError)?
                     && let Some(loc) = FrameLoc::decode(&enc)
-                    && loc.segid == old_segid
+                    // Full-loc equality, not just the segid: a rewrite staged
+                    // into the same source segment whose commit lands between
+                    // the gather and this swap moves the pointer to a sibling
+                    // frame, and swapping on the segid alone would revert the
+                    // extent to the gathered (superseded) frame's bytes.
+                    && loc == old_loc
                 {
                     txn.put_bytes(&key, Bytes::copy_from_slice(&new_loc.encode()));
                     // Move the bytes only on a won CAS: after a lost race the
                     // relocated frame is dead weight (no live pointer) and must
                     // not be credited. Source debit is live-only; the packed
                     // frame credits both live and total.
-                    self.seg_delta(&mut txn, old_segid, -(loc.byte_len as i64), 0);
+                    self.seg_delta(&mut txn, old_loc.segid, -(loc.byte_len as i64), 0);
                     self.seg_delta(
                         &mut txn,
                         new_loc.segid,

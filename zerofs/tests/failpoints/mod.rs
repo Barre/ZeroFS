@@ -3102,6 +3102,74 @@ async fn test_crash_compact_after_seal_before_repoint() {
     );
 }
 
+/// An overwrite whose commit lands between compaction's gather and its repoint,
+/// with both frames in the same source segment (any rewrite within one seal
+/// window). The gather resolves the pointer to the old frame; the repoint's
+/// conditional swap must then reject the move, or it reverts the extent to the
+/// old frame's content and the acked overwrite is lost. The pause failpoint
+/// models the commit worker stalled (semi-sync ship, sync-writes flush queued
+/// behind the GC barrier) while the pass runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
+    let (
+        _scenario,
+        TestSetup {
+            ctx: _ctx,
+            fs,
+            creds,
+            auth,
+        },
+    ) = TestSetup::new().await;
+
+    let (file_id, _) = fs
+        .create(&creds, 0, b"f.txt", &SetAttributes::default())
+        .await
+        .unwrap();
+    // Frame a: committed. Frame b: staged into the same open segment (appended
+    // to its buffer with the pointer-put left uncommitted, as when the commit
+    // worker is backed up).
+    fs.write(&auth, file_id, 0, &Bytes::from(vec![1u8; 4096]))
+        .await
+        .unwrap();
+    let mut txn2 = fs.db.new_transaction().unwrap();
+    fs.extent_store
+        .write(&mut txn2, file_id, 0, &Bytes::from(vec![2u8; 4096]), 4096)
+        .await
+        .unwrap();
+    // Seal: one segment holding both frames, committed pointer still frame a.
+    fs.extent_store.seal_open().await.unwrap();
+    let sources = fs.extent_store.list_segments().await.unwrap();
+    assert_eq!(sources.len(), 1, "both frames must share one segment");
+
+    // Compact the source; the gather resolves frame a and packs its bytes,
+    // then parks after the packed PUT, before the repoint.
+    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "pause").unwrap();
+    let es = fs.extent_store.clone();
+    let handle =
+        tokio::task::spawn(async move { es.compact_segments(&sources, &[], 256 << 20).await });
+    let mut waited = 0;
+    while fs.extent_store.list_segments().await.unwrap().len() < 2 {
+        waited += 1;
+        assert!(waited < 500, "compaction never reached the packed PUT");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The overwrite's commit now lands, still pointing into the source segment.
+    fs.write_coordinator.commit(txn2).await.unwrap();
+    let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
+    assert_eq!(&data[..], &vec![2u8; 4096][..], "overwrite visible pre-repoint");
+
+    fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "off").unwrap();
+    handle.await.unwrap().unwrap();
+
+    let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
+    assert_eq!(
+        &data[..],
+        &vec![2u8; 4096][..],
+        "repoint reverted an acked overwrite to the gathered stale frame"
+    );
+}
+
 /// Crash mid-reclaim, after a dead segment's object is deleted but before its
 /// `segcount` counter key is dropped. The segment was directory-verified dead, so no
 /// FrameLoc dangles; the stale counter is a benign leak (a later pass ignores it, as
