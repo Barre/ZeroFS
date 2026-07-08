@@ -29,6 +29,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bounds a unary control RPC (Hello) so a peer that accepts the call but never
 /// answers does not stall the leader's startup role election.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Decode ceiling for an incoming `ReplicateRequest`. tonic defaults to 4 MiB.
+const MAX_SHIP_DECODE_BYTES: usize = usize::MAX;
 
 fn to_repl_ops(ops: Vec<ProtoOp>) -> Vec<ReplOp> {
     ops.into_iter()
@@ -127,7 +129,7 @@ impl ReplicationReceiver {
     }
 
     pub fn into_server(self) -> ReplicationServiceServer<Self> {
-        ReplicationServiceServer::new(self)
+        ReplicationServiceServer::new(self).max_decoding_message_size(MAX_SHIP_DECODE_BYTES)
     }
 }
 
@@ -411,6 +413,33 @@ mod tests {
             2,
             "a stale-epoch ship must not buffer"
         );
+    }
+
+    // A coalesced ship past tonic's 4 MiB default decode limit must be accepted:
+    // at the default the standby rejects it before the handler, the leader sees a
+    // failed ship, and it downgrades to solo and taints the lineage under ordinary
+    // write load. `into_server` raises the limit; this proves the wiring.
+    #[tokio::test]
+    async fn ship_larger_than_the_default_decode_limit_is_accepted() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let endpoint = spawn_receiver(buffer.clone()).await;
+        let sender = loop {
+            match ReplicationSender::connect(endpoint.clone()).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+
+        // One op whose payload alone clears the 4 MiB default with headroom.
+        let big = ReplOp::Put(
+            Bytes::from_static(b"k"),
+            Bytes::from(vec![0u8; 6 * 1024 * 1024]),
+        );
+        assert!(
+            sender.ship(1, &[big], &[], 0, 1).await.unwrap(),
+            "a ship past the 4 MiB default decode limit must be accepted, not rejected"
+        );
+        assert_eq!(buffer.lock().await.len(), 1, "the large batch must buffer");
     }
 
     // Hello reports the responder's configured node_id, so a booting peer can
