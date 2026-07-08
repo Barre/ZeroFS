@@ -89,6 +89,10 @@ pub struct ReplicationReceiver {
     /// Fired when a deposed leader asks (Hello) and we are a standby holding a
     /// tail, so we take over at once instead of waiting out the heartbeat gap.
     takeover_trigger: Option<Arc<Notify>>,
+    /// This node's configured id, reported via Hello so a booting peer can
+    /// refuse startup on a duplicated node_id (identity keys the latest-leader
+    /// record, so a collision is a config error).
+    node_id: String,
 }
 
 impl ReplicationReceiver {
@@ -97,6 +101,7 @@ impl ReplicationReceiver {
         dedup: Arc<crate::dedup::DedupCache>,
         leading: Arc<AtomicBool>,
         takeover_trigger: Option<Arc<Notify>>,
+        node_id: String,
     ) -> Self {
         Self {
             buffer,
@@ -105,6 +110,7 @@ impl ReplicationReceiver {
             heartbeats: watch::channel(0u64).0,
             leading,
             takeover_trigger,
+            node_id,
         }
     }
 
@@ -213,6 +219,7 @@ impl ReplicationService for ReplicationReceiver {
         // over and preserve it). Either way the caller must defer, not open as writer.
         Ok(Response::new(HelloResponse {
             peer_active: leading || has_tail,
+            node_id: self.node_id.clone(),
         }))
     }
 }
@@ -255,8 +262,16 @@ impl ReplicationSender {
 }
 
 /// Ask a peer (Hello) whether the caller should defer instead of opening as
-/// writer: true if the peer is leading or holds an un-replayed tail.
-pub async fn hello_peer(endpoint: String) -> anyhow::Result<bool> {
+/// writer. `peer_active` is true if the peer is leading or holds an un-replayed
+/// tail; `node_id` is the peer's configured id (empty from a peer predating the
+/// field), which the caller checks against its own to catch a duplicated
+/// node_id at startup.
+pub struct HelloAnswer {
+    pub peer_active: bool,
+    pub node_id: String,
+}
+
+pub async fn hello_peer(endpoint: String) -> anyhow::Result<HelloAnswer> {
     let mut client =
         tokio::time::timeout(CONNECT_TIMEOUT, ReplicationServiceClient::connect(endpoint))
             .await
@@ -264,7 +279,11 @@ pub async fn hello_peer(endpoint: String) -> anyhow::Result<bool> {
     let resp = tokio::time::timeout(RPC_TIMEOUT, client.hello(HelloRequest {}))
         .await
         .map_err(|_| anyhow::anyhow!("Hello RPC timed out"))??;
-    Ok(resp.into_inner().peer_active)
+    let resp = resp.into_inner();
+    Ok(HelloAnswer {
+        peer_active: resp.peer_active,
+        node_id: resp.node_id,
+    })
 }
 
 /// Stream heartbeats at `interval` until the connection breaks. `epoch` is the
@@ -320,6 +339,7 @@ mod tests {
             Arc::new(crate::dedup::DedupCache::new(64)),
             Arc::new(AtomicBool::new(false)),
             None,
+            "standby-under-test".to_string(),
         );
         let highest_epoch = receiver.highest_epoch();
         let server = receiver.into_server();
@@ -344,6 +364,7 @@ mod tests {
             Arc::new(crate::dedup::DedupCache::new(64)),
             leading,
             None,
+            "standby-under-test".to_string(),
         )
         .into_server();
         tokio::spawn(async move {
@@ -392,6 +413,22 @@ mod tests {
         );
     }
 
+    // Hello reports the responder's configured node_id, so a booting peer can
+    // refuse startup on a duplicated identity (it keys the latest-leader record).
+    #[tokio::test]
+    async fn hello_reports_the_responders_node_id() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let endpoint = spawn_receiver(buffer).await;
+        let answer = loop {
+            match hello_peer(endpoint.clone()).await {
+                Ok(a) => break a,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert_eq!(answer.node_id, "standby-under-test");
+        assert!(!answer.peer_active, "idle standby: empty tail, not leading");
+    }
+
     #[tokio::test]
     async fn heartbeats_tick_liveness_and_stop_on_break() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
@@ -400,6 +437,7 @@ mod tests {
             Arc::new(crate::dedup::DedupCache::new(64)),
             Arc::new(AtomicBool::new(false)),
             None,
+            "standby-under-test".to_string(),
         );
         let mut liveness = receiver.liveness();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

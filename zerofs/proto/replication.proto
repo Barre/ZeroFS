@@ -63,4 +63,9 @@ message HelloResponse {
     // True if the peer is leading or holds an un-replayed tail: the caller must
     // NOT open as writer; it should defer and follow.
     bool peer_active = 1;
+    // Responder's configured node_id. The caller refuses to start when it equals
+    // its own: node identity keys the latest-leader record, so a duplicated
+    // node_id is a config error. Empty from a peer predating this field, which
+    // skips the check.
+    string node_id = 2;
 }

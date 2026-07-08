@@ -350,16 +350,19 @@ async fn worker_loop(
             None
         };
 
-        // HA: stamp this data db with the highest shipped batch seqno, flushed
-        // atomically with the batch. On takeover a promoted standby prunes its
-        // buffered tail to this watermark, so a batch already flushed here is
-        // never replayed (replaying a stale batch would regress monotonic
-        // counters and double-count stats against the newer db state). Local
+        // HA provenance stamp, flushed atomically with the batch: (epoch, last
+        // acked ship's seqno, solo commits since). On takeover a promoted
+        // standby validates its buffered tail against this durable head: prune
+        // to the shipped watermark, and drop ships the leader outlived (solo
+        // progress after them means replaying would regress newer state). Local
         // only (not in repl_ops); the standby keys its tail by its own seqnos.
-        if let (Some(repl), Some(seqno)) = (ctx.replicator.as_ref(), shipped_seqno) {
+        if let Some(repl) = ctx.replicator.as_ref()
+            && any_ops
+        {
+            let (epoch, last_shipped, solo) = repl.stamp();
             merged.put_bytes(
                 ctx.key_codec.ha_seqno_key(),
-                KeyCodec::encode_ha_seqno(repl.writer_epoch(), seqno),
+                KeyCodec::encode_ha_stamp(epoch, last_shipped, solo),
             );
         }
 

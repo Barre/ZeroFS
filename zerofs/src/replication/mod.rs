@@ -7,6 +7,7 @@
 //! writer (fencing the old leader). No separate coordination database.
 
 pub mod failover;
+pub mod leader_record;
 pub mod lease;
 pub mod replicator;
 pub mod tail;
