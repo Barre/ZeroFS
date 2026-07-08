@@ -827,7 +827,9 @@ impl ZeroFS {
         match &mut inode {
             Inode::File(file) => {
                 let old_size = file.size;
-                let end_offset = offset + data.len() as u64;
+                let end_offset = offset
+                    .checked_add(data.len() as u64)
+                    .ok_or(FsError::InvalidArgument)?;
                 let new_size = std::cmp::max(file.size, end_offset);
 
                 if new_size > old_size {
@@ -1178,6 +1180,10 @@ impl ZeroFS {
             Inode::File(f) => f,
             _ => return Err(FsError::IsDirectory),
         };
+
+        // A client-supplied offset+length can overflow u64; reject before the
+        // wrapped range reaches the extent layer.
+        offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
         let mut txn = self.db.new_transaction()?;
 
@@ -3700,6 +3706,45 @@ mod tests {
 
         assert_eq!(read_data.as_ref(), data);
         assert!(eof);
+    }
+
+    #[tokio::test]
+    async fn write_offset_length_overflow_is_rejected() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"f.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        for off in [u64::MAX - 4, u64::MAX - 99, u64::MAX] {
+            let r = fs
+                .write(
+                    &(&test_auth()).into(),
+                    file_id,
+                    off,
+                    &Bytes::from(vec![1u8; 100]),
+                )
+                .await;
+            assert!(
+                matches!(r, Err(FsError::InvalidArgument)),
+                "write at offset {off} must be EINVAL, got {r:?}"
+            );
+        }
+        // The rejected writes left the file untouched.
+        let size = match fs.inode_store.get(file_id).await.unwrap() {
+            Inode::File(f) => f.size,
+            _ => panic!("expected a file"),
+        };
+        assert_eq!(size, 0, "a rejected overflow write must not grow the file");
+
+        // trim's offset+length overflow is likewise rejected.
+        let r = fs
+            .trim(&(&test_auth()).into(), file_id, u64::MAX - 4, 100)
+            .await;
+        assert!(
+            matches!(r, Err(FsError::InvalidArgument)),
+            "trim overflow must be EINVAL, got {r:?}"
+        );
     }
 
     #[tokio::test]

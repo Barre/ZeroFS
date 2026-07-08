@@ -1827,7 +1827,9 @@ impl ExtentStore {
         if data.is_empty() {
             return Ok(TailUpdate::Keep);
         }
-        let end_offset = offset + data.len() as u64;
+        let end_offset = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FsError::InvalidArgument)?;
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end_offset - 1) / EXTENT_SIZE as u64;
 
@@ -1957,9 +1959,9 @@ impl ExtentStore {
         if length == 0 {
             return Ok(());
         }
+        let end_offset = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
         self.tail_invalidate(id);
 
-        let end_offset = offset + length;
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end_offset - 1) / EXTENT_SIZE as u64;
 
