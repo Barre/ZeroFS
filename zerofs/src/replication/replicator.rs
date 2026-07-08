@@ -31,6 +31,11 @@ pub struct Replicator {
     writer_epoch: u64,
     /// Next batch seqno, assigned only when a batch is actually shipped.
     seqno: AtomicU64,
+    /// Last seqno whose ship was acked, and commits since without one. Together
+    /// with the epoch they form the provenance stamp each batch carries, which
+    /// the takeover replay guard checks the buffered tail against.
+    last_shipped: AtomicU64,
+    solo_count: AtomicU64,
     /// Highest batch seqno confirmed durable on object storage.
     watermark: AtomicU64,
     /// Applied-but-not-yet-durable shipped batches: (batch seqno, SlateDB seqno).
@@ -47,6 +52,8 @@ impl Replicator {
             peer_endpoint,
             writer_epoch,
             seqno: AtomicU64::new(1),
+            last_shipped: AtomicU64::new(0),
+            solo_count: AtomicU64::new(0),
             watermark: AtomicU64::new(0),
             pending: StdMutex::new(VecDeque::new()),
             sender: Mutex::new(None),
@@ -57,6 +64,20 @@ impl Replicator {
     /// caller records durability for the prune watermark), `None` if solo. Either
     /// way the caller applies and acks; only a shipped write is two-node durable.
     pub async fn ship(&self, ops: &[ReplOp], op_ids: &[crate::dedup::OpId]) -> Option<u64> {
+        let shipped = self.ship_inner(ops, op_ids).await;
+        match shipped {
+            Some(seqno) => {
+                self.last_shipped.store(seqno, Ordering::Relaxed);
+                self.solo_count.store(0, Ordering::Relaxed);
+            }
+            None => {
+                self.solo_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        shipped
+    }
+
+    async fn ship_inner(&self, ops: &[ReplOp], op_ids: &[crate::dedup::OpId]) -> Option<u64> {
         let mut guard = self.sender.lock().await;
         let sender = guard.as_ref()?;
         let seqno = self.seqno.fetch_add(1, Ordering::Relaxed);
@@ -91,8 +112,16 @@ impl Replicator {
         }
     }
 
-    pub fn writer_epoch(&self) -> u64 {
-        self.writer_epoch
+    /// The provenance stamp for the batch just shipped (or run solo): (epoch,
+    /// last acked ship's seqno, solo commits since). Committed atomically with
+    /// the batch by the write coordinator, whose single worker is the only
+    /// `ship` caller, so the counters always describe the current batch.
+    pub fn stamp(&self) -> (u64, u64, u64) {
+        (
+            self.writer_epoch,
+            self.last_shipped.load(Ordering::Relaxed),
+            self.solo_count.load(Ordering::Relaxed),
+        )
     }
 
     pub fn mark_applied(&self, seqno: u64, slatedb_seqno: u64) {
@@ -222,6 +251,7 @@ mod tests {
             Arc::new(DedupCache::new(64)),
             Arc::new(AtomicBool::new(false)),
             None,
+            "standby-under-test".to_string(),
         )
         .into_server();
         let (shutdown, rx) = tokio::sync::oneshot::channel();
@@ -334,6 +364,28 @@ mod tests {
             r.sender.lock().await.is_none(),
             "a rejected ship must clear the sender"
         );
+    }
+
+    // The provenance stamp tracks the last acked ship and counts solo commits
+    // since; an acked ship resets the count. The replay guard reads solo > 0 at
+    // the durable head as ships the leader outlived.
+    #[tokio::test]
+    async fn stamp_counts_solo_commits_and_resets_on_an_acked_ship() {
+        let (endpoint, _buffer, server) = spawn_receiver().await;
+        let r = Replicator::new(endpoint.clone(), 9);
+        assert_eq!(r.stamp(), (9, 0, 0), "fresh replicator: nothing shipped");
+
+        assert_eq!(r.ship(&put(), &[]).await, None, "starts solo (no sender)");
+        assert_eq!(r.stamp(), (9, 0, 1));
+
+        *r.sender.lock().await = Some(connect(&endpoint).await);
+        assert_eq!(r.ship(&put(), &[]).await, Some(1));
+        assert_eq!(r.stamp(), (9, 1, 0), "an acked ship resets the solo count");
+
+        server.stop().await;
+        assert_eq!(r.ship(&put(), &[]).await, None, "failed ship runs solo");
+        assert_eq!(r.ship(&put(), &[]).await, None);
+        assert_eq!(r.stamp(), (9, 1, 2), "solo commits count from the last ack");
     }
 
     #[tokio::test]

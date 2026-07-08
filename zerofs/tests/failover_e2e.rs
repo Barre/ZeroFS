@@ -86,6 +86,27 @@ fn write_config(
         Some(l) => format!("replication_listen = \"{l}\"\n"),
         None => String::new(),
     };
+    let (storage_url, aws_section) = match std::env::var("ZEROFS_TEST_S3_URL") {
+        Ok(base) => {
+            let unique = data_dir
+                .display()
+                .to_string()
+                .replace(['/', '.'], "-")
+                .trim_matches('-')
+                .to_string();
+            (
+                format!("{}/{unique}", base.trim_end_matches('/')),
+                "\n[aws]\naccess_key_id = \"${AWS_ACCESS_KEY_ID}\"\n\
+                 secret_access_key = \"${AWS_SECRET_ACCESS_KEY}\"\n\
+                 endpoint = \"${AWS_ENDPOINT}\"\n\
+                 region = \"us-east-1\"\n\
+                 allow_http = \"true\"\n\
+                 conditional_put = \"etag\"\n"
+                    .to_string(),
+            )
+        }
+        Err(_) => (format!("file://{}", data_dir.display()), String::new()),
+    };
     // Short HA timing for a fast test; still valid (heartbeat < lease,
     // takeover > lease + 2s guard band).
     let cfg = format!(
@@ -95,9 +116,9 @@ dir = "{cache}"
 disk_size_gb = 1.0
 
 [storage]
-url = "file://{data}"
+url = "{storage_url}"
 encryption_password = "failover-e2e-test"
-
+{aws_section}
 [servers]
 
 [servers.ninep]
@@ -114,7 +135,6 @@ role = "{role}"
 enabled = false
 "#,
         cache = cache_dir.display(),
-        data = data_dir.display(),
         ninep = ninep_sock.display(),
         rpc = rpc_sock.display(),
     );
@@ -1003,13 +1023,14 @@ async fn op_id_dedups_create_across_failover() {
     );
 }
 
-/// A promoted standby that restarts while the original leader stays down must
-/// RE-TAKE leadership (its Hello sees the leader gone), not wait forever for a
-/// dead leader. The static-config-role version left it stuck in the standby watch.
-/// SIGKILL; that was the encryption-key init race, since fixed.)
+/// A restarting node that the latest-leader record names must NOT elect itself
+/// from Hello silence: its silent peer may be live behind a partition, holding
+/// acked writes in its RAM tail or already promoted. It blocks until a peer
+/// answers; when the peer is permanently gone, the operator boots it by removing
+/// the peer from `replication.peers` (the escape hatch this test also proves).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn promoted_standby_retakes_when_original_leader_stays_down() {
+async fn a_latest_leader_survivor_blocks_on_silence_until_the_peer_is_removed() {
     let _e2e_permit = e2e_gate().await;
     use ninep_client::{ClientError, NOFID, NinePClient, Target};
 
@@ -1073,7 +1094,10 @@ async fn promoted_standby_retakes_when_original_leader_stays_down() {
         "standby B never took over"
     );
 
-    // The promoted B now restarts (fresh cache) while A is still down.
+    // The promoted B (now the recorded latest leader) restarts, fresh cache,
+    // while A is still down. Its Hello goes unanswered, so it must block:
+    // it cannot tell dead-A from partitioned-A, and electing against a live A
+    // would fence it.
     b.child.kill().expect("kill B");
     b.child.wait().expect("reap B");
     let b2_cfg = dir.path().join("b2.toml");
@@ -1088,12 +1112,36 @@ async fn promoted_standby_retakes_when_original_leader_stays_down() {
         Some(&a_repl),
         Some(&b_repl),
     );
-    let _b2 = spawn(&b2_cfg);
+    let mut b2 = spawn(&b2_cfg);
+    assert!(
+        !wait_for_socket(&b_9p, Duration::from_secs(15)).await,
+        "a latest-leader survivor must not elect itself from silence"
+    );
+    assert!(
+        b2.child.try_wait().expect("probe b2").is_none(),
+        "the blocked survivor must be waiting, not crashed"
+    );
 
-    // B must RE-TAKE (Hello sees A gone), not wait forever for the dead leader.
+    // The operator's escape hatch: declare the dead peer gone by removing it
+    // from the config. The node then boots solo and serves the durable state.
+    b2.child.kill().expect("kill b2");
+    b2.child.wait().expect("reap b2");
+    let b3_cfg = dir.path().join("b3.toml");
+    write_config(
+        &b3_cfg,
+        &data_dir,
+        &dir.path().join("cache-b3"),
+        "node-b",
+        "leader",
+        &b_9p,
+        &dir.path().join("b-rpc.sock"),
+        None,
+        None,
+    );
+    let _b3 = spawn(&b3_cfg);
     assert!(
         wait_for_socket(&b_9p, Duration::from_secs(120)).await,
-        "a promoted standby must re-take when the original leader is down, not stall"
+        "with the dead peer removed from the config the survivor must serve"
     );
     // x (durable once B first took over) survives the restart.
     assert!(
@@ -1101,7 +1149,45 @@ async fn promoted_standby_retakes_when_original_leader_stays_down() {
             client.mkdir(1, b"x", 0o755, 0).await,
             Err(ClientError::Errno(17))
         ),
-        "x must survive the promoted standby's restart"
+        "x must survive the survivor's restart"
+    );
+}
+
+/// A configured standby never elects itself from silence, even on a fresh
+/// database with no latest-leader record: the configured leader decides the
+/// roles when it appears, and a silent peer may be a live leader a self-election
+/// would fence. Promoting a standby whose peer is permanently gone is the same
+/// config edit as for a blocked survivor (role = "leader", peer removed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
+async fn a_config_standby_never_elects_itself_from_silence() {
+    let _e2e_permit = e2e_gate().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let b_9p = dir.path().join("b-9p.sock");
+    let b_cfg = dir.path().join("b.toml");
+    let a_repl = format!("127.0.0.1:{}", free_port()); // nothing ever listens here
+    let b_repl = format!("127.0.0.1:{}", free_port());
+    write_config(
+        &b_cfg,
+        &data_dir,
+        &dir.path().join("cache-b"),
+        "node-b",
+        "standby",
+        &b_9p,
+        &dir.path().join("b-rpc.sock"),
+        Some(&a_repl),
+        Some(&b_repl),
+    );
+    let mut b = spawn(&b_cfg);
+    assert!(
+        !wait_for_socket(&b_9p, Duration::from_secs(15)).await,
+        "a configured standby must not elect itself while every peer is silent"
+    );
+    assert!(
+        b.child.try_wait().expect("probe b").is_none(),
+        "the waiting standby must be alive, not crashed"
     );
 }
 
@@ -1345,7 +1431,10 @@ async fn connected_killboth_case(reuse_cache: bool) {
     standby.child.kill().ok();
     standby.child.wait().ok();
 
-    // Reopen the leader from the store alone (its dead-standby peer -> Solo).
+    // Reopen the pair from the store: both tails died with the processes, so
+    // survival depends entirely on what the leader flushed on fsync. Both nodes
+    // restart because the leader is the recorded latest writer and must hear
+    // its peer answer Hello before it opens.
     let l_cfg2 = dir.path().join("l2.toml");
     let cache_l2 = if reuse_cache {
         cache_l
@@ -1363,6 +1452,19 @@ async fn connected_killboth_case(reuse_cache: bool) {
         Some(&b_repl),
         Some(&a_repl),
     );
+    let s_cfg2 = dir.path().join("s2.toml");
+    write_config(
+        &s_cfg2,
+        &data_dir,
+        &dir.path().join("cache-s2"),
+        "node-b",
+        "standby",
+        &s_9p,
+        &dir.path().join("b-rpc.sock"),
+        Some(&a_repl),
+        Some(&b_repl),
+    );
+    let _standby2 = spawn(&s_cfg2);
     let _leader2 = spawn(&l_cfg2);
     assert!(
         wait_for_socket(&l_9p, Duration::from_secs(90)).await,

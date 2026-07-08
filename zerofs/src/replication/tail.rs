@@ -58,6 +58,18 @@ impl TailBuffer {
         self.batches.insert(seqno, ops);
     }
 
+    /// Term of the buffered batches (0 before anything was accepted).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Drop every buffered batch. Only the takeover replay guard calls this,
+    /// when the durable head supersedes the tail; the receive path's cross-term
+    /// drop lives in [`Self::accept`].
+    pub fn discard(&mut self) {
+        self.batches.clear();
+    }
+
     /// Drop batches with seqno <= `watermark` (confirmed durable).
     pub fn prune(&mut self, watermark: u64) {
         self.batches.retain(|&seqno, _| seqno > watermark);
@@ -80,6 +92,40 @@ impl TailBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.batches.is_empty()
+    }
+}
+
+/// What a takeover may do with the buffered tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayDecision {
+    /// Nothing of the tail's term ever flushed: the tail is the only copy of
+    /// that term's acked writes.
+    ReplayAll,
+    /// The durable head is the tail's term with no solo progress: batches up to
+    /// the stamped seqno are already durable, the rest replays.
+    PruneTo(u64),
+    /// The durable head supersedes the tail; replaying would regress it.
+    Discard,
+}
+
+/// Validate the tail against the db's durable provenance stamp (epoch, last
+/// acked ship's seqno, solo commits since; committed with every replicated
+/// batch): replay must only extend durable history.
+///
+/// A stamp from a later term means that term flushed progress the tail predates.
+/// Solo progress in the tail's own term means the leader outlived these ships:
+/// each buffered batch past the stamped seqno was re-committed locally as a solo
+/// write, so its content is either already durable here, superseded by a newer
+/// solo commit, or died honestly with the leader; replaying it could resurrect
+/// an old value over newer durable state. A stamp from an older term (or none)
+/// means nothing of the tail's term flushed and the whole tail replays.
+pub fn replay_decision(stamp: Option<(u64, u64, u64)>, tail_epoch: u64) -> ReplayDecision {
+    match stamp {
+        None => ReplayDecision::ReplayAll,
+        Some((epoch, _, _)) if epoch > tail_epoch => ReplayDecision::Discard,
+        Some((epoch, _, _)) if epoch < tail_epoch => ReplayDecision::ReplayAll,
+        Some((_, _, solo)) if solo > 0 => ReplayDecision::Discard,
+        Some((_, seqno, _)) => ReplayDecision::PruneTo(seqno),
     }
 }
 
@@ -132,6 +178,60 @@ mod tests {
         tb.accept(1, 7, vec![put(b"k", b"first")]);
         tb.accept(1, 7, vec![put(b"k", b"first")]);
         assert_eq!(tb.len(), 1, "a re-shipped seqno must not duplicate");
+    }
+
+    // Finding A: a ship is delivered but its ack is lost, so the leader counts it
+    // failed, goes Solo, and keeps committing durable progress (stamp solo > 0).
+    // The buffered batch's content was re-committed locally, so replaying it after
+    // the leader dies would resurrect an old value over newer durable state.
+    #[test]
+    fn solo_progress_in_the_tails_term_discards_the_outlived_ships() {
+        assert_eq!(
+            replay_decision(Some((5, 41, 1)), 5),
+            ReplayDecision::Discard,
+            "one solo commit after ship 41: batches past 41 were superseded"
+        );
+        assert_eq!(replay_decision(Some((5, 0, 7)), 5), ReplayDecision::Discard);
+    }
+
+    // The never-shipped-term residual: a later leader (epoch 6) never reached the
+    // standby (Solo from birth), flushed durable progress, and died. The standby
+    // still holds epoch-5 batches (no epoch-6 ship ever cleared them); replaying
+    // them would regress epoch 6's durable writes. Any durable stamp from a term
+    // newer than the tail supersedes it.
+    #[test]
+    fn a_later_terms_durable_progress_discards_an_older_tail() {
+        assert_eq!(replay_decision(Some((6, 0, 3)), 5), ReplayDecision::Discard);
+        assert_eq!(replay_decision(Some((6, 2, 0)), 5), ReplayDecision::Discard);
+    }
+
+    // The normal crash of a connected leader: the durable head is a shipped stamp
+    // of the tail's own term with no solo progress. Batches up to it are already
+    // durable; everything after is the acked-but-unflushed suffix and replays.
+    #[test]
+    fn a_connected_crash_prunes_the_durable_prefix_and_replays_the_rest() {
+        assert_eq!(
+            replay_decision(Some((5, 3, 0)), 5),
+            ReplayDecision::PruneTo(3)
+        );
+    }
+
+    // The semisync no-acked-loss guarantee: a leader that shipped its term's
+    // writes but died before any flush leaves no stamp from that term (absent, or
+    // an older term's). The tail is the only copy of those acked writes and must
+    // replay in full.
+    #[test]
+    fn a_term_with_no_durable_progress_replays_its_full_tail() {
+        assert_eq!(replay_decision(None, 5), ReplayDecision::ReplayAll);
+        assert_eq!(
+            replay_decision(Some((4, 9, 0)), 5),
+            ReplayDecision::ReplayAll
+        );
+        assert_eq!(
+            replay_decision(Some((4, 9, 6)), 5),
+            ReplayDecision::ReplayAll,
+            "an older term's solo progress predates the tail's term entirely"
+        );
     }
 
     // A batch from a newer term drops the prior term's tail, whatever its seqnos:

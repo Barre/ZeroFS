@@ -32,6 +32,10 @@ use tracing::info;
 /// Storage, crypto, and parsed config in hand; no db or receiver yet.
 struct Prepared {
     object_store: Arc<dyn object_store::ObjectStore>,
+    /// `object_store` behind the shared retry wrapper, for I/O ZeroFS issues
+    /// directly (segments, GC/checkpoint listings, the HA leader record).
+    /// SlateDB traffic stays on `object_store`: it brings its own retry layer.
+    retrying_object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
     /// the filesystem so the RPC server can stream backend requests (`otrace`).
@@ -197,6 +201,9 @@ impl Prepared {
         });
 
         Ok(Self {
+            retrying_object_store: Arc::new(
+                crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
+            ),
             object_store,
             wal_object_store,
             object_tracer,
@@ -237,6 +244,7 @@ impl Prepared {
                 self.dedup.clone(),
                 leading.clone(),
                 Some(takeover_trigger.clone()),
+                node_id.clone(),
             );
             let liveness = Some(receiver.liveness());
             let highest_epoch = Some(receiver.highest_epoch());
@@ -269,11 +277,14 @@ impl Prepared {
 impl ReceiverUp {
     /// Resolve the role by asking peers (Hello) and not the static config: a failover
     /// makes the config-standby the live leader, so a (re)starting node must learn
-    /// the situation. Defer to an active peer; else lead if configured leader, or
-    /// if configured standby with every peer confirmed down. A follower then
-    /// watches heartbeats and promotes once they stop. Resolving to writer here,
-    /// before `open_db`, is what keeps a follower from opening the db and fencing a
-    /// live leader; the writer-epoch CAS is the hard single-writer guarantee.
+    /// the situation. Defer to an active peer. On silence, the recorded latest
+    /// writer and any configured standby block until a peer answers (see
+    /// [`crate::replication::leader_record`]); only a configured leader the record
+    /// does not name leads through it (fresh db, or recovery after losing both
+    /// nodes). A follower then watches heartbeats and promotes once they stop.
+    /// Resolving to writer here, before `open_db`, is what keeps a follower from
+    /// opening the db and fencing a live leader; the writer-epoch CAS is the hard
+    /// single-writer guarantee.
     async fn become_writer(mut self) -> Result<Writer> {
         let db_mode = self.prepared.db_mode;
 
@@ -282,12 +293,22 @@ impl ReceiverUp {
             && !params.peers.is_empty()
             && params.replication_listen.is_some()
         {
+            let was_latest = crate::replication::leader_record::read(
+                &self.prepared.retrying_object_store,
+                &self.prepared.actual_db_path,
+            )
+            .await
+            .context("HA: cannot resolve a boot role without the latest-leader record")?
+            .is_some_and(|(_, node)| node == params.node_id);
+
             let peers = params.peers.clone();
             let config_leader = params.is_leader();
-            let mut lead = config_leader;
-            for attempt in 0..6u32 {
+            let lead;
+            let mut silent_rounds = 0u32;
+            loop {
                 let mut any_active = false;
                 let mut any_reachable = false;
+                let mut all_answered = true;
                 for peer in &peers {
                     let endpoint = if peer.starts_with("http") {
                         peer.clone()
@@ -295,14 +316,49 @@ impl ReceiverUp {
                         format!("http://{peer}")
                     };
                     match crate::replication::transport::hello_peer(endpoint).await {
-                        Ok(true) => any_active = true,
-                        Ok(false) => any_reachable = true,
-                        Err(e) => tracing::debug!("HA: Hello to peer {peer} failed: {e:#}"),
+                        Ok(answer) => {
+                            // Identity keys the latest-leader record; a duplicated
+                            // node_id is a config error.
+                            if !answer.node_id.is_empty() && answer.node_id == params.node_id {
+                                anyhow::bail!(
+                                    "HA: peer {peer} reports the same node_id {:?} as this \
+                                     node; node_id must be unique within the pair",
+                                    params.node_id
+                                );
+                            }
+                            if answer.peer_active {
+                                any_active = true;
+                            } else {
+                                any_reachable = true;
+                            }
+                        }
+                        Err(e) => {
+                            all_answered = false;
+                            tracing::debug!("HA: Hello to peer {peer} failed: {e:#}");
+                        }
                     }
                 }
                 if any_active {
                     lead = false; // a peer serves and will preserve the tail: defer
                     break;
+                }
+                if was_latest && !all_answered {
+                    // This node was the last writer and a peer is silent. That peer
+                    // may be live behind a partition, holding this node's acked
+                    // writes in its RAM tail or already promoted; electing would
+                    // abandon the tail or fence the live writer.
+                    if silent_rounds.is_multiple_of(20) {
+                        tracing::warn!(
+                            "HA {}: this node was the latest writer and a peer does not \
+                             answer Hello; blocking startup until it does (if the peer is \
+                             permanently gone, remove it from replication.peers, and set \
+                             role = \"leader\" if this node was the standby)",
+                            params.node_id
+                        );
+                    }
+                    silent_rounds += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
                 }
                 if config_leader {
                     lead = true; // configured leader, no active peer: lead
@@ -312,13 +368,21 @@ impl ReceiverUp {
                     lead = false; // standby, peer up but not yet leading: watch it
                     break;
                 }
-                // Standby whose peer is unreachable: re-take so a promoted standby
-                // is not stuck when its leader is gone, but retry first so a booting
-                // configured leader can appear before we invert roles.
-                lead = true;
-                if attempt < 5 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Configured standby, every peer silent: wait. The configured
+                // leader decides the roles when it appears. A timeout here could
+                // not tell a dead peer from a partition whose live leader this
+                // election would fence, so a permanently gone peer is an operator
+                // call (promote this node by config).
+                if silent_rounds.is_multiple_of(20) {
+                    tracing::warn!(
+                        "HA {}: configured standby and no peer answers Hello; waiting \
+                         for one (if the peer is permanently gone, set role = \"leader\" \
+                         and remove it from replication.peers to promote this node)",
+                        params.node_id
+                    );
                 }
+                silent_rounds += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             params.role = if lead {
                 crate::config::ReplicationRole::Leader
@@ -413,12 +477,8 @@ impl Writer {
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
-        let retrying: Arc<dyn object_store::ObjectStore> =
-            Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
-                self.prepared.object_store.clone(),
-            ));
         let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
-            retrying,
+            self.prepared.retrying_object_store.clone(),
             parts_cache,
         ));
         let db_prefix = Path::from(self.prepared.actual_db_path.clone());
@@ -483,49 +543,60 @@ impl DbOpen {
             && let Some(buffer) = ha.tail.as_ref()
         {
             let mut buf = buffer.lock().await;
-            // Prune the tail to exactly what this db already holds. The leader
-            // stamps each shipped batch with its seqno (`ha_seqno_key`), flushed
-            // atomically with the batch, so the db's durable value is the highest
-            // shipped batch flushed here. A deposed leader that kept flushing Solo
-            // (a partition) advances it past the whole tail, so we drop those stale
-            // batches instead of replaying them (a replay would regress monotonic
-            // counters and double-count stats against the newer db). A crashed
-            // leader (kill-leader) didn't flush its last shipped batches, so they
-            // stay > the watermark and are replayed (un-fsynced recovery). Trust it
-            // only when written by this same term, since the seqno restarts per term.
-            {
+            // Replay must only extend durable history: validate the tail against
+            // the db's provenance stamp (see `replay_decision`). On an unreadable
+            // or undecodable stamp, drop the tail: that forfeits at most
+            // un-fsynced writes (the honest designed-in loss), while replaying
+            // blind could regress durable state.
+            if !buf.is_empty() {
+                use crate::replication::tail::{ReplayDecision, replay_decision};
                 let codec = KeyCodec::new();
-                match raw_db.get(&codec.ha_seqno_key()).await {
-                    Ok(Some(v)) => {
-                        if let Some((epoch, seqno)) = KeyCodec::decode_ha_seqno(&v) {
-                            let term = ha
-                                .highest_epoch
-                                .as_ref()
-                                .map(|e| e.load(Ordering::Acquire))
-                                .unwrap_or(0);
-                            if epoch == term {
-                                let before = buf.len();
-                                buf.prune(seqno);
-                                info!(
-                                    "HA takeover: db holds shipped batches through seqno {} \
-                                     (epoch {}); pruned {} stale of {} buffered batch(es)",
-                                    seqno,
-                                    epoch,
-                                    before - buf.len(),
-                                    before
-                                );
-                            } else {
-                                info!(
-                                    "HA takeover: db HA watermark epoch {} != current term {}; \
-                                     replaying full tail",
-                                    epoch, term
-                                );
-                            }
+                let decision = match raw_db.get(&codec.ha_seqno_key()).await {
+                    Ok(None) => replay_decision(None, buf.epoch()),
+                    Ok(Some(v)) => match KeyCodec::decode_ha_stamp(&v) {
+                        Some(stamp) => replay_decision(Some(stamp), buf.epoch()),
+                        None => {
+                            tracing::warn!("HA takeover: undecodable HA stamp; dropping the tail");
+                            ReplayDecision::Discard
                         }
-                    }
-                    Ok(None) => {}
+                    },
                     Err(e) => {
-                        tracing::warn!("HA takeover: reading HA tail watermark failed: {e}")
+                        tracing::warn!(
+                            "HA takeover: reading the HA stamp failed ({e}); dropping the \
+                             tail rather than replaying over unseen durable state"
+                        );
+                        ReplayDecision::Discard
+                    }
+                };
+                match decision {
+                    ReplayDecision::ReplayAll => {
+                        info!(
+                            "HA takeover: nothing of the tail's term (epoch {}) is durable; \
+                             replaying the full tail",
+                            buf.epoch()
+                        );
+                    }
+                    ReplayDecision::PruneTo(seqno) => {
+                        let before = buf.len();
+                        buf.prune(seqno);
+                        info!(
+                            "HA takeover: db holds shipped batches through seqno {} \
+                             (epoch {}); pruned {} durable of {} buffered batch(es)",
+                            seqno,
+                            buf.epoch(),
+                            before - buf.len(),
+                            before
+                        );
+                    }
+                    ReplayDecision::Discard => {
+                        info!(
+                            "HA takeover: the durable head supersedes the buffered tail \
+                             (epoch {}, {} batch(es)); dropping it instead of regressing \
+                             newer state",
+                            buf.epoch(),
+                            buf.len()
+                        );
+                        buf.discard();
                     }
                 }
             }
@@ -643,6 +714,24 @@ impl DbOpen {
                     .await
                     .context("HA takeover replay flush failed")?;
             }
+        }
+
+        // Every HA writer names itself in the latest-leader record before it
+        // serves, so its next boot blocks on a silent peer instead of electing.
+        // After the writer-epoch CAS, so concurrent openers are serialized.
+        if let Some(params) = self.prepared.replication_params.as_ref()
+            && !self.prepared.db_mode.is_read_only()
+            && let SlateDbHandle::ReadWrite(raw_db) = &self.slatedb
+        {
+            let epoch = raw_db.subscribe().borrow().current_manifest.writer_epoch();
+            crate::replication::leader_record::write(
+                &self.prepared.retrying_object_store,
+                &self.prepared.actual_db_path,
+                epoch,
+                &params.node_id,
+            )
+            .await
+            .context("HA: writing the latest-leader record failed")?;
         }
 
         Ok(Replayed(self))
@@ -780,9 +869,7 @@ impl Replayed {
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
-            object_store: Arc::new(crate::retrying_object_store::RetryingObjectStore::new(
-                prepared.object_store,
-            )),
+            object_store: prepared.retrying_object_store,
             wal_object_store: prepared.wal_object_store,
             db_path: prepared.actual_db_path,
             db_handle,

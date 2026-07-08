@@ -360,8 +360,10 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    /// Key for the HA tail watermark: the highest shipped replication batch seqno
-    /// (and the writer epoch that shipped it) flushed into this data db.
+    /// Key for the HA provenance stamp: (writer epoch, last shipped batch seqno,
+    /// solo commits since that ship), flushed atomically with every replicated
+    /// leader's batch. The takeover replay guard validates the buffered tail
+    /// against this durable head.
     pub fn ha_seqno_key(&self) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
         self.push_prefix(&mut key, KeyPrefix::System);
@@ -369,10 +371,11 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn encode_ha_seqno(writer_epoch: u64, seqno: u64) -> Bytes {
-        let mut v = Vec::with_capacity(U64_SIZE * 2);
+    pub fn encode_ha_stamp(writer_epoch: u64, seqno: u64, solo: u64) -> Bytes {
+        let mut v = Vec::with_capacity(U64_SIZE * 3);
         v.extend_from_slice(&writer_epoch.to_le_bytes());
         v.extend_from_slice(&seqno.to_le_bytes());
+        v.extend_from_slice(&solo.to_le_bytes());
         Bytes::from(v)
     }
 
@@ -439,14 +442,20 @@ impl KeyCodec {
         }
     }
 
-    /// Returns `(writer_epoch, seqno)`.
-    pub fn decode_ha_seqno(data: &[u8]) -> Option<(u64, u64)> {
-        if data.len() != U64_SIZE * 2 {
+    /// Returns `(writer_epoch, last shipped seqno, solo commits since)`. A
+    /// two-field value predates the solo counter and reads as solo 0.
+    pub fn decode_ha_stamp(data: &[u8]) -> Option<(u64, u64, u64)> {
+        if data.len() != U64_SIZE * 2 && data.len() != U64_SIZE * 3 {
             return None;
         }
         let epoch = u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?);
-        let seqno = u64::from_le_bytes(data[U64_SIZE..].try_into().ok()?);
-        Some((epoch, seqno))
+        let seqno = u64::from_le_bytes(data[U64_SIZE..U64_SIZE * 2].try_into().ok()?);
+        let solo = if data.len() == U64_SIZE * 3 {
+            u64::from_le_bytes(data[U64_SIZE * 2..].try_into().ok()?)
+        } else {
+            0
+        };
+        Some((epoch, seqno, solo))
     }
 
     pub fn parse_key(&self, key: &[u8]) -> ParsedKey {
@@ -686,15 +695,23 @@ mod tests {
     }
 
     #[test]
-    fn test_ha_seqno_encoding() {
-        let (epoch, seqno) = (7u64, 123456u64);
-        let encoded = KeyCodec::encode_ha_seqno(epoch, seqno);
-        assert_eq!(KeyCodec::decode_ha_seqno(&encoded), Some((epoch, seqno)));
+    fn test_ha_stamp_encoding() {
+        let (epoch, seqno, solo) = (7u64, 123456u64, 3u64);
+        let encoded = KeyCodec::encode_ha_stamp(epoch, seqno, solo);
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&encoded),
+            Some((epoch, seqno, solo))
+        );
+        // A pre-solo two-field value still decodes, as solo 0.
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&encoded[..16]),
+            Some((epoch, seqno, 0))
+        );
         // Wrong length is rejected, not silently misread.
-        assert_eq!(KeyCodec::decode_ha_seqno(&encoded[..8]), None);
-        assert_eq!(KeyCodec::decode_ha_seqno(&[]), None);
+        assert_eq!(KeyCodec::decode_ha_stamp(&encoded[..8]), None);
+        assert_eq!(KeyCodec::decode_ha_stamp(&[]), None);
 
-        // The HA-seqno key is distinct from the inode counter (both System-prefixed).
+        // The HA-stamp key is distinct from the inode counter (both System-prefixed).
         let codec = KeyCodec::new();
         assert_ne!(codec.ha_seqno_key(), codec.system_counter_key());
     }
@@ -829,7 +846,10 @@ mod prop_tests {
                 KeyCodec::decode_tombstone_size(&KeyCodec::encode_tombstone_size(x)).unwrap(),
                 x
             );
-            prop_assert_eq!(KeyCodec::decode_ha_seqno(&KeyCodec::encode_ha_seqno(x, y)), Some((x, y)));
+            prop_assert_eq!(
+                KeyCodec::decode_ha_stamp(&KeyCodec::encode_ha_stamp(x, y, x ^ y)),
+                Some((x, y, x ^ y))
+            );
             prop_assert_eq!(
                 KeyCodec::decode_dir_entry(&KeyCodec::encode_dir_entry(x, y)).unwrap(),
                 (x, y)
