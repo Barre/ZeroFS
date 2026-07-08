@@ -183,7 +183,12 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
     let mut count_by_prefix: std::collections::HashMap<KeyPrefix, usize> =
         std::collections::HashMap::new();
 
-    while let Ok(Some(kv)) = iter.next().await {
+    loop {
+        let kv = match iter.next().await {
+            Ok(Some(kv)) => kv,
+            Ok(None) => break,
+            Err(e) => anyhow::bail!("dump scan failed after {count} keys: {e}"),
+        };
         let key = kv.key;
 
         let (prefix, detail) = match describe_key(&codec, &key) {

@@ -418,16 +418,7 @@ impl Db {
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<(Bytes, Bytes)>>(32);
-
-        tokio::spawn(async move {
-            let mut iter = iter;
-            while let Ok(Some(kv)) = iter.next().await {
-                if tx.send(Ok((kv.key, kv.value))).await.is_err() {
-                    break;
-                }
-            }
-        });
-
+        tokio::spawn(forward_scan(iter, tx));
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
@@ -753,6 +744,40 @@ impl Db {
     }
 }
 
+/// The scan forwarder's input
+trait ScanSource: Send {
+    fn next_kv(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Option<(Bytes, Bytes)>>> + Send;
+}
+
+impl ScanSource for slatedb::DbIterator {
+    async fn next_kv(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        Ok(self.next().await?.map(|kv| (kv.key, kv.value)))
+    }
+}
+
+/// Pump `iter` into `tx` until end-of-range, a dropped consumer, or an error.
+async fn forward_scan<S: ScanSource>(
+    mut iter: S,
+    tx: tokio::sync::mpsc::Sender<Result<(Bytes, Bytes)>>,
+) {
+    loop {
+        match iter.next_kv().await {
+            Ok(Some(kv)) => {
+                if tx.send(Ok(kv)).await.is_err() {
+                    break; // consumer dropped the stream
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod warm_tracker_tests {
     use super::WarmTracker;
@@ -844,5 +869,126 @@ mod lease_gate_tests {
             db.get_bytes(&key).await.is_err(),
             "read must be refused after the lease is revoked"
         );
+    }
+}
+
+#[cfg(test)]
+mod scan_error_tests {
+    use super::*;
+    use futures::StreamExt;
+    use slatedb::config::PutOptions;
+    use std::collections::VecDeque;
+
+    /// A scripted [`ScanSource`]; yields its items then end-of-range.
+    struct Scripted(VecDeque<Result<Option<(Bytes, Bytes)>>>);
+
+    impl ScanSource for Scripted {
+        async fn next_kv(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+            self.0.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    // A mid-scan error must surface as an Err item on the stream, never as a
+    // silently truncated clean end: read_range would serve the missing extents
+    // as fabricated zeros, and delete_range would skip their segment debits (a
+    // permanent leak).
+    #[tokio::test]
+    async fn forwarder_delivers_a_mid_scan_error_instead_of_truncating() {
+        let kv = |k: &str| {
+            (
+                Bytes::copy_from_slice(k.as_bytes()),
+                Bytes::from_static(b"v"),
+            )
+        };
+        let script = VecDeque::from([
+            Ok(Some(kv("a"))),
+            Ok(Some(kv("b"))),
+            Err(anyhow::anyhow!("mid-scan read failure")),
+            // Past the error: must never be served.
+            Ok(Some(kv("c"))),
+        ]);
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(forward_scan(Scripted(script), tx));
+
+        let items: Vec<_> = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .collect()
+            .await;
+        assert!(
+            items.len() == 3 && items[2].is_err(),
+            "two rows then the delivered error, nothing after; got {} item(s), \
+             last ok={:?}",
+            items.len(),
+            items.last().map(|i| i.is_ok())
+        );
+        assert!(items[0].is_ok() && items[1].is_ok());
+    }
+
+    // The forwarder streams a range wider than the eager prefetch window
+    // (max_fetch_tasks x read_ahead_bytes) to completion over a cold reopen —
+    // the paged path production scans rarely cross.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_streams_a_multi_window_range_completely() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let path = slatedb::object_store::path::Path::from("data");
+        const ROWS: usize = 8192;
+        let value = vec![7u8; 4096];
+        let settings = || slatedb::config::Settings {
+            compactor_options: None,
+            ..Default::default()
+        };
+        {
+            let db = Db::new(
+                Arc::new(
+                    slatedb::DbBuilder::new(path.clone(), store.clone())
+                        .with_settings(settings())
+                        .build()
+                        .await
+                        .unwrap(),
+                ),
+                None,
+            );
+            for i in 0..ROWS {
+                let key = Bytes::from(format!("k{i:05}"));
+                db.put_with_options(
+                    &key,
+                    &value,
+                    &PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            db.flush().await.unwrap();
+            db.close().await.unwrap();
+        }
+        let db = Db::new(
+            Arc::new(
+                slatedb::DbBuilder::new(path, store)
+                    .with_settings(settings())
+                    .build()
+                    .await
+                    .unwrap(),
+            ),
+            None,
+        );
+        let mut stream = db
+            .scan(Bytes::new()..Bytes::from_static(&[0xff]))
+            .await
+            .unwrap();
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut rows = 0usize;
+            while let Some(item) = stream.next().await {
+                item.unwrap();
+                rows += 1;
+            }
+            rows
+        })
+        .await
+        .expect("scan drain hung");
+        assert_eq!(rows, ROWS);
     }
 }
