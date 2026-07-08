@@ -1,6 +1,5 @@
 //! The replication transport: the standby's receiver (a tonic service over the
 //! shared tail buffer) and the leader's sender (a tonic client), over gRPC.
-#![allow(dead_code)]
 
 use crate::replication::tail::{ReplOp, TailBuffer};
 use bytes::Bytes;
@@ -153,12 +152,13 @@ impl ReplicationService for ReplicationReceiver {
         let ops = to_repl_ops(req.ops);
         {
             let mut buf = self.buffer.lock().await;
-            // A higher epoch is a new leader term: drop the prior term's tail so its
-            // batches can't replay (in seqno order) over the new term's writes.
-            if req.writer_epoch > prev {
-                buf.clear();
-            }
-            buf.accept(req.seqno, ops);
+            // `accept` drops a prior term's tail when this ship's epoch exceeds the
+            // tail's own. Keyed there, not on `prev` (the `highest_epoch` fence,
+            // which heartbeats also advance): a beat from the new term arrives
+            // before its first ship, so `prev` would already equal this epoch and
+            // the drop would be skipped, letting a stale batch replay over the new
+            // term's writes.
+            buf.accept(req.writer_epoch, req.seqno, ops);
             if req.prune_watermark > 0 {
                 buf.prune(req.prune_watermark);
             }
@@ -306,6 +306,31 @@ mod tests {
 
     async fn spawn_receiver(buffer: Arc<Mutex<TailBuffer>>) -> String {
         spawn_receiver_with_leading(buffer, Arc::new(AtomicBool::new(false))).await
+    }
+
+    /// Like [`spawn_receiver`] but also hands back the receiver's `highest_epoch`,
+    /// so a test can observe a heartbeat's effect on it.
+    async fn spawn_receiver_exposing_epoch(
+        buffer: Arc<Mutex<TailBuffer>>,
+    ) -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = ReplicationReceiver::new(
+            buffer,
+            Arc::new(crate::dedup::DedupCache::new(64)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let highest_epoch = receiver.highest_epoch();
+        let server = receiver.into_server();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), highest_epoch)
     }
 
     async fn spawn_receiver_with_leading(
@@ -471,6 +496,82 @@ mod tests {
             Some(b"new".as_ref()),
             "the post-restart (epoch 6) write must win, but a stale epoch-5 batch at a \
              higher seqno replayed last and clobbered it (cross-term seqno collision)"
+        );
+    }
+
+    // Same cross-term scenario as above, but the restarted leader's heartbeat
+    // reaches the standby before its first ship.
+    #[tokio::test]
+    async fn heartbeat_epoch_bump_must_not_defeat_the_cross_term_tail_clear() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let (endpoint, highest_epoch) = spawn_receiver_exposing_epoch(buffer.clone()).await;
+        let sender = loop {
+            match ReplicationSender::connect(endpoint.clone()).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+
+        // Term (epoch 5): un-durable tail at seqno 50/51, "/f" = "old".
+        assert!(
+            sender
+                .ship(50, &[put(b"/f", b"old")], &[], 0, 5)
+                .await
+                .unwrap()
+        );
+        assert!(
+            sender
+                .ship(51, &[put(b"/f", b"old")], &[], 0, 5)
+                .await
+                .unwrap()
+        );
+
+        // The restarted leader (epoch 6) heartbeats before it ships. Drive a real
+        // heartbeat and wait until the receiver has processed it (highest_epoch == 6).
+        let hb = tokio::spawn(run_heartbeat_sender(
+            endpoint.clone(),
+            6,
+            Duration::from_secs(3600),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while highest_epoch.load(Ordering::Acquire) < 6 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the heartbeat must bump highest_epoch to 6");
+
+        // Now the post-restart (epoch 6) write ships at the reset seqno 1.
+        assert!(
+            sender
+                .ship(1, &[put(b"/f", b"new")], &[], 0, 6)
+                .await
+                .unwrap(),
+            "a higher-epoch ship is accepted"
+        );
+        hb.abort();
+
+        // Replay the tail in seqno order, exactly as a takeover does.
+        let buf = buffer.lock().await;
+        let mut state: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::new();
+        for (_seqno, ops) in buf.batches_in_order() {
+            for op in ops {
+                match op {
+                    ReplOp::Put(k, v) | ReplOp::PutFrame(k, v, _) => {
+                        state.insert(k.to_vec(), v.to_vec());
+                    }
+                    ReplOp::Delete(k) => {
+                        state.remove(k.as_ref());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            state.get(b"/f".as_ref()).map(|v| v.as_slice()),
+            Some(b"new".as_ref()),
+            "the epoch-6 write must win: a heartbeat bumped highest_epoch, so the \
+             epoch-6 ship did not clear the stale epoch-5 tail, which replayed last"
         );
     }
 
