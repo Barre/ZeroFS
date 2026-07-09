@@ -89,4 +89,6 @@ jobs:
           done
           ./target/debug/examples/quickstart "unix:$WORK/9p.sock"
       - name: Run crash tests
-        run: cargo test --features failpoints --test failpoints --verbose
+        run: |
+          cargo test --features failpoints --test failpoints --verbose
+          cargo test --features failpoints --test dst crash_points --verbose

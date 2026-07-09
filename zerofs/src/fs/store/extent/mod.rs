@@ -38,7 +38,7 @@ use futures::stream::StreamExt;
 use read::{READ_AHEAD_MAX_CONCURRENT, READ_AHEAD_TRACK_BYTES};
 use select::{NominationSet, PairStats};
 use slatedb::config::WriteOptions;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -85,8 +85,9 @@ pub struct ExtentStore {
     codec: Arc<FrameCodec>,
     open: Arc<Mutex<OpenSegment>>,
     /// Finalized bytes of segments whose PUT is in flight (or failed and pending a
-    /// re-PUT). Reads consult these before the object store.
-    sealing: Arc<Mutex<HashMap<Segid, Bytes>>>,
+    /// re-PUT). Reads consult these before the object store. Ordered so the
+    /// barrier's re-PUT sequence is deterministic (seal order).
+    sealing: Arc<Mutex<BTreeMap<Segid, Bytes>>>,
     /// Permits = max in-flight seals; acquiring all is the fsync drain barrier.
     seal_sem: Arc<Semaphore>,
     /// Deadline after which each currently-dead segment may be deleted:
@@ -120,7 +121,8 @@ pub struct ExtentStore {
     prefetch_sem: Arc<Semaphore>,
     /// Buffer size that triggers a background seal (i.e. the segment object size).
     /// Defaults to the const; tests lower it so seal paths don't allocate 256 MiB.
-    seal_threshold: usize,
+    /// Shared across clones so a test can retune the instance the fs holds.
+    seal_threshold: Arc<std::sync::atomic::AtomicUsize>,
     /// Weak handle to the commit worker, injected post-construction (the worker owns
     /// an `ExtentStore` clone, so a strong handle would cycle). Set in production;
     /// unset in the extent unit tests, where `commit_via_coordinator` is the sole
@@ -157,7 +159,7 @@ impl ExtentStore {
             lock_manager,
             codec,
             open,
-            sealing: Arc::new(Mutex::new(HashMap::new())),
+            sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_SEALS)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
             nominations: Arc::new(Mutex::new(NominationSet::default())),
@@ -168,7 +170,7 @@ impl ExtentStore {
             tail_cache,
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
-            seal_threshold: SEAL_THRESHOLD,
+            seal_threshold: Arc::new(std::sync::atomic::AtomicUsize::new(SEAL_THRESHOLD)),
             coordinator: Arc::new(std::sync::OnceLock::new()),
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
         }
@@ -287,9 +289,22 @@ impl ExtentStore {
     /// Test-only: lower the seal threshold so seal-path tests don't build a full
     /// 256 MiB segment.
     #[cfg(test)]
-    fn with_seal_threshold(mut self, n: usize) -> Self {
-        self.seal_threshold = n;
+    fn with_seal_threshold(self, n: usize) -> Self {
+        self.set_seal_threshold(n);
         self
+    }
+
+    /// Retune the seal threshold on a live store (shared across clones). For the
+    /// DST harness, which needs small segments to exercise the seal/reclaim paths.
+    #[allow(dead_code)] // used by the DST integration test, not the lib/bin
+    pub fn set_seal_threshold(&self, n: usize) {
+        self.seal_threshold
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn seal_threshold(&self) -> usize {
+        self.seal_threshold
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

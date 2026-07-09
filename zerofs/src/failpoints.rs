@@ -77,6 +77,52 @@ pub const COMPACT_AFTER_SEAL_BEFORE_REPOINT: &str = "compact_after_seal_before_r
 /// Segment reclaim, after a dead segment's object is deleted but before its
 /// `segcount` counter key is dropped. A crash here must not dangle (the segment was
 /// directory-verified dead before deletion); the stale counter is a benign leak.
+/// `reclaim_segments_gated`, after the durable barrier and gate, before the
+/// segcount scan. A crash here lands between "everything committed so far is
+/// durable" and "the pass acted on it".
+pub const RECLAIM_AFTER_BARRIER_BEFORE_SCAN: &str = "reclaim_after_barrier_before_scan";
+
+/// DST window widening: `(point, arming thread, virtual millis)`. The named
+/// site awaits the delay via [`widen`], turning an otherwise awaitless window
+/// into one concurrent commits can land in (the fail crate's own sleep blocks
+/// the thread, which stalls a single-threaded virtual-time world instead of
+/// widening anything). The thread id scopes the hook to the arming world.
+#[allow(clippy::type_complexity)]
+pub static WIDEN: std::sync::Mutex<Option<(&'static str, std::thread::ThreadId, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Await the configured widening delay at `point`, if armed for this thread.
+pub async fn widen(point: &'static str) {
+    let millis = {
+        let slot = WIDEN.lock().unwrap();
+        match &*slot {
+            Some((p, thread, millis)) if *p == point && *thread == std::thread::current().id() => {
+                Some(*millis)
+            }
+            _ => None,
+        }
+    };
+    if let Some(millis) = millis {
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+    }
+}
+
+/// `seal_and_repoint`, between one pack's per-inode repoint commits. A crash
+/// here leaves the pack partially repointed: some inodes point at it, the
+/// rest still point at their source segments; widening it maximizes the
+/// overwrites the repoint CAS must reject.
+pub const COMPACT_BETWEEN_REPOINTS: &str = "compact_between_repoints";
+
+/// `reclaim_segments_gated`, after the directory verify and before the
+/// irreversible object delete. Widening it tests the "no frame points here
+/// is a permanent verdict" claim the delete rests on.
+pub const RECLAIM_AFTER_VERIFY_BEFORE_DELETE: &str = "reclaim_after_verify_before_delete";
+
+/// The coalesced run read, after the FrameLocs are resolved and before the
+/// segment GET. Widening it lets a repoint+delete 404 the segment mid-read,
+/// forcing the per-extent re-resolve fallback.
+pub const READ_AFTER_RESOLVE_BEFORE_FETCH: &str = "read_after_resolve_before_fetch";
+
 pub const RECLAIM_AFTER_SEGMENT_DELETE: &str = "reclaim_after_segment_delete";
 
 /// Synchronous open-segment seal (the flush/fsync path), forcing the directory

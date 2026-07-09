@@ -87,10 +87,21 @@ impl<Id: Eq + std::hash::Hash + Copy> WarmTracker<Id> {
     }
 }
 
+/// DST override for [`exit_on_write_error`]: in the simulation the "process"
+/// is one instance inside the test, so death becomes a task panic: the
+/// instance's workers stop and the test goes on to verify what the crash
+/// left behind.
+#[doc(hidden)]
+pub static DST_PANIC_ON_WRITE_ERROR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Fatal handler for SlateDB write errors.
 /// After a write failure, the database state is unknown. Exit and let
 /// the eventual orchestrator restart the service to rebuild from a known-good state.
 pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
+    if DST_PANIC_ON_WRITE_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
+        panic!("dst: simulated process death on write error: {err}");
+    }
     tracing::error!("Fatal write error, exiting: {}", err);
     std::process::exit(1)
 }

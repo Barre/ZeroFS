@@ -54,7 +54,8 @@ const F_RESERVED: usize = 60; // 4 (must be zero)
 
 /// Logical segment identity. Epoch-namespaced so two leader terms can never
 /// target the same object key. Stored as two u64s, never bit-packed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// Ordered (epoch, counter) so ordered containers iterate in seal order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Segid {
     pub epoch: u64,
     pub counter: u64,

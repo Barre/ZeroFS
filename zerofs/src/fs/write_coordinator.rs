@@ -22,7 +22,7 @@ use crate::task::spawn_named;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -152,7 +152,8 @@ pub(crate) async fn stage_seg_deltas(
     deltas: impl IntoIterator<Item = (bytes::Bytes, (i64, i64))>,
     batch: &mut WriteBatch,
 ) -> Result<(Vec<(bytes::Bytes, bytes::Bytes)>, SegFootprintDelta), FsError> {
-    let mut agg: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
+    // Ordered so the read fan-out below issues in a deterministic sequence.
+    let mut agg: BTreeMap<bytes::Bytes, (i64, i64)> = BTreeMap::new();
     for (k, (dl, dt)) in deltas {
         let e = agg.entry(k).or_insert((0, 0));
         e.0 = e.0.saturating_add(dl);

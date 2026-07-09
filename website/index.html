@@ -2259,6 +2259,13 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
               with a crash mode. The HA suite kills and pauses a leader/standby pair over a local S3 server.</p>
             <span class="src">jepsen workflows →</span>
           </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/dst-soak.yml">
+            <h3>Deterministic simulation</h3>
+            <p>The storage engine runs in simulated worlds: virtual time, seeded fault injection, and crashes placed
+              mid-operation, with recovery checked against a byte-exact model. A failing seed replays the identical
+              run. Fresh seeds soak for 50 minutes every hour in the CI.</p>
+            <span class="src">dst-soak workflow →</span>
+          </a>
         </div>
       </div>
     </section>

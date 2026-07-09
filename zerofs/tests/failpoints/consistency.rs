@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use zerofs::fs::EXTENT_SIZE;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::errors::FsError;
@@ -81,6 +81,13 @@ pub enum ConsistencyError {
         file_size: u64,
         expected_extents: u64,
         found_extents: u64,
+    },
+    /// An extent key exists at or beyond EOF: a truncate or GC repoint left a
+    /// stale key that would resurrect old bytes if the file regrows.
+    ExtentsBeyondEof {
+        inode_id: InodeId,
+        file_size: u64,
+        beyond_eof: u64,
     },
     /// A committed FrameLoc points at a segment the read path can't return: a crash
     /// between the FrameLoc commit and the segment PUT (seal), or a torn/corrupt
@@ -220,6 +227,15 @@ impl std::fmt::Display for ConsistencyError {
                 f,
                 "File {} (size={}) missing extents: expected={}, found={}",
                 inode_id, file_size, expected_extents, found_extents
+            ),
+            Self::ExtentsBeyondEof {
+                inode_id,
+                file_size,
+                beyond_eof,
+            } => write!(
+                f,
+                "File {} (size={}) has {} extent keys at or beyond EOF",
+                inode_id, file_size, beyond_eof
             ),
             Self::UnreadableExtents {
                 inode_id,
@@ -370,16 +386,21 @@ pub struct ConsistencyChecker<'a> {
     fs: &'a ZeroFS,
     codec: KeyCodec,
     report: ConsistencyReport,
-    inode_refs: HashMap<InodeId, u32>,
-    valid_inodes: HashSet<InodeId>,
-    subdir_counts: HashMap<InodeId, u32>,
-    tombstone_inodes: HashSet<InodeId>,
-    directory_inodes: HashSet<InodeId>,
+    inode_refs: BTreeMap<InodeId, u32>,
+    valid_inodes: BTreeSet<InodeId>,
+    subdir_counts: BTreeMap<InodeId, u32>,
+    tombstone_inodes: BTreeSet<InodeId>,
+    directory_inodes: BTreeSet<InodeId>,
     /// Inodes recorded in the durable open-unlink orphan set. After a clean
     /// restart this is always empty (the startup drain reclaims them), but the
     /// online state, an inode with nlink==0, no directory entry, present in
     /// this set is legal and must not be flagged as an orphaned inode.
-    orphan_inodes: HashSet<InodeId>,
+    orphan_inodes: BTreeSet<InodeId>,
+    /// Sparse-file mode (the DST workload writes at arbitrary offsets): a hole
+    /// extent legitimately has no key, so the dense per-file extent count does
+    /// not apply. The invariant checked instead is that no extent key exists at
+    /// or beyond EOF.
+    sparse_files: bool,
 }
 
 impl<'a> ConsistencyChecker<'a> {
@@ -390,12 +411,13 @@ impl<'a> ConsistencyChecker<'a> {
             fs,
             codec: KeyCodec::new(),
             report: ConsistencyReport::default(),
-            inode_refs: HashMap::new(),
-            valid_inodes: HashSet::new(),
-            subdir_counts: HashMap::new(),
-            tombstone_inodes: HashSet::new(),
-            directory_inodes: HashSet::new(),
-            orphan_inodes: HashSet::new(),
+            inode_refs: BTreeMap::new(),
+            valid_inodes: BTreeSet::new(),
+            subdir_counts: BTreeMap::new(),
+            tombstone_inodes: BTreeSet::new(),
+            directory_inodes: BTreeSet::new(),
+            orphan_inodes: BTreeSet::new(),
+            sparse_files: false,
         }
     }
 
@@ -695,32 +717,59 @@ impl<'a> ConsistencyChecker<'a> {
                 continue;
             }
             if let Ok(Inode::File(file)) = self.fs.inode_store.get(inode_id).await {
-                if file.size == 0 {
-                    continue;
-                }
                 let expected_extents = file.size.div_ceil(EXTENT_SIZE as u64);
-                let start_key = self.codec.extent_key(inode_id, 0);
-                let end_key = self.codec.extent_key(inode_id, expected_extents);
+                if file.size > 0 {
+                    let start_key = self.codec.extent_key(inode_id, 0);
+                    let end_key = self.codec.extent_key(inode_id, expected_extents);
 
-                let mut found_extents = 0u64;
-                let stream = match self.fs.db.scan(start_key..end_key).await {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                futures::pin_mut!(stream);
+                    let mut found_extents = 0u64;
+                    let stream = match self.fs.db.scan(start_key..end_key).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    futures::pin_mut!(stream);
 
-                while let Some(result) = stream.next().await {
-                    if result.is_ok() {
-                        found_extents += 1;
+                    while let Some(result) = stream.next().await {
+                        if result.is_ok() {
+                            found_extents += 1;
+                        }
+                    }
+
+                    if !self.sparse_files && found_extents != expected_extents {
+                        self.report.errors.push(ConsistencyError::MissingExtents {
+                            inode_id,
+                            file_size: file.size,
+                            expected_extents,
+                            found_extents,
+                        });
                     }
                 }
 
-                if found_extents != expected_extents {
-                    self.report.errors.push(ConsistencyError::MissingExtents {
+                // No extent key at or beyond EOF (size 0 included: a
+                // truncate-to-zero must leave no keys at all): writes extend
+                // the size and truncates delete the tail in the same commit,
+                // so this holds at every commit boundary, sparse or dense.
+                // Scan errors propagate; a skipped check must not read as a
+                // passed one.
+                let tail_start = self.codec.extent_key(inode_id, expected_extents);
+                let tail_end = self.codec.extent_key(inode_id, u64::MAX);
+                let stream = self
+                    .fs
+                    .db
+                    .scan(tail_start..tail_end)
+                    .await
+                    .map_err(|_| FsError::IoError)?;
+                futures::pin_mut!(stream);
+                let mut beyond_eof = 0u64;
+                while let Some(result) = stream.next().await {
+                    result.map_err(|_| FsError::IoError)?;
+                    beyond_eof += 1;
+                }
+                if beyond_eof > 0 {
+                    self.report.errors.push(ConsistencyError::ExtentsBeyondEof {
                         inode_id,
                         file_size: file.size,
-                        expected_extents,
-                        found_extents,
+                        beyond_eof,
                     });
                 }
 
@@ -729,7 +778,9 @@ impl<'a> ConsistencyChecker<'a> {
                 // whose segment was never PUT (crash between commit and seal) reads
                 // back as a dangling pointer, and a torn segment fails the per-frame
                 // AEAD — both surface here, not in the key count above.
-                if let Err(e) = self.fs.extent_store.read(inode_id, 0, file.size).await {
+                if file.size > 0
+                    && let Err(e) = self.fs.extent_store.read(inode_id, 0, file.size).await
+                {
                     self.report
                         .errors
                         .push(ConsistencyError::UnreadableExtents {
@@ -781,7 +832,7 @@ impl<'a> ConsistencyChecker<'a> {
             .await
             .map_err(|_| FsError::IoError)?;
 
-        let mut orphaned_by_inode: HashMap<InodeId, u64> = HashMap::new();
+        let mut orphaned_by_inode: BTreeMap<InodeId, u64> = BTreeMap::new();
 
         while let Some(result) = stream.next().await {
             let (key, _) = result.map_err(|_| FsError::IoError)?;
@@ -1019,8 +1070,19 @@ impl<'a> ConsistencyChecker<'a> {
     }
 }
 
+#[allow(dead_code)] // used by the failpoints target, not DST
 pub async fn verify_consistency(fs: &ZeroFS) -> Result<ConsistencyReport, FsError> {
     ConsistencyChecker::new(fs).verify_all().await
+}
+
+/// As [`verify_consistency`] for a sparse-file workload (the DST harness):
+/// hole extents have no keys, so the dense extent count is skipped. Verifying
+/// hole contents is the caller's job.
+#[allow(dead_code)] // used by the DST target, not failpoints
+pub async fn verify_consistency_sparse(fs: &ZeroFS) -> Result<ConsistencyReport, FsError> {
+    let mut checker = ConsistencyChecker::new(fs);
+    checker.sparse_files = true;
+    checker.verify_all().await
 }
 
 fn inodes_equal(a: &Inode, b: &Inode) -> bool {

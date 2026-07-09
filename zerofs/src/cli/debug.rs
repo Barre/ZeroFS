@@ -23,11 +23,11 @@ const U64_SIZE: usize = std::mem::size_of::<u64>();
 fn describe_key(codec: &KeyCodec, key: &[u8]) -> Option<(KeyPrefix, String)> {
     let (in_extent_domain, rest) = if let Some(rest) = key.strip_prefix(EXTENT_DOMAIN) {
         (true, rest)
-    } else if let Some(rest) = key.strip_prefix(META_DOMAIN) {
-        (false, rest)
     } else {
-        return None;
+        let rest = key.strip_prefix(META_DOMAIN)?;
+        (false, rest)
     };
+
     let prefix = KeyPrefix::try_from(*rest.first()?).ok()?;
     if (prefix == KeyPrefix::Extent) != in_extent_domain {
         return None;

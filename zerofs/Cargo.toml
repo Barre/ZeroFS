@@ -152,8 +152,14 @@ futures = "0.3"
 proptest = "1"
 zerofs-client = { path = "zerofs-client" }
 ninep-client = { path = "ninep-client" }
+# start_paused virtual-time runtimes for the DST harness.
+tokio = { version = "1.49", features = ["test-util"] }
 
 [[test]]
 name = "failpoints"
 path = "tests/failpoints/mod.rs"
 required-features = ["failpoints"]
+
+[[test]]
+name = "dst"
+path = "tests/dst/mod.rs"
