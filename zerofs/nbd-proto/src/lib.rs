@@ -1,3 +1,5 @@
+//! NBD (Network Block Device) wire types and constants.
+
 use deku::prelude::*;
 
 // NBD Magic numbers
@@ -66,12 +68,8 @@ pub const NBD_EXPORT_NAME_PADDING: usize = 124;
 pub const NBD_OPTION_HEADER_SIZE: usize = 16;
 pub const NBD_REQUEST_HEADER_SIZE: usize = 28;
 
-// Server configuration
-pub const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
-pub const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
-#[deku(id_type = "u16", endian = "big")]
+#[deku(id_type = "u16", id_endian = "big")]
 pub enum NBDCommand {
     #[deku(id = "0")]
     Read,
@@ -92,7 +90,7 @@ pub enum NBDCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
-#[deku(id_type = "u32")]
+#[deku(id_type = "u32", id_endian = "big")]
 pub enum NBDOption {
     #[deku(id = "NBD_OPT_EXPORT_NAME")]
     ExportName,
@@ -217,5 +215,93 @@ impl NBDExportInfo {
             size,
             transmission_flags: flags,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_stable<T>(value: &T)
+    where
+        T: DekuContainerWrite + for<'a> DekuContainerRead<'a>,
+    {
+        let once = value.to_bytes().unwrap();
+        let (_, decoded) = T::from_bytes((&once, 0)).unwrap();
+        let twice = decoded.to_bytes().unwrap();
+        assert_eq!(once, twice, "encode/decode is not a stable canonical form");
+    }
+
+    #[test]
+    fn request_round_trips() {
+        let request = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: NBD_CMD_FLAG_FUA,
+            cmd_type: NBDCommand::Write,
+            cookie: 0x0102_0304_0506_0708,
+            offset: 4096,
+            length: 512,
+        };
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(&bytes[6..8], &[0, 1]);
+        assert_stable(&request);
+    }
+
+    #[test]
+    fn unknown_command_round_trips_big_endian() {
+        let mut bytes = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: NBDCommand::Read,
+            cookie: 0,
+            offset: 0,
+            length: 0,
+        }
+        .to_bytes()
+        .unwrap();
+        // cmd_type occupies the two bytes after magic (u32) + flags (u16).
+        bytes[6] = 0x12;
+        bytes[7] = 0x34;
+        let (_, decoded) = NBDRequest::from_bytes((&bytes, 0)).unwrap();
+        assert_eq!(decoded.cmd_type, NBDCommand::Unknown(0x1234));
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn reply_types_round_trip() {
+        assert_stable(&NBDSimpleReply::new(0x1122_3344_5566_7788, NBD_SUCCESS));
+        assert_stable(&NBDOptionReply::new(NBD_OPT_GO, NBD_REP_ACK, 0));
+    }
+
+    #[test]
+    fn option_header_round_trips() {
+        assert_stable(&NBDOptionHeader {
+            magic: NBD_IHAVEOPT,
+            option: NBD_OPT_GO,
+            length: 32,
+        });
+        assert_eq!(NBDOption::Go.to_bytes().unwrap(), NBD_OPT_GO.to_be_bytes());
+    }
+
+    #[test]
+    fn short_buffers_error_without_panicking() {
+        assert!(NBDRequest::from_bytes((&[0u8; 5], 0)).is_err());
+        assert!(NBDOptionHeader::from_bytes((&[0u8; 3], 0)).is_err());
+    }
+
+    #[test]
+    fn wrong_magic_is_rejected() {
+        let mut bytes = NBDRequest {
+            magic: NBD_REQUEST_MAGIC,
+            flags: 0,
+            cmd_type: NBDCommand::Read,
+            cookie: 0,
+            offset: 0,
+            length: 0,
+        }
+        .to_bytes()
+        .unwrap();
+        bytes[0] ^= 0xff;
+        assert!(NBDRequest::from_bytes((&bytes, 0)).is_err());
     }
 }

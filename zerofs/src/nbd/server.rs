@@ -1,15 +1,20 @@
-use super::error::{NBDError, Result};
+use super::error::{CommandError, NBDError, Result};
 use super::handler::{NBDDevice, NBDHandler, OptionReply, OptionResult};
-use super::protocol::*;
+use super::out_of_bounds;
 use crate::fs::ZeroFS;
 use bytes::BytesMut;
 use deku::prelude::*;
+use nbd_proto::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const MAX_OPTION_LENGTH: u32 = 4096;
+const MAX_REQUEST_LENGTH: u32 = 128 * 1024 * 1024;
+const DISCARD_CHUNK_SIZE: usize = 64 * 1024;
 
 pub enum Transport {
     Tcp(SocketAddr),
@@ -201,6 +206,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 "Received option: {} (length: {})",
                 header.option, header.length
             );
+
+            if header.length > MAX_OPTION_LENGTH {
+                return Err(NBDError::Protocol(format!(
+                    "option data length {} exceeds max {MAX_OPTION_LENGTH}",
+                    header.length
+                )));
+            }
 
             match header.option {
                 NBD_OPT_LIST => {
@@ -395,6 +407,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 request.cmd_type, request.offset, request.length
             );
 
+            if request.length > MAX_REQUEST_LENGTH {
+                if request.cmd_type == NBDCommand::Write {
+                    return Err(NBDError::Protocol(format!(
+                        "write length {} exceeds max {MAX_REQUEST_LENGTH}",
+                        request.length
+                    )));
+                }
+                self.send_unit_result(request.cookie, Err(CommandError::InvalidArgument))
+                    .await;
+                continue;
+            }
+
             let fua = (request.flags & NBD_CMD_FLAG_FUA) != 0;
 
             match request.cmd_type {
@@ -479,12 +503,18 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         fua: bool,
         device_size: u64,
     ) -> super::error::CommandResult<()> {
-        use super::error::CommandError;
-
-        // Check for out-of-bounds write - must read and discard data first
-        if offset + length as u64 > device_size {
-            let mut data = BytesMut::zeroed(length as usize);
-            let _ = self.reader.read_exact(&mut data).await;
+        // Consume an invalid write's payload to keep the request stream aligned.
+        if out_of_bounds(offset, length, device_size) {
+            let mut remaining = length as usize;
+            let mut buf = vec![0; remaining.min(DISCARD_CHUNK_SIZE)];
+            while remaining > 0 {
+                let chunk = remaining.min(buf.len());
+                self.reader
+                    .read_exact(&mut buf[..chunk])
+                    .await
+                    .map_err(|_| CommandError::IoError)?;
+                remaining -= chunk;
+            }
             return Err(CommandError::NoSpace);
         }
 

@@ -1,4 +1,5 @@
 use crate::fs::errors::FsError;
+use nbd_proto::{NBD_EINVAL, NBD_EIO, NBD_ENOSPC};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -38,9 +39,9 @@ pub enum CommandError {
 impl CommandError {
     pub fn to_errno(self) -> u32 {
         match self {
-            CommandError::InvalidArgument => super::protocol::NBD_EINVAL,
-            CommandError::IoError => super::protocol::NBD_EIO,
-            CommandError::NoSpace => super::protocol::NBD_ENOSPC,
+            CommandError::InvalidArgument => NBD_EINVAL,
+            CommandError::IoError => NBD_EIO,
+            CommandError::NoSpace => NBD_ENOSPC,
         }
     }
 }

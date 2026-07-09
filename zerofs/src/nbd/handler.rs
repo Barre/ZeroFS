@@ -1,9 +1,5 @@
 use super::error::{CommandError, CommandResult, NBDError, Result};
-use super::protocol::{
-    NBD_INFO_EXPORT, NBD_READDIR_DEFAULT_LIMIT, NBD_REP_ACK, NBD_REP_ERR_INVALID,
-    NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, NBD_REP_SERVER, NBD_ZERO_CHUNK_SIZE, NBDInfoExport,
-    TRANSMISSION_FLAGS,
-};
+use super::out_of_bounds;
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
@@ -11,8 +7,15 @@ use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::Bytes;
 use deku::DekuContainerWrite;
+use nbd_proto::{
+    NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
+    NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
+};
 use std::sync::Arc;
 use tracing::debug;
+
+const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
+const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Response to send back for an option
 pub struct OptionReply {
@@ -266,7 +269,7 @@ impl NBDHandler {
         length: u32,
         device_size: u64,
     ) -> CommandResult<Bytes> {
-        if offset + length as u64 > device_size {
+        if out_of_bounds(offset, length, device_size) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -311,7 +314,7 @@ impl NBDHandler {
         fua: bool,
         device_size: u64,
     ) -> CommandResult<()> {
-        if offset + length as u64 > device_size {
+        if out_of_bounds(offset, length, device_size) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -339,7 +342,7 @@ impl NBDHandler {
         fua: bool,
         device_size: u64,
     ) -> CommandResult<()> {
-        if offset + length as u64 > device_size {
+        if out_of_bounds(offset, length, device_size) {
             return Err(CommandError::NoSpace);
         }
 
@@ -378,7 +381,7 @@ impl NBDHandler {
     }
 
     pub async fn cache(&self, offset: u64, length: u32, device_size: u64) -> CommandResult<()> {
-        if offset + length as u64 > device_size {
+        if out_of_bounds(offset, length, device_size) {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())

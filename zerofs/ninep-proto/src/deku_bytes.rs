@@ -54,15 +54,24 @@ impl std::ops::Deref for DekuBytes {
     }
 }
 
+const READ_CHUNK_SIZE: usize = 64 * 1024;
+
 impl<'a> DekuReader<'a, &u32> for DekuBytes {
     fn from_reader_with_ctx<R: Read + Seek>(
         reader: &mut Reader<R>,
         count: &u32,
     ) -> Result<Self, DekuError> {
         let count = *count as usize;
-        let mut buf = vec![0u8; count];
-
-        reader.read_bytes(count, &mut buf, Order::Lsb0)?;
+        // Do not allocate an untrusted length until the input supplies it.
+        let mut buf = Vec::with_capacity(count.min(READ_CHUNK_SIZE));
+        let mut remaining = count;
+        while remaining > 0 {
+            let chunk = remaining.min(READ_CHUNK_SIZE);
+            let start = buf.len();
+            buf.resize(start + chunk, 0);
+            reader.read_bytes(chunk, &mut buf[start..], Order::Lsb0)?;
+            remaining -= chunk;
+        }
         Ok(Self(Bytes::from(buf)))
     }
 }
