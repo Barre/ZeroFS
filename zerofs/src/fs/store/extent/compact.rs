@@ -14,7 +14,7 @@ use crate::fs::inode::InodeId;
 use crate::segment::{FrameLoc, Segid};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{info, warn};
 
 /// Live frames evacuated from candidates are repacked into segments of this
@@ -375,7 +375,8 @@ impl ExtentStore {
 
         // Group by inode so each conditional swap is taken under that inode's write
         // lock (excludes a concurrent foreground write to the same extent).
-        let mut by_inode: HashMap<InodeId, Vec<(u64, FrameLoc, FrameLoc)>> = HashMap::new();
+        // Ordered so the lock-acquisition sequence is deterministic.
+        let mut by_inode: BTreeMap<InodeId, Vec<(u64, FrameLoc, FrameLoc)>> = BTreeMap::new();
         for (i, (inode, extent, new_loc)) in new_locs.into_iter().enumerate() {
             by_inode
                 .entry(inode)
@@ -385,6 +386,11 @@ impl ExtentStore {
 
         let mut swapped = 0;
         for (inode, items) in by_inode {
+            #[cfg(feature = "failpoints")]
+            {
+                fail_point!(fp::COMPACT_BETWEEN_REPOINTS);
+                fp::widen(fp::COMPACT_BETWEEN_REPOINTS).await;
+            }
             let _guard = self.lock_manager.acquire(inode).await;
             let mut txn = self.db.new_transaction()?;
             let mut any = false;

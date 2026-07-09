@@ -48,9 +48,19 @@ fn get_current_uid_gid() -> (u32, u32) {
     (0, 0)
 }
 
+/// DST override: when set, every inode timestamp is one fixed instant. Real
+/// time varies run to run and flows into committed inode rows, whose byte
+/// values shift compressed SST block sizes and break same-seed replay.
+#[doc(hidden)]
+pub static DST_FIXED_TIME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Wall-clock now as `(seconds, nanoseconds)` since the Unix epoch; a
 /// pre-epoch clock clamps to zero.
 pub fn get_current_time() -> (u64, u32) {
+    if DST_FIXED_TIME.load(std::sync::atomic::Ordering::Relaxed) {
+        return (1_700_000_000, 0);
+    }
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d,
         Err(e) => {

@@ -1,0 +1,48 @@
+name: dst-soak
+
+on:
+  schedule:
+    # Hourly: each run soaks fresh random seeds for 50 minutes, so coverage
+    # accumulates run over run (a failing seed prints its DST_SEEDS repro).
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      budget_secs:
+        description: "Soak budget in seconds"
+        default: "3000"
+        required: false
+
+permissions:
+  contents: read
+
+# Never two soaks at once; a late finisher queues the next rather than
+# overlapping it.
+concurrency:
+  group: dst-soak
+  cancel-in-progress: false
+
+jobs:
+  soak:
+    name: Deterministic simulation soak
+    runs-on: ubuntu-latest
+    if: github.repository == 'Barre/ZeroFS'
+    # Cold build plus the soak budget.
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Soak
+        run: >
+          DST_WALL_CLOCK_SECS=${{ github.event.inputs.budget_secs || 3000 }}
+          DST_ROUNDS=8
+          cargo test --profile ci --test dst -- --nocapture seeds
+      - name: Upload divergence traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dst-traces-${{ github.run_id }}
+          path: /tmp/dst_trace_*.log
+          if-no-files-found: ignore

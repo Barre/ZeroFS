@@ -272,7 +272,7 @@ impl ExtentStore {
             // Overwrite debit of the superseded frame: live only, total untouched.
             self.seg_delta(txn, segid, -(byte_len as i64), 0);
         }
-        let over_threshold = self.open.lock().unwrap().buf.len() >= self.seal_threshold;
+        let over_threshold = self.open.lock().unwrap().buf.len() >= self.seal_threshold();
         if over_threshold {
             self.spawn_seal().await;
         }
@@ -947,7 +947,7 @@ mod tests {
         let mut model = Vec::new();
         // Incompressible bytes, so the sealed buffer actually crosses the threshold
         // (a repeating pattern would compress below it and never seal).
-        let n = store.seal_threshold + 4 * EXTENT_SIZE;
+        let n = store.seal_threshold() + 4 * EXTENT_SIZE;
         let data = incompressible(0, n);
         // One >threshold write triggers a background seal; the data reads back
         // correctly whether still in flight (sealing buffer) or already sealed.

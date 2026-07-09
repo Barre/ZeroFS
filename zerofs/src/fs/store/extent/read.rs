@@ -5,6 +5,8 @@
 
 use super::select::{NOMINATE_MIN_FANOUT, NOMINATE_PER_CALL_CAP, PAIR_BUMPS_PER_CALL, PairStats};
 use super::{ExtentStore, ZERO_EXTENT};
+#[cfg(feature = "failpoints")]
+use crate::failpoints::{self as fp, fail_point};
 use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::segment::{FrameLoc, Segid};
@@ -453,6 +455,11 @@ impl ExtentStore {
                         }
                     }
                     prev_nonram = Some((first.segid, extent + n));
+                    #[cfg(feature = "failpoints")]
+                    {
+                        fail_point!(fp::READ_AFTER_RESOLVE_BEFORE_FETCH);
+                        fp::widen(fp::READ_AFTER_RESOLVE_BEFORE_FETCH).await;
+                    }
                     // A GET error is swallowed: a compaction repoint+delete can 404
                     // this run's segment out from under us. Fall back to per-extent
                     // reads via `get`, which re-resolves each FrameLoc.

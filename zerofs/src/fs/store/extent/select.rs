@@ -160,12 +160,14 @@ impl PairStats {
     pub(super) fn sweep_and_hot(&mut self, now: Instant) -> (Vec<(Segid, Segid)>, u64) {
         self.map
             .retain(|_, s| now.saturating_duration_since(s.last_seen) <= PAIR_STALE_AFTER);
-        let hot = self
+        let mut hot: Vec<(Segid, Segid)> = self
             .map
             .iter()
             .filter(|(_, s)| s.count >= PAIR_HOT_MIN)
             .map(|(k, _)| *k)
             .collect();
+        // Map order is arbitrary; assembly order must not be.
+        hot.sort_unstable();
         (hot, std::mem::take(&mut self.dropped))
     }
 }

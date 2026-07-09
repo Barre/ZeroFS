@@ -20,7 +20,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use slatedb::config::WriteOptions;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
@@ -255,6 +255,12 @@ impl ExtentStore {
             }
         };
 
+        #[cfg(feature = "failpoints")]
+        {
+            fail_point!(fp::RECLAIM_AFTER_BARRIER_BEFORE_SCAN);
+            fp::widen(fp::RECLAIM_AFTER_BARRIER_BEFORE_SCAN).await;
+        }
+
         let cur_epoch = self.segments.epoch();
         // Exclusive counter cutoff for eligibility: the still-open segment's
         // own counter, not `next_counter()`. seal_open() just rotated in a
@@ -436,9 +442,6 @@ impl ExtentStore {
 
         let mut deleted = 0;
         let mut freed_counters: Vec<Segid> = Vec::new();
-        // Total bytes of every dropped counter (deleted segments plus leaked
-        // counters), to debit from the monitor's incremental footprint gauges.
-        let mut freed_appended = 0u64;
         for (segid, size) in to_delete {
             // Fail-closed: a segment is deleted only once its directory confirms no
             // frame is still referenced. Sound because an eligible segment can never
@@ -458,10 +461,14 @@ impl ExtentStore {
                     // counter drop left the counter behind; drop it so it stops
                     // re-appearing as dead each pass.
                     freed_counters.push(segid);
-                    freed_appended += size;
                     continue;
                 }
                 SegmentDeadVerdict::Reclaim => {}
+            }
+            #[cfg(feature = "failpoints")]
+            {
+                fail_point!(fp::RECLAIM_AFTER_VERIFY_BEFORE_DELETE);
+                fp::widen(fp::RECLAIM_AFTER_VERIFY_BEFORE_DELETE).await;
             }
             if let Err(e) = self.segments.delete_segment(segid).await {
                 // Don't abort the pass: already-deleted segments still need
@@ -482,7 +489,6 @@ impl ExtentStore {
                 human_bytes(size)
             );
             freed_counters.push(segid);
-            freed_appended += size;
             deleted_bytes += size;
             deleted += 1;
         }
@@ -490,9 +496,27 @@ impl ExtentStore {
         // per segment ever created.
         if !freed_counters.is_empty() {
             let dropped = freed_counters.len() as i64;
+            // Debit the gauges by each row's value at drop time, not the
+            // scan-time total: a pack segment's per-inode credit txns can
+            // straddle the scan, so the row may hold more than the scan saw.
+            // Stable to read here: after the directory verify nothing credits
+            // a retired segment (packs mint fresh ids, writers credit only
+            // the open segment).
+            let mut freed_appended = 0u64;
             let mut txn = self.db.new_transaction()?;
             for segid in &freed_counters {
-                txn.delete_bytes(&self.key_codec.segcount_key(segid.epoch, segid.counter));
+                let key = self.key_codec.segcount_key(segid.epoch, segid.counter);
+                if let Some((_, total)) = self
+                    .db
+                    .get_bytes(&key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|b| KeyCodec::decode_segcount(&b))
+                {
+                    freed_appended += total;
+                }
+                txn.delete_bytes(&key);
             }
             self.commit_via_coordinator(txn).await?;
             // Committed: debit the dropped counters from the footprint gauges.
@@ -586,7 +610,7 @@ impl ExtentStore {
             // the leading group always packs whole — and a whole-packed
             // group's merged output cannot re-heat its seams.
             let gate_fired = freed >= MIN_FREED_BYTES
-                || sel.sel_live >= self.seal_threshold as u64 / 4
+                || sel.sel_live >= self.seal_threshold() as u64 / 4
                 || !sel.chain_groups.is_empty();
             if !gate_fired {
                 // Declined leftovers recur identically: not backlog, and the
@@ -910,8 +934,9 @@ impl ExtentStore {
             // Transient read error: fail-closed, keep the segment.
             Err(_) => return SegmentDeadVerdict::Keep,
         };
-        // Unique extents the directory names (an extent can recur across rewrites).
-        let want: HashSet<(InodeId, u64)> = dir.iter().map(|e| (e.inode, e.extent)).collect();
+        // Unique extents the directory names (an extent can recur across
+        // rewrites). Ordered so the lookup fan-out issues deterministically.
+        let want: BTreeSet<(InodeId, u64)> = dir.iter().map(|e| (e.inode, e.extent)).collect();
         // A FrameLoc pointing here in either view means the segment is live; a
         // point-read error is treated as still-referenced (fail-closed).
         let points_here = |enc: Result<Option<Bytes>, anyhow::Error>| match enc {

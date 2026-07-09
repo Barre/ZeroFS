@@ -98,6 +98,7 @@ zerofs run -c zerofs.toml
 - **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
 - **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.
 - **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across failover. The local-fs model checker also runs with failovers injected.
+- **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: the data plane runs in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies deciding every task interleaving, seeded transient store faults, and crashes placed at arbitrary await points or, via failpoints, inside specific narrow windows, with recovery checked against a reference model. One seed is one exact schedule, so a failing seed reproduces identically.
 
 ## Web UI
 
