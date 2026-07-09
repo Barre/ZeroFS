@@ -431,8 +431,10 @@ pub async fn materialize_segment_if_absent(
         return Ok(false);
     }
     let path = Path::from(segid.object_key());
-    if object_store.head(&path).await.is_ok() {
-        return Ok(false);
+    match object_store.head(&path).await {
+        Ok(_) => return Ok(false),
+        Err(slatedb::object_store::Error::NotFound { .. }) => {}
+        Err(e) => return Err(SegmentStoreError::ObjectStore(e.to_string())),
     }
     let end = frames
         .iter()
@@ -503,27 +505,47 @@ mod tests {
         Bytes::from(v)
     }
 
-    /// Wraps `InMemory` so multipart uploads fail (the part at `fail_part`, or
-    /// the COMPLETE call) and records whether the upload got aborted.
+    /// Wraps `InMemory` to inject multipart or HEAD failures and record the
+    /// resulting cleanup/write behavior.
     #[derive(Debug)]
     struct MultipartFaultStore {
         inner: Arc<dyn ObjectStore>,
         fail_part: Option<usize>,
         fail_complete: bool,
+        fail_head: bool,
         aborted: Arc<AtomicBool>,
+        put_called: Arc<AtomicBool>,
     }
 
     impl MultipartFaultStore {
         fn new(fail_part: Option<usize>, fail_complete: bool) -> (Arc<Self>, Arc<AtomicBool>) {
             let aborted = Arc::new(AtomicBool::new(false));
+            let put_called = Arc::new(AtomicBool::new(false));
             (
                 Arc::new(Self {
                     inner: Arc::new(InMemory::new()),
                     fail_part,
                     fail_complete,
+                    fail_head: false,
                     aborted: aborted.clone(),
+                    put_called,
                 }),
                 aborted,
+            )
+        }
+
+        fn with_head_error() -> (Arc<Self>, Arc<AtomicBool>) {
+            let put_called = Arc::new(AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    inner: Arc::new(InMemory::new()),
+                    fail_part: None,
+                    fail_complete: false,
+                    fail_head: true,
+                    aborted: Arc::new(AtomicBool::new(false)),
+                    put_called: put_called.clone(),
+                }),
+                put_called,
             )
         }
 
@@ -582,6 +604,7 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> OsResult<PutResult> {
+            self.put_called.store(true, Ordering::SeqCst);
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -601,6 +624,11 @@ mod tests {
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+            if self.fail_head && options.head {
+                return Err(slatedb::object_store::Error::NotSupported {
+                    source: "injected HEAD fault".into(),
+                });
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -795,6 +823,31 @@ mod tests {
         // Each db lists only its own segment, not the other's.
         assert_eq!(seg_a.list_segments().await.unwrap().len(), 1);
         assert_eq!(seg_b.list_segments().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn materialization_fails_closed_when_head_errors() {
+        let (store, put_called) = MultipartFaultStore::with_head_error();
+        let object_store: Arc<dyn ObjectStore> = store;
+        let codec = FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let segid = Segid::new(9, 1);
+        let frames = [ReconFrame {
+            frame_index: 0,
+            byte_offset: 0,
+            byte_len: 5,
+            inode: 1,
+            extent: 0,
+            bytes: Bytes::from_static(b"\x01\0\0\0x"),
+        }];
+
+        let err = materialize_segment_if_absent(&object_store, &codec, segid, &frames)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SegmentStoreError::ObjectStore(_)));
+        assert!(
+            !put_called.load(Ordering::SeqCst),
+            "a failed HEAD must not fall through to an unconditional PUT"
+        );
     }
 
     // HA takeover: the bytes the leader ships (a segment's raw frames) reconstruct
