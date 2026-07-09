@@ -486,11 +486,11 @@ pub struct GcConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub busy_backlog_dead_percent: Option<u64>,
     /// Per-round compaction budget in MiB: the live-byte selection cap, the
-    /// heat reserve (half), and the plaintext gather RAM cap. Raising it packs
+    /// heat reserve (half), and the stored-byte gather cap. Raising it packs
     /// hot seams whose cheapest pair exceeds half the default round (the
     /// "over-reserve" chains) and lifts per-batch dead-space throughput, at
-    /// ~this much peak gather RAM per batch (more for a highly compressible
-    /// seam, gathered whole). Default 256.
+    /// ~this much peak gather RAM per batch (more when the leading seam
+    /// chain alone exceeds it, gathered whole). Default 256.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub compact_round_max_mib: Option<u64>,
 }
@@ -1172,7 +1172,7 @@ impl Settings {
         toml_string.push_str("# busy_backlog_dead_percent = 20   # Dead-space percent at/above which busy_backlog_interval_secs\n");
         toml_string.push_str("#                                  # applies while the store is active (default: 20).\n");
         toml_string.push_str("# compact_round_max_mib = 256      # Per-round compaction budget in MiB (default: 256, range 64-4096):\n");
-        toml_string.push_str("#                                  # live-byte selection cap, heat reserve (half), and plaintext gather\n");
+        toml_string.push_str("#                                  # live-byte selection cap, heat reserve (half), and stored-byte gather\n");
         toml_string.push_str("#                                  # RAM cap. Raise to pack over-reserve hot seams and lift dead-space\n");
         toml_string.push_str("#                                  # throughput per batch, at up to this many MiB peak gather RAM.\n");
 

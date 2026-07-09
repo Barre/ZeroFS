@@ -14,7 +14,7 @@
 use crate::db::{Db, Transaction};
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
-use crate::frame_codec::FrameCodec;
+use crate::frame_codec::{Compressed, FrameCodec};
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
@@ -117,6 +117,13 @@ const PACK_CUT_SLACK_BYTES: u64 = 32 << 20;
 const MAX_COMPACT_SEGMENTS_PER_ROUND: usize = 64;
 const MAX_COMPACT_BYTES_PER_ROUND: u64 = 256 << 20; // 256 MiB (~one PACK_TARGET segment/round)
 
+/// Charged against the gather cap per frame, on top of its payload: the fixed
+/// bookkeeping a gathered frame costs regardless of size (frames tuple, `seen`
+/// entry, batch metas, source-loc copy, allocation slack), which dominates
+/// when near-constant-fill data stores 32 KiB extents as a few hundred bytes.
+/// Also bounds frames per round, and with it the largest repoint transaction.
+const GATHER_FRAME_OVERHEAD_BYTES: u64 = 200;
+
 /// A compaction round must free at least this much dead space to run (unless
 /// enough small-segment live bytes have accumulated to pack a dense segment;
 /// see `reclaim_segments_gated`). A near-1:1 repack is churn.
@@ -197,7 +204,7 @@ type CompactRun = (u64, u32, u32, Vec<(InodeId, u64)>);
 type SegStat = (Segid, u64, u64);
 
 /// One packed batch awaiting seal: frames and their gathered source locations.
-type PackBatch = (Vec<(InodeId, u64, Bytes)>, Vec<FrameLoc>);
+type PackBatch = (Vec<(InodeId, u64, Compressed)>, Vec<FrameLoc>);
 
 /// Write-cold inputs, computed once per pass after the barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1344,7 +1351,7 @@ impl ExtentStore {
         // batches fan out on rayon; block_in_place needs the multi-thread
         // runtime (tests run current-thread), and small batches stay inline.
         let payloads: Vec<&Bytes> = edits.iter().filter_map(|(_, e)| e.as_ref()).collect();
-        let compressed: Vec<Vec<u8>> = if payloads.len() >= PARALLEL_COMPRESS_MIN_FRAMES
+        let compressed: Vec<Compressed> = if payloads.len() >= PARALLEL_COMPRESS_MIN_FRAMES
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
@@ -2102,9 +2109,11 @@ impl ExtentStore {
     /// gating on foreground idleness (see the segment-GC loop).
     ///
     /// `round_bytes` (config `compact_round_max_mib`) is the per-round live-byte
-    /// budget: the selection cap, the heat reserve (half), and the plaintext
-    /// gather RAM cap. Raising it packs over-reserve seams and lifts dead-space
-    /// throughput per batch, at proportional gather RAM.
+    /// budget: the selection cap, the heat reserve (half), and the stored-byte
+    /// gather cap (frames stay compressed through the gather, so its RAM tracks
+    /// stored size whatever the data's compression ratio). Raising it packs
+    /// over-reserve seams and lifts dead-space throughput per batch, at
+    /// proportional gather RAM.
     pub async fn reclaim_segments_gated<F, Fut, K>(
         &self,
         gate: F,
@@ -2849,22 +2858,26 @@ impl ExtentStore {
     ///
     /// The repoint is conditional and per-inode-locked: it holds the same write
     /// lock the foreground path uses and moves an extent only if it still points
-    /// at the source frame, so a concurrent overwrite is never clobbered. The new
-    /// segment is durably PUT (by `seal`) before any extent references it, so a
-    /// crash between seal and repoint just leaves the source in place.
+    /// at the source frame, so a concurrent overwrite is never clobbered. The
+    /// new segment is durably PUT (by `seal_compressed`) before any extent
+    /// references it, so a crash between seal and repoint just leaves the
+    /// source in place.
     pub async fn compact_segments(
         &self,
         segids: &[Segid],
         atomic_prefix: &[usize],
-        // Plaintext gather RAM cap (config `compact_round_max_mib`); a leading
+        // Gather cap in stored bytes (config `compact_round_max_mib`); a leading
         // atomic group is still gathered whole, so this bounds RAM to one group.
+        // Frames stay compressed end to end (verify + AAD rebind only) and each
+        // charges [`GATHER_FRAME_OVERHEAD_BYTES`] besides its payload, so gather
+        // memory tracks the budget whatever the data's compression ratio.
         round_bytes: u64,
     ) -> Result<(usize, usize, usize), FsError> {
         debug_assert!(atomic_prefix.iter().sum::<usize>() <= segids.len());
         // Gather still-live frames across all sources, tagged with the exact
         // source FrameLoc the liveness read resolved (the repoint CAS's expected
         // value).
-        let mut frames: Vec<(InodeId, u64, FrameLoc, Bytes)> = Vec::new();
+        let mut frames: Vec<(InodeId, u64, FrameLoc, Compressed)> = Vec::new();
         let mut gathered: u64 = 0;
         let mut consumed = 0usize;
         // Gather each live (inode, extent) at most once: an extent rewritten K times
@@ -2877,12 +2890,11 @@ impl ExtentStore {
             .filter(|&g| g > 0)
             .chain(std::iter::repeat(1));
         while consumed < segids.len() {
-            // Plaintext RAM bound only, unlike the selection budget (on-store
-            // live bytes): checked before each group, so the first group is
-            // always gathered whole and every call makes progress. A group
-            // stopped mid-way would 1:1-repack a chain prefix that dissolves
-            // no seam, so the cap never splits one; if it trips at a group
-            // boundary the whole gather stops (`consumed` stays a prefix).
+            // Checked before each group, so the first group is always gathered
+            // whole and every call makes progress. A group stopped mid-way would
+            // 1:1-repack a chain prefix that dissolves no seam, so the cap never
+            // splits one; if it trips at a group boundary the whole gather stops
+            // (`consumed` stays a prefix).
             if gathered >= round_bytes {
                 break;
             }
@@ -2946,7 +2958,7 @@ impl ExtentStore {
         let mut relocated = 0;
         let mut packed = 0;
         for (batch, batch_src) in batches {
-            let n = self.seal_and_repoint(&batch, &batch_src).await?;
+            let n = self.seal_and_repoint(batch, &batch_src).await?;
             relocated += n;
             packed += usize::from(n > 0);
         }
@@ -2954,13 +2966,14 @@ impl ExtentStore {
     }
 
     /// Gather one source segment's still-live frames for [`Self::compact_segments`]:
-    /// append them to `frames` (tagged with the resolved source [`FrameLoc`]),
-    /// growing `seen` and the plaintext `gathered` total.
+    /// append them to `frames` (tagged with the resolved source [`FrameLoc`]) as
+    /// verified, still-compressed payloads, growing `seen` and the stored-byte
+    /// `gathered` total.
     async fn gather_source(
         &self,
         segid: Segid,
         seen: &mut HashSet<(InodeId, u64)>,
-        frames: &mut Vec<(InodeId, u64, FrameLoc, Bytes)>,
+        frames: &mut Vec<(InodeId, u64, FrameLoc, Compressed)>,
         gathered: &mut u64,
     ) -> Result<(), FsError> {
         let dir = self
@@ -3034,20 +3047,20 @@ impl ExtentStore {
                 )),
             }
         }
-        let read: Vec<Vec<(InodeId, u64, Bytes)>> = stream::iter(runs)
+        let read: Vec<Vec<(InodeId, u64, Compressed)>> = stream::iter(runs)
             .map(|(byte_offset, total_len, first_frame, slots)| {
                 let store = self.clone();
                 async move {
-                    let bytes = store
+                    let payloads = store
                         .segments
-                        .read_run(segid, byte_offset, total_len, first_frame, &slots)
+                        .read_compressed_run(segid, byte_offset, total_len, first_frame, &slots)
                         .await
                         .map_err(|_| FsError::IoError)?;
                     Ok::<_, FsError>(
                         slots
                             .into_iter()
-                            .zip(bytes)
-                            .map(|((inode, extent), b)| (inode, extent, b))
+                            .zip(payloads)
+                            .map(|((inode, extent), p)| (inode, extent, p))
                             .collect::<Vec<_>>(),
                     )
                 }
@@ -3056,25 +3069,30 @@ impl ExtentStore {
             .try_collect::<Vec<_>>()
             .await?;
 
-        for (inode, extent, bytes) in read.into_iter().flatten() {
+        for (inode, extent, payload) in read.into_iter().flatten() {
             seen.insert((inode, extent));
-            *gathered += bytes.len() as u64;
-            frames.push((inode, extent, loc_of[&(inode, extent)], bytes));
+            // Stored size (the AEAD strips a constant nonce+tag; close enough
+            // for a RAM cap and consistent with the selection budget's unit)
+            // plus the fixed per-frame bookkeeping.
+            *gathered += payload.len() as u64 + GATHER_FRAME_OVERHEAD_BYTES;
+            frames.push((inode, extent, loc_of[&(inode, extent)], payload));
         }
         Ok(())
     }
 
     /// Seal one packed batch into a new segment and repoint the extents that still
     /// reference their source frame. `src[i]` is the gathered source [`FrameLoc`]
-    /// of `batch[i]`, the swap's expected value.
+    /// of `batch[i]`, the swap's expected value. The batch's payloads are still
+    /// compressed; the seal rebinds each frame's AAD without a decompress.
     async fn seal_and_repoint(
         &self,
-        batch: &[(InodeId, u64, Bytes)],
+        batch: Vec<(InodeId, u64, Compressed)>,
         src: &[FrameLoc],
     ) -> Result<usize, FsError> {
+        let batch_len = batch.len();
         let new_locs = self
             .segments
-            .seal(batch)
+            .seal_compressed(batch)
             .await
             .map_err(|_| FsError::IoError)?;
 
@@ -3155,9 +3173,9 @@ impl ExtentStore {
         info!(
             "compaction: packed {:?}: {} frames, {} repointed, {} discarded to concurrent writes{}",
             new_segid,
-            batch.len(),
+            batch_len,
             swapped,
-            batch.len() - swapped,
+            batch_len - swapped,
             orphan_note,
         );
         Ok(swapped)
@@ -5241,9 +5259,9 @@ mod tests {
         );
     }
 
-    /// A world where the plaintext RAM cap trips long before the on-store
-    /// selection budget: two constant-fill (highly compressible) segments
-    /// whose live plaintext alone overflows the gather cap, then three
+    /// A world whose decompressed size dwarfs the round budget while its
+    /// stored size stays tiny: two constant-fill (highly compressible)
+    /// segments whose live plaintext alone overflows the budget, then three
     /// incompressible small segments that clear the economics gate on their
     /// own. All five tie on the live fraction, so selection keeps scan
     /// (counter) order and the compressible pair is always gathered first.
@@ -5296,11 +5314,13 @@ mod tests {
         (store, db, segids)
     }
 
-    /// The gather's RAM cap stops between sources; the never-gathered picks
-    /// must stay in the drain and be consumed by later batches of the same
-    /// pass, ending unsaturated once everything is packed.
+    /// A world whose plaintext dwarfs the round budget drains in ONE batch:
+    /// frames stay compressed through the gather, so its cap tracks stored
+    /// bytes (the selection budget's unit) and compressibility no longer
+    /// forces mid-pass deferral. (Before the compressed passthrough, these
+    /// same sources tripped the then-plaintext cap and needed later batches.)
     #[tokio::test]
-    async fn ram_capped_gather_defers_sources_to_later_batches_of_the_pass() {
+    async fn compressible_sources_pack_in_one_batch_under_the_stored_byte_cap() {
         let (store, db, segids) = ram_capped_world().await;
         let comp_extents = (MAX_COMPACT_BYTES_PER_ROUND / 2) as usize / EXTENT_SIZE + 32;
         let outcome = store
@@ -5309,14 +5329,15 @@ mod tests {
                 None,
                 Some(TAIL_SCRUB_DEFAULT_PERCENT),
                 QUIESCENT_AFTER_DEFAULT,
-                || true,
+                // No multi-batch approval: everything must fit the first batch.
+                || false,
             )
             .await
             .unwrap();
         assert_eq!(
             outcome.relocated,
             2 * comp_extents + 3 * 28,
-            "later batches drained the RAM-cap leftovers"
+            "one batch drained every source: no plaintext-cap deferral"
         );
         assert_eq!(
             outcome.status,
@@ -5332,46 +5353,105 @@ mod tests {
         }
     }
 
-    /// A pass cut before the leftovers are re-selected must report them as
-    /// saturation (the fast cadence follows up), not silently drop them.
+    /// `compact_segments`' budget is checked between groups: a call whose
+    /// budget is exhausted consumes a group-granular prefix (never splitting
+    /// an atomic group, always taking at least the first) and leaves the
+    /// rest untouched for the caller's backlog, packable by a later call.
     #[tokio::test]
-    async fn ram_capped_cut_with_unconsumed_leftovers_stays_saturated() {
-        let (store, db, segids) = ram_capped_world().await;
-        let comp_extents = (MAX_COMPACT_BYTES_PER_ROUND / 2) as usize / EXTENT_SIZE + 32;
-        let outcome = store
-            .reclaim_segments_tuned(
-                Utc::now(),
-                None,
-                Some(TAIL_SCRUB_DEFAULT_PERCENT),
-                QUIESCENT_AFTER_DEFAULT,
-                || false,
+    async fn exhausted_gather_budget_consumes_a_group_prefix_and_never_splits_a_group() {
+        let (store, db) = make().await;
+        // Four single-extent sources of incompressible data; segids[0..2] form
+        // one atomic group (a chain), segids[2..] are singletons.
+        let mut segids = Vec::new();
+        for inode in 1u64..5 {
+            write_chunk_at(
+                &store,
+                &db,
+                inode,
+                0,
+                Bytes::from(incompressible(inode as usize, EXTENT_SIZE)),
             )
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.relocated,
-            2 * comp_extents,
-            "one batch: only the gathered prefix packed"
-        );
-        assert_eq!(
-            outcome.status,
-            PassStatus::Completed { saturated: true },
-            "un-consumed picks are backlog"
-        );
-        for inode in 1u64..3 {
-            assert_ne!(
-                frameloc_of(&store, &db, inode, 0).await.unwrap().segid,
-                segids[(inode - 1) as usize],
-                "gathered sources packed"
-            );
+            .await;
+            store.seal_open().await.unwrap();
+            segids.push(frameloc_of(&store, &db, inode, 0).await.unwrap().segid);
         }
-        for inode in 3u64..6 {
+
+        // A 1-byte budget is exhausted before (and after) every group; the
+        // leading group must still gather whole.
+        let (relocated, packed, consumed) = store.compact_segments(&segids, &[2], 1).await.unwrap();
+        assert_eq!(consumed, 2, "the leading atomic group consumed whole");
+        assert_eq!(relocated, 2, "both group members' frames relocated");
+        assert_eq!(packed, 1, "the group merged into one packed segment");
+        let now_1 = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        let now_2 = frameloc_of(&store, &db, 2, 0).await.unwrap().segid;
+        assert_ne!(now_1, segids[0]);
+        assert_eq!(now_1, now_2, "group members merged, not split");
+        for inode in 3u64..5 {
             assert_eq!(
                 frameloc_of(&store, &db, inode, 0).await.unwrap().segid,
                 segids[(inode - 1) as usize],
-                "never-gathered sources left in place, not lost"
+                "past-budget sources left in place, not lost"
             );
         }
+
+        // Singletons: the same 1-byte budget consumes exactly the first.
+        let rest = &segids[2..];
+        let (relocated, _, consumed) = store.compact_segments(rest, &[], 1).await.unwrap();
+        assert_eq!(
+            (consumed, relocated),
+            (1, 1),
+            "one singleton per exhausted call"
+        );
+        assert_ne!(
+            frameloc_of(&store, &db, 3, 0).await.unwrap().segid,
+            segids[2]
+        );
+        assert_eq!(
+            frameloc_of(&store, &db, 4, 0).await.unwrap().segid,
+            segids[3],
+            "the unconsumed singleton stays for the caller's backlog"
+        );
+    }
+
+    /// Relocation is an AAD rebind of the verified still-compressed payload,
+    /// never a decompress/recompress: frames sealed under a Zstd codec keep
+    /// byte-identical payload sizes when a restarted Lz4-configured store
+    /// compacts them (a recompression would re-encode them as lz4), and read
+    /// back intact through the auto-detecting open.
+    #[tokio::test]
+    async fn compaction_passes_compressed_payloads_through_across_codec_configs() {
+        let (store, db, object_store) = make_with_compression(CompressionConfig::Zstd(3)).await;
+        // Compressible content: zstd and lz4 encodings would differ in size,
+        // so byte_len equality across the repack distinguishes passthrough
+        // from recompression.
+        let data = vec![0x41u8; 2 * EXTENT_SIZE];
+        write_and_check(&store, &db, &mut Vec::new(), 0, &data).await;
+        store.seal_open().await.unwrap();
+        let old_locs = [
+            frameloc_of(&store, &db, 1, 0).await.unwrap(),
+            frameloc_of(&store, &db, 1, 1).await.unwrap(),
+        ];
+
+        // A restarted store, now configured for Lz4, compacts the zstd world.
+        let store2 = make_store(object_store, db.clone(), CompressionConfig::Lz4, 8);
+        let (relocated, _, _) = store2
+            .compact_segments(&[old_locs[0].segid], &[], MAX_COMPACT_BYTES_PER_ROUND)
+            .await
+            .unwrap();
+        assert_eq!(relocated, 2);
+        for (extent, old) in old_locs.iter().enumerate() {
+            let new = frameloc_of(&store2, &db, 1, extent as u64).await.unwrap();
+            assert_ne!(new.segid, old.segid, "relocated");
+            assert_eq!(
+                new.byte_len, old.byte_len,
+                "payload passed through byte-identically (no recompression)"
+            );
+        }
+        assert_eq!(
+            store2.read(1, 0, data.len() as u64).await.unwrap().as_ref(),
+            data.as_slice(),
+            "zstd payloads read back through the lz4-configured codec"
+        );
     }
 
     /// Write `bytes` to `inode` at extent offset `extent_off` (chunks
@@ -5398,15 +5478,14 @@ mod tests {
         store.apply_tail_update(inode, tu);
     }
 
-    /// Capture this thread's INFO log lines while the returned guard lives
-    /// (current-thread test runtime: every poll runs under the guard).
-    /// DEFECT-1 regression: a chain whose HEAD member alone decodes past the
-    /// gather's 256 MiB plaintext RAM cap must still gather whole (the group
-    /// is atomic), not stop at consumed=1 — a 1:1 repack that dissolves no
-    /// seam, spends the reserve, and re-heats forever on a quiescent store.
-    /// Constant-fill (compressible) data keeps the members inside the
-    /// on-store reserve while their plaintext overflows the cap; all-zero
-    /// writes would elide into holes.
+    /// A chain whose HEAD member alone decodes past the round budget must
+    /// still gather whole (the group is atomic), not stop at consumed=1: a
+    /// 1:1 repack dissolves no seam, spends the reserve, and re-heats
+    /// forever on a quiescent store. Constant-fill (compressible) data keeps
+    /// the members inside the on-store reserve while their plaintext
+    /// overflows the budget (trivially satisfied now that the gather stays
+    /// compressed; kept as the atomicity regression); all-zero writes would
+    /// elide into holes.
     #[tokio::test]
     async fn chain_with_head_over_ram_cap_packs_whole_in_one_pass() {
         let (store, db) = make().await;
@@ -5509,12 +5588,13 @@ mod tests {
         assert_eq!(&got[EXTENT_SIZE..], &b_buf[..EXTENT_SIZE]);
     }
 
-    /// DEFECT-1/2 regression with two chains: the first exhausts the RAM
-    /// cap, so the second defers WHOLE — members un-consumed (in pending),
-    /// the pass saturated, and only the actually-packed group counted — and
-    /// packs on the next pass.
+    /// Two hot chains, one whose plaintext dwarfs the round budget, both
+    /// pack in a single pass: the gather holds compressed payloads, so its
+    /// budget tracks stored bytes and compressibility no longer defers the
+    /// second group to a later pass. (Before the compressed passthrough the
+    /// first chain exhausted the then-plaintext cap here.)
     #[tokio::test]
-    async fn ram_cap_defers_second_chain_whole_and_packs_it_next_pass() {
+    async fn two_chains_pack_in_one_pass_under_the_stored_byte_budget() {
         let (store, db) = make().await;
         store.enable_nominations();
         // Chain 1 (inode 1): A1|A2 jointly decode past the cap. A1 carries
@@ -5603,8 +5683,8 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
 
-        // Pass: chain 1 gathers whole and trips the cap at the group
-        // boundary; chain 2 must defer whole, not split.
+        // One pass packs both chains: neither the reserve (their stored live
+        // is tiny) nor the gather budget (stored-byte unit) defers anything.
         let outcome = store
             .reclaim_segments_tuned(
                 Utc::now(),
@@ -5617,66 +5697,29 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.relocated,
-            (a1_extents + half) as usize,
-            "only chain 1's members gathered"
-        );
-        assert_eq!(
-            outcome.status,
-            PassStatus::Completed { saturated: true },
-            "the deferred chain's un-consumed picks are backlog"
+            (a1_extents + half + 2 * b_extents) as usize,
+            "both chains' members gathered in one pass"
         );
         assert_eq!(
             outcome.chains,
             ChainOutcome {
                 assembled: 2,
-                packed: 1,
-                deferred: 1,
+                packed: 2,
+                deferred: 0,
                 warm: 0,
                 unpackable: 0,
             },
-            "the gather-cap-deferred group must not count as packed",
+            "both groups packed, none deferred",
         );
         let now_a1 = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
         let now_a2 = frameloc_of(&store, &db, 1, a1_extents).await.unwrap().segid;
         assert_ne!(now_a1, a1);
         assert_ne!(now_a2, a2);
         assert_eq!(now_a1, now_a2, "chain 1 merged");
-        assert_eq!(
-            frameloc_of(&store, &db, 2, 0).await.unwrap().segid,
-            b1,
-            "deferred chain member left un-consumed"
-        );
-        assert_eq!(
-            frameloc_of(&store, &db, 2, b_extents).await.unwrap().segid,
-            b2,
-            "deferred chain member left un-consumed"
-        );
-
-        // Next pass: the still-hot seam re-forms the chain, which now leads
-        // an empty gather and packs whole.
-        let outcome = store
-            .reclaim_segments_tuned(
-                Utc::now(),
-                None,
-                Some(TAIL_SCRUB_DEFAULT_PERCENT),
-                Duration::from_millis(500),
-                || false,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.relocated,
-            2 * b_extents as usize,
-            "the deferred chain packed next pass"
-        );
-        assert_eq!(
-            (outcome.chains.assembled, outcome.chains.packed),
-            (1, 1),
-            "the re-formed chain packs whole",
-        );
         let now_b1 = frameloc_of(&store, &db, 2, 0).await.unwrap().segid;
         let now_b2 = frameloc_of(&store, &db, 2, b_extents).await.unwrap().segid;
         assert_ne!(now_b1, b1);
+        assert_ne!(now_b2, b2);
         assert_eq!(now_b1, now_b2, "chain 2 merged: the seam is gone");
 
         // Integrity across both seams.
