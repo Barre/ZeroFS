@@ -82,10 +82,6 @@ impl TailBuffer {
             .map(|(&seqno, ops)| (seqno, ops.as_slice()))
     }
 
-    pub fn highest_seqno(&self) -> Option<u64> {
-        self.batches.keys().next_back().copied()
-    }
-
     pub fn len(&self) -> usize {
         self.batches.len()
     }
@@ -151,7 +147,6 @@ mod tests {
             vec![1, 2, 3],
             "replay must be in ascending seqno order"
         );
-        assert_eq!(tb.highest_seqno(), Some(3));
         assert_eq!(tb.len(), 3);
     }
 
