@@ -1432,6 +1432,23 @@ mod tests {
         assert_eq!(with, without, "an uncovered op must not carry an op-id");
     }
 
+    #[test]
+    fn truncated_large_payload_is_rejected() {
+        let frame = P9Message::new(
+            7,
+            Message::Twrite(Twrite {
+                fid: 1,
+                offset: 0,
+                count: u32::MAX,
+                data: vec![0xde, 0xad, 0xbe, 0xef].into(),
+            }),
+        )
+        .to_bytes()
+        .unwrap();
+        assert!(frame.len() < 64);
+        assert!(P9Message::from_bytes_ctx(&frame, false).is_err());
+    }
+
     fn qid() -> Qid {
         Qid {
             type_: 0x80,

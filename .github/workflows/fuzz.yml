@@ -1,0 +1,57 @@
+name: fuzz
+
+on:
+  # Short smoke on relevant PRs, plus a longer nightly run.
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "zerofs/ninep-proto/**"
+      - "zerofs/nbd-proto/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      run_secs:
+        description: "Per-target fuzz budget in seconds"
+        default: "1800"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: ${{ matrix.crate }} decoder fuzz
+    runs-on: ubuntu-latest
+    if: github.repository == 'Barre/ZeroFS'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [ninep-proto, nbd-proto]
+    defaults:
+      run:
+        working-directory: zerofs/${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed corpus
+        run: cargo run --manifest-path fuzz/Cargo.toml --example gen_corpus
+      - name: Fuzz the decoder
+        env:
+          FUZZ_SECONDS: ${{ inputs.run_secs || (github.event_name == 'pull_request' && '120' || '1800') }}
+        run: cargo fuzz run decode -- -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.crate }}-${{ github.run_id }}
+          path: zerofs/${{ matrix.crate }}/fuzz/artifacts/
+          if-no-files-found: ignore

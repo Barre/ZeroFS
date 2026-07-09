@@ -1,0 +1,26 @@
+# Own workspace so the nightly-only libfuzzer dependency never enters the
+# stable zerofs workspace build.
+[workspace]
+
+[package]
+name = "nbd-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+deku = "0.20"
+
+[dependencies.nbd-proto]
+path = ".."
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,14 @@
+[package]
+name = "nbd-proto"
+version = "0.1.0"
+edition = "2024"
+description = "NBD (Network Block Device) wire protocol types used by ZeroFS"
+license = "AGPL-3.0"
+repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+documentation = "https://docs.rs/nbd-proto"
+keywords = ["nbd", "network-block-device", "protocol", "filesystem", "zerofs"]
+categories = ["network-programming", "filesystem", "encoding"]
+
+[dependencies]
+deku = "0.20"
