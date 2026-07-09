@@ -42,6 +42,22 @@ pub enum CodecError {
     Decrypt,
 }
 
+/// A frame's compressed (but not encrypted) payload: what sits between
+/// [`FrameCodec::compress`] and [`FrameCodec::seal_compressed`], or comes out of
+/// [`FrameCodec::open_compressed`]. A distinct type so plaintext can't be sealed
+/// as if pre-compressed (double compression on read) nor a compressed payload
+/// served as plaintext; the only ways out are `seal_compressed` (re-encrypt
+/// as-is, the compaction passthrough) and `decompress`.
+pub struct Compressed(Vec<u8>);
+
+impl Compressed {
+    /// Stored payload size, the unit of compaction's gather accounting.
+    #[allow(clippy::len_without_is_empty)] // a compressed payload is never empty
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Compress-then-encrypt primitive over a single frame.
 ///
 /// Holds a derived XChaCha20-Poly1305 subkey and a compression config. Cheap to
@@ -80,8 +96,14 @@ impl FrameCodec {
     /// Encrypt an already-[`Self::compress`]ed payload, binding `aad`.
     /// `seal(plain, aad)` is exactly `seal_compressed(compress(plain), aad)`;
     /// the split exists so callers can run the compression outside a lock whose
-    /// critical section must assign the identifiers the AAD binds.
-    pub fn seal_compressed(&self, compressed: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>, CodecError> {
+    /// critical section must assign the identifiers the AAD binds, and so a
+    /// relocation can rebind a frame's AAD from [`Self::open_compressed`]'s
+    /// output without a decompress/recompress round trip.
+    pub fn seal_compressed(
+        &self,
+        Compressed(compressed): Compressed,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, CodecError> {
         let mut out = Vec::with_capacity(NONCE_SIZE + compressed.len() + TAG_SIZE);
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         thread_rng().fill_bytes(&mut nonce_bytes);
@@ -98,13 +120,21 @@ impl FrameCodec {
 
     /// Decrypt (verifying `aad`) then decompress a frame produced by [`Self::seal`].
     pub fn open(&self, frame: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
+        let Compressed(compressed) = self.open_compressed(frame, aad)?;
+        self.decompress(&compressed)
+    }
+
+    /// Decrypt (verifying `aad`) a frame, returning its still-compressed payload.
+    /// `open(frame, aad)` is exactly `decompress(open_compressed(frame, aad))`;
+    /// the split lets a relocation verify and rebind a frame without ever
+    /// materializing (or recompressing) the plaintext.
+    pub fn open_compressed(&self, frame: &[u8], aad: &[u8]) -> Result<Compressed, CodecError> {
         if frame.len() < NONCE_SIZE + TAG_SIZE {
             return Err(CodecError::TooShort(frame.len()));
         }
         let (nonce_bytes, ciphertext) = frame.split_at(NONCE_SIZE);
         let nonce = XNonce::from_slice(nonce_bytes);
-        let compressed = self
-            .cipher
+        self.cipher
             .decrypt(
                 nonce,
                 Payload {
@@ -112,23 +142,23 @@ impl FrameCodec {
                     aad,
                 },
             )
-            .map_err(|_| CodecError::Decrypt)?;
-        self.decompress(&compressed)
+            .map(Compressed)
+            .map_err(|_| CodecError::Decrypt)
     }
 
     /// Compress `data` with the configured codec. Pure: the output depends only
     /// on the bytes and the configured level, never on shared state, so it can
     /// run on any thread, outside any lock, and feed [`Self::seal_compressed`].
-    pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    pub fn compress(&self, data: &[u8]) -> Result<Compressed, CodecError> {
         match self.compression {
-            CompressionConfig::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
+            CompressionConfig::Lz4 => Ok(Compressed(lz4_flex::compress_prepend_size(data))),
             CompressionConfig::Zstd(level) => {
                 let compressed = zstd_compress(data, level)?;
                 // Prepend original size (LE u32) for decompression.
                 let mut result = Vec::with_capacity(4 + compressed.len());
                 result.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 result.extend_from_slice(&compressed);
-                Ok(result)
+                Ok(Compressed(result))
             }
         }
     }

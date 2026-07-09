@@ -308,6 +308,7 @@ You can change the compression algorithm at any time without migration:
 - **New writes** use the currently configured algorithm
 - **Existing data** remains readable regardless of how it was compressed
 - Compression format is auto-detected per-frame when reading
+- **Existing data is never re-encoded**: compaction relocates frames byte-for-byte without recompressing, so changing the algorithm or level does not rewrite or shrink data already stored; old and new encodings coexist indefinitely until the data is overwritten or removed
 
 
 ## LSM Tree Performance Tuning
@@ -377,7 +378,7 @@ tail_scrub_min_dead_percent = 5  # Repack write-cold segments above this % dead 
 
 - **`min_batches_per_pass`** (default: 4, min: 1): Compaction batches a pass runs before it starts yielding to foreground load. Below the floor it drains regardless of client activity; past it a client op ends the pass within one batch. This raises reclaim throughput under sustained load. Batches run sequentially, so this does not raise peak RAM. Idle stores always drain to the internal per-pass cap (32) regardless.
 
-- **`compact_round_max_mib`** (default: 256, range: 64–4096): Per-round compaction budget in MiB, the heat reserve for nominations and hot seams (half the budget), and the plaintext gather RAM cap. Raising it packs hot seams whose cheapest pair exceeds the reserve (the *over-reserve* chains that otherwise never repack; see [Read-Directed Compaction](/read-directed-compaction)) and lifts dead-space throughput per batch. The cost is peak gather RAM of roughly this many MiB per batch (more for a highly compressible seam, which is gathered whole), so treat it as a RAM dial.
+- **`compact_round_max_mib`** (default: 256, range: 64–4096): Per-round compaction budget in MiB, the heat reserve for nominations and hot seams (half the budget), and the stored-byte gather cap (frames stay compressed through relocation, so gather RAM tracks stored size whatever the data's compression ratio). Raising it packs hot seams whose cheapest pair exceeds the reserve (the *over-reserve* chains that otherwise never repack; see [Read-Directed Compaction](/read-directed-compaction)) and lifts dead-space throughput per batch. The cost is peak gather RAM of roughly this many MiB per batch (more when the leading seam chain alone exceeds the budget, since a chain is gathered whole), so treat it as a RAM dial.
 
 - **`read_directed`** (default: `true`): Whether reads steer compaction: the nomination priority, seam statistics, and chain repacks described under [Read-Directed Compaction](/read-directed-compaction). Turning it off stops all read-side recording; counter-driven reclamation and the tail scrub are unaffected.
 

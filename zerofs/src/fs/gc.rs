@@ -57,7 +57,7 @@ pub struct GcTuning {
     /// foreground idleness (the busy-store throughput floor).
     pub min_batches_per_pass: usize,
     /// Per-round live-byte budget (selection cap, half-reserve for heat, and
-    /// plaintext gather RAM cap). Raising it packs over-reserve seams and lifts
+    /// stored-byte gather cap). Raising it packs over-reserve seams and lifts
     /// per-batch dead-space throughput, at proportional gather RAM.
     pub round_bytes: u64,
     /// Whether reads feed compaction at all (nominations, seam heat, chains).

@@ -15,9 +15,11 @@ use slatedb::object_store::{
     GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, path::Path,
 };
 
-use crate::frame_codec::FrameCodec;
+use crate::frame_codec::{Compressed, FrameCodec};
 use crate::fs::inode::InodeId;
-use crate::segment::{DirEntry, FrameLoc, Segid, SegmentBuilder, SegmentError};
+use crate::segment::{
+    DirEntry, FrameLoc, Segid, SegmentBuilder, SegmentError, seal_compressed_batch,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentStoreError {
@@ -170,20 +172,41 @@ impl SegmentStore {
 
     /// Seal `frames` (each `(inode, extent, full-extent plaintext)`) into one new
     /// segment object, durable on return. Returns each frame's location.
+    #[allow(dead_code)] // production packs via seal_compressed; tests build plaintext worlds here
     pub async fn seal(
         &self,
         frames: &[(InodeId, u64, Bytes)],
     ) -> Result<Vec<(InodeId, u64, FrameLoc)>> {
+        let compressed = frames
+            .iter()
+            .map(|(id, extent, data)| {
+                let payload = self.codec.compress(data).map_err(SegmentError::from)?;
+                Ok((*id, *extent, payload))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.seal_compressed(compressed).await
+    }
+
+    /// As [`Self::seal`] for already-compressed payloads (relocated frames read
+    /// via [`Self::read_compressed_run`]): each re-seals under its new slot's
+    /// AAD, never decompressed, so compaction's memory tracks stored size. A
+    /// large batch's seals fan out on rayon ([`seal_compressed_batch`]); the
+    /// appends assign offsets in the same order.
+    pub async fn seal_compressed(
+        &self,
+        frames: Vec<(InodeId, u64, Compressed)>,
+    ) -> Result<Vec<(InodeId, u64, FrameLoc)>> {
         let segid = self.next_segid();
+        let sealed = seal_compressed_batch(&self.codec, segid, frames)?;
         let mut builder = SegmentBuilder::new(&self.codec, segid);
-        let mut locs = Vec::with_capacity(frames.len());
-        for (id, extent, data) in frames {
+        let mut locs = Vec::with_capacity(sealed.len());
+        for (id, extent, body) in sealed {
             let byte_offset = builder.byte_len();
-            let frame_index = builder.add_frame(*id, *extent, data.as_ref())?;
+            let frame_index = builder.append_sealed(id, extent, &body);
             let byte_len = (builder.byte_len() - byte_offset) as u32;
             locs.push((
-                *id,
-                *extent,
+                id,
+                extent,
                 FrameLoc {
                     segid,
                     frame_index,
@@ -222,15 +245,7 @@ impl SegmentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Vec<Bytes>> {
-        // A ranged GET of just this run's bytes; the parts cache (warmed at seal
-        // time) absorbs the re-read and read-after-write cases.
-        let path = Path::from(segid.object_key());
-        let region = self
-            .object_store
-            .get_range(&path, byte_offset..byte_offset + byte_len as u64)
-            .await
-            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        let region = self.read_run_region(segid, byte_offset, byte_len).await?;
         let frames = crate::segment::read_frames_from_region(
             &self.codec,
             &region,
@@ -239,6 +254,44 @@ impl SegmentStore {
             slots,
         )?;
         Ok(frames.into_iter().map(Bytes::from).collect())
+    }
+
+    /// As [`Self::read_run`] but AEAD-verify only, returning still-compressed
+    /// payloads for relocation (see [`Self::seal_compressed`]).
+    pub async fn read_compressed_run(
+        &self,
+        segid: Segid,
+        byte_offset: u64,
+        byte_len: u32,
+        first_frame: u32,
+        slots: &[(InodeId, u64)],
+    ) -> Result<Vec<Compressed>> {
+        let region = self.read_run_region(segid, byte_offset, byte_len).await?;
+        Ok(crate::segment::read_compressed_frames_from_region(
+            &self.codec,
+            &region,
+            segid,
+            first_frame,
+            slots,
+        )?)
+    }
+
+    /// One ranged GET of a frame run's bytes; the parts cache (warmed at seal
+    /// time) absorbs the re-read and read-after-write cases.
+    async fn read_run_region(
+        &self,
+        segid: Segid,
+        byte_offset: u64,
+        byte_len: u32,
+    ) -> Result<Bytes> {
+        let path = Path::from(segid.object_key());
+        let region = self
+            .object_store
+            .get_range(&path, byte_offset..byte_offset + byte_len as u64)
+            .await
+            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(region)
     }
 }
 

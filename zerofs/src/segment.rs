@@ -27,7 +27,7 @@
 #[cfg(test)]
 use bytes::Bytes;
 
-use crate::frame_codec::{CodecError, FrameCodec};
+use crate::frame_codec::{CodecError, Compressed, FrameCodec};
 
 /// HKDF info label for the data-plane segment subkey. Domain-separated from the
 /// block-transformer subkey so a block frame and a segment frame never share a key.
@@ -213,32 +213,40 @@ impl<'a> SegmentBuilder<'a> {
 
     /// Seal `plaintext` for logical block `(inode, extent)` and append it.
     /// Returns the frame's index within the segment.
+    #[allow(dead_code)] // production packs via seal_compressed_batch; tests build plaintext worlds here
     pub fn add_frame(
         &mut self,
         inode: u64,
         extent: u64,
         plaintext: &[u8],
     ) -> Result<u32, SegmentError> {
-        let frame_index = self.dir.len() as u32;
         let sealed = seal_frame(
             self.codec,
             self.segid,
-            frame_index,
+            self.dir.len() as u32,
             inode,
             extent,
             plaintext,
         )?;
+        Ok(self.append_sealed(inode, extent, &sealed))
+    }
+
+    /// Append a frame body sealed under this builder's segid and the index
+    /// this append assigns (`dir.len()`); a batch pre-sealed by
+    /// [`seal_compressed_batch`] knows both upfront.
+    pub fn append_sealed(&mut self, inode: u64, extent: u64, sealed: &[u8]) -> u32 {
+        let frame_index = self.dir.len() as u32;
         let byte_offset = self.buf.len() as u64;
         let len = sealed.len() as u32;
         self.buf.extend_from_slice(&len.to_le_bytes());
-        self.buf.extend_from_slice(&sealed);
+        self.buf.extend_from_slice(sealed);
         self.dir.push(DirEntry {
             byte_offset,
             len,
             inode,
             extent,
         });
-        Ok(frame_index)
+        frame_index
     }
 
     /// Finalize the segment bytes: append the sealed directory and the footer.
@@ -256,6 +264,7 @@ impl<'a> SegmentBuilder<'a> {
 /// Compress+encrypt one extent into a sealed frame body (no length prefix), bound
 /// to its `(segid, frame_index, inode, extent)` AAD. Shared by [`SegmentBuilder`]
 /// and the data plane's open-segment buffer.
+#[allow(dead_code)] // reached only from the test-only plaintext seal path (add_frame)
 pub(crate) fn seal_frame(
     codec: &FrameCodec,
     segid: Segid,
@@ -270,16 +279,32 @@ pub(crate) fn seal_frame(
 /// [`seal_frame`] over an already-compressed payload. The write path compresses
 /// outside the open-segment lock (compression is the expensive half of the codec
 /// and is independent of the AAD) and binds `(segid, frame_index)` here, under
-/// the lock that assigns them.
+/// the lock that assigns them. Compaction feeds it [`open_compressed_frame`]'s
+/// output to relocate a frame without a decompress/recompress round trip.
 pub(crate) fn seal_compressed_frame(
     codec: &FrameCodec,
     segid: Segid,
     frame_index: u32,
     inode: u64,
     extent: u64,
-    compressed: Vec<u8>,
+    compressed: Compressed,
 ) -> Result<Vec<u8>, SegmentError> {
     Ok(codec.seal_compressed(compressed, &frame_aad(segid, frame_index, inode, extent))?)
+}
+
+/// Decrypt (verifying the frame's `(segid, frame_index, inode, extent)` AAD) a
+/// sealed frame body into its still-compressed payload, for relocation: the
+/// payload re-seals under a new slot's AAD via [`seal_compressed_frame`] without
+/// the plaintext ever being materialized.
+pub(crate) fn open_compressed_frame(
+    codec: &FrameCodec,
+    segid: Segid,
+    frame_index: u32,
+    inode: u64,
+    extent: u64,
+    sealed: &[u8],
+) -> Result<Compressed, SegmentError> {
+    Ok(codec.open_compressed(sealed, &frame_aad(segid, frame_index, inode, extent))?)
 }
 
 /// Seal the segment directory into its AEAD frame. The one fallible step of
@@ -535,10 +560,11 @@ impl Segment {
     }
 }
 
-/// Stored bytes in a run before decode fans out on rayon. The per-frame AEAD
-/// verify tracks stored size, not frame count, so gate on bytes: rayon's
-/// dispatch floor plus block_in_place only pay off on large runs.
-const PARALLEL_OPEN_MIN_BYTES: usize = 1024 * 1024;
+/// Stored bytes in a run or batch before the per-frame AEAD (verify or seal)
+/// fans out on rayon. The cipher's cost tracks stored size, not frame count,
+/// so gate on bytes: rayon's dispatch floor plus block_in_place only pay off
+/// on large runs.
+const PARALLEL_CRYPTO_MIN_BYTES: usize = 1024 * 1024;
 
 /// One frame's byte range within the region plus its AAD inputs (absolute frame
 /// index, inode, extent).
@@ -574,36 +600,28 @@ fn parse_spans(
     Ok(spans)
 }
 
-/// AEAD verify + decompress is a pure function per frame, so a large
-/// coalesced run decodes across cores. `parallel` is the caller's threshold
-/// decision; even when set, block_in_place needs the multi-thread runtime
-/// (current-thread runtimes decode inline), and with no runtime at all (unit
-/// tests, sync callers) rayon runs directly.
-fn open_spans(
-    codec: &FrameCodec,
-    region: &[u8],
-    segid: Segid,
+/// The per-span AEAD open (verify + decompress, or verify only) is a pure
+/// function, so a large coalesced run decodes across cores. `parallel` is the
+/// caller's threshold decision; even when set, block_in_place needs the
+/// multi-thread runtime (current-thread runtimes decode inline), and with no
+/// runtime at all (unit tests, sync callers) rayon runs directly.
+fn open_spans<T: Send>(
     spans: &[FrameSpan],
     parallel: bool,
-) -> Result<Vec<Vec<u8>>, SegmentError> {
-    let open = |(range, fi, inode, extent): &FrameSpan| -> Result<Vec<u8>, SegmentError> {
-        Ok(codec.open(
-            &region[range.clone()],
-            &frame_aad(segid, *fi, *inode, *extent),
-        )?)
-    };
+    open: impl Fn(&FrameSpan) -> Result<T, SegmentError> + Sync,
+) -> Result<Vec<T>, SegmentError> {
     if !parallel {
-        return spans.iter().map(open).collect();
+        return spans.iter().map(&open).collect();
     }
     let run = || {
         use rayon::prelude::*;
-        spans.par_iter().map(open).collect::<Result<Vec<_>, _>>()
+        spans.par_iter().map(&open).collect::<Result<Vec<_>, _>>()
     };
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(run)
         }
-        Ok(_) => spans.iter().map(open).collect(),
+        Ok(_) => spans.iter().map(&open).collect(),
         Err(_) => run(),
     }
 }
@@ -618,8 +636,72 @@ pub(crate) fn read_frames_from_region(
     slots: &[(u64, u64)],
 ) -> Result<Vec<Vec<u8>>, SegmentError> {
     let spans = parse_spans(region, first_frame, slots)?;
-    let parallel = region.len() >= PARALLEL_OPEN_MIN_BYTES;
-    open_spans(codec, region, segid, &spans, parallel)
+    let parallel = region.len() >= PARALLEL_CRYPTO_MIN_BYTES;
+    open_spans(&spans, parallel, |(range, fi, inode, extent)| {
+        Ok(codec.open(
+            &region[range.clone()],
+            &frame_aad(segid, *fi, *inode, *extent),
+        )?)
+    })
+}
+
+/// As [`read_frames_from_region`] but AEAD-verify only, returning each frame's
+/// still-compressed payload. The relocation (compaction) read: the payloads
+/// re-seal under their new slots' AADs without a decompress/recompress round
+/// trip, so gather memory tracks stored size, not the compression ratio.
+pub(crate) fn read_compressed_frames_from_region(
+    codec: &FrameCodec,
+    region: &[u8],
+    segid: Segid,
+    first_frame: u32,
+    slots: &[(u64, u64)],
+) -> Result<Vec<Compressed>, SegmentError> {
+    let spans = parse_spans(region, first_frame, slots)?;
+    let parallel = region.len() >= PARALLEL_CRYPTO_MIN_BYTES;
+    open_spans(&spans, parallel, |(range, fi, inode, extent)| {
+        open_compressed_frame(codec, segid, *fi, *inode, *extent, &region[range.clone()])
+    })
+}
+
+/// [`seal_compressed_frame`] over a whole batch destined for a fresh segment:
+/// frame `i` gets index `i`, so every AAD is known upfront and the seals are
+/// independent pure functions. A batch past [`PARALLEL_CRYPTO_MIN_BYTES`]
+/// stored bytes encrypts across cores, under the same dispatch rules as
+/// [`open_spans`].
+pub(crate) fn seal_compressed_batch(
+    codec: &FrameCodec,
+    segid: Segid,
+    frames: Vec<(u64, u64, Compressed)>,
+) -> Result<Vec<(u64, u64, Vec<u8>)>, SegmentError> {
+    let seal_one = |(i, (inode, extent, compressed)): (usize, (u64, u64, Compressed))| {
+        Ok((
+            inode,
+            extent,
+            seal_compressed_frame(codec, segid, i as u32, inode, extent, compressed)?,
+        ))
+    };
+    let stored: usize = frames.iter().map(|(_, _, c)| c.len()).sum();
+    // Decided before `frames` moves into the rayon closure.
+    let offload = stored >= PARALLEL_CRYPTO_MIN_BYTES
+        && match tokio::runtime::Handle::try_current() {
+            Ok(h) => h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+            Err(_) => true,
+        };
+    if !offload {
+        return frames.into_iter().enumerate().map(seal_one).collect();
+    }
+    let run = move || {
+        use rayon::prelude::*;
+        frames
+            .into_par_iter()
+            .enumerate()
+            .map(seal_one)
+            .collect::<Result<Vec<_>, _>>()
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(run),
+        Err(_) => run(),
+    }
 }
 
 #[cfg(test)]
@@ -631,33 +713,22 @@ mod tests {
         FrameCodec::new(&[5u8; 32], SEGMENT_INFO, CompressionConfig::Zstd(3))
     }
 
-    // A run past PARALLEL_OPEN_MIN_BYTES decodes on rayon and must roundtrip with the
-    // per-frame AADs intact and in order. Content is incompressible so the stored
-    // run clears the byte gate (compressible frames would shrink below it and take
-    // the serial path, defeating the test).
+    // A run past PARALLEL_CRYPTO_MIN_BYTES decodes on rayon and must roundtrip with
+    // the per-frame AADs intact and in order. Content is incompressible so the
+    // stored run clears the byte gate (compressible frames would shrink below it
+    // and take the serial path, defeating the test).
     #[test]
     fn large_run_roundtrips_through_parallel_decode() {
         let c = codec();
         let segid = Segid::new(3, 9);
-        let incompressible = |seed: u64| -> Vec<u8> {
-            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-            (0..32 * 1024)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    x as u8
-                })
-                .collect()
-        };
-        let n = (PARALLEL_OPEN_MIN_BYTES / (32 * 1024) + 8) as u64;
+        let n = (PARALLEL_CRYPTO_MIN_BYTES / (32 * 1024) + 8) as u64;
         let frames: Vec<(u64, u64, Vec<u8>)> =
             (0..n).map(|i| (7, i, incompressible(i + 1))).collect();
         let bytes = build(&c, segid, &frames);
         let seg = Segment::parse(Bytes::from(bytes)).unwrap();
         // The frame region is the gate input; assert it actually crosses so this
         // exercises the parallel branch, not the serial fallback.
-        assert!(seg.dir_offset as usize >= PARALLEL_OPEN_MIN_BYTES);
+        assert!(seg.dir_offset as usize >= PARALLEL_CRYPTO_MIN_BYTES);
         let slots: Vec<(u64, u64)> = frames.iter().map(|(ino, ext, _)| (*ino, *ext)).collect();
         let got = seg
             .read_range(&c, 0, seg.dir_offset as u32, 0, &slots)
@@ -665,6 +736,62 @@ mod tests {
         for ((_, _, want), got) in frames.iter().zip(&got) {
             assert_eq!(want, got);
         }
+    }
+
+    // The relocation crypto (verify-only read, rebind-only batch seal) past the
+    // same byte gate fans out on rayon and must preserve order and AADs:
+    // batch-seal compressed extents into segment A, read the packed region back
+    // verify-only, re-seal into segment B, and open each under B's AADs.
+    #[test]
+    fn large_relocation_batch_roundtrips_through_parallel_crypto() {
+        let c = codec();
+        let (seg_a, seg_b) = (Segid::new(3, 10), Segid::new(3, 11));
+        let n = (PARALLEL_CRYPTO_MIN_BYTES / (32 * 1024) + 8) as u64;
+        let plains: Vec<(u64, u64, Vec<u8>)> =
+            (0..n).map(|i| (7, i, incompressible(i + 1))).collect();
+        let batch: Vec<(u64, u64, Compressed)> = plains
+            .iter()
+            .map(|(ino, ext, p)| (*ino, *ext, c.compress(p).unwrap()))
+            .collect();
+        assert!(batch.iter().map(|(_, _, p)| p.len()).sum::<usize>() >= PARALLEL_CRYPTO_MIN_BYTES);
+        let sealed = seal_compressed_batch(&c, seg_a, batch).unwrap();
+        let mut b = SegmentBuilder::new(&c, seg_a);
+        for (ino, ext, body) in &sealed {
+            b.append_sealed(*ino, *ext, body);
+        }
+        let raw = b.finish(10).unwrap();
+        let seg = Segment::parse(Bytes::from(raw.clone())).unwrap();
+        let slots: Vec<(u64, u64)> = plains.iter().map(|(ino, ext, _)| (*ino, *ext)).collect();
+        let got = read_compressed_frames_from_region(
+            &c,
+            &raw[..seg.dir_offset as usize],
+            seg_a,
+            0,
+            &slots,
+        )
+        .unwrap();
+        let rebatch: Vec<(u64, u64, Compressed)> = slots
+            .iter()
+            .zip(got)
+            .map(|(&(ino, ext), p)| (ino, ext, p))
+            .collect();
+        let resealed = seal_compressed_batch(&c, seg_b, rebatch).unwrap();
+        for (i, ((ino, ext, body), (_, _, want))) in resealed.iter().zip(&plains).enumerate() {
+            let aad = frame_aad(seg_b, i as u32, *ino, *ext);
+            assert_eq!(&c.open(body, &aad).unwrap(), want);
+        }
+    }
+
+    fn incompressible(seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..32 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
     }
 
     fn sample_frames() -> Vec<(u64, u64, Vec<u8>)> {
