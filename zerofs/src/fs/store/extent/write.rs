@@ -105,6 +105,8 @@ impl ExtentStore {
             .collect()
     }
 
+    /// Stage the extent-key delete only: the segment-counter debit is the
+    /// caller's job (see [`Self::delete_range`], which debits as it scans).
     pub fn delete(&self, txn: &mut Transaction, id: InodeId, extent_idx: u64) {
         let key = self.key_codec.extent_key(id, extent_idx);
         txn.delete_bytes(&key);
@@ -127,6 +129,7 @@ impl ExtentStore {
         );
     }
 
+    /// Stage deletes for extents `[start, end)` with their live-byte debits.
     pub async fn delete_range(
         &self,
         txn: &mut Transaction,
@@ -414,6 +417,9 @@ impl ExtentStore {
         });
     }
 
+    /// Stage a write at `offset` as read-modify-write over full extents;
+    /// all-zero extents become holes. Commits nothing itself: the returned
+    /// [`TailUpdate`] must be applied only after the txn commits.
     pub async fn write(
         &self,
         txn: &mut Transaction,
@@ -512,6 +518,8 @@ impl ExtentStore {
         })
     }
 
+    /// Stage a shrink to `new_size` (growth is a no-op: extension is sparse):
+    /// drops extents past the end and zero-fills the partial last one.
     pub async fn truncate(
         &self,
         txn: &mut Transaction,
@@ -546,6 +554,8 @@ impl ExtentStore {
         Ok(())
     }
 
+    /// Stage zeroes over `[offset, offset + length)` capped at `file_size`:
+    /// fully-covered extents become holes, partial ones are RMW-zeroed.
     pub async fn zero_range(
         &self,
         txn: &mut Transaction,
