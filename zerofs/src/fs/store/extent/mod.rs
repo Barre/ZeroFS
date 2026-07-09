@@ -197,6 +197,10 @@ pub struct ExtentStore {
     /// commit. Reclaim takes the exclusive side before seal+flush+cutoff, which
     /// drains every publisher that could still reference the segment it seals.
     segment_publish_barrier: Arc<SegmentPublishBarrier>,
+    /// Serializes appends through threshold-triggered rotation. The writer that
+    /// crosses the threshold keeps this gate while waiting for a seal permit,
+    /// so later writers cannot keep extending an overdue open segment.
+    append_gate: Arc<tokio::sync::Mutex<()>>,
     /// Finalized bytes of segments whose PUT is in flight (or failed and pending a
     /// re-PUT). Reads consult these before the object store. Ordered so the
     /// barrier's re-PUT sequence is deterministic (seal order).
@@ -273,6 +277,7 @@ impl ExtentStore {
             codec,
             open,
             segment_publish_barrier: Arc::new(SegmentPublishBarrier::new()),
+            append_gate: Arc::new(tokio::sync::Mutex::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_SEALS)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
