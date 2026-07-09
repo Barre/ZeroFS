@@ -122,6 +122,10 @@ impl ExtentStore {
         live_delta: i64,
         total_delta: i64,
     ) {
+        debug_assert!(
+            total_delta <= 0 || txn.has_segment_publish_guard(),
+            "a positive segment credit must remain publication-protected through commit"
+        );
         txn.add_seg_delta(
             &self.key_codec.segcount_key(segid.epoch, segid.counter),
             live_delta,
@@ -225,6 +229,11 @@ impl ExtentStore {
                 .map_err(|_| FsError::IoError)?
         };
         let mut compressed = compressed.into_iter();
+        if edits.iter().any(|(_, edit)| edit.is_some()) {
+            // Must precede assignment under `open`: once the lock is released,
+            // GC may try to seal this segment and must see this publisher.
+            self.protect_segment_publish(txn).await;
+        }
         {
             let mut open = self.open.lock().unwrap();
             for (extent, edit) in edits {

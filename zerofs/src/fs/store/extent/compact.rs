@@ -15,6 +15,7 @@ use crate::segment::{FrameLoc, Segid};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Live frames evacuated from candidates are repacked into segments of this
@@ -360,6 +361,11 @@ impl ExtentStore {
         batch: Vec<(InodeId, u64, Compressed)>,
         src: &[FrameLoc],
     ) -> Result<usize, FsError> {
+        // A packed object is another future FrameLoc source. Although the
+        // production GC task is single-threaded, protect it with the same
+        // invariant as foreground writes so future concurrent callers cannot
+        // make it eligible before its repoints commit.
+        let publish_guard = self.new_segment_publish_guard().await;
         let batch_len = batch.len();
         let new_locs = self
             .segments
@@ -393,6 +399,7 @@ impl ExtentStore {
             }
             let _guard = self.lock_manager.acquire(inode).await;
             let mut txn = self.db.new_transaction()?;
+            txn.hold_segment_publish_guard(Arc::clone(&publish_guard));
             let mut any = false;
             for (extent, old_loc, new_loc) in items {
                 let key = self.key_codec.extent_key(inode, extent);
