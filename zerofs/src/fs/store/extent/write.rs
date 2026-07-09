@@ -225,6 +225,10 @@ impl ExtentStore {
                 .map_err(|_| FsError::IoError)?
         };
         let mut compressed = compressed.into_iter();
+        // Keep later writers from appending once this writer discovers that a
+        // rotation is due. In particular, this guard stays held while
+        // spawn_seal waits for an in-flight-seal permit.
+        let _append_guard = self.append_gate.lock().await;
         {
             let mut open = self.open.lock().unwrap();
             for (extent, edit) in edits {
@@ -960,6 +964,83 @@ mod tests {
             store.read(1, 0, n as u64).await.unwrap().as_ref(),
             model.as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn saturated_seals_backpressure_before_later_writers_append() {
+        let (store, db) = make().await;
+        store.set_seal_threshold(1);
+
+        // Model four slow object-store PUTs by holding every seal permit. The
+        // first writer can append, but then has to wait before rotating.
+        let permits = store
+            .seal_sem
+            .clone()
+            .acquire_many_owned(MAX_INFLIGHT_SEALS as u32)
+            .await
+            .unwrap();
+        let first = tokio::spawn({
+            let store = store.clone();
+            let db = db.clone();
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                store
+                    .write(&mut txn, 100, 0, &Bytes::from_static(b"a"), 0)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store.open.lock().unwrap().dir.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first writer did not reach the seal-permit wait");
+
+        let second = tokio::spawn({
+            let store = store.clone();
+            let db = db.clone();
+            async move {
+                let mut txn = db.new_transaction().unwrap();
+                store
+                    .write(&mut txn, 101, 0, &Bytes::from_static(b"b"), 0)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let appended_behind_blocked_seal =
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                loop {
+                    if store.open.lock().unwrap().dir.len() > 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+        assert!(
+            !appended_behind_blocked_seal,
+            "a later writer grew the open segment while rotation was blocked"
+        );
+        assert!(!second.is_finished());
+
+        drop(permits);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            first.await.unwrap();
+            second.await.unwrap();
+            while !store.seals_quiet() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writers did not resume after seal permits were released");
     }
 
     #[tokio::test]
