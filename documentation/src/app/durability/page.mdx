@@ -360,35 +360,41 @@ This verifies that the atomicity and ordering guarantees hold at each injected c
 
 ## Deterministic Simulation Testing
 
-The data plane (the extent store, segment garbage collection, and crash recovery) also runs under deterministic simulation. A simulated world executes on a single-threaded runtime with virtual time: every object-store operation is assigned a pseudo-random latency from a seeded generator, and those latencies decide the order in which concurrent tasks wake. One seed defines one exact schedule, hours of simulated activity execute in seconds, and the same seed replays the same run. Seeds are drawn fresh from OS entropy on every run and printed, so repeated runs accumulate coverage and any failure is reproducible from its printed seed. A companion test replays one seed and compares the two runs' complete execution traces, so replay determinism is itself under test.
+The data path, namespace mutations, segment garbage collection, compaction, and crash recovery also run under deterministic simulation. A simulated world executes on a single-threaded runtime with virtual time: every object-store operation is assigned a pseudo-random latency from a seeded generator, and those latencies decide the order in which concurrent tasks wake. One seed defines one exact schedule, hours of simulated activity execute in seconds, and the same seed replays the same run. Seeds are drawn fresh from OS entropy on every run and printed, so repeated runs accumulate coverage and any failure is reproducible from its printed seed. A companion test replays one seed and compares the two runs' complete execution traces, so replay determinism is itself under test.
 
-Each world runs concurrent writers (writes, truncates, verified reads, whole-file scans, fsyncs) against live garbage-collection passes, over an in-memory object store in the production durability configuration and behind the production retry layer. Some worlds also inject seeded transient store faults, including puts and deletes whose effect lands but whose response is lost, so retries collide with their own already-applied writes. At a seeded instant the world crashes mid-flight. Every task is cancelled at whatever await point it happens to occupy, the store rejects all in-flight I/O (a dead process completes no writes), and a fresh instance recovers from the surviving objects.
+Each world races ordinary file writers (writes, truncates, hole punches, verified reads, whole-file scans, and fsyncs), two disjoint-region writers on one shared inode, a namespace actor, and live garbage-collection passes. The namespace actor creates and removes files and directories, mutates file content, renames and overwrites entries, creates hardlinks, symlinks, and special nodes, retries idempotent creates, and exercises open-unlink reclamation. The world runs over an in-memory object store in the production durability configuration and behind the production retry layer. Some worlds also inject seeded transient store faults, including puts and deletes whose effect lands but whose response is lost, so retries collide with their own already-applied writes. At a seeded instant the world crashes mid-flight. Every task is cancelled at whatever await point it happens to occupy, the store rejects all in-flight I/O (a dead process completes no writes), and a fresh instance recovers from the surviving objects.
 
 At every quiesced point and after every crash, the state must satisfy a model-based oracle:
 
-1. Each file's content equals the replay of some prefix of its acknowledged operation history, no older than the last acknowledged fsync. One in-flight operation of unknown fate is permitted at the cut.
-2. Every referenced extent still resolves: the filesystem is re-read in full, so a dangling frame pointer or a wrongly deleted segment surfaces immediately. The extent-key set must match the model: every extent with data has a key and no key exists beyond EOF.
-3. The accounting reconciles: each segment counter equals the byte sum of the extent pointers referencing it, and the incremental footprint gauges match an authoritative scan.
-4. The full consistency checker passes, including the stats counters behind statfs.
+1. Each ordinary file and shared-inode region equals the replay of an operation prefix no older than the last acknowledged fsync. One in-flight operation of unknown fate is permitted per actor at the cut, and the shared file's durable size is fixed.
+2. The namespace tree is structurally isomorphic to a prefix of its operation log: paths, node kinds and values, file contents, and hardlink identity must all match.
+3. Every referenced extent still resolves: the filesystem is re-read in full, so a dangling frame pointer or a wrongly deleted segment surfaces immediately. Modeled data files also require a key for every nonzero extent and reject keys beyond EOF.
+4. Segment accounting reconciles through typed snapshots: each counter's live bytes equal the byte sum of the extent pointers referencing it, live bytes never exceed appended bytes, and every referenced segment has a counter.
+5. All incremental footprint gauges (segment count, appended bytes, live bytes, and reclaimable bytes) equal an authoritative scan.
+6. The full consistency checker passes, including directory and link invariants, extent readability and EOF bounds, orphan metadata, inode and directory-cookie counters, and the global stats behind statfs.
 
 Garbage-collection passes run with seeded per-pass tuning so the rarely-taken paths execute too: checkpoint-pinned passes, the write-cold gates (tail scrub, chain compaction), small round budgets that exercise the gather caps, and multi-batch drains.
 
 A companion mode composes the simulation with failpoints. Some windows are too narrow for a timer to land in (a read-decide-act gap with no await inside it), so each round can arm a failpoint that crashes the world at that exact code point, and can widen such a gap by a few virtual milliseconds so concurrent commits land inside it before the code acts. This combination reproduces historical bugs whose window is the space between a garbage-collection decision and the irreversible action it drives. The failpoint suite remains alongside as the deterministic pointwise guard for each window.
 
-The simulation is part of the plain test suite: `cargo test` runs it alongside the unit tests. A scheduled job additionally soaks fresh seeds for 50 minutes every hour, so schedule coverage accumulates continuously.
+CI runs the simulation as a dedicated test target with the required SlateDB and Tokio configuration flags. A scheduled job additionally soaks fresh seeds for 50 minutes every hour.
 
 ```bash {{ title: 'Running the simulation' }}
-cargo test --test dst
+export DST_RUSTFLAGS="--cfg dst --cfg tokio_unstable --cfg io_uring_skip_arch_check"
+RUSTFLAGS="$DST_RUSTFLAGS" cargo test --test dst
 
 # A timed soak: fresh random seeds, fanned across all cores, until the
 # budget elapses. Scale depth with DST_ROUNDS / DST_OPS / DST_CRASH_PCT.
-DST_WALL_CLOCK_SECS=3600 cargo test --test dst -- --nocapture seeds
+DST_WALL_CLOCK_SECS=3600 RUSTFLAGS="$DST_RUSTFLAGS" \
+  cargo test --test dst -- --nocapture seeds
 
 # Failpoint-placed crashes and widened windows
-cargo test --features failpoints --test dst crash_points
+RUSTFLAGS="$DST_RUSTFLAGS" \
+  cargo test --features failpoints --test dst crash_points
 
 # Reproduce a failure from its printed seed
-DST_SEEDS=16039913183294875603 cargo test --test dst -- --nocapture
+DST_SEEDS=16039913183294875603 RUSTFLAGS="$DST_RUSTFLAGS" \
+  cargo test --test dst -- --nocapture
 ```
 
 ## Continuous Integration Testing
@@ -437,7 +443,7 @@ This test validates data integrity through multiple filesystem layers and across
 |------------|----------|----------|
 | Unit tests | n/a | Core filesystem logic |
 | Failpoint crash tests | n/a | Crash consistency at each operation stage |
-| Deterministic simulation | n/a | Data-plane schedules and mid-flight crashes under randomized interleaving, with exact replay |
+| Deterministic simulation | n/a | Data and namespace models, GC/compaction schedules, accounting invariants, and mid-flight crash recovery with exact replay |
 | Jepsen (local-fs) | 9P | Model-based correctness, crash consistency |
 | pjdfstest | NFS, 9P, FUSE | POSIX compliance |
 | stress-ng | NFS, 9P, FUSE | Concurrent operations under load |
