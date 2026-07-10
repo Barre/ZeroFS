@@ -123,7 +123,7 @@ impl ExtentStore {
         total_delta: i64,
     ) {
         debug_assert!(
-            total_delta <= 0 || txn.has_segment_publish_guard(),
+            total_delta <= 0 || txn.has_extent_ref_guard(),
             "a positive segment credit must remain publication-protected through commit"
         );
         txn.add_seg_delta(
@@ -230,9 +230,8 @@ impl ExtentStore {
         };
         let mut compressed = compressed.into_iter();
         if edits.iter().any(|(_, edit)| edit.is_some()) {
-            // Must precede assignment under `open`: once the lock is released,
-            // GC may try to seal this segment and must see this publisher.
-            self.protect_segment_publish(txn).await;
+            // Must precede FrameLoc assignment under `open`.
+            self.protect_extent_ref(txn).await;
         }
         // Keep later writers from appending once this writer discovers that a
         // rotation is due. In particular, this guard stays held while

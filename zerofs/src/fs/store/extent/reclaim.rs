@@ -230,13 +230,10 @@ impl ExtentStore {
             >,
         K: Fn(usize) -> bool,
     {
-        // Drain FrameLoc publishers before sealing: their shared publication
-        // guards were acquired before assignment and live through commit, so
-        // once this exclusive guard lands no segment below the captured cutoff
-        // can gain a reference later. Acquire it before the DB flush barrier:
-        // publishers hold publication-read and acquire DB-read at commit.
+        // Drain FrameLoc publishers before seal+flush+cutoff. Lock order matches
+        // the commit path: extent-reference barrier, then DB flush barrier.
         let (cur_epoch, cutoff) = {
-            let _publishers = self.segment_publish_barrier.close_and_drain().await;
+            let _refs = self.extent_ref_barrier.clone().write_owned().await;
             let _barrier = self.db.flush_barrier().write_owned().await;
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
@@ -827,11 +824,10 @@ impl ExtentStore {
     /// can't leave a not-yet-credited packed segment eligible. Returns the
     /// number of orphans reclaimed.
     pub async fn sweep_orphans(&self, modified_before: DateTime<Utc>) -> Result<usize, FsError> {
-        // Same publisher drain + lock order as the fast reclaim. Capture the
-        // cutoff while staging is still excluded; after release, new frames can
-        // only target that cutoff or newer and are therefore ineligible here.
+        // Use the fast-reclaim barrier order and capture the cutoff while new
+        // FrameLoc publishers are excluded.
         let (cur_epoch, cutoff) = {
-            let _publishers = self.segment_publish_barrier.close_and_drain().await;
+            let _refs = self.extent_ref_barrier.clone().write_owned().await;
             let _barrier = self.db.flush_barrier().write_owned().await;
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
@@ -1080,29 +1076,25 @@ mod tests {
         let expected = Bytes::from(vec![7u8; 1000]);
         let mut pending = db.new_transaction().unwrap();
         store.write(&mut pending, 2, 0, &expected, 0).await.unwrap();
-        assert!(pending.has_segment_publish_guard());
+        assert!(pending.has_extent_ref_guard());
+        assert!(
+            store.extent_ref_barrier.try_write().is_err(),
+            "the staged FrameLoc must hold the reference-read side"
+        );
 
         // With an already-expired horizon this pass would previously seal the
         // segment, observe live=0/no pointer, and delete it before `pending`
-        // committed. It must now wait at the publication barrier.
+        // committed. It must now block on the reference-write barrier.
         let reclaim_store = store.clone();
-        let reclaim = tokio::spawn(async move {
+        let mut reclaim = tokio::spawn(async move {
             reclaim_store
                 .reclaim_segments(Utc::now() - chrono::Duration::days(1), None)
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if store.segment_publish_barrier.state.lock().unwrap().closed {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("reclaim reaches and closes the publication barrier");
         assert!(
-            !reclaim.is_finished(),
+            tokio::time::timeout(Duration::from_millis(50), &mut reclaim)
+                .await
+                .is_err(),
             "reclaim crossed the barrier while a FrameLoc publisher was outstanding"
         );
 
