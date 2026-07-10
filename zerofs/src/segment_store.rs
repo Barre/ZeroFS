@@ -6,19 +6,22 @@
 //! The counter is per-instance (reset each process open); epoch namespacing is
 //! what keeps two writer terms from colliding on an object key.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
-    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, path::Path,
+    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
 use crate::fs::inode::InodeId;
 use crate::segment::{
-    DirEntry, FrameLoc, Segid, SegmentBuilder, SegmentError, seal_compressed_batch,
+    DirEntry, FOOTER_LEN, FrameLoc, LEN_PREFIX, Segid, SegmentBuilder, SegmentError,
+    seal_compressed_batch,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -416,11 +419,108 @@ pub struct ReconFrame {
     pub bytes: Bytes,
 }
 
-/// Materialize a segment object from shipped frames, unless it is already on the
-/// store (HEAD-guard — never overwrite a leader-sealed object, which may include
-/// frames the standby never received). Each frame's raw `[len][sealed]` bytes go
-/// back at their original `byte_offset`, so the replayed `FrameLoc`s resolve.
-/// Returns whether a PUT happened. HA-takeover only.
+/// Confirm that an object which won a concurrent create contains every frame the
+/// takeover is about to reference. The existing object may be the old leader's
+/// full seal (a superset of the replay tail), but it must agree on both the
+/// authenticated directory entry and exact sealed bytes of each required frame.
+async fn verify_existing_recon_segment(
+    object_store: &Arc<dyn ObjectStore>,
+    codec: &FrameCodec,
+    segid: Segid,
+    frames: &[ReconFrame],
+) -> Result<()> {
+    let path = Path::from(segid.object_key());
+    let footer_result = object_store
+        .get_opts(
+            &path,
+            GetOptions {
+                range: Some(GetRange::Suffix(FOOTER_LEN as u64)),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+    let object_size = footer_result.meta.size;
+    let footer = footer_result
+        .bytes()
+        .await
+        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+    let meta = crate::segment::parse_footer(&footer, object_size)?;
+    if meta.segid != segid {
+        return Err(SegmentError::SegidMismatch {
+            expected: segid,
+            found: meta.segid,
+        }
+        .into());
+    }
+    let dir_bytes = object_store
+        .get_range(
+            &path,
+            meta.dir_offset..meta.dir_offset + meta.dir_len as u64,
+        )
+        .await
+        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+    let dir: HashSet<_> = crate::segment::decode_directory(codec, &dir_bytes, &footer, &meta)?
+        .into_iter()
+        .map(|entry| (entry.byte_offset, entry.len, entry.inode, entry.extent))
+        .collect();
+
+    for frame in frames {
+        let body_len = frame
+            .byte_len
+            .checked_sub(LEN_PREFIX as u32)
+            .ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "shipped frame is shorter than its length prefix for {segid:?}"
+                ))
+            })?;
+        if !dir.contains(&(frame.byte_offset, body_len, frame.inode, frame.extent)) {
+            return Err(SegmentStoreError::ObjectStore(format!(
+                "existing segment {segid:?} is missing replayed frame {} for inode {} extent {}",
+                frame.frame_index, frame.inode, frame.extent
+            )));
+        }
+    }
+    // The conflict path is uncommon but may carry a full segment's worth of
+    // replay frames. Verify their ranges with bounded concurrency rather than
+    // adding one object-store round trip at a time to takeover latency.
+    futures::stream::iter(frames)
+        .map(|frame| {
+            let path = &path;
+            async move {
+                let end = frame
+                    .byte_offset
+                    .checked_add(frame.byte_len as u64)
+                    .ok_or_else(|| {
+                        SegmentStoreError::ObjectStore(format!(
+                            "shipped frame range overflows for {segid:?}"
+                        ))
+                    })?;
+                let existing = object_store
+                    .get_range(path, frame.byte_offset..end)
+                    .await
+                    .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+                if existing != frame.bytes {
+                    return Err(SegmentStoreError::ObjectStore(format!(
+                        "existing segment {segid:?} disagrees with replayed frame {} for inode {} extent {}",
+                        frame.frame_index, frame.inode, frame.extent
+                    )));
+                }
+                Ok(())
+            }
+        })
+        .buffer_unordered(SEAL_UPLOAD_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
+}
+
+/// Materialize a segment object from shipped frames unless another complete
+/// object already owns the immutable key. The create is atomic: a delayed old
+/// leader seal can win, but takeover never overwrites it with a possibly partial
+/// reconstruction. Each frame's raw `[len][sealed]` bytes go back at its
+/// original `byte_offset`, so the replayed `FrameLoc`s resolve. Returns whether
+/// this call created the object. HA-takeover only.
 pub async fn materialize_segment_if_absent(
     object_store: &Arc<dyn ObjectStore>,
     codec: &FrameCodec,
@@ -431,21 +531,28 @@ pub async fn materialize_segment_if_absent(
         return Ok(false);
     }
     let path = Path::from(segid.object_key());
-    match object_store.head(&path).await {
-        Ok(_) => return Ok(false),
-        Err(slatedb::object_store::Error::NotFound { .. }) => {}
-        Err(e) => return Err(SegmentStoreError::ObjectStore(e.to_string())),
-    }
-    let end = frames
-        .iter()
-        .map(|f| f.byte_offset + f.byte_len as u64)
-        .max()
-        .unwrap_or(0) as usize;
+    let end = frames.iter().try_fold(0u64, |end, frame| {
+        let frame_end = frame
+            .byte_offset
+            .checked_add(frame.byte_len as u64)
+            .ok_or_else(|| {
+                SegmentStoreError::ObjectStore(format!(
+                    "shipped frame range overflows for {segid:?}"
+                ))
+            })?;
+        Ok::<_, SegmentStoreError>(end.max(frame_end))
+    })?;
+    let end = usize::try_from(end).map_err(|_| {
+        SegmentStoreError::ObjectStore(format!("shipped segment is too large for {segid:?}"))
+    })?;
     let mut buf = vec![0u8; end];
     for f in frames {
         let start = f.byte_offset as usize;
         let stop = start + f.byte_len as usize;
-        if stop > buf.len() || f.bytes.len() != f.byte_len as usize {
+        if f.byte_len < LEN_PREFIX as u32
+            || stop > buf.len()
+            || f.bytes.len() != f.byte_len as usize
+        {
             return Err(SegmentStoreError::ObjectStore(format!(
                 "shipped frame layout mismatch for {segid:?}"
             )));
@@ -458,17 +565,27 @@ pub async fn materialize_segment_if_absent(
         .iter()
         .map(|f| DirEntry {
             byte_offset: f.byte_offset,
-            len: f.byte_len.saturating_sub(crate::segment::LEN_PREFIX as u32),
+            len: f.byte_len - LEN_PREFIX as u32,
             inode: f.inode,
             extent: f.extent,
         })
         .collect();
     let bytes = crate::segment::finalize_segment(codec, segid, buf, &dir, segid.counter)?;
-    object_store
-        .put(&path, Bytes::from(bytes).into())
+    match object_store
+        .put_opts(
+            &path,
+            Bytes::from(bytes).into(),
+            PutOptions::from(PutMode::Create),
+        )
         .await
-        .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-    Ok(true)
+    {
+        Ok(_) => Ok(true),
+        Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+            verify_existing_recon_segment(object_store, codec, segid, frames).await?;
+            Ok(false)
+        }
+        Err(e) => Err(SegmentStoreError::ObjectStore(e.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +600,7 @@ mod tests {
         PutPayload, PutResult, Result as OsResult, UploadPart,
     };
     use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
 
     fn store() -> SegmentStore {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -505,54 +623,72 @@ mod tests {
         Bytes::from(v)
     }
 
-    /// Wraps `InMemory` to inject multipart or HEAD failures and record the
-    /// resulting cleanup/write behavior.
+    fn recon_frames(
+        frames: &[(InodeId, u64, Bytes)],
+        locs: &[(InodeId, u64, FrameLoc)],
+        segment: &Bytes,
+    ) -> Vec<ReconFrame> {
+        frames
+            .iter()
+            .zip(locs)
+            .map(|((inode, extent, _), (_, _, loc))| {
+                let start = loc.byte_offset as usize;
+                let end = start + loc.byte_len as usize;
+                ReconFrame {
+                    frame_index: loc.frame_index,
+                    byte_offset: loc.byte_offset,
+                    byte_len: loc.byte_len,
+                    inode: *inode,
+                    extent: *extent,
+                    bytes: segment.slice(start..end),
+                }
+            })
+            .collect()
+    }
+
+    /// Wraps `InMemory` to inject multipart or create failures and record the
+    /// resulting cleanup behavior.
     #[derive(Debug)]
     struct MultipartFaultStore {
         inner: Arc<dyn ObjectStore>,
         fail_part: Option<usize>,
         fail_complete: bool,
-        fail_head: bool,
+        fail_put: bool,
+        fail_after_create: AtomicBool,
         aborted: Arc<AtomicBool>,
-        put_called: Arc<AtomicBool>,
     }
 
     impl MultipartFaultStore {
         fn new(fail_part: Option<usize>, fail_complete: bool) -> (Arc<Self>, Arc<AtomicBool>) {
             let aborted = Arc::new(AtomicBool::new(false));
-            let put_called = Arc::new(AtomicBool::new(false));
             (
                 Arc::new(Self {
                     inner: Arc::new(InMemory::new()),
                     fail_part,
                     fail_complete,
-                    fail_head: false,
+                    fail_put: false,
+                    fail_after_create: AtomicBool::new(false),
                     aborted: aborted.clone(),
-                    put_called,
                 }),
                 aborted,
             )
         }
 
-        fn with_head_error() -> (Arc<Self>, Arc<AtomicBool>) {
-            let put_called = Arc::new(AtomicBool::new(false));
-            (
-                Arc::new(Self {
-                    inner: Arc::new(InMemory::new()),
-                    fail_part: None,
-                    fail_complete: false,
-                    fail_head: true,
-                    aborted: Arc::new(AtomicBool::new(false)),
-                    put_called: put_called.clone(),
-                }),
-                put_called,
-            )
+        fn with_create_failure(fail_after_create: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemory::new()),
+                fail_part: None,
+                fail_complete: false,
+                fail_put: !fail_after_create,
+                fail_after_create: AtomicBool::new(fail_after_create),
+                aborted: Arc::new(AtomicBool::new(false)),
+            })
         }
 
         fn injected() -> slatedb::object_store::Error {
             slatedb::object_store::Error::Generic {
                 store: "MultipartFaultStore",
-                source: "injected multipart fault".into(),
+                source: "injected object-store fault".into(),
             }
         }
     }
@@ -604,8 +740,15 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> OsResult<PutResult> {
-            self.put_called.store(true, Ordering::SeqCst);
-            self.inner.put_opts(location, payload, opts).await
+            if self.fail_put {
+                return Err(Self::injected());
+            }
+            let is_create = matches!(&opts.mode, PutMode::Create);
+            let result = self.inner.put_opts(location, payload, opts).await?;
+            if is_create && self.fail_after_create.swap(false, Ordering::SeqCst) {
+                return Err(Self::injected());
+            }
+            Ok(result)
         }
 
         async fn put_multipart_opts(
@@ -624,11 +767,81 @@ mod tests {
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
-            if self.fail_head && options.head {
-                return Err(slatedb::object_store::Error::NotSupported {
-                    source: "injected HEAD fault".into(),
-                });
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OsResult<Path>>,
+        ) -> BoxStream<'static, OsResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OsResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Pauses one conditional create before it reaches the backing store, so a
+    /// competing old-leader seal can deterministically win the object key.
+    #[derive(Debug)]
+    struct CreateGateStore {
+        inner: Arc<dyn ObjectStore>,
+        entered: Notify,
+        release: Notify,
+        gate_once: AtomicBool,
+    }
+
+    impl CreateGateStore {
+        fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                entered: Notify::new(),
+                release: Notify::new(),
+                gate_once: AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl std::fmt::Display for CreateGateStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CreateGateStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CreateGateStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            if matches!(&opts.mode, PutMode::Create) && self.gate_once.swap(false, Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
             }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
             self.inner.get_opts(location, options).await
         }
 
@@ -826,9 +1039,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialization_fails_closed_when_head_errors() {
-        let (store, put_called) = MultipartFaultStore::with_head_error();
-        let object_store: Arc<dyn ObjectStore> = store;
+    async fn materialization_propagates_create_errors() {
+        let object_store: Arc<dyn ObjectStore> = MultipartFaultStore::with_create_failure(false);
         let codec = FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
         let segid = Segid::new(9, 1);
         let frames = [ReconFrame {
@@ -844,15 +1056,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SegmentStoreError::ObjectStore(_)));
-        assert!(
-            !put_called.load(Ordering::SeqCst),
-            "a failed HEAD must not fall through to an unconditional PUT"
-        );
+        assert!(matches!(
+            object_store.head(&Path::from(segid.object_key())).await,
+            Err(slatedb::object_store::Error::NotFound { .. })
+        ));
     }
 
     // HA takeover: the bytes the leader ships (a segment's raw frames) reconstruct
-    // a segment on a fresh store that reads back identically — and the HEAD-guard
-    // makes a repeat call a no-op (never overwrite a leader-sealed object).
+    // a segment on a fresh store that reads back identically — and atomic create
+    // makes a repeat call a verified no-op.
     #[tokio::test]
     async fn shipped_frames_reconstruct_a_readable_segment() {
         let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
@@ -876,22 +1088,7 @@ mod tests {
             .unwrap();
 
         // Standby: rebuild ReconFrames from each FrameLoc + the shipped raw bytes.
-        let recon: Vec<ReconFrame> = frames
-            .iter()
-            .zip(&locs)
-            .map(|((inode, extent, _), (_, _, loc))| {
-                let s = loc.byte_offset as usize;
-                let e = s + loc.byte_len as usize;
-                ReconFrame {
-                    frame_index: loc.frame_index,
-                    byte_offset: loc.byte_offset,
-                    byte_len: loc.byte_len,
-                    inode: *inode,
-                    extent: *extent,
-                    bytes: seg_bytes.slice(s..e),
-                }
-            })
-            .collect();
+        let recon = recon_frames(&frames, &locs, &seg_bytes);
 
         let store_b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         assert!(
@@ -904,7 +1101,7 @@ mod tests {
             !materialize_segment_if_absent(&store_b, &codec(), segid, &recon)
                 .await
                 .unwrap(),
-            "HEAD-guard: already present -> no-op"
+            "verified existing object -> no-op"
         );
 
         let seg_b = SegmentStore::new(store_b, codec(), 9, None);
@@ -912,5 +1109,124 @@ mod tests {
             let got = seg_b.read_extent(*loc, *inode, *extent).await.unwrap();
             assert_eq!(&got, data, "reconstructed frame reads back identically");
         }
+    }
+
+    // The old leader may already be sealing the full segment when takeover
+    // reconstructs a subset from its replication tail. If the full PUT lands
+    // first, takeover's create must preserve it rather than overwrite it with
+    // the partial object it prepared before discovering the winner.
+    #[tokio::test]
+    async fn concurrent_full_seal_wins_over_partial_takeover_reconstruction() {
+        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let leader_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let leader = SegmentStore::new(leader_os.clone(), codec(), 9, None);
+        let frames = vec![
+            (5u64, 0u64, Bytes::from(vec![1u8; 1000])),
+            (5, 1, Bytes::from(vec![2u8; 2000])),
+            (7, 0, Bytes::from(vec![3u8; 1500])),
+        ];
+        let locs = leader.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let path = Path::from(segid.object_key());
+        let full = leader_os.get(&path).await.unwrap().bytes().await.unwrap();
+        let partial_recon = recon_frames(&frames[..2], &locs[..2], &full);
+
+        let shared: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gate = CreateGateStore::new(shared.clone());
+        let takeover_store: Arc<dyn ObjectStore> = gate.clone();
+        let takeover_codec = codec();
+        let takeover =
+            materialize_segment_if_absent(&takeover_store, &takeover_codec, segid, &partial_recon);
+        let old_leader = async {
+            gate.entered.notified().await;
+            shared.put(&path, full.clone().into()).await.unwrap();
+            gate.release.notify_one();
+        };
+        let (materialized, ()) = tokio::join!(takeover, old_leader);
+        assert!(
+            !materialized.unwrap(),
+            "the old leader won the immutable segment key"
+        );
+        assert_eq!(
+            shared.get(&path).await.unwrap().bytes().await.unwrap(),
+            full,
+            "takeover must not replace the full seal with its partial reconstruction"
+        );
+
+        let reader = SegmentStore::new(shared, codec(), 9, None);
+        for ((inode, extent, expected), (_, _, loc)) in frames.iter().zip(&locs) {
+            assert_eq!(
+                reader.read_extent(*loc, *inode, *extent).await.unwrap(),
+                expected
+            );
+        }
+    }
+
+    // A create can land while its success response is lost. Retrying the same
+    // conditional request then returns AlreadyExists; byte verification turns
+    // that ambiguous response into success without a second overwrite.
+    #[tokio::test]
+    async fn lost_create_response_is_verified_as_success() {
+        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let source_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let source = SegmentStore::new(source_os.clone(), codec(), 9, None);
+        let frames = vec![(5u64, 0u64, Bytes::from(vec![1u8; 1000]))];
+        let locs = source.seal(&frames).await.unwrap();
+        let segid = locs[0].2.segid;
+        let path = Path::from(segid.object_key());
+        let segment = source_os.get(&path).await.unwrap().bytes().await.unwrap();
+        let recon = recon_frames(&frames, &locs, &segment);
+
+        let fault = MultipartFaultStore::with_create_failure(true);
+        let retrying: Arc<dyn ObjectStore> = Arc::new(
+            crate::retrying_object_store::RetryingObjectStore::new(fault.clone()),
+        );
+        assert!(
+            !materialize_segment_if_absent(&retrying, &codec(), segid, &recon)
+                .await
+                .unwrap(),
+            "the retry observes the object created by the attempt whose response was lost"
+        );
+        let reader = SegmentStore::new(fault.inner.clone(), codec(), 9, None);
+        assert_eq!(
+            reader
+                .read_extent(locs[0].2, frames[0].0, frames[0].1)
+                .await
+                .unwrap(),
+            frames[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_segment_mismatch_aborts_takeover() {
+        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let wanted_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wanted = SegmentStore::new(wanted_os.clone(), codec(), 9, None);
+        let wanted_frames = vec![(5u64, 0u64, Bytes::from(vec![1u8; 1000]))];
+        let wanted_locs = wanted.seal(&wanted_frames).await.unwrap();
+        let segid = wanted_locs[0].2.segid;
+        let path = Path::from(segid.object_key());
+        let wanted_bytes = wanted_os.get(&path).await.unwrap().bytes().await.unwrap();
+        let recon = recon_frames(&wanted_frames, &wanted_locs, &wanted_bytes);
+
+        // A fresh writer with the same epoch/counter produces the same key but
+        // different sealed bytes. Create must not overwrite it, and verification
+        // must not let replay publish a pointer into the conflicting object.
+        let existing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let conflicting = SegmentStore::new(existing.clone(), codec(), 9, None);
+        let conflicting_frames = vec![(5u64, 0u64, Bytes::from(vec![9u8; 1000]))];
+        let conflicting_locs = conflicting.seal(&conflicting_frames).await.unwrap();
+        assert_eq!(conflicting_locs[0].2.segid, segid);
+        let before = existing.get(&path).await.unwrap().bytes().await.unwrap();
+
+        let err = materialize_segment_if_absent(&existing, &codec(), segid, &recon)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SegmentStoreError::ObjectStore(_)));
+        assert_eq!(
+            existing.get(&path).await.unwrap().bytes().await.unwrap(),
+            before,
+            "failed verification must leave the existing object untouched"
+        );
     }
 }
