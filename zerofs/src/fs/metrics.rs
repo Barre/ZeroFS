@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
-const MB_IN_BYTES: f64 = 1_048_576.0;
+const MIB_IN_BYTES: f64 = 1024.0 * 1024.0;
 
 struct PreviousSnapshot {
     total_operations: u64,
@@ -130,13 +130,13 @@ impl FileSystemStats {
         };
 
         let mb_read_per_sec = if interval_secs > 0.0 {
-            (bytes_read - snapshot.bytes_read) as f64 / interval_secs / MB_IN_BYTES
+            (bytes_read - snapshot.bytes_read) as f64 / interval_secs / MIB_IN_BYTES
         } else {
             0.0
         };
 
         let mb_written_per_sec = if interval_secs > 0.0 {
-            (bytes_written - snapshot.bytes_written) as f64 / interval_secs / MB_IN_BYTES
+            (bytes_written - snapshot.bytes_written) as f64 / interval_secs / MIB_IN_BYTES
         } else {
             0.0
         };
@@ -256,11 +256,10 @@ impl FileSystemStats {
     }
 }
 
-/// Whole-store footprint from a one-time scan, used to seed the monitor's
-/// segment gauges at open. After seeding they are maintained incrementally off
-/// the commit path (see [`SegmentGcStats::apply_footprint_delta`]); this scan is
-/// also the ground truth the incremental path is tested against.
-#[derive(Debug, Clone, Copy, Default)]
+/// Whole-store segment footprint. `ExtentStore::sample_footprint` computes it
+/// authoritatively; the monitor gauges maintain the same values incrementally
+/// after open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SegmentFootprint {
     pub segment_count: u64,
     pub appended_bytes: u64,
