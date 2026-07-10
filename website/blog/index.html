@@ -9,11 +9,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Blog — ZeroFS</title>
-<meta name="description" content="Engineering notes from ZeroFS: serving S3-compatible buckets as POSIX filesystems and block devices.">
+<meta name="description" content="ZeroFS blog: Notes on building a distributed filesystem.">
 <link rel="icon" type="image/png" href="/favicon.png">
 <script defer data-domain="zerofs.net" src="https://p.merklemap.com/js/script.js"></script>
 <meta property="og:title" content="Blog — ZeroFS">
-<meta property="og:description" content="Engineering notes from ZeroFS.">
+<meta property="og:description" content="Notes on building a distributed filesystem.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://www.zerofs.net/blog">
 <meta property="og:image" content="https://www.zerofs.net/assets/og-card.jpg">
@@ -47,19 +47,23 @@
 <main>
   <section class="idx-hero">
     <div class="wrap">
-      <p class="eyebrow rv">Engineering notes from ZeroFS</p>
       <h1 class="rv" data-d="80">Blog</h1>
-      <p class="rv" data-d="160">Notes on building a filesystem that lives in S3: the storage engine, the protocols on top of it, and the failure modes we test for.</p>
+      <p class="rv" data-d="160">Notes on building a distributed filesystem.</p>
+      <div class="idx-art" aria-hidden="true">
+        <svg><use href="#enso"/></svg>
+      </div>
     </div>
   </section>
 
   <section class="post-list">
     <div class="wrap">
       <a class="post-row rv" href="/blog/highly-available-posix-on-s3">
-        <div class="meta"><span class="tag">Engineering</span><span>June 28, 2026</span><span>11 min read</span></div>
-        <h2>Making POSIX filesystems replicated and highly available</h2>
-        <p>A filesystem on S3 has two single-node weaknesses: a window of acknowledged-but-unflushed writes, and a serving gap while the node is down. ZeroFS closes both with a leader, a standby, writer-epoch fencing, semi-synchronous replication, and an <code>fsync</code> that never reports a durability it cannot prove.</p>
-        <span class="more">Read the post <span class="arrow">→</span></span>
+        <div class="post-copy">
+          <div class="meta"><span>June 28, 2026</span><span>8 min read</span></div>
+          <h2>Making POSIX filesystems replicated and highly available</h2>
+          <p>ZeroFS pairs writer-epoch fencing with semi-synchronous replication so a filesystem can fail over without split-brain or a falsely successful <code>fsync</code>.</p>
+          <span class="more">Read the post <span class="arrow">→</span></span>
+        </div>
       </a>
     </div>
   </section>

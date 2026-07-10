@@ -38,7 +38,7 @@
       <svg class="wm" aria-hidden="true"><use href="#wordmark"/></svg>
     </a>
     <nav>
-      <a href="/blog">Blog</a>
+      <a href="/blog" aria-current="page">Blog</a>
       <a href="https://www.zerofs.net/docs">Docs</a>
       <a href="https://github.com/Barre/ZeroFS" class="keep gh" aria-label="ZeroFS on GitHub">
         <svg viewBox="0 0 16 16" width="17" height="17" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -49,45 +49,48 @@
   </div>
 </header>
 
+<div class="reading-progress" aria-hidden="true"><span></span></div>
+
 <main>
   <article>
     <div class="post-hero">
+      <div class="post-hero-art" aria-hidden="true"><svg><use href="#enso"/></svg></div>
       <div class="wrap">
-        <p class="eyebrow rv">Engineering · High availability</p>
+        <a class="back-link rv" href="/blog"><span aria-hidden="true">←</span> Back to blog</a>
         <h1 class="rv" data-d="80">Making POSIX filesystems replicated and highly available</h1>
         <div class="post-meta rv" data-d="160">
           <span>June 28, 2026</span><span class="dot">·</span>
           <span>Pierre Barre</span><span class="dot">·</span>
-          <span>11 min read</span>
+          <span>8 min read</span>
         </div>
       </div>
     </div>
 
     <div class="post">
       <div class="wrap body">
-        <p class="lede rv">ZeroFS stores a POSIX filesystem in a log-structured database that lives in an S3 bucket. Running that on one node is straightforward. Surviving the loss of the node is harder than it first looks, because the obvious ways to add a second one quietly weaken durability, and on a filesystem durability is the entire contract. Downtime is recoverable; a write the caller already saw acknowledged is not. Holding that line across a failover is most of what high availability in ZeroFS comes down to.</p>
+        <p class="lede rv">ZeroFS stores a POSIX filesystem in a log-structured database in S3. On one node, acknowledged but unflushed writes live only in memory, and the filesystem is unavailable whenever that node is down. A standby must cover both gaps without weakening the durability promised by <code>fsync</code>.</p>
 
-        <h2 class="rv">Where a single node runs out</h2>
-        <p class="rv">Object storage is durable but slow and charged per request, so committing every filesystem operation as its own upload would saddle each write with tens of milliseconds and a billed PUT. ZeroFS does what any LSM engine does and buffers writes in an in-memory memtable, flushing them to the bucket in batches: on <code>fsync</code>, when the memtable fills, and on a periodic timer. A <code>write()</code> returns as soon as the data reaches the memtable, and <code>fsync()</code> is what pushes it the rest of the way to S3.</p>
-        <p class="rv">That leaves a single node exposed in two unrelated ways. Writes that have been acknowledged but not yet flushed exist only in that node's memory, so a crash before the next flush loses them; POSIX allows this, since the durability boundary is <code>fsync</code> rather than <code>write</code>, but the gap between the two is real. And the data that has already reached S3, while perfectly safe, has nobody to serve it for as long as the node is down. The first problem is about un-flushed writes, the second about an absent server, and a standby node can answer both at once. The work is in adding that standby without reopening the durability hole the single node already had.</p>
+        <h2 class="rv" id="where-a-single-node-runs-out">Where a single node runs out</h2>
+        <p class="rv">Object storage is durable, but each request is slow and billable. Committing every filesystem operation directly would add tens of milliseconds and a PUT charge to each write. ZeroFS instead buffers writes in an in-memory memtable and flushes batches on <code>fsync</code>, when the memtable fills, and on a periodic timer. A <code>write()</code> returns once the data reaches the memtable; <code>fsync()</code> pushes it to S3.</p>
+        <p class="rv">This creates two failure modes. A crash before a flush loses acknowledged writes, which POSIX permits because <code>fsync</code>, not <code>write</code>, is the durability boundary. Data already flushed remains in S3, but no server exposes the filesystem while the node is down. A standby can retain the in-memory tail and take over serving, provided it never becomes a second writer.</p>
 
-        <h2 class="rv">Only one writer, ever</h2>
-        <p class="rv">Two nodes over one bucket can fall into split-brain: both decide they are the leader and write at the same time. On a filesystem that means corruption, and once two writers have interleaved their updates there is no untangling them afterward. The protection therefore cannot depend on good timing; it has to hold under arbitrary delays, network partitions, and clock skew.</p>
-        <p class="rv">ZeroFS is single-writer per database, and the writer is chosen by the storage layer rather than negotiated between the nodes. Opening the database for writing issues a conditional update to its manifest that increments a <code>writer_epoch</code> and fences whoever held it before; the previous writer's next manifest write fails outright. Only one node can commit durable state at a time. The fenced leader's in-flight SST files are left unreferenced and later reclaimed by garbage collection, so they never overwrite live data, and the leader stops the moment its first write is rejected. Both nodes can briefly believe they lead, but only one will ever succeed in committing; the other finds it has been fenced and stops. This holds without reference to any clock, and everything else is layered on top of it.</p>
+        <h2 class="rv" id="only-one-writer-ever">Only one writer, ever</h2>
+        <p class="rv">Two nodes over one bucket can split-brain: both believe they are the leader and write concurrently. Once their updates interleave, the filesystem is corrupt. Preventing that cannot depend on timing, network reachability, or synchronized clocks.</p>
+        <p class="rv">The storage layer chooses the single writer. Opening a database for writing conditionally updates its manifest, increments a <code>writer_epoch</code>, and fences the previous holder. The old leader's next manifest write fails and it stops. Any SST files it uploaded in the meantime remain unreferenced and are later reclaimed by garbage collection. During a race, both nodes may briefly claim leadership, but only one epoch can commit.</p>
         <div class="callout rv">
-          <p>Fencing relies on a conditional write (put-if-not-exists), which S3, Azure Blob, and Google Cloud Storage support directly; for S3-compatible stores that don't, ZeroFS reaches the same guarantee through Redis. A node also asks its peer which of them is currently active at startup instead of trusting its configured role, so two writers can never come up together from cold.</p>
+          <p>Fencing uses conditional writes, supported directly by S3, Azure Blob, and Google Cloud Storage. For S3-compatible stores without that primitive, ZeroFS uses Redis. At startup, each node also asks its peer which one is active instead of trusting its configured role.</p>
         </div>
 
-        <h2 class="rv">Why two nodes, not three</h2>
-        <p class="rv">The instinct from Raft and Paxos is that fault-tolerant agreement wants an odd number of participants: three nodes so a majority survives the loss of one, five to survive two. That arithmetic exists because the cluster has to agree with itself about who leads and which writes are committed, and a majority is how it breaks a tie without splitting. ZeroFS holds no such vote. The one fact the whole scheme rests on, which node currently holds the writer epoch, is settled by a single compare-and-swap against the manifest in the bucket, and it is the object store, not the nodes, that picks the winner.</p>
-        <p class="rv">A linearizable compare-and-swap register is on its own enough to solve consensus for any number of contenders; it is the strong primitive a protocol like Raft spends pages rebuilding out of weaker ones. The object store offers it directly through conditional writes. The agreement three machines would otherwise maintain between themselves therefore lives in the bucket, next to the committed data it is agreeing about. That leaves the ZeroFS nodes to do nothing but serve: one node is already correct on its own, and the second is there to take over and to hold the un-<code>fsync</code>'d tail, not to make up a quorum. Because there is no quorum to maintain, an even number of nodes is fine. If the bucket is unreachable the filesystem stops, but so would anything else reading from it, and the data inside is no less safe.</p>
+        <h2 class="rv" id="why-two-nodes-not-three">Why two nodes, not three</h2>
+        <p class="rv">Raft and Paxos clusters use an odd number of members because the nodes vote on leadership and committed state. ZeroFS has no node quorum. A conditional update to the manifest in the bucket decides which node owns the writer epoch.</p>
+        <p class="rv">The object store's linearizable compare-and-swap can choose one winner among any number of contenders. One ZeroFS node serves; the second holds the un-<code>fsync</code>'d tail and can take over. A third would add no voting safety because the vote already happens in the bucket.</p>
 
-        <h2 class="rv">Keeping a standby in step</h2>
-        <p class="rv">With that settled, the standby's job is to hold the writes the leader has accepted but not yet flushed. Replication is semi-synchronous and strictly ordered: for each write, the leader sends it to the standby and waits for an acknowledgement before applying the write locally and answering the client. Because the standby acknowledges first, anything a client has been able to observe was already replicated, and the standby never trails the visible state. Writes it has received but not yet applied sit in a tail buffer, ready to be replayed if it has to take over.</p>
-        <p class="rv">Waiting for the standby is only reasonable while the standby is there. If it falls behind or drops off the network, the leader stops shipping and carries on alone rather than stalling the filesystem behind an unreachable replica, then resumes shipping once the standby returns. ZeroFS calls these states Connected and Solo. A leader in Solo makes its writes as durable as a standalone node's, which is to say the un-<code>fsync</code>'d ones are no longer backed by a second copy. Solo weakens durability and leaves safety untouched, since fencing owes nothing to replication: a leader running alone still cannot be joined by a second writer.</p>
+        <h2 class="rv" id="keeping-a-standby-in-step">Keeping a standby in step</h2>
+        <p class="rv">Replication is semi-synchronous and ordered. For each write, the leader sends it to the standby, waits for an acknowledgement, applies it locally, and then answers the client. Anything visible to a client has therefore reached the standby. Unapplied writes remain in a tail buffer for replay during takeover.</p>
+        <p class="rv">If the standby falls behind or disconnects, the leader enters Solo instead of blocking the filesystem. Replication resumes when the standby returns. Solo writes have single-node durability: writes not yet flushed have no second copy. Fencing still prevents another writer from committing.</p>
 
-        <h2 class="rv">When the leader dies</h2>
-        <p class="rv">The leader emits a heartbeat every 100 ms, each carrying its writer epoch. When the standby has gone without one for the takeover TTL of roughly two seconds, it promotes itself: it opens the database for writing, which fences the old leader, replays the tail it has buffered, and starts serving. Should the old leader come back, its heartbeats carry a stale epoch and are ignored, so it cannot reclaim the lead once a takeover is under way; and if it reaches a standby that still holds an un-replayed tail, that contact is the cue to promote at once rather than wait out the timer.</p>
+        <h2 class="rv" id="when-the-leader-dies">When the leader dies</h2>
+        <p class="rv">The leader sends a heartbeat every 100 ms with its writer epoch. After roughly two seconds without one, the standby opens the database for writing, fences the old leader, replays its buffered tail, and starts serving. Heartbeats from the old epoch are ignored. If a standby with an unreplayed tail hears from a stale leader, it promotes immediately rather than waiting for the timer.</p>
         <figure class="rv">
           <div class="diagram"><pre class="mermaid">
 sequenceDiagram
@@ -116,44 +119,45 @@ sequenceDiagram
           </pre></div>
           <figcaption>A leader failure end to end: steady state, takeover, and the client's rerouted retry.</figcaption>
         </figure>
-        <p class="rv">Clients hold the addresses of both nodes, so when one stops serving they find the other and carry on against it. The delicate case is the retry, since an operation in flight when the leader died may or may not have committed. Every mutating call carries a stable operation id that the new leader uses to deduplicate, which lets a client resend a <code>mkdir</code> or a <code>rename</code> and get a real answer back instead of a timeout or a duplicated effect. A deposed leader has to stop answering reads as well as writes: a node serves only while its lease is valid, the lease follows the storage engine's view of the database, and the manifest poll that notices the new epoch closes the stale database within a single interval. An idle, read-only ex-leader therefore steps aside on its own, without having to attempt a write to learn that it has lost.</p>
+        <p class="rv">Clients know both addresses and reroute when one node stops serving. A request in flight during failure may already have committed, so every mutating call carries a stable operation id. The client can retry a <code>mkdir</code> or <code>rename</code> on the new leader without duplicating the effect.</p>
+        <p class="rv">The old leader must stop reads as well as writes. A node serves only while its lease is valid, and the lease follows the storage engine's view of the database. A manifest poll sees the new epoch and closes the stale database within one interval, even if the old leader is idle.</p>
 
-        <h2 class="rv">When fsync can't prove durability</h2>
-        <p class="rv">Replication narrows the un-<code>fsync</code>'d window but cannot close it. Lose both nodes at once, or lose a lone node while it runs Solo, and writes that were acknowledged but never flushed are gone. A design could let that loss pass silently and treat it as the cost of the architecture. ZeroFS does not: the guarantee it makes is exact, and it holds on a single node as much as on a pair. A successful <code>fsync</code> means every write acknowledged on that descriptor is durable in object storage, and under HA, that it also survives any failover. Where a recovery did not in fact carry those writes, the <code>fsync</code> returns <code>ESTALE</code>; it does not report success over data that no longer exists.</p>
-        <p class="rv">The whole thing turns on one value, a <strong>lineage token</strong>, which names a single unbroken durable lineage. A takeover keeps the token when it can show it inherited the leader's data, which is exactly the case of a connected standby replaying its tail, and mints a fresh one when it cannot: after a cold restart of both nodes, or after a takeover that follows a spell in Solo, where the un-shipped writes never reached the standby to begin with. A leader entering Solo records the lineage as un-inheritable in object storage before it acknowledges its first Solo write, which forces any later takeover to regenerate rather than lay claim to writes it does not hold. Each un-<code>fsync</code>'d change the client makes is tagged with the token current at the time; on <code>fsync</code> the client presents the oldest token still outstanding, the leader flushes and checks it against the live lineage, and a mismatch fails the call. Three cases follow from that one comparison:</p>
+        <h2 class="rv" id="when-fsync-cant-prove-durability">When fsync can't prove durability</h2>
+        <p class="rv">Replication reduces but cannot eliminate the un-<code>fsync</code>'d window. Losing both nodes, or losing a leader in Solo, discards acknowledged writes that never reached S3. A successful <code>fsync</code> means every write acknowledged on that descriptor is in object storage and, under HA, survives failover. If recovery did not carry those writes, <code>fsync</code> returns <code>ESTALE</code>.</p>
+        <p class="rv">A <strong>lineage token</strong> identifies an uninterrupted durable history. A connected standby that replays the leader's tail retains the token. A cold restart or takeover after Solo gets a new token because it cannot prove that it inherited every write. Before acknowledging its first Solo write, the leader marks the lineage un-inheritable in object storage. The client tags un-<code>fsync</code>'d changes with the current token; on <code>fsync</code>, the leader flushes and compares the oldest outstanding token with the live one. A mismatch fails the call.</p>
         <div class="table-wrap rv">
           <table>
             <thead><tr><th>What happened</th><th>Token</th><th>fsync result</th></tr></thead>
             <tbody>
-              <tr><td>Clean single-node crash</td><td>Kept: the standby held the writes and replayed the tail</td><td>Succeeds transparently, as on a single node</td></tr>
+              <tr><td>Connected leader fails</td><td>Kept: the standby held the writes and replayed the tail</td><td>Succeeds after failover</td></tr>
               <tr><td>Both nodes lost before a flush</td><td>Regenerated: a cold restart can't prove it inherited anything</td><td><code>ESTALE</code>: the writes were only in memory</td></tr>
               <tr><td>Takeover after Solo</td><td>Regenerated: the Solo leader tainted the lineage first</td><td><code>ESTALE</code>: the new leader never got the writes</td></tr>
             </tbody>
           </table>
         </div>
-        <p class="rv">The check is per descriptor and follows POSIX faithfully: it accounts for the whole file across every open handle, says nothing about any other file, and covers metadata, directory entries, and <code>rename</code> across both directories as well as ordinary data writes. When a failure does cross the line, the application hears about it at its next <code>fsync</code>: that call fails rather than succeeds, and since the first <code>fsync</code> after a write is the durability boundary, the failure means the un-<code>fsync</code>'d work since the last successful one is gone. Redo it and <code>fsync</code> again. The client libraries surface this as a distinct stale-handle error, so an application can tell it apart from any other failure and recover deliberately.</p>
+        <p class="rv">The token check is per descriptor but covers the whole file across open handles, plus metadata, directory entries, and both sides of a <code>rename</code>. On a mismatch, the next <code>fsync</code> returns <code>ESTALE</code>: work since the last successful <code>fsync</code> is gone. Client libraries expose this as a distinct stale-handle error.</p>
 
-        <h2 class="rv">Trying to break it</h2>
-        <p class="rv">A claim like "no split-brain" or "a successful <code>fsync</code> is always durable" is only as good as the testing behind it, so ZeroFS is checked with <a href="https://jepsen.io">Jepsen</a>, the framework built to find exactly these failures under fault injection.</p>
-        <p class="rv">Two layers run against it. The first treats a single node as a black box: Jepsen issues random sequences of filesystem operations over a 9P mount and checks every result against a reference model, shrinking any divergence to a minimal failing case. A crash mode kills the server mid-run, drops the in-memory memtable, recovers from object storage, and confirms the surviving state is consistent with the last <code>fsync</code>. This layer runs in CI on every change.</p>
-        <p class="rv">The second stands up a real leader and standby over MinIO and turns a nemesis loose on them: it kills the leader, the standby, or both; partitions the link between the two; pauses the object store so neither can reach it; and freezes the leader past its lease with a stop signal, all while a client keeps writing and calling <code>fsync</code>. After each run the checker asks the questions the guarantees above depend on. Did two nodes ever both commit? Did a write that was acknowledged and <code>fsync</code>'d ever vanish across a failover? When a frozen leader thaws after the standby has already taken over, does it come back fenced instead of serving stale data? Across these runs the pair shows no lost, duplicated, or stale reads, and the thawed leader finds itself fenced and steps aside rather than corrupting anything. The <a href="https://github.com/Barre/ZeroFS/tree/main/jepsen/ha">whole suite is in the repo</a>.</p>
+        <h2 class="rv" id="trying-to-break-it">Trying to break it</h2>
+        <p class="rv">ZeroFS tests these guarantees with <a href="https://jepsen.io">Jepsen</a>. The single-node suite generates filesystem operations over a 9P mount and checks them against a reference model. Its crash mode kills the server, drops the memtable, recovers from object storage, and verifies the result against the last <code>fsync</code>. This suite runs in CI on every change.</p>
+        <p class="rv">The HA suite runs a leader and standby over MinIO while a nemesis kills either node or both, partitions the pair, pauses the object store, and freezes the leader beyond its lease. Meanwhile, a client continues to write and call <code>fsync</code>. The checker looks for overlapping commit epochs, lost durable writes, duplicates, stale reads, and a thawed leader that fails to recognize its fencing. The <a href="https://github.com/Barre/ZeroFS/tree/main/jepsen/ha">suite is in the repository</a>.</p>
 
-        <h2 class="rv">What it doesn't do</h2>
-        <p class="rv">A few limits are worth stating plainly. This is two nodes and a single standby, so it buys availability through failover and not write throughput; there is still exactly one writer, and spreading reads across machines is a separate feature. Failover is bounded rather than instantaneous, since on a crash the standby waits out the two-second takeover TTL, and clients ride that gap by blocking and retrying instead of erroring. Advisory byte-range locks live in one server's memory and are not replicated, so a failover drops them; they are advisory and do not gate data, but the same caveat attends networked file locks in general and is worth designing around. And <code>fsync</code> is still the durability contract: the connected standby additionally shelters un-<code>fsync</code>'d writes, but that is a cushion, not a reason to stop calling <code>fsync</code> where it matters. The full configuration, the complete table of guarantees, and each failover case in detail live in the <a href="https://www.zerofs.net/docs/high-availability">high availability docs</a>.</p>
+        <h2 class="rv" id="what-it-doesnt-do">What it doesn't do</h2>
+        <p class="rv">HA improves availability, not throughput. There is still one writer, and reads are not distributed across nodes.</p>
+        <p class="rv">Crash failover takes roughly two seconds while the standby waits for the takeover TTL; clients block and retry during that interval. Advisory byte-range locks are not replicated and disappear on failover.</p>
+        <p class="rv"><code>fsync</code> remains the durability boundary. A connected standby also protects unflushed writes, but applications should not rely on that extra copy. Configuration and a complete failure-case table are in the <a href="https://www.zerofs.net/docs/high-availability">high availability documentation</a>.</p>
 
         <hr class="rule">
-        <p class="rv">None of this closes the un-<code>fsync</code>'d window; no filesystem backed by object storage can. What it guarantees is that nothing crosses that window silently. Fencing settles the writer without trusting a clock, so a partition cannot corrupt the filesystem. Semi-sync keeps the standby current, so an ordinary failover loses nothing. And when a failure reaches past what replication covers, the next <code>fsync</code> returns an error instead of a false success.</p>
+        <p class="rv">Fencing makes the writer a storage-layer decision rather than a timing assumption. Replication covers ordinary failover; lineage tokens turn failures outside that coverage into <code>ESTALE</code> instead of false success.</p>
       </div>
     </div>
 
     <div class="post-cta">
       <div class="wrap">
-        <p class="eyebrow rv">Go deeper</p>
-        <h2 class="rv">The full design, with every failover case diagrammed.</h2>
+        <p class="eyebrow rv">Documentation</p>
+        <h2 class="rv">Configuration, guarantees, and failure modes.</h2>
         <div class="links rv">
-          <a class="btn primary" href="https://www.zerofs.net/docs/high-availability">High availability docs <span aria-hidden="true">→</span></a>
+          <a class="btn primary" href="https://www.zerofs.net/docs/high-availability">High availability <span aria-hidden="true">→</span></a>
           <a class="btn ghost" href="https://www.zerofs.net/docs/durability">Durability &amp; consistency</a>
-          <a class="btn ghost" href="https://www.zerofs.net/docs/quickstart">Install ZeroFS</a>
         </div>
       </div>
     </div>
@@ -172,6 +176,19 @@ const hdr = document.querySelector("header");
 const onScroll = () => hdr.classList.toggle("scrolled", scrollY > 24);
 onScroll();
 addEventListener("scroll", onScroll, { passive: true });
+
+// A one-pixel progress line is the only persistent navigation in the article.
+const article = document.querySelector("article");
+const progress = document.querySelector(".reading-progress span");
+const updateProgress = () => {
+  const start = article.getBoundingClientRect().top + scrollY;
+  const end = start + article.offsetHeight - innerHeight;
+  const value = end > start ? Math.min(1, Math.max(0, (scrollY - start) / (end - start))) : 1;
+  progress.style.transform = `scaleX(${value})`;
+};
+updateProgress();
+addEventListener("scroll", updateProgress, { passive: true });
+addEventListener("resize", updateProgress);
 
 // GitHub star count, cached for a day (matches the landing page; shares its localStorage cache)
 (async () => {

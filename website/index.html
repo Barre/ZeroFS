@@ -1706,23 +1706,27 @@
 
     /* footer */
     footer .wrap {
-      padding: 28px 32px 36px;
+      padding: 30px 32px 38px;
       display: flex;
       flex-wrap: wrap;
       justify-content: space-between;
       gap: 12px;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      color: var(--text-faint);
-    }
-
-    footer a {
+      font-family: var(--sans);
+      font-size: 13.5px;
+      line-height: 1.5;
+      letter-spacing: 0;
       color: var(--text-dim);
     }
 
-    footer a:hover {
+    footer a {
       color: var(--text);
+      text-decoration: underline;
+      text-decoration-color: var(--line-bright);
+      text-underline-offset: 3px;
+    }
+
+    footer a:hover {
+      text-decoration-color: var(--accent);
     }
 
     /* reveal */
