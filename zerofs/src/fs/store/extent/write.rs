@@ -229,6 +229,14 @@ impl ExtentStore {
         // rotation is due. In particular, this guard stays held while
         // spawn_seal waits for an in-flight-seal permit.
         let _append_guard = self.append_gate.lock().await;
+        // Once a frame is appended, a seal can make this segment eligible for
+        // reclaim before the caller submits `txn`. Carry the read guard on the
+        // transaction through its eventual database commit; reclaim drains all
+        // such guards before sealing and snapshots a cutoff that future appends
+        // cannot fall below.
+        if edits.iter().any(|(_, edit)| edit.is_some()) {
+            txn.hold_extent_ref_guard(Arc::clone(&self.extent_ref_barrier).read_owned().await);
+        }
         {
             let mut open = self.open.lock().unwrap();
             for (extent, edit) in edits {

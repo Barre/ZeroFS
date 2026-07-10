@@ -229,6 +229,10 @@ async fn worker_loop(
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         // Per-segment (live, total) deltas, aggregated per key across the batch.
         let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
+        // Staged frames may already have been sealed even though their
+        // FrameLoc transactions are only now reaching the worker. Keep their
+        // reclaim guards until the merged database write completes.
+        let mut extent_ref_guards = Vec::new();
         // Op-ids carried by this batch's transactions, recorded on apply.
         let mut batch_op_ids: Vec<crate::dedup::OpId> = Vec::new();
         for (mut txn, reply) in batch {
@@ -254,6 +258,7 @@ async fn worker_loop(
                 e.0 = e.0.saturating_add(dl);
                 e.1 = e.1.saturating_add(dt);
             }
+            extent_ref_guards.extend(txn.take_extent_ref_guards());
             if replicating {
                 repl_ops.extend(txn.apply_to_collecting(&mut merged));
             } else {
@@ -427,6 +432,11 @@ async fn worker_loop(
                 Err(_) => result = Err(FsError::IoError),
             }
         }
+
+        // Every staged FrameLoc in this batch is now committed or the batch
+        // failed. Reclaim may take the write side and classify the sealed
+        // segments; release before a sync flush, which does not need the pin.
+        drop(extent_ref_guards);
 
         // Publish on write success without waiting for the sync flush below:
         // a flush failure means the db is broken (SlateDB retries flushes

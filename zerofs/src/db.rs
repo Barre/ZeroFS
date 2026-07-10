@@ -131,6 +131,11 @@ pub struct Transaction {
     /// aggregated by the commit worker into one absolute `(live, total)` per
     /// segment. Same lock-free pattern as `stats_deltas`.
     seg_deltas: Vec<(Bytes, (i64, i64))>,
+    /// Read-side guards for extent segments this transaction appended to. A
+    /// guard is acquired before a frame becomes sealable and held through the
+    /// metadata commit, so reclaim's write-side barrier can establish that no
+    /// eligible segment can still gain a reference.
+    extent_ref_guards: Vec<tokio::sync::OwnedRwLockReadGuard<()>>,
     op_id: crate::dedup::OpId,
 }
 
@@ -140,6 +145,7 @@ impl Transaction {
             ops: Vec::new(),
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
+            extent_ref_guards: Vec::new(),
             op_id: [0u8; 16],
         }
     }
@@ -195,6 +201,18 @@ impl Transaction {
         std::mem::take(&mut self.seg_deltas)
     }
 
+    /// Keep an extent-reference staging guard alive until this transaction's
+    /// database write has completed.
+    pub(crate) fn hold_extent_ref_guard(&mut self, guard: tokio::sync::OwnedRwLockReadGuard<()>) {
+        self.extent_ref_guards.push(guard);
+    }
+
+    /// Transfer staged-reference guards to the commit path. They must not be
+    /// dropped until after the corresponding `WriteBatch` is applied.
+    pub(crate) fn take_extent_ref_guards(&mut self) -> Vec<tokio::sync::OwnedRwLockReadGuard<()>> {
+        std::mem::take(&mut self.extent_ref_guards)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
@@ -211,6 +229,10 @@ impl Transaction {
             self.seg_deltas.is_empty(),
             "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
              WriteCoordinator, not into_inner/apply_to"
+        );
+        debug_assert!(
+            self.extent_ref_guards.is_empty(),
+            "extent reference guards would be dropped before commit"
         );
         for op in self.ops {
             match op {
@@ -229,6 +251,10 @@ impl Transaction {
             self.seg_deltas.is_empty(),
             "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
              WriteCoordinator, not apply_to_collecting"
+        );
+        debug_assert!(
+            self.extent_ref_guards.is_empty(),
+            "extent reference guards would be dropped before commit"
         );
         let mut ops = Vec::with_capacity(self.ops.len());
         for op in self.ops {

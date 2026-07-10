@@ -230,15 +230,27 @@ impl ExtentStore {
             >,
         K: Fn(usize) -> bool,
     {
-        // The seal makes the flushed manifest reference only PUT segments; the
-        // flush makes "dead in the in-memory view" mean "dead in the durable view".
-        // Under the flush barrier (write side), same as the flush coordinator, so a
-        // concurrent commit can't durably reference the just-rotated open buffer.
-        {
-            let _barrier = self.db.flush_barrier().write_owned().await;
-            self.seal_open().await?;
-            self.db.flush().await.map_err(|_| FsError::IoError)?;
-        }
+        // First drain transactions that already appended frames but have not
+        // committed their FrameLocs yet. Only then seal+flush and snapshot the
+        // cutoff. A future transaction can append only to the fresh open
+        // segment at `cutoff`, while every older segment is now permanently
+        // unable to gain references and safe to classify.
+        let (cur_epoch, cutoff) = {
+            let _refs = self.extent_ref_barrier.clone().write_owned().await;
+            // The seal makes the flushed manifest reference only PUT segments;
+            // the flush makes "dead in memory" mean "dead durably". The DB
+            // write barrier prevents a commit from entering the flushed set
+            // between those two operations.
+            {
+                let _barrier = self.db.flush_barrier().write_owned().await;
+                self.seal_open().await?;
+                self.db.flush().await.map_err(|_| FsError::IoError)?;
+            }
+            (
+                self.segments.epoch(),
+                self.open.lock().unwrap().segid.counter,
+            )
+        };
         tracing::debug!("segment GC: durable barrier done (sealed + flushed), scanning extents");
 
         // Post-barrier on purpose; see the doc comment for the race this closes.
@@ -261,15 +273,12 @@ impl ExtentStore {
             fp::widen(fp::RECLAIM_AFTER_BARRIER_BEFORE_SCAN).await;
         }
 
-        let cur_epoch = self.segments.epoch();
         // Exclusive counter cutoff for eligibility: the still-open segment's
         // own counter, not `next_counter()`. seal_open() just rotated in a
         // fresh open segment that is still accepting frames whose credits may
         // not be visible to the scan below; `next_counter()` would include it,
         // and a mid-pass background seal could then mis-classify that fully
         // live segment as dead.
-        let cutoff = self.open.lock().unwrap().segid.counter;
-
         // A persistent checkpoint pins a view this scan-driven path can't
         // bound by object mtime (it never LISTs). Skip classification entirely
         // while one exists; the scan still runs for the footprint log.
@@ -785,19 +794,26 @@ impl ExtentStore {
     /// can't leave a not-yet-credited packed segment eligible. Returns the
     /// number of orphans reclaimed.
     pub async fn sweep_orphans(&self, modified_before: DateTime<Utc>) -> Result<usize, FsError> {
-        // Durable barrier, as in the fast reclaim: seal the open buffer and flush so
-        // the eligibility cutoff and the directory verify observe the durable view.
-        {
-            let _barrier = self.db.flush_barrier().write_owned().await;
-            self.seal_open().await?;
-            self.db.flush().await.map_err(|_| FsError::IoError)?;
-        }
+        // As in fast reclaim, first drain every transaction that has appended a
+        // frame but not committed its counter/reference. Otherwise the listed
+        // object can look like an absent-counter orphan and be deleted just
+        // before that delayed transaction lands.
+        let (cur_epoch, cutoff) = {
+            let _refs = self.extent_ref_barrier.clone().write_owned().await;
+            {
+                let _barrier = self.db.flush_barrier().write_owned().await;
+                self.seal_open().await?;
+                self.db.flush().await.map_err(|_| FsError::IoError)?;
+            }
+            (
+                self.segments.epoch(),
+                self.open.lock().unwrap().segid.counter,
+            )
+        };
 
-        let cur_epoch = self.segments.epoch();
         // Same eligibility cutoff as reclaim_segments_gated. A freshly-packed
         // compaction segment always carries a higher counter, so it is never
         // eligible even mid-compaction.
-        let cutoff = self.open.lock().unwrap().segid.counter;
         let eligible =
             |s: &Segid| s.epoch < cur_epoch || (s.epoch == cur_epoch && s.counter < cutoff);
 
@@ -1005,6 +1021,67 @@ mod tests {
         );
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
+    }
+
+    // A write appends its frame before the caller submits the FrameLoc +
+    // segcount transaction. Reclaim must drain that staged reference before it
+    // seals the segment and decides that the old live=0 counter is deletable;
+    // otherwise the delayed commit creates a pointer to an object GC just
+    // removed.
+    #[tokio::test]
+    async fn reclaim_waits_for_staged_reference_commit_before_classifying_segment() {
+        let (store, db) = make().await;
+
+        // Give the current open segment a real counter, then make every
+        // committed frame in it dead while leaving the segment open.
+        let mut txn = db.new_transaction().unwrap();
+        let old = Bytes::from(vec![1u8; EXTENT_SIZE]);
+        store.write(&mut txn, 1, 0, &old, 0).await.unwrap();
+        commit(&store, txn).await;
+        let segid = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+
+        let mut txn = db.new_transaction().unwrap();
+        store.delete_range(&mut txn, 1, 0, 1).await.unwrap();
+        commit(&store, txn).await;
+        assert_eq!(segcount_of(&store, &db, segid).await, 0);
+        assert!(frameloc_of(&store, &db, 1, 0).await.is_none());
+
+        // Append a replacement frame to that same segment, but deliberately
+        // pause before committing its pointer and counter credit.
+        let replacement = Bytes::from(vec![2u8; EXTENT_SIZE]);
+        let mut staged = db.new_transaction().unwrap();
+        let tail = store
+            .write(&mut staged, 1, 0, &replacement, 0)
+            .await
+            .unwrap();
+        assert!(
+            store.extent_ref_barrier.try_write().is_err(),
+            "the staged reference must pin reclaim until commit"
+        );
+
+        let reclaim_store = store.clone();
+        let mut reclaim =
+            tokio::spawn(async move { reclaim_store.reclaim_segments(Utc::now(), None).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut reclaim)
+                .await
+                .is_err(),
+            "reclaim classified a segment while its new reference was still staged"
+        );
+
+        commit(&store, staged).await;
+        store.apply_tail_update(1, tail);
+        let (deleted, _) = tokio::time::timeout(std::time::Duration::from_secs(5), reclaim)
+            .await
+            .expect("reclaim did not resume after the reference commit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(frameloc_of(&store, &db, 1, 0).await.unwrap().segid, segid);
+        assert_eq!(
+            store.read(1, 0, EXTENT_SIZE as u64).await.unwrap(),
+            replacement
+        );
     }
 
     // The verify checks the durable view too: a durable pointer masked in memory

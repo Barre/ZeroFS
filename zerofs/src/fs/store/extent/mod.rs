@@ -88,6 +88,11 @@ pub struct ExtentStore {
     /// crosses the threshold keeps this gate while waiting for a seal permit,
     /// so later writers cannot keep extending an overdue open segment.
     append_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Read-held from the moment a transaction appends a frame until its
+    /// FrameLoc + segcount commit lands. Reclaim takes the write side before
+    /// sealing and choosing its eligibility cutoff, closing the window where a
+    /// sealed segment looked dead but could still gain a delayed reference.
+    extent_ref_barrier: Arc<tokio::sync::RwLock<()>>,
     /// Finalized bytes of segments whose PUT is in flight (or failed and pending a
     /// re-PUT). Reads consult these before the object store. Ordered so the
     /// barrier's re-PUT sequence is deterministic (seal order).
@@ -164,6 +169,7 @@ impl ExtentStore {
             codec,
             open,
             append_gate: Arc::new(tokio::sync::Mutex::new(())),
+            extent_ref_barrier: Arc::new(tokio::sync::RwLock::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_SEALS)),
             delete_at: Arc::new(Mutex::new(HashMap::new())),
@@ -268,6 +274,9 @@ impl ExtentStore {
             return coord.commit(txn).await;
         }
         let deltas = txn.take_seg_deltas();
+        // Unit tests use this direct fallback instead of the production commit
+        // worker; preserve the same staged-reference lifetime here.
+        let extent_ref_guards = txn.take_extent_ref_guards();
         let mut batch = txn.into_inner();
         let (_, footprint_delta) =
             crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
@@ -281,6 +290,7 @@ impl ExtentStore {
             )
             .await
             .map_err(|_| FsError::IoError)?;
+        drop(extent_ref_guards);
         // Committed: fold the batch's net footprint into the monitor gauges,
         // mirroring the write coordinator's apply on its own path.
         self.segment_gc_stats.apply_footprint_delta(
