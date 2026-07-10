@@ -361,11 +361,9 @@ impl ExtentStore {
         batch: Vec<(InodeId, u64, Compressed)>,
         src: &[FrameLoc],
     ) -> Result<usize, FsError> {
-        // A packed object is another future FrameLoc source. Although the
-        // production GC task is single-threaded, protect it with the same
-        // invariant as foreground writes so future concurrent callers cannot
-        // make it eligible before its repoints commit.
-        let publish_guard = self.new_segment_publish_guard().await;
+        // Pin the packed segment from allocation through every repoint. Clones
+        // let the coordinator retain the pin if this future is cancelled.
+        let extent_ref_guard = self.new_extent_ref_guard().await;
         let batch_len = batch.len();
         let new_locs = self
             .segments
@@ -399,7 +397,7 @@ impl ExtentStore {
             }
             let _guard = self.lock_manager.acquire(inode).await;
             let mut txn = self.db.new_transaction()?;
-            txn.hold_segment_publish_guard(Arc::clone(&publish_guard));
+            txn.hold_extent_ref_guard(Arc::clone(&extent_ref_guard));
             let mut any = false;
             for (extent, old_loc, new_loc) in items {
                 let key = self.key_codec.extent_key(inode, extent);
@@ -514,6 +512,59 @@ mod tests {
             segcount_of(&store, &db, packed).await,
             live_bytes(&store, &db, 1, 0..2, packed).await,
         );
+    }
+
+    // Holding the GC side must stop compaction before it creates the target.
+    #[tokio::test]
+    async fn compaction_acquires_reference_guard_before_sealing() {
+        let (store, db) = make().await;
+
+        for (inode, byte) in [(1, 1u8), (2, 2)] {
+            let mut txn = db.new_transaction().unwrap();
+            let tail = store
+                .write(&mut txn, inode, 0, &Bytes::from(vec![byte; 1000]), 0)
+                .await
+                .unwrap();
+            commit(&store, txn).await;
+            store.apply_tail_update(inode, tail);
+            store.seal_open().await.unwrap();
+        }
+
+        let seg_a = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        let seg_b = frameloc_of(&store, &db, 2, 0).await.unwrap().segid;
+        let source_count = store.segments.list_segments().await.unwrap().len();
+
+        let gc_guard = store.extent_ref_barrier.clone().write_owned().await;
+
+        let compacting_store = store.clone();
+        let mut compaction = tokio::spawn(async move {
+            compacting_store
+                .compact_segments(&[seg_a, seg_b], &[], MAX_COMPACT_BYTES_PER_ROUND)
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut compaction)
+                .await
+                .is_err(),
+            "compaction must block on the reference barrier"
+        );
+        assert_eq!(
+            store.segments.list_segments().await.unwrap().len(),
+            source_count,
+            "compaction sealed a packed segment before taking the reference barrier"
+        );
+
+        drop(gc_guard);
+        let (swapped, packed, _) = compaction.await.unwrap().unwrap();
+        assert_eq!(swapped, 2);
+        assert_eq!(packed, 1);
+        for (inode, byte) in [(1, 1u8), (2, 2)] {
+            assert_eq!(
+                store.read(inode, 0, 1000).await.unwrap().as_ref(),
+                &[byte; 1000]
+            );
+        }
     }
 
     #[tokio::test]
