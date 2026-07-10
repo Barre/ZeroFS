@@ -20,6 +20,13 @@
 //! without it, 8 fresh seeds; fanned across all cores), `DST_ROUNDS`,
 //! `DST_OPS` (per file per round). All harness sleeps are whole
 //! milliseconds; see `Hooks::latency` for why.
+//!
+//! This target runs with SlateDB's `cfg(dst)` branches and Tokio's seeded
+//! scheduler. Keep its dedicated CI invocation's `RUSTFLAGS` when reproducing
+//! locally; an ordinary `cargo test` intentionally compiles this as an empty
+//! target, matching SlateDB's own DST tests.
+
+#![cfg(dst)]
 
 #[path = "../failpoints/consistency.rs"]
 mod consistency;
@@ -1389,6 +1396,7 @@ fn run_seed_mode(seed: u64, fp_crash: bool) -> (u64, Vec<String>) {
     zerofs::fs::DST_FIXED_TIME.store(true, std::sync::atomic::Ordering::Relaxed);
     zerofs::db::DST_PANIC_ON_WRITE_ERROR.store(true, std::sync::atomic::Ordering::Relaxed);
     let rt = tokio::runtime::Builder::new_current_thread()
+        .rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()))
         .enable_all()
         .start_paused(true)
         .build()

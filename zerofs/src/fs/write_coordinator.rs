@@ -225,6 +225,10 @@ async fn worker_loop(
         // Collected only when replicating, to ship the batch to the standby.
         let mut repl_ops: Vec<crate::replication::ReplOp> = Vec::new();
         let mut replies = Vec::with_capacity(batch.len());
+        // Keep every FrameLoc publisher alive until the merged write has
+        // committed (or definitively failed). Consuming Transaction into the
+        // WriteBatch must not release these guards early.
+        let mut segment_publish_guards = Vec::new();
         let mut any_ops = false;
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         // Per-segment (live, total) deltas, aggregated per key across the batch.
@@ -232,6 +236,9 @@ async fn worker_loop(
         // Op-ids carried by this batch's transactions, recorded on apply.
         let mut batch_op_ids: Vec<crate::dedup::OpId> = Vec::new();
         for (mut txn, reply) in batch {
+            if let Some(guard) = txn.take_segment_publish_guard() {
+                segment_publish_guards.push(guard);
+            }
             any_ops |= !txn.is_empty();
             let oid = txn.op_id();
             if crate::dedup::has_op_id(&oid) {
@@ -443,6 +450,10 @@ async fn worker_loop(
                 footprint_delta.d_live,
             );
         }
+
+        // The pointer is visible (or the commit definitively failed), so the
+        // segment can no longer be misclassified by a later reclaim scan.
+        drop(segment_publish_guards);
 
         // In sync_writes mode, force a flush after the batch is committed so
         // every caller in the batch only sees Ok once their data is durable in

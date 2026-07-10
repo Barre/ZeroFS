@@ -131,8 +131,23 @@ pub struct Transaction {
     /// aggregated by the commit worker into one absolute `(live, total)` per
     /// segment. Same lock-free pattern as `stats_deltas`.
     seg_deltas: Vec<(Bytes, (i64, i64))>,
+    /// Shared side of the extent-store publication barrier. A transaction that
+    /// has assigned any FrameLoc holds this from before the frame is appended
+    /// until the coordinator has made its pointer visible. Segment GC takes
+    /// the exclusive side before sealing and choosing its eligibility cutoff,
+    /// so a sealed segment can no longer gain a late reference.
+    segment_publish_guard: Option<SegmentPublishGuard>,
     op_id: crate::dedup::OpId,
 }
+
+/// Type-erased RAII token supplied by the extent store. Keeping this token in
+/// the transaction lets the database layer preserve the publisher's lifetime
+/// without depending on the extent module's admission-gate implementation.
+pub(crate) trait SegmentPublishPermit: Send + Sync {}
+
+impl<T: Send + Sync> SegmentPublishPermit for T {}
+
+pub(crate) type SegmentPublishGuard = Arc<dyn SegmentPublishPermit>;
 
 impl Transaction {
     pub fn new() -> Self {
@@ -140,8 +155,25 @@ impl Transaction {
             ops: Vec::new(),
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
+            segment_publish_guard: None,
             op_id: [0u8; 16],
         }
+    }
+
+    pub(crate) fn has_segment_publish_guard(&self) -> bool {
+        self.segment_publish_guard.is_some()
+    }
+
+    pub(crate) fn hold_segment_publish_guard(&mut self, guard: SegmentPublishGuard) {
+        debug_assert!(
+            self.segment_publish_guard.is_none(),
+            "a transaction may hold only one segment publication guard"
+        );
+        self.segment_publish_guard = Some(guard);
+    }
+
+    pub(crate) fn take_segment_publish_guard(&mut self) -> Option<SegmentPublishGuard> {
+        self.segment_publish_guard.take()
     }
 
     /// Tag with a client idempotency op-id (all-zero = none). The commit worker
@@ -212,6 +244,10 @@ impl Transaction {
             "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
              WriteCoordinator, not into_inner/apply_to"
         );
+        debug_assert!(
+            self.segment_publish_guard.is_none(),
+            "segment publication guard would be dropped before commit"
+        );
         for op in self.ops {
             match op {
                 TxOp::Put(k, v) => target.put_bytes(k, v),
@@ -229,6 +265,10 @@ impl Transaction {
             self.seg_deltas.is_empty(),
             "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
              WriteCoordinator, not apply_to_collecting"
+        );
+        debug_assert!(
+            self.segment_publish_guard.is_none(),
+            "segment publication guard would be dropped before commit"
         );
         let mut ops = Vec::with_capacity(self.ops.len());
         for op in self.ops {

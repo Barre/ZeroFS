@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  DST_RUSTFLAGS: --cfg dst --cfg tokio_unstable --cfg io_uring_skip_arch_check
 
 permissions:
   contents: read
@@ -41,6 +42,8 @@ jobs:
           components: "clippy"
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run DST clippy
+        run: RUSTFLAGS="$DST_RUSTFLAGS" cargo clippy --test dst -- -D warnings
 
   build:
     name: Build and Test
@@ -55,6 +58,8 @@ jobs:
         run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose
+      - name: Run deterministic simulation tests
+        run: RUSTFLAGS="$DST_RUSTFLAGS" cargo test --test dst --verbose
       - name: Run zerofs-client crate tests (incl. doctests, all features)
         run: cargo test -p zerofs-client --all-features --verbose
       - name: Run the zerofs-client example end-to-end
@@ -91,4 +96,4 @@ jobs:
       - name: Run crash tests
         run: |
           cargo test --features failpoints --test failpoints --verbose
-          cargo test --features failpoints --test dst crash_points --verbose
+          RUSTFLAGS="$DST_RUSTFLAGS" cargo test --features failpoints --test dst crash_points --verbose

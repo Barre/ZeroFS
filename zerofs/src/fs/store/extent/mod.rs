@@ -22,7 +22,7 @@ mod write;
 pub(crate) use reclaim::QUIESCENT_AFTER_DEFAULT;
 pub use reclaim::{ChainOutcome, PassOutcome, PassStatus};
 
-use crate::db::{Db, Transaction};
+use crate::db::{Db, SegmentPublishGuard, Transaction};
 use crate::frame_codec::FrameCodec;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::KeyCodec;
@@ -42,13 +42,122 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::error;
 use write::{MAX_INFLIGHT_SEALS, OpenSegment, SEAL_THRESHOLD, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
 pub(super) const ZERO_EXTENT: &[u8] = &[0u8; EXTENT_SIZE];
+
+#[derive(Default)]
+struct SegmentPublishState {
+    active: usize,
+    closed: bool,
+}
+
+/// Admission gate between FrameLoc assignment and segment reclamation.
+struct SegmentPublishBarrier {
+    state: Mutex<SegmentPublishState>,
+    changed: watch::Sender<u64>,
+    exclusive: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl SegmentPublishBarrier {
+    fn new() -> Self {
+        let (changed, _) = watch::channel(0);
+        Self {
+            state: Mutex::new(SegmentPublishState::default()),
+            changed,
+            exclusive: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    async fn admit(self: &Arc<Self>) -> SegmentPublishGuard {
+        let mut changed = self.changed.subscribe();
+        loop {
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.closed {
+                    state.active = state
+                        .active
+                        .checked_add(1)
+                        .expect("segment publisher count overflow");
+                    return Arc::new(SegmentPublishPermit {
+                        barrier: Arc::clone(self),
+                    });
+                }
+            }
+            changed
+                .changed()
+                .await
+                .expect("segment publication gate outlives its watcher");
+        }
+    }
+
+    async fn close_and_drain(self: &Arc<Self>) -> SegmentPublishExclusiveGuard {
+        let mut changed = self.changed.subscribe();
+        let exclusive = Arc::clone(&self.exclusive).lock_owned().await;
+        {
+            let mut state = self.state.lock().unwrap();
+            debug_assert!(!state.closed);
+            state.closed = true;
+        }
+
+        let guard = SegmentPublishExclusiveGuard {
+            barrier: Arc::clone(self),
+            _exclusive: exclusive,
+        };
+        loop {
+            if self.state.lock().unwrap().active == 0 {
+                return guard;
+            }
+            changed
+                .changed()
+                .await
+                .expect("segment publication gate outlives its watcher");
+        }
+    }
+
+    fn signal(&self) {
+        self.changed.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
+    }
+}
+
+struct SegmentPublishPermit {
+    barrier: Arc<SegmentPublishBarrier>,
+}
+
+impl Drop for SegmentPublishPermit {
+    fn drop(&mut self) {
+        {
+            let mut state = self.barrier.state.lock().unwrap();
+            state.active = state
+                .active
+                .checked_sub(1)
+                .expect("segment publisher count underflow");
+        }
+        self.barrier.signal();
+    }
+}
+
+struct SegmentPublishExclusiveGuard {
+    barrier: Arc<SegmentPublishBarrier>,
+    _exclusive: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for SegmentPublishExclusiveGuard {
+    fn drop(&mut self) {
+        {
+            let mut state = self.barrier.state.lock().unwrap();
+            debug_assert!(state.closed);
+            state.closed = false;
+        }
+        self.barrier.signal();
+    }
+}
 
 /// What a `write` leaves for the tail cache. Applied by the caller only after
 /// the transaction commits, so the cache never runs ahead of durable state.
@@ -84,6 +193,10 @@ pub struct ExtentStore {
     lock_manager: Arc<KeyedLockManager<InodeId>>,
     codec: Arc<FrameCodec>,
     open: Arc<Mutex<OpenSegment>>,
+    /// Transactions that have assigned a FrameLoc hold the shared side through
+    /// commit. Reclaim takes the exclusive side before seal+flush+cutoff, which
+    /// drains every publisher that could still reference the segment it seals.
+    segment_publish_barrier: Arc<SegmentPublishBarrier>,
     /// Serializes appends through threshold-triggered rotation. The writer that
     /// crosses the threshold keeps this gate while waiting for a seal permit,
     /// so later writers cannot keep extending an overdue open segment.
@@ -163,6 +276,7 @@ impl ExtentStore {
             lock_manager,
             codec,
             open,
+            segment_publish_barrier: Arc::new(SegmentPublishBarrier::new()),
             append_gate: Arc::new(tokio::sync::Mutex::new(())),
             sealing: Arc::new(Mutex::new(BTreeMap::new())),
             seal_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_SEALS)),
@@ -184,6 +298,18 @@ impl ExtentStore {
     /// Reclaim/compaction metrics holder, for the Prometheus bridge.
     pub fn segment_gc_stats(&self) -> Arc<SegmentGcStats> {
         Arc::clone(&self.segment_gc_stats)
+    }
+
+    async fn new_segment_publish_guard(&self) -> SegmentPublishGuard {
+        self.segment_publish_barrier.admit().await
+    }
+
+    /// Attach the publication lifetime to the transaction before assigning it
+    /// a FrameLoc. Repeated edits in one transaction share the same guard.
+    pub(super) async fn protect_segment_publish(&self, txn: &mut Transaction) {
+        if !txn.has_segment_publish_guard() {
+            txn.hold_segment_publish_guard(self.new_segment_publish_guard().await);
+        }
     }
 
     /// One-time footprint scan: sums the segcount rows into the aggregate the
@@ -267,6 +393,9 @@ impl ExtentStore {
         if let Some(coord) = self.coordinator.get() {
             return coord.commit(txn).await;
         }
+        // Unit-test fallback: retain the same publication lifetime the real
+        // coordinator carries across its merged database write.
+        let segment_publish_guard = txn.take_segment_publish_guard();
         let deltas = txn.take_seg_deltas();
         let mut batch = txn.into_inner();
         let (_, footprint_delta) =
@@ -288,6 +417,7 @@ impl ExtentStore {
             footprint_delta.d_appended,
             footprint_delta.d_live,
         );
+        drop(segment_publish_guard);
         Ok(())
     }
 

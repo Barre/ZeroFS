@@ -38,6 +38,7 @@ jobs:
         run: >
           DST_WALL_CLOCK_SECS=${{ github.event.inputs.budget_secs || 3000 }}
           DST_ROUNDS=8
+          RUSTFLAGS="--cfg dst --cfg tokio_unstable --cfg io_uring_skip_arch_check"
           cargo test --profile ci --test dst -- --nocapture seeds
       - name: Upload divergence traces
         if: failure()

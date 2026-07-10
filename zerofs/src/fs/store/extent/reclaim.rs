@@ -230,15 +230,21 @@ impl ExtentStore {
             >,
         K: Fn(usize) -> bool,
     {
-        // The seal makes the flushed manifest reference only PUT segments; the
-        // flush makes "dead in the in-memory view" mean "dead in the durable view".
-        // Under the flush barrier (write side), same as the flush coordinator, so a
-        // concurrent commit can't durably reference the just-rotated open buffer.
-        {
+        // Drain FrameLoc publishers before sealing: their shared publication
+        // guards were acquired before assignment and live through commit, so
+        // once this exclusive guard lands no segment below the captured cutoff
+        // can gain a reference later. Acquire it before the DB flush barrier:
+        // publishers hold publication-read and acquire DB-read at commit.
+        let (cur_epoch, cutoff) = {
+            let _publishers = self.segment_publish_barrier.close_and_drain().await;
             let _barrier = self.db.flush_barrier().write_owned().await;
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
-        }
+            (
+                self.segments.epoch(),
+                self.open.lock().unwrap().segid.counter,
+            )
+        };
         tracing::debug!("segment GC: durable barrier done (sealed + flushed), scanning extents");
 
         // Post-barrier on purpose; see the doc comment for the race this closes.
@@ -261,15 +267,12 @@ impl ExtentStore {
             fp::widen(fp::RECLAIM_AFTER_BARRIER_BEFORE_SCAN).await;
         }
 
-        let cur_epoch = self.segments.epoch();
         // Exclusive counter cutoff for eligibility: the still-open segment's
         // own counter, not `next_counter()`. seal_open() just rotated in a
         // fresh open segment that is still accepting frames whose credits may
         // not be visible to the scan below; `next_counter()` would include it,
         // and a mid-pass background seal could then mis-classify that fully
         // live segment as dead.
-        let cutoff = self.open.lock().unwrap().segid.counter;
-
         // A persistent checkpoint pins a view this scan-driven path can't
         // bound by object mtime (it never LISTs). Skip classification entirely
         // while one exists; the scan still runs for the footprint log.
@@ -443,10 +446,9 @@ impl ExtentStore {
         let mut deleted = 0;
         let mut freed_counters: Vec<Segid> = Vec::new();
         for (segid, size) in to_delete {
-            // Fail-closed: a segment is deleted only once its directory confirms no
-            // frame is still referenced. Sound because an eligible segment can never
-            // regain a reference, so "no frame points here" is a permanent verdict.
-            match self.verify_segment_reclaimable(segid).await {
+            // A segment is deleted only once its directory confirms no
+            // frame is still referenced.
+            let verdict = match self.verify_segment_reclaimable(segid).await {
                 SegmentDeadVerdict::Keep => {
                     // The counter under-counted (a live frame remains) or the read
                     // was transient — leak beats loss.
@@ -456,14 +458,47 @@ impl ExtentStore {
                     );
                     continue;
                 }
-                SegmentDeadVerdict::ObjectAbsent => {
-                    // A crash between deleting the object and committing the
-                    // counter drop left the counter behind; drop it so it stops
-                    // re-appearing as dead each pass.
-                    freed_counters.push(segid);
-                    continue;
+                verdict => verdict,
+            };
+            // The publication barrier makes a new credit impossible for an
+            // eligible segment, but never turn an observed invariant breach
+            // into object loss.
+            let counter_key = self.key_codec.segcount_key(segid.epoch, segid.counter);
+            let still_dead = match self.db.get_bytes(&counter_key).await {
+                Ok(Some(value)) => match KeyCodec::decode_segcount(&value) {
+                    Some((0, _)) => true,
+                    Some((live, _)) => {
+                        error!(
+                            "segment GC: {segid:?} became live ({live} bytes) after its dead scan; \
+                             skipping delete"
+                        );
+                        false
+                    }
+                    None => {
+                        error!("segment GC: undecodable counter for {segid:?}; skipping delete");
+                        false
+                    }
+                },
+                Ok(None) => {
+                    error!("segment GC: counter for {segid:?} disappeared; skipping delete");
+                    false
                 }
-                SegmentDeadVerdict::Reclaim => {}
+                Err(e) => {
+                    error!(
+                        "segment GC: counter recheck for {segid:?} failed: {e}; skipping delete"
+                    );
+                    false
+                }
+            };
+            if !still_dead {
+                continue;
+            }
+            if matches!(verdict, SegmentDeadVerdict::ObjectAbsent) {
+                // A crash between deleting the object and committing the
+                // counter drop left the counter behind; drop it so it stops
+                // re-appearing as dead each pass.
+                freed_counters.push(segid);
+                continue;
             }
             #[cfg(feature = "failpoints")]
             {
@@ -495,35 +530,42 @@ impl ExtentStore {
         // Drop the counters of deleted segments, else one segcount key leaks
         // per segment ever created.
         if !freed_counters.is_empty() {
-            let dropped = freed_counters.len() as i64;
             // Debit the gauges by each row's value at drop time, not the
             // scan-time total: a pack segment's per-inode credit txns can
             // straddle the scan, so the row may hold more than the scan saw.
             // Stable to read here: after the directory verify nothing credits
             // a retired segment (packs mint fresh ids, writers credit only
             // the open segment).
+            let mut dropped = 0i64;
             let mut freed_appended = 0u64;
+            let mut freed_live = 0u64;
             let mut txn = self.db.new_transaction()?;
             for segid in &freed_counters {
                 let key = self.key_codec.segcount_key(segid.epoch, segid.counter);
-                if let Some((_, total)) = self
+                let value = self
                     .db
                     .get_bytes(&key)
                     .await
-                    .ok()
-                    .flatten()
-                    .and_then(|b| KeyCodec::decode_segcount(&b))
-                {
-                    freed_appended += total;
-                }
+                    .map_err(|_| FsError::IoError)?;
+                let Some(value) = value else {
+                    continue;
+                };
+                let (live, total) = KeyCodec::decode_segcount(&value).ok_or(FsError::IoError)?;
+                dropped += 1;
+                freed_live += live;
+                freed_appended += total;
                 txn.delete_bytes(&key);
             }
-            self.commit_via_coordinator(txn).await?;
-            // Committed: debit the dropped counters from the footprint gauges.
-            // The freed segments are dead (live == 0), so only segment_count and
-            // appended fall; reclaimable falls with appended.
-            self.segment_gc_stats
-                .apply_footprint_delta(-dropped, -(freed_appended as i64), 0);
+            if dropped > 0 {
+                self.commit_via_coordinator(txn).await?;
+                // Use the exact rows removed rather than assuming the earlier
+                // scan still describes them. `freed_live` should be zero.
+                self.segment_gc_stats.apply_footprint_delta(
+                    -dropped,
+                    -(freed_appended as i64),
+                    -(freed_live as i64),
+                );
+            }
         }
 
         // Chains from hot pairs whose both endpoints are scan-seen live —
@@ -785,19 +827,22 @@ impl ExtentStore {
     /// can't leave a not-yet-credited packed segment eligible. Returns the
     /// number of orphans reclaimed.
     pub async fn sweep_orphans(&self, modified_before: DateTime<Utc>) -> Result<usize, FsError> {
-        // Durable barrier, as in the fast reclaim: seal the open buffer and flush so
-        // the eligibility cutoff and the directory verify observe the durable view.
-        {
+        // Same publisher drain + lock order as the fast reclaim. Capture the
+        // cutoff while staging is still excluded; after release, new frames can
+        // only target that cutoff or newer and are therefore ineligible here.
+        let (cur_epoch, cutoff) = {
+            let _publishers = self.segment_publish_barrier.close_and_drain().await;
             let _barrier = self.db.flush_barrier().write_owned().await;
             self.seal_open().await?;
             self.db.flush().await.map_err(|_| FsError::IoError)?;
-        }
-
-        let cur_epoch = self.segments.epoch();
+            (
+                self.segments.epoch(),
+                self.open.lock().unwrap().segid.counter,
+            )
+        };
         // Same eligibility cutoff as reclaim_segments_gated. A freshly-packed
         // compaction segment always carries a higher counter, so it is never
         // eligible even mid-compaction.
-        let cutoff = self.open.lock().unwrap().segid.counter;
         let eligible =
             |s: &Segid| s.epoch < cur_epoch || (s.epoch == cur_epoch && s.counter < cutoff);
 
@@ -1005,6 +1050,80 @@ mod tests {
         );
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
         assert_eq!(store.read(1, 0, 1000).await.unwrap().as_ref(), &[1u8; 1000]);
+    }
+
+    /// A transaction may append a frame before its FrameLoc/counter commit.
+    /// Reclaim must drain that publisher before it seals and classifies the
+    /// segment; otherwise an immediate horizon can delete the object and let
+    /// the delayed transaction publish a dangling pointer afterward.
+    #[tokio::test]
+    async fn reclaim_drains_staged_frame_publishers_before_classification() {
+        let (store, db) = make().await;
+
+        // Give the current open segment a durable, fully-dead counter row.
+        let mut seed = db.new_transaction().unwrap();
+        store
+            .write(&mut seed, 1, 0, &Bytes::from(vec![1u8; 1000]), 0)
+            .await
+            .unwrap();
+        commit(&store, seed).await;
+        let segid = frameloc_of(&store, &db, 1, 0).await.unwrap().segid;
+        let mut remove = db.new_transaction().unwrap();
+        store.delete_range(&mut remove, 1, 0, 1).await.unwrap();
+        commit(&store, remove).await;
+        let (live, total) = segcount_pair_of(&store, &db, segid).await;
+        assert_eq!(live, 0);
+        assert!(total > 0);
+
+        // Append another frame to that same still-open segment, but deliberately
+        // retain its transaction instead of committing it.
+        let expected = Bytes::from(vec![7u8; 1000]);
+        let mut pending = db.new_transaction().unwrap();
+        store.write(&mut pending, 2, 0, &expected, 0).await.unwrap();
+        assert!(pending.has_segment_publish_guard());
+
+        // With an already-expired horizon this pass would previously seal the
+        // segment, observe live=0/no pointer, and delete it before `pending`
+        // committed. It must now wait at the publication barrier.
+        let reclaim_store = store.clone();
+        let reclaim = tokio::spawn(async move {
+            reclaim_store
+                .reclaim_segments(Utc::now() - chrono::Duration::days(1), None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store.segment_publish_barrier.state.lock().unwrap().closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reclaim reaches and closes the publication barrier");
+        assert!(
+            !reclaim.is_finished(),
+            "reclaim crossed the barrier while a FrameLoc publisher was outstanding"
+        );
+
+        commit(&store, pending).await;
+        let (deleted, _) = tokio::time::timeout(Duration::from_secs(5), reclaim)
+            .await
+            .expect("reclaim completes after publisher commit")
+            .expect("reclaim task")
+            .expect("reclaim pass");
+        assert_eq!(deleted, 0, "the newly referenced segment must be kept");
+        assert_eq!(store.read(2, 0, 1000).await.unwrap(), expected);
+
+        let footprint = store.sample_footprint().await.unwrap();
+        let gauges = store.segment_gc_stats();
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(footprint.segment_count, gauges.segment_count.load(Relaxed));
+        assert_eq!(
+            footprint.appended_bytes,
+            gauges.appended_bytes.load(Relaxed)
+        );
+        assert_eq!(footprint.live_bytes, gauges.live_bytes.load(Relaxed));
     }
 
     // The verify checks the durable view too: a durable pointer masked in memory
