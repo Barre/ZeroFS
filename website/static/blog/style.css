@@ -118,11 +118,13 @@ main { position: relative; z-index: 1; }
 .post-list { padding: 24px 0 104px; }
 .post-row {
   display: block;
-  padding: 48px 0 52px;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  transition: border-color .18s ease;
+  margin-inline: -24px;
+  padding: 48px 24px 52px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  transition: border-color .18s ease, background .18s ease;
 }
+.post-row + .post-row { margin-top: 16px; }
 .post-copy { min-width: 0; max-width: 720px; }
 .post-row .meta {
   font-family: var(--mono); font-size: 12px; letter-spacing: 0.05em;
@@ -142,9 +144,13 @@ main { position: relative; z-index: 1; }
   font-family: var(--mono); font-size: 13px; color: var(--accent);
 }
 .post-row .more .arrow { display: inline-block; transition: transform .18s ease; }
-.post-row:hover { border-color: rgba(255,255,255,.15); }
-.post-row:hover h2 { filter: brightness(1.14); }
-.post-row:hover .more .arrow { transform: translateX(3px); }
+.post-row:hover, .post-row:focus-visible {
+  border-color: rgba(77,159,255,.24);
+  background: linear-gradient(110deg, rgba(77,159,255,.07), var(--panel) 48%, transparent 82%);
+  outline: none;
+}
+.post-row:hover h2, .post-row:focus-visible h2 { filter: brightness(1.14); }
+.post-row:hover .more .arrow, .post-row:focus-visible .more .arrow { transform: translateX(3px); }
 
 /* ---------- article ---------- */
 .reading-progress {
@@ -288,6 +294,11 @@ main { position: relative; z-index: 1; }
 .post td { font-family: var(--serif); font-size: 15.5px; line-height: 1.5; color: var(--text-read); }
 .post td:first-child { color: var(--text); font-weight: 500; white-space: nowrap; }
 .post tr:last-child td { border-bottom: 0; }
+.post .table-wrap.wide-table {
+  width: min(960px, 94vw); max-width: none;
+  margin-left: calc(50% - min(480px, 47vw));
+}
+.post .wide-table td:first-child { min-width: 110px; white-space: normal; }
 
 /* diagram */
 /* the diagram breaks out wider than the prose, centered on the column, so it stays
@@ -367,7 +378,7 @@ main { position: relative; z-index: 1; }
   .idx-hero p { max-width: 23rem; font-size: 18px; }
   .idx-art { top: 48%; right: -112px; width: 300px; height: 300px; opacity: .45; }
   .post-list { padding: 20px 0 72px; }
-  .post-row { padding: 32px 0 38px; }
+  .post-row { margin-inline: -8px; padding: 32px 8px 38px; }
   .post-row .meta { gap: 10px; font-size: 11.5px; }
   .post-row h2 { font-size: 28px; }
   .post-row p { font-size: 17px; }
