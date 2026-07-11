@@ -206,6 +206,33 @@ impl Storage {
         let fs = Self::open(sim.clone(), self.clock.clone(), reopen_seed, config.scale).await;
         self.incarnation = Incarnation::Live { sim, fs };
     }
+
+    /// Reopen the cleanly closed filesystem over the same backing store.
+    async fn reopen_after_close(&mut self, config: &WorldConfig, digest: &Digest) {
+        let old = std::mem::replace(&mut self.incarnation, Incarnation::Reopening);
+        let Incarnation::Live { sim, fs } = old else {
+            panic!("attempted to reopen while already reopening");
+        };
+        drop(fs);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        drop(sim);
+        let sim = Arc::new(SimStore::new(
+            self.backing.clone(),
+            config.seed ^ 0x5157 ^ 0xC105E,
+            config.fault_ppm,
+            digest.clone(),
+        ));
+        let fs = Self::open(
+            sim.clone(),
+            self.clock.clone(),
+            config.seed ^ 1,
+            config.scale,
+        )
+        .await;
+        self.incarnation = Incarnation::Live { sim, fs };
+    }
 }
 
 struct WorldModel {
@@ -705,6 +732,108 @@ impl WorldHarness {
 
 pub(crate) fn run_seed(seed: u64) -> (u64, Vec<String>) {
     run_seed_mode(seed, false)
+}
+
+/// Cover an acknowledged write after the last ordinary flush, then race a write
+/// against close. An acknowledged write must survive; a rejected one must not.
+pub(crate) fn run_graceful_close_case(seed: u64) {
+    zerofs::fs::DST_FIXED_TIME.store(true, Relaxed);
+    zerofs::db::DST_PANIC_ON_WRITE_ERROR.store(true, Relaxed);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()))
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let digest = Digest::default();
+        let config = WorldConfig {
+            seed,
+            failpoint_crashes: false,
+            rounds: 0,
+            ops_per_file: 0,
+            gc_passes: 0,
+            crash_pct: 0,
+            fault_ppm: 0,
+            scale: scale_for(seed),
+            file_mix: FileOpMix::new(1, 1, 1, 1),
+        };
+        let mut storage = Storage::new(&config, &digest).await;
+        let creds = creds();
+        let auth = auth();
+
+        let fs = storage.fs().clone();
+        let (id, _) = fs
+            .create(&creds, 0, b"graceful", &SetAttributes::default())
+            .await
+            .expect("create");
+        let flushed = pattern(seed, EXTENT_SIZE);
+        fs.write(&auth, id, 0, &Bytes::from(flushed.clone()))
+            .await
+            .expect("flushed write");
+        fs.client_fsync().await.expect("flush");
+        let late = pattern(seed ^ 1, EXTENT_SIZE);
+        fs.write(&auth, id, EXTENT_SIZE as u64, &Bytes::from(late.clone()))
+            .await
+            .expect("late write");
+        fs.flush_coordinator.close().await.expect("close");
+        drop(fs);
+
+        storage.reopen_after_close(&config, &digest).await;
+        let fs = storage.fs();
+        let (bytes, _) = fs
+            .read_file(&auth, id, 0, 2 * EXTENT_SIZE as u32)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "read after graceful close failed (seed {seed}): {e:?} — \
+                     a dangling extent pointer survived the close"
+                )
+            });
+        let expected = [flushed.as_slice(), late.as_slice()].concat();
+        assert_eq!(
+            bytes.as_ref(),
+            expected,
+            "contents after close (seed {seed})"
+        );
+        let report = verify_consistency_sparse(fs)
+            .await
+            .expect("consistency scan");
+        assert!(
+            report.is_consistent(),
+            "consistency errors after graceful close (seed {seed}):\n{report}"
+        );
+
+        // A racing write may win or be rejected, but may never leave a dangling
+        // extent or disappear after being acknowledged.
+        let fs = storage.fs().clone();
+        let racer = pattern(seed ^ 2, EXTENT_SIZE);
+        let racing_write = {
+            let fs = fs.clone();
+            let racer = Bytes::from(racer.clone());
+            let auth = auth.clone();
+            tokio::spawn(async move { fs.write(&auth, id, 2 * EXTENT_SIZE as u64, &racer).await })
+        };
+        fs.flush_coordinator.close().await.expect("second close");
+        let raced = racing_write.await.expect("racing write task");
+        drop(fs);
+
+        storage.reopen_after_close(&config, &digest).await;
+        let fs = storage.fs();
+        let (bytes, _) = fs
+            .read_file(&auth, id, 0, 3 * EXTENT_SIZE as u32)
+            .await
+            .unwrap_or_else(|e| panic!("read after racing close failed (seed {seed}): {e:?}"));
+        let expected = match raced {
+            Ok(_) => [flushed.as_slice(), late.as_slice(), racer.as_slice()].concat(),
+            Err(_) => [flushed.as_slice(), late.as_slice()].concat(),
+        };
+        assert_eq!(
+            bytes.as_ref(),
+            expected,
+            "racing close contents (seed {seed})"
+        );
+    });
 }
 
 pub(crate) fn run_seed_mode(seed: u64, failpoint_crashes: bool) -> (u64, Vec<String>) {

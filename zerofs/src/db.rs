@@ -14,6 +14,7 @@ use slatedb::{CacheTarget, DbCacheManagerOps, DbReader, WriteBatch};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_stream::Stream;
 
 /// Wrapper for SlateDB handle that can be either read-write or read-only.
@@ -311,6 +312,8 @@ pub struct Db {
     /// the un-PUT open buffer: a commit that overlaps a flush lands *after* it, so
     /// its pointer is never in the flushed set referencing an un-sealed segment.
     flush_barrier: Arc<tokio::sync::RwLock<()>>,
+    /// Rejects writers released from the flush barrier after final close.
+    closing: AtomicBool,
 }
 
 impl Db {
@@ -325,6 +328,7 @@ impl Db {
             lease: None,
             status,
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -335,6 +339,7 @@ impl Db {
             lease: None,
             status: None,
             flush_barrier: Arc::new(tokio::sync::RwLock::new(())),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -358,6 +363,19 @@ impl Db {
             return Err(FsError::LeaderLeaseExpired.into());
         }
         Ok(())
+    }
+
+    #[inline]
+    fn check_closing(&self) -> Result<()> {
+        if self.closing.load(Ordering::Relaxed) {
+            return Err(FsError::ShuttingDown.into());
+        }
+        Ok(())
+    }
+
+    /// Called under the flush barrier's write lock immediately before close.
+    pub fn mark_closing(&self) {
+        self.closing.store(true, Ordering::Relaxed);
     }
 
     /// Whether this node may serve as leader right now (always true in single-node
@@ -541,6 +559,7 @@ impl Db {
         // Read side of the flush barrier: a commit overlapping a seal+flush waits
         // for it, so its pointer lands after the flush, never in the flushed set.
         let _flush_guard = self.flush_barrier.read().await;
+        self.check_closing()?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => match db.write_with_options(batch, options).await {
@@ -569,6 +588,7 @@ impl Db {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
         let _flush_guard = self.flush_barrier.read().await;
+        self.check_closing()?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
@@ -589,6 +609,7 @@ impl Db {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
+        self.check_closing()?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {

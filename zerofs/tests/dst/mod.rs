@@ -225,6 +225,16 @@ fn crash_points() {
     scenario.teardown();
 }
 
+/// Every write acknowledged before a graceful close must survive reopen.
+#[test]
+fn graceful_close_durability() {
+    let seed = dst_seeds()
+        .and_then(|seeds| seeds.into_iter().next())
+        .unwrap_or_else(|| rand::thread_rng().r#gen());
+    eprintln!("dst: graceful close seed {seed}");
+    crate::world::run_graceful_close_case(seed);
+}
+
 /// A failing seed is only a repro if the same seed is the same run. The seed
 /// under replay is drawn fresh each run (or DST_SEEDS' first entry, so a
 /// reproduction exercises the same one) and printed.
