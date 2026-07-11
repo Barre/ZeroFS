@@ -1,0 +1,197 @@
+/*
+  Copyright (c) 2026 Pierre Barre. All rights reserved.
+  Shared marketing-site header and footer geometry.
+*/
+
+html {
+  scrollbar-gutter: stable;
+}
+
+header {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 100;
+  height: auto;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  transition: background .3s ease, border-color .3s ease;
+}
+
+header.scrolled {
+  border-bottom-color: var(--line);
+  background: rgba(10, 10, 9, .96);
+  backdrop-filter: blur(8px);
+}
+
+.bar {
+  width: 100%;
+  max-width: 1180px;
+  height: 72px;
+  margin: 0 auto;
+  padding: 0 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 13px;
+  color: var(--text);
+}
+
+.brand svg {
+  display: block;
+  color: var(--text);
+}
+
+.brand .mark {
+  width: 36px;
+  height: 36px;
+  filter: drop-shadow(0 0 12px rgba(255, 255, 255, .18));
+  transition: filter .2s;
+}
+
+.brand:hover .mark {
+  filter: drop-shadow(0 0 18px rgba(255, 255, 255, .35));
+}
+
+.brand .wm {
+  width: 84px;
+  height: 18.1px;
+}
+
+nav {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+
+nav a {
+  padding: 8px 13px;
+  border-radius: 8px;
+  color: var(--text-dim);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -.005em;
+  text-decoration: none;
+  transition: color .15s, background .15s;
+}
+
+nav a:hover {
+  color: var(--text);
+  background: var(--panel-hover);
+}
+
+nav a[aria-current="page"] {
+  color: var(--text);
+}
+
+nav a.gh {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+nav a.gh svg {
+  display: block;
+  opacity: .9;
+}
+
+nav a.gh span {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+nav a.cta {
+  margin-left: 14px;
+  padding: 10px 20px;
+  border-radius: 999px;
+  background: var(--text);
+  color: #0a0a09;
+  font-size: 14px;
+  font-weight: 600;
+  transition: transform .15s, box-shadow .15s, background .15s;
+}
+
+nav a.cta:hover {
+  background: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 28px rgba(255, 255, 255, .22);
+}
+
+footer {
+  border-top: 1px solid var(--line);
+}
+
+footer .wrap {
+  width: 100%;
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 30px 32px 38px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+
+footer a {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--line-bright);
+  text-underline-offset: 3px;
+}
+
+footer a:hover {
+  text-decoration-color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  .bar {
+    width: 100%;
+    height: 60px;
+    padding: 0 20px;
+  }
+
+  nav {
+    gap: 2px;
+  }
+
+  nav a:not(.cta):not(.keep) {
+    display: none;
+  }
+
+  footer .wrap {
+    width: 100%;
+  }
+}
+
+@media (max-width: 430px) {
+  .brand {
+    gap: 10px;
+  }
+
+  .brand .wm {
+    width: 72px;
+  }
+
+  nav a.gh {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  nav a.cta {
+    margin-left: 4px;
+    padding: 9px 16px;
+  }
+}

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+Disallow: /social/
+Sitemap: https://www.zerofs.net/sitemap.xml

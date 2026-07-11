@@ -1,0 +1,43 @@
+{% extends "blog-base.html" %}
+
+{% block metadata %}
+<title>{{ section.title }}</title>
+<meta name="description" content="{{ section.description }}">
+<link rel="canonical" href="{{ current_url | safe }}">
+<meta property="og:title" content="{{ section.title }}">
+<meta property="og:description" content="{{ section.description }}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{{ current_url | safe }}">
+<meta property="og:image" content="https://www.zerofs.net/assets/og-card.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="alternate" type="application/atom+xml" title="ZeroFS blog" href="/atom.xml">
+{% endblock metadata %}
+
+{% block content %}
+<main>
+  <section class="idx-hero">
+    <div class="wrap">
+      <h1 class="rv" data-d="80">Blog</h1>
+      <p class="rv" data-d="160">Notes on building a distributed filesystem.</p>
+      <div class="idx-art" aria-hidden="true">
+        <svg><use href="#enso" /></svg>
+      </div>
+    </div>
+  </section>
+
+  <section class="post-list">
+    <div class="wrap">
+      {% for post in section.pages %}
+      <a class="post-row rv" href="{{ post.path | safe }}">
+        <div class="post-copy">
+          <div class="meta"><time datetime="{{ post.date }}">{{ post.extra.display_date }}</time><span>{{ post.extra.reading_time }}</span></div>
+          <h2>{{ post.title }}</h2>
+          <p>{{ post.extra.summary | safe }}</p>
+          <span class="more">Read the post <span class="arrow">→</span></span>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+</main>
+{% endblock content %}
