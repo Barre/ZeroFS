@@ -23,6 +23,7 @@ impl fmt::Display for proto::FileOperation {
             proto::FileOperation::Mknod => "mknod  ",
             proto::FileOperation::Trim => "trim   ",
             proto::FileOperation::Fsync => "fsync  ",
+            proto::FileOperation::Fallocate => "falloc ",
         };
         write!(f, "{}", s)
     }
@@ -160,6 +161,19 @@ impl From<FileAccessEvent> for proto::FileAccessEvent {
                 proto::OperationParams {
                     offset: Some(offset),
                     length: Some(length),
+                    ..Default::default()
+                },
+            ),
+            FileOperation::Fallocate {
+                offset,
+                length,
+                mode,
+            } => (
+                proto::FileOperation::Fallocate as i32,
+                proto::OperationParams {
+                    offset: Some(offset),
+                    length: Some(length),
+                    mode: Some(mode),
                     ..Default::default()
                 },
             ),
@@ -386,6 +400,14 @@ mod tests {
             P::Trim as i32
         );
         assert_eq!(code(FileOperation::Fsync), P::Fsync as i32);
+        assert_eq!(
+            code(FileOperation::Fallocate {
+                offset: 0,
+                length: 1,
+                mode: 0x10,
+            }),
+            P::Fallocate as i32
+        );
     }
 
     #[test]
@@ -405,6 +427,12 @@ mod tests {
             length: 2,
         });
         assert_eq!((p.offset, p.length), (Some(1), Some(2)));
+        let p = params(FileOperation::Fallocate {
+            offset: 3,
+            length: 4,
+            mode: 0x11,
+        });
+        assert_eq!((p.offset, p.length, p.mode), (Some(3), Some(4), Some(0x11)));
 
         assert_eq!(
             params(FileOperation::Create { mode: 0o644 }).mode,

@@ -108,6 +108,7 @@ enum FileOperation {
     MKNOD = 11;
     TRIM = 12;
     FSYNC = 13;
+    FALLOCATE = 14;
 }
 
 message OperationParams {

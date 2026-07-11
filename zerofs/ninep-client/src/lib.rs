@@ -262,8 +262,7 @@ pub struct NinePClient {
     live_notify: Notify,
     reconnect_notify: Arc<Notify>,
     msize: AtomicU32,
-    /// Negotiated extension level, re-negotiated on reconnect: 0 = plain
-    /// 9P2000.L, 1 = `.zerofs`, 2 = `.zerofs2`, 3 = `.zerofs3` (op-id).
+    /// Negotiated cumulative extension level, re-negotiated on reconnect.
     extensions: AtomicU8,
     fid_ctr: AtomicU32,
     fid_free: Mutex<Vec<u32>>,
@@ -717,6 +716,11 @@ impl NinePClient {
     /// `.zerofs5` negotiated: a file open can fold in its first read (Tlopenatread).
     pub fn extensions_v5_enabled(&self) -> bool {
         self.extensions.load(Ordering::Relaxed) >= 5
+    }
+
+    /// `.zerofs6` negotiated: the atomic ZeroFS-private Tfallocate request.
+    pub fn fallocate_enabled(&self) -> bool {
+        self.extensions.load(Ordering::Relaxed) >= 6
     }
 
     /// Record a just-acked mutating write on `fid` as un-fsync'd under `token` (the
@@ -1196,6 +1200,32 @@ impl NinePClient {
         match self.rpc(Message::Tsetattr(ts)).await? {
             Message::Rsetattr(_) => Ok(()),
             _ => Err(ClientError::Unexpected("setattr")),
+        }
+    }
+
+    /// Atomically allocate, punch, or zero a file range through the negotiated
+    /// ZeroFS-private Tfallocate request.
+    pub async fn fallocate(
+        &self,
+        fid: u32,
+        offset: u64,
+        length: u64,
+        mode: u32,
+    ) -> ClientResult<()> {
+        if !self.fallocate_enabled() {
+            return Err(ClientError::Errno(libc::EOPNOTSUPP as u32));
+        }
+        match self
+            .rpc(Message::Tfallocate(Tfallocate {
+                fid,
+                offset,
+                length,
+                mode,
+            }))
+            .await?
+        {
+            Message::Rfallocate(_) => Ok(()),
+            _ => Err(ClientError::Unexpected("fallocate")),
         }
     }
 
@@ -1943,9 +1973,8 @@ impl NinePClient {
             .any(|&fid| self.snapshot_unsynced(fid).0.is_some())
         {
             // Fail-closed: we hold un-fsync'd writes from an earlier `.zerofs4` session
-            // but are now on a connection that cannot verify durability (an
-            // `ignore_fsync` or pre-`.zerofs4` server). A plain unchecked fsync could
-            // succeed over a lost write, so refuse.
+            // but are now on a pre-`.zerofs4` connection that cannot verify durability.
+            // A plain unchecked fsync could succeed over a lost write, so refuse.
             Err(ClientError::Errno(libc::ESTALE as u32))
         } else {
             match self
@@ -2122,12 +2151,12 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
     let (otx, orx) = oneshot::channel();
     conn.pending.insert(NOTAG, otx);
     // Propose the newest extension down through `.zerofs3` so the server's substring
-    // match lands on the highest it offers and degrades cleanly: a pre-`.zerofs5`
-    // server picks `.zerofs4`, and an `ignore_fsync` or pre-`.zerofs4` server picks
-    // `.zerofs3` (keeping the op-id) rather than dropping all the way to `.zerofs`.
+    // match lands on the highest it offers and degrades cleanly: a pre-`.zerofs6`
+    // server picks `.zerofs5`, while a pre-`.zerofs4` server picks `.zerofs3`
+    // (keeping the op-id) rather than dropping all the way to `.zerofs`.
     let body = Message::Tversion(Tversion {
         msize: requested,
-        version: P9String::new(b"9P2000.L.zerofs5.zerofs4.zerofs3".to_vec()),
+        version: P9String::new(b"9P2000.L.zerofs6.zerofs5.zerofs4.zerofs3".to_vec()),
     });
     let bytes = match P9Message::new(NOTAG, body).to_bytes() {
         Ok(b) => b,
@@ -2151,7 +2180,9 @@ async fn negotiate_on(conn: &Conn, requested: u32) -> ClientResult<(u32, u8)> {
                 return Err(ClientError::Unexpected("version"));
             }
             // The server echoes the highest suffix it supports; plain `9P2000.L` means none.
-            let extensions = if vstr.contains(".zerofs5") {
+            let extensions = if vstr.contains(".zerofs6") {
+                6
+            } else if vstr.contains(".zerofs5") {
                 5
             } else if vstr.contains(".zerofs4") {
                 4

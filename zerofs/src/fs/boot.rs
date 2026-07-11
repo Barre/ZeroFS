@@ -304,13 +304,15 @@ impl ZeroFS {
     /// writes belong to the live lineage (so the flush just made them durable, or a
     /// clean takeover carried them). Otherwise the client's writes were made under a
     /// lineage that broke (a cold restart or a Solo-tainted takeover) and may be
-    /// lost, so we return ESTALE rather than a false success. Never reachable under
-    /// `ignore_fsync`: the server does not offer `.zerofs4` then, so the flush above
-    /// always runs and the OK branch's durability assumption holds.
+    /// lost, so we return ESTALE rather than a false success. With `ignore_fsync`,
+    /// the administrator explicitly opts out and this barrier returns immediately.
     pub async fn client_fsync_verified(
         &self,
         client_token: u64,
     ) -> Result<(), crate::fs::errors::FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
         self.flush_coordinator.flush().await?;
         if client_token == 0 || client_token == self.lineage_token {
             Ok(())
@@ -430,6 +432,15 @@ mod tests {
             }
             _ => panic!("Root should be a directory"),
         }
+    }
+
+    #[tokio::test]
+    async fn ignore_fsync_applies_to_verified_barriers() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.ignore_fsync = true;
+        fs.client_fsync_verified(fs.lineage_token.wrapping_add(1))
+            .await
+            .expect("the explicit ignore_fsync opt-out bypasses lineage verification");
     }
 
     #[tokio::test]

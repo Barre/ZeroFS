@@ -1,7 +1,7 @@
 export const metadata = {
   title: '9P Protocol Extensions',
   description:
-    'The private extensions ZeroFS negotiates on top of 9P2000.L: fewer round trips, idempotent retries, reconnect by inode id, and durability-verified fsync, with their on-the-wire framing.',
+    'The private extensions ZeroFS negotiates on top of 9P2000.L: fewer round trips, idempotent retries, reconnect by inode id, durability-verified fsync, and fallocate.',
 }
 
 export const sections = [
@@ -11,12 +11,13 @@ export const sections = [
   { title: 'Idempotent retries', id: 'idempotent-retries' },
   { title: 'Reconnect by inode id', id: 'reconnect' },
   { title: 'Durability-verified fsync', id: 'durable-fsync' },
+  { title: 'Atomic fallocate', id: 'fallocate' },
   { title: 'Message reference', id: 'message-reference' },
 ]
 
 # 9P Protocol Extensions
 
-ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own client negotiates a set of private extensions on top of it: fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, and an fsync that verifies durability rather than assuming it. This page documents what each one does and how it is framed on the wire. {{ className: 'lead' }}
+ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own client negotiates a set of private extensions on top of it: fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, durability-aware fsync, and atomic fallocate operations. This page documents what each one does and how it is framed on the wire. {{ className: 'lead' }}
 
 ## Overview {{ id: 'overview' }}
 
@@ -28,10 +29,11 @@ Every extension was added to remove a specific cost in the standard protocol:
 - 9P2000.L has no way to retry a mutating request safely: a `mkdir` whose reply was lost cannot be re-sent without risking a double-apply. An op-id makes retries idempotent.
 - A reconnecting client cannot re-bind a fid to a file that was renamed while it was disconnected. Rebinding by inode id fixes that.
 - 9P `Tfsync` returns success whether or not the connection's writes are still the live durable copy. The durability-verified variant returns success only when they are.
+- 9P2000.L has no fallocate request. `Tfallocate` carries Linux range-allocation modes to an atomic server-side operation.
 
 ## Negotiation {{ id: 'negotiation' }}
 
-Capabilities are negotiated as part of the standard `Tversion`/`Rversion` exchange. The client proposes the highest level it supports as a single version string; the server echoes back the highest level it can honor. Levels are cumulative and the suffixes stack, so the client offers `9P2000.L.zerofs5.zerofs4.zerofs3` and an older server that only understands `.zerofs` replies with that, leaving the client to degrade rather than send messages the server cannot parse. Matching is by substring, so each side independently recognizes the levels it knows.
+Capabilities are negotiated as part of the standard `Tversion`/`Rversion` exchange. The client proposes the highest level it supports as a single version string; the server echoes back the highest level it can honor. Levels are cumulative and the suffixes stack, so the client offers `9P2000.L.zerofs6.zerofs5.zerofs4.zerofs3` and an older server that only understands `.zerofs` replies with that, leaving the client to degrade rather than send messages the server cannot parse. Matching is by substring, so each side independently recognizes the levels it knows.
 
 | Level | Version string | Adds |
 | --- | --- | --- |
@@ -41,9 +43,10 @@ Capabilities are negotiated as part of the standard `Tversion`/`Rversion` exchan
 | 3 | `9P2000.L.zerofs3` | Per-request idempotency op-id in the frame, for safe retry. |
 | 4 | `9P2000.L.zerofs4` | Durability-verified fsync (`Tgetlineage`, `Tfsyncdur`). |
 | 5 | `9P2000.L.zerofs5` | Folds a file open and its first read into one round trip. |
+| 6 | `9P2000.L.zerofs6` | Atomic fallocate operations (`Tfallocate`). |
 
 <Note>
-Levels 4 and 5 are durability features, so a server started with `ignore_fsync` never offers them and caps negotiation at level 3. A client that needs verified durability is therefore never handed a connection that would silently fake it.
+The negotiated level describes protocol support. `ignore_fsync` does not lower it: that setting is an explicit administrator opt-out that makes both `Tfsync` and `Tfsyncdur` return without forcing stable storage.
 </Note>
 
 The op-id at level 3 is spliced into the frame only on the request types that carry one, and only once both peers have negotiated `.zerofs3`. An older peer never sees the extra bytes, so standard framing is byte-for-byte unchanged for it. The fid rebinding extension (`Trebind`) is not gated by a version level: it is a private message the bundled client sends only after a reconnect, and the server accepts it from any session.
@@ -111,7 +114,7 @@ with op-id    size[4] type[1] tag[2] op_id[16] body...
 
 The server keeps a bounded cache keyed by op-id. The first time it sees an op-id it applies the operation and records the reply; a retry carrying the same op-id returns the recorded reply without re-applying. Concurrent retries of the same op-id are serialized through a single-flight gate, so two copies in flight at once still apply exactly once. An all-zero op-id means "no dedup requested" and always applies.
 
-Only the non-idempotent mutations carry an op-id: the create family (`Tlcreate`, `Tsymlink`, `Tmknod`, `Tmkdir`, `Tlink`), `Trename`, `Trenameat`, `Tunlinkat`, and their level-2 compound forms. Operations that are already idempotent (reads, walks, attach, clunk, write, setattr, and `Tlopenat`) are left out, so they pay nothing.
+Only the non-idempotent mutations carry an op-id: the create family (`Tlcreate`, `Tsymlink`, `Tmknod`, `Tmkdir`, `Tlink`), `Trename`, `Trenameat`, `Tunlinkat`, and their level-2 compound forms. Operations that are already idempotent (reads, walks, attach, clunk, write, setattr, fallocate, and `Tlopenat`) are left out, so they pay nothing. The supported fallocate modes are idempotent with respect to file data, size, and quota; range-shifting modes are not supported.
 
 The op-id is what makes `zerofs mount` reconnect cleanly. On a dropped connection the client re-sends in-flight mutations with their original op-ids, and the [client-side failover path](/high-availability) keeps a stable op-id across a re-route so a retried `mkdir` or `rename` applies once even when the request lands on a different node after a failover.
 
@@ -141,7 +144,18 @@ Tfsyncdur    fid[4] datasync[4] token[8]
              -> Rlerror(ESTALE)   otherwise
 ```
 
-This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it is what lets the bundled client verify fsync durability through a [high-availability](/high-availability) failover. A server with `ignore_fsync` set never offers level 4, so a client that asks for verified durability is never silently downgraded to an unverified success.
+This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it is what lets the bundled client verify fsync durability through a [high-availability](/high-availability) failover. With `ignore_fsync`, the administrator deliberately disables the barrier: `Tfsyncdur` returns success without flushing or checking lineage.
+
+## Atomic fallocate {{ id: 'fallocate' }}
+
+Level 6 adds `Tfallocate`, since standard 9P2000.L has no message for Linux `fallocate(2)`. The request targets an open file fid and carries the byte range and Linux mode bits. The server applies extent edits, logical-size growth, quota accounting, timestamps, and cached directory metadata in one transaction.
+
+```text {{ title: 'Tfallocate / Rfallocate' }}
+Tfallocate  fid[4] offset[8] length[8] mode[4]
+Rfallocate  (empty body)
+```
+
+Supported modes are plain allocation (`0`), `PUNCH_HOLE | KEEP_SIZE`, and `ZERO_RANGE` with optional `KEEP_SIZE`. Zero-filled ranges are represented as sparse holes while logical growth remains quota-accounted. Standalone keep-size preallocation and the collapse, insert, unshare, and write-zeroes modes return `EOPNOTSUPP`.
 
 ## Message reference {{ id: 'message-reference' }}
 
@@ -149,6 +163,7 @@ Every extension message and its 9P type id. Reply types are paired with their re
 
 | Type | Message | Level | Purpose |
 | --- | --- | --- | --- |
+| 228 / 229 | `Tfallocate` / `Rfallocate` | 6 | Atomically allocate, punch, or zero a file range. |
 | 230 / 231 | `Tlopenatread` / `Rlopenatread` | 5 | Open plus first read in one round trip. |
 | 232 | `Tfsyncdur` | 4 | Durability-verified fsync (replies with `Rfsync`, type 51). |
 | 233 / 234 | `Tgetlineage` / `Rgetlineage` | 4 | Query the connection's durability lineage token. |

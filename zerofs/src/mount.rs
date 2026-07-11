@@ -21,7 +21,11 @@ use fuser::{
     SessionACL, TimeOrNow,
 };
 use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
-use ninep_proto::{GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat};
+#[cfg(test)]
+use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
+use ninep_proto::{
+    GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat, classify_fallocate_mode,
+};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -203,6 +207,25 @@ fn split_time(t: SystemTime) -> (u64, u64) {
         Ok(d) => (d.as_secs(), d.subsec_nanos() as u64),
         Err(_) => (0, 0),
     }
+}
+
+/// Validate the Linux mode combinations implemented by the ZeroFS server and
+/// return the unsigned bits carried by the private 9P request.
+fn validate_fallocate(offset: u64, length: u64, mode: i32) -> Result<u32, Errno> {
+    if mode < 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if length == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = offset.checked_add(length).ok_or(Errno::EFBIG)?;
+    if end > OFFSET_MAX {
+        return Err(Errno::EFBIG);
+    }
+    let mode = mode as u32;
+    classify_fallocate_mode(mode)
+        .map(|_| mode)
+        .ok_or(Errno::EOPNOTSUPP)
 }
 
 fn stat_to_attr(stat: &Stat) -> FileAttr {
@@ -1399,9 +1422,9 @@ impl Filesystem for Fuse9P {
         });
     }
 
-    // Operations we don't support over the 9P backend. Each returns the same
-    // ENOSYS that fuser's default trait method would, but without the per-call
-    // "[Not Implemented]" WARN — callers (cp, xattr tools, etc.) fall back.
+    // Mostly operations we don't support over the 9P backend. Those callbacks
+    // return the same ENOSYS as fuser's default without its per-call warning;
+    // fallocate below is the one negotiated private-extension exception.
     fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         reply.error(Errno::ENOSYS);
     }
@@ -1477,13 +1500,28 @@ impl Filesystem for Fuse9P {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: u64,
-        _length: u64,
-        _mode: i32,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::ENOSYS);
+        let mode = match validate_fallocate(offset, length, mode) {
+            Ok(mode) => mode,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+
+        let client = Arc::clone(&self.client);
+        let fid = fh.0 as u32;
+        self.rt.spawn(async move {
+            match client.fallocate(fid, offset, length, mode).await {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
+        });
     }
 
     fn lseek(
@@ -1915,6 +1953,40 @@ mod consistency_tests {
         assert_eq!(handle_open_flags(false, true), FopenFlags::FOPEN_DIRECT_IO);
         assert_eq!(handle_open_flags(true, true), FopenFlags::FOPEN_DIRECT_IO);
     }
+
+    #[test]
+    fn supported_fallocate_modes_are_accepted() {
+        for mode in [
+            0,
+            (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) as i32,
+            FALLOC_FL_ZERO_RANGE as i32,
+            (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) as i32,
+        ] {
+            assert_eq!(validate_fallocate(10, 20, mode).unwrap(), mode as u32);
+        }
+    }
+
+    #[test]
+    fn fallocate_rejects_invalid_or_unsupported_ranges() {
+        assert_eq!(
+            validate_fallocate(0, 0, 0).unwrap_err().code(),
+            libc::EINVAL
+        );
+        assert_eq!(
+            validate_fallocate(OFFSET_MAX, 1, 0).unwrap_err().code(),
+            libc::EFBIG
+        );
+        assert_eq!(
+            validate_fallocate(0, 1, FALLOC_FL_KEEP_SIZE as i32)
+                .unwrap_err()
+                .code(),
+            libc::EOPNOTSUPP
+        );
+        assert_eq!(
+            validate_fallocate(0, 1, 0x80).unwrap_err().code(),
+            libc::EOPNOTSUPP
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2057,6 +2129,59 @@ mod client_tests {
         assert!(sfs.blocks > 0);
         assert_eq!(sfs.namelen, 255);
 
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn atomic_fallocate_modes_roundtrip() {
+        let (client, shutdown, _dir, _sock) = setup().await;
+        assert!(client.fallocate_enabled());
+        client
+            .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
+            .await
+            .unwrap();
+
+        let fid = client.alloc_fid();
+        client.walk(ROOT_FID_TEST, fid, &[]).await.unwrap();
+        client
+            .lcreate(
+                fid,
+                b"fallocate.bin",
+                (libc::O_RDWR | libc::O_CREAT) as u32,
+                libc::S_IFREG | 0o644,
+                0,
+            )
+            .await
+            .unwrap();
+        client.write(fid, 0, b"abcdefghijkl").await.unwrap();
+
+        client.fallocate(fid, 16, 4, 0).await.unwrap();
+        assert_eq!(client.getattr(fid, GETATTR_ALL).await.unwrap().size, 20);
+
+        client
+            .fallocate(fid, 2, 3, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)
+            .await
+            .unwrap();
+        let data = client.read(fid, 0, 12).await.unwrap();
+        assert_eq!(&data[..2], b"ab");
+        assert_eq!(&data[2..5], &[0; 3]);
+        assert_eq!(&data[5..], b"fghijkl");
+
+        client
+            .fallocate(fid, 8, 20, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(client.getattr(fid, GETATTR_ALL).await.unwrap().size, 20);
+
+        for unsupported_mode in [FALLOC_FL_KEEP_SIZE, 0x80] {
+            match client.fallocate(fid, 0, 1, unsupported_mode).await {
+                Err(ClientError::Errno(e)) => assert_eq!(e, libc::EOPNOTSUPP as u32),
+                other => panic!("expected EOPNOTSUPP for {unsupported_mode:#x}, got {other:?}"),
+            }
+        }
+
+        client.clunk(fid).await.unwrap();
+        client.free_fid(fid);
         shutdown.cancel();
     }
 

@@ -7,8 +7,8 @@ use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
-    AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize,
-    SetTime, SetUid, Timestamp,
+    AuthContext, FallocateMode, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid,
+    SetMode, SetSize, SetTime, SetUid, Timestamp,
 };
 use crate::fs::{OpenHandle, ZeroFS};
 use bytes::Bytes;
@@ -18,7 +18,7 @@ use dashmap::mapref::entry::Entry;
 use fp::fail_point;
 use ninep_proto::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use tracing::debug;
 
 pub const DEFAULT_MSIZE: u32 = 256 * 1024;
@@ -108,8 +108,8 @@ pub struct Session {
     /// session is rooted at the whole filesystem). Trebind validates rebound
     /// inodes against this subtree.
     pub attach_root: AtomicU64,
-    /// Set once `.zerofs3` is negotiated: requests carry a frame op-id.
-    pub op_id_enabled: AtomicBool,
+    /// Negotiated cumulative ZeroFS extension level (0 for plain 9P2000.L).
+    pub extensions: AtomicU8,
 }
 
 impl From<&Tsetattr> for SetAttributes {
@@ -177,7 +177,7 @@ impl NinePHandler {
             msize: AtomicU32::new(DEFAULT_MSIZE),
             fids: Arc::new(DashMap::new()),
             attach_root: AtomicU64::new(0),
-            op_id_enabled: AtomicBool::new(false),
+            extensions: AtomicU8::new(0),
         });
 
         Self {
@@ -203,7 +203,7 @@ impl NinePHandler {
 
     /// Whether this connection negotiated `.zerofs3`.
     pub fn op_id_enabled(&self) -> bool {
-        self.session.op_id_enabled.load(AtomicOrdering::Relaxed)
+        self.session.extensions.load(AtomicOrdering::Relaxed) >= 3
     }
 
     /// Returns the effective GID for a create-type operation. When a credential
@@ -272,6 +272,7 @@ impl NinePHandler {
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
             Message::Tsetattr(ts) => self.setattr(ts).await,
+            Message::Tfallocate(tf) => self.fallocate(tf).await,
             Message::Tmkdir(tm) => self.mkdir(tm, op_id).await,
             Message::Tsymlink(ts) => self.symlink(ts, op_id).await,
             Message::Tmknod(tm) => self.mknod(tm, op_id).await,
@@ -351,35 +352,28 @@ impl NinePHandler {
         // v9fs proposes plain `9P2000.L`, so it gets the plain reply and the
         // extension handlers are not used. An old client proposing `.zerofs` gets
         // `.zerofs` back and never sends the compound messages.
-        // `.zerofs4` (durability-verified fsync) is offered only when this server
-        // can actually honor it: `ignore_fsync` makes fsync a no-op, so we must not
-        // promise a verified fsync — the client then degrades to `.zerofs3` and uses
-        // a plain (unverified) fsync, which is honest about what it provides.
-        // `.zerofs5` (open+first-read fold) is cumulative over `.zerofs4`, so it is
-        // offered on the same terms: only when fsync is real, since the level implies
-        // durability-verified fsync. An `ignore_fsync` server therefore caps at
-        // `.zerofs3` and the read fold is simply not used.
-        let version = if version_str.contains(".zerofs5") && !self.filesystem.ignore_fsync {
-            VERSION_9P2000L_ZEROFS5
-        } else if version_str.contains(".zerofs4") && !self.filesystem.ignore_fsync {
-            VERSION_9P2000L_ZEROFS4
+        // The extension level describes protocol capabilities. `ignore_fsync`
+        // deliberately weakens fsync semantics but does not hide later protocol
+        // features from a client whose administrator chose that tradeoff.
+        let (version, extensions) = if version_str.contains(".zerofs6") {
+            (VERSION_9P2000L_ZEROFS6, 6)
+        } else if version_str.contains(".zerofs5") {
+            (VERSION_9P2000L_ZEROFS5, 5)
+        } else if version_str.contains(".zerofs4") {
+            (VERSION_9P2000L_ZEROFS4, 4)
         } else if version_str.contains(".zerofs3") {
-            VERSION_9P2000L_ZEROFS3
+            (VERSION_9P2000L_ZEROFS3, 3)
         } else if version_str.contains(".zerofs2") {
-            VERSION_9P2000L_ZEROFS2
+            (VERSION_9P2000L_ZEROFS2, 2)
         } else if version_str.contains(".zerofs") {
-            VERSION_9P2000L_ZEROFS
+            (VERSION_9P2000L_ZEROFS, 1)
         } else {
-            VERSION_9P2000L
+            (VERSION_9P2000L, 0)
         };
 
-        // `.zerofs4`/`.zerofs5` imply `.zerofs3`, so the frame op-id is enabled for all.
-        self.session.op_id_enabled.store(
-            version == VERSION_9P2000L_ZEROFS3
-                || version == VERSION_9P2000L_ZEROFS4
-                || version == VERSION_9P2000L_ZEROFS5,
-            AtomicOrdering::Relaxed,
-        );
+        self.session
+            .extensions
+            .store(extensions, AtomicOrdering::Relaxed);
 
         Ok(Message::Rversion(Rversion {
             msize,
@@ -1263,6 +1257,28 @@ impl NinePHandler {
         Ok(Message::Rsetattr(Rsetattr))
     }
 
+    async fn fallocate(&self, tf: Tfallocate) -> P9Result<Message> {
+        if self.session.extensions.load(AtomicOrdering::Relaxed) < 6 {
+            return Err(P9Error::NotSupported);
+        }
+        let fid_entry = self.get_fid(tf.fid)?;
+        if !fid_entry.opened {
+            return Err(P9Error::FidNotOpen);
+        }
+        let mode = match classify_fallocate_mode(tf.mode) {
+            Some(FallocateKind::Allocate) => FallocateMode::Allocate,
+            Some(FallocateKind::PunchHole) => FallocateMode::PunchHole,
+            Some(FallocateKind::ZeroRange { keep_size }) => FallocateMode::ZeroRange { keep_size },
+            None => return Err(P9Error::NotSupported),
+        };
+
+        let auth = AuthContext::from(&fid_entry.creds);
+        self.filesystem
+            .fallocate(&auth, fid_entry.inode_id, tf.offset, tf.length, mode)
+            .await?;
+        Ok(Message::Rfallocate(Rfallocate))
+    }
+
     // ZeroFS fast path: Tsetattr whose reply carries the post-op stat (which the
     // filesystem computes anyway), sparing the client its follow-up Tgetattr.
     async fn setattr_attr(&self, ts: Tsetattr) -> P9Result<Message> {
@@ -1967,6 +1983,36 @@ mod tests {
             .await;
         match resp.body {
             Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS2),
+            other => panic!("expected Rversion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fallocate_is_negotiated_as_zerofs6() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.ignore_fsync = true;
+        let handler = NinePHandler::new(Arc::new(fs), Arc::new(FileLockManager::new()));
+        let resp = handler
+            .handle_message(
+                0,
+                Message::Tversion(Tversion {
+                    msize: DEFAULT_MSIZE,
+                    version: P9String::new(b"9P2000.L.zerofs6.zerofs5.zerofs4.zerofs3".to_vec()),
+                }),
+            )
+            .await;
+        match resp.body {
+            Message::Rversion(rv) => {
+                assert_eq!(
+                    rv.version.data, VERSION_9P2000L_ZEROFS6,
+                    "ignore_fsync is an explicit opt-out, not a protocol-level cap"
+                );
+                assert_eq!(handler.session.extensions.load(AtomicOrdering::Relaxed), 6);
+                assert!(
+                    handler.op_id_enabled(),
+                    "level 6 must include level 3 op-ids"
+                );
+            }
             other => panic!("expected Rversion, got {other:?}"),
         }
     }

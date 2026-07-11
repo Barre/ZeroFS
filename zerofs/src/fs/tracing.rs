@@ -21,6 +21,7 @@ pub enum FileOperation {
     Symlink { target: String },
     Mknod { mode: u32 },
     Trim { offset: u64, length: u64 },
+    Fallocate { offset: u64, length: u64, mode: u32 },
     Fsync,
 }
 
@@ -40,6 +41,7 @@ impl std::fmt::Display for FileOperation {
             FileOperation::Symlink { .. } => "symlink",
             FileOperation::Mknod { .. } => "mknod  ",
             FileOperation::Trim { .. } => "trim   ",
+            FileOperation::Fallocate { .. } => "falloc ",
             FileOperation::Fsync => "fsync  ",
         };
         write!(f, "{}", s)
