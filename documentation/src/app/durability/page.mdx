@@ -265,7 +265,7 @@ The durability guarantees available to applications depend on the access protoco
 
     - `fsync()` issues a durability-verified flush (`Tfsyncdur`, a ZeroFS 9P extension negotiated by `zerofs mount` and the client libraries)
     - ZeroFS flushes all buffered data to object storage, then verifies the writes' lineage; the call returns success only when durability is confirmed, otherwise `ESTALE` (see [Verified fsync](#verified-fsync))
-    - Plain 9P2000.L clients (e.g. the Linux kernel v9fs client) issue `Tfsync`: a durable but unverified flush. A server with `ignore_fsync` enabled never offers the verified extension.
+    - Plain 9P2000.L clients (e.g. the Linux kernel v9fs client) issue `Tfsync`: a durable but unverified flush. With `ignore_fsync`, both standard and durability-verified fsync requests return without forcing a flush; selecting that option explicitly opts out of the guarantee.
 
   </Col>
   <Col>
@@ -297,6 +297,7 @@ ZeroFS verifies its consistency guarantees through systematic crash simulation u
     | Operation | Failpoints |
     |-----------|------------|
     | write | after extent write, after inode update, after commit |
+    | fallocate | after extent edits, after inode update, after commit |
     | create | after inode allocation, after directory entry, after commit |
     | remove | after inode delete, after tombstone, after directory unlink, after commit |
     | rename | after target delete, after source unlink, after new entry, after commit |
@@ -311,7 +312,9 @@ ZeroFS verifies its consistency guarantees through systematic crash simulation u
     | segment reclaim | after barrier, before scan; after verify, before delete; after segment delete, before counter drop |
     | seal | forced open-segment seal error |
 
-    Each crash failpoint aborts the operation at the injection point; the filesystem instance is torn down (discarding all in-memory state) and restarted from object storage, simulating a crash at that exact point. The seal failpoint injects an error return instead, verifying that a failed seal leaves the open buffer intact for retry rather than committing dangling pointers.
+    Fallocate exposes these boundaries as `fallocate_after_extents`, `fallocate_after_inode`, and `fallocate_after_commit`. Its focused atomicity test verifies that aborting at either pre-commit point discards the staged extent and inode changes, while aborting after commit leaves the complete range operation visible.
+
+    The crash-harness failpoints abort the operation at the injection point; the filesystem instance is torn down (discarding all in-memory state) and restarted from object storage, simulating a crash at that exact point. The seal failpoint injects an error return instead, verifying that a failed seal leaves the open buffer intact for retry rather than committing dangling pointers.
 
   </Col>
   <Col>

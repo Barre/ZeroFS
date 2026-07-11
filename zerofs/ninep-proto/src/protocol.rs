@@ -18,9 +18,8 @@ pub const VERSION_9P2000L_ZEROFS3: &[u8] = b"9P2000.L.zerofs3";
 /// durability lineage token via Tgetlineage and presents it on Tfsyncdur; the
 /// server flushes and returns Rfsync only if that token is still the live
 /// durable lineage, else Rlerror(ESTALE). So a successful fsync implies every
-/// write the client acked before it is durable (survives a crash/failover).
-/// A server with `ignore_fsync` set never offers this, so a verified client is
-/// never handed a hollow OK.
+/// write the client acked before it is durable (survives a crash/failover),
+/// unless the administrator explicitly configured `ignore_fsync`.
 pub const VERSION_9P2000L_ZEROFS4: &[u8] = b"9P2000.L.zerofs4";
 /// `.zerofs5`: folds a file open and its first read into one round trip.
 /// Tlopenatread opens `fid`'s inode on a fresh `newfid` (exactly like Tlopenat)
@@ -28,9 +27,10 @@ pub const VERSION_9P2000L_ZEROFS4: &[u8] = b"9P2000.L.zerofs4";
 /// fits in the prefetch window needs no follow-up Tread. The inline read is
 /// best-effort and never affects the open: on a read error the reply carries the
 /// open result with empty data, and the client issues a normal Tread. Implies
-/// `.zerofs4` (the levels are cumulative), so an `ignore_fsync` server, which
-/// caps at `.zerofs3`, does not offer it.
+/// `.zerofs4` because the levels are cumulative.
 pub const VERSION_9P2000L_ZEROFS5: &[u8] = b"9P2000.L.zerofs5";
+/// `.zerofs6`: adds the atomic ZeroFS-private Tfallocate message.
+pub const VERSION_9P2000L_ZEROFS6: &[u8] = b"9P2000.L.zerofs6";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -48,6 +48,34 @@ pub const SETATTR_ATIME: u32 = 0x00000010;
 pub const SETATTR_MTIME: u32 = 0x00000020;
 pub const SETATTR_ATIME_SET: u32 = 0x00000080;
 pub const SETATTR_MTIME_SET: u32 = 0x00000100;
+
+// Linux fallocate mode bits carried verbatim by Tfallocate.
+pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+
+/// Supported semantic operation encoded by the Linux fallocate mode bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallocateKind {
+    Allocate,
+    PunchHole,
+    ZeroRange { keep_size: bool },
+}
+
+/// Parse the exact fallocate mode combinations supported by ZeroFS.
+pub fn classify_fallocate_mode(mode: u32) -> Option<FallocateKind> {
+    match mode {
+        0 => Some(FallocateKind::Allocate),
+        mode if mode == (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) => {
+            Some(FallocateKind::PunchHole)
+        }
+        FALLOC_FL_ZERO_RANGE => Some(FallocateKind::ZeroRange { keep_size: false }),
+        mode if mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE) => {
+            Some(FallocateKind::ZeroRange { keep_size: true })
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
 #[deku(id_type = "u8")]
@@ -338,6 +366,22 @@ pub struct Tsetattr {
     #[deku(endian = "little")]
     pub mtime_nsec: u64,
 }
+
+/// ZeroFS-private fallocate request, negotiated via `.zerofs6`.
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Tfallocate {
+    #[deku(endian = "little")]
+    pub fid: u32,
+    #[deku(endian = "little")]
+    pub offset: u64,
+    #[deku(endian = "little")]
+    pub length: u64,
+    #[deku(endian = "little")]
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, DekuRead, DekuWrite)]
+pub struct Rfallocate;
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Tmkdir {
@@ -935,6 +979,11 @@ pub const T_MKDIRATTR: u8 = 240;
 pub const T_SYMLINKATTR: u8 = 242;
 pub const T_MKNODATTR: u8 = 244;
 pub const T_LINKATTR: u8 = 246;
+// The supported fallocate modes are idempotent with respect to file data,
+// size, and quota, so retries do not require an op-id. The request still
+// participates in fsync durability tracking.
+pub const T_FALLOCATE: u8 = 228;
+pub const R_FALLOCATE: u8 = 229;
 
 // Main message enum
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -984,6 +1033,10 @@ pub enum Message {
     Tsetattr(Tsetattr),
     #[deku(id = "27")]
     Rsetattr(Rsetattr),
+    #[deku(id = "T_FALLOCATE")]
+    Tfallocate(Tfallocate),
+    #[deku(id = "R_FALLOCATE")]
+    Rfallocate(Rfallocate),
     #[deku(id = "T_MKDIR")]
     Tmkdir(Tmkdir),
     #[deku(id = "73")]
@@ -1122,6 +1175,7 @@ impl Message {
             Message::Twrite(m) => Some(m.fid),
             Message::Tsetattr(m) => Some(m.fid),
             Message::Tsetattrattr(m) => Some(m.fid),
+            Message::Tfallocate(m) => Some(m.fid),
             Message::Tlcreate(m) => Some(m.fid),
             // The directory ENTRY is in the parent; `fsync(parent)` must cover it.
             Message::Tlcreateattr(m) => Some(m.dfid),
@@ -1267,6 +1321,8 @@ impl P9Message {
             Message::Rgetattr(_) => 25,
             Message::Tsetattr(_) => 26,
             Message::Rsetattr(_) => 27,
+            Message::Tfallocate(_) => T_FALLOCATE,
+            Message::Rfallocate(_) => R_FALLOCATE,
             Message::Tmkdir(_) => T_MKDIR,
             Message::Rmkdir(_) => 73,
             Message::Tsymlink(_) => T_SYMLINK,
@@ -1383,6 +1439,46 @@ mod tests {
             vec![1],
             "a single-directory op yields just its own fid"
         );
+    }
+
+    #[test]
+    fn fallocate_round_trips_and_tracks_its_file_fid() {
+        assert_eq!(classify_fallocate_mode(0), Some(FallocateKind::Allocate));
+        assert_eq!(
+            classify_fallocate_mode(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE),
+            Some(FallocateKind::PunchHole)
+        );
+        assert_eq!(
+            classify_fallocate_mode(FALLOC_FL_ZERO_RANGE),
+            Some(FallocateKind::ZeroRange { keep_size: false })
+        );
+        assert_eq!(
+            classify_fallocate_mode(FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE),
+            Some(FallocateKind::ZeroRange { keep_size: true })
+        );
+        assert_eq!(classify_fallocate_mode(FALLOC_FL_KEEP_SIZE), None);
+
+        let msg = P9Message::new(
+            9,
+            Message::Tfallocate(Tfallocate {
+                fid: 42,
+                offset: 100,
+                length: 200,
+                mode: FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+            }),
+        );
+        let bytes = msg.to_bytes().unwrap();
+        let (_, decoded) = P9Message::from_bytes((&bytes, 0)).unwrap();
+        assert_eq!(decoded.type_, T_FALLOCATE);
+        assert_eq!(decoded.body.durability_fid(), Some(42));
+        match decoded.body {
+            Message::Tfallocate(tf) => {
+                assert_eq!(tf.offset, 100);
+                assert_eq!(tf.length, 200);
+                assert_eq!(tf.mode, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE);
+            }
+            _ => panic!("expected Tfallocate"),
+        }
     }
 
     #[test]

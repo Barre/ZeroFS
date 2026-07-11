@@ -55,6 +55,12 @@ fn format_params(params: Option<&OperationParams>, op: i32) -> String {
                 params.length.unwrap_or(0)
             )
         }
+        FileOperation::Fallocate => format!(
+            " offset={} len={} mode={:#x}",
+            params.offset.unwrap_or(0),
+            params.length.unwrap_or(0),
+            params.mode.unwrap_or(0)
+        ),
         FileOperation::Create
         | FileOperation::Mkdir
         | FileOperation::Setattr

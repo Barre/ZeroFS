@@ -115,6 +115,11 @@ jobs:
           url = "s3://zerofs-test/test"
           encryption_password = "test-password-123"
 
+          [filesystem]
+          # Keep statfs finite so generic/213 can request more than the
+          # advertised capacity and exercise fallocate's ENOSPC path.
+          max_size_gb = 4.0
+
           [aws]
           access_key_id = "minioadmin"
           secret_access_key = "minioadmin"
@@ -157,6 +162,10 @@ jobs:
           [storage]
           url = "s3://zerofs-test/scratch"
           encryption_password = "test-password-123"
+
+          [filesystem]
+          # Match the TEST filesystem's finite quota for scratch operations.
+          max_size_gb = 4.0
 
           [aws]
           access_key_id = "minioadmin"
@@ -270,6 +279,7 @@ jobs:
           #  - 504: BSD/flock locks don't appear in /proc/locks on FUSE
           generic/478
           generic/504
+          generic/749
           EOF
 
       - name: Run xfstests

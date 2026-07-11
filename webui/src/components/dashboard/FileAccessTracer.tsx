@@ -5,7 +5,11 @@ import { adminClient } from "../../lib/grpc/client";
 import { formatSize } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Tip } from "../ui/Tip";
-import type { FileAccessEvent, OperationParams } from "../../lib/grpc/gen/admin_pb";
+import {
+  FileOperation,
+  type FileAccessEvent,
+  type OperationParams,
+} from "../../lib/grpc/gen/admin_pb";
 
 const OP_COLORS: Record<string, string> = {
   READ: "text-blue-400",
@@ -22,6 +26,7 @@ const OP_COLORS: Record<string, string> = {
   MKNOD: "text-orange-400",
   TRIM: "text-yellow-400",
   FSYNC: "text-cyan-400",
+  FALLOCATE: "text-fuchsia-400",
 };
 
 function formatTime(d: Date): string {
@@ -29,7 +34,22 @@ function formatTime(d: Date): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${d.getMilliseconds().toString().padStart(3, "0")}`;
 }
 
-function formatParams(params: OperationParams | undefined): string {
+function formatFallocateMode(mode: number): string {
+  switch (mode) {
+    case 0:
+      return "allocate";
+    case 0x03:
+      return "punch-hole|keep-size";
+    case 0x10:
+      return "zero-range";
+    case 0x11:
+      return "zero-range|keep-size";
+    default:
+      return `mode=0x${mode.toString(16)}`;
+  }
+}
+
+function formatParams(params: OperationParams | undefined, operation: string): string {
   if (!params) return "";
   const parts: string[] = [];
   if (params.offset != null && params.length != null) {
@@ -37,7 +57,9 @@ function formatParams(params: OperationParams | undefined): string {
   } else if (params.length != null) {
     parts.push(formatSize(params.length));
   }
-  if (params.mode != null) parts.push((params.mode & 0o7777).toString(8));
+  if (params.mode != null) {
+    parts.push(operation === "FALLOCATE" ? formatFallocateMode(params.mode) : (params.mode & 0o7777).toString(8));
+  }
   if (params.newPath) parts.push(`\u2192 ${params.newPath}`);
   if (params.linkTarget) parts.push(`\u2192 ${params.linkTarget}`);
   if (params.filename) parts.push(params.filename);
@@ -80,23 +102,6 @@ export function FileAccessTracer() {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [events]);
 
-  const opNames = [
-    "READ",
-    "WRITE",
-    "CREATE",
-    "REMOVE",
-    "RENAME",
-    "MKDIR",
-    "READDIR",
-    "LOOKUP",
-    "SETATTR",
-    "LINK",
-    "SYMLINK",
-    "MKNOD",
-    "TRIM",
-    "FSYNC",
-  ];
-
   return (
     <div className="card-surface rounded-lg p-5">
       <div className="flex items-center justify-between mb-3">
@@ -122,14 +127,16 @@ export function FileAccessTracer() {
           <p className="text-muted-foreground">Waiting for events...</p>
         ) : (
           events.map(({ event, receivedAt }, i) => {
-            const opName = opNames[event.operation] ?? "?";
+            const opName = FileOperation[event.operation] ?? "?";
             return (
               <div key={i} className="flex gap-2 hover:bg-accent/40 px-1 -mx-1 rounded min-w-0">
                 <span className="text-muted-foreground/50 shrink-0 tabular-nums">{formatTime(receivedAt)}</span>
-                <span className={`w-[60px] shrink-0 text-right ${OP_COLORS[opName] ?? "text-muted"}`}>{opName}</span>
+                <span className={`w-[72px] shrink-0 text-right ${OP_COLORS[opName] ?? "text-muted"}`}>{opName}</span>
                 <span className="text-foreground/80 truncate min-w-0">{event.path}</span>
                 {event.params && (
-                  <span className="text-muted-foreground shrink-0 whitespace-nowrap">{formatParams(event.params)}</span>
+                  <span className="text-muted-foreground shrink-0 whitespace-nowrap">
+                    {formatParams(event.params, opName)}
+                  </span>
                 )}
               </div>
             );

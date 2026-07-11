@@ -4,6 +4,10 @@ pub const WRITE_AFTER_EXTENT: &str = "write_after_extent";
 pub const WRITE_AFTER_INODE: &str = "write_after_inode";
 pub const WRITE_AFTER_COMMIT: &str = "write_after_commit";
 
+pub const FALLOCATE_AFTER_EXTENTS: &str = "fallocate_after_extents";
+pub const FALLOCATE_AFTER_INODE: &str = "fallocate_after_inode";
+pub const FALLOCATE_AFTER_COMMIT: &str = "fallocate_after_commit";
+
 pub const CREATE_AFTER_INODE: &str = "create_after_inode";
 pub const CREATE_AFTER_DIR_ENTRY: &str = "create_after_dir_entry";
 pub const CREATE_AFTER_COMMIT: &str = "create_after_commit";

@@ -15,6 +15,29 @@ pub enum FileType {
     BlockDevice,
 }
 
+/// Filesystem-level fallocate operations supported by ZeroFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallocateMode {
+    /// Reserve quota and grow the logical file size when the range crosses EOF.
+    Allocate,
+    /// Deallocate the range without changing the logical file size.
+    PunchHole,
+    /// Make the range read as zero, optionally preserving the logical file size.
+    ZeroRange { keep_size: bool },
+}
+
+impl FallocateMode {
+    /// Linux fallocate mode bits used in traces and on the private 9P wire.
+    pub const fn linux_mode(self) -> u32 {
+        match self {
+            Self::Allocate => 0,
+            Self::PunchHole => 0x01 | 0x02,
+            Self::ZeroRange { keep_size: false } => 0x10,
+            Self::ZeroRange { keep_size: true } => 0x10 | 0x01,
+        }
+    }
+}
+
 impl From<FileType> for ftype3 {
     fn from(ft: FileType) -> Self {
         match ft {
