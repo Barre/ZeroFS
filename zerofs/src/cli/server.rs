@@ -885,16 +885,6 @@ pub async fn run_server(
 
     let shutdown = CancellationToken::new();
 
-    // Graceful shutdown stops the heartbeat loop so the lease lapses and a
-    // standby can take over promptly.
-    if let Some(hb_shutdown) = heartbeat_shutdown {
-        let shutdown_clone = shutdown.clone();
-        tokio::spawn(async move {
-            shutdown_clone.cancelled().await;
-            let _ = hb_shutdown.send(true);
-        });
-    }
-
     let telemetry_handle = crate::telemetry::start_periodic_reporting(
         &settings,
         Arc::clone(&fs.global_stats),
@@ -1127,25 +1117,23 @@ pub async fn run_server(
         let _ = handle.await;
     }
     info!("Performing final flush and closing database...");
-    if !db_mode.is_read_only()
-        && let Err(e) = fs.flush_coordinator.flush().await
-    {
-        // The final seal-gated flush failed, so the memtable holds FrameLocs
-        // pointing at an un-PUT segment. db.close() would flush that memtable
-        // and durably publish the dangling pointers; exit hard instead. The
-        // unflushed writes were never durable, so discarding them is correct
-        // crash semantics.
+    if db_mode.is_read_only() {
+        if let Err(e) = fs.db.close().await {
+            tracing::error!("Database close failed: {:?}", e);
+            return Err(e);
+        }
+    } else if let Err(e) = fs.flush_coordinator.close().await {
+        // Never call db.close() after a seal failure: its implicit metadata
+        // flush could publish pointers to an un-PUT segment.
         tracing::error!(
-            "Final flush failed during shutdown ({e:?}); exiting without closing the database \
-             to avoid durably committing dangling extent pointers. Writes since the last \
-             successful flush are discarded (they were never durable)."
+            "Final flush+close failed ({e:?}); exiting without a separate database close"
         );
         std::process::exit(1);
     }
 
-    if let Err(e) = fs.db.close().await {
-        tracing::error!("Database close failed: {:?}", e);
-        return Err(e);
+    // Keep the local lease valid until all writes are durable and the DB is closed.
+    if let Some(hb_shutdown) = heartbeat_shutdown {
+        let _ = hb_shutdown.send(true);
     }
 
     info!("Shutdown complete");

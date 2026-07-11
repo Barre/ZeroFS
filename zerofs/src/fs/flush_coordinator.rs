@@ -13,10 +13,16 @@ use tokio::sync::oneshot;
 /// memtable is flushed, so a durable manifest never references an un-PUT segment.
 type SealHook =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), FsError>> + Send>> + Send + Sync>;
+type Reply = oneshot::Sender<Result<(), FsError>>;
+
+enum Request {
+    Flush(Reply),
+    Close(Reply),
+}
 
 #[derive(Clone)]
 pub struct FlushCoordinator {
-    sender: mpsc::UnboundedSender<oneshot::Sender<Result<(), FsError>>>,
+    sender: mpsc::UnboundedSender<Request>,
     seal_hook: Arc<OnceLock<SealHook>>,
 }
 
@@ -24,44 +30,63 @@ impl FlushCoordinator {
     pub fn new(db: Arc<Db>) -> Self {
         let seal_hook: Arc<OnceLock<SealHook>> = Arc::new(OnceLock::new());
         let hook = Arc::clone(&seal_hook);
-        let (sender, mut receiver) =
-            mpsc::unbounded_channel::<oneshot::Sender<Result<(), FsError>>>();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
 
         spawn_named("flush-coordinator", async move {
-            let mut pending_senders = Vec::new();
-
-            while let Some(sender) = receiver.recv().await {
-                pending_senders.push(sender);
-
-                while let Ok(sender) = receiver.try_recv() {
-                    pending_senders.push(sender);
+            while let Some(request) = receiver.recv().await {
+                let mut pending_senders = Vec::new();
+                let mut closer = None;
+                match request {
+                    Request::Flush(sender) => pending_senders.push(sender),
+                    Request::Close(sender) => closer = Some(sender),
+                }
+                while closer.is_none() {
+                    match receiver.try_recv() {
+                        Ok(Request::Flush(sender)) => pending_senders.push(sender),
+                        Ok(Request::Close(sender)) => closer = Some(sender),
+                        Err(_) => break,
+                    }
                 }
 
-                // Seal first (the durability barrier); if sealing fails, don't
-                // flush — that would durably commit dangling extents. Hold the
-                // flush barrier across seal+flush so a concurrent commit can't
-                // slip a pointer to the newly-rotated open buffer into the
-                // flushed set.
-                let result = {
-                    let _barrier = db.flush_barrier().write_owned().await;
-                    match hook.get() {
-                        Some(seal) => match seal().await {
-                            Ok(()) => {
-                                #[cfg(feature = "failpoints")]
-                                fail_point!(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST);
-                                db.flush().await.map_err(|_| FsError::IoError)
-                            }
-                            Err(e) => Err(e),
-                        },
-                        None => db.flush().await.map_err(|_| FsError::IoError),
-                    }
+                // A close keeps the barrier through db.close(), leaving no gap
+                // in which a FrameLoc can commit after the final seal.
+                let barrier = db.flush_barrier().write_owned().await;
+                let result = match hook.get() {
+                    Some(seal) => match seal().await {
+                        Ok(()) => {
+                            #[cfg(feature = "failpoints")]
+                            fail_point!(fp::FLUSH_AFTER_SEAL_BEFORE_MANIFEST);
+                            db.flush().await.map_err(|_| FsError::IoError)
+                        }
+                        Err(e) => Err(e),
+                    },
+                    None => db.flush().await.map_err(|_| FsError::IoError),
                 };
+
+                let close_result = if closer.is_some() && result.is_ok() {
+                    db.mark_closing();
+                    db.close().await.map_err(|_| FsError::IoError)
+                } else {
+                    result
+                };
+                drop(barrier);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::FLUSH_AFTER_COMPLETE);
 
                 for sender in pending_senders.drain(..) {
                     let _ = sender.send(result);
+                }
+                if let Some(closer) = closer {
+                    let _ = closer.send(close_result);
+                    while let Ok(request) = receiver.try_recv() {
+                        match request {
+                            Request::Flush(sender) | Request::Close(sender) => {
+                                let _ = sender.send(Err(FsError::ShuttingDown));
+                            }
+                        }
+                    }
+                    return;
                 }
             }
         });
@@ -78,8 +103,22 @@ impl FlushCoordinator {
     pub async fn flush(&self) -> Result<(), FsError> {
         let (tx, rx) = oneshot::channel();
 
-        self.sender.send(tx).map_err(|_| FsError::IoError)?;
+        self.sender
+            .send(Request::Flush(tx))
+            .map_err(|_| FsError::ShuttingDown)?;
 
-        rx.await.map_err(|_| FsError::IoError)?
+        rx.await.map_err(|_| FsError::ShuttingDown)?
+    }
+
+    /// Seal, flush, and close under one barrier write lock. On error, the
+    /// caller must exit without closing the database separately.
+    pub async fn close(&self) -> Result<(), FsError> {
+        let (tx, rx) = oneshot::channel();
+
+        self.sender
+            .send(Request::Close(tx))
+            .map_err(|_| FsError::ShuttingDown)?;
+
+        rx.await.map_err(|_| FsError::ShuttingDown)?
     }
 }
