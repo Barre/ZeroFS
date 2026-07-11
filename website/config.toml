@@ -1,0 +1,19 @@
+base_url = "https://www.zerofs.net"
+title = "ZeroFS"
+description = "A log-structured filesystem for S3-compatible object storage."
+author = "Pierre Barre"
+default_language = "en"
+compile_sass = false
+build_search_index = false
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+generate_sitemap = true
+generate_robots_txt = false
+minify_html = false
+
+[markdown]
+smart_punctuation = false
+
+[link_checker]
+internal_level = "error"
+external_level = "warn"

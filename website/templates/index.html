@@ -1,0 +1,975 @@
+<!doctype html>
+<!--
+  Copyright (c) 2026 Pierre Barre. All rights reserved.
+  This file is not covered by the AGPL-3.0 license of the ZeroFS repository.
+  See website/static/LICENSE.
+-->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ section.title }}</title>
+  <meta name="description" content="{{ section.description }}">
+  <link rel="canonical" href="{{ current_url | safe }}">
+  <link rel="icon" type="image/png" href="favicon.png">
+  {% include "partials/analytics.html" %}
+  <meta property="og:title" content="{{ section.title }}">
+  <meta property="og:description" content="{{ section.extra.og_description }}">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="{{ current_url | safe }}">
+  <meta property="og:image" content="https://www.zerofs.net/assets/og-card.jpg">
+  <meta property="og:image:width" content="2400">
+  <meta property="og:image:height" content="1260">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="alternate" type="application/atom+xml" title="ZeroFS blog" href="/atom.xml">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "Organization",
+          "@id": "https://www.zerofs.net/#organization",
+          "name": "ZeroFS",
+          "url": "https://www.zerofs.net/",
+          "logo": "https://www.zerofs.net/favicon.png",
+          "sameAs": ["https://github.com/Barre/ZeroFS"]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.zerofs.net/#website",
+          "url": "https://www.zerofs.net/",
+          "name": "ZeroFS",
+          "publisher": { "@id": "https://www.zerofs.net/#organization" }
+        }
+      ]
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400..900;1,400..900&family=Geist+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="/css/index.css">
+  <link rel="stylesheet" href="/css/site-shell.css">
+</head>
+
+<body>
+  {% include "partials/brand-symbols.html" %}
+  {% set blog_active = false %}
+  {% include "partials/site-header.html" %}
+
+  <main>
+
+    <div class="hero">
+      <div class="hero-scene" aria-hidden="true">
+        <div class="hero-glow"></div>
+        <div class="enso-tilt">
+          <div class="enso-prec">
+            <svg class="hero-enso">
+              <use href="#enso" />
+            </svg>
+          </div>
+        </div>
+        <div class="hero-particles"></div>
+      </div>
+      <div class="wrap">
+        <h1><span class="l"><span class="li">ZeroFS is a log-structured</span></span><span class="l"><span class="li">filesystem
+              for S3<span class="dot">.</span></span></span></h1>
+        <p class="lede rv" data-d="550">ZeroFS serves S3-compatible buckets as <strong>POSIX filesystems</strong> over
+          NFS and 9P, and as <strong>raw block devices</strong> over NBD. All three servers run in one userspace
+          process. Writes go out as immutable segments, compressed and encrypted before upload. Warm reads come from
+          local cache.</p>
+        <div class="install rv" data-d="750">
+          <div class="cmd tabbed">
+            <div class="cmd-head">
+              <div class="cmd-tabs" role="tablist" aria-label="Install method">
+                <button type="button" role="tab" aria-selected="true" data-method="apt">apt</button>
+                <button type="button" role="tab" aria-selected="false" data-method="dnf">dnf</button>
+                <button type="button" role="tab" aria-selected="false" data-method="curl">curl</button>
+              </div>
+              <button type="button" class="cmd-copy" id="install-copy" data-copy="">Copy</button>
+            </div>
+            <div class="cmd-body" id="install-body"></div>
+          </div>
+          <a class="ghost" href="https://www.zerofs.net/docs/quickstart">
+            <span class="ghost-portal" aria-hidden="true">
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+              <svg>
+                <use href="#enso" />
+              </svg>
+            </span>
+            <span class="ghost-noise" aria-hidden="true"></span>
+            <span class="ghost-label"><svg class="ghost-mark" aria-hidden="true">
+                <use href="#enso" />
+              </svg>Quickstart <span class="ghost-arrow">→</span></span>
+          </a>
+        </div>
+        <p class="alt-install rv" data-d="950">or via <a href="https://github.com/Barre/ZeroFS#via-docker">Docker</a> ·
+          <a href="https://github.com/Barre/zerofs#github-action">GitHub&nbsp;Action</a> · <a
+            href="https://www.zerofs.net/docs/quickstart#installation">other&nbsp;platforms</a></p>
+      </div>
+    </div>
+
+    <section>
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">01</span><span class="label">Protocols</span></div>
+        <h2 class="rv">Files over NFS and 9P, block&nbsp;devices over NBD.</h2>
+        <p class="sec-intro rv">The three servers share one process and one bucket. Clients connect with the NFS and 9P
+          support already in the kernel, ZeroFS' own client or <code style="white-space: nowrap">nbd-client</code>.</p>
+        <div class="flow rv" aria-hidden="true">
+          <svg class="flow-d" viewBox="0 0 920 240">
+            <defs>
+              <filter id="glowD" x="-40%" y="-40%" width="180%" height="180%">
+                <feGaussianBlur stdDeviation="2.5" result="b" />
+                <feMerge>
+                  <feMergeNode in="b" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+            <path id="w-nfs" class="wire" d="M150,48 C280,48 310,120 392,120" />
+            <path id="w-9p" class="wire" d="M150,120 L392,120" />
+            <path id="w-nbd" class="wire" d="M150,192 C280,192 310,120 392,120" />
+            <path id="w-out" class="wire" d="M548,120 L772,120" />
+            <rect class="node" x="40" y="26" width="110" height="44" rx="10" />
+            <text class="nodelabel" x="95" y="53" text-anchor="middle">NFS</text>
+            <rect class="node" x="40" y="98" width="110" height="44" rx="10" />
+            <text class="nodelabel" x="95" y="125" text-anchor="middle">9P</text>
+            <rect class="node" x="40" y="170" width="110" height="44" rx="10" />
+            <text class="nodelabel" x="95" y="197" text-anchor="middle">NBD</text>
+            <g class="recv recv-zfs">
+              <rect class="node" x="392" y="86" width="156" height="68" rx="14" />
+              <g transform="translate(414, 106)" color="#f4f3ef">
+                <use href="#enso" width="28" height="28" />
+              </g>
+              <g color="#f4f3ef">
+                <use href="#wordmark" x="452" y="112" width="76" height="16.4" />
+              </g>
+              <rect class="pulse" x="392" y="86" width="156" height="68" rx="14" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowD)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="dA1.repeatEvent;dA2.repeatEvent;dA3.repeatEvent" />
+              </rect>
+            </g>
+            <g class="recv recv-s3">
+              <rect class="node" x="772" y="98" width="110" height="44" rx="10" />
+              <text class="nodelabel" x="827" y="125" text-anchor="middle">S3</text>
+              <rect class="pulse" x="772" y="98" width="110" height="44" rx="10" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowD)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="dA4.repeatEvent;dA5.repeatEvent" />
+              </rect>
+            </g>
+            <text class="wirelabel" x="660" y="108" text-anchor="middle">ENCRYPTED OBJECTS</text>
+            <g class="pulse" fill="#4d9fff">
+              <circle r="6" opacity="0.22">
+                <animateMotion dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#w-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5">
+                <animateMotion id="dA1" dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#w-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#w-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion id="dA2" dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#w-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#w-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion id="dA3" dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#w-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion id="dA4" dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion id="dA5" dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#w-out" />
+                </animateMotion>
+              </circle>
+            </g>
+          </svg>
+          <svg class="flow-m" viewBox="0 0 360 490">
+            <defs>
+              <filter id="glowM" x="-40%" y="-40%" width="180%" height="180%">
+                <feGaussianBlur stdDeviation="2.5" result="b" />
+                <feMerge>
+                  <feMergeNode in="b" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+            </defs>
+            <path id="m-nfs" class="wire" d="M60,64 C60,150 110,170 168,210" />
+            <path id="m-9p" class="wire" d="M180,64 L180,210" />
+            <path id="m-nbd" class="wire" d="M300,64 C300,150 250,170 192,210" />
+            <path id="m-out" class="wire" d="M180,278 L180,420" />
+            <rect class="node" x="10" y="20" width="100" height="44" rx="10" />
+            <text class="nodelabel" x="60" y="47" text-anchor="middle">NFS</text>
+            <rect class="node" x="130" y="20" width="100" height="44" rx="10" />
+            <text class="nodelabel" x="180" y="47" text-anchor="middle">9P</text>
+            <rect class="node" x="250" y="20" width="100" height="44" rx="10" />
+            <text class="nodelabel" x="300" y="47" text-anchor="middle">NBD</text>
+            <g class="recv recv-zfs">
+              <rect class="node" x="102" y="210" width="156" height="68" rx="14" />
+              <g transform="translate(124, 230)" color="#f4f3ef">
+                <use href="#enso" width="28" height="28" />
+              </g>
+              <g color="#f4f3ef">
+                <use href="#wordmark" x="162" y="236" width="76" height="16.4" />
+              </g>
+              <rect class="pulse" x="102" y="210" width="156" height="68" rx="14" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowM)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="mA1.repeatEvent;mA2.repeatEvent;mA3.repeatEvent" />
+              </rect>
+            </g>
+            <g class="recv recv-s3">
+              <rect class="node" x="125" y="420" width="110" height="44" rx="10" />
+              <text class="nodelabel" x="180" y="447" text-anchor="middle">S3</text>
+              <rect class="pulse" x="125" y="420" width="110" height="44" rx="10" fill="none" stroke="#4d9fff"
+                stroke-width="1.5" opacity="0" filter="url(#glowM)" pointer-events="none">
+                <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.18;1" dur="0.5s"
+                  begin="mA4.repeatEvent;mA5.repeatEvent" />
+              </rect>
+            </g>
+            <text class="wirelabel" x="194" y="352">ENCRYPTED OBJECTS</text>
+            <g class="pulse" fill="#4d9fff">
+              <circle r="6" opacity="0.22">
+                <animateMotion dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#m-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5">
+                <animateMotion id="mA1" dur="2.4s" begin="0s" repeatCount="indefinite">
+                  <mpath href="#m-nfs" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#m-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.8s" fill="freeze" />
+                <animateMotion id="mA2" dur="2.4s" begin="0.8s" repeatCount="indefinite">
+                  <mpath href="#m-9p" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#m-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.6s" fill="freeze" />
+                <animateMotion id="mA3" dur="2.4s" begin="1.6s" repeatCount="indefinite">
+                  <mpath href="#m-nbd" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="0.4s" fill="freeze" />
+                <animateMotion id="mA4" dur="1.8s" begin="0.4s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+              <circle r="6" opacity="0.22" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+              <circle r="2.5" visibility="hidden">
+                <set attributeName="visibility" to="visible" begin="1.3s" fill="freeze" />
+                <animateMotion id="mA5" dur="1.8s" begin="1.3s" repeatCount="indefinite">
+                  <mpath href="#m-out" />
+                </animateMotion>
+              </circle>
+            </g>
+          </svg>
+        </div>
+        <div class="proto-grid">
+          <div class="proto rv">
+            <h3>NFS</h3>
+            <p>macOS, Linux, Windows, and the BSDs mount it with the NFS clients they ship. NFS COMMIT semantics let
+              fsync return before data reaches S3; use a 9P mount where fsync durability matters.</p>
+            <pre><span class="c"># mounts from any major OS</span>
+mount -t nfs 127.0.0.1:/ /mnt/zerofs</pre>
+          </div>
+          <div class="proto rv">
+            <h3>9P</h3>
+            <p>fsync returns only after data reaches stable storage. The bundled FUSE client, <code>zerofs mount</code>,
+              mounts without root and reconnects on its own; it is the recommended Linux mount.</p>
+            <pre><span class="c"># bundled FUSE client, no root</span>
+zerofs mount 127.0.0.1:5564 /mnt/zerofs</pre>
+          </div>
+          <div class="proto rv">
+            <h3>NBD</h3>
+            <p>Device files in a <code>.nbd</code> directory attach as raw block devices; ZFS pools and VM boot disks
+              run on them. FLUSH and FUA replies return only after data is durable, so write barriers hold.</p>
+            <pre><span class="c"># attach a block device</span>
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
+          </div>
+        </div>
+        <div class="backends rv">
+          <b>Runs on</b><span>Amazon S3</span><span>Google Cloud Storage</span><span>Azure Blob</span><span>Any
+            S3-compatible store</span><span>local disk</span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">02</span><span class="label">Testing</span></div>
+        <h2 class="rv">How ZeroFS is tested.</h2>
+        <div class="proof-grid">
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>POSIX semantics</h3>
+            <p>8,662 pjdfstest cases: permissions, ownership, links, rename behavior. A few cases per protocol are
+              excluded where NFS or 9P can't express the semantics (or where we decided to make tradeoffs).
+            </p>
+            <span class="src">pjdfstest workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>xfstests</h3>
+            <p>A standard filesystems test suite.</p>
+            <span class="src">xfstests workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>Kernel builds</h3>
+            <p>The Linux kernel compiles with <code>make -j$(nproc)</code> on NFS, 9P, and FUSE mounts. A parallel build
+              keeps many processes writing the same tree at once.</p>
+            <span class="src">kernel-compile workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>stress-ng</h3>
+            <p>file-handling stressors run concurrently against live NFS, 9P, and FUSE mounts: dentry churn, deep and
+              wide directories, rename, metamix, utime, and more.</p>
+            <span class="src">stress-ng workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>ZFS pool and scrub</h3>
+            <p>CI creates a ZFS pool on ZeroFS block devices, extracts the Linux kernel source onto it, and runs a
+              scrub.</p>
+            <span class="src">zfs-test workflow →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/ci.yml">
+            <h3>Jepsen local-fs and HA</h3>
+            <p>The local-fs suite drives a 9P mount with random operation histories checked against a reference model,
+              with a crash mode. The HA suite kills and pauses a leader/standby pair over a local S3 server.</p>
+            <span class="src">jepsen workflows →</span>
+          </a>
+          <a class="proof rv" href="https://github.com/Barre/ZeroFS/actions/workflows/dst-soak.yml">
+            <h3>Deterministic simulation</h3>
+            <p>The storage engine runs in simulated worlds: virtual time, seeded fault injection, and crashes placed
+              mid-operation, with recovery checked against a byte-exact model. A failing seed replays the identical
+              run. Fresh seeds soak for 50 minutes every hour in the CI.</p>
+            <span class="src">dst-soak workflow →</span>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section class="term-sec">
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">03</span><span class="label">Geo-distribution</span></div>
+        <h2 class="rv">A ZFS mirror across three S3 regions.</h2>
+        <p class="sec-intro rv">Each instance exposes one region's bucket as a block device; to ZFS they are plain
+          disks.</p>
+        <div class="term rv" role="img" aria-label="Terminal session creating a geo-distributed ZFS pool">
+          <div class="titlebar"><i></i><i></i><i></i><span>global-pool — zsh</span></div>
+          <div class="body">
+            <div><span class="ps1">$</span> nbd-client 10.0.1.5 10809 /dev/nbd0 -N storage -persist <span class="c">#
+                us-east</span></div>
+            <div><span class="ps1">$</span> nbd-client 10.0.2.5 10809 /dev/nbd1 -N storage -persist <span class="c">#
+                eu-west</span></div>
+            <div><span class="ps1">$</span> nbd-client 10.0.3.5 10809 /dev/nbd2 -N storage -persist <span class="c">#
+                ap-southeast</span></div>
+            <div><span class="ps1">$</span> zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2</div>
+            <div><span class="ps1">$</span> zpool status global-pool | grep state</div>
+            <div class="out">&nbsp;state: <span class="ok">ONLINE</span></div>
+          </div>
+        </div>
+        <p class="term-caption rv">When a region is unreachable, <b>the pool degrades and stays online.</b> ZFS
+          resilvers the member when it returns.</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">04</span><span class="label">Engine</span></div>
+        <h2 class="rv">The storage engine.</h2>
+        <div class="feat-grid">
+          <div class="feat rv">
+            <h3>Immutable segments</h3>
+            <p>File data is split into 32&thinsp;KiB extents and packed into immutable segment objects of up to
+              256&thinsp;MiB.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Encryption</h3>
+            <p>XChaCha20-Poly1305 on every extent before upload. The data key is wrapped
+              by a key derived from the password with Argon2id.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Compression</h3>
+            <p>zstd or lz4, applied before encryption. The codec can change at any time without migration; existing
+              data's codec is detected on read.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Caching</h3>
+            <p>Memory and disk tiers hold recently read and written data.</p>
+          </div>
+          <div class="feat rv">
+            <h3>TRIM</h3>
+            <p>TRIM is supported and eventually translates to a reclamation of physical S3 objects.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Checkpoints</h3>
+            <p>Named point-in-time checkpoints. Any checkpoint opens read-only.</p>
+          </div>
+          <div class="feat rv">
+            <h3>Read replicas</h3>
+            <p>One writer, any number of read-only instances against the same bucket. Replicas follow the writer's
+              changes and return EROFS on write.</p>
+          </div>
+          <div class="feat rv">
+            <h3>fsync and failover</h3>
+            <p>Over 9P and NBD, a successful fsync means data is committed to the object store. An optional standby
+              holds acked-but-unflushed writes and takes over in seconds.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="casts">
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">05</span><span class="label">Recordings</span></div>
+        <h2 class="rv">Terminal session recordings.</h2>
+        <div class="tabs rv" role="tablist" aria-label="Demo recordings">
+          <button role="tab" aria-selected="true" data-cast="730946">Kernel build</button>
+          <button role="tab" aria-selected="false" data-cast="728234">ZFS on S3</button>
+          <button role="tab" aria-selected="false" data-cast="728172">Ubuntu boot</button>
+          <button role="tab" aria-selected="false" data-cast="728101">Self-hosting</button>
+        </div>
+        <div class="term cast-frame rv">
+          <div class="titlebar"><i></i><i></i><i></i><span id="cast-title">kernel-build — asciinema</span></div>
+          <div class="body">
+            <div id="cast-player"></div>
+          </div>
+        </div>
+            <p class="shot-caption rv" id="cast-caption"><b>The Linux kernel compiles in 16 seconds</b> on ZFS over a ZeroFS NBD
+              volume.</p>
+            </div
+      </div>
+    </section>
+
+    <section class="shots">
+      <div class="wrap">
+        <div class="sec-head rv"><span class="idx">06</span><span class="label">Web UI</span></div>
+        <h2 class="rv">One config section adds a web console.</h2>
+        <div class="tabs rv" role="tablist" aria-label="Web UI screenshots">
+          <button role="tab" aria-selected="true" data-shot="files">File manager</button>
+          <button role="tab" aria-selected="false" data-shot="dash">Dashboard</button>
+          <button role="tab" aria-selected="false" data-shot="term">Terminal</button>
+        </div>
+        <div class="browser rv">
+          <div class="chrome"><i></i><i></i><i></i><span class="url">127.0.0.1:8080</span></div>
+          <div class="view">
+            <img id="shot-files" class="active" src="assets/webui_file_manager.webp"
+              alt="ZeroFS web file manager browsing the Linux 6.17 source tree with an inline file preview">
+            <img id="shot-dash" src="assets/webui_dashboard.webp"
+              alt="ZeroFS dashboard with live throughput, IOPS, operation counters, and garbage-collection stats"
+              loading="lazy">
+            <img id="shot-term" src="assets/webui_terminal.webp"
+              alt="Linux VM booting in the browser with its root filesystem mounted from ZeroFS" loading="lazy">
+          </div>
+        </div>
+        <p class="shot-caption rv" id="shot-caption"><b>The file manager speaks 9P over WebSocket.</b> Drag-and-drop
+          uploads work, including entire folders.</p>
+      </div>
+    </section>
+
+    <div class="closer">
+      <div class="wrap">
+        <svg class="rv" aria-hidden="true">
+          <use href="#enso" />
+        </svg>
+      </div>
+    </div>
+
+  </main>
+
+  {% include "partials/site-footer.html" %}
+
+  <script src="/js/site.js" defer></script>
+
+  <script>
+    document.querySelectorAll("[data-copy]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(btn.dataset.copy);
+          const t = btn.textContent; btn.textContent = "Copied";
+          setTimeout(() => { btn.textContent = t; }, 1400);
+        } catch { }
+      });
+    });
+
+    const INSTALL = {
+      apt: [
+        "curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg",
+        'echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list',
+        "sudo apt update && sudo apt install zerofs",
+      ],
+      dnf: [
+        "curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo",
+        "sudo dnf install zerofs",
+      ],
+      curl: ["curl -sSfL https://sh.zerofs.net | sh"],
+    };
+    const instBody = document.getElementById("install-body");
+    const instCopy = document.getElementById("install-copy");
+    const instTabs = document.querySelectorAll(".cmd-tabs button");
+    function renderInstall(method) {
+      const lines = INSTALL[method];
+      instBody.replaceChildren(...lines.map(line => {
+        const row = document.createElement("div");
+        row.className = "line";
+        const ps1 = document.createElement("span");
+        ps1.className = "ps1"; ps1.textContent = "$";
+        const txt = document.createElement("span");
+        txt.textContent = line;
+        row.append(ps1, txt);
+        return row;
+      }));
+      instCopy.dataset.copy = lines.join("\n");
+    }
+    instTabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        instTabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+        renderInstall(tab.dataset.method);
+      });
+    });
+    renderInstall("apt");
+    const captions = {
+      files: "<b>The file manager speaks 9P over WebSocket.</b> Drag-and-drop uploads work, including entire folders.",
+      dash: "<b>Throughput, IOPS, storage usage, operation counters, and GC stats</b> stream over gRPC-web, updated once a second.",
+      term: "<b>The terminal boots a Linux VM via v86</b>, filesystem served over the same 9P WebSocket. The guest has no network device.",
+    };
+    const tabs = document.querySelectorAll(".shots .tabs button");
+    tabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        tabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+        document.querySelectorAll(".browser .view img").forEach(img =>
+          img.classList.toggle("active", img.id === `shot-${tab.dataset.shot}`));
+        document.getElementById("shot-caption").innerHTML = captions[tab.dataset.shot];
+      });
+    });
+    const io = new IntersectionObserver(entries => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+    }, { rootMargin: "0px 0px -8% 0px" });
+    document.querySelectorAll(".rv").forEach((el, i) => {
+      el.style.transitionDelay = el.dataset.d ? `${el.dataset.d}ms` : `${Math.min((i % 6) * 70, 350)}ms`;
+      io.observe(el);
+      // the observer's -8% bottom margin strands hero content in the viewport's bottom
+      // strip (e.g. the alt-install line) until the first scroll; reveal what's already on screen
+      if (el.getBoundingClientRect().top < innerHeight) el.classList.add("in");
+    });
+
+    // asciinema recordings — player lib loads only when the section nears the viewport
+    const CASTS = {
+      "730946": ["kernel-build — asciinema", "<b>The Linux kernel compiles in 16 seconds</b> on ZFS over a ZeroFS NBD volume."],
+      "728234": ["zfs-on-s3 — asciinema", "<b>zpool create runs directly on ZeroFS block devices</b>; no intermediate filesystem."],
+      "728172": ["ubuntu-boot — asciinema", "<b>Ubuntu boots</b> with its root filesystem served by ZeroFS."],
+      "728101": ["self-hosting — asciinema", "<b>The Rust toolchain builds ZeroFS</b> on a filesystem ZeroFS is serving."],
+    };
+    let castPlayer = null, castLib = null;
+    function loadCastLib() {
+      if (castLib) return castLib;
+      const css = document.createElement("link");
+      css.rel = "stylesheet";
+      css.href = "https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.css";
+      document.head.appendChild(css);
+      castLib = new Promise(resolve => {
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.js";
+        s.onload = resolve;
+        document.head.appendChild(s);
+      });
+      return castLib;
+    }
+    function showCast(id) {
+      document.getElementById("cast-title").textContent = CASTS[id][0];
+      document.getElementById("cast-caption").innerHTML = CASTS[id][1];
+      loadCastLib().then(() => {
+        if (castPlayer) castPlayer.dispose();
+        castPlayer = AsciinemaPlayer.create(
+          `https://asciinema.org/a/${id}.cast`,
+          document.getElementById("cast-player"),
+          {
+            fit: "width", poster: "npt:0:03", idleTimeLimit: 2, preload: true,
+            terminalFontFamily: '"Geist Mono", monospace'
+          }
+        );
+      });
+    }
+    const castTabs = document.querySelectorAll(".casts .tabs button");
+    castTabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        castTabs.forEach(t => t.setAttribute("aria-selected", t === tab ? "true" : "false"));
+        showCast(tab.dataset.cast);
+      });
+    });
+    const castIO = new IntersectionObserver(entries => {
+      if (!entries.some(e => e.isIntersecting)) return;
+      castIO.disconnect();
+      showCast(document.querySelector('.casts .tabs button[aria-selected="true"]').dataset.cast);
+    }, { rootMargin: "1800px 0px" });
+    castIO.observe(document.querySelector(".casts"));
+
+
+
+    // segmented-control glider for tab groups
+    document.querySelectorAll(".tabs").forEach(group => {
+      const glider = document.createElement("span");
+      glider.className = "glider";
+      glider.setAttribute("aria-hidden", "true");
+      group.prepend(glider);
+      const move = () => {
+        const active = group.querySelector('button[aria-selected="true"]');
+        if (!active) return;
+        glider.style.width = `${active.offsetWidth}px`;
+        glider.style.transform = `translateX(${active.offsetLeft}px)`;
+      };
+      move();
+      requestAnimationFrame(() => group.classList.add("gliding"));
+      group.addEventListener("click", e => { if (e.target.closest("button")) move(); });
+      window.addEventListener("resize", move);
+      document.fonts?.ready.then(move);
+    });
+
+    const motionOK = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // hero depth: cursor parallax + scroll recede
+    if (motionOK) {
+      const hero = document.querySelector(".hero");
+      const scene = document.querySelector(".hero-scene");
+      const layers = [[".hero-glow", 10], [".enso-tilt", 16], [".hero-particles", 26]]
+        .map(([s, d]) => [scene.querySelector(s), d]);
+      let tx = 0, ty = 0, cx = 0, cy = 0, raf = 0;
+      const tiltEl = scene.querySelector(".enso-tilt");
+      const step = () => {
+        cx += (tx - cx) * 0.06; cy += (ty - cy) * 0.06;
+        for (const [el, d] of layers)
+          el.style.translate = `${(-cx * d).toFixed(2)}px ${(-cy * d).toFixed(2)}px`;
+        tiltEl.style.setProperty("--mtx", `${(-cy * 6).toFixed(2)}deg`);
+        tiltEl.style.setProperty("--mty", `${(cx * 6).toFixed(2)}deg`);
+        raf = (Math.abs(tx - cx) > 0.0004 || Math.abs(ty - cy) > 0.0004)
+          ? requestAnimationFrame(step) : 0;
+      };
+      const kick = () => { if (!raf) raf = requestAnimationFrame(step); };
+      if (matchMedia("(pointer: fine)").matches) {
+        hero.addEventListener("mousemove", e => {
+          const r = hero.getBoundingClientRect();
+          tx = (e.clientX - r.left) / r.width - 0.5;
+          ty = (e.clientY - r.top) / r.height - 0.5;
+          kick();
+        });
+        hero.addEventListener("mouseleave", () => { tx = ty = 0; kick(); });
+      }
+      const recede = () => {
+        const f = Math.min(1, Math.max(0, scrollY / (hero.offsetHeight * 0.85)));
+        scene.style.opacity = (1 - f * 0.95).toFixed(3);
+        scene.style.translate = `0 ${(scrollY * 0.22).toFixed(1)}px`;
+      };
+      recede();
+      addEventListener("scroll", recede, { passive: true });
+    }
+
+    // ink-dust particles drifting off the hero enso, trailing smoke (canvas)
+    if (motionOK) {
+      const field = document.querySelector(".hero-particles");
+      const cv = document.createElement("canvas");
+      field.appendChild(cv);
+      const ctx = cv.getContext("2d");
+      const DPR = Math.min(devicePixelRatio || 1, 2);
+
+      // same CSS cubic-beziers as before, evaluated by Newton on the x polynomial
+      const cubic = (x1, y1, x2, y2) => {
+        const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+        const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+        return x => {
+          x = Math.min(1, Math.max(0, x));
+          let t = x;
+          for (let i = 0; i < 5; i++) {
+            const dd = (3 * ax * t + 2 * bx) * t + cx;
+            if (!dd) break;
+            t -= (((ax * t + bx) * t + cx) * t - x) / dd;
+          }
+          t = Math.min(1, Math.max(0, t));
+          return ((ay * t + by) * t + cy) * t;
+        };
+      };
+      const driftE = cubic(.25, .55, .6, 1);
+      const tumbleE = cubic(.15, .8, .3, 1);
+
+      // rasterize the enso glyph once per color, glow baked in (center half of a 2x box)
+      const sprite = color => {
+        const c = document.createElement("canvas");
+        c.width = c.height = 96;
+        const sym = document.getElementById("enso");
+        const img = new Image();
+        img.onload = () => {
+          const g = c.getContext("2d");
+          g.shadowColor = color;
+          g.shadowBlur = 16;
+          g.drawImage(img, 24, 24, 48, 48);
+          g.shadowBlur = 0; // crisp core pass, glow only once
+          g.drawImage(img, 24, 24, 48, 48);
+        };
+        img.src = "data:image/svg+xml;utf8," + encodeURIComponent(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="${sym.getAttribute("viewBox")}" style="color:${color}">${sym.innerHTML}</svg>`);
+        return c;
+      };
+      const WHITE = "244,243,239", BLUE = "77,159,255";
+      const sprW = sprite(`rgb(${WHITE})`), sprB = sprite(`rgb(${BLUE})`);
+
+      const ARC = 7 * Math.PI / 180;
+      const parts = Array.from({ length: 26 }, () => ({
+        a: Math.random() * Math.PI * 2,
+        d: 60 + Math.random() * 130,
+        T: 7 + Math.random() * 8,
+        ph: Math.random(),
+        s: 9 + Math.random() * 10,
+        o: 0.45 + Math.random() * 0.4,
+        tu: (300 + Math.random() * 420) * Math.PI / 180,
+        c: Math.random() < 0.3 ? BLUE : WHITE,
+        p0: 0,
+        hist: [],
+      }));
+
+      let R = 0, r0 = 310;
+      const size = () => {
+        r0 = parseFloat(getComputedStyle(field).getPropertyValue("--r0")) || 310;
+        R = r0 + 230;
+        cv.width = cv.height = Math.round(R * 2 * DPR);
+        cv.style.width = cv.style.height = `${R * 2}px`;
+        cv.style.left = cv.style.top = `${-R}px`;
+        for (const m of parts) m.hist.length = 0;
+      };
+      size();
+      addEventListener("resize", size);
+
+      const TRAIL = 2.4; // seconds of smoke kept behind each mote
+      let vis = true, praf = 0;
+      const frame = () => {
+        praf = vis ? requestAnimationFrame(frame) : 0;
+        const now = performance.now() / 1000;
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        ctx.clearRect(0, 0, R * 2, R * 2);
+        ctx.lineCap = "round";
+
+        for (const m of parts) {
+          const p = (now / m.T + m.ph) % 1;
+          if (p < m.p0) m.hist.length = 0; // wrapped: new life, fresh trail
+          m.p0 = p;
+          const e = driftE(p);
+          const ang = m.a + ARC * e, rad = r0 + m.d * e;
+          const x = R + Math.cos(ang) * rad, y = R + Math.sin(ang) * rad;
+          const al = m.o * (p < 0.12 ? driftE(p / 0.12) : 1 - driftE((p - 0.12) / 0.88));
+          const sc = 1 - 0.65 * e;
+
+          if (!m.hist.length || now - m.hist[m.hist.length - 1].t > 0.09)
+            m.hist.push({ x, y, al, t: now });
+          while (m.hist.length && now - m.hist[0].t > TRAIL) m.hist.shift();
+
+          // smoke ribbon through past positions, drawn as filled variable-width
+          // bands with alpha graded along the chord — one fill per band, so
+          // densely-spaced samples from slow motes cannot stack up opacity
+          const pts = m.hist.concat({ x, y, al, t: now });
+          const n = pts.length;
+          const chx = pts[n - 1].x - pts[0].x, chy = pts[n - 1].y - pts[0].y;
+          const chord = Math.hypot(chx, chy);
+          if (n > 2 && chord > 4) {
+            const ux = chx / chord, uy = chy / chord;
+            const gr = m.s * sc;
+            // smoke, not a comet: each ink parcel drifts sideways at its own
+            // steady pace (tail meanders), the band billows (puffy width), and
+            // everything fades to zero within the glyph radius so the trail
+            // emerges from behind the ring's trailing edge, not its center.
+            // sines are keyed to each parcel's birth time — smooth along the
+            // band, stable across frames.
+            const P = pts.map(q => {
+              const age = Math.min(1, (now - q.t) / TRAIL);
+              const drift = (Math.sin(q.t * 2.1 + m.a * 7) * 0.6 + Math.sin(q.t * 3.7 + m.a * 13) * 0.4)
+                * m.s * 0.9 * Math.pow(age, 1.3);
+              const wx = q.x - uy * drift, wy = q.y + ux * drift;
+              return {
+                x: wx, y: wy, al: q.al, age,
+                puff: 1 + 0.3 * Math.sin(q.t * 3.1 + m.a * 23),
+                hf: Math.min(1, Math.max(0, (Math.hypot(wx - x, wy - y) - gr * 0.45) / (gr * 0.5))),
+              };
+            });
+            const band = (width, alpha) => {
+              const g = ctx.createLinearGradient(P[0].x, P[0].y, P[n - 1].x, P[n - 1].y);
+              ctx.beginPath();
+              const back = [];
+              for (let j = 0; j < n; j++) {
+                const q = P[j];
+                let dx = P[Math.min(n - 1, j + 1)].x - P[Math.max(0, j - 1)].x;
+                let dy = P[Math.min(n - 1, j + 1)].y - P[Math.max(0, j - 1)].y;
+                const dl = Math.hypot(dx, dy) || 1;
+                const hw = width(q) / 2;
+                dx = dx / dl * hw; dy = dy / dl * hw;
+                j ? ctx.lineTo(q.x - dy, q.y + dx) : ctx.moveTo(q.x - dy, q.y + dx);
+                back.push(q.x + dy, q.y - dx);
+                g.addColorStop(
+                  Math.min(1, Math.max(0, ((q.x - P[0].x) * ux + (q.y - P[0].y) * uy) / chord)),
+                  `rgba(${m.c},${(q.al * q.hf * alpha(1 - q.age)).toFixed(3)})`);
+              }
+              for (let j = back.length - 2; j >= 0; j -= 2) ctx.lineTo(back[j], back[j + 1]);
+              ctx.closePath();
+              ctx.fillStyle = g;
+              ctx.fill();
+            };
+            const wb = m.s * sc;
+            band(q => wb * (0.8 + 2.6 * q.age) * q.puff, f => Math.pow(f, 1.5) * 0.075); // halo: billows, lingers
+            band(q => wb * (0.38 + 0.5 * q.age) * q.puff, f => f * f * 0.24); // core: sharp, dies fast
+          }
+
+          // the mote itself, tumbling
+          const ds = m.s * sc;
+          ctx.globalAlpha = al;
+          ctx.translate(x, y);
+          ctx.rotate(m.tu * tumbleE(p));
+          ctx.drawImage(m.c === BLUE ? sprB : sprW, -ds, -ds, ds * 2, ds * 2);
+          ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+          ctx.globalAlpha = 1;
+        }
+      };
+      praf = requestAnimationFrame(frame);
+      new IntersectionObserver(([en]) => {
+        vis = en.isIntersecting;
+        if (vis && !praf) praf = requestAnimationFrame(frame);
+      }).observe(cv);
+    }
+
+    // cursor spotlight
+    if (motionOK && matchMedia("(pointer: fine)").matches) {
+      document.querySelectorAll(".proof, .proto, .feat").forEach(card => {
+        card.addEventListener("mousemove", e => {
+          const r = card.getBoundingClientRect();
+          card.style.setProperty("--mx", `${e.clientX - r.left}px`);
+          card.style.setProperty("--my", `${e.clientY - r.top}px`);
+        });
+      });
+    }
+
+    // stat count-up
+    if (motionOK) {
+      const fmt = (el, v) => {
+        const dec = +(el.dataset.dec || 0);
+        el.textContent = el.dataset.sep
+          ? Math.round(v).toLocaleString("en-US")
+          : v.toFixed(dec);
+      };
+      const counters = document.querySelectorAll("[data-count]");
+      counters.forEach(el => fmt(el, 0));
+      const cio = new IntersectionObserver(entries => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          cio.unobserve(e.target);
+          const el = e.target, target = +el.dataset.count, t0 = performance.now();
+          const dur = 1300;
+          (function tick(t) {
+            const p = Math.min((t - t0) / dur, 1);
+            fmt(el, target * (1 - Math.pow(1 - p, 3)));
+            if (p < 1) requestAnimationFrame(tick);
+          })(t0);
+        }
+      }, { threshold: 0.6 });
+      counters.forEach(el => cio.observe(el));
+    }
+
+    // terminal line-by-line reveal
+    if (motionOK) {
+      const term = document.querySelector(".term-sec .term");
+      const lines = [...document.querySelectorAll(".term-sec .term .body > div")];
+      lines.forEach(l => l.classList.add("line-hidden"));
+      const tio = new IntersectionObserver(entries => {
+        if (!entries.some(e => e.isIntersecting)) return;
+        tio.disconnect();
+        lines.forEach((line, i) => {
+          setTimeout(() => {
+            lines.forEach(l => l.classList.remove("line-active"));
+            line.classList.remove("line-hidden");
+            if (i < lines.length - 1) line.classList.add("line-active");
+          }, 400 + i * 520);
+        });
+      }, { threshold: 0.5 });
+      tio.observe(term);
+    }
+  </script>
+</body>
+
+</html>

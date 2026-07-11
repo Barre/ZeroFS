@@ -1,0 +1,139 @@
+{% extends "blog-base.html" %}
+
+{% block metadata %}
+<title>{{ page.title }} — ZeroFS</title>
+<meta name="description" content="{{ page.description }}">
+<meta property="og:title" content="{{ page.title }}">
+<meta property="og:description" content="{{ page.extra.og_description }}">
+<meta property="og:type" content="article">
+<meta property="article:published_time" content="{{ page.date }}">
+<meta property="article:author" content="{{ page.authors | first }}">
+<meta property="og:url" content="{{ current_url | safe }}">
+<meta property="og:image" content="https://www.zerofs.net/assets/og-card.jpg">
+<meta property="og:image:width" content="2400">
+<meta property="og:image:height" content="1260">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="{{ current_url | safe }}">
+<link rel="alternate" type="application/atom+xml" title="ZeroFS blog" href="/atom.xml">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": {{ page.title | json_encode | safe }},
+  "description": {{ page.description | json_encode | safe }},
+  "datePublished": "{{ page.date }}",
+  "author": { "@type": "Person", "name": {{ page.authors | first | json_encode | safe }} },
+  "publisher": { "@type": "Organization", "name": "ZeroFS", "url": "https://www.zerofs.net/" },
+  "mainEntityOfPage": {{ current_url | json_encode | safe }},
+  "image": "https://www.zerofs.net/assets/og-card.jpg"
+}
+</script>
+{% endblock metadata %}
+
+{% block content %}
+<div class="reading-progress" aria-hidden="true"><span></span></div>
+
+<main>
+  <article>
+    <div class="post-hero">
+      <div class="post-hero-art" aria-hidden="true"><svg><use href="#enso" /></svg></div>
+      <div class="wrap">
+        <a class="back-link rv" href="/blog/"><span aria-hidden="true">←</span> Back to blog</a>
+        <h1 class="rv" data-d="80">{{ page.title }}</h1>
+        <div class="post-meta rv" data-d="160">
+          <time datetime="{{ page.date }}">{{ page.extra.display_date }}</time><span class="dot">·</span>
+          <span>{{ page.authors | first }}</span><span class="dot">·</span>
+          <span>{{ page.extra.reading_time }}</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="post">
+      <div class="wrap body">
+        {{ page.content | safe }}
+      </div>
+    </div>
+
+    <div class="post-cta">
+      <div class="wrap">
+        <p class="eyebrow rv">Documentation</p>
+        <h2 class="rv">Configuration, guarantees, and failure modes.</h2>
+        <div class="links rv">
+          <a class="btn primary" href="/docs/high-availability">High availability <span aria-hidden="true">→</span></a>
+          <a class="btn ghost" href="/docs/durability">Durability &amp; consistency</a>
+        </div>
+      </div>
+    </div>
+  </article>
+</main>
+{% endblock content %}
+
+{% block scripts %}
+<script>
+// A one-pixel progress line is the only persistent navigation in the article.
+const article = document.querySelector("article");
+const progress = document.querySelector(".reading-progress span");
+const updateProgress = () => {
+  const start = article.getBoundingClientRect().top + scrollY;
+  const end = start + article.offsetHeight - innerHeight;
+  const value = end > start ? Math.min(1, Math.max(0, (scrollY - start) / (end - start))) : 1;
+  progress.style.transform = `scaleX(${value})`;
+};
+updateProgress();
+addEventListener("scroll", updateProgress, { passive: true });
+addEventListener("resize", updateProgress);
+</script>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+mermaid.initialize({
+  startOnLoad: false,
+  securityLevel: "strict",
+  theme: "base",
+  sequence: {
+    useMaxWidth: true,
+    mirrorActors: false,
+    actorMargin: 70,
+    messageMargin: 42,
+    boxMargin: 12,
+    noteMargin: 12,
+    diagramMarginX: 10,
+    diagramMarginY: 10,
+    actorFontSize: 15,
+    messageFontSize: 14,
+    noteFontSize: 13,
+    actorFontFamily: '"Schibsted Grotesk", sans-serif',
+    messageFontFamily: '"Schibsted Grotesk", sans-serif',
+    noteFontFamily: '"Schibsted Grotesk", sans-serif'
+  },
+  themeVariables: {
+    darkMode: true,
+    background: "#111110",
+    primaryColor: "#15151a",
+    primaryTextColor: "#f4f3ef",
+    primaryBorderColor: "rgba(255,255,255,0.22)",
+    lineColor: "#6e6c64",
+    secondaryColor: "#15151a",
+    tertiaryColor: "#0f0f0e",
+    actorBkg: "#15151a",
+    actorBorder: "#4d9fff",
+    actorTextColor: "#f4f3ef",
+    actorLineColor: "#6e6c64",
+    signalColor: "#a8a69e",
+    signalTextColor: "#a8a69e",
+    labelBoxBkgColor: "#15151a",
+    labelBoxBorderColor: "rgba(255,255,255,0.22)",
+    labelTextColor: "#f4f3ef",
+    loopTextColor: "#a8a69e",
+    noteBkgColor: "rgba(77,159,255,0.13)",
+    noteBorderColor: "#4d9fff",
+    noteTextColor: "#f4f3ef",
+    sequenceNumberColor: "#0a0a09",
+    fontFamily: '"Schibsted Grotesk", sans-serif',
+    fontSize: "15px"
+  }
+});
+// Render only after the web fonts are ready so Mermaid measures the real font.
+try { await document.fonts.ready; } catch (e) {}
+mermaid.run({ querySelector: ".mermaid" });
+</script>
+{% endblock scripts %}

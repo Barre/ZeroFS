@@ -8,5 +8,8 @@ __pycache__
 jepsen/ha/store
 jepsen/ha/.lein-failures
 
-# generated site (documentation static export assembled by scripts/build-site.sh)
-website/docs
+# generated site assembled by scripts/build-site.sh
+/dist/site
+
+# Zola's default local build/serve output
+/website/public
