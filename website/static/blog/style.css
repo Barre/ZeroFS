@@ -97,6 +97,17 @@ main { position: relative; z-index: 1; }
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .idx-hero p { margin-top: 18px; max-width: 600px; font-family: var(--serif); font-size: 19px; line-height: 1.55; color: var(--text-read); }
+.feed-link {
+  align-self: flex-start;
+  display: inline-flex; align-items: center; gap: 9px;
+  margin-top: 24px;
+  font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.02em;
+  color: var(--text-dim);
+  transition: color .15s;
+}
+.feed-link svg { width: 15px; height: 15px; flex: none; }
+.feed-link:hover { color: var(--accent); }
+.feed-link:focus-visible { color: var(--accent); outline: 1px solid var(--accent); outline-offset: 6px; border-radius: 2px; }
 .idx-art {
   position: absolute;
   top: 50%; right: 24px;
@@ -350,16 +361,17 @@ main { position: relative; z-index: 1; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   .idx-art svg { animation: none; }
-  .back-link, .post-row, .post-row h2, .post-row .more .arrow { transition: none; }
+  .feed-link, .back-link, .post-row, .post-row h2, .post-row .more .arrow { transition: none; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .idx-hero .eyebrow, .idx-hero h1, .idx-hero .wrap > p,
+  .idx-hero .eyebrow, .idx-hero h1, .idx-hero .wrap > p, .idx-hero .feed-link,
   .post-hero .back-link, .post-hero h1, .post-hero .post-meta {
     animation: blog-rise .8s cubic-bezier(.2,.6,.2,1) backwards;
   }
   .idx-hero h1, .post-hero h1 { animation-delay: 70ms; }
   .idx-hero .wrap > p, .post-hero .post-meta { animation-delay: 140ms; }
+  .idx-hero .feed-link { animation-delay: 210ms; }
 }
 
 @keyframes blog-rise { from { opacity: 0; transform: translateY(14px); } }
