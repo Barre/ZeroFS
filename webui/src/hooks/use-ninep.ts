@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { p9client, type FileEntry, type FileInfo, type TrafficStats } from "../lib/ninep/client";
+import { p9client, type FileEntry, type FileInfo, type TrafficStats } from "../lib/zerofs/client";
 import { useNinePConnection } from "./use-ninep-connection";
 
 export function useDirectory(path: string) {
@@ -69,14 +69,16 @@ export function useUpload() {
       file,
       onProgress,
       signal,
+      batch,
     }: {
       dirPath: string;
       file: File;
       onProgress?: (sent: number, total: number) => void;
       signal?: AbortSignal;
+      batch?: ReturnType<typeof p9client.beginUploadBatch>;
     }) => {
       const targetPath = dirPath.replace(/\/$/, "") + "/" + file.name;
-      return p9client.uploadBlob(targetPath, file, onProgress, signal);
+      return p9client.uploadBlob(targetPath, file, { onProgress, signal, batch });
     },
     onSuccess: (_data, { dirPath }) => {
       qc.invalidateQueries({ queryKey: ["9p", "ls", dirPath] });

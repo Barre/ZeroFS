@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { type FileEntry } from "../../../lib/ninep/client";
+import { type FileEntry } from "../../../lib/zerofs/client";
 import { joinPath } from "../../../lib/format";
 import { DRAG_MIME } from "../FileBrowser";
 

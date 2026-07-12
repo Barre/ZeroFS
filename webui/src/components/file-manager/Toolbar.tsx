@@ -22,7 +22,7 @@ import { Tip } from "../ui/Tip";
 import { SearchBar } from "./SearchBar";
 import { usePresence } from "../../hooks/use-presence";
 import { formatSizeFixed, formatOps } from "../../lib/format";
-import type { FileEntry } from "../../lib/ninep/client";
+import type { FileEntry } from "../../lib/zerofs/client";
 
 export function ToolbarButton({
   onClick,

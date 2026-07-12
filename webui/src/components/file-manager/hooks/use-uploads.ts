@@ -2,8 +2,9 @@ import { useState, useCallback, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useUpload } from "../../../hooks/use-ninep";
-import { p9client, type FileEntry } from "../../../lib/ninep/client";
+import { p9client, type FileEntry } from "../../../lib/zerofs/client";
 import { useFileTransfers } from "../../transfers/use-file-transfers";
+import type { TransferHandle } from "../../transfers/TransferContext";
 import { formatSize, joinPath } from "../../../lib/format";
 import { formatError } from "../../../lib/errors";
 import { pooled } from "../../../lib/async";
@@ -119,9 +120,12 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
 
   const doUpload = useCallback(
     async (filesToUpload: File[]) => {
+      const batch = p9client.beginUploadBatch();
+      const completed: TransferHandle[] = [];
       await pooled(filesToUpload, 8, async (file) => {
-        const uploadOne = async () => {
-          const retry = () => uploadOne();
+        const uploadOne = async (mode: "batch" | "standalone") => {
+          const retry = () => uploadOne("standalone");
+          const uploadBatch = mode === "batch" ? batch : undefined;
           const handle = transfers.startUpload(file.name, file.size, retry);
           try {
             await uploadMut.mutateAsync({
@@ -129,15 +133,28 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
               file,
               onProgress: (sent, total) => handle.update(sent, total),
               signal: handle.signal,
+              batch: uploadBatch,
             });
-            handle.finish();
+            if (uploadBatch) completed.push(handle);
+            else handle.finish();
           } catch (err) {
             if (err instanceof DOMException && err.name === "AbortError") return;
             handle.fail(formatError(err));
           }
         };
-        await uploadOne();
+        await uploadOne("batch");
       });
+
+      if (completed.length === 0) return;
+      try {
+        await p9client.finishUploadBatch(batch);
+        for (const handle of completed) {
+          if (!handle.signal.aborted) handle.finish();
+        }
+      } catch (err) {
+        const message = formatError(err);
+        for (const handle of completed) handle.fail(message);
+      }
     },
     [path, uploadMut, transfers],
   );
@@ -232,18 +249,18 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
         }
 
         let filesUploaded = 0;
+        const batch = p9client.beginUploadBatch();
         await pooled(uploadItems, 16, async (item) => {
           if (handle.signal.aborted) return;
           const targetPath = joinPath(path, item.relativePath);
           try {
-            await p9client.uploadBlob(
-              targetPath,
-              item.file,
-              (sent) => {
+            await p9client.uploadBlob(targetPath, item.file, {
+              onProgress: (sent) => {
                 handle.update(bytesUploaded + sent, totalBytes, `${filesUploaded}/${uploadItems.length} files`);
               },
-              handle.signal,
-            );
+              signal: handle.signal,
+              batch,
+            });
             bytesUploaded += item.file.size;
           } catch (err) {
             if (err instanceof DOMException && err.name === "AbortError") return;
@@ -254,6 +271,16 @@ export function useUploads(path: string, entries: FileEntry[] | undefined) {
           handle.update(bytesUploaded, totalBytes, `${filesUploaded}/${uploadItems.length} files`);
         });
 
+        if (errors < uploadItems.length) {
+          try {
+            await p9client.finishUploadBatch(batch);
+          } catch (err) {
+            if (!handle.signal.aborted) handle.fail(formatError(err));
+            return;
+          }
+        }
+
+        if (handle.signal.aborted) return;
         if (errors === uploadItems.length) {
           handle.fail(`All ${errors} uploads failed`);
         } else {

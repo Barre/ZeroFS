@@ -5,7 +5,7 @@ import { X, Info, FolderOpen, Loader2, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { useStat } from "../../hooks/use-ninep";
 import { useFrozen } from "../../hooks/use-frozen";
-import { p9client } from "../../lib/ninep/client";
+import { p9client } from "../../lib/zerofs/client";
 import { formatSize, formatMode, formatTimestamp } from "../../lib/format";
 import { formatError } from "../../lib/errors";
 import { Button } from "../ui/Button";

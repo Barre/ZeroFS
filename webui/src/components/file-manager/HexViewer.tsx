@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
 import { useResizeObserver } from "../../hooks/use-resize-observer";
-import { p9client } from "../../lib/ninep/client";
+import { p9client } from "../../lib/zerofs/client";
 
 interface HexViewerProps {
   path: string;

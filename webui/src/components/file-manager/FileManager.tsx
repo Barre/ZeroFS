@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Loader2, Upload } from "lucide-react";
 import { useDirectory, useMkdir, useRemove, useRename, useTrafficStats } from "../../hooks/use-ninep";
-import { p9client, type FileEntry } from "../../lib/ninep/client";
+import { p9client, type FileEntry } from "../../lib/zerofs/client";
 import { formatError } from "../../lib/errors";
 import { joinPath } from "../../lib/format";
 import { Breadcrumb } from "./Breadcrumb";

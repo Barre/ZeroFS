@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect } from "react";
 import { Search, X, Loader2 } from "lucide-react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { p9client, type SearchResult } from "../../lib/ninep/client";
+import { p9client, type SearchResult } from "../../lib/zerofs/client";
 import { Button } from "../ui/Button";
 import { ToolbarButton } from "./Toolbar";
 import { FileIcon } from "./FileIcon";
