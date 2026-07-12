@@ -425,6 +425,15 @@ jobs:
           cache: "npm"
           cache-dependency-path: webui/package-lock.json
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2.82.9
+        with:
+          tool: wasm-pack@0.15.0
+          fallback: none
+
       - name: Install VM image build dependencies
         run: |
           sudo apt-get update
