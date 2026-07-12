@@ -21,7 +21,7 @@ ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol
 
 ## Overview {{ id: 'overview' }}
 
-The extensions are transparent. A stock kernel 9P client never proposes them, so it negotiates plain `9P2000.L` and behaves exactly as it would against any other 9P server. Only the bundled client uses them: [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) and the [client libraries](/client-libraries) both wrap the same `zerofs-client` core, so they share one set of capabilities and one negotiation path.
+The extensions are transparent. A stock kernel 9P client never proposes them, so it negotiates plain `9P2000.L` and behaves exactly as it would against any other 9P server. ZeroFS's own clients use them: [`zerofs mount`](/9p-access#mounting-with-zerofs-mount), the [client libraries](/client-libraries), and the [Web UI file manager](/web-ui#9p-on-the-web) all use the same `zerofs-client` core (compiled to WebAssembly in the browser), so they share one set of capabilities and one negotiation path.
 
 Every extension was added to remove a specific cost in the standard protocol:
 

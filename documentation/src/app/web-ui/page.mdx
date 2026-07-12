@@ -51,7 +51,7 @@ Ctrl+F searches the current directory, recursing at most 10 levels deep. A plain
 
 ### Transfers
 
-Downloading a folder reads every file into browser memory and zips it client-side, so folder downloads are bounded by what the tab can hold in memory. Recursive delete is a client-side walk with live progress and cancel. Dragging selected entries onto another tab issues 9P renames: a move, not a copy.
+Downloading a folder reads every file into browser memory and zips it client-side, so folder downloads are bounded by what the tab can hold in memory. Multi-file and folder uploads write files concurrently, then issue one filesystem-wide durability barrier for the completed batch rather than one fsync per file. Recursive delete is a client-side walk with live progress and cancel. Dragging selected entries onto another tab issues 9P renames: a move, not a copy.
 
 ## Dashboard {{ id: 'dashboard' }}
 
@@ -65,7 +65,7 @@ The tracer keeps the most recent 1000 events. Pausing discards events that arriv
 
 The file manager does not use a REST API. It speaks 9P, the same binary protocol the Linux kernel speaks when you `mount -t 9p`. The transport is a WebSocket instead of TCP; the messages on the wire are identical.
 
-The 9P server already handles permissions, streaming, renames, and directory listings, so the UI reuses it directly through a [9P client in TypeScript](https://github.com/Barre/zerofs/tree/main/webui/src/lib/ninep) over a WebSocket rather than a REST layer that would reimplement the same logic.
+The 9P server already handles permissions, streaming, renames, and directory listings, so the UI reuses it directly rather than adding a REST layer that would reimplement the same logic. Its browser client is the shared Rust [`zerofs-client`](https://crates.io/crates/zerofs-client) core compiled to WebAssembly, with a thin TypeScript facade for file-manager operations. It therefore negotiates the same [ZeroFS extensions](/9p-extensions) and uses the same reconnect and open-handle replay logic as `zerofs mount` and the native [client libraries](/client-libraries).
 
 When you open the UI, the browser connects to `/ws/9p`. The server upgrades the connection and hands it to the same `NinePHandler` that serves other clients over TCP. From that point on, the browser is another 9P session.
 
