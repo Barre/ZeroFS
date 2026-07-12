@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useCallback, useEffect, useLayoutEffect } fr
 import { useResizeObserver } from "../../hooks/use-resize-observer";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowUp, ArrowDown, FolderPlus, FilePlus } from "lucide-react";
-import { type FileEntry } from "../../lib/ninep/client";
+import { type FileEntry } from "../../lib/zerofs/client";
 import { FileIcon } from "./FileIcon";
 import { formatSize, formatMode } from "../../lib/format";
 import { FileContextMenuWrapper, type ContextMenuAction } from "./FileContextMenu";

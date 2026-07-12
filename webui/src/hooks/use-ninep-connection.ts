@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useSyncExternalStore } from "react";
-import { p9client, type ConnectionState } from "../lib/ninep/client";
+import { p9client, type ConnectionState } from "../lib/zerofs/client";
 
 function getWsUrl() {
   const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";

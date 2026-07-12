@@ -20,7 +20,7 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import { HexViewer } from "./HexViewer";
 import { ToolbarButton } from "./Toolbar";
 import { filetypemime } from "magic-bytes.js";
-import { p9client } from "../../lib/ninep/client";
+import { p9client } from "../../lib/zerofs/client";
 import { formatError } from "../../lib/errors";
 import "../../lib/monaco";
 

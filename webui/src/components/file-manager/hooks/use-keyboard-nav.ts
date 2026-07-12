@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback } from "react";
-import { type FileEntry } from "../../../lib/ninep/client";
+import { type FileEntry } from "../../../lib/zerofs/client";
 
 interface UseKeyboardNavOptions {
   containerRef: React.RefObject<HTMLDivElement | null>;

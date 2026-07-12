@@ -9,7 +9,7 @@ import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type D
 import { SortableContext, horizontalListSortingStrategy, useSortable, arrayMove } from "@dnd-kit/sortable";
 import { FileManager } from "../components/file-manager/FileManager";
 import { DRAG_MIME } from "../components/file-manager/FileBrowser";
-import { p9client } from "../lib/ninep/client";
+import { p9client } from "../lib/zerofs/client";
 import { formatError } from "../lib/errors";
 import { joinPath } from "../lib/format";
 import { toast } from "sonner";
