@@ -136,7 +136,16 @@ To build with the Web UI, run make from the repository root:
 make build-release
 ```
 
-The target builds the frontend first (npm ci, buf generate, the v86 VM image script, npm run build), then runs `cargo build --profile release --features webui`. Running `cargo build --features webui` on its own fails: the binary embeds `webui/dist` at compile time, and the directory exists only after the frontend build. The frontend build needs Node.js (CI uses Node 22), bsdtar (the `libarchive-tools` package on Debian/Ubuntu), and squashfs-tools. The VM image script downloads an Alpine 3.21 ISO and v86 BIOS files and verifies their SHA-256 checksums.
+The target builds the shared Rust client for the browser with `wasm-pack`, then builds the frontend (npm ci, buf generate, the v86 VM image script, npm run build), and finally runs `cargo build --profile release --features webui`. Running `cargo build --features webui` on its own fails: the binary embeds `webui/dist` at compile time, and the directory exists only after the frontend build.
+
+Install the WebAssembly target and `wasm-pack` before building:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack --version 0.15.0 --locked
+```
+
+The frontend also needs Node.js (CI uses Node 22), bsdtar (the `libarchive-tools` package on Debian/Ubuntu), and squashfs-tools. The VM image script downloads an Alpine 3.21 ISO and v86 BIOS files and verifies their SHA-256 checksums.
 
 Prebuilt release binaries and the Docker image are built with the `webui` feature and include the Web UI.
 
