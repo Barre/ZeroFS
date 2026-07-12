@@ -12,7 +12,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
+#[cfg(not(target_arch = "wasm32"))]
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxFut<T> = Pin<Box<dyn Future<Output = T>>>;
 
 /// A pull-based stream of [`DirEntry`] over an open [`Dir`], yielding entries
 /// one at a time (fetched a server batch at a time underneath). It holds the

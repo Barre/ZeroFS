@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
+#[cfg(not(target_arch = "wasm32"))]
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type BoxFut<T> = Pin<Box<dyn Future<Output = T>>>;
 
 enum State {
     Idle,

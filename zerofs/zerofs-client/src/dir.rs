@@ -89,7 +89,7 @@ impl Dir {
         if st.guard.is_none() {
             // Open the listing sibling on a fresh fid (shared op: Tlopenat on
             // v2, clone + lopen otherwise), leaving the ops fid unopened.
-            let flags = (libc::O_RDONLY | libc::O_DIRECTORY) as u32;
+            let flags = crate::linux::O_RDONLY | crate::linux::O_DIRECTORY;
             let g = self.session.alloc_guard();
             let guard = match self
                 .session
@@ -284,7 +284,7 @@ impl Dir {
         let (fid, display) = self.at(name)?;
         self.session
             .client
-            .unlinkat(fid, name, libc::AT_REMOVEDIR as u32)
+            .unlinkat(fid, name, crate::linux::AT_REMOVEDIR)
             .await
             .ctx(&display)
     }

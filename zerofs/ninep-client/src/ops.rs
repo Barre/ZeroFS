@@ -140,7 +140,7 @@ impl NinePClient {
         match self.walk(from, newfid, names).await {
             // Only a full walk creates `newfid` (a partial one leaves it unset).
             Ok(qids) if qids.len() == names.len() => {}
-            Ok(_) => return Err(ClientError::Errno(libc::ENOENT as u32)),
+            Ok(_) => return Err(ClientError::Errno(crate::linux::ENOENT)),
             Err(e) => return Err(e),
         }
         match self.getattr(newfid, GETATTR_ALL).await {

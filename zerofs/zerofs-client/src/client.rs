@@ -1,7 +1,7 @@
 use crate::dir::Dir;
 use crate::error::{ClientResultExt, ZeroFsError};
 use crate::file::File;
-use crate::path::{components, display, display_path, split_parent};
+use crate::path::{components, display, display_path, path_bytes, path_from_bytes, split_parent};
 use crate::session::{FidGuard, Session};
 use crate::types::{
     Capabilities, ConnectOptions, DirEntry, FileType, Metadata, NodeKind, OpenOptions, SetAttrs,
@@ -11,13 +11,12 @@ use bytes::{Bytes, BytesMut};
 use ninep_client::{NOFID, NinePClient};
 use ninep_proto::Stat;
 use std::collections::VecDeque;
-use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_9P_PORT: u16 = 5564;
 
 /// Symlink resolution cap, mirroring Linux's SYMLOOP_MAX headroom.
@@ -44,9 +43,10 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Connect with defaults. Targets: `"unix:/sock"`, `"tcp://host:port"`,
-    /// `"host:port"`, `"host"` (port 5564), or a bare filesystem path (unix
-    /// socket).
+    /// Connect with defaults. Native targets: `"unix:/sock"`,
+    /// `"tcp://host:port"`, `"host:port"`, `"host"` (port 5564), or a bare
+    /// filesystem path (unix socket). Browser WASM targets are `"ws://..."`
+    /// and `"wss://..."`.
     pub async fn connect(target: &str) -> Result<Arc<Client>, ZeroFsError> {
         Self::connect_with(target, ConnectOptions::default()).await
     }
@@ -58,23 +58,40 @@ impl Client {
     ) -> Result<Arc<Client>, ZeroFsError> {
         let fut = Self::establish(target, &opts);
         match opts.connect_timeout_ms {
-            Some(ms) => match tokio::time::timeout(Duration::from_millis(ms as u64), fut).await {
-                Ok(result) => result,
-                Err(_) => Err(ZeroFsError::ConnectFailed {
-                    message: format!("connecting to {target}: timed out after {ms} ms"),
-                }),
-            },
+            Some(ms) => {
+                match crate::runtime::timeout(Duration::from_millis(ms as u64), fut).await {
+                    Ok(result) => result,
+                    Err(_) => Err(ZeroFsError::ConnectFailed {
+                        message: format!("connecting to {target}: timed out after {ms} ms"),
+                    }),
+                }
+            }
             None => fut.await,
         }
     }
 
     async fn establish(target: &str, opts: &ConnectOptions) -> Result<Arc<Client>, ZeroFsError> {
         let client = dial(target, opts.msize).await?;
+        #[cfg(not(target_arch = "wasm32"))]
         let uid = opts.uid.unwrap_or_else(|| unsafe { libc::geteuid() });
+        #[cfg(target_arch = "wasm32")]
+        let uid = opts.uid.unwrap_or(0);
+        #[cfg(not(target_arch = "wasm32"))]
         let gid = opts.gid.unwrap_or_else(|| unsafe { libc::getegid() });
+        #[cfg(target_arch = "wasm32")]
+        let gid = opts.gid.unwrap_or(0);
         let uname = match &opts.uname {
             Some(u) => u.clone(),
-            None => std::env::var("USER").unwrap_or_else(|_| uid.to_string()),
+            None => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    std::env::var("USER").unwrap_or_else(|_| uid.to_string())
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    uid.to_string()
+                }
+            }
         };
         let root_fid = client.alloc_fid();
         client
@@ -98,6 +115,17 @@ impl Client {
             max_read_chunk: c.max_io(),
             max_write_chunk: c.max_write_payload(),
         }
+    }
+
+    /// Whether the underlying session is currently live. During transparent
+    /// reconnect this is false while operations wait for replay to finish.
+    pub fn is_connected(&self) -> bool {
+        self.session.client.is_connected()
+    }
+
+    /// Cumulative 9P wire traffic for this client, including reconnects.
+    pub fn traffic_stats(&self) -> ninep_client::TrafficStats {
+        self.session.client.traffic_stats()
     }
 
     /// Number of server fids this client currently holds: the root, open
@@ -227,7 +255,7 @@ impl Client {
         let names = components(path)?;
         let (guard, stat) = self.session.walk(&names, pd).await?;
         self.session
-            .lopen(guard.fid(), libc::O_RDONLY as u32, pd)
+            .lopen(guard.fid(), crate::linux::O_RDONLY, pd)
             .await?;
         Ok((guard, stat))
     }
@@ -300,7 +328,7 @@ impl Client {
         if buf.is_empty() {
             buf.push(b'/');
         }
-        Ok(PathBuf::from(OsString::from_vec(buf)))
+        path_from_bytes(buf)
     }
 
     /// True if the path exists (any file type, no symlink following);
@@ -411,7 +439,7 @@ impl Client {
         self.session.check_open()?;
         self.session
             .client
-            .fsync(self.session.root_fid, 0)
+            .fsync_all(self.session.root_fid, 0)
             .await
             .ctx("/")
     }
@@ -518,7 +546,7 @@ impl Client {
         let (dir_guard, name) = self.parent_of(path, &pd).await?;
         self.session
             .client
-            .unlinkat_op_id(dir_guard.fid(), name, libc::AT_REMOVEDIR as u32, op_id)
+            .unlinkat_op_id(dir_guard.fid(), name, crate::linux::AT_REMOVEDIR, op_id)
             .await
             .ctx(&pd)
     }
@@ -621,7 +649,7 @@ impl Client {
             .symlink_at_op_id(
                 dir_guard.fid(),
                 name,
-                target.as_ref().as_os_str().as_bytes(),
+                path_bytes(target.as_ref())?,
                 &ld,
                 op_id,
             )
@@ -636,7 +664,7 @@ impl Client {
         let names = components(path)?;
         let (guard, _) = self.session.walk(&names, &pd).await?;
         let target = self.session.client.readlink(guard.fid()).await.ctx(&pd)?;
-        Ok(PathBuf::from(OsString::from_vec(target)))
+        path_from_bytes(target)
     }
 
     /// Create a fifo, socket, or device node; `mode` carries permission bits
@@ -839,9 +867,13 @@ impl Client {
 
 /// Empty a directory recursively: lists in rounds (rewinding between them so
 /// deletion never races the cursor) until nothing is left.
-fn remove_dir_contents<'a>(
-    dir: &'a Dir,
-) -> std::pin::Pin<Box<dyn Future<Output = Result<(), ZeroFsError>> + Send + 'a>> {
+#[cfg(not(target_arch = "wasm32"))]
+type RemoveDirFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<(), ZeroFsError>> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type RemoveDirFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Result<(), ZeroFsError>> + 'a>>;
+
+fn remove_dir_contents<'a>(dir: &'a Dir) -> RemoveDirFuture<'a> {
     Box::pin(async move {
         loop {
             dir.rewind().await?;
@@ -868,28 +900,44 @@ fn remove_dir_contents<'a>(
 async fn dial(target: &str, msize: u32) -> Result<Arc<NinePClient>, ZeroFsError> {
     let connect_failed = |message: String| ZeroFsError::ConnectFailed { message };
 
-    if let Some(rest) = target.strip_prefix("unix:") {
-        let path = rest.strip_prefix("//").unwrap_or(rest);
-        return NinePClient::connect_unix(path, msize)
-            .await
-            .map_err(|e| connect_failed(format!("9P unix socket {path}: {e}")));
+    #[cfg(target_arch = "wasm32")]
+    {
+        if target.starts_with("ws://") || target.starts_with("wss://") {
+            return NinePClient::connect_websocket(target, msize)
+                .await
+                .map_err(|e| connect_failed(format!("9P WebSocket {target}: {e}")));
+        }
+        Err(connect_failed(format!(
+            "browser clients require a ws:// or wss:// target, got {target:?}"
+        )))
     }
 
-    let hostport = target.strip_prefix("tcp://").unwrap_or(target);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(rest) = target.strip_prefix("unix:") {
+            let path = rest.strip_prefix("//").unwrap_or(rest);
+            return NinePClient::connect_unix(path, msize)
+                .await
+                .map_err(|e| connect_failed(format!("9P unix socket {path}: {e}")));
+        }
 
-    // A path-like target without a scheme is treated as a unix socket.
-    if hostport.starts_with('/') || hostport.starts_with('.') {
-        return NinePClient::connect_unix(hostport, msize)
+        let hostport = target.strip_prefix("tcp://").unwrap_or(target);
+
+        // A path-like target without a scheme is treated as a unix socket.
+        if hostport.starts_with('/') || hostport.starts_with('.') {
+            return NinePClient::connect_unix(hostport, msize)
+                .await
+                .map_err(|e| connect_failed(format!("9P unix socket {hostport}: {e}")));
+        }
+
+        let addr = resolve_addr(hostport).await?;
+        NinePClient::connect_tcp(addr, msize)
             .await
-            .map_err(|e| connect_failed(format!("9P unix socket {hostport}: {e}")));
+            .map_err(|e| connect_failed(format!("9P server {addr}: {e}")))
     }
-
-    let addr = resolve_addr(hostport).await?;
-    NinePClient::connect_tcp(addr, msize)
-        .await
-        .map_err(|e| connect_failed(format!("9P server {addr}: {e}")))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, ZeroFsError> {
     if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
         return Ok(addr);

@@ -15,7 +15,15 @@ categories = ["filesystem", "network-programming"]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dst)"] }
 
 [workspace]
-members = ["ninep-proto", "nbd-proto", "ninep-client", "zerofs-csi", "zerofs-client", "zerofs-ffi"]
+members = [
+    "ninep-proto",
+    "nbd-proto",
+    "ninep-client",
+    "zerofs-csi",
+    "zerofs-client",
+    "zerofs-client-web",
+    "zerofs-ffi",
+]
 
 # Single source of truth for the release version. The zerofs-csi image is
 # tagged with the repo release tag and layers on the zerofs image of that

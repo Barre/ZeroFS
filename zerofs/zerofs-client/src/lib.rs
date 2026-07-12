@@ -1,13 +1,15 @@
 //! Async, path-based client for a ZeroFS server, speaking 9P2000.L (plus the
 //! ZeroFS fast-path extensions, used automatically when the server offers
-//! them) over TCP or a unix socket.
+//! them) over TCP or a unix socket natively, and over WebSocket in browser
+//! WASM builds.
 //!
 //! The primary surface is one-shot path operations on a shared [`Client`] (
 //! read, write, stat, rename, mkdir), with [`File`] and [`Dir`] handles only
 //! where statefulness pays (chunked I/O, incremental listing, openat-style
 //! child operations). Paths are bytes, as on POSIX and the 9P wire: every
 //! path parameter is `impl AsRef<Path>`, so non-UTF-8 names need nothing
-//! special. The API otherwise stays FFI-friendly (owned buffers, a flat
+//! special on Unix. Browser paths come from JavaScript strings and are UTF-8.
+//! The API otherwise stays FFI-friendly (owned buffers, a flat
 //! exhaustive error enum, `Arc` handles, explicit `close`, cancel-safe
 //! futures) for the `zerofs-ffi` bindings layer built on top.
 //!
@@ -53,8 +55,8 @@
 //!
 //! **Cancellation.** Every public future is cancel-safe: dropping it at any
 //! await point leaks nothing (in-flight fids are reclaimed in the background).
-//! There is deliberately no per-operation timeout parameter; bound waits with
-//! `tokio::time::timeout`.
+//! There is deliberately no per-operation timeout parameter; callers can bound
+//! waits with their runtime's timeout facility.
 //!
 //! **Connection loss.** The underlying session reconnects forever with backoff
 //! and replays its state; while the server is unreachable, calls block rather
@@ -62,9 +64,6 @@
 //! so a non-idempotent op (rename, create, unlink) can apply twice across a
 //! reconnect.
 
-// `libc::mode_t` constants are u32 on Linux but u16 on macOS; the `as u32`
-// casts clippy flags here are portability.
-#![allow(clippy::unnecessary_cast)]
 #![warn(missing_docs)]
 
 mod client;
@@ -74,7 +73,9 @@ pub mod failover;
 mod file;
 #[cfg(feature = "tokio-io")]
 pub mod io;
+mod linux;
 mod path;
+mod runtime;
 mod session;
 #[cfg(feature = "stream")]
 pub mod stream;
@@ -95,3 +96,4 @@ pub use types::{
 /// Re-exported so callers need not depend on `bytes` directly; it is the return
 /// type of every read (cheap to clone and slice, derefs to `&[u8]`).
 pub use bytes::Bytes;
+pub use ninep_client::TrafficStats;
