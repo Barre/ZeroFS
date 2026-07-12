@@ -102,6 +102,7 @@ fn content_type(path: &str) -> &'static str {
         Some("js") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("json") => "application/json",
+        Some("wasm") => "application/wasm",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
@@ -206,4 +207,101 @@ pub fn start(
         }));
     }
     handles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use std::process::Stdio;
+
+    #[derive(Clone)]
+    struct SmokeState {
+        app: AppState,
+        connections: Arc<std::sync::Mutex<CancellationToken>>,
+        connection_closed: Arc<tokio::sync::Notify>,
+    }
+
+    async fn smoke_ws_upgrade(
+        ws: WebSocketUpgrade,
+        State(state): State<SmokeState>,
+    ) -> impl IntoResponse {
+        let connection_shutdown = state.connections.lock().unwrap().clone();
+        let connection_closed = state.connection_closed.clone();
+        ws.on_upgrade(move |socket| async move {
+            tokio::select! {
+                _ = handle_9p_ws(socket, state.app) => {}
+                _ = connection_shutdown.cancelled() => {}
+            }
+            connection_closed.notify_one();
+        })
+    }
+
+    async fn drop_smoke_connections(State(state): State<SmokeState>) -> StatusCode {
+        let closed = state.connection_closed.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        {
+            let mut shutdown = state.connections.lock().unwrap();
+            shutdown.cancel();
+            *shutdown = CancellationToken::new();
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(1), closed).await {
+            Ok(()) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// End-to-end browser-runtime smoke test. Kept ignored because it requires
+    /// the generated wasm-pack output and Node 22's WebSocket implementation;
+    /// the WebUI workflow invokes it explicitly after `make webui`.
+    #[tokio::test]
+    #[ignore]
+    async fn wasm_client_smoke() {
+        let filesystem = Arc::new(ZeroFS::new_in_memory().await.expect("in-memory filesystem"));
+        let state = SmokeState {
+            app: AppState {
+                filesystem,
+                lock_manager: Arc::new(FileLockManager::new()),
+                uid: 0,
+                gid: 0,
+            },
+            connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
+            connection_closed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let app = Router::new()
+            .route("/ws/9p", get(smoke_ws_upgrade))
+            .route("/drop-connections", post(drop_smoke_connections))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind smoke server");
+        let address = listener.local_addr().expect("smoke server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve smoke endpoint");
+        });
+
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../webui/scripts/smoke-wasm-client.mjs");
+        let output = tokio::process::Command::new("node")
+            .arg(script)
+            .arg(format!("ws://{address}/ws/9p"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .expect("run Node WASM smoke client");
+        server.abort();
+
+        assert!(
+            output.status.success(),
+            "WASM client failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
