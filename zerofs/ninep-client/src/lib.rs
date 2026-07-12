@@ -21,17 +21,27 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use ninep_proto::*;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, info, warn};
+
+mod linux;
+mod runtime;
+#[cfg(target_arch = "wasm32")]
+mod web_transport;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
@@ -113,12 +123,27 @@ impl ClientError {
     pub fn to_errno(&self) -> i32 {
         match self {
             ClientError::Errno(e) => *e as i32,
-            _ => libc::EIO,
+            _ => linux::EIO,
         }
     }
 }
 
 pub type ClientResult<T> = Result<T, ClientError>;
+
+/// Cumulative wire traffic for this logical client across reconnects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrafficStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub operations: u64,
+}
+
+#[derive(Default)]
+struct TrafficCounters {
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    operations: AtomicU64,
+}
 
 mod ops;
 pub use ops::{DirEntryCookie, ReaddirState, SetattrBuilder, SetattrTime};
@@ -128,8 +153,13 @@ pub use ops::{DirEntryCookie, ReaddirState, SetattrBuilder, SetattrTime};
 /// failover.
 #[derive(Clone)]
 pub enum Target {
+    #[cfg(not(target_arch = "wasm32"))]
     Tcp(SocketAddr),
+    #[cfg(not(target_arch = "wasm32"))]
     Unix(PathBuf),
+    /// A browser WebSocket carrying one complete 9P frame per binary message.
+    #[cfg(target_arch = "wasm32")]
+    WebSocket(String),
 }
 
 /// A single live transport (one socket + its reader/writer tasks). Replaced
@@ -145,7 +175,7 @@ struct Conn {
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
     /// Monotonic base for [`Conn::last_alive`].
-    base: std::time::Instant,
+    base: runtime::Clock,
     /// Millis (since `base`) at which the reader last decoded a frame: proof the
     /// server is answering. Read by the timeout path to tell a slow leader from a
     /// hung one without always paying for an explicit probe.
@@ -161,6 +191,7 @@ struct Conn {
     /// each hold an `Arc<Conn>`, so the cycle never breaks on Drop; teardown is
     /// explicit via [`Conn::shutdown`].
     reader_shutdown: Notify,
+    counters: Arc<TrafficCounters>,
 }
 
 impl Conn {
@@ -176,7 +207,7 @@ impl Conn {
     /// Record that the server just answered (any decoded frame). Called by the reader.
     fn mark_alive(&self) {
         self.last_alive
-            .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .store(self.base.elapsed_millis(), Ordering::Relaxed);
     }
 
     /// `now_ms - last_ms < window`, saturating (a `last` ahead of `now` counts as within).
@@ -187,10 +218,37 @@ impl Conn {
     /// Did the reader decode a frame within `window`?
     fn heard_within(&self, window: Duration) -> bool {
         Self::within(
-            self.base.elapsed().as_millis() as u64,
+            self.base.elapsed_millis(),
             self.last_alive.load(Ordering::Relaxed),
             window,
         )
+    }
+
+    fn deliver(&self, frame: Bytes) {
+        self.counters
+            .bytes_received
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
+        self.mark_alive();
+        if frame.len() < P9_HEADER_SIZE {
+            warn!(
+                "9P client: response frame too short ({} bytes)",
+                frame.len()
+            );
+            return;
+        }
+        let tag = u16::from_le_bytes([frame[5], frame[6]]);
+        if let Some((_, tx)) = self.pending.remove(&tag) {
+            let _ = tx.send(frame);
+        } else {
+            debug!("9P client: response for unknown tag {tag}");
+        }
+    }
+
+    fn connection_lost(&self, reconnect: &Notify) {
+        self.dead.store(true, Ordering::Release);
+        self.pending.clear();
+        self.writer_shutdown.notify_one();
+        reconnect.notify_waiters();
     }
 }
 
@@ -273,6 +331,7 @@ pub struct NinePClient {
     /// connection it was made on). Per-fid because `fsync` is per-fd POSIX: a verified
     /// fsync of one fid accounts only for that fid's writes. See [`Unsynced`].
     unsynced: DashMap<u32, Unsynced>,
+    counters: Arc<TrafficCounters>,
 }
 
 /// One fid's outstanding un-fsync'd writes for `.zerofs4` verified fsync. Holds the
@@ -330,6 +389,7 @@ impl Unsynced {
 
 impl NinePClient {
     /// Connect to a 9P server over TCP and negotiate the protocol version.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_tcp(addr: SocketAddr, requested_msize: u32) -> std::io::Result<Arc<Self>> {
         Self::connect(vec![Target::Tcp(addr)], requested_msize)
             .await
@@ -337,6 +397,7 @@ impl NinePClient {
     }
 
     /// Connect to a 9P server over a Unix domain socket and negotiate the version.
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_unix(
         path: impl AsRef<Path>,
         requested_msize: u32,
@@ -361,10 +422,22 @@ impl NinePClient {
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
+    /// Connect to 9P over a browser WebSocket.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn connect_websocket(url: &str, requested_msize: u32) -> ClientResult<Arc<Self>> {
+        Self::connect(vec![Target::WebSocket(url.to_string())], requested_msize).await
+    }
+
     async fn connect(targets: Vec<Target>, requested_msize: u32) -> ClientResult<Arc<Self>> {
         let reconnect_notify = Arc::new(Notify::new());
-        let (conn, msize, extensions) =
-            Self::probe(&targets, requested_msize, Arc::clone(&reconnect_notify)).await?;
+        let counters = Arc::new(TrafficCounters::default());
+        let (conn, msize, extensions) = Self::probe(
+            &targets,
+            requested_msize,
+            Arc::clone(&reconnect_notify),
+            Arc::clone(&counters),
+        )
+        .await?;
 
         let client = Arc::new(Self {
             targets,
@@ -379,6 +452,7 @@ impl NinePClient {
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
             unsynced: DashMap::new(),
+            counters,
         });
         client.spawn_supervisor();
         Ok(client)
@@ -389,8 +463,9 @@ impl NinePClient {
         target: &Target,
         requested_msize: u32,
         reconnect_notify: Arc<Notify>,
+        counters: Arc<TrafficCounters>,
     ) -> ClientResult<(Arc<Conn>, u32, u8)> {
-        let (read, write) = dial(target).await?;
+        let transport = dial(target).await?;
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(P9_CHANNEL_SIZE);
         let conn = Arc::new(Conn {
             writer_tx,
@@ -398,22 +473,32 @@ impl NinePClient {
             tag_ctr: AtomicU16::new(0),
             lineage_token: AtomicU64::new(0),
             dead: AtomicBool::new(false),
-            base: std::time::Instant::now(),
+            base: runtime::Clock::now(),
             last_alive: AtomicU64::new(0),
             probe_lock: tokio::sync::Mutex::new(()),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
+            counters,
         });
 
-        spawn_writer(
-            write,
-            writer_rx,
-            Arc::clone(&conn),
-            Arc::clone(&reconnect_notify),
-        );
-        spawn_reader(read, Arc::clone(&conn), reconnect_notify);
+        match transport {
+            #[cfg(not(target_arch = "wasm32"))]
+            DialedTransport::Native { read, write } => {
+                spawn_writer(
+                    write,
+                    writer_rx,
+                    Arc::clone(&conn),
+                    Arc::clone(&reconnect_notify),
+                );
+                spawn_reader(read, Arc::clone(&conn), reconnect_notify);
+            }
+            #[cfg(target_arch = "wasm32")]
+            DialedTransport::WebSocket(io) => {
+                web_transport::spawn(io, writer_rx, Arc::clone(&conn), reconnect_notify);
+            }
+        }
 
-        match tokio::time::timeout(PROBE_TIMEOUT, negotiate_on(&conn, requested_msize)).await {
+        match runtime::timeout(PROBE_TIMEOUT, negotiate_on(&conn, requested_msize)).await {
             Ok(Ok((msize, extensions))) => Ok((conn, msize, extensions)),
             // Healthy socket but the handshake failed/stalled; tear down so the fd is not leaked.
             Ok(Err(e)) => {
@@ -435,16 +520,18 @@ impl NinePClient {
         targets: &[Target],
         requested_msize: u32,
         reconnect_notify: Arc<Notify>,
+        counters: Arc<TrafficCounters>,
     ) -> ClientResult<(Arc<Conn>, u32, u8)> {
         let mut probes = FuturesUnordered::new();
         for target in targets {
             let target = target.clone();
             let notify = Arc::clone(&reconnect_notify);
+            let counters = Arc::clone(&counters);
             probes.push(async move {
                 let (conn, msize, extensions) =
-                    Self::connect_once(&target, requested_msize, notify).await?;
+                    Self::connect_once(&target, requested_msize, notify, counters).await?;
                 // A fenced/lapsed leader still accepts connections; confirm the lease before adopting.
-                match tokio::time::timeout(PROBE_TIMEOUT, Self::leader_check(&conn)).await {
+                match runtime::timeout(PROBE_TIMEOUT, Self::leader_check(&conn)).await {
                     Ok(Ok(())) => Ok((conn, msize, extensions)),
                     Ok(Err(e)) => {
                         conn.shutdown();
@@ -472,7 +559,7 @@ impl NinePClient {
 
         // Tear down the still-running losers (each bounded by PROBE_TIMEOUT) so their tasks don't leak.
         if !probes.is_empty() {
-            tokio::spawn(async move {
+            runtime::spawn(async move {
                 while let Some(res) = probes.next().await {
                     if let Ok((conn, _, _)) = res {
                         conn.shutdown();
@@ -489,7 +576,10 @@ impl NinePClient {
     /// is not serving. Uses a reserved fid the session never allocates.
     async fn leader_check(conn: &Conn) -> ClientResult<()> {
         const PROBE_FID: u32 = 0xFFFF_FFFE;
+        #[cfg(not(target_arch = "wasm32"))]
         let n_uname = unsafe { libc::geteuid() };
+        #[cfg(target_arch = "wasm32")]
+        let n_uname = 0;
         match Self::send_raw_rpc(
             conn,
             Message::Tattach(Tattach {
@@ -528,7 +618,7 @@ impl NinePClient {
     fn spawn_supervisor(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let notify = Arc::clone(&self.reconnect_notify);
-        tokio::spawn(async move {
+        runtime::spawn(async move {
             loop {
                 // Enable the waiter before reading `dead` so a set-dead-then-notify isn't lost.
                 loop {
@@ -564,7 +654,7 @@ impl NinePClient {
                         Err(e) => {
                             debug!("9P reconnect failed ({e}); retrying in {backoff:?}");
                             drop(this);
-                            tokio::time::sleep(backoff).await;
+                            runtime::sleep(backoff).await;
                             backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
                         }
                     }
@@ -579,6 +669,7 @@ impl NinePClient {
             &self.targets,
             self.requested_msize,
             Arc::clone(&self.reconnect_notify),
+            Arc::clone(&self.counters),
         )
         .await?;
 
@@ -586,7 +677,7 @@ impl NinePClient {
         self.extensions.store(extensions, Ordering::Relaxed);
         // Replay failure, or a stall past REPLAY_TIMEOUT, discards this connection:
         // tear it down so its fd is not leaked and the supervisor reconnects afresh.
-        match tokio::time::timeout(REPLAY_TIMEOUT, self.replay(&conn)).await {
+        match runtime::timeout(REPLAY_TIMEOUT, self.replay(&conn)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 conn.shutdown();
@@ -723,6 +814,21 @@ impl NinePClient {
         self.extensions.load(Ordering::Relaxed) >= 6
     }
 
+    /// Whether requests currently have a live connection rather than waiting
+    /// for reconnect/session replay.
+    pub fn is_connected(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Cumulative traffic across the lifetime of this logical client.
+    pub fn traffic_stats(&self) -> TrafficStats {
+        TrafficStats {
+            bytes_sent: self.counters.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.counters.bytes_received.load(Ordering::Relaxed),
+            operations: self.counters.operations.load(Ordering::Relaxed),
+        }
+    }
+
     /// Record a just-acked mutating write on `fid` as un-fsync'd under `token` (the
     /// lineage token of the connection it returned on).
     fn note_unsynced(&self, fid: u32, token: u64) {
@@ -857,7 +963,7 @@ impl NinePClient {
             if conn.dead.load(Ordering::Acquire) {
                 conn.pending.remove(&tag);
                 self.reconnect_notify.notify_waiters();
-                tokio::task::yield_now().await;
+                runtime::yield_now().await;
                 continue;
             }
 
@@ -875,7 +981,7 @@ impl NinePClient {
             if conn.writer_tx.send(bytes).await.is_err() {
                 // Not sent: safe to retry after reconnect.
                 conn.pending.remove(&tag);
-                tokio::task::yield_now().await;
+                runtime::yield_now().await;
                 continue;
             }
 
@@ -889,12 +995,12 @@ impl NinePClient {
             // resend exactly-once.
             let mut extensions = 0u32;
             let frame = loop {
-                match tokio::time::timeout(REQUEST_TIMEOUT, &mut orx).await {
+                match runtime::timeout(REQUEST_TIMEOUT, &mut orx).await {
                     Ok(Ok(frame)) => break frame,
                     Ok(Err(_)) => {
                         // Lost the reply to a drop: wait for reconnect and resend.
                         conn.pending.remove(&tag);
-                        tokio::task::yield_now().await;
+                        runtime::yield_now().await;
                         continue 'resend;
                     }
                     Err(_) => {
@@ -905,7 +1011,7 @@ impl NinePClient {
                         // Hung, or out of patience: tear it down, reprobe, resend.
                         conn.pending.remove(&tag);
                         self.force_reprobe(&conn);
-                        tokio::task::yield_now().await;
+                        runtime::yield_now().await;
                         continue 'resend;
                     }
                 }
@@ -920,7 +1026,7 @@ impl NinePClient {
                 && e.ecode == P9_ENOTLEADER
             {
                 self.force_reprobe(&conn);
-                tokio::task::yield_now().await;
+                runtime::yield_now().await;
                 continue;
             }
             // A mutating op that just succeeded is durable-but-un-fsync'd under this
@@ -963,7 +1069,7 @@ impl NinePClient {
             return true;
         }
         matches!(
-            tokio::time::timeout(PROBE_TIMEOUT, Self::leader_check(conn)).await,
+            runtime::timeout(PROBE_TIMEOUT, Self::leader_check(conn)).await,
             Ok(Ok(()))
         )
     }
@@ -1213,7 +1319,7 @@ impl NinePClient {
         mode: u32,
     ) -> ClientResult<()> {
         if !self.fallocate_enabled() {
-            return Err(ClientError::Errno(libc::EOPNOTSUPP as u32));
+            return Err(ClientError::Errno(linux::EOPNOTSUPP));
         }
         match self
             .rpc(Message::Tfallocate(Tfallocate {
@@ -1360,7 +1466,7 @@ impl NinePClient {
             Message::Rlcreate(r) => {
                 // `fid` now names the created file: record its inode and the reopen
                 // flags (create-only bits stripped) so replay rebinds and reopens it.
-                let reopen = flags & !((libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC) as u32);
+                let reopen = flags & !(linux::O_CREAT | linux::O_EXCL | linux::O_TRUNC);
                 let mut st = self.state.lock().unwrap();
                 if let Some(rec) = st.fids.get_mut(&fid) {
                     let n_uname = rec.n_uname();
@@ -1420,7 +1526,7 @@ impl NinePClient {
             .await?;
         match resp {
             Message::Rlcreateattr(r) => {
-                let reopen = flags & !((libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC) as u32);
+                let reopen = flags & !(linux::O_CREAT | linux::O_EXCL | linux::O_TRUNC);
                 let mut st = self.state.lock().unwrap();
                 if let Some(n_uname) = st.fids.get(&dfid).map(FidRecord::n_uname) {
                     st.fids.insert(
@@ -1956,7 +2062,7 @@ impl NinePClient {
                     Ok(())
                 }
                 Ok(_) => Err(ClientError::Unexpected("fsync")),
-                Err(ClientError::Errno(e)) if e == libc::ESTALE as u32 => {
+                Err(ClientError::Errno(e)) if e == linux::ESTALE => {
                     // A covered fid's lineage broke: its writes are lost. Keep each
                     // obligation (not cleared, so a later fsync of the inode still
                     // surfaces the loss), flagged reported so the app's redo supersedes
@@ -1973,9 +2079,10 @@ impl NinePClient {
             .any(|&fid| self.snapshot_unsynced(fid).0.is_some())
         {
             // Fail-closed: we hold un-fsync'd writes from an earlier `.zerofs4` session
-            // but are now on a pre-`.zerofs4` connection that cannot verify durability.
-            // A plain unchecked fsync could succeed over a lost write, so refuse.
-            Err(ClientError::Errno(libc::ESTALE as u32))
+            // but are now on a connection that cannot verify durability (an
+            // `ignore_fsync` or pre-`.zerofs4` server). A plain unchecked fsync could
+            // succeed over a lost write, so refuse.
+            Err(ClientError::Errno(linux::ESTALE))
         } else {
             match self
                 .rpc(Message::Tfsync(Tfsync {
@@ -1995,6 +2102,21 @@ impl NinePClient {
     /// which fans an inode across fids, uses [`Self::fsync_inode`].
     pub async fn fsync(&self, fid: u32, datasync: u32) -> ClientResult<()> {
         self.fsync_inode(&[fid], fid, datasync).await
+    }
+
+    /// Filesystem-wide durability barrier covering every currently outstanding
+    /// write on this logical client. The server flush is global; presenting the
+    /// oldest token across all live fids preserves verified-fsync lineage checks
+    /// while allowing a batch of files to share one flush.
+    pub async fn fsync_all(&self, primary: u32, datasync: u32) -> ClientResult<()> {
+        let mut fids = vec![primary];
+        for entry in &self.unsynced {
+            let fid = *entry.key();
+            if fid != primary {
+                fids.push(fid);
+            }
+        }
+        self.fsync_inode(&fids, primary, datasync).await
     }
 
     pub async fn statfs(&self, fid: u32) -> ClientResult<Rstatfs> {
@@ -2109,17 +2231,23 @@ fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
     a_start < b_end && b_start < a_end
 }
 
-/// Open a socket to the target, returning boxed read/write halves so the
-/// supervisor can redial either transport uniformly.
-async fn dial(
-    target: &Target,
-) -> ClientResult<(
-    Box<dyn AsyncRead + Unpin + Send>,
-    Box<dyn AsyncWrite + Unpin + Send>,
-)> {
+enum DialedTransport {
+    #[cfg(not(target_arch = "wasm32"))]
+    Native {
+        read: Box<dyn AsyncRead + Unpin + Send>,
+        write: Box<dyn AsyncWrite + Unpin + Send>,
+    },
+    #[cfg(target_arch = "wasm32")]
+    WebSocket(web_transport::WebSocketIo),
+}
+
+/// Open a connection to the target. Native sockets are byte streams and are
+/// framed by the reader; browser WebSockets already carry complete frames.
+async fn dial(target: &Target) -> ClientResult<DialedTransport> {
     match target {
+        #[cfg(not(target_arch = "wasm32"))]
         Target::Tcp(addr) => {
-            let stream = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
+            let stream = runtime::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
                 .await
                 .map_err(|_| ClientError::Disconnected)?
                 .map_err(|_| ClientError::Disconnected)?;
@@ -2130,16 +2258,27 @@ async fn dial(
                 .with_retries(4);
             let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
             let (r, w) = stream.into_split();
-            Ok((Box::new(r), Box::new(w)))
+            Ok(DialedTransport::Native {
+                read: Box::new(r),
+                write: Box::new(w),
+            })
         }
+        #[cfg(not(target_arch = "wasm32"))]
         Target::Unix(path) => {
-            let stream = tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(path))
+            let stream = runtime::timeout(PROBE_TIMEOUT, UnixStream::connect(path))
                 .await
                 .map_err(|_| ClientError::Disconnected)?
                 .map_err(|_| ClientError::Disconnected)?;
             let (r, w) = stream.into_split();
-            Ok((Box::new(r), Box::new(w)))
+            Ok(DialedTransport::Native {
+                read: Box::new(r),
+                write: Box::new(w),
+            })
         }
+        #[cfg(target_arch = "wasm32")]
+        Target::WebSocket(url) => web_transport::connect(url)
+            .await
+            .map(DialedTransport::WebSocket),
     }
 }
 
@@ -2248,13 +2387,14 @@ async fn query_lineage_token(conn: &Conn) -> ClientResult<()> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_writer(
     write: Box<dyn AsyncWrite + Unpin + Send>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     conn: Arc<Conn>,
     reconnect: Arc<Notify>,
 ) {
-    tokio::spawn(async move {
+    runtime::spawn(async move {
         let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, write);
         loop {
             tokio::select! {
@@ -2264,11 +2404,15 @@ fn spawn_writer(
                 _ = conn.writer_shutdown.notified() => break,
                 maybe = rx.recv() => {
                     let Some(frame) = maybe else { break };
+                    conn.counters.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                    conn.counters.operations.fetch_add(1, Ordering::Relaxed);
                     if writer.write_all(&frame).await.is_err() {
                         break;
                     }
                     let mut failed = false;
                     while let Ok(more) = rx.try_recv() {
+                        conn.counters.bytes_sent.fetch_add(more.len() as u64, Ordering::Relaxed);
+                        conn.counters.operations.fetch_add(1, Ordering::Relaxed);
                         if writer.write_all(&more).await.is_err() {
                             failed = true;
                             break;
@@ -2285,8 +2429,9 @@ fn spawn_writer(
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconnect: Arc<Notify>) {
-    tokio::spawn(async move {
+    runtime::spawn(async move {
         let mut framed = LengthDelimitedCodec::builder()
             .little_endian()
             .length_field_offset(0)
@@ -2311,29 +2456,11 @@ fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconn
                 }
                 None => break,
             };
-            // Any frame is proof of life; the timeout path reads this to tell a
-            // slow leader from a hung one without paying for an explicit probe.
-            conn.mark_alive();
-            if frame.len() < P9_HEADER_SIZE {
-                warn!(
-                    "9P client: response frame too short ({} bytes)",
-                    frame.len()
-                );
-                continue;
-            }
-            let tag = u16::from_le_bytes([frame[5], frame[6]]);
-            if let Some((_, tx)) = conn.pending.remove(&tag) {
-                let _ = tx.send(frame);
-            } else {
-                debug!("9P client: response for unknown tag {tag}");
-            }
+            conn.deliver(frame);
         }
 
         // Connection gone: fail in-flight requests, wake the writer, reconnect.
-        conn.dead.store(true, Ordering::Release);
-        conn.pending.clear();
-        conn.writer_shutdown.notify_one();
-        reconnect.notify_waiters();
+        conn.connection_lost(&reconnect);
     });
 }
 
@@ -2452,11 +2579,12 @@ mod liveness_tests {
             tag_ctr: AtomicU16::new(0),
             lineage_token: AtomicU64::new(0),
             dead: AtomicBool::new(false),
-            base: std::time::Instant::now(),
+            base: runtime::Clock::now(),
             last_alive: AtomicU64::new(0),
             probe_lock: tokio::sync::Mutex::new(()),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
+            counters: Arc::new(TrafficCounters::default()),
         }
     }
 

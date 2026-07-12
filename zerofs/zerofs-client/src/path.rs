@@ -1,4 +1,5 @@
 use crate::error::ZeroFsError;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
 
@@ -26,13 +27,57 @@ pub(crate) fn components(path: &Path) -> Result<Vec<&[u8]>, ZeroFsError> {
                 });
             }
             Component::Normal(name) => {
-                validate_name(name.as_bytes(), &name.to_string_lossy())?;
-                out.push(name.as_bytes());
+                let bytes = os_bytes(name)?;
+                validate_name(bytes, &name.to_string_lossy())?;
+                out.push(bytes);
             }
-            Component::Prefix(_) => unreachable!("no path prefixes on unix"),
+            Component::Prefix(_) => {
+                return Err(ZeroFsError::InvalidArgument {
+                    message: format!("{path:?}: platform path prefixes are not supported"),
+                });
+            }
         }
     }
     Ok(out)
+}
+
+/// Borrow a path as wire bytes. Native Unix preserves arbitrary bytes; browser
+/// paths are necessarily UTF-8 because they originate as JavaScript strings.
+pub(crate) fn path_bytes(path: &Path) -> Result<&[u8], ZeroFsError> {
+    os_bytes(path.as_os_str())
+}
+
+#[cfg(unix)]
+fn os_bytes(value: &std::ffi::OsStr) -> Result<&[u8], ZeroFsError> {
+    Ok(value.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn os_bytes(value: &std::ffi::OsStr) -> Result<&[u8], ZeroFsError> {
+    value
+        .to_str()
+        .map(str::as_bytes)
+        .ok_or_else(|| ZeroFsError::InvalidArgument {
+            message: "browser paths must be valid UTF-8".to_string(),
+        })
+}
+
+pub(crate) fn path_from_bytes(bytes: Vec<u8>) -> Result<std::path::PathBuf, ZeroFsError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            bytes,
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .map(std::path::PathBuf::from)
+            .map_err(|_| ZeroFsError::InvalidArgument {
+                message: "server returned a non-UTF-8 path to a browser client".to_string(),
+            })
+    }
 }
 
 /// Validate one byte-exact name component: no `/`, no NUL, not `.`/`..`/empty,

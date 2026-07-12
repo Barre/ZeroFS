@@ -12,11 +12,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectOptions {
-    /// Numeric uid asserted at attach (`None` = process euid); the server
-    /// enforces permissions as this user.
+    /// Numeric uid asserted at attach (`None` = process euid natively, 0 in a
+    /// browser); the server enforces permissions as this user.
     pub uid: Option<u32>,
     /// Group assigned to files/directories created through this client
-    /// (`None` = process egid).
+    /// (`None` = process egid natively, 0 in a browser).
     pub gid: Option<u32>,
     /// Username string sent at attach (`None` = `$USER`, else the uid rendered
     /// as text); informational; `uid` is authoritative.
@@ -175,27 +175,27 @@ pub enum FileType {
 
 impl FileType {
     pub(crate) fn from_mode(mode: u32) -> Self {
-        match mode & libc::S_IFMT as u32 {
-            x if x == libc::S_IFREG as u32 => Self::File,
-            x if x == libc::S_IFDIR as u32 => Self::Dir,
-            x if x == libc::S_IFLNK as u32 => Self::Symlink,
-            x if x == libc::S_IFIFO as u32 => Self::Fifo,
-            x if x == libc::S_IFSOCK as u32 => Self::Socket,
-            x if x == libc::S_IFCHR as u32 => Self::CharDevice,
-            x if x == libc::S_IFBLK as u32 => Self::BlockDevice,
+        match mode & crate::linux::S_IFMT {
+            x if x == crate::linux::S_IFREG => Self::File,
+            x if x == crate::linux::S_IFDIR => Self::Dir,
+            x if x == crate::linux::S_IFLNK => Self::Symlink,
+            x if x == crate::linux::S_IFIFO => Self::Fifo,
+            x if x == crate::linux::S_IFSOCK => Self::Socket,
+            x if x == crate::linux::S_IFCHR => Self::CharDevice,
+            x if x == crate::linux::S_IFBLK => Self::BlockDevice,
             _ => Self::Unknown,
         }
     }
 
     pub(crate) fn from_dt(dt: u8) -> Self {
         match dt {
-            libc::DT_REG => Self::File,
-            libc::DT_DIR => Self::Dir,
-            libc::DT_LNK => Self::Symlink,
-            libc::DT_FIFO => Self::Fifo,
-            libc::DT_SOCK => Self::Socket,
-            libc::DT_CHR => Self::CharDevice,
-            libc::DT_BLK => Self::BlockDevice,
+            crate::linux::DT_REG => Self::File,
+            crate::linux::DT_DIR => Self::Dir,
+            crate::linux::DT_LNK => Self::Symlink,
+            crate::linux::DT_FIFO => Self::Fifo,
+            crate::linux::DT_SOCK => Self::Socket,
+            crate::linux::DT_CHR => Self::CharDevice,
+            crate::linux::DT_BLK => Self::BlockDevice,
             _ => Self::Unknown,
         }
     }

@@ -1,0 +1,27 @@
+[package]
+name = "zerofs-client-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0"
+description = "Browser WASM bindings for zerofs-client"
+repository = "https://github.com/Barre/ZeroFS"
+homepage = "https://www.zerofs.net"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-pack 0.15 currently bundles a Binaryen build that does not enable the
+# bulk-memory instructions emitted by current rustc. Rust's release+LTO pass
+# still optimizes the module; skip the incompatible post-pass.
+wasm-opt = false
+
+[dependencies]
+zerofs-client = { path = "../zerofs-client", default-features = false, features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"

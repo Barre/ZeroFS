@@ -158,22 +158,22 @@ impl ZeroFsError {
     /// Linux errno per the strict 1:1 table; `Io` returns its errno unchanged.
     pub fn to_errno(&self) -> i32 {
         match self {
-            Self::NotFound { .. } => libc::ENOENT,
-            Self::PermissionDenied { .. } => libc::EACCES,
-            Self::NotPermitted { .. } => libc::EPERM,
-            Self::AlreadyExists { .. } => libc::EEXIST,
-            Self::NotADirectory { .. } => libc::ENOTDIR,
-            Self::IsADirectory { .. } => libc::EISDIR,
-            Self::DirectoryNotEmpty { .. } => libc::ENOTEMPTY,
-            Self::NameTooLong { .. } => libc::ENAMETOOLONG,
-            Self::InvalidArgument { .. } => libc::EINVAL,
-            Self::TooManySymlinks { .. } => libc::ELOOP,
-            Self::Closed => libc::EBADF,
-            Self::ConnectFailed { .. } => libc::EIO,
+            Self::NotFound { .. } => crate::linux::ENOENT,
+            Self::PermissionDenied { .. } => crate::linux::EACCES,
+            Self::NotPermitted { .. } => crate::linux::EPERM,
+            Self::AlreadyExists { .. } => crate::linux::EEXIST,
+            Self::NotADirectory { .. } => crate::linux::ENOTDIR,
+            Self::IsADirectory { .. } => crate::linux::EISDIR,
+            Self::DirectoryNotEmpty { .. } => crate::linux::ENOTEMPTY,
+            Self::NameTooLong { .. } => crate::linux::ENAMETOOLONG,
+            Self::InvalidArgument { .. } => crate::linux::EINVAL,
+            Self::TooManySymlinks { .. } => crate::linux::ELOOP,
+            Self::Closed => crate::linux::EBADF,
+            Self::ConnectFailed { .. } => crate::linux::EIO,
             Self::NotLeader { .. } => P9_ENOTLEADER as i32,
-            Self::Stale { .. } => libc::ESTALE,
+            Self::Stale { .. } => crate::linux::ESTALE,
             Self::Io { errno, .. } => *errno,
-            Self::Protocol { .. } => libc::EIO,
+            Self::Protocol { .. } => crate::linux::EIO,
         }
     }
 
@@ -181,19 +181,19 @@ impl ZeroFsError {
     pub(crate) fn from_errno(errno: i32, path: &str) -> Self {
         let path = path.to_string();
         match errno {
-            libc::ENOENT => Self::NotFound { path },
-            libc::EACCES => Self::PermissionDenied { path },
-            libc::EPERM => Self::NotPermitted { path },
-            libc::EEXIST => Self::AlreadyExists { path },
-            libc::ENOTDIR => Self::NotADirectory { path },
-            libc::EISDIR => Self::IsADirectory { path },
-            libc::ENOTEMPTY => Self::DirectoryNotEmpty { path },
-            libc::ENAMETOOLONG => Self::NameTooLong { name: path },
-            libc::EINVAL => Self::InvalidArgument {
+            crate::linux::ENOENT => Self::NotFound { path },
+            crate::linux::EACCES => Self::PermissionDenied { path },
+            crate::linux::EPERM => Self::NotPermitted { path },
+            crate::linux::EEXIST => Self::AlreadyExists { path },
+            crate::linux::ENOTDIR => Self::NotADirectory { path },
+            crate::linux::EISDIR => Self::IsADirectory { path },
+            crate::linux::ENOTEMPTY => Self::DirectoryNotEmpty { path },
+            crate::linux::ENAMETOOLONG => Self::NameTooLong { name: path },
+            crate::linux::EINVAL => Self::InvalidArgument {
                 message: format!("{path}: invalid argument"),
             },
-            libc::ELOOP => Self::TooManySymlinks { path },
-            libc::ESTALE => Self::Stale { path },
+            crate::linux::ELOOP => Self::TooManySymlinks { path },
+            crate::linux::ESTALE => Self::Stale { path },
             c if c == P9_ENOTLEADER as i32 => Self::NotLeader { path },
             errno => Self::Io {
                 message: std::io::Error::from_raw_os_error(errno).to_string(),

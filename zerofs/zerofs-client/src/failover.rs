@@ -63,7 +63,7 @@ pub(crate) fn is_transport_failure(e: &ZeroFsError) -> bool {
         | ZeroFsError::Closed
         | ZeroFsError::Protocol { .. } => true,
         // The per-op db gate (a lapse racing an already-dispatched op) flattens to EIO.
-        ZeroFsError::Io { errno, .. } => *errno == libc::EIO,
+        ZeroFsError::Io { errno, .. } => *errno == crate::linux::EIO,
         _ => false,
     }
 }
@@ -85,7 +85,7 @@ impl FailoverClient {
             if fc.obtain().await.is_some() {
                 return Ok(fc);
             }
-            tokio::time::sleep(RETRY_DELAY).await;
+            crate::runtime::sleep(RETRY_DELAY).await;
         }
         Err(ZeroFsError::ConnectFailed {
             message: "no serving leader found among targets".into(),
@@ -114,12 +114,12 @@ impl FailoverClient {
     async fn probe(&self) -> Option<Arc<Client>> {
         for target in &self.targets {
             let connected =
-                tokio::time::timeout(PROBE_CONNECT_TIMEOUT, Client::connect(target)).await;
+                crate::runtime::timeout(PROBE_CONNECT_TIMEOUT, Client::connect(target)).await;
             let Ok(Ok(client)) = connected else {
                 continue;
             };
             let healthy = matches!(
-                tokio::time::timeout(PROBE_OP_TIMEOUT, client.stat("/")).await,
+                crate::runtime::timeout(PROBE_OP_TIMEOUT, client.stat("/")).await,
                 Ok(Ok(_))
             );
             if healthy {
@@ -143,15 +143,15 @@ impl FailoverClient {
         let mut last = None;
         for _ in 0..MAX_ATTEMPTS {
             let Some(client) = self.obtain().await else {
-                tokio::time::sleep(RETRY_DELAY).await;
+                crate::runtime::sleep(RETRY_DELAY).await;
                 continue;
             };
-            match tokio::time::timeout(OP_TIMEOUT, op(client)).await {
+            match crate::runtime::timeout(OP_TIMEOUT, op(client)).await {
                 Ok(Ok(v)) => return Ok(v),
                 Ok(Err(e)) if is_transport_failure(&e) => {
                     self.invalidate();
                     last = Some(e);
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    crate::runtime::sleep(RETRY_DELAY).await;
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {

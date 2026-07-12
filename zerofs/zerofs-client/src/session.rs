@@ -30,7 +30,7 @@ impl Session {
     pub(crate) fn new(client: Arc<NinePClient>, root_fid: u32, gid: u32) -> Arc<Self> {
         let (clunk_tx, mut rx) = mpsc::unbounded_channel::<u32>();
         let janitor_client = Arc::clone(&client);
-        tokio::spawn(async move {
+        crate::runtime::spawn(async move {
             while let Some(fid) = rx.recv().await {
                 // The fid is gone server-side whatever the reply says; only
                 // return it to the allocator once the clunk has been answered,
@@ -289,7 +289,7 @@ impl Session {
         let written = self.client.write(fid, offset, data).await.ctx(display)?;
         if written != data.len() as u64 {
             return Err(ZeroFsError::Io {
-                errno: libc::EIO,
+                errno: crate::linux::EIO,
                 path: display.to_string(),
                 message: format!("short write: {written} of {} bytes", data.len()),
             });
@@ -323,15 +323,15 @@ impl Session {
         op_id: [u8; 16],
     ) -> Result<FidGuard, ZeroFsError> {
         let acc = match (opts.read, opts.write) {
-            (true, true) => libc::O_RDWR,
-            (false, true) => libc::O_WRONLY,
-            (true, false) => libc::O_RDONLY,
+            (true, true) => crate::linux::O_RDWR,
+            (false, true) => crate::linux::O_WRONLY,
+            (true, false) => crate::linux::O_RDONLY,
             (false, false) => {
                 return Err(ZeroFsError::InvalidArgument {
                     message: format!("{display}: open requires read and/or write access"),
                 });
             }
-        } as u32;
+        };
 
         // Bounded retries around the open/create race; each iteration observes
         // a state another client may have changed in between.
@@ -365,8 +365,8 @@ impl Session {
 
             // Create path: natively exclusive on the server (Tlcreateattr on
             // v2, clone + lcreate otherwise; the shared op handles both).
-            let mode = libc::S_IFREG as u32 | (opts.mode & 0o7777);
-            let flags = acc | libc::O_CREAT as u32;
+            let mode = crate::linux::S_IFREG | (opts.mode & 0o7777);
+            let flags = acc | crate::linux::O_CREAT;
             let guard = self.alloc_guard();
             match self
                 .client
@@ -386,7 +386,7 @@ impl Session {
         }
 
         Err(ZeroFsError::Io {
-            errno: libc::EAGAIN,
+            errno: crate::linux::EAGAIN,
             path: display.to_string(),
             message: "open/create raced with concurrent create+unlink; retries exhausted"
                 .to_string(),
@@ -444,7 +444,7 @@ impl Session {
         display: &str,
         op_id: [u8; 16],
     ) -> Result<Metadata, ZeroFsError> {
-        let mode = libc::S_IFDIR as u32 | (mode & 0o7777);
+        let mode = crate::linux::S_IFDIR | (mode & 0o7777);
         let guard = self.alloc_guard();
         let res = self
             .client
@@ -506,12 +506,12 @@ impl Session {
         op_id: [u8; 16],
     ) -> Result<Metadata, ZeroFsError> {
         let (type_bits, major, minor) = match kind {
-            NodeKind::Fifo => (libc::S_IFIFO, 0, 0),
-            NodeKind::Socket => (libc::S_IFSOCK, 0, 0),
-            NodeKind::BlockDevice { major, minor } => (libc::S_IFBLK, major, minor),
-            NodeKind::CharDevice { major, minor } => (libc::S_IFCHR, major, minor),
+            NodeKind::Fifo => (crate::linux::S_IFIFO, 0, 0),
+            NodeKind::Socket => (crate::linux::S_IFSOCK, 0, 0),
+            NodeKind::BlockDevice { major, minor } => (crate::linux::S_IFBLK, major, minor),
+            NodeKind::CharDevice { major, minor } => (crate::linux::S_IFCHR, major, minor),
         };
-        let mode = type_bits as u32 | (mode & 0o7777);
+        let mode = type_bits | (mode & 0o7777);
         let guard = self.alloc_guard();
         let res = self
             .client

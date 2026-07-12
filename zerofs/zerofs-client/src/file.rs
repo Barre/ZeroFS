@@ -3,7 +3,8 @@ use crate::failover::{
     FailoverClient, MAX_ATTEMPTS, OP_TIMEOUT, RETRY_DELAY, is_transport_failure,
 };
 use crate::session::{FidGuard, Session};
-use crate::types::{Metadata, OpenOptions, SetAttrs};
+use crate::types::OpenOptions;
+use crate::types::{Metadata, SetAttrs};
 use arc_swap::ArcSwap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -111,13 +112,14 @@ impl File {
                 return Err(ZeroFsError::Closed);
             }
             let b = self.bound.load_full();
-            match tokio::time::timeout(OP_TIMEOUT, op(Arc::clone(&b.session), b.guard.fid())).await
+            match crate::runtime::timeout(OP_TIMEOUT, op(Arc::clone(&b.session), b.guard.fid()))
+                .await
             {
                 Ok(Ok(v)) => return Ok(v),
                 Ok(Err(e)) if is_transport_failure(&e) => {
                     last = Some(e);
                     self.rebind(rc, &b).await?;
-                    tokio::time::sleep(RETRY_DELAY).await;
+                    crate::runtime::sleep(RETRY_DELAY).await;
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
