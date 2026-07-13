@@ -811,10 +811,10 @@
    ;; so a short hold suffices before the heal.
    {:fault :bounce-leader    :heal :heal-restart :hold 8}
    {:fault :liveness-restart :heal :heal-restart :hold 6}
-   ;; Network partition. CONFIRMED RED (2026-06-22): a partitioned leader serves
-   ;; Solo and acks fsync'd writes for ~2s until it detects the takeover ("newer
-   ;; DB client") and exits; the promoted standby's state lacks them -> acked loss.
-   ;; Tracking a real split-brain finding (not a heal-restart artifact).
+   ;; Network partition: peer-only cut; both nodes still reach the store. The
+   ;; standby promotes and the deposed leader self-fences: its next flush loses
+   ;; the epoch CAS, so an fsync in the window fails instead of lying, and plain
+   ;; un-fsync'd acks die with the zombie (the documented Solo degradation).
    {:fault :partition       :heal :heal-partition :hold 12}])
 
 (defn nemesis-gen
