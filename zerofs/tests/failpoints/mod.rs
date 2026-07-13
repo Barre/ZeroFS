@@ -1,6 +1,7 @@
 mod consistency;
 
 use bytes::Bytes;
+use futures::TryStreamExt;
 use slatedb::DbBuilder;
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;
@@ -9,7 +10,9 @@ use std::sync::Arc;
 use zerofs::db::SlateDbHandle;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::permissions::Credentials;
+use zerofs::fs::store::ExtentStore;
 use zerofs::fs::types::{AuthContext, SetAttributes};
+use zerofs::segment::Segid;
 
 use consistency::verify_consistency;
 use zerofs::failpoints as fp;
@@ -24,6 +27,29 @@ fn test_creds() -> Credentials {
         groups: [1000; 16],
         groups_count: 1,
     }
+}
+
+async fn list_segments(object_store: &Arc<dyn ObjectStore>) -> Vec<Segid> {
+    object_store
+        .list(Some(&Path::from("segments")))
+        .map_ok(|meta| Segid::from_object_key(meta.location.as_ref()))
+        .try_filter_map(|segid| std::future::ready(Ok(segid)))
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+async fn reclaim_now(store: &ExtentStore) -> anyhow::Result<(usize, usize)> {
+    let outcome = store
+        .reclaim_segments_gated(
+            || std::future::ready(Ok(Some((chrono::Utc::now(), None)))),
+            Some(zerofs::config::GcConfig::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT),
+            std::time::Duration::from_secs(5 * 60),
+            |_| false,
+            256 << 20,
+        )
+        .await?;
+    Ok((outcome.deleted, outcome.relocated))
 }
 
 /// Test context holding filesystem and in-memory object store.
@@ -67,17 +93,25 @@ impl CrashTestContext {
         );
 
         Arc::new(
-            ZeroFS::new_with_slatedb(
+            ZeroFS::new_with_slatedb_and_lease(
                 SlateDbHandle::ReadWrite(slatedb),
                 u64::MAX,
                 None,
                 false,
+                false,
+                None,
+                None,
+                Arc::new(zerofs::dedup::DedupCache::new(65_536)),
+                None,
+                zerofs::object_trace::ObjectTracer::new(),
                 Arc::clone(&self.object_store),
                 zerofs::frame_codec::FrameCodec::new(
                     &[7u8; 32],
                     zerofs::segment::SEGMENT_INFO,
                     zerofs::config::CompressionConfig::default(),
                 ),
+                None,
+                None,
             )
             .await
             .unwrap(),
@@ -2982,14 +3016,15 @@ async fn test_crash_reclaim_after_inode_delete_redrains() {
         .unwrap();
     fs.flush_coordinator.flush().await.unwrap();
 
-    fs.open_handle_inc(file_id);
+    let open_handle = fs.new_open_handle(file_id);
     fs.remove(&auth, 0, b"victim.txt").await.unwrap();
     fs.flush_coordinator.flush().await.unwrap();
 
     // Last clunk triggers reclaim; panic mid-reclaim before commit.
     fail::cfg(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE, "panic").unwrap();
+    drop(open_handle);
     let fs_clone = Arc::clone(&fs);
-    let handle = tokio::task::spawn(async move { fs_clone.handle_closed(file_id).await });
+    let handle = tokio::task::spawn(async move { fs_clone.reclaim_if_unreferenced(file_id).await });
     let _ = handle.await;
     fail::cfg(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE, "off").unwrap();
     drop(fs);
@@ -3081,7 +3116,7 @@ async fn test_crash_compact_after_seal_before_repoint() {
         .unwrap();
     fs.flush_coordinator.flush().await.unwrap();
 
-    let segids = fs.extent_store.list_segments().await.unwrap();
+    let segids = list_segments(&ctx.object_store).await;
     fail::cfg(fp::COMPACT_AFTER_SEAL_BEFORE_REPOINT, "panic").unwrap();
     let es = fs.extent_store.clone();
     let handle =
@@ -3114,7 +3149,7 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
     let (
         _scenario,
         TestSetup {
-            ctx: _ctx,
+            ctx,
             fs,
             creds,
             auth,
@@ -3138,7 +3173,7 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
         .unwrap();
     // Seal: one segment holding both frames, committed pointer still frame a.
     fs.extent_store.seal_open().await.unwrap();
-    let sources = fs.extent_store.list_segments().await.unwrap();
+    let sources = list_segments(&ctx.object_store).await;
     assert_eq!(sources.len(), 1, "both frames must share one segment");
 
     // Compact the source; the gather resolves frame a and packs its bytes,
@@ -3148,7 +3183,7 @@ async fn test_compact_repoint_rejects_overwrite_committed_during_pack() {
     let handle =
         tokio::task::spawn(async move { es.compact_segments(&sources, &[], 256 << 20).await });
     let mut waited = 0;
-    while fs.extent_store.list_segments().await.unwrap().len() < 2 {
+    while list_segments(&ctx.object_store).await.len() < 2 {
         waited += 1;
         assert!(waited < 500, "compaction never reached the packed PUT");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3184,7 +3219,7 @@ async fn test_reclaim_deletes_from_the_durable_view_without_a_wal() {
     let (
         _scenario,
         TestSetup {
-            ctx: _ctx,
+            ctx,
             fs,
             creds,
             auth,
@@ -3204,14 +3239,14 @@ async fn test_reclaim_deletes_from_the_durable_view_without_a_wal() {
         .await
         .unwrap();
     fs.flush_coordinator.flush().await.unwrap();
-    assert_eq!(fs.extent_store.list_segments().await.unwrap().len(), 2);
+    assert_eq!(list_segments(&ctx.object_store).await.len(), 2);
 
-    let (deleted, _) = fs.extent_store.reclaim_now().await.unwrap();
+    let (deleted, _) = reclaim_now(&fs.extent_store).await.unwrap();
     assert_eq!(
         deleted, 1,
         "the durable scan must see the barrier-flushed death and delete in one pass"
     );
-    assert_eq!(fs.extent_store.list_segments().await.unwrap().len(), 1);
+    assert_eq!(list_segments(&ctx.object_store).await.len(), 1);
     let data = fs.extent_store.read(file_id, 0, 4096).await.unwrap();
     assert_eq!(&data[..], &vec![2u8; 4096][..]);
 }
@@ -3248,7 +3283,7 @@ async fn test_crash_reclaim_after_segment_delete() {
 
     fail::cfg(fp::RECLAIM_AFTER_SEGMENT_DELETE, "panic").unwrap();
     let es = fs.extent_store.clone();
-    let handle = tokio::task::spawn(async move { es.reclaim_now().await });
+    let handle = tokio::task::spawn(async move { reclaim_now(&es).await });
     let _ = handle.await;
     fail::cfg(fp::RECLAIM_AFTER_SEGMENT_DELETE, "off").unwrap();
     drop(fs);

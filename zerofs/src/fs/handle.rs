@@ -74,7 +74,7 @@ impl ZeroFS {
     /// Decrement the open-handle count, returning the count after. Only the
     /// `handle_closed` test path uses this; production decrements via the
     /// `OpenHandle` guard's drop.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_handle_dec(&self, id: InodeId) -> u64 {
         dec_open_handle(&self.open_handles, id)
     }
@@ -119,9 +119,8 @@ impl ZeroFS {
     }
 
     /// Synchronous decrement-then-reclaim. Production drives this through the
-    /// `OpenHandle` guard (drop decrements) and the drainer; this entry point is
-    /// kept for tests that want the reclaim to happen inline, with no drainer.
-    #[allow(dead_code)]
+    /// `OpenHandle` guard (drop decrements) and the drainer.
+    #[cfg(test)]
     pub async fn handle_closed(&self, id: InodeId) {
         // Decrement outside the lock; reclaim_if_unreferenced re-reads the count
         // (and nlink) under it.

@@ -53,8 +53,14 @@ pub(super) fn make_store(
     let key_codec = Arc::new(KeyCodec::new());
     let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, compression);
     let segments = Arc::new(SegmentStore::new(object_store, codec, epoch, None));
-    ExtentStore::new(db, key_codec, segments, Arc::new(KeyedLockManager::new()))
-        .with_seal_threshold(8 * 1024 * 1024)
+    ExtentStore::new(
+        db,
+        key_codec,
+        segments,
+        Arc::new(KeyedLockManager::new()),
+        super::write::SEAL_THRESHOLD,
+    )
+    .with_seal_threshold(8 * 1024 * 1024)
 }
 
 pub(super) async fn commit(store: &ExtentStore, txn: Transaction) {

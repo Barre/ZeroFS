@@ -29,7 +29,7 @@ pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// the in-RAM buffer between flushes. The seal PUT is concurrent multipart
 /// (`SegmentStore::put_segment`), so its fsync-path latency stays bounded
 /// despite the size.
-pub(super) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
+pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 
 /// Max segments sealing (PUT in flight) concurrently. Bounds the un-PUT RAM in
 /// `sealing` to ~this × SEAL_THRESHOLD; acquiring all permits is the fsync
@@ -977,7 +977,7 @@ mod tests {
     #[tokio::test]
     async fn saturated_seals_backpressure_before_later_writers_append() {
         let (store, db) = make().await;
-        store.set_seal_threshold(1);
+        let store = store.with_seal_threshold(1);
 
         // Model four slow object-store PUTs by holding every seal permit. The
         // first writer can append, but then has to wait before rotating.

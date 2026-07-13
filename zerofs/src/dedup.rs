@@ -110,12 +110,12 @@ impl DedupCache {
         }
     }
 
-    #[allow(dead_code)] // used by tests and future metrics
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().results.len()
     }
 
-    #[allow(dead_code)] // used by tests and future metrics
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -277,31 +277,6 @@ impl RedisCommit {
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
         })
     }
-
-    /// Set the lock-key prefix (keys are `{prefix}:{hex(path)}`). Default `s3-lock`.
-    #[must_use]
-    #[allow(dead_code)] // configuration hook; defaults are wired, setters kept for callers
-    pub fn with_key_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.key_prefix = prefix.into();
-        self
-    }
-
-    /// Set the lock TTL — both the Redis key expiry and the operation deadline.
-    /// Default 300s.
-    #[must_use]
-    #[allow(dead_code)] // configuration hook; defaults are wired, setters kept for callers
-    pub fn with_lock_ttl(mut self, ttl: Duration) -> Self {
-        self.lock_ttl = ttl;
-        self
-    }
-
-    /// Set the maximum time to wait when acquiring a lock. Default 60s.
-    #[must_use]
-    #[allow(dead_code)] // configuration hook; defaults are wired, setters kept for callers
-    pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
-        self.acquire_timeout = timeout;
-        self
-    }
 }
 
 #[async_trait]

@@ -1,16 +1,7 @@
 //! The standby's in-memory replication tail buffer: committed batches the leader
 //! shipped but that may not yet be durable on object storage, keyed by the
-//! leader's monotonic batch seqno. On takeover the new leader replays this tail
-//! so no acknowledged write is lost.
-//!
-//! Under the segment data plane (RFC-0025) an extent write's value is a `FrameLoc`
-//! pointer whose bytes live in an external `segments/` object that may still be
-//! the leader's un-PUT open buffer. `PutFrame` closes that gap: it ships the
-//! sealed frame bytes alongside the `FrameLoc`, and on takeover the new leader
-//! materializes any missing segment on the shared store from the buffered frames
-//! (HEAD-guarded so a leader-sealed segment is never overwritten). Segment
-//! objects are immutable and deterministically keyed, so that PUT is idempotent
-//! with the leader's.
+//! leader's monotonic batch seqno. On takeover the new leader reconciles and
+//! replays the batches that survived in this receiver incarnation.
 //!
 //! Replay is idempotent (last-write-wins per key in seqno order), so keeping an
 //! already-durable batch is harmless. Pruning must therefore stay conservative:
@@ -38,6 +29,12 @@ pub struct TailBuffer {
     /// Leader term of the buffered batches. A ship from a newer term drops them
     /// first (see [`Self::accept`]).
     epoch: u64,
+    /// Highest ship sequence number observed in `epoch`, including batches that
+    /// were subsequently pruned.
+    max_seqno: u64,
+    /// Highest sequence number the leader proved durable on shared storage.
+    /// Missing batches at or below this frontier do not break lineage coverage.
+    durable_through: u64,
 }
 
 struct TailBatch {
@@ -48,10 +45,7 @@ struct TailBatch {
 
 impl TailBuffer {
     pub fn new() -> Self {
-        Self {
-            batches: BTreeMap::new(),
-            epoch: 0,
-        }
+        Self::default()
     }
 
     /// Buffer a term-scoped batch. A newer term replaces the old tail because
@@ -59,9 +53,12 @@ impl TailBuffer {
     /// cannot suppress it. Re-shipping the same seqno replaces its batch.
     pub fn accept(&mut self, epoch: u64, seqno: u64, ops: Vec<ReplOp>, op_ids: Vec<OpId>) {
         if epoch > self.epoch {
-            self.batches.clear();
-            self.epoch = epoch;
+            *self = Self {
+                epoch,
+                ..Self::default()
+            };
         }
+        self.max_seqno = self.max_seqno.max(seqno);
         self.batches.insert(seqno, TailBatch { ops, op_ids });
     }
 
@@ -70,16 +67,17 @@ impl TailBuffer {
         self.epoch
     }
 
-    /// Drop every buffered batch. Only the takeover replay guard calls this,
+    /// Drop every buffered batch. Only takeover reconciliation calls this,
     /// when the durable head supersedes the tail; the receive path's cross-term
     /// drop lives in [`Self::accept`].
     pub fn discard(&mut self) {
-        self.batches.clear();
+        *self = Self::default();
     }
 
     /// Drop batches with seqno <= `watermark` (confirmed durable), returning
     /// their now-safe-to-publish op-ids.
     pub fn prune(&mut self, watermark: u64) -> Vec<OpId> {
+        self.durable_through = self.durable_through.max(watermark);
         let mut durable_op_ids = Vec::new();
         self.batches.retain(|&seqno, batch| {
             if seqno <= watermark {
@@ -92,10 +90,33 @@ impl TailBuffer {
         durable_op_ids
     }
 
-    /// Successful takeover replay made every remaining batch durable. Remove
-    /// them from the tail and return the op-ids that may now enter dedup.
+    /// Whether this receiver can account for every ship in `observed_epoch`:
+    /// each sequence number is either proven durable through the watermark or
+    /// present in the volatile tail that takeover is about to replay.
+    ///
+    /// Seeing only a heartbeat is deliberately insufficient. A replacement
+    /// receiver can inherit a reconnecting transport without inheriting the old
+    /// process's tail; the first post-restart ship exposes that as an uncovered
+    /// sequence gap unless its watermark proves the missing prefix durable.
+    pub(crate) fn preserves_lineage(&self, observed_epoch: u64) -> bool {
+        if observed_epoch == 0 || self.epoch != observed_epoch || self.max_seqno == 0 {
+            return false;
+        }
+        if self.durable_through >= self.max_seqno {
+            return true;
+        }
+
+        let first = self.durable_through + 1;
+        (first..=self.max_seqno).eq(self
+            .batches
+            .range(first..=self.max_seqno)
+            .map(|(&seqno, _)| seqno))
+    }
+
+    /// Successful takeover replay made every remaining batch durable. Clear the
+    /// tail's coverage state and return the op-ids that may now enter dedup.
     pub fn finish_replay(&mut self) -> Vec<OpId> {
-        let batches = std::mem::take(&mut self.batches);
+        let batches = std::mem::take(self).batches;
         batches
             .into_values()
             .flat_map(|batch| batch.op_ids)
@@ -122,7 +143,7 @@ impl TailBuffer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayDecision {
     /// Nothing of the tail's term ever flushed: the tail is the only copy of
-    /// that term's acked writes.
+    /// the batches this receiver still holds.
     ReplayAll,
     /// The durable head is the tail's term with no solo progress: batches up to
     /// the stamped seqno are already durable, the rest replays.
@@ -316,5 +337,73 @@ mod tests {
             vec![op_id(7)],
             "pending op-ids from the replaced term must be dropped with its data"
         );
+    }
+
+    #[test]
+    fn fresh_receiver_does_not_preserve_lineage_across_an_uncovered_gap() {
+        let mut tb = TailBuffer::new();
+        tb.accept(7, 2, vec![put(b"y", b"2")], vec![]);
+
+        assert!(
+            !tb.preserves_lineage(7),
+            "seqno 1 may have died with the receiver's prior incarnation"
+        );
+    }
+
+    #[test]
+    fn durable_watermark_covers_a_missing_prefix_after_receiver_restart() {
+        let mut tb = TailBuffer::new();
+        tb.accept(7, 2, vec![put(b"y", b"2")], vec![]);
+        tb.prune(1);
+
+        assert!(
+            tb.preserves_lineage(7),
+            "the durable frontier accounts for seqno 1 and the tail holds seqno 2"
+        );
+    }
+
+    #[test]
+    fn durably_pruned_empty_tail_retains_coverage_proof() {
+        let mut tb = TailBuffer::new();
+        tb.accept(7, 1, vec![put(b"x", b"1")], vec![]);
+        tb.prune(1);
+
+        assert!(tb.is_empty());
+        assert!(
+            tb.preserves_lineage(7),
+            "pruned-empty is proven durable, unlike a fresh empty receiver"
+        );
+    }
+
+    #[test]
+    fn internal_sequence_gap_breaks_lineage_coverage() {
+        let mut tb = TailBuffer::new();
+        tb.accept(7, 1, vec![put(b"x", b"1")], vec![]);
+        tb.accept(7, 3, vec![put(b"z", b"3")], vec![]);
+
+        assert!(!tb.preserves_lineage(7), "seqno 2 is unaccounted for");
+    }
+
+    #[test]
+    fn contiguous_tail_preserves_only_its_own_observed_epoch() {
+        let mut tb = TailBuffer::new();
+        tb.accept(7, 1, vec![put(b"x", b"1")], vec![]);
+        tb.accept(7, 2, vec![put(b"y", b"2")], vec![]);
+
+        assert!(tb.preserves_lineage(7));
+        assert!(
+            !tb.preserves_lineage(8),
+            "a newer heartbeat without a ship gives no tail coverage for that term"
+        );
+    }
+
+    #[test]
+    fn empty_or_discarded_tail_cannot_establish_lineage() {
+        let mut tb = TailBuffer::new();
+        assert!(!tb.preserves_lineage(7), "heartbeat-only is not proof");
+
+        tb.accept(7, 1, vec![put(b"x", b"1")], vec![]);
+        tb.discard();
+        assert!(!tb.preserves_lineage(7));
     }
 }

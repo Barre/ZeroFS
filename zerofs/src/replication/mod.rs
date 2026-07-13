@@ -9,6 +9,7 @@
 pub mod failover;
 pub mod leader_record;
 pub mod lease;
+mod replay;
 pub mod replicator;
 pub mod tail;
 pub mod transport;
@@ -18,6 +19,8 @@ mod zombie;
 pub use failover::watch_heartbeats_until_takeover;
 #[allow(unused_imports)]
 pub use lease::{Lease, run_lease_from_status};
+#[doc(hidden)]
+pub use replay::LineageProof;
 #[allow(unused_imports)]
 pub use replicator::{Replicator, ShipOutcome};
 #[allow(unused_imports)]
@@ -47,7 +50,6 @@ const _: () = assert!(
 /// Runtime parameters from [`crate::config::ReplicationConfig`]; the failover
 /// timing is hardcoded (see the constants above).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ReplicationParams {
     pub node_id: String,
     pub role: ReplicationRole,

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 /// Per-round compaction bounds, so a large backlog is worked down incrementally.
 pub(super) const MAX_COMPACT_SEGMENTS_PER_ROUND: usize = 64;
+#[cfg(test)]
 pub(super) const MAX_COMPACT_BYTES_PER_ROUND: u64 = 256 << 20; // 256 MiB (~one PACK_TARGET segment/round)
 
 /// Distinct on-store segments a demand read must span to nominate them.
