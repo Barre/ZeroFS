@@ -834,6 +834,170 @@ async fn unflushed_file_write_survives_failover() {
     unflushed_file_write_survives_failover_case().await;
 }
 
+/// A solo episode leaves a durable solo>0 provenance stamp. The first shipped
+/// batch after the standby returns must be durable before its ack: a leader
+/// crash right after the ack used to leave the durable head stamped solo>0, and
+/// the takeover replay guard discarded the acked batch together with the
+/// outlived tail (solo -> reconnect -> crash lost an acked Connected write).
+async fn post_solo_reconnect_write_survives_failover_case() {
+    use ninep_client::{NOFID, NinePClient, Target};
+    const O_CREAT_RDWR: u32 = 0x42; // O_CREAT | O_RDWR
+    const O_RDONLY: u32 = 0;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let l_9p = dir.path().join("leader-9p.sock");
+    let s_9p = dir.path().join("standby-9p.sock");
+    let l_cfg = dir.path().join("leader.toml");
+    let s_cfg = dir.path().join("standby.toml");
+    let a_repl = format!("127.0.0.1:{}", free_port());
+    let b_repl = format!("127.0.0.1:{}", free_port());
+    write_config(
+        &l_cfg,
+        &data_dir,
+        &dir.path().join("cache-l"),
+        "node-a",
+        "leader",
+        &l_9p,
+        &dir.path().join("a-rpc.sock"),
+        Some(&b_repl),
+        Some(&a_repl),
+    );
+    write_config(
+        &s_cfg,
+        &data_dir,
+        &dir.path().join("cache-s"),
+        "node-b",
+        "standby",
+        &s_9p,
+        &dir.path().join("b-rpc.sock"),
+        Some(&a_repl),
+        Some(&b_repl),
+    );
+
+    let mut standby = spawn(&s_cfg);
+    let mut leader = spawn(&l_cfg);
+    assert!(
+        wait_for_socket(&l_9p, Duration::from_secs(90)).await,
+        "leader 9P never came up"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await; // leader replicator connects
+
+    let client = NinePClient::connect_multi(
+        vec![Target::Unix(l_9p.clone()), Target::Unix(s_9p.clone())],
+        256 * 1024,
+    )
+    .await
+    .expect("connect lands on the leader");
+    client
+        .attach(1, NOFID, "root", "/", 0)
+        .await
+        .expect("attach");
+
+    // Connected history for the term.
+    client.walk(1, 10, &[]).await.expect("clone root");
+    client
+        .lcreate(10, b"pre", O_CREAT_RDWR, 0o644, 0)
+        .await
+        .expect("lcreate pre");
+    client.write(10, 0, b"pre").await.expect("write pre");
+    client.clunk(10).await.ok();
+
+    // Standby outage: the next write downgrades the leader to solo, and the
+    // fsync flushes, putting the solo>0 stamp on the durable head.
+    standby.child.kill().expect("kill standby");
+    standby.child.wait().expect("reap standby");
+    client.walk(1, 11, &[]).await.expect("clone root for solo");
+    client
+        .lcreate(11, b"solo", O_CREAT_RDWR, 0o644, 0)
+        .await
+        .expect("lcreate solo");
+    client.write(11, 0, b"solo").await.expect("write solo");
+    client.fsync(11, 0).await.expect("fsync solo");
+    client.clunk(11).await.ok();
+
+    // The standby returns (same identity, fresh cache); shipping re-establishes.
+    let s_cfg2 = dir.path().join("standby2.toml");
+    write_config(
+        &s_cfg2,
+        &data_dir,
+        &dir.path().join("cache-s2"),
+        "node-b",
+        "standby",
+        &s_9p,
+        &dir.path().join("b-rpc.sock"),
+        Some(&a_repl),
+        Some(&b_repl),
+    );
+    let standby2 = spawn(&s_cfg2);
+    // A standby serves 9P only after takeover; its replication listener is the
+    // liveness signal here.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while tokio::net::TcpStream::connect(&b_repl).await.is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "standby replication listener never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await; // leader reconnect loop reconnects
+
+    // The acked write the old code lost: shipped and acked, then the leader
+    // dies before any further flush.
+    let data: Vec<u8> = (0..5000u32)
+        .map(|i| i.wrapping_mul(2654435761) as u8)
+        .collect();
+    client.walk(1, 12, &[]).await.expect("clone root for f");
+    client
+        .lcreate(12, b"f", O_CREAT_RDWR, 0o644, 0)
+        .await
+        .expect("lcreate f");
+    client.write(12, 0, &data).await.expect("write f");
+
+    leader.child.kill().expect("kill leader");
+    leader.child.wait().expect("reap leader");
+    // A restarting leader defers to the tail-holding standby (Hello), so the
+    // takeover happens now instead of waiting out the heartbeat gap.
+    let l_cfg2 = dir.path().join("leader2.toml");
+    write_config(
+        &l_cfg2,
+        &data_dir,
+        &dir.path().join("cache-l2"),
+        "node-a",
+        "leader",
+        &l_9p,
+        &dir.path().join("a-rpc.sock"),
+        Some(&b_repl),
+        Some(&a_repl),
+    );
+    let _leader2 = spawn(&l_cfg2);
+
+    client
+        .walk(1, 20, &[b"f"])
+        .await
+        .expect("walk to f after failover");
+    client.lopen(20, O_RDONLY).await.expect("open f");
+    let got = client
+        .read(20, 0, data.len() as u32)
+        .await
+        .expect("read f after failover");
+    assert_eq!(
+        got, data,
+        "an acked post-reconnect write must survive failover; losing it means the \
+         durable head still carried the solo>0 stamp when the leader died (the \
+         reconnect transition flush is missing)"
+    );
+
+    drop(standby2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
+async fn post_solo_reconnect_write_survives_failover() {
+    let _e2e_permit = e2e_gate().await;
+    post_solo_reconnect_write_survives_failover_case().await;
+}
+
 /// A FROZEN leader (SIGSTOP keeps its TCP connection open, so the clean-crash
 /// reconnect never fires) must not hang a client: the per-request timeout tears
 /// the dead-but-open connection down and re-routes to the standby that promoted
