@@ -25,7 +25,7 @@ use slatedb::BlockTransformer;
 use slatedb::object_store::path::Path;
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify, watch};
 use tracing::info;
 
@@ -49,11 +49,9 @@ struct Prepared {
     db_mode: DatabaseMode,
 }
 
-/// Present only with a `replication_listen` address. `leading` answers a peer's
-/// Hello; `takeover_trigger` fires an immediate takeover when a deposed leader
-/// checks in; `liveness`/`highest_epoch`/`tail` feed the watch and the replay.
+/// Receiver handles carried through role election and takeover replay.
 struct HaReceiver {
-    leading: Arc<AtomicBool>,
+    role: Arc<crate::replication::transport::ReceiverRole>,
     takeover_trigger: Arc<Notify>,
     liveness: Option<watch::Receiver<u64>>,
     highest_epoch: Option<Arc<AtomicU64>>,
@@ -181,8 +179,7 @@ impl Prepared {
             .as_ref()
             .map(crate::replication::ReplicationParams::from_config);
 
-        // Shared with the receiver, which records shipped op-ids to keep the
-        // cache warm for after a takeover.
+        // Shared by request handling and takeover replay.
         let dedup = Arc::new(crate::dedup::DedupCache::new(65_536));
 
         // Trace at the bottom of the stack so otrace sees the requests that
@@ -232,7 +229,6 @@ impl Prepared {
             .and_then(|p| p.replication_listen.clone());
 
         let ha = if let Some(listen) = listen {
-            let leading = Arc::new(AtomicBool::new(false));
             let takeover_trigger = Arc::new(Notify::new());
             let node_id = self.replication_params.as_ref().unwrap().node_id.clone();
             let addr: std::net::SocketAddr = listen
@@ -242,10 +238,10 @@ impl Prepared {
             let receiver = crate::replication::transport::ReplicationReceiver::new(
                 buffer.clone(),
                 self.dedup.clone(),
-                leading.clone(),
                 Some(takeover_trigger.clone()),
                 node_id.clone(),
             );
+            let role = receiver.role();
             let liveness = Some(receiver.liveness());
             let highest_epoch = Some(receiver.highest_epoch());
             let server = receiver.into_server();
@@ -260,7 +256,7 @@ impl Prepared {
                 }
             });
             Some(HaReceiver {
-                leading,
+                role,
                 takeover_trigger,
                 liveness,
                 highest_epoch,
@@ -467,6 +463,15 @@ impl Writer {
             parts_cache,
         } = opened;
 
+        // Publish this open's epoch once; later status manifests may belong to
+        // the writer that fenced us.
+        if let SlateDbHandle::ReadWrite(raw_db) = &slatedb
+            && let Some(ha) = &self.ha
+        {
+            let writer_epoch = raw_db.subscribe().borrow().current_manifest.writer_epoch();
+            ha.role.publish_writer(writer_epoch);
+        }
+
         // Segment reads share SlateDB's prefetch parts cache (one budget, keyed
         // by path); the seal-cache still serves same-process read-after-write.
         //
@@ -497,13 +502,6 @@ impl Writer {
             }));
 
         let db_handle = slatedb.clone();
-        // Now the writer; the Hello handler reports `leading` so a (re)starting
-        // peer defers instead of re-taking.
-        if matches!(slatedb, SlateDbHandle::ReadWrite(_))
-            && let Some(ha) = &self.ha
-        {
-            ha.leading.store(true, Ordering::Release);
-        }
 
         let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
         let ignore_fsync = settings
@@ -578,7 +576,10 @@ impl DbOpen {
                     }
                     ReplayDecision::PruneTo(seqno) => {
                         let before = buf.len();
-                        buf.prune(seqno);
+                        let durable_op_ids = buf.prune(seqno);
+                        for op_id in durable_op_ids {
+                            self.prepared.dedup.record(op_id, bytes::Bytes::new());
+                        }
                         info!(
                             "HA takeover: db holds shipped batches through seqno {} \
                              (epoch {}); pruned {} durable of {} buffered batch(es)",
@@ -713,6 +714,12 @@ impl DbOpen {
                     .flush()
                     .await
                     .context("HA takeover replay flush failed")?;
+
+                // The flush made the suffix durable. Earlier errors leave the
+                // tail and its pending op-ids intact.
+                for op_id in buf.finish_replay() {
+                    self.prepared.dedup.record(op_id, bytes::Bytes::new());
+                }
             }
         }
 

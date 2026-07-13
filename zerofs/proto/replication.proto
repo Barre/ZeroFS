@@ -37,13 +37,14 @@ message ReplicateRequest {
     // Leader's data-db writer epoch. The standby rejects a ship below the highest
     // epoch it has seen, so a deposed leader cannot pollute the tail.
     uint64 writer_epoch = 4;
-    // Op-ids applied in this batch (16 bytes each), recorded by the standby
-    // atomically with the data so a retry survives a failover. Empty if none.
+    // Op-ids in this batch (16 bytes each). They remain with the volatile tail
+    // until a prune watermark or successful replay proves the data durable.
     repeated bytes op_ids = 5;
 }
 
 message ReplicateResponse {
-    // True once buffered on the standby; false if rejected (e.g. stale epoch).
+    // False means the sender epoch was superseded. A stale receiver returns
+    // gRPC UNAVAILABLE instead.
     bool accepted = 1;
 }
 

@@ -2,11 +2,9 @@
 //! for its durable ack BEFORE the write coordinator applies the batch
 //! (commit-then-apply), so anything a read can see is already replicated.
 //!
-//! Dynamic: ships while a standby is reachable; on a ship failure or timeout it
-//! downgrades to solo (single-node durable) so a standby outage never blocks
-//! writes, and a reconnect loop re-establishes shipping when the standby returns.
-//! Downgrading is split-brain-safe: a downgraded leader still heartbeats (holds
-//! its lease), so the standby never takes over.
+//! Dynamic: ships while a peer is usable; on a ship failure or timeout it
+//! downgrades to solo (single-node durable) so an outage never blocks writes,
+//! and a reconnect loop re-establishes shipping when the peer returns.
 //!
 //! Also drives the prune watermark: only confirmed-durable batches are pruned, so
 //! the watermark can never outrun durability.
@@ -21,6 +19,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Outcome of shipping one batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShipOutcome {
+    /// The standby durably acked: two-node durable; the seqno feeds the prune
+    /// watermark.
+    Shipped(u64),
+    /// No usable peer: the caller applies and acks single-node durable.
+    Solo,
+    /// The standby rejected the ship: authoritative evidence a newer writer
+    /// exists and this leader is deposed. Terminal; the caller must fail the
+    /// batch, never ack it.
+    Deposed,
+}
+
+enum ReplicationState {
+    Solo,
+    Connected(Box<ReplicationSender>),
+    Deposed,
+}
+
 /// How long a single ship may take before the leader downgrades to solo.
 const SHIP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a solo leader retries connecting to its standby.
@@ -29,7 +47,7 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 pub struct Replicator {
     peer_endpoint: String,
     writer_epoch: u64,
-    /// Next batch seqno, assigned only when a batch is actually shipped.
+    /// Next seqno for a ship attempt; attempted seqnos are never reused.
     seqno: AtomicU64,
     /// Last seqno whose ship was acked, and commits since without one. Together
     /// with the epoch they form the provenance stamp each batch carries, which
@@ -40,9 +58,7 @@ pub struct Replicator {
     watermark: AtomicU64,
     /// Applied-but-not-yet-durable shipped batches: (batch seqno, SlateDB seqno).
     pending: StdMutex<VecDeque<(u64, u64)>>,
-    /// Live sender, `None` in solo mode. Set only by the reconnect loop, cleared
-    /// only by a failed ship.
-    sender: Mutex<Option<ReplicationSender>>,
+    state: Mutex<ReplicationState>,
 }
 
 impl Replicator {
@@ -56,30 +72,35 @@ impl Replicator {
             solo_count: AtomicU64::new(0),
             watermark: AtomicU64::new(0),
             pending: StdMutex::new(VecDeque::new()),
-            sender: Mutex::new(None),
+            state: Mutex::new(ReplicationState::Solo),
         })
     }
 
-    /// Ship a batch and wait for its durable ack. `Some(seqno)` if shipped (the
-    /// caller records durability for the prune watermark), `None` if solo. Either
-    /// way the caller applies and acks; only a shipped write is two-node durable.
-    pub async fn ship(&self, ops: &[ReplOp], op_ids: &[crate::dedup::OpId]) -> Option<u64> {
-        let shipped = self.ship_inner(ops, op_ids).await;
-        match shipped {
-            Some(seqno) => {
+    /// Ship a batch and wait for its durable ack. On `Shipped`/`Solo` the caller
+    /// applies and acks (only a shipped write is two-node durable); on `Deposed`
+    /// it must fail the batch.
+    pub async fn ship(&self, ops: &[ReplOp], op_ids: &[crate::dedup::OpId]) -> ShipOutcome {
+        let outcome = self.ship_inner(ops, op_ids).await;
+        match outcome {
+            ShipOutcome::Shipped(seqno) => {
                 self.last_shipped.store(seqno, Ordering::Relaxed);
                 self.solo_count.store(0, Ordering::Relaxed);
             }
-            None => {
+            ShipOutcome::Solo => {
                 self.solo_count.fetch_add(1, Ordering::Relaxed);
             }
+            ShipOutcome::Deposed => {}
         }
-        shipped
+        outcome
     }
 
-    async fn ship_inner(&self, ops: &[ReplOp], op_ids: &[crate::dedup::OpId]) -> Option<u64> {
-        let mut guard = self.sender.lock().await;
-        let sender = guard.as_ref()?;
+    async fn ship_inner(&self, ops: &[ReplOp], op_ids: &[crate::dedup::OpId]) -> ShipOutcome {
+        let mut state = self.state.lock().await;
+        let sender = match &*state {
+            ReplicationState::Solo => return ShipOutcome::Solo,
+            ReplicationState::Connected(sender) => sender,
+            ReplicationState::Deposed => return ShipOutcome::Deposed,
+        };
         let seqno = self.seqno.fetch_add(1, Ordering::Relaxed);
         let watermark = self.watermark.load(Ordering::Relaxed);
         let shipped = tokio::time::timeout(
@@ -88,26 +109,24 @@ impl Replicator {
         )
         .await;
         match shipped {
-            Ok(Ok(true)) => Some(seqno),
+            Ok(Ok(true)) => ShipOutcome::Shipped(seqno),
             Ok(Ok(false)) => {
-                tracing::error!(
-                    "HA: standby rejected a ship (stale writer epoch?); downgrading to solo"
-                );
-                *guard = None;
-                None
+                tracing::error!("HA: standby rejected a ship: this leader is deposed");
+                *state = ReplicationState::Deposed;
+                ShipOutcome::Deposed
             }
             Ok(Err(e)) => {
                 tracing::warn!(
                     "HA: standby ship failed; downgrading to solo (new writes are \
                      single-node durable until the standby returns): {e:#}"
                 );
-                *guard = None;
-                None
+                *state = ReplicationState::Solo;
+                ShipOutcome::Solo
             }
             Err(_) => {
                 tracing::warn!("HA: standby ship timed out; downgrading to solo");
-                *guard = None;
-                None
+                *state = ReplicationState::Solo;
+                ShipOutcome::Solo
             }
         }
     }
@@ -148,8 +167,23 @@ impl Replicator {
     }
 }
 
+#[cfg(test)]
+impl Replicator {
+    /// Test wiring for transitions normally driven by the reconnect loop.
+    pub(crate) async fn set_sender_for_tests(&self, sender: Option<ReplicationSender>) {
+        *self.state.lock().await = match sender {
+            Some(sender) => ReplicationState::Connected(Box::new(sender)),
+            None => ReplicationState::Solo,
+        };
+    }
+
+    async fn is_connected_for_tests(&self) -> bool {
+        matches!(&*self.state.lock().await, ReplicationState::Connected(_))
+    }
+}
+
 /// Re-establish shipping whenever the leader is solo and the standby is
-/// reachable. Runs until the replicator is dropped.
+/// reachable. Stops when the replicator is dropped or deposed.
 pub async fn run_reconnect(replicator: Weak<Replicator>) {
     let mut ticker = tokio::time::interval(RECONNECT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -158,16 +192,20 @@ pub async fn run_reconnect(replicator: Weak<Replicator>) {
         let Some(replicator) = replicator.upgrade() else {
             break;
         };
-        if replicator.sender.lock().await.is_some() {
-            continue;
+        {
+            let state = replicator.state.lock().await;
+            match &*state {
+                ReplicationState::Solo => {}
+                ReplicationState::Connected(_) => continue,
+                ReplicationState::Deposed => break,
+            }
         }
         let endpoint = replicator.peer_endpoint.clone();
         match ReplicationSender::connect(endpoint).await {
             Ok(sender) => {
-                let mut guard = replicator.sender.lock().await;
-                // Reconnect loop is the only writer of `Some`, so no race.
-                if guard.is_none() {
-                    *guard = Some(sender);
+                let mut state = replicator.state.lock().await;
+                if matches!(&*state, ReplicationState::Solo) {
+                    *state = ReplicationState::Connected(Box::new(sender));
                     tracing::info!("HA: connected to standby; semi-sync replication resumed");
                 }
             }
@@ -213,15 +251,14 @@ mod tests {
         let r = Replicator::new("http://127.0.0.1:1".to_string(), 0);
         assert_eq!(
             r.ship(&[ReplOp::Put("k".into(), "v".into())], &[]).await,
-            None,
-            "with no standby connected, ship must run solo (None)"
+            ShipOutcome::Solo,
+            "with no standby connected, ship must run solo"
         );
     }
 
     use crate::dedup::DedupCache;
     use crate::replication::tail::TailBuffer;
     use crate::replication::transport::ReplicationReceiver;
-    use std::sync::atomic::AtomicBool;
     use tokio::net::TcpListener;
 
     /// A running receiver. Hold it to keep the standby up; `stop()` it (or drop it)
@@ -240,20 +277,22 @@ mod tests {
         }
     }
 
-    /// Stand up a real receiver over a loopback socket. Returns its endpoint, the
-    /// shared tail buffer, and a handle controlling the server's lifetime.
-    async fn spawn_receiver() -> (String, Arc<Mutex<TailBuffer>>, ServerHandle) {
+    async fn spawn_receiver_at(
+        local_writer_epoch: Option<u64>,
+    ) -> (String, Arc<Mutex<TailBuffer>>, ServerHandle) {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = ReplicationReceiver::new(
+        let receiver = ReplicationReceiver::new(
             buffer.clone(),
             Arc::new(DedupCache::new(64)),
-            Arc::new(AtomicBool::new(false)),
             None,
             "standby-under-test".to_string(),
-        )
-        .into_server();
+        );
+        if let Some(epoch) = local_writer_epoch {
+            receiver.role().publish_writer(epoch);
+        }
+        let server = receiver.into_server();
         let (shutdown, rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -271,6 +310,10 @@ mod tests {
             buffer,
             ServerHandle { shutdown, join },
         )
+    }
+
+    async fn spawn_receiver() -> (String, Arc<Mutex<TailBuffer>>, ServerHandle) {
+        spawn_receiver_at(None).await
     }
 
     async fn connect(endpoint: &str) -> ReplicationSender {
@@ -291,10 +334,10 @@ mod tests {
     async fn ship_assigns_increasing_seqnos_and_buffers_on_the_standby() {
         let (endpoint, buffer, _server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 7);
-        *r.sender.lock().await = Some(connect(&endpoint).await);
+        r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
 
-        assert_eq!(r.ship(&put(), &[]).await, Some(1));
-        assert_eq!(r.ship(&put(), &[]).await, Some(2));
+        assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(1));
+        assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(2));
 
         let seqnos: Vec<u64> = buffer
             .lock()
@@ -316,12 +359,16 @@ mod tests {
         let (endpoint, _buffer, _server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 1);
 
-        assert_eq!(r.ship(&put(), &[]).await, None, "no sender yet: solo");
-
-        *r.sender.lock().await = Some(connect(&endpoint).await);
         assert_eq!(
             r.ship(&put(), &[]).await,
-            Some(1),
+            ShipOutcome::Solo,
+            "no sender yet: solo"
+        );
+
+        r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Shipped(1),
             "first real ship is seqno 1"
         );
     }
@@ -332,21 +379,26 @@ mod tests {
     async fn ship_downgrades_to_solo_when_the_standby_is_unreachable() {
         let (endpoint, _buffer, server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 1);
-        *r.sender.lock().await = Some(connect(&endpoint).await);
-        assert_eq!(r.ship(&put(), &[]).await, Some(1));
+        r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
+        assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(1));
 
         server.stop().await;
-        assert_eq!(r.ship(&put(), &[]).await, None, "a failed ship runs solo");
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Solo,
+            "a failed ship runs solo"
+        );
         assert!(
-            r.sender.lock().await.is_none(),
+            !r.is_connected_for_tests().await,
             "a failed ship must clear the sender so reconnect can re-establish it"
         );
     }
 
-    // A deposed leader's ship is rejected by the standby (its epoch is below the
-    // highest seen). The leader must downgrade, not loop re-shipping a rejected batch.
+    // A rejected ship (epoch below the standby's highest seen) is deposal
+    // evidence, not an outage: the outcome is terminal, and the reconnect loop
+    // must not re-establish shipping for a fenced leader.
     #[tokio::test]
-    async fn ship_downgrades_to_solo_on_stale_epoch_rejection() {
+    async fn ship_reports_deposed_on_stale_epoch_rejection_and_stays_deposed() {
         let (endpoint, _buffer, _server) = spawn_receiver().await;
         // A newer leader (epoch 5) ships first, bumping the receiver's highest epoch.
         let newer = connect(&endpoint).await;
@@ -358,11 +410,59 @@ mod tests {
         );
 
         let r = Replicator::new(endpoint.clone(), 1);
-        *r.sender.lock().await = Some(connect(&endpoint).await);
-        assert_eq!(r.ship(&put(), &[]).await, None, "a rejected ship runs solo");
+        r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Deposed,
+            "a rejected ship is deposal evidence"
+        );
         assert!(
-            r.sender.lock().await.is_none(),
+            !r.is_connected_for_tests().await,
             "a rejected ship must clear the sender"
+        );
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Deposed,
+            "deposal is sticky"
+        );
+
+        // The reconnect loop sees the deposal and stops instead of re-dialing.
+        let recon = tokio::spawn(run_reconnect(Arc::downgrade(&r)));
+        tokio::time::timeout(Duration::from_secs(5), recon)
+            .await
+            .expect("run_reconnect must stop for a deposed replicator")
+            .unwrap();
+        assert!(
+            !r.is_connected_for_tests().await,
+            "a deposed replicator must not get a new sender"
+        );
+    }
+
+    // A fenced former leader can remain reachable until its next failed flush.
+    // Its stale role claim must not depose the newer writer.
+    #[tokio::test]
+    async fn newer_writer_is_not_deposed_by_a_stale_leading_peer() {
+        let (endpoint, buffer, _server) = spawn_receiver_at(Some(7)).await;
+        let r = Replicator::new(endpoint.clone(), 8);
+        r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
+
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Solo,
+            "an epoch-8 writer must treat a stale epoch-7 receiver as unavailable"
+        );
+        assert!(
+            !r.is_connected_for_tests().await,
+            "the stale receiver must be disconnected"
+        );
+        assert!(
+            buffer.lock().await.is_empty(),
+            "the stale receiver must not acknowledge or buffer the new writer's batch"
+        );
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Solo,
+            "the ambiguous rejection must not latch terminal deposal"
         );
     }
 
@@ -375,16 +475,24 @@ mod tests {
         let r = Replicator::new(endpoint.clone(), 9);
         assert_eq!(r.stamp(), (9, 0, 0), "fresh replicator: nothing shipped");
 
-        assert_eq!(r.ship(&put(), &[]).await, None, "starts solo (no sender)");
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Solo,
+            "starts solo (no sender)"
+        );
         assert_eq!(r.stamp(), (9, 0, 1));
 
-        *r.sender.lock().await = Some(connect(&endpoint).await);
-        assert_eq!(r.ship(&put(), &[]).await, Some(1));
+        r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
+        assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(1));
         assert_eq!(r.stamp(), (9, 1, 0), "an acked ship resets the solo count");
 
         server.stop().await;
-        assert_eq!(r.ship(&put(), &[]).await, None, "failed ship runs solo");
-        assert_eq!(r.ship(&put(), &[]).await, None);
+        assert_eq!(
+            r.ship(&put(), &[]).await,
+            ShipOutcome::Solo,
+            "failed ship runs solo"
+        );
+        assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Solo);
         assert_eq!(r.stamp(), (9, 1, 2), "solo commits count from the last ack");
     }
 
@@ -392,11 +500,11 @@ mod tests {
     async fn run_reconnect_reestablishes_the_sender() {
         let (endpoint, _buffer, _server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 1);
-        assert!(r.sender.lock().await.is_none(), "starts solo");
+        assert!(!r.is_connected_for_tests().await, "starts solo");
 
         let recon = tokio::spawn(run_reconnect(Arc::downgrade(&r)));
         tokio::time::timeout(Duration::from_secs(5), async {
-            while r.sender.lock().await.is_none() {
+            while !r.is_connected_for_tests().await {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
@@ -405,7 +513,7 @@ mod tests {
 
         assert_eq!(
             r.ship(&put(), &[]).await,
-            Some(1),
+            ShipOutcome::Shipped(1),
             "shipping resumes after reconnect"
         );
         recon.abort();

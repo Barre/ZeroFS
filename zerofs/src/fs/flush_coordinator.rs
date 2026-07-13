@@ -24,6 +24,9 @@ enum Request {
 pub struct FlushCoordinator {
     sender: mpsc::UnboundedSender<Request>,
     seal_hook: Arc<OnceLock<SealHook>>,
+    /// Test-only count of successful coordinator flush cycles.
+    #[cfg(test)]
+    completed_flushes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FlushCoordinator {
@@ -31,6 +34,10 @@ impl FlushCoordinator {
         let seal_hook: Arc<OnceLock<SealHook>> = Arc::new(OnceLock::new());
         let hook = Arc::clone(&seal_hook);
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
+        #[cfg(test)]
+        let completed_flushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let flush_counter = Arc::clone(&completed_flushes);
 
         spawn_named("flush-coordinator", async move {
             while let Some(request) = receiver.recv().await {
@@ -69,6 +76,10 @@ impl FlushCoordinator {
                 } else {
                     result
                 };
+                #[cfg(test)]
+                if result.is_ok() {
+                    flush_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 drop(barrier);
 
                 #[cfg(feature = "failpoints")]
@@ -91,7 +102,12 @@ impl FlushCoordinator {
             }
         });
 
-        Self { sender, seal_hook }
+        Self {
+            sender,
+            seal_hook,
+            #[cfg(test)]
+            completed_flushes,
+        }
     }
 
     /// Install the pre-flush seal hook (first call wins). Set once at bring-up,
@@ -108,6 +124,12 @@ impl FlushCoordinator {
             .map_err(|_| FsError::ShuttingDown)?;
 
         rx.await.map_err(|_| FsError::ShuttingDown)?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_flush_count(&self) -> u64 {
+        self.completed_flushes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Seal, flush, and close under one barrier write lock. On error, the
