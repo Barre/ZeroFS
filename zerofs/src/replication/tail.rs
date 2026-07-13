@@ -15,8 +15,12 @@
 //! Replay is idempotent (last-write-wins per key in seqno order), so keeping an
 //! already-durable batch is harmless. Pruning must therefore stay conservative:
 //! prune too little and you waste memory, prune too much and you lose acked writes.
+//! Op IDs follow their batch: prune/replay publishes them; discard or term
+//! replacement drops them.
 use bytes::Bytes;
 use std::collections::BTreeMap;
+
+use crate::dedup::OpId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplOp {
@@ -30,10 +34,16 @@ pub enum ReplOp {
 
 #[derive(Default)]
 pub struct TailBuffer {
-    batches: BTreeMap<u64, Vec<ReplOp>>,
+    batches: BTreeMap<u64, TailBatch>,
     /// Leader term of the buffered batches. A ship from a newer term drops them
     /// first (see [`Self::accept`]).
     epoch: u64,
+}
+
+struct TailBatch {
+    ops: Vec<ReplOp>,
+    /// Published to dedup only after prune or successful replay.
+    op_ids: Vec<OpId>,
 }
 
 impl TailBuffer {
@@ -44,18 +54,15 @@ impl TailBuffer {
         }
     }
 
-    /// Buffer a batch tagged with its leader term. A batch from a newer term
-    /// drops the prior term's batches first: seqnos restart per term, so a stale
-    /// high-seqno batch would otherwise replay (in seqno order) over a new
-    /// low-seqno one. Keyed on the tail's own epoch, never an externally tracked
-    /// one, so a heartbeat that already advanced the fencing epoch cannot suppress
-    /// the drop. Re-shipping the same (epoch, seqno) overwrites the prior copy.
-    pub fn accept(&mut self, epoch: u64, seqno: u64, ops: Vec<ReplOp>) {
+    /// Buffer a term-scoped batch. A newer term replaces the old tail because
+    /// seqnos restart per term; the decision uses the tail epoch so a heartbeat
+    /// cannot suppress it. Re-shipping the same seqno replaces its batch.
+    pub fn accept(&mut self, epoch: u64, seqno: u64, ops: Vec<ReplOp>, op_ids: Vec<OpId>) {
         if epoch > self.epoch {
             self.batches.clear();
             self.epoch = epoch;
         }
-        self.batches.insert(seqno, ops);
+        self.batches.insert(seqno, TailBatch { ops, op_ids });
     }
 
     /// Term of the buffered batches (0 before anything was accepted).
@@ -70,16 +77,36 @@ impl TailBuffer {
         self.batches.clear();
     }
 
-    /// Drop batches with seqno <= `watermark` (confirmed durable).
-    pub fn prune(&mut self, watermark: u64) {
-        self.batches.retain(|&seqno, _| seqno > watermark);
+    /// Drop batches with seqno <= `watermark` (confirmed durable), returning
+    /// their now-safe-to-publish op-ids.
+    pub fn prune(&mut self, watermark: u64) -> Vec<OpId> {
+        let mut durable_op_ids = Vec::new();
+        self.batches.retain(|&seqno, batch| {
+            if seqno <= watermark {
+                durable_op_ids.extend(batch.op_ids.iter().copied());
+                false
+            } else {
+                true
+            }
+        });
+        durable_op_ids
+    }
+
+    /// Successful takeover replay made every remaining batch durable. Remove
+    /// them from the tail and return the op-ids that may now enter dedup.
+    pub fn finish_replay(&mut self) -> Vec<OpId> {
+        let batches = std::mem::take(&mut self.batches);
+        batches
+            .into_values()
+            .flat_map(|batch| batch.op_ids)
+            .collect()
     }
 
     /// Ascending seqno order, for replay on takeover.
     pub fn batches_in_order(&self) -> impl Iterator<Item = (u64, &[ReplOp])> {
         self.batches
             .iter()
-            .map(|(&seqno, ops)| (seqno, ops.as_slice()))
+            .map(|(&seqno, batch)| (seqno, batch.ops.as_slice()))
     }
 
     pub fn len(&self) -> usize {
@@ -133,13 +160,17 @@ mod tests {
         ReplOp::Put(Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
     }
 
+    fn op_id(n: u8) -> OpId {
+        [n; 16]
+    }
+
     #[test]
-    fn buffers_in_order_and_reports_highest() {
+    fn buffers_in_seqno_order() {
         let mut tb = TailBuffer::new();
         assert!(tb.is_empty());
-        tb.accept(1, 3, vec![put(b"c", b"3")]);
-        tb.accept(1, 1, vec![put(b"a", b"1")]);
-        tb.accept(1, 2, vec![put(b"b", b"2")]);
+        tb.accept(1, 3, vec![put(b"c", b"3")], vec![]);
+        tb.accept(1, 1, vec![put(b"a", b"1")], vec![]);
+        tb.accept(1, 2, vec![put(b"b", b"2")], vec![]);
 
         let seqnos: Vec<u64> = tb.batches_in_order().map(|(s, _)| s).collect();
         assert_eq!(
@@ -154,31 +185,67 @@ mod tests {
     fn prune_is_conservative_and_inclusive() {
         let mut tb = TailBuffer::new();
         for s in 1..=5 {
-            tb.accept(1, s, vec![put(b"k", format!("{s}").as_bytes())]);
+            tb.accept(1, s, vec![put(b"k", format!("{s}").as_bytes())], vec![]);
         }
-        tb.prune(3);
+        assert!(tb.prune(3).is_empty());
         let seqnos: Vec<u64> = tb.batches_in_order().map(|(s, _)| s).collect();
         assert_eq!(seqnos, vec![4, 5]);
 
-        tb.prune(0);
+        assert!(tb.prune(0).is_empty());
         assert_eq!(tb.len(), 2);
 
-        tb.prune(100);
+        assert!(tb.prune(100).is_empty());
         assert!(tb.is_empty());
     }
 
     #[test]
     fn reship_same_seqno_overwrites_not_duplicates() {
         let mut tb = TailBuffer::new();
-        tb.accept(1, 7, vec![put(b"k", b"first")]);
-        tb.accept(1, 7, vec![put(b"k", b"first")]);
+        tb.accept(1, 7, vec![put(b"k", b"first")], vec![op_id(1)]);
+        tb.accept(1, 7, vec![put(b"k", b"first")], vec![op_id(2)]);
         assert_eq!(tb.len(), 1, "a re-shipped seqno must not duplicate");
+        assert_eq!(
+            tb.finish_replay(),
+            vec![op_id(2)],
+            "the replacement batch owns the seqno's pending op-ids"
+        );
     }
 
-    // Finding A: a ship is delivered but its ack is lost, so the leader counts it
-    // failed, goes Solo, and keeps committing durable progress (stamp solo > 0).
-    // The buffered batch's content was re-committed locally, so replaying it after
-    // the leader dies would resurrect an old value over newer durable state.
+    #[test]
+    fn op_ids_follow_durable_prune_and_successful_replay() {
+        let mut tb = TailBuffer::new();
+        tb.accept(1, 1, vec![put(b"a", b"1")], vec![op_id(1)]);
+        tb.accept(1, 2, vec![put(b"b", b"2")], vec![op_id(2)]);
+
+        assert_eq!(
+            tb.prune(1),
+            vec![op_id(1)],
+            "only the confirmed-durable prefix may publish"
+        );
+        assert_eq!(tb.len(), 1);
+        assert_eq!(
+            tb.finish_replay(),
+            vec![op_id(2)],
+            "successful replay publishes the remaining suffix"
+        );
+        assert!(tb.is_empty(), "successful replay releases the tail storage");
+    }
+
+    #[test]
+    fn discarded_tail_drops_pending_op_ids_without_completing_them() {
+        let mut tb = TailBuffer::new();
+        tb.accept(1, 1, vec![put(b"a", b"1")], vec![op_id(1)]);
+
+        tb.discard();
+
+        assert!(tb.is_empty());
+        assert!(
+            tb.finish_replay().is_empty(),
+            "discarded op-ids must never be returned as successfully applied"
+        );
+    }
+
+    // A lost ship ack followed by solo progress leaves the buffered batch stale.
     #[test]
     fn solo_progress_in_the_tails_term_discards_the_outlived_ships() {
         assert_eq!(
@@ -235,14 +302,19 @@ mod tests {
     #[test]
     fn a_newer_epoch_drops_the_prior_terms_tail() {
         let mut tb = TailBuffer::new();
-        tb.accept(5, 50, vec![put(b"f", b"old")]);
-        tb.accept(5, 51, vec![put(b"f", b"old")]);
-        tb.accept(6, 1, vec![put(b"f", b"new")]);
+        tb.accept(5, 50, vec![put(b"f", b"old")], vec![op_id(5)]);
+        tb.accept(5, 51, vec![put(b"f", b"old")], vec![op_id(6)]);
+        tb.accept(6, 1, vec![put(b"f", b"new")], vec![op_id(7)]);
         let seqnos: Vec<u64> = tb.batches_in_order().map(|(s, _)| s).collect();
         assert_eq!(
             seqnos,
             vec![1],
             "the prior term's high-seqno batches must be dropped, not left to replay last"
+        );
+        assert_eq!(
+            tb.finish_replay(),
+            vec![op_id(7)],
+            "pending op-ids from the replaced term must be dropped with its data"
         );
     }
 }

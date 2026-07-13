@@ -3,8 +3,8 @@
 
 use crate::replication::tail::{ReplOp, TailBuffer};
 use bytes::Bytes;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, watch};
 use tonic::transport::Channel;
@@ -31,6 +31,28 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Decode ceiling for an incoming `ReplicateRequest`. tonic defaults to 4 MiB.
 const MAX_SHIP_DECODE_BYTES: usize = usize::MAX;
+
+/// The writer epoch this process acquired, published once when it promotes.
+/// It remains available after fencing so peer rejections can identify which
+/// process is stale.
+#[derive(Default)]
+pub(crate) struct ReceiverRole {
+    writer_epoch: OnceLock<u64>,
+}
+
+impl ReceiverRole {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn publish_writer(&self, writer_epoch: u64) {
+        assert!(
+            self.writer_epoch.set(writer_epoch).is_ok(),
+            "receiver writer epoch published twice"
+        );
+    }
+
+    fn leading_epoch(&self) -> Option<u64> {
+        self.writer_epoch.get().copied()
+    }
+}
 
 fn to_repl_ops(ops: Vec<ProtoOp>) -> Vec<ReplOp> {
     ops.into_iter()
@@ -80,14 +102,12 @@ fn to_proto_ops(ops: &[ReplOp]) -> Vec<ProtoOp> {
 pub struct ReplicationReceiver {
     buffer: Arc<Mutex<TailBuffer>>,
     highest_epoch: Arc<AtomicU64>,
-    /// Idempotency cache kept warm by recording each shipped op-id, so a client's
-    /// retry after this node promotes is recognized as already applied.
+    /// Idempotency cache for batches proven durable by pruning or replay.
     dedup: Arc<crate::dedup::DedupCache>,
     /// Ticks on each accepted heartbeat; the failover watch follows it.
     heartbeats: watch::Sender<u64>,
-    /// True once this node is the writer. Reported via Hello so a (re)starting
-    /// peer defers to it instead of opening as writer.
-    leading: Arc<AtomicBool>,
+    /// This process's locally opened writer epoch, if it has promoted.
+    role: Arc<ReceiverRole>,
     /// Fired when a deposed leader asks (Hello) and we are a standby holding a
     /// tail, so we take over at once instead of waiting out the heartbeat gap.
     takeover_trigger: Option<Arc<Notify>>,
@@ -95,13 +115,19 @@ pub struct ReplicationReceiver {
     /// refuse startup on a duplicated node_id (identity keys the latest-leader
     /// record, so a collision is a config error).
     node_id: String,
+    /// Test-only gate between the fast checks and the tail lock.
+    #[cfg(test)]
+    before_tail_lock_pause: Option<(u64, Arc<Notify>, Arc<Notify>)>,
+    /// Test-only gate inside the admission critical section (fence check passed,
+    /// append not yet done), to prove epoch publication cannot interleave there.
+    #[cfg(test)]
+    before_append_pause: Option<(u64, Arc<Notify>, Arc<Notify>)>,
 }
 
 impl ReplicationReceiver {
     pub fn new(
         buffer: Arc<Mutex<TailBuffer>>,
         dedup: Arc<crate::dedup::DedupCache>,
-        leading: Arc<AtomicBool>,
         takeover_trigger: Option<Arc<Notify>>,
         node_id: String,
     ) -> Self {
@@ -110,10 +136,36 @@ impl ReplicationReceiver {
             highest_epoch: Arc::new(AtomicU64::new(0)),
             dedup,
             heartbeats: watch::channel(0u64).0,
-            leading,
+            role: Arc::new(ReceiverRole::default()),
             takeover_trigger,
             node_id,
+            #[cfg(test)]
+            before_tail_lock_pause: None,
+            #[cfg(test)]
+            before_append_pause: None,
         }
+    }
+
+    #[cfg(test)]
+    fn pause_epoch_before_tail_lock(
+        mut self,
+        epoch: u64,
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    ) -> Self {
+        self.before_tail_lock_pause = Some((epoch, reached, resume));
+        self
+    }
+
+    #[cfg(test)]
+    fn pause_epoch_before_append(
+        mut self,
+        epoch: u64,
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    ) -> Self {
+        self.before_append_pause = Some((epoch, reached, resume));
+        self
     }
 
     /// Subscribe before [`Self::into_server`] consumes the receiver.
@@ -128,6 +180,26 @@ impl ReplicationReceiver {
         self.highest_epoch.clone()
     }
 
+    /// Handle used to publish the local writer epoch before takeover replay.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn role(&self) -> Arc<ReceiverRole> {
+        self.role.clone()
+    }
+
+    /// A promoted receiver never buffers peer writes. A lower or equal sender
+    /// is deposed; a higher sender means this receiver is the stale process.
+    fn leading_rejection(&self, incoming_epoch: u64) -> Result<Option<ReplicateResponse>, Status> {
+        let Some(local_epoch) = self.role.leading_epoch() else {
+            return Ok(None);
+        };
+        if incoming_epoch > local_epoch {
+            return Err(Status::unavailable(format!(
+                "receiver is a stale writer at epoch {local_epoch}; incoming writer epoch is {incoming_epoch}"
+            )));
+        }
+        Ok(Some(ReplicateResponse { accepted: false }))
+    }
+
     pub fn into_server(self) -> ReplicationServiceServer<Self> {
         ReplicationServiceServer::new(self).max_decoding_message_size(MAX_SHIP_DECODE_BYTES)
     }
@@ -140,41 +212,59 @@ impl ReplicationService for ReplicationReceiver {
         request: Request<ReplicateRequest>,
     ) -> Result<Response<ReplicateResponse>, Status> {
         let req = request.into_inner();
-        // Once this node has promoted (it is now the writer), it must never accept
-        // a ship: a deposed leader that shares the same writer epoch (its fence in
-        // the object store hasn't bitten yet) would otherwise be accepted here,
-        // recorded into dedup, and buffered into an already-replayed tail — the old
-        // leader would then ack that write as "replicated" moments before it dies,
-        // losing an acked write and falsely deduping the client's retry. Being the
-        // writer is the authoritative signal that any other term is deposed.
-        if self.leading.load(Ordering::Acquire) {
-            return Ok(Response::new(ReplicateResponse { accepted: false }));
+        if let Some(rejection) = self.leading_rejection(req.writer_epoch)? {
+            return Ok(Response::new(rejection));
         }
-        // Reject a deposed leader: a ship whose epoch is below the highest seen.
-        let prev = self
-            .highest_epoch
-            .fetch_max(req.writer_epoch, Ordering::AcqRel);
-        if req.writer_epoch < prev {
+        // Fast-path reject for a deposed leader (epoch below the highest seen).
+        // Advisory only, no publication: the authoritative fence runs under the
+        // tail lock below, atomically with the append.
+        if req.writer_epoch < self.highest_epoch.load(Ordering::Acquire) {
             return Ok(Response::new(ReplicateResponse { accepted: false }));
         }
         let ops = to_repl_ops(req.ops);
+        let op_ids: Vec<crate::dedup::OpId> = req
+            .op_ids
+            .into_iter()
+            .filter_map(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())
+            .filter(crate::dedup::has_op_id)
+            .collect();
+        #[cfg(test)]
+        if let Some((epoch, reached, resume)) = &self.before_tail_lock_pause
+            && req.writer_epoch == *epoch
+        {
+            reached.notify_one();
+            resume.notified().await;
+        }
         {
             let mut buf = self.buffer.lock().await;
-            // `accept` drops a prior term's tail when this ship's epoch exceeds the
-            // tail's own. Keyed there, not on `prev` (the `highest_epoch` fence,
-            // which heartbeats also advance): a beat from the new term arrives
-            // before its first ship, so `prev` would already equal this epoch and
-            // the drop would be skipped, letting a stale batch replay over the new
-            // term's writes.
-            buf.accept(req.writer_epoch, req.seqno, ops);
-            if req.prune_watermark > 0 {
-                buf.prune(req.prune_watermark);
+            // Serialize promotion/replay against the append.
+            if let Some(rejection) = self.leading_rejection(req.writer_epoch)? {
+                return Ok(Response::new(rejection));
             }
-        }
-        // Keep the dedup cache warm so a retry after promotion is recognized.
-        for raw in req.op_ids {
-            if let Ok(op_id) = <[u8; 16]>::try_from(raw.as_slice()) {
-                self.dedup.record(op_id, Bytes::new());
+            // The authoritative epoch fence. Publication (here and in `heartbeat`)
+            // happens only under the tail lock, so no newer epoch can land between
+            // this check and the append.
+            let prev = self
+                .highest_epoch
+                .fetch_max(req.writer_epoch, Ordering::AcqRel);
+            if req.writer_epoch < prev {
+                return Ok(Response::new(ReplicateResponse { accepted: false }));
+            }
+            #[cfg(test)]
+            if let Some((epoch, reached, resume)) = &self.before_append_pause
+                && req.writer_epoch == *epoch
+            {
+                reached.notify_one();
+                resume.notified().await;
+            }
+            // Cross-term replacement uses the tail epoch; `highest_epoch` may
+            // already have advanced on a heartbeat.
+            buf.accept(req.writer_epoch, req.seqno, ops, op_ids);
+            if req.prune_watermark > 0 {
+                // Publish under the tail lock so takeover sees one disposition.
+                for op_id in buf.prune(req.prune_watermark) {
+                    self.dedup.record(op_id, Bytes::new());
+                }
             }
         }
         Ok(Response::new(ReplicateResponse { accepted: true }))
@@ -190,12 +280,17 @@ impl ReplicationService for ReplicationReceiver {
         // itself the writer, ignore all beats: a same-epoch zombie must not keep
         // this node's liveness view ticking (it is deposed by our promotion).
         while let Some(beat) = stream.message().await? {
-            if self.leading.load(Ordering::Acquire) {
+            if self.role.leading_epoch().is_some() {
                 continue;
             }
-            let prev = self
-                .highest_epoch
-                .fetch_max(beat.writer_epoch, Ordering::AcqRel);
+            // Publication shares the tail lock with ship admission (see
+            // `replicate`): a beat's epoch bump must not land inside another
+            // ship's fence-check-to-append window.
+            let prev = {
+                let _buf = self.buffer.lock().await;
+                self.highest_epoch
+                    .fetch_max(beat.writer_epoch, Ordering::AcqRel)
+            };
             if beat.writer_epoch >= prev {
                 self.heartbeats.send_modify(|c| *c = c.wrapping_add(1));
             }
@@ -207,7 +302,7 @@ impl ReplicationService for ReplicationReceiver {
         &self,
         _request: Request<HelloRequest>,
     ) -> Result<Response<HelloResponse>, Status> {
-        let leading = self.leading.load(Ordering::Acquire);
+        let leading = self.role.leading_epoch().is_some();
         let has_tail = !self.buffer.lock().await.is_empty();
         // A standby holding the tail takes over NOW so the deposed leader's defer
         // doesn't wait out the heartbeat gap (a leader already serves).
@@ -226,8 +321,8 @@ impl ReplicationService for ReplicationReceiver {
     }
 }
 
-/// The leader side: ships batches and reports whether the standby accepted them.
-/// Errors propagate so the caller does not ack the client on a failed ship.
+/// Ships batches and reports whether the peer accepted them. Transport errors
+/// propagate to the replicator, which decides whether to run solo.
 pub struct ReplicationSender {
     client: Mutex<ReplicationServiceClient<Channel>>,
 }
@@ -325,8 +420,49 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
 
+    fn new_receiver(
+        buffer: Arc<Mutex<TailBuffer>>,
+        dedup: Arc<crate::dedup::DedupCache>,
+    ) -> ReplicationReceiver {
+        ReplicationReceiver::new(buffer, dedup, None, "standby-under-test".to_string())
+    }
+
+    async fn serve(receiver: ReplicationReceiver) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(receiver.into_server())
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn connect(endpoint: &str) -> ReplicationSender {
+        for _ in 0..100 {
+            if let Ok(sender) = ReplicationSender::connect(endpoint.to_string()).await {
+                return sender;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("could not connect to receiver");
+    }
+
     async fn spawn_receiver(buffer: Arc<Mutex<TailBuffer>>) -> String {
-        spawn_receiver_with_leading(buffer, Arc::new(AtomicBool::new(false))).await
+        serve(new_receiver(
+            buffer,
+            Arc::new(crate::dedup::DedupCache::new(64)),
+        ))
+        .await
+    }
+
+    async fn spawn_receiver_with_dedup(
+        buffer: Arc<Mutex<TailBuffer>>,
+        dedup: Arc<crate::dedup::DedupCache>,
+    ) -> String {
+        serve(new_receiver(buffer, dedup)).await
     }
 
     /// Like [`spawn_receiver`] but also hands back the receiver's `highest_epoch`,
@@ -334,49 +470,45 @@ mod tests {
     async fn spawn_receiver_exposing_epoch(
         buffer: Arc<Mutex<TailBuffer>>,
     ) -> (String, Arc<AtomicU64>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let receiver = ReplicationReceiver::new(
-            buffer,
-            Arc::new(crate::dedup::DedupCache::new(64)),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            "standby-under-test".to_string(),
-        );
+        let receiver = new_receiver(buffer, Arc::new(crate::dedup::DedupCache::new(64)));
         let highest_epoch = receiver.highest_epoch();
-        let server = receiver.into_server();
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(server)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        (format!("http://{addr}"), highest_epoch)
+        (serve(receiver).await, highest_epoch)
     }
 
-    async fn spawn_receiver_with_leading(
+    async fn spawn_receiver_with_role(
         buffer: Arc<Mutex<TailBuffer>>,
-        leading: Arc<AtomicBool>,
-    ) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = ReplicationReceiver::new(
-            buffer,
-            Arc::new(crate::dedup::DedupCache::new(64)),
-            leading,
-            None,
-            "standby-under-test".to_string(),
-        )
-        .into_server();
-        tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(server)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        format!("http://{addr}")
+    ) -> (String, Arc<ReceiverRole>) {
+        let receiver = new_receiver(buffer, Arc::new(crate::dedup::DedupCache::new(64)));
+        let role = receiver.role();
+        (serve(receiver).await, role)
+    }
+
+    /// Receiver paused inside the admission critical section (fence check passed,
+    /// append pending) for `paused_epoch`, exposing `highest_epoch` so the test
+    /// can observe whether a concurrent publication lands during the pause.
+    async fn spawn_receiver_paused_before_append(
+        buffer: Arc<Mutex<TailBuffer>>,
+        paused_epoch: u64,
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    ) -> (String, Arc<AtomicU64>) {
+        let receiver = new_receiver(buffer, Arc::new(crate::dedup::DedupCache::new(64)))
+            .pause_epoch_before_append(paused_epoch, reached, resume);
+        let highest_epoch = receiver.highest_epoch();
+        (serve(receiver).await, highest_epoch)
+    }
+
+    async fn spawn_receiver_paused_before_tail_lock(
+        buffer: Arc<Mutex<TailBuffer>>,
+        dedup: Arc<crate::dedup::DedupCache>,
+        paused_epoch: u64,
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    ) -> (String, Arc<ReceiverRole>) {
+        let receiver =
+            new_receiver(buffer, dedup).pause_epoch_before_tail_lock(paused_epoch, reached, resume);
+        let role = receiver.role();
+        (serve(receiver).await, role)
     }
 
     fn put(k: &[u8], v: &[u8]) -> ReplOp {
@@ -387,12 +519,7 @@ mod tests {
     async fn ships_buffers_prunes_and_fences_stale_epoch() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let endpoint = spawn_receiver(buffer.clone()).await;
-        let sender = loop {
-            match ReplicationSender::connect(endpoint.clone()).await {
-                Ok(s) => break s,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        };
+        let sender = connect(&endpoint).await;
 
         assert!(sender.ship(1, &[put(b"a", b"1")], &[], 0, 1).await.unwrap());
         assert!(sender.ship(2, &[put(b"b", b"2")], &[], 0, 1).await.unwrap());
@@ -415,6 +542,98 @@ mod tests {
         );
     }
 
+    // A watermark is the first proof that a volatile tail batch is durable.
+    #[tokio::test]
+    async fn pending_op_ids_publish_only_when_pruned_as_durable() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let dedup = Arc::new(crate::dedup::DedupCache::new(64));
+        let endpoint = spawn_receiver_with_dedup(buffer, dedup.clone()).await;
+        let sender = connect(&endpoint).await;
+        let durable = [1u8; 16];
+        let pending = [2u8; 16];
+
+        assert!(
+            sender
+                .ship(1, &[put(b"a", b"1")], &[durable], 0, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            dedup.get(&durable).is_none(),
+            "an accepted-but-unpruned tail batch is not known applied yet"
+        );
+
+        assert!(
+            sender
+                .ship(2, &[put(b"b", b"2")], &[pending], 1, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            dedup.get(&durable).is_some(),
+            "watermark pruning proves the first batch durable and publishes its op-id"
+        );
+        assert!(
+            dedup.get(&pending).is_none(),
+            "the unpruned suffix must remain pending"
+        );
+    }
+
+    // Pending op-ids share the disposition of their tail batch across terms.
+    #[tokio::test]
+    async fn cross_term_tail_replacement_drops_pending_op_ids() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let dedup = Arc::new(crate::dedup::DedupCache::new(64));
+        let endpoint = spawn_receiver_with_dedup(buffer, dedup.clone()).await;
+        let sender = connect(&endpoint).await;
+        let durable_old = [3u8; 16];
+        let old = [4u8; 16];
+        let durable_new = [5u8; 16];
+        let pending_new = [6u8; 16];
+
+        assert!(
+            sender
+                .ship(49, &[put(b"durable-old", b"value")], &[durable_old], 0, 5)
+                .await
+                .unwrap()
+        );
+        assert!(
+            sender
+                .ship(50, &[put(b"old", b"value")], &[old], 49, 5)
+                .await
+                .unwrap()
+        );
+        assert!(
+            sender
+                .ship(1, &[put(b"new", b"value")], &[durable_new], 0, 6)
+                .await
+                .unwrap()
+        );
+        assert!(
+            sender
+                .ship(2, &[put(b"next", b"value")], &[pending_new], 1, 6)
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            dedup.get(&durable_old).is_some(),
+            "an already-pruned old-term id remains valid across term replacement"
+        );
+        assert!(
+            dedup.get(&old).is_none(),
+            "an old-term op-id must disappear with its replaced tail batch"
+        );
+        assert!(
+            dedup.get(&durable_new).is_some(),
+            "the pruned new-term batch is proven durable"
+        );
+        assert!(
+            dedup.get(&pending_new).is_none(),
+            "the unpruned new-term suffix remains pending"
+        );
+    }
+
     // A coalesced ship past tonic's 4 MiB default decode limit must be accepted:
     // at the default the standby rejects it before the handler, the leader sees a
     // failed ship, and it downgrades to solo and taints the lineage under ordinary
@@ -423,12 +642,7 @@ mod tests {
     async fn ship_larger_than_the_default_decode_limit_is_accepted() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let endpoint = spawn_receiver(buffer.clone()).await;
-        let sender = loop {
-            match ReplicationSender::connect(endpoint.clone()).await {
-                Ok(s) => break s,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        };
+        let sender = connect(&endpoint).await;
 
         // One op whose payload alone clears the 4 MiB default with headroom.
         let big = ReplOp::Put(
@@ -464,7 +678,6 @@ mod tests {
         let receiver = ReplicationReceiver::new(
             buffer,
             Arc::new(crate::dedup::DedupCache::new(64)),
-            Arc::new(AtomicBool::new(false)),
             None,
             "standby-under-test".to_string(),
         );
@@ -512,12 +725,7 @@ mod tests {
     async fn stale_prior_epoch_tail_does_not_clobber_newer_writes() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let endpoint = spawn_receiver(buffer.clone()).await;
-        let sender = loop {
-            match ReplicationSender::connect(endpoint.clone()).await {
-                Ok(s) => break s,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        };
+        let sender = connect(&endpoint).await;
 
         // Term 1 (writer epoch 5): un-durable tail at seqno 50/51, "/f" = "old".
         assert!(
@@ -542,27 +750,14 @@ mod tests {
             "a higher-epoch ship is accepted"
         );
 
-        // Replay the tail in seqno order, exactly as a takeover does.
         let buf = buffer.lock().await;
-        let mut state: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            std::collections::HashMap::new();
-        for (_seqno, ops) in buf.batches_in_order() {
-            for op in ops {
-                match op {
-                    ReplOp::Put(k, v) | ReplOp::PutFrame(k, v, _) => {
-                        state.insert(k.to_vec(), v.to_vec());
-                    }
-                    ReplOp::Delete(k) => {
-                        state.remove(k.as_ref());
-                    }
-                }
-            }
-        }
+        assert_eq!(buf.epoch(), 6);
         assert_eq!(
-            state.get(b"/f".as_ref()).map(|v| v.as_slice()),
-            Some(b"new".as_ref()),
-            "the post-restart (epoch 6) write must win, but a stale epoch-5 batch at a \
-             higher seqno replayed last and clobbered it (cross-term seqno collision)"
+            buf.batches_in_order()
+                .map(|(seqno, _)| seqno)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the newer term must replace the old high-seqno tail"
         );
     }
 
@@ -572,12 +767,7 @@ mod tests {
     async fn heartbeat_epoch_bump_must_not_defeat_the_cross_term_tail_clear() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let (endpoint, highest_epoch) = spawn_receiver_exposing_epoch(buffer.clone()).await;
-        let sender = loop {
-            match ReplicationSender::connect(endpoint.clone()).await {
-                Ok(s) => break s,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        };
+        let sender = connect(&endpoint).await;
 
         // Term (epoch 5): un-durable tail at seqno 50/51, "/f" = "old".
         assert!(
@@ -618,51 +808,32 @@ mod tests {
         );
         hb.abort();
 
-        // Replay the tail in seqno order, exactly as a takeover does.
         let buf = buffer.lock().await;
-        let mut state: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            std::collections::HashMap::new();
-        for (_seqno, ops) in buf.batches_in_order() {
-            for op in ops {
-                match op {
-                    ReplOp::Put(k, v) | ReplOp::PutFrame(k, v, _) => {
-                        state.insert(k.to_vec(), v.to_vec());
-                    }
-                    ReplOp::Delete(k) => {
-                        state.remove(k.as_ref());
-                    }
-                }
-            }
-        }
+        assert_eq!(buf.epoch(), 6);
         assert_eq!(
-            state.get(b"/f".as_ref()).map(|v| v.as_slice()),
-            Some(b"new".as_ref()),
-            "the epoch-6 write must win: a heartbeat bumped highest_epoch, so the \
-             epoch-6 ship did not clear the stale epoch-5 tail, which replayed last"
+            buf.batches_in_order()
+                .map(|(seqno, _)| seqno)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "a heartbeat epoch bump must not suppress cross-term replacement"
         );
     }
 
-    // A standby promotes (leading=true), then a deposed leader sharing the
-    // same writer epoch re-ships. The ship must be rejected — see the
-    // `leading` check in `replicate`.
+    // A leading receiver must distinguish a zombie sender from a peer that has
+    // acquired a strictly newer writer epoch. Neither may enter its replayed tail,
+    // but only the former is evidence that the sender itself is deposed.
     #[tokio::test]
-    async fn promoted_node_rejects_equal_epoch_zombie_ship() {
+    async fn leading_receiver_rejects_zombies_but_reports_newer_writer_unavailable() {
         let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let leading = Arc::new(AtomicBool::new(false));
-        let endpoint = spawn_receiver_with_leading(buffer.clone(), leading.clone()).await;
-        let sender = loop {
-            match ReplicationSender::connect(endpoint.clone()).await {
-                Ok(s) => break s,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        };
+        let (endpoint, role) = spawn_receiver_with_role(buffer.clone()).await;
+        let sender = connect(&endpoint).await;
 
         // Before promotion, an epoch-7 ship is accepted and buffered.
         assert!(sender.ship(1, &[put(b"a", b"1")], &[], 0, 7).await.unwrap());
         assert_eq!(buffer.lock().await.len(), 1);
 
-        // This node promotes (opens the db as writer at a new epoch).
-        leading.store(true, Ordering::Release);
+        // This process publishes the writer epoch it acquired on open.
+        role.publish_writer(7);
 
         // The deposed leader (still epoch 7) re-ships: it must be rejected, and
         // nothing must enter the tail or dedup.
@@ -677,6 +848,263 @@ mod tests {
             buffer.lock().await.len(),
             1,
             "a rejected zombie ship must not buffer into the promoted node's tail"
+        );
+
+        assert!(
+            !sender.ship(3, &[put(b"c", b"3")], &[], 0, 6).await.unwrap(),
+            "a lower-epoch zombie must also be authoritatively rejected"
+        );
+
+        let err = sender
+            .ship(1, &[put(b"new", b"writer")], &[], 0, 8)
+            .await
+            .expect_err("a newer writer must see this stale receiver as unavailable");
+        assert_eq!(
+            err.downcast_ref::<tonic::Status>().map(tonic::Status::code),
+            Some(tonic::Code::Unavailable)
+        );
+        assert_eq!(
+            buffer.lock().await.len(),
+            1,
+            "the newer writer must not enter a stale process's already-replayed tail"
+        );
+    }
+
+    // Promotion may land between the fast role check and the tail lock.
+    #[tokio::test]
+    async fn ship_losing_the_promotion_race_is_rejected() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let dedup = Arc::new(crate::dedup::DedupCache::new(64));
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let (endpoint, role) = spawn_receiver_paused_before_tail_lock(
+            buffer.clone(),
+            dedup.clone(),
+            7,
+            reached.clone(),
+            resume.clone(),
+        )
+        .await;
+        let sender = connect(&endpoint).await;
+        let op_id = [9u8; 16];
+        let ship = tokio::spawn(async move {
+            sender
+                .ship(1, &[put(b"late", b"write")], &[op_id], 0, 7)
+                .await
+                .unwrap()
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), reached.notified())
+            .await
+            .expect("the ship must reach the tail-lock boundary");
+
+        // Promotion publishes the new role before taking this same lock for its
+        // one-time replay. Keep it held until the waiting handler is released.
+        role.publish_writer(8);
+        let replay_guard = buffer.lock().await;
+        resume.notify_one();
+        tokio::task::yield_now().await;
+        drop(replay_guard);
+
+        let accepted = tokio::time::timeout(Duration::from_secs(3), ship)
+            .await
+            .expect("the ship must finish after replay releases the tail lock")
+            .unwrap();
+        assert!(
+            !accepted,
+            "a ship that loses the tail-lock race to promotion must be rejected"
+        );
+        assert!(
+            buffer.lock().await.is_empty(),
+            "the post-replay ship must not enter the tail"
+        );
+        assert!(
+            dedup.get(&op_id).is_none(),
+            "a rejected post-replay ship must not poison dedup"
+        );
+    }
+
+    // A newer sender makes a promoter with an older local epoch the stale side.
+    #[tokio::test]
+    async fn newer_ship_losing_the_promotion_race_sees_stale_receiver() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let dedup = Arc::new(crate::dedup::DedupCache::new(64));
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let (endpoint, role) = spawn_receiver_paused_before_tail_lock(
+            buffer.clone(),
+            dedup.clone(),
+            9,
+            reached.clone(),
+            resume.clone(),
+        )
+        .await;
+        let sender = connect(&endpoint).await;
+        let op_id = [10u8; 16];
+        let ship = tokio::spawn(async move {
+            sender
+                .ship(1, &[put(b"newer", b"write")], &[op_id], 0, 9)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), reached.notified())
+            .await
+            .expect("the newer ship must reach the tail-lock boundary");
+
+        role.publish_writer(8);
+        let replay_guard = buffer.lock().await;
+        resume.notify_one();
+        tokio::task::yield_now().await;
+        drop(replay_guard);
+
+        let err = tokio::time::timeout(Duration::from_secs(3), ship)
+            .await
+            .expect("the newer ship must finish after replay releases the tail lock")
+            .unwrap()
+            .expect_err("the stale promoter must report itself unavailable");
+        assert_eq!(
+            err.downcast_ref::<tonic::Status>().map(tonic::Status::code),
+            Some(tonic::Code::Unavailable)
+        );
+        assert!(
+            buffer.lock().await.is_empty(),
+            "a stale promoter must not append after its one-time replay"
+        );
+        assert!(
+            dedup.get(&op_id).is_none(),
+            "a stale promoter must not publish the rejected op-id"
+        );
+    }
+
+    // Heartbeat epoch publication shares the ship admission critical section.
+    #[tokio::test]
+    async fn heartbeat_epoch_update_waits_for_ship_admission() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let (endpoint, highest_epoch) =
+            spawn_receiver_paused_before_append(buffer.clone(), 5, reached.clone(), resume.clone())
+                .await;
+        let sender = connect(&endpoint).await;
+
+        let ship = tokio::spawn(async move {
+            sender
+                .ship(50, &[put(b"f", b"old")], &[], 0, 5)
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(3), reached.notified())
+            .await
+            .expect("the ship must reach the admission critical section");
+
+        // A restarted leader (epoch 6) heartbeats while the epoch-5 ship holds
+        // the admission critical section.
+        let hb = tokio::spawn(run_heartbeat_sender(
+            endpoint.clone(),
+            6,
+            Duration::from_secs(3600),
+        ));
+        let published_mid_admission = tokio::time::timeout(Duration::from_millis(500), async {
+            while highest_epoch.load(Ordering::Acquire) < 6 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            !published_mid_admission,
+            "a heartbeat published a newer epoch inside another ship's admission \
+             critical section"
+        );
+
+        // The ship was admitted before any newer epoch was published: accepted.
+        resume.notify_one();
+        let accepted = tokio::time::timeout(Duration::from_secs(3), ship)
+            .await
+            .expect("the ship must finish once resumed")
+            .unwrap();
+        assert!(accepted);
+
+        // Once the admission releases the lock the beat publishes, and a further
+        // stale ship is fenced.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while highest_epoch.load(Ordering::Acquire) < 6 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the heartbeat must publish after the admission releases");
+        hb.abort();
+        let sender2 = connect(&endpoint).await;
+        assert!(
+            !sender2
+                .ship(51, &[put(b"f", b"old2")], &[], 0, 5)
+                .await
+                .unwrap(),
+            "a stale ship after the published beat must be fenced"
+        );
+    }
+
+    // A stale ship must be re-fenced if a newer term wins the tail lock.
+    #[tokio::test]
+    async fn stale_ship_losing_the_tail_lock_race_is_rejected() {
+        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+        let dedup = Arc::new(crate::dedup::DedupCache::new(64));
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let (endpoint, _role) = spawn_receiver_paused_before_tail_lock(
+            buffer.clone(),
+            dedup.clone(),
+            5,
+            reached.clone(),
+            resume.clone(),
+        )
+        .await;
+
+        let stale_sender = connect(&endpoint).await;
+        let current_sender = connect(&endpoint).await;
+
+        let stale_op_id = [5u8; 16];
+        let stale_ship = tokio::spawn(async move {
+            stale_sender
+                .ship(50, &[put(b"stale", b"write")], &[stale_op_id], 0, 5)
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(3), reached.notified())
+            .await
+            .expect("the stale ship must reach the tail-lock boundary");
+
+        assert!(
+            current_sender
+                .ship(1, &[put(b"current", b"write")], &[], 0, 6)
+                .await
+                .unwrap(),
+            "the newer epoch ship must be accepted first"
+        );
+        resume.notify_one();
+
+        let stale_accepted = tokio::time::timeout(Duration::from_secs(3), stale_ship)
+            .await
+            .expect("the stale ship must finish after it resumes")
+            .unwrap();
+        assert!(
+            !stale_accepted,
+            "a stale ship must be re-fenced if a newer epoch won the tail lock"
+        );
+        let buf = buffer.lock().await;
+        assert_eq!(buf.epoch(), 6);
+        assert_eq!(
+            buf.batches_in_order()
+                .map(|(seqno, _)| seqno)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the stale epoch batch must not enter the newer term's tail"
+        );
+        drop(buf);
+        assert!(
+            dedup.get(&stale_op_id).is_none(),
+            "a re-fenced stale ship must not poison dedup"
         );
     }
 }

@@ -18,6 +18,7 @@ use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::fs::store::{ExtentStore, InodeStore};
+use crate::replication::ShipOutcome;
 use crate::task::spawn_named;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
@@ -208,11 +209,10 @@ async fn worker_loop(
     initial_counter: u64,
 ) {
     let mut last_emitted_counter = initial_counter;
-    // Set once this leader first downgrades to Solo and durably taints its lineage.
-    // The current lineage is always untainted at bring-up (we never carry forward a
-    // tainted one), so it starts false; once set it stays set for this process's
-    // life — a lineage that ever went Solo stays tainted even if it reconnects.
+    // A lineage is tainted at most once per leader process.
     let mut taint_written = false;
+    // Cleared after the first post-solo shipped batch is flushed.
+    let mut reconnect_flush_pending = false;
 
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
@@ -343,18 +343,36 @@ async fn worker_loop(
             repl_ops = ctx.extent_store.enrich_repl_ops(repl_ops);
         }
 
-        // Commit-then-apply: ship and await the standby's durable ack before
-        // applying, so a visible write is always replicated. `ship` returns None
-        // when solo (no standby, or just downgraded); a solo write is still valid,
-        // just single-node durable until the standby returns.
-        let shipped_seqno = if any_ops {
-            match ctx.replicator.as_ref() {
-                Some(repl) => repl.ship(&repl_ops, &batch_op_ids).await,
-                None => None,
-            }
-        } else {
-            None
+        // Commit-then-apply while connected. Solo batches still commit with
+        // single-node durability.
+        let ship_outcome = match (any_ops, ctx.replicator.as_ref()) {
+            (true, Some(repl)) => Some(repl.ship(&repl_ops, &batch_op_ids).await),
+            _ => None,
         };
+        // Rejection is deposal evidence. Fail the batch and force a manifest
+        // update so fencing closes the database without waiting for its poller.
+        let (shipped_seqno, ran_solo) = match ship_outcome {
+            Some(ShipOutcome::Deposed) => {
+                tracing::error!(
+                    "HA: standby rejected a ship: this leader is deposed; failing the \
+                     batch and stepping down"
+                );
+                let _ = ctx.flush_coordinator.flush().await;
+                if counter_staged {
+                    ctx.inode_store.allocate();
+                }
+                for reply in replies {
+                    let _ = reply.send(Err(FsError::IoError));
+                }
+                continue;
+            }
+            Some(ShipOutcome::Shipped(seqno)) => (Some(seqno), false),
+            Some(ShipOutcome::Solo) => (None, true),
+            None => (None, false),
+        };
+        if ran_solo {
+            reconnect_flush_pending = true;
+        }
 
         // HA provenance stamp, flushed atomically with the batch: (epoch, last
         // acked ship's seqno, solo commits since). On takeover a promoted
@@ -384,7 +402,7 @@ async fn worker_loop(
         // carried-forward token. One flush per leader, gated by `taint_written`. If
         // it can't be made durable we fail the batch rather than ack a write we
         // cannot stand behind.
-        if !taint_written && any_ops && ctx.replicator.is_some() && shipped_seqno.is_none() {
+        if !taint_written && ran_solo {
             match ctx
                 .db
                 .put_with_options(
@@ -454,9 +472,16 @@ async fn worker_loop(
         // In sync_writes mode, force a flush after the batch is committed so
         // every caller in the batch only sees Ok once their data is durable in
         // object storage. FlushCoordinator coalesces concurrent flush requests
-        // into a single db.flush()
-        if ctx.sync_writes && result.is_ok() && any_ops {
+        // into a single db.flush(). The first shipped batch after a solo episode
+        // must flush too: its stamp (solo=0) supersedes the durable solo>0 one,
+        // and acking before it is durable would let a crash-then-takeover
+        // discard this acked batch with the outlived tail.
+        let reconnect_flush = shipped_seqno.is_some() && reconnect_flush_pending;
+        if (ctx.sync_writes || reconnect_flush) && result.is_ok() && any_ops {
             result = ctx.flush_coordinator.flush().await;
+            if result.is_ok() && reconnect_flush {
+                reconnect_flush_pending = false;
+            }
         }
 
         // Same watermark hole as the seg-delta abort above, for the failures
@@ -748,5 +773,151 @@ mod tests {
             .unwrap();
         let shard: StatsShardData = bincode::deserialize(&raw).unwrap();
         assert_eq!((shard.used_bytes, shard.used_inodes), (0, TASKS));
+    }
+
+    use crate::replication::transport::{ReplicationReceiver, ReplicationSender};
+    use crate::replication::{ReplOp, Replicator, TailBuffer};
+
+    async fn spawn_receiver() -> (String, Arc<tokio::sync::Mutex<TailBuffer>>) {
+        let buffer = Arc::new(tokio::sync::Mutex::new(TailBuffer::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ReplicationReceiver::new(
+            buffer.clone(),
+            Arc::new(crate::dedup::DedupCache::new(64)),
+            None,
+            "standby-under-test".to_string(),
+        )
+        .into_server();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), buffer)
+    }
+
+    async fn connect_sender(endpoint: &str) -> ReplicationSender {
+        for _ in 0..100 {
+            if let Ok(s) = ReplicationSender::connect(endpoint.to_string()).await {
+                return s;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("could not connect to receiver");
+    }
+
+    /// A second coordinator over the same fs's stores, with a replicator attached.
+    fn replicating_coordinator(fs: &ZeroFS, replicator: Arc<Replicator>) -> WriteCoordinator {
+        WriteCoordinator::new(
+            fs.db.clone(),
+            fs.inode_store.clone(),
+            fs.flush_coordinator.clone(),
+            Arc::new(KeyCodec::new()),
+            fs.global_stats.clone(),
+            false,
+            Some(replicator),
+            fs.dedup.clone(),
+            fs.lineage_token,
+            fs.extent_store.clone(),
+        )
+    }
+
+    // A standby's rejection is deposal evidence: a newer writer exists, so the
+    // new history cannot contain this batch. It must fail, not be applied and
+    // acked by the deposed leader.
+    #[tokio::test]
+    async fn rejected_ship_fails_the_batch_instead_of_acking() {
+        let fs = make_fs().await;
+        let (endpoint, _buffer) = spawn_receiver().await;
+        // A newer leader (epoch 5) shipped first: epoch-1 ships are rejected.
+        let newer = connect_sender(&endpoint).await;
+        assert!(
+            newer
+                .ship(1, &[ReplOp::Put("a".into(), "b".into())], &[], 0, 5)
+                .await
+                .unwrap()
+        );
+
+        let repl = Replicator::new(endpoint.clone(), 1);
+        repl.set_sender_for_tests(Some(connect_sender(&endpoint).await))
+            .await;
+        let coord = replicating_coordinator(&fs, repl);
+
+        let codec = codec();
+        let key = codec.extent_key(1, 0);
+        let mut txn = Transaction::new();
+        txn.put_bytes(&key, Bytes::from_static(b"v"));
+        coord
+            .commit(txn)
+            .await
+            .expect_err("a deposed leader must fail the batch, not ack it");
+        assert!(
+            fs.db.get_bytes(&key).await.unwrap().is_none(),
+            "a deposed leader must not apply the rejected batch"
+        );
+
+        // Deposal is terminal: later batches fail too.
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(1, 1), Bytes::from_static(b"w"));
+        coord.commit(txn).await.expect_err("deposal must be sticky");
+    }
+
+    // The first shipped batch after a solo episode carries the stamp (solo=0)
+    // that supersedes the durable solo>0 one. It must be durable before the ack:
+    // a crash before the flush leaves the durable head stamped solo>0, and the
+    // takeover replay guard would discard the acked batch with the tail.
+    #[tokio::test]
+    async fn first_shipped_batch_after_a_solo_episode_is_flushed_before_ack() {
+        let fs = make_fs().await;
+        let (endpoint, _buffer) = spawn_receiver().await;
+        let repl = Replicator::new(endpoint.clone(), 7);
+        repl.set_sender_for_tests(Some(connect_sender(&endpoint).await))
+            .await;
+        let coord = replicating_coordinator(&fs, repl.clone());
+        let codec = codec();
+
+        // Connected write: no forced flush.
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(1, 0), Bytes::from_static(b"a"));
+        coord.commit(txn).await.unwrap();
+        let baseline = fs.flush_coordinator.completed_flush_count();
+
+        // Standby outage: solo writes (the first durably taints the lineage).
+        repl.set_sender_for_tests(None).await;
+        for i in 1..=2u64 {
+            let mut txn = Transaction::new();
+            txn.put_bytes(&codec.extent_key(1, i), Bytes::from_static(b"s"));
+            coord.commit(txn).await.unwrap();
+        }
+        assert_eq!(
+            fs.flush_coordinator.completed_flush_count(),
+            baseline + 1,
+            "the solo episode forces exactly the one-time taint flush"
+        );
+
+        // Reconnect: the next shipped batch must flush before its ack.
+        repl.set_sender_for_tests(Some(connect_sender(&endpoint).await))
+            .await;
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(1, 3), Bytes::from_static(b"c"));
+        coord.commit(txn).await.unwrap();
+        assert_eq!(
+            fs.flush_coordinator.completed_flush_count(),
+            baseline + 2,
+            "the first post-solo shipped batch must be forced durable before the ack"
+        );
+
+        // Steady state again: no flush per shipped batch.
+        let mut txn = Transaction::new();
+        txn.put_bytes(&codec.extent_key(1, 4), Bytes::from_static(b"d"));
+        coord.commit(txn).await.unwrap();
+        assert_eq!(
+            fs.flush_coordinator.completed_flush_count(),
+            baseline + 2,
+            "steady-state shipped batches must not force a flush"
+        );
     }
 }

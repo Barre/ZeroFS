@@ -19,7 +19,7 @@ pub use failover::watch_heartbeats_until_takeover;
 #[allow(unused_imports)]
 pub use lease::{Lease, run_lease_from_status};
 #[allow(unused_imports)]
-pub use replicator::Replicator;
+pub use replicator::{Replicator, ShipOutcome};
 #[allow(unused_imports)]
 pub use tail::{ReplOp, TailBuffer};
 
