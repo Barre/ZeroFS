@@ -776,19 +776,17 @@ mod tests {
     }
 
     use crate::replication::transport::{ReplicationReceiver, ReplicationSender};
-    use crate::replication::{ReplOp, Replicator, TailBuffer};
+    use crate::replication::{ReplOp, Replicator};
 
-    async fn spawn_receiver() -> (String, Arc<tokio::sync::Mutex<TailBuffer>>) {
-        let buffer = Arc::new(tokio::sync::Mutex::new(TailBuffer::new()));
+    async fn spawn_receiver() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = ReplicationReceiver::new(
-            buffer.clone(),
+        let receiver = ReplicationReceiver::new(
             Arc::new(crate::dedup::DedupCache::new(64)),
             None,
             "standby-under-test".to_string(),
-        )
-        .into_server();
+        );
+        let server = receiver.into_server();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(server)
@@ -796,7 +794,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (format!("http://{addr}"), buffer)
+        format!("http://{addr}")
     }
 
     async fn connect_sender(endpoint: &str) -> ReplicationSender {
@@ -831,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_ship_fails_the_batch_instead_of_acking() {
         let fs = make_fs().await;
-        let (endpoint, _buffer) = spawn_receiver().await;
+        let endpoint = spawn_receiver().await;
         // A newer leader (epoch 5) shipped first: epoch-1 ships are rejected.
         let newer = connect_sender(&endpoint).await;
         assert!(
@@ -868,11 +866,11 @@ mod tests {
     // The first shipped batch after a solo episode carries the stamp (solo=0)
     // that supersedes the durable solo>0 one. It must be durable before the ack:
     // a crash before the flush leaves the durable head stamped solo>0, and the
-    // takeover replay guard would discard the acked batch with the tail.
+    // takeover reconciliation would discard the acked batch with the tail.
     #[tokio::test]
     async fn first_shipped_batch_after_a_solo_episode_is_flushed_before_ack() {
         let fs = make_fs().await;
-        let (endpoint, _buffer) = spawn_receiver().await;
+        let endpoint = spawn_receiver().await;
         let repl = Replicator::new(endpoint.clone(), 7);
         repl.set_sender_for_tests(Some(connect_sender(&endpoint).await))
             .await;

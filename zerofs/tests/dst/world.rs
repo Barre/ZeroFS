@@ -144,22 +144,29 @@ impl Storage {
                 .expect("slatedb open"),
         );
         let fs = Arc::new(
-            ZeroFS::new_with_slatedb(
+            ZeroFS::new_with_slatedb_and_lease(
                 SlateDbHandle::ReadWrite(slatedb),
                 u64::MAX,
                 None,
                 false,
+                false,
+                None,
+                None,
+                Arc::new(zerofs::dedup::DedupCache::new(65_536)),
+                None,
+                zerofs::object_trace::ObjectTracer::new(),
                 object_store,
                 zerofs::frame_codec::FrameCodec::new(
                     &[7u8; 32],
                     zerofs::segment::SEGMENT_INFO,
                     zerofs::config::CompressionConfig::default(),
                 ),
+                None,
+                Some(scale.seal_threshold),
             )
             .await
             .expect("zerofs open"),
         );
-        fs.extent_store.set_seal_threshold(scale.seal_threshold);
         fs.extent_store.enable_nominations();
         fs
     }

@@ -1,10 +1,10 @@
-//! The replication transport: the standby's receiver (a tonic service over the
-//! shared tail buffer) and the leader's sender (a tonic client), over gRPC.
+//! The replication transport: the receiver-side role state machine and the
+//! leader's gRPC sender.
 
+use crate::dedup::OpId;
 use crate::replication::tail::{ReplOp, TailBuffer};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, watch};
 use tonic::transport::Channel;
@@ -32,25 +32,163 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Decode ceiling for an incoming `ReplicateRequest`. tonic defaults to 4 MiB.
 const MAX_SHIP_DECODE_BYTES: usize = usize::MAX;
 
-/// The writer epoch this process acquired, published once when it promotes.
-/// It remains available after fencing so peer rejections can identify which
-/// process is stale.
-#[derive(Default)]
-pub(crate) struct ReceiverRole {
-    writer_epoch: OnceLock<u64>,
+/// One decoded replication batch at the message boundary.
+struct IncomingShip {
+    seqno: u64,
+    ops: Vec<ReplOp>,
+    op_ids: Vec<OpId>,
+    prune_watermark: u64,
+    writer_epoch: u64,
 }
 
-impl ReceiverRole {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn publish_writer(&self, writer_epoch: u64) {
-        assert!(
-            self.writer_epoch.set(writer_epoch).is_ok(),
-            "receiver writer epoch published twice"
-        );
+/// Receiver-side disposition of a decoded ship.
+enum ShipDisposition {
+    /// The batch entered the standby tail.
+    Accepted,
+    /// The sender is at or below this receiver's writer epoch, or below the
+    /// highest epoch already observed. This is authoritative deposal evidence.
+    SenderDeposed,
+    /// The sender is newer than this process's locally acquired writer epoch.
+    /// The receiver is stale, so this is an availability failure for the sender,
+    /// not evidence that the sender is deposed.
+    ReceiverStale {
+        local_epoch: u64,
+        incoming_epoch: u64,
+    },
+}
+
+fn ship_rpc_response(disposition: ShipDisposition) -> Result<Response<ReplicateResponse>, Status> {
+    match disposition {
+        ShipDisposition::Accepted => Ok(Response::new(ReplicateResponse { accepted: true })),
+        ShipDisposition::SenderDeposed => Ok(Response::new(ReplicateResponse { accepted: false })),
+        ShipDisposition::ReceiverStale {
+            local_epoch,
+            incoming_epoch,
+        } => Err(Status::unavailable(format!(
+            "receiver is a stale writer at epoch {local_epoch}; incoming writer \
+             epoch is {incoming_epoch}"
+        ))),
+    }
+}
+
+struct StandbyState {
+    observed_epoch: u64,
+    tail: TailBuffer,
+}
+
+enum ReceiverPhase {
+    Standby(StandbyState),
+    /// The local writer epoch is acquired and the old standby tail is owned by
+    /// takeover reconciliation. Admission stays closed if it fails or is cancelled.
+    Promoting {
+        writer_epoch: u64,
+    },
+    Leading {
+        writer_epoch: u64,
+    },
+}
+
+struct ReceiverCore {
+    phase: Mutex<ReceiverPhase>,
+    dedup: Arc<crate::dedup::DedupCache>,
+}
+
+/// Handle for atomically freezing a receiver's standby state during promotion.
+#[derive(Clone)]
+pub struct ReceiverControl {
+    core: Arc<ReceiverCore>,
+}
+
+/// The tail and observed epoch frozen by one promotion transition. It is
+/// intentionally non-cloneable: reconciliation consumes the only copy.
+#[must_use = "a promotion snapshot must be reconciled before serving"]
+pub struct PromotionSnapshot {
+    control: ReceiverControl,
+    writer_epoch: u64,
+    observed_epoch: u64,
+    tail: TailBuffer,
+}
+
+impl ReceiverControl {
+    /// Fence receiver admission and take ownership of the standby tail.
+    pub async fn begin_promotion(&self, writer_epoch: u64) -> anyhow::Result<PromotionSnapshot> {
+        anyhow::ensure!(writer_epoch > 0, "receiver writer epoch must be nonzero");
+        let mut phase = self.core.phase.lock().await;
+        match &*phase {
+            ReceiverPhase::Standby(_) => {}
+            ReceiverPhase::Promoting {
+                writer_epoch: existing,
+            }
+            | ReceiverPhase::Leading {
+                writer_epoch: existing,
+            } => anyhow::bail!(
+                "receiver already fenced at writer epoch {existing}; cannot promote \
+                 at epoch {writer_epoch}"
+            ),
+        }
+        let ReceiverPhase::Standby(standby) =
+            std::mem::replace(&mut *phase, ReceiverPhase::Promoting { writer_epoch })
+        else {
+            unreachable!("standby phase checked above")
+        };
+        Ok(PromotionSnapshot {
+            control: self.clone(),
+            writer_epoch,
+            observed_epoch: standby.observed_epoch,
+            tail: standby.tail,
+        })
     }
 
-    fn leading_epoch(&self) -> Option<u64> {
-        self.writer_epoch.get().copied()
+    async fn complete_promotion(&self, writer_epoch: u64) -> anyhow::Result<()> {
+        let mut phase = self.core.phase.lock().await;
+        match &*phase {
+            ReceiverPhase::Promoting {
+                writer_epoch: current,
+            } if *current == writer_epoch => {
+                *phase = ReceiverPhase::Leading { writer_epoch };
+                Ok(())
+            }
+            ReceiverPhase::Promoting {
+                writer_epoch: current,
+            } => anyhow::bail!("receiver promotion epoch changed from {writer_epoch} to {current}"),
+            ReceiverPhase::Standby(_) => {
+                anyhow::bail!("receiver returned to standby during promotion")
+            }
+            ReceiverPhase::Leading {
+                writer_epoch: current,
+            } => anyhow::bail!("receiver already leading at epoch {current}"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inspect_standby_for_tests<R>(
+        &self,
+        inspect: impl FnOnce(&TailBuffer, u64) -> R,
+    ) -> R {
+        let phase = self.core.phase.lock().await;
+        let ReceiverPhase::Standby(standby) = &*phase else {
+            panic!("receiver is no longer a standby")
+        };
+        inspect(&standby.tail, standby.observed_epoch)
+    }
+}
+
+impl PromotionSnapshot {
+    pub(crate) fn observed_epoch(&self) -> u64 {
+        self.observed_epoch
+    }
+
+    pub(crate) fn tail_mut(&mut self) -> &mut TailBuffer {
+        &mut self.tail
+    }
+
+    pub(crate) fn dedup(&self) -> Arc<crate::dedup::DedupCache> {
+        self.control.core.dedup.clone()
+    }
+
+    pub(crate) async fn complete(self) -> anyhow::Result<u64> {
+        self.control.complete_promotion(self.writer_epoch).await?;
+        Ok(self.writer_epoch)
     }
 }
 
@@ -97,17 +235,11 @@ fn to_proto_ops(ops: &[ReplOp]) -> Vec<ProtoOp> {
         .collect()
 }
 
-/// The standby side: buffers shipped batches into the shared tail buffer, prunes
-/// on the leader's watermark, and rejects ships from a stale writer epoch.
+/// Receives replication into an owned standby tail and fences stale writer epochs.
 pub struct ReplicationReceiver {
-    buffer: Arc<Mutex<TailBuffer>>,
-    highest_epoch: Arc<AtomicU64>,
-    /// Idempotency cache for batches proven durable by pruning or replay.
-    dedup: Arc<crate::dedup::DedupCache>,
+    core: Arc<ReceiverCore>,
     /// Ticks on each accepted heartbeat; the failover watch follows it.
     heartbeats: watch::Sender<u64>,
-    /// This process's locally opened writer epoch, if it has promoted.
-    role: Arc<ReceiverRole>,
     /// Fired when a deposed leader asks (Hello) and we are a standby holding a
     /// tail, so we take over at once instead of waiting out the heartbeat gap.
     takeover_trigger: Option<Arc<Notify>>,
@@ -115,9 +247,9 @@ pub struct ReplicationReceiver {
     /// refuse startup on a duplicated node_id (identity keys the latest-leader
     /// record, so a collision is a config error).
     node_id: String,
-    /// Test-only gate between the fast checks and the tail lock.
+    /// Test-only gate between the fast checks and the phase lock.
     #[cfg(test)]
-    before_tail_lock_pause: Option<(u64, Arc<Notify>, Arc<Notify>)>,
+    before_phase_lock_pause: Option<(u64, Arc<Notify>, Arc<Notify>)>,
     /// Test-only gate inside the admission critical section (fence check passed,
     /// append not yet done), to prove epoch publication cannot interleave there.
     #[cfg(test)]
@@ -126,34 +258,36 @@ pub struct ReplicationReceiver {
 
 impl ReplicationReceiver {
     pub fn new(
-        buffer: Arc<Mutex<TailBuffer>>,
         dedup: Arc<crate::dedup::DedupCache>,
         takeover_trigger: Option<Arc<Notify>>,
         node_id: String,
     ) -> Self {
         Self {
-            buffer,
-            highest_epoch: Arc::new(AtomicU64::new(0)),
-            dedup,
+            core: Arc::new(ReceiverCore {
+                phase: Mutex::new(ReceiverPhase::Standby(StandbyState {
+                    observed_epoch: 0,
+                    tail: TailBuffer::new(),
+                })),
+                dedup,
+            }),
             heartbeats: watch::channel(0u64).0,
-            role: Arc::new(ReceiverRole::default()),
             takeover_trigger,
             node_id,
             #[cfg(test)]
-            before_tail_lock_pause: None,
+            before_phase_lock_pause: None,
             #[cfg(test)]
             before_append_pause: None,
         }
     }
 
     #[cfg(test)]
-    fn pause_epoch_before_tail_lock(
+    fn pause_epoch_before_phase_lock(
         mut self,
         epoch: u64,
         reached: Arc<Notify>,
         resume: Arc<Notify>,
     ) -> Self {
-        self.before_tail_lock_pause = Some((epoch, reached, resume));
+        self.before_phase_lock_pause = Some((epoch, reached, resume));
         self
     }
 
@@ -173,31 +307,113 @@ impl ReplicationReceiver {
         self.heartbeats.subscribe()
     }
 
-    /// Highest writer epoch seen from the leader (ships + heartbeats). At takeover
-    /// the promoted standby uses it to confirm the db's HA tail watermark was
-    /// written by this same term before pruning its tail by it.
-    pub fn highest_epoch(&self) -> Arc<AtomicU64> {
-        self.highest_epoch.clone()
-    }
-
-    /// Handle used to publish the local writer epoch before takeover replay.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn role(&self) -> Arc<ReceiverRole> {
-        self.role.clone()
+    /// Return the handle used to begin promotion after opening the writer db.
+    pub fn control(&self) -> ReceiverControl {
+        ReceiverControl {
+            core: self.core.clone(),
+        }
     }
 
     /// A promoted receiver never buffers peer writes. A lower or equal sender
     /// is deposed; a higher sender means this receiver is the stale process.
-    fn leading_rejection(&self, incoming_epoch: u64) -> Result<Option<ReplicateResponse>, Status> {
-        let Some(local_epoch) = self.role.leading_epoch() else {
-            return Ok(None);
-        };
+    fn fenced_disposition(local_epoch: u64, incoming_epoch: u64) -> ShipDisposition {
         if incoming_epoch > local_epoch {
-            return Err(Status::unavailable(format!(
-                "receiver is a stale writer at epoch {local_epoch}; incoming writer epoch is {incoming_epoch}"
-            )));
+            ShipDisposition::ReceiverStale {
+                local_epoch,
+                incoming_epoch,
+            }
+        } else {
+            ShipDisposition::SenderDeposed
         }
-        Ok(Some(ReplicateResponse { accepted: false }))
+    }
+
+    /// Cheap advisory rejection before converting the decoded payload. The
+    /// authoritative decision is repeated while mutating `ReceiverPhase`.
+    async fn preflight_ship(&self, incoming_epoch: u64) -> Option<ShipDisposition> {
+        let phase = self.core.phase.lock().await;
+        match &*phase {
+            ReceiverPhase::Standby(standby) => {
+                (incoming_epoch < standby.observed_epoch).then_some(ShipDisposition::SenderDeposed)
+            }
+            ReceiverPhase::Promoting { writer_epoch } | ReceiverPhase::Leading { writer_epoch } => {
+                Some(Self::fenced_disposition(*writer_epoch, incoming_epoch))
+            }
+        }
+    }
+
+    /// Admit one decoded replication batch. Fencing, observed-peer epoch,
+    /// tail mutation, pruning, and dedup publication share one state transition.
+    async fn receive_ship(&self, ship: IncomingShip) -> ShipDisposition {
+        let IncomingShip {
+            seqno,
+            ops,
+            op_ids,
+            prune_watermark,
+            writer_epoch,
+        } = ship;
+
+        let op_ids: Vec<OpId> = op_ids.into_iter().filter(crate::dedup::has_op_id).collect();
+        #[cfg(test)]
+        if let Some((epoch, reached, resume)) = &self.before_phase_lock_pause
+            && writer_epoch == *epoch
+        {
+            reached.notify_one();
+            resume.notified().await;
+        }
+        let mut phase = self.core.phase.lock().await;
+        match &mut *phase {
+            ReceiverPhase::Standby(standby) => {
+                if writer_epoch < standby.observed_epoch {
+                    return ShipDisposition::SenderDeposed;
+                }
+                standby.observed_epoch = standby.observed_epoch.max(writer_epoch);
+                #[cfg(test)]
+                if let Some((epoch, reached, resume)) = &self.before_append_pause
+                    && writer_epoch == *epoch
+                {
+                    reached.notify_one();
+                    resume.notified().await;
+                }
+                // Cross-term replacement uses the tail epoch; a heartbeat may
+                // already have advanced `observed_epoch`.
+                standby.tail.accept(writer_epoch, seqno, ops, op_ids);
+                if prune_watermark > 0 {
+                    for op_id in standby.tail.prune(prune_watermark) {
+                        self.core.dedup.record(op_id, Bytes::new());
+                    }
+                }
+                ShipDisposition::Accepted
+            }
+            ReceiverPhase::Promoting {
+                writer_epoch: local_epoch,
+            }
+            | ReceiverPhase::Leading {
+                writer_epoch: local_epoch,
+            } => Self::fenced_disposition(*local_epoch, writer_epoch),
+        }
+    }
+
+    /// Publish a heartbeat's observed writer epoch and report whether it should
+    /// tick liveness. Promotion moves the complete standby state out under this
+    /// same lock, so a late beat has no path to the frozen snapshot.
+    async fn receive_heartbeat(&self, writer_epoch: u64) -> bool {
+        #[cfg(test)]
+        if let Some((epoch, reached, resume)) = &self.before_phase_lock_pause
+            && writer_epoch == *epoch
+        {
+            reached.notify_one();
+            resume.notified().await;
+        }
+        let mut phase = self.core.phase.lock().await;
+        match &mut *phase {
+            ReceiverPhase::Standby(standby) if writer_epoch >= standby.observed_epoch => {
+                standby.observed_epoch = writer_epoch;
+                true
+            }
+            ReceiverPhase::Standby(_)
+            | ReceiverPhase::Promoting { .. }
+            | ReceiverPhase::Leading { .. } => false,
+        }
     }
 
     pub fn into_server(self) -> ReplicationServiceServer<Self> {
@@ -212,62 +428,24 @@ impl ReplicationService for ReplicationReceiver {
         request: Request<ReplicateRequest>,
     ) -> Result<Response<ReplicateResponse>, Status> {
         let req = request.into_inner();
-        if let Some(rejection) = self.leading_rejection(req.writer_epoch)? {
-            return Ok(Response::new(rejection));
+        // Reject cheaply before converting/copying the unbounded decoded payload.
+        // Advisory only: `receive_ship` repeats the decision while mutating the
+        // phase, which remains the authoritative admission fence.
+        if let Some(disposition) = self.preflight_ship(req.writer_epoch).await {
+            return ship_rpc_response(disposition);
         }
-        // Fast-path reject for a deposed leader (epoch below the highest seen).
-        // Advisory only, no publication: the authoritative fence runs under the
-        // tail lock below, atomically with the append.
-        if req.writer_epoch < self.highest_epoch.load(Ordering::Acquire) {
-            return Ok(Response::new(ReplicateResponse { accepted: false }));
-        }
-        let ops = to_repl_ops(req.ops);
-        let op_ids: Vec<crate::dedup::OpId> = req
-            .op_ids
-            .into_iter()
-            .filter_map(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())
-            .filter(crate::dedup::has_op_id)
-            .collect();
-        #[cfg(test)]
-        if let Some((epoch, reached, resume)) = &self.before_tail_lock_pause
-            && req.writer_epoch == *epoch
-        {
-            reached.notify_one();
-            resume.notified().await;
-        }
-        {
-            let mut buf = self.buffer.lock().await;
-            // Serialize promotion/replay against the append.
-            if let Some(rejection) = self.leading_rejection(req.writer_epoch)? {
-                return Ok(Response::new(rejection));
-            }
-            // The authoritative epoch fence. Publication (here and in `heartbeat`)
-            // happens only under the tail lock, so no newer epoch can land between
-            // this check and the append.
-            let prev = self
-                .highest_epoch
-                .fetch_max(req.writer_epoch, Ordering::AcqRel);
-            if req.writer_epoch < prev {
-                return Ok(Response::new(ReplicateResponse { accepted: false }));
-            }
-            #[cfg(test)]
-            if let Some((epoch, reached, resume)) = &self.before_append_pause
-                && req.writer_epoch == *epoch
-            {
-                reached.notify_one();
-                resume.notified().await;
-            }
-            // Cross-term replacement uses the tail epoch; `highest_epoch` may
-            // already have advanced on a heartbeat.
-            buf.accept(req.writer_epoch, req.seqno, ops, op_ids);
-            if req.prune_watermark > 0 {
-                // Publish under the tail lock so takeover sees one disposition.
-                for op_id in buf.prune(req.prune_watermark) {
-                    self.dedup.record(op_id, Bytes::new());
-                }
-            }
-        }
-        Ok(Response::new(ReplicateResponse { accepted: true }))
+        let ship = IncomingShip {
+            seqno: req.seqno,
+            ops: to_repl_ops(req.ops),
+            op_ids: req
+                .op_ids
+                .into_iter()
+                .filter_map(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())
+                .collect(),
+            prune_watermark: req.prune_watermark,
+            writer_epoch: req.writer_epoch,
+        };
+        ship_rpc_response(self.receive_ship(ship).await)
     }
 
     async fn heartbeat(
@@ -280,18 +458,7 @@ impl ReplicationService for ReplicationReceiver {
         // itself the writer, ignore all beats: a same-epoch zombie must not keep
         // this node's liveness view ticking (it is deposed by our promotion).
         while let Some(beat) = stream.message().await? {
-            if self.role.leading_epoch().is_some() {
-                continue;
-            }
-            // Publication shares the tail lock with ship admission (see
-            // `replicate`): a beat's epoch bump must not land inside another
-            // ship's fence-check-to-append window.
-            let prev = {
-                let _buf = self.buffer.lock().await;
-                self.highest_epoch
-                    .fetch_max(beat.writer_epoch, Ordering::AcqRel)
-            };
-            if beat.writer_epoch >= prev {
+            if self.receive_heartbeat(beat.writer_epoch).await {
                 self.heartbeats.send_modify(|c| *c = c.wrapping_add(1));
             }
         }
@@ -302,20 +469,23 @@ impl ReplicationService for ReplicationReceiver {
         &self,
         _request: Request<HelloRequest>,
     ) -> Result<Response<HelloResponse>, Status> {
-        let leading = self.role.leading_epoch().is_some();
-        let has_tail = !self.buffer.lock().await.is_empty();
-        // A standby holding the tail takes over NOW so the deposed leader's defer
-        // doesn't wait out the heartbeat gap (a leader already serves).
-        if !leading
-            && has_tail
-            && let Some(trigger) = &self.takeover_trigger
-        {
+        let (peer_active, trigger_takeover) = {
+            let phase = self.core.phase.lock().await;
+            match &*phase {
+                ReceiverPhase::Standby(standby) => {
+                    let has_tail = !standby.tail.is_empty();
+                    (has_tail, has_tail)
+                }
+                ReceiverPhase::Promoting { .. } | ReceiverPhase::Leading { .. } => (true, false),
+            }
+        };
+        // A standby holding the tail takes over now, without waiting out the
+        // heartbeat gap.
+        if trigger_takeover && let Some(trigger) = &self.takeover_trigger {
             trigger.notify_one();
         }
-        // Active = leading, or a standby holding an un-replayed tail (it will take
-        // over and preserve it). Either way the caller must defer, not open as writer.
         Ok(Response::new(HelloResponse {
-            peer_active: leading || has_tail,
+            peer_active,
             node_id: self.node_id.clone(),
         }))
     }
@@ -359,10 +529,8 @@ impl ReplicationSender {
 }
 
 /// Ask a peer (Hello) whether the caller should defer instead of opening as
-/// writer. `peer_active` is true if the peer is leading or holds an un-replayed
-/// tail; `node_id` is the peer's configured id (empty from a peer predating the
-/// field), which the caller checks against its own to catch a duplicated
-/// node_id at startup.
+/// writer. `peer_active` is true if the peer is promoting, leading, or preserving
+/// an un-replayed tail. `node_id` is empty on peers predating that field.
 pub struct HelloAnswer {
     pub peer_active: bool,
     pub node_id: String,
@@ -420,11 +588,8 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
 
-    fn new_receiver(
-        buffer: Arc<Mutex<TailBuffer>>,
-        dedup: Arc<crate::dedup::DedupCache>,
-    ) -> ReplicationReceiver {
-        ReplicationReceiver::new(buffer, dedup, None, "standby-under-test".to_string())
+    fn new_receiver(dedup: Arc<crate::dedup::DedupCache>) -> ReplicationReceiver {
+        ReplicationReceiver::new(dedup, None, "standby-under-test".to_string())
     }
 
     async fn serve(receiver: ReplicationReceiver) -> String {
@@ -450,65 +615,43 @@ mod tests {
         panic!("could not connect to receiver");
     }
 
-    async fn spawn_receiver(buffer: Arc<Mutex<TailBuffer>>) -> String {
-        serve(new_receiver(
-            buffer,
-            Arc::new(crate::dedup::DedupCache::new(64)),
-        ))
-        .await
+    async fn spawn_receiver() -> (String, ReceiverControl) {
+        let receiver = new_receiver(Arc::new(crate::dedup::DedupCache::new(64)));
+        let control = receiver.control();
+        (serve(receiver).await, control)
     }
 
     async fn spawn_receiver_with_dedup(
-        buffer: Arc<Mutex<TailBuffer>>,
         dedup: Arc<crate::dedup::DedupCache>,
-    ) -> String {
-        serve(new_receiver(buffer, dedup)).await
-    }
-
-    /// Like [`spawn_receiver`] but also hands back the receiver's `highest_epoch`,
-    /// so a test can observe a heartbeat's effect on it.
-    async fn spawn_receiver_exposing_epoch(
-        buffer: Arc<Mutex<TailBuffer>>,
-    ) -> (String, Arc<AtomicU64>) {
-        let receiver = new_receiver(buffer, Arc::new(crate::dedup::DedupCache::new(64)));
-        let highest_epoch = receiver.highest_epoch();
-        (serve(receiver).await, highest_epoch)
-    }
-
-    async fn spawn_receiver_with_role(
-        buffer: Arc<Mutex<TailBuffer>>,
-    ) -> (String, Arc<ReceiverRole>) {
-        let receiver = new_receiver(buffer, Arc::new(crate::dedup::DedupCache::new(64)));
-        let role = receiver.role();
-        (serve(receiver).await, role)
+    ) -> (String, ReceiverControl) {
+        let receiver = new_receiver(dedup);
+        let control = receiver.control();
+        (serve(receiver).await, control)
     }
 
     /// Receiver paused inside the admission critical section (fence check passed,
-    /// append pending) for `paused_epoch`, exposing `highest_epoch` so the test
-    /// can observe whether a concurrent publication lands during the pause.
+    /// append pending) for `paused_epoch`.
     async fn spawn_receiver_paused_before_append(
-        buffer: Arc<Mutex<TailBuffer>>,
         paused_epoch: u64,
         reached: Arc<Notify>,
         resume: Arc<Notify>,
-    ) -> (String, Arc<AtomicU64>) {
-        let receiver = new_receiver(buffer, Arc::new(crate::dedup::DedupCache::new(64)))
+    ) -> (String, ReceiverControl) {
+        let receiver = new_receiver(Arc::new(crate::dedup::DedupCache::new(64)))
             .pause_epoch_before_append(paused_epoch, reached, resume);
-        let highest_epoch = receiver.highest_epoch();
-        (serve(receiver).await, highest_epoch)
+        let control = receiver.control();
+        (serve(receiver).await, control)
     }
 
-    async fn spawn_receiver_paused_before_tail_lock(
-        buffer: Arc<Mutex<TailBuffer>>,
+    async fn spawn_receiver_paused_before_phase_lock(
         dedup: Arc<crate::dedup::DedupCache>,
         paused_epoch: u64,
         reached: Arc<Notify>,
         resume: Arc<Notify>,
-    ) -> (String, Arc<ReceiverRole>) {
+    ) -> (String, ReceiverControl) {
         let receiver =
-            new_receiver(buffer, dedup).pause_epoch_before_tail_lock(paused_epoch, reached, resume);
-        let role = receiver.role();
-        (serve(receiver).await, role)
+            new_receiver(dedup).pause_epoch_before_phase_lock(paused_epoch, reached, resume);
+        let control = receiver.control();
+        (serve(receiver).await, control)
     }
 
     fn put(k: &[u8], v: &[u8]) -> ReplOp {
@@ -517,26 +660,31 @@ mod tests {
 
     #[tokio::test]
     async fn ships_buffers_prunes_and_fences_stale_epoch() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let endpoint = spawn_receiver(buffer.clone()).await;
+        let (endpoint, control) = spawn_receiver().await;
         let sender = connect(&endpoint).await;
 
         assert!(sender.ship(1, &[put(b"a", b"1")], &[], 0, 1).await.unwrap());
         assert!(sender.ship(2, &[put(b"b", b"2")], &[], 0, 1).await.unwrap());
-        assert_eq!(buffer.lock().await.len(), 2);
+        assert_eq!(
+            control
+                .inspect_standby_for_tests(|tail, _| tail.len())
+                .await,
+            2
+        );
 
         // A ship carrying a prune watermark drops the durable prefix.
         assert!(sender.ship(3, &[put(b"c", b"3")], &[], 1, 1).await.unwrap());
-        {
-            let buf = buffer.lock().await;
-            let seqnos: Vec<u64> = buf.batches_in_order().map(|(s, _)| s).collect();
-            assert_eq!(seqnos, vec![2, 3], "watermark 1 prunes seqno 1");
-        }
+        let seqnos: Vec<u64> = control
+            .inspect_standby_for_tests(|tail, _| tail.batches_in_order().map(|(s, _)| s).collect())
+            .await;
+        assert_eq!(seqnos, vec![2, 3], "watermark 1 prunes seqno 1");
 
         // A ship from an older writer epoch (a deposed leader) is rejected.
         assert!(!sender.ship(4, &[put(b"x", b"x")], &[], 0, 0).await.unwrap());
         assert_eq!(
-            buffer.lock().await.len(),
+            control
+                .inspect_standby_for_tests(|tail, _| tail.len())
+                .await,
             2,
             "a stale-epoch ship must not buffer"
         );
@@ -545,9 +693,8 @@ mod tests {
     // A watermark is the first proof that a volatile tail batch is durable.
     #[tokio::test]
     async fn pending_op_ids_publish_only_when_pruned_as_durable() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let dedup = Arc::new(crate::dedup::DedupCache::new(64));
-        let endpoint = spawn_receiver_with_dedup(buffer, dedup.clone()).await;
+        let (endpoint, _control) = spawn_receiver_with_dedup(dedup.clone()).await;
         let sender = connect(&endpoint).await;
         let durable = [1u8; 16];
         let pending = [2u8; 16];
@@ -582,9 +729,8 @@ mod tests {
     // Pending op-ids share the disposition of their tail batch across terms.
     #[tokio::test]
     async fn cross_term_tail_replacement_drops_pending_op_ids() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let dedup = Arc::new(crate::dedup::DedupCache::new(64));
-        let endpoint = spawn_receiver_with_dedup(buffer, dedup.clone()).await;
+        let (endpoint, _control) = spawn_receiver_with_dedup(dedup.clone()).await;
         let sender = connect(&endpoint).await;
         let durable_old = [3u8; 16];
         let old = [4u8; 16];
@@ -640,8 +786,7 @@ mod tests {
     // write load. `into_server` raises the limit; this proves the wiring.
     #[tokio::test]
     async fn ship_larger_than_the_default_decode_limit_is_accepted() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let endpoint = spawn_receiver(buffer.clone()).await;
+        let (endpoint, control) = spawn_receiver().await;
         let sender = connect(&endpoint).await;
 
         // One op whose payload alone clears the 4 MiB default with headroom.
@@ -653,15 +798,20 @@ mod tests {
             sender.ship(1, &[big], &[], 0, 1).await.unwrap(),
             "a ship past the 4 MiB default decode limit must be accepted, not rejected"
         );
-        assert_eq!(buffer.lock().await.len(), 1, "the large batch must buffer");
+        assert_eq!(
+            control
+                .inspect_standby_for_tests(|tail, _| tail.len())
+                .await,
+            1,
+            "the large batch must buffer"
+        );
     }
 
     // Hello reports the responder's configured node_id, so a booting peer can
     // refuse startup on a duplicated identity (it keys the latest-leader record).
     #[tokio::test]
     async fn hello_reports_the_responders_node_id() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let endpoint = spawn_receiver(buffer).await;
+        let (endpoint, _control) = spawn_receiver().await;
         let answer = loop {
             match hello_peer(endpoint.clone()).await {
                 Ok(a) => break a,
@@ -674,9 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeats_tick_liveness_and_stop_on_break() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let receiver = ReplicationReceiver::new(
-            buffer,
             Arc::new(crate::dedup::DedupCache::new(64)),
             None,
             "standby-under-test".to_string(),
@@ -723,8 +871,7 @@ mod tests {
     // it. seqno is per-term, not global, so the buffer must drop a superseded epoch.
     #[tokio::test]
     async fn stale_prior_epoch_tail_does_not_clobber_newer_writes() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let endpoint = spawn_receiver(buffer.clone()).await;
+        let (endpoint, control) = spawn_receiver().await;
         let sender = connect(&endpoint).await;
 
         // Term 1 (writer epoch 5): un-durable tail at seqno 50/51, "/f" = "old".
@@ -750,12 +897,19 @@ mod tests {
             "a higher-epoch ship is accepted"
         );
 
-        let buf = buffer.lock().await;
-        assert_eq!(buf.epoch(), 6);
+        let (epoch, seqnos) = control
+            .inspect_standby_for_tests(|tail, _| {
+                (
+                    tail.epoch(),
+                    tail.batches_in_order()
+                        .map(|(seqno, _)| seqno)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .await;
+        assert_eq!(epoch, 6);
         assert_eq!(
-            buf.batches_in_order()
-                .map(|(seqno, _)| seqno)
-                .collect::<Vec<_>>(),
+            seqnos,
             vec![1],
             "the newer term must replace the old high-seqno tail"
         );
@@ -765,8 +919,7 @@ mod tests {
     // reaches the standby before its first ship.
     #[tokio::test]
     async fn heartbeat_epoch_bump_must_not_defeat_the_cross_term_tail_clear() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let (endpoint, highest_epoch) = spawn_receiver_exposing_epoch(buffer.clone()).await;
+        let (endpoint, control) = spawn_receiver().await;
         let sender = connect(&endpoint).await;
 
         // Term (epoch 5): un-durable tail at seqno 50/51, "/f" = "old".
@@ -784,19 +937,23 @@ mod tests {
         );
 
         // The restarted leader (epoch 6) heartbeats before it ships. Drive a real
-        // heartbeat and wait until the receiver has processed it (highest_epoch == 6).
+        // heartbeat and wait until the receiver has observed epoch 6.
         let hb = tokio::spawn(run_heartbeat_sender(
             endpoint.clone(),
             6,
             Duration::from_secs(3600),
         ));
         tokio::time::timeout(Duration::from_secs(5), async {
-            while highest_epoch.load(Ordering::Acquire) < 6 {
+            while control
+                .inspect_standby_for_tests(|_, observed_epoch| observed_epoch)
+                .await
+                < 6
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("the heartbeat must bump highest_epoch to 6");
+        .expect("the heartbeat must publish observed epoch 6");
 
         // Now the post-restart (epoch 6) write ships at the reset seqno 1.
         assert!(
@@ -808,32 +965,43 @@ mod tests {
         );
         hb.abort();
 
-        let buf = buffer.lock().await;
-        assert_eq!(buf.epoch(), 6);
+        let (epoch, seqnos) = control
+            .inspect_standby_for_tests(|tail, _| {
+                (
+                    tail.epoch(),
+                    tail.batches_in_order()
+                        .map(|(seqno, _)| seqno)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .await;
+        assert_eq!(epoch, 6);
         assert_eq!(
-            buf.batches_in_order()
-                .map(|(seqno, _)| seqno)
-                .collect::<Vec<_>>(),
+            seqnos,
             vec![1],
             "a heartbeat epoch bump must not suppress cross-term replacement"
         );
     }
 
-    // A leading receiver must distinguish a zombie sender from a peer that has
-    // acquired a strictly newer writer epoch. Neither may enter its replayed tail,
+    // A fenced receiver must distinguish a zombie sender from a peer that has
+    // acquired a strictly newer writer epoch. Neither may enter its frozen tail,
     // but only the former is evidence that the sender itself is deposed.
     #[tokio::test]
-    async fn leading_receiver_rejects_zombies_but_reports_newer_writer_unavailable() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
-        let (endpoint, role) = spawn_receiver_with_role(buffer.clone()).await;
+    async fn fenced_receiver_rejects_zombies_but_reports_newer_writer_unavailable() {
+        let (endpoint, control) = spawn_receiver().await;
         let sender = connect(&endpoint).await;
 
         // Before promotion, an epoch-7 ship is accepted and buffered.
         assert!(sender.ship(1, &[put(b"a", b"1")], &[], 0, 7).await.unwrap());
-        assert_eq!(buffer.lock().await.len(), 1);
+        assert_eq!(
+            control
+                .inspect_standby_for_tests(|tail, _| tail.len())
+                .await,
+            1
+        );
 
-        // This process publishes the writer epoch it acquired on open.
-        role.publish_writer(7);
+        // This process acquired its writer epoch and atomically froze the tail.
+        let promotion = control.begin_promotion(7).await.unwrap();
 
         // The deposed leader (still epoch 7) re-ships: it must be rejected, and
         // nothing must enter the tail or dedup.
@@ -842,12 +1010,12 @@ mod tests {
                 .ship(2, &[put(b"b", b"2")], &[[9u8; 16]], 0, 7)
                 .await
                 .unwrap(),
-            "a promoted node must reject an equal-epoch zombie's ship"
+            "a fenced node must reject an equal-epoch zombie's ship"
         );
         assert_eq!(
-            buffer.lock().await.len(),
+            promotion.tail.len(),
             1,
-            "a rejected zombie ship must not buffer into the promoted node's tail"
+            "a rejected zombie ship must not enter the frozen promotion tail"
         );
 
         assert!(
@@ -864,21 +1032,48 @@ mod tests {
             Some(tonic::Code::Unavailable)
         );
         assert_eq!(
-            buffer.lock().await.len(),
+            promotion.tail.len(),
             1,
-            "the newer writer must not enter a stale process's already-replayed tail"
+            "the newer writer must not enter a stale process's frozen tail"
+        );
+        promotion.complete().await.unwrap();
+    }
+
+    // Replay failure or cancellation drops the only tail owner. The receiver
+    // must remain fenced rather than silently reopening admission without it.
+    #[tokio::test]
+    async fn dropped_promotion_snapshot_leaves_receiver_fail_closed() {
+        let (endpoint, control) = spawn_receiver().await;
+        let sender = connect(&endpoint).await;
+
+        assert!(sender.ship(1, &[put(b"a", b"1")], &[], 0, 7).await.unwrap());
+        let promotion = control.begin_promotion(8).await.unwrap();
+        drop(promotion);
+
+        assert!(
+            !sender
+                .ship(2, &[put(b"late", b"write")], &[], 0, 7)
+                .await
+                .unwrap(),
+            "dropping the replay capability must not reopen receiver admission"
+        );
+        assert!(
+            control.begin_promotion(9).await.is_err(),
+            "a failed promotion is terminal for this receiver incarnation"
+        );
+        assert!(
+            hello_peer(endpoint).await.unwrap().peer_active,
+            "a fail-closed promoter must still make a booting peer defer"
         );
     }
 
-    // Promotion may land between the fast role check and the tail lock.
+    // Promotion may land between the advisory check and the phase lock.
     #[tokio::test]
     async fn ship_losing_the_promotion_race_is_rejected() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let dedup = Arc::new(crate::dedup::DedupCache::new(64));
         let reached = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
-        let (endpoint, role) = spawn_receiver_paused_before_tail_lock(
-            buffer.clone(),
+        let (endpoint, control) = spawn_receiver_paused_before_phase_lock(
             dedup.clone(),
             7,
             reached.clone(),
@@ -896,43 +1091,38 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(3), reached.notified())
             .await
-            .expect("the ship must reach the tail-lock boundary");
+            .expect("the ship must reach the phase-lock boundary");
 
-        // Promotion publishes the new role before taking this same lock for its
-        // one-time replay. Keep it held until the waiting handler is released.
-        role.publish_writer(8);
-        let replay_guard = buffer.lock().await;
+        // Promotion changes phase and moves the tail out in one transition.
+        let promotion = control.begin_promotion(8).await.unwrap();
         resume.notify_one();
-        tokio::task::yield_now().await;
-        drop(replay_guard);
 
         let accepted = tokio::time::timeout(Duration::from_secs(3), ship)
             .await
-            .expect("the ship must finish after replay releases the tail lock")
+            .expect("the ship must finish after promotion releases the phase lock")
             .unwrap();
         assert!(
             !accepted,
-            "a ship that loses the tail-lock race to promotion must be rejected"
+            "a ship that loses the phase-lock race to promotion must be rejected"
         );
         assert!(
-            buffer.lock().await.is_empty(),
+            promotion.tail.is_empty(),
             "the post-replay ship must not enter the tail"
         );
         assert!(
             dedup.get(&op_id).is_none(),
             "a rejected post-replay ship must not poison dedup"
         );
+        promotion.complete().await.unwrap();
     }
 
     // A newer sender makes a promoter with an older local epoch the stale side.
     #[tokio::test]
     async fn newer_ship_losing_the_promotion_race_sees_stale_receiver() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let dedup = Arc::new(crate::dedup::DedupCache::new(64));
         let reached = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
-        let (endpoint, role) = spawn_receiver_paused_before_tail_lock(
-            buffer.clone(),
+        let (endpoint, control) = spawn_receiver_paused_before_phase_lock(
             dedup.clone(),
             9,
             reached.clone(),
@@ -949,17 +1139,14 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(3), reached.notified())
             .await
-            .expect("the newer ship must reach the tail-lock boundary");
+            .expect("the newer ship must reach the phase-lock boundary");
 
-        role.publish_writer(8);
-        let replay_guard = buffer.lock().await;
+        let promotion = control.begin_promotion(8).await.unwrap();
         resume.notify_one();
-        tokio::task::yield_now().await;
-        drop(replay_guard);
 
         let err = tokio::time::timeout(Duration::from_secs(3), ship)
             .await
-            .expect("the newer ship must finish after replay releases the tail lock")
+            .expect("the newer ship must finish after promotion releases the phase lock")
             .unwrap()
             .expect_err("the stale promoter must report itself unavailable");
         assert_eq!(
@@ -967,24 +1154,23 @@ mod tests {
             Some(tonic::Code::Unavailable)
         );
         assert!(
-            buffer.lock().await.is_empty(),
+            promotion.tail.is_empty(),
             "a stale promoter must not append after its one-time replay"
         );
         assert!(
             dedup.get(&op_id).is_none(),
             "a stale promoter must not publish the rejected op-id"
         );
+        promotion.complete().await.unwrap();
     }
 
     // Heartbeat epoch publication shares the ship admission critical section.
     #[tokio::test]
     async fn heartbeat_epoch_update_waits_for_ship_admission() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
         let reached = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
-        let (endpoint, highest_epoch) =
-            spawn_receiver_paused_before_append(buffer.clone(), 5, reached.clone(), resume.clone())
-                .await;
+        let (endpoint, control) =
+            spawn_receiver_paused_before_append(5, reached.clone(), resume.clone()).await;
         let sender = connect(&endpoint).await;
 
         let ship = tokio::spawn(async move {
@@ -1005,7 +1191,11 @@ mod tests {
             Duration::from_secs(3600),
         ));
         let published_mid_admission = tokio::time::timeout(Duration::from_millis(500), async {
-            while highest_epoch.load(Ordering::Acquire) < 6 {
+            while control
+                .inspect_standby_for_tests(|_, observed_epoch| observed_epoch)
+                .await
+                < 6
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1028,7 +1218,11 @@ mod tests {
         // Once the admission releases the lock the beat publishes, and a further
         // stale ship is fenced.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while highest_epoch.load(Ordering::Acquire) < 6 {
+            while control
+                .inspect_standby_for_tests(|_, observed_epoch| observed_epoch)
+                .await
+                < 6
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1045,15 +1239,69 @@ mod tests {
         );
     }
 
-    // A stale ship must be re-fenced if a newer term wins the tail lock.
+    // A heartbeat already in flight before promotion must not publish a new
+    // observed epoch after takeover freezes the receiver state.
     #[tokio::test]
-    async fn stale_ship_losing_the_tail_lock_race_is_rejected() {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+    async fn heartbeat_losing_the_promotion_race_cannot_change_replay_snapshot() {
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let receiver = Arc::new(
+            new_receiver(Arc::new(crate::dedup::DedupCache::new(64)))
+                .pause_epoch_before_phase_lock(8, reached.clone(), resume.clone()),
+        );
+        let control = receiver.control();
+
+        assert!(matches!(
+            receiver
+                .receive_ship(IncomingShip {
+                    seqno: 1,
+                    ops: vec![put(b"covered", b"write")],
+                    op_ids: Vec::new(),
+                    prune_watermark: 0,
+                    writer_epoch: 7,
+                })
+                .await,
+            ShipDisposition::Accepted
+        ));
+
+        let heartbeat = tokio::spawn({
+            let receiver = receiver.clone();
+            async move { receiver.receive_heartbeat(8).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), reached.notified())
+            .await
+            .expect("the heartbeat must reach the phase-lock boundary");
+
+        let promotion = control.begin_promotion(8).await.unwrap();
+        resume.notify_one();
+
+        let observed_epoch = promotion.observed_epoch();
+        assert_eq!(observed_epoch, 7);
+        assert!(
+            promotion.tail.preserves_lineage(observed_epoch),
+            "takeover must freeze the tail and observed epoch in one owned value"
+        );
+
+        let ticked = tokio::time::timeout(Duration::from_secs(3), heartbeat)
+            .await
+            .expect("the heartbeat must finish after promotion releases the phase lock")
+            .unwrap();
+        assert!(!ticked, "a promoted receiver must ignore the late beat");
+        assert_eq!(
+            promotion.observed_epoch(),
+            7,
+            "the late heartbeat has no path to the frozen snapshot"
+        );
+        promotion.complete().await.unwrap();
+    }
+
+    // A stale ship must be re-fenced if a newer term wins the phase lock.
+    #[tokio::test]
+    async fn stale_ship_losing_the_phase_lock_race_is_rejected() {
         let dedup = Arc::new(crate::dedup::DedupCache::new(64));
         let reached = Arc::new(Notify::new());
         let resume = Arc::new(Notify::new());
-        let (endpoint, _role) = spawn_receiver_paused_before_tail_lock(
-            buffer.clone(),
+        let (endpoint, control) = spawn_receiver_paused_before_phase_lock(
             dedup.clone(),
             5,
             reached.clone(),
@@ -1073,7 +1321,7 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(3), reached.notified())
             .await
-            .expect("the stale ship must reach the tail-lock boundary");
+            .expect("the stale ship must reach the phase-lock boundary");
 
         assert!(
             current_sender
@@ -1090,18 +1338,24 @@ mod tests {
             .unwrap();
         assert!(
             !stale_accepted,
-            "a stale ship must be re-fenced if a newer epoch won the tail lock"
+            "a stale ship must be re-fenced if a newer epoch won the phase lock"
         );
-        let buf = buffer.lock().await;
-        assert_eq!(buf.epoch(), 6);
+        let (epoch, seqnos) = control
+            .inspect_standby_for_tests(|tail, _| {
+                (
+                    tail.epoch(),
+                    tail.batches_in_order()
+                        .map(|(seqno, _)| seqno)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .await;
+        assert_eq!(epoch, 6);
         assert_eq!(
-            buf.batches_in_order()
-                .map(|(seqno, _)| seqno)
-                .collect::<Vec<_>>(),
+            seqnos,
             vec![1],
             "the stale epoch batch must not enter the newer term's tail"
         );
-        drop(buf);
         assert!(
             dedup.get(&stale_op_id).is_none(),
             "a re-fenced stale ship must not poison dedup"

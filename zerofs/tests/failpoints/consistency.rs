@@ -1070,7 +1070,7 @@ impl<'a> ConsistencyChecker<'a> {
     }
 }
 
-#[allow(dead_code)] // used by the failpoints target, not DST
+#[cfg(not(dst))]
 pub async fn verify_consistency(fs: &ZeroFS) -> Result<ConsistencyReport, FsError> {
     ConsistencyChecker::new(fs).verify_all().await
 }
@@ -1078,7 +1078,7 @@ pub async fn verify_consistency(fs: &ZeroFS) -> Result<ConsistencyReport, FsErro
 /// As [`verify_consistency`] for a sparse-file workload (the DST harness):
 /// hole extents have no keys, so the dense extent count is skipped. Verifying
 /// hole contents is the caller's job.
-#[allow(dead_code)] // used by the DST target, not failpoints
+#[cfg(dst)]
 pub async fn verify_consistency_sparse(fs: &ZeroFS) -> Result<ConsistencyReport, FsError> {
     let mut checker = ConsistencyChecker::new(fs);
     checker.sparse_files = true;

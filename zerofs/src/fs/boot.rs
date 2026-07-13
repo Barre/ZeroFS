@@ -14,6 +14,7 @@ use crate::fs::tracing::AccessTracer;
 use crate::fs::write_coordinator::WriteCoordinator;
 use crate::fs::{STATS_SHARDS, ZeroFS, get_current_time, get_current_uid_gid};
 use crate::object_trace::ObjectTracer;
+use crate::replication::LineageProof;
 use crate::segment_store::SegmentStore;
 use dashmap::DashMap;
 use slatedb::config::{PutOptions, WriteOptions};
@@ -24,7 +25,7 @@ use std::sync::Mutex;
 impl ZeroFS {
     /// Thin no-lease wrapper retained for the single-node constructors and tests;
     /// the replication-aware server path calls `new_with_slatedb_and_lease`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn new_with_slatedb(
         slatedb: SlateDbHandle,
         max_bytes: u64,
@@ -42,18 +43,18 @@ impl ZeroFS {
             None,
             None,
             Arc::new(crate::dedup::DedupCache::new(65_536)),
-            false, // single-node / test: never a live takeover, always regenerate
+            None, // single-node / test: no HA coverage proof, always regenerate
             ObjectTracer::new(),
             object_store,
             segment_codec,
+            None,
             None,
         )
         .await
     }
 
-    /// Like [`new_with_slatedb`](Self::new_with_slatedb) but attaches an HA leader
-    /// `lease`: the data `Db` refuses reads/writes while the lease is invalid (not
-    /// the confirmed leader). Single-node callers pass no lease.
+    /// Like [`new_with_slatedb`](Self::new_with_slatedb), with HA lease,
+    /// replication, and takeover-lineage state.
     #[allow(clippy::too_many_arguments)]
     pub async fn new_with_slatedb_and_lease(
         slatedb: SlateDbHandle,
@@ -64,14 +65,13 @@ impl ZeroFS {
         lease: Option<Arc<crate::replication::Lease>>,
         replicator: Option<Arc<crate::replication::Replicator>>,
         dedup: Arc<crate::dedup::DedupCache>,
-        // True only when this node is a standby promoting after receiving replication
-        // from a live leader; false on a cold bootstrap / config leader / single node.
-        // Decides whether the durability lineage carries forward (resolve_lineage_token).
-        is_live_takeover: bool,
+        // Present only when takeover reconciliation produced an epoch-bound proof.
+        lineage_proof: Option<LineageProof>,
         object_tracer: ObjectTracer,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
+        seal_threshold_override: Option<usize>,
     ) -> anyhow::Result<Self> {
         let lock_manager = Arc::new(KeyedLockManager::new());
         let key_codec = Arc::new(KeyCodec::new());
@@ -79,9 +79,12 @@ impl ZeroFS {
         // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
         // open). Used as a fresh, never-reused lineage token whenever the durability
         // lineage must be regenerated (see `resolve_lineage_token`).
-        let writer_epoch = match &slatedb {
-            SlateDbHandle::ReadWrite(db) => db.subscribe().borrow().current_manifest.writer_epoch(),
-            SlateDbHandle::ReadOnly(_) => 0,
+        let (writer_epoch, raw_writer) = match &slatedb {
+            SlateDbHandle::ReadWrite(db) => (
+                db.subscribe().borrow().current_manifest.writer_epoch(),
+                Some(db.clone()),
+            ),
+            SlateDbHandle::ReadOnly(_) => (0, None),
         };
 
         let db = Arc::new(match slatedb {
@@ -163,6 +166,7 @@ impl ZeroFS {
             key_codec.clone(),
             segment_store,
             lock_manager.clone(),
+            seal_threshold_override.unwrap_or(crate::fs::store::extent::SEAL_THRESHOLD),
         );
         // Seed the monitor's segment footprint gauges from the existing on-store
         // segments before any write; from here they are maintained incrementally
@@ -182,11 +186,22 @@ impl ZeroFS {
         let tombstone_store = TombstoneStore::new(db.clone(), key_codec.clone());
         let orphan_store = OrphanStore::new(db.clone(), key_codec.clone());
 
-        // Resolve the durability lineage token: carry it forward across an untainted
-        // live takeover (transparent failover), else regenerate it (cold bootstrap or
-        // Solo-tainted takeover). Must precede the WriteCoordinator, which taints it.
-        let lineage_token =
-            Self::resolve_lineage_token(&db, &key_codec, writer_epoch, is_live_takeover).await?;
+        // Carry the durability lineage only across a coverage-proven, untainted
+        // takeover; otherwise regenerate it. This must precede the WriteCoordinator,
+        // which records any later Solo taint.
+        let lineage_token = match raw_writer {
+            Some(raw_writer) => {
+                Self::resolve_lineage_token(
+                    &db,
+                    &key_codec,
+                    &raw_writer,
+                    writer_epoch,
+                    lineage_proof,
+                )
+                .await?
+            }
+            None => 0,
+        };
 
         let write_coordinator = WriteCoordinator::new(
             db.clone(),
@@ -241,23 +256,17 @@ impl ZeroFS {
     }
 
     /// Resolve the durability lineage token at bring-up. Carry the stored token
-    /// forward only on a live-standby takeover of an untainted lineage — the standby
-    /// provably has every acked write (ship-before-apply, and a Solo episode would
-    /// have left a taint), so a client's un-fsync'd writes stay verifiable and its
-    /// fsync is transparent across the failover. Otherwise regenerate a fresh token
-    /// (`writer_epoch`: monotonic, never reused) and persist it durably: a cold
-    /// bootstrap (the lineage broke — un-fsync'd writes are gone) or a Solo-tainted
-    /// takeover (acked Solo writes the standby never received), where a client's
-    /// pre-break writes must fail their verified fsync rather than match a stale token.
+    /// only when takeover reconciliation proved complete coverage and the lineage is
+    /// untainted, so the client's verified fsync remains transparent. Otherwise
+    /// persist a fresh, never-reused `writer_epoch` token; pre-break clients then
+    /// fail verified fsync rather than matching a stale lineage.
     async fn resolve_lineage_token(
         db: &Db,
         key_codec: &KeyCodec,
+        raw_writer: &Arc<slatedb::Db>,
         writer_epoch: u64,
-        is_live_takeover: bool,
+        lineage_proof: Option<LineageProof>,
     ) -> anyhow::Result<u64> {
-        if db.is_read_only() {
-            return Ok(0);
-        }
         let stored = db
             .get_bytes(&key_codec.lineage_key())
             .await?
@@ -267,9 +276,13 @@ impl ZeroFS {
             .get_bytes(&key_codec.taint_key())
             .await?
             .and_then(|b| KeyCodec::decode_u64(&b));
-        let keep = is_live_takeover && stored.is_some() && stored != taint;
-        if keep {
-            return Ok(stored.unwrap());
+        let preserve =
+            lineage_proof.is_some_and(|proof| proof.authorizes(raw_writer, writer_epoch));
+        if preserve
+            && let Some(stored_token) = stored
+            && Some(stored_token) != taint
+        {
+            return Ok(stored_token);
         }
         let token = writer_epoch;
         db.put_with_options(

@@ -44,7 +44,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::error;
-use write::{MAX_INFLIGHT_SEALS, OpenSegment, SEAL_THRESHOLD, TAIL_CACHE_BYTES};
+pub(crate) use write::SEAL_THRESHOLD;
+use write::{MAX_INFLIGHT_SEALS, OpenSegment, TAIL_CACHE_BYTES};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
@@ -127,9 +128,9 @@ pub struct ExtentStore {
     /// Global bound on concurrent read-ahead fetches.
     prefetch_sem: Arc<Semaphore>,
     /// Buffer size that triggers a background seal (i.e. the segment object size).
-    /// Defaults to the const; tests lower it so seal paths don't allocate 256 MiB.
-    /// Shared across clones so a test can retune the instance the fs holds.
-    seal_threshold: Arc<std::sync::atomic::AtomicUsize>,
+    /// Tests and the DST harness lower it at construction time so seal paths do
+    /// not allocate 256 MiB.
+    seal_threshold: usize,
     /// Weak handle to the commit worker, injected post-construction (the worker owns
     /// an `ExtentStore` clone, so a strong handle would cycle). Set in production;
     /// unset in the extent unit tests, where `commit_via_coordinator` is the sole
@@ -146,6 +147,7 @@ impl ExtentStore {
         key_codec: Arc<KeyCodec>,
         segments: Arc<SegmentStore>,
         lock_manager: Arc<KeyedLockManager<InodeId>>,
+        seal_threshold: usize,
     ) -> Self {
         let tail_cache = CacheBuilder::new(TAIL_CACHE_BYTES)
             .with_weighter(|_id: &InodeId, (_idx, data): &(u64, Bytes)| data.len())
@@ -179,7 +181,7 @@ impl ExtentStore {
             tail_cache,
             read_ahead,
             prefetch_sem: Arc::new(Semaphore::new(READ_AHEAD_MAX_CONCURRENT)),
-            seal_threshold: Arc::new(std::sync::atomic::AtomicUsize::new(SEAL_THRESHOLD)),
+            seal_threshold,
             coordinator: Arc::new(std::sync::OnceLock::new()),
             segment_gc_stats: Arc::new(SegmentGcStats::default()),
         }
@@ -313,22 +315,13 @@ impl ExtentStore {
     /// Test-only: lower the seal threshold so seal-path tests don't build a full
     /// 256 MiB segment.
     #[cfg(test)]
-    fn with_seal_threshold(self, n: usize) -> Self {
-        self.set_seal_threshold(n);
+    fn with_seal_threshold(mut self, n: usize) -> Self {
+        self.seal_threshold = n;
         self
-    }
-
-    /// Retune the seal threshold on a live store (shared across clones). For the
-    /// DST harness, which needs small segments to exercise the seal/reclaim paths.
-    #[allow(dead_code)] // used by the DST integration test, not the lib/bin
-    pub fn set_seal_threshold(&self, n: usize) {
-        self.seal_threshold
-            .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(super) fn seal_threshold(&self) -> usize {
         self.seal_threshold
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

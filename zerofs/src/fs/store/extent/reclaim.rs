@@ -5,10 +5,9 @@
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 
-use super::select::{
-    ColdCtx, HotChain, MAX_COMPACT_BYTES_PER_ROUND, SegStat, chain_components, live_permille,
-    select_round,
-};
+#[cfg(test)]
+use super::select::MAX_COMPACT_BYTES_PER_ROUND;
+use super::select::{ColdCtx, HotChain, SegStat, chain_components, live_permille, select_round};
 use super::{ExtentStore, PARALLEL_EXTENT_OPS, human_bytes};
 use crate::fs::FsError;
 use crate::fs::inode::InodeId;
@@ -49,6 +48,7 @@ pub(crate) const QUIESCENT_AFTER_DEFAULT: Duration = Duration::from_secs(5 * 60)
 
 /// Tail-scrub floor for the config-less wrapper; aliased so the literal
 /// exists once.
+#[cfg(test)]
 pub(super) const TAIL_SCRUB_DEFAULT_PERCENT: u64 =
     crate::config::GcConfig::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT;
 
@@ -125,30 +125,11 @@ pub enum PassStatus {
 }
 
 impl ExtentStore {
-    /// List the PUT segment ids. Exposed for the failpoints crash tests, which drive
-    /// `compact_segments` directly (the reclaim floor won't compact tiny test data).
-    #[cfg(feature = "failpoints")]
-    #[allow(dead_code)] // used by the failpoints integration test, not the lib/bin
-    pub async fn list_segments(&self) -> Result<Vec<Segid>, FsError> {
-        self.segments
-            .list_segments()
-            .await
-            .map_err(|_| FsError::IoError)
-    }
-
-    /// Reclaim with an immediate horizon (so a dead segment is deleted this pass).
-    /// For the failpoints crash tests, which have no `chrono` in scope.
-    #[cfg(feature = "failpoints")]
-    #[allow(dead_code)] // used by the failpoints integration test, not the lib/bin
-    pub async fn reclaim_now(&self) -> Result<(usize, usize), FsError> {
-        self.reclaim_segments(chrono::Utc::now(), None).await
-    }
-
     /// Reclaim object-store space: delete fully-dead segments and compact the
     /// most-fragmented ones, driven entirely off the local `segcount` scan.
     /// Returns (segments deleted, frames relocated); production goes through
     /// [`Self::reclaim_segments_gated`], which also reports saturation.
-    #[allow(dead_code)] // failpoints + tests
+    #[cfg(test)]
     pub async fn reclaim_segments(
         &self,
         delete_horizon: DateTime<Utc>,

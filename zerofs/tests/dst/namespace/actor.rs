@@ -527,12 +527,12 @@ impl NamespaceActor {
         let name = path.last().unwrap().clone();
         let parent_inode = self.model.inode_of(&path[..path.len() - 1]);
         let fs = self.context.fs.clone();
-        {
+        let open_handle = {
             // Order the open count increment against remove's
             // defer-versus-delete decision.
             let _guard = fs.lock_manager.acquire(id).await;
-            fs.open_handle_inc(id);
-        }
+            fs.new_open_handle(id)
+        };
         self.model.oplog.push(NsOp::Remove(path.clone()));
 
         let mut crashed = self.context.crashed.clone();
@@ -555,9 +555,10 @@ impl NamespaceActor {
             return removed;
         }
 
+        drop(open_handle);
         tokio::select! {
             biased;
-            () = fs.handle_closed(id) => {
+            () = fs.reclaim_if_unreferenced(id) => {
                 self.context.digest.event(("ncl", show_path(&path)));
                 StepOutcome::Completed
             }

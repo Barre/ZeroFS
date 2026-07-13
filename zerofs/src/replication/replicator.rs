@@ -51,7 +51,7 @@ pub struct Replicator {
     seqno: AtomicU64,
     /// Last seqno whose ship was acked, and commits since without one. Together
     /// with the epoch they form the provenance stamp each batch carries, which
-    /// the takeover replay guard checks the buffered tail against.
+    /// takeover reconciliation checks the buffered tail against.
     last_shipped: AtomicU64,
     solo_count: AtomicU64,
     /// Highest batch seqno confirmed durable on object storage.
@@ -257,8 +257,7 @@ mod tests {
     }
 
     use crate::dedup::DedupCache;
-    use crate::replication::tail::TailBuffer;
-    use crate::replication::transport::ReplicationReceiver;
+    use crate::replication::transport::{ReceiverControl, ReplicationReceiver};
     use tokio::net::TcpListener;
 
     /// A running receiver. Hold it to keep the standby up; `stop()` it (or drop it)
@@ -279,18 +278,23 @@ mod tests {
 
     async fn spawn_receiver_at(
         local_writer_epoch: Option<u64>,
-    ) -> (String, Arc<Mutex<TailBuffer>>, ServerHandle) {
-        let buffer = Arc::new(Mutex::new(TailBuffer::new()));
+    ) -> (String, ReceiverControl, ServerHandle) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let receiver = ReplicationReceiver::new(
-            buffer.clone(),
             Arc::new(DedupCache::new(64)),
             None,
             "standby-under-test".to_string(),
         );
+        let control = receiver.control();
         if let Some(epoch) = local_writer_epoch {
-            receiver.role().publish_writer(epoch);
+            control
+                .begin_promotion(epoch)
+                .await
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
         }
         let server = receiver.into_server();
         let (shutdown, rx) = tokio::sync::oneshot::channel();
@@ -307,12 +311,12 @@ mod tests {
         });
         (
             format!("http://{addr}"),
-            buffer,
+            control,
             ServerHandle { shutdown, join },
         )
     }
 
-    async fn spawn_receiver() -> (String, Arc<Mutex<TailBuffer>>, ServerHandle) {
+    async fn spawn_receiver() -> (String, ReceiverControl, ServerHandle) {
         spawn_receiver_at(None).await
     }
 
@@ -332,19 +336,16 @@ mod tests {
 
     #[tokio::test]
     async fn ship_assigns_increasing_seqnos_and_buffers_on_the_standby() {
-        let (endpoint, buffer, _server) = spawn_receiver().await;
+        let (endpoint, control, _server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 7);
         r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
 
         assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(1));
         assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(2));
 
-        let seqnos: Vec<u64> = buffer
-            .lock()
-            .await
-            .batches_in_order()
-            .map(|(s, _)| s)
-            .collect();
+        let seqnos: Vec<u64> = control
+            .inspect_standby_for_tests(|tail, _| tail.batches_in_order().map(|(s, _)| s).collect())
+            .await;
         assert_eq!(
             seqnos,
             vec![1, 2],
@@ -356,7 +357,7 @@ mod tests {
     // solo write must not burn one (else a later takeover replays with a gap).
     #[tokio::test]
     async fn solo_ship_does_not_consume_a_seqno() {
-        let (endpoint, _buffer, _server) = spawn_receiver().await;
+        let (endpoint, _control, _server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 1);
 
         assert_eq!(
@@ -377,7 +378,7 @@ mod tests {
     // (clears the sender) and the write still completes single-node durable.
     #[tokio::test]
     async fn ship_downgrades_to_solo_when_the_standby_is_unreachable() {
-        let (endpoint, _buffer, server) = spawn_receiver().await;
+        let (endpoint, _control, server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 1);
         r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
         assert_eq!(r.ship(&put(), &[]).await, ShipOutcome::Shipped(1));
@@ -399,7 +400,7 @@ mod tests {
     // must not re-establish shipping for a fenced leader.
     #[tokio::test]
     async fn ship_reports_deposed_on_stale_epoch_rejection_and_stays_deposed() {
-        let (endpoint, _buffer, _server) = spawn_receiver().await;
+        let (endpoint, _control, _server) = spawn_receiver().await;
         // A newer leader (epoch 5) ships first, bumping the receiver's highest epoch.
         let newer = connect(&endpoint).await;
         assert!(
@@ -439,10 +440,10 @@ mod tests {
     }
 
     // A fenced former leader can remain reachable until its next failed flush.
-    // Its stale role claim must not depose the newer writer.
+    // Its stale leading state must not depose the newer writer.
     #[tokio::test]
     async fn newer_writer_is_not_deposed_by_a_stale_leading_peer() {
-        let (endpoint, buffer, _server) = spawn_receiver_at(Some(7)).await;
+        let (endpoint, _control, _server) = spawn_receiver_at(Some(7)).await;
         let r = Replicator::new(endpoint.clone(), 8);
         r.set_sender_for_tests(Some(connect(&endpoint).await)).await;
 
@@ -455,10 +456,6 @@ mod tests {
             !r.is_connected_for_tests().await,
             "the stale receiver must be disconnected"
         );
-        assert!(
-            buffer.lock().await.is_empty(),
-            "the stale receiver must not acknowledge or buffer the new writer's batch"
-        );
         assert_eq!(
             r.ship(&put(), &[]).await,
             ShipOutcome::Solo,
@@ -467,11 +464,11 @@ mod tests {
     }
 
     // The provenance stamp tracks the last acked ship and counts solo commits
-    // since; an acked ship resets the count. The replay guard reads solo > 0 at
+    // since; an acked ship resets the count. Takeover replay reads solo > 0 at
     // the durable head as ships the leader outlived.
     #[tokio::test]
     async fn stamp_counts_solo_commits_and_resets_on_an_acked_ship() {
-        let (endpoint, _buffer, server) = spawn_receiver().await;
+        let (endpoint, _control, server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 9);
         assert_eq!(r.stamp(), (9, 0, 0), "fresh replicator: nothing shipped");
 
@@ -498,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_reconnect_reestablishes_the_sender() {
-        let (endpoint, _buffer, _server) = spawn_receiver().await;
+        let (endpoint, _control, _server) = spawn_receiver().await;
         let r = Replicator::new(endpoint.clone(), 1);
         assert!(!r.is_connected_for_tests().await, "starts solo");
 

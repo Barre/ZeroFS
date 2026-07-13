@@ -1,8 +1,8 @@
 //! Type-state filesystem bring-up: each phase consumes the previous, so the
 //! ordering is compile-time enforced. Receiver listening before any Hello
 //! (`ReceiverUp`); db opened only from `Writer`, so a follower can't open it and
-//! fence a live leader; tail replayed only from `DbOpen`; fs assembled only from
-//! `Replayed`, so no acked write is served before its tail is restored.
+//! fence a live leader; tail reconciled only from `DbOpen`; fs assembled only from
+//! `Reconciled`, so the surviving tail is accounted for before serving.
 //!
 //! `ha: None` is single-node mode; the HA steps are then no-ops.
 
@@ -13,20 +13,19 @@ use crate::cli::server::{
 };
 use crate::config::Settings;
 use crate::db::SlateDbHandle;
-use crate::fs::key_codec::KeyCodec;
 use crate::fs::{CacheConfig, ZeroFS};
 use crate::key_management;
 use crate::object_trace::{ObjectTracer, TracingObjectStore};
 use crate::parse_object_store::parse_url_opts;
-use crate::replication::{ReplicationParams, TailBuffer};
+use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
+use crate::replication::{LineageProof, ReplicationParams};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
 use slatedb::object_store::path::Path;
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Notify, watch};
 use tracing::info;
 
 /// Storage, crypto, and parsed config in hand; no db or receiver yet.
@@ -49,13 +48,11 @@ struct Prepared {
     db_mode: DatabaseMode,
 }
 
-/// Receiver handles carried through role election and takeover replay.
+/// Receiver handles carried through role election and takeover reconciliation.
 struct HaReceiver {
-    role: Arc<crate::replication::transport::ReceiverRole>,
+    control: ReceiverControl,
     takeover_trigger: Arc<Notify>,
     liveness: Option<watch::Receiver<u64>>,
-    highest_epoch: Option<Arc<AtomicU64>>,
-    tail: Option<Arc<Mutex<TailBuffer>>>,
 }
 
 /// The receiver is listening, so a peer's concurrent Hello is answered before we
@@ -75,7 +72,7 @@ struct Writer {
 /// The data db is open as the writer.
 struct DbOpen {
     prepared: Prepared,
-    ha: Option<HaReceiver>,
+    promotion: Option<PromotionSnapshot>,
     slatedb: SlateDbHandle,
     db_handle: SlateDbHandle,
     maintenance_runtime: Option<tokio::runtime::Handle>,
@@ -90,8 +87,11 @@ struct DbOpen {
     segment_warm: Option<crate::segment_store::SegmentWarmHook>,
 }
 
-/// The buffered tail (if any) has been replayed into the open db.
-struct Replayed(DbOpen);
+/// The standby tail has been reconciled with the open db.
+struct Reconciled {
+    db: DbOpen,
+    lineage_proof: Option<LineageProof>,
+}
 
 impl Prepared {
     async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
@@ -179,7 +179,7 @@ impl Prepared {
             .as_ref()
             .map(crate::replication::ReplicationParams::from_config);
 
-        // Shared by request handling and takeover replay.
+        // Shared by request handling and takeover reconciliation.
         let dedup = Arc::new(crate::dedup::DedupCache::new(65_536));
 
         // Trace at the bottom of the stack so otrace sees the requests that
@@ -219,7 +219,7 @@ impl Prepared {
     }
 
     /// Answers Hello (so a peer learns our state) and buffers the leader's stream
-    /// (the un-flushed tail, for replay on takeover). Started before the role
+    /// (the un-flushed tail, for reconciliation on takeover). Started before the role
     /// decision so a peer's concurrent Hello is answered.
     fn start_receiver(self) -> Result<ReceiverUp> {
         let listen = self
@@ -234,16 +234,13 @@ impl Prepared {
             let addr: std::net::SocketAddr = listen
                 .parse()
                 .with_context(|| format!("invalid replication_listen address {listen:?}"))?;
-            let buffer = Arc::new(Mutex::new(TailBuffer::new()));
             let receiver = crate::replication::transport::ReplicationReceiver::new(
-                buffer.clone(),
                 self.dedup.clone(),
                 Some(takeover_trigger.clone()),
                 node_id.clone(),
             );
-            let role = receiver.role();
+            let control = receiver.control();
             let liveness = Some(receiver.liveness());
-            let highest_epoch = Some(receiver.highest_epoch());
             let server = receiver.into_server();
             info!("HA {node_id}: replication receiver listening on {addr}");
             tokio::spawn(async move {
@@ -256,11 +253,9 @@ impl Prepared {
                 }
             });
             Some(HaReceiver {
-                role,
+                control,
                 takeover_trigger,
                 liveness,
-                highest_epoch,
-                tail: Some(buffer),
             })
         } else {
             None
@@ -463,14 +458,19 @@ impl Writer {
             parts_cache,
         } = opened;
 
-        // Publish this open's epoch once; later status manifests may belong to
-        // the writer that fenced us.
-        if let SlateDbHandle::ReadWrite(raw_db) = &slatedb
-            && let Some(ha) = &self.ha
-        {
+        // Atomically fence receiver admission and take ownership of the standby
+        // tail. Later status manifests may belong to a writer that fenced us.
+        let promotion = if let (SlateDbHandle::ReadWrite(raw_db), Some(ha)) = (&slatedb, &self.ha) {
             let writer_epoch = raw_db.subscribe().borrow().current_manifest.writer_epoch();
-            ha.role.publish_writer(writer_epoch);
-        }
+            Some(
+                ha.control
+                    .begin_promotion(writer_epoch)
+                    .await
+                    .context("HA: freezing the standby tail for promotion failed")?,
+            )
+        } else {
+            None
+        };
 
         // Segment reads share SlateDB's prefetch parts cache (one budget, keyed
         // by path); the seal-cache still serves same-process read-after-write.
@@ -519,7 +519,7 @@ impl Writer {
 
         Ok(DbOpen {
             prepared: self.prepared,
-            ha: self.ha,
+            promotion,
             slatedb,
             db_handle,
             maintenance_runtime,
@@ -533,195 +533,23 @@ impl Writer {
 }
 
 impl DbOpen {
-    /// A promoted standby replays its buffered tail into the freshly-opened data
-    /// db (idempotent, seqno order) and flushes before serving, so no acknowledged
-    /// write is lost.
-    async fn replay_tail(self) -> Result<Replayed> {
-        if let (Some(ha), SlateDbHandle::ReadWrite(raw_db)) = (&self.ha, &self.slatedb)
-            && let Some(buffer) = ha.tail.as_ref()
-        {
-            let mut buf = buffer.lock().await;
-            // Replay must only extend durable history: validate the tail against
-            // the db's provenance stamp (see `replay_decision`). On an unreadable
-            // or undecodable stamp, drop the tail: that forfeits at most
-            // un-fsynced writes (the honest designed-in loss), while replaying
-            // blind could regress durable state.
-            if !buf.is_empty() {
-                use crate::replication::tail::{ReplayDecision, replay_decision};
-                let codec = KeyCodec::new();
-                let decision = match raw_db.get(&codec.ha_seqno_key()).await {
-                    Ok(None) => replay_decision(None, buf.epoch()),
-                    Ok(Some(v)) => match KeyCodec::decode_ha_stamp(&v) {
-                        Some(stamp) => replay_decision(Some(stamp), buf.epoch()),
-                        None => {
-                            tracing::warn!("HA takeover: undecodable HA stamp; dropping the tail");
-                            ReplayDecision::Discard
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            "HA takeover: reading the HA stamp failed ({e}); dropping the \
-                             tail rather than replaying over unseen durable state"
-                        );
-                        ReplayDecision::Discard
-                    }
+    /// Reconcile a standby's frozen tail before serving.
+    async fn reconcile_tail(mut self) -> Result<Reconciled> {
+        let lineage_proof = match self.promotion.take() {
+            Some(promotion) => {
+                let SlateDbHandle::ReadWrite(raw_db) = &self.slatedb else {
+                    anyhow::bail!("HA promotion requires a writable data db");
                 };
-                match decision {
-                    ReplayDecision::ReplayAll => {
-                        info!(
-                            "HA takeover: nothing of the tail's term (epoch {}) is durable; \
-                             replaying the full tail",
-                            buf.epoch()
-                        );
-                    }
-                    ReplayDecision::PruneTo(seqno) => {
-                        let before = buf.len();
-                        let durable_op_ids = buf.prune(seqno);
-                        for op_id in durable_op_ids {
-                            self.prepared.dedup.record(op_id, bytes::Bytes::new());
-                        }
-                        info!(
-                            "HA takeover: db holds shipped batches through seqno {} \
-                             (epoch {}); pruned {} durable of {} buffered batch(es)",
-                            seqno,
-                            buf.epoch(),
-                            before - buf.len(),
-                            before
-                        );
-                    }
-                    ReplayDecision::Discard => {
-                        info!(
-                            "HA takeover: the durable head supersedes the buffered tail \
-                             (epoch {}, {} batch(es)); dropping it instead of regressing \
-                             newer state",
-                            buf.epoch(),
-                            buf.len()
-                        );
-                        buf.discard();
-                    }
-                }
+                promotion
+                    .reconcile_into(
+                        raw_db,
+                        &self.segment_object_store,
+                        &self.prepared.segment_codec,
+                    )
+                    .await?
             }
-            if !buf.is_empty() {
-                info!(
-                    "HA takeover: replaying {} buffered batch(es) into the data db",
-                    buf.len()
-                );
-                let key_codec = KeyCodec::new();
-                // Un-PUT segments referenced by shipped extent writes, rebuilt
-                // on the shared store so the replayed FrameLocs resolve.
-                let mut recon: std::collections::HashMap<
-                    crate::segment::Segid,
-                    Vec<crate::segment_store::ReconFrame>,
-                > = std::collections::HashMap::new();
-                for (_seqno, ops) in buf.batches_in_order() {
-                    let mut batch = slatedb::WriteBatch::new();
-                    for op in ops {
-                        match op {
-                            crate::replication::ReplOp::Put(k, v) => {
-                                batch.put_bytes(k.clone(), v.clone())
-                            }
-                            crate::replication::ReplOp::Delete(k) => batch.delete(k.clone()),
-                            crate::replication::ReplOp::PutFrame(k, v, frame) => {
-                                batch.put_bytes(k.clone(), v.clone());
-                                if let Some((inode, extent)) = key_codec.parse_extent_key_full(k)
-                                    && let Some(loc) = crate::segment::FrameLoc::decode(v)
-                                {
-                                    recon.entry(loc.segid).or_default().push(
-                                        crate::segment_store::ReconFrame {
-                                            frame_index: loc.frame_index,
-                                            byte_offset: loc.byte_offset,
-                                            byte_len: loc.byte_len,
-                                            inode,
-                                            extent,
-                                            bytes: frame.clone(),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    raw_db
-                        .write_with_options(
-                            batch,
-                            &slatedb::config::WriteOptions {
-                                await_durable: false,
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .context("HA takeover tail replay failed")?;
-                }
-                // Materialize the un-PUT segments before serving; HEAD-guarded
-                // so a leader-sealed object is never overwritten with a
-                // (possibly partial) reconstruction.
-                let mut materialized = 0usize;
-                for (segid, frames) in &recon {
-                    // A failure here can't be swallowed: the next step flushes
-                    // these FrameLocs durably, and serving without the segment
-                    // object would leave acked writes permanently dangling.
-                    // Retry a few times, then fail the takeover.
-                    const MATERIALIZE_ATTEMPTS: u32 = 5;
-                    let mut attempt = 0;
-                    loop {
-                        match crate::segment_store::materialize_segment_if_absent(
-                            &self.segment_object_store,
-                            &self.prepared.segment_codec,
-                            *segid,
-                            frames,
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                materialized += 1;
-                                break;
-                            }
-                            Ok(false) => break,
-                            Err(e) => {
-                                attempt += 1;
-                                if attempt >= MATERIALIZE_ATTEMPTS {
-                                    return Err(anyhow::anyhow!(
-                                        "HA takeover: reconstructing un-PUT segment {:?} failed \
-                                         after {} attempts: {}. Aborting takeover rather than \
-                                         durably committing a dangling FrameLoc for an acked write.",
-                                        segid,
-                                        MATERIALIZE_ATTEMPTS,
-                                        e
-                                    ));
-                                }
-                                tracing::warn!(
-                                    "HA takeover: reconstructing segment {:?} failed \
-                                     (attempt {}/{}): {}; retrying",
-                                    segid,
-                                    attempt,
-                                    MATERIALIZE_ATTEMPTS,
-                                    e
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    200 * attempt as u64,
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-                }
-                if materialized > 0 {
-                    info!(
-                        "HA takeover: materialized {} un-PUT segment(s) from the replayed tail",
-                        materialized
-                    );
-                }
-                raw_db
-                    .flush()
-                    .await
-                    .context("HA takeover replay flush failed")?;
-
-                // The flush made the suffix durable. Earlier errors leave the
-                // tail and its pending op-ids intact.
-                for op_id in buf.finish_replay() {
-                    self.prepared.dedup.record(op_id, bytes::Bytes::new());
-                }
-            }
-        }
+            None => None,
+        };
 
         // Every HA writer names itself in the latest-leader record before it
         // serves, so its next boot blocks on a silent peer instead of electing.
@@ -741,15 +569,19 @@ impl DbOpen {
             .context("HA: writing the latest-leader record failed")?;
         }
 
-        Ok(Replayed(self))
+        Ok(Reconciled {
+            db: self,
+            lineage_proof,
+        })
     }
 }
 
-impl Replayed {
+impl Reconciled {
     async fn into_filesystem(self, settings: &Settings) -> Result<InitResult> {
+        let Reconciled { db, lineage_proof } = self;
         let DbOpen {
             prepared,
-            ha,
+            promotion: _,
             slatedb,
             db_handle,
             maintenance_runtime,
@@ -758,16 +590,7 @@ impl Replayed {
             ignore_fsync,
             segment_object_store,
             segment_warm,
-        } = self.0;
-
-        // A live-standby takeover iff we observed a live leader's epoch on the
-        // replication stream (ships/heartbeats) before promoting. A cold bootstrap /
-        // config leader / single node observed none (highest_epoch stays 0), so it
-        // regenerates the durability lineage rather than carrying a stale one forward.
-        let is_live_takeover = ha
-            .as_ref()
-            .and_then(|h| h.highest_epoch.as_ref())
-            .is_some_and(|e| e.load(Ordering::Relaxed) > 0);
+        } = db;
 
         // Leader replicator: ships to the standby when connected, runs solo
         // otherwise, reconnecting when it reappears. Never blocks startup or writes.
@@ -858,11 +681,12 @@ impl Replayed {
             lease,
             replicator,
             prepared.dedup,
-            is_live_takeover,
+            lineage_proof,
             prepared.object_tracer.clone(),
             segment_object_store,
             prepared.segment_codec,
             segment_warm,
+            None,
         )
         .await
         .context("Failed to initialize filesystem")?;
@@ -899,7 +723,7 @@ pub async fn initialize_filesystem(
         .await?
         .open_db(settings)
         .await?
-        .replay_tail()
+        .reconcile_tail()
         .await?
         .into_filesystem(settings)
         .await

@@ -175,7 +175,7 @@ impl SegmentStore {
 
     /// Seal `frames` (each `(inode, extent, full-extent plaintext)`) into one new
     /// segment object, durable on return. Returns each frame's location.
-    #[allow(dead_code)] // production packs via seal_compressed; tests build plaintext worlds here
+    #[cfg(test)] // production packs via seal_compressed; tests build plaintext worlds here
     pub async fn seal(
         &self,
         frames: &[(InodeId, u64, Bytes)],
@@ -314,7 +314,7 @@ impl SegmentStore {
     /// List every `segments/` object currently present. Production reclaim
     /// streams via [`Self::list_segments_stream`]; this collected form serves
     /// the tests and the failpoints harness.
-    #[allow(dead_code)] // used by tests and the failpoints wrapper, not the bin
+    #[cfg(test)]
     pub async fn list_segments(&self) -> Result<Vec<Segid>> {
         use futures::TryStreamExt;
         self.list_segments_stream()

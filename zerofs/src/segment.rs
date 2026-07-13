@@ -214,7 +214,7 @@ impl<'a> SegmentBuilder<'a> {
 
     /// Seal `plaintext` for logical block `(inode, extent)` and append it.
     /// Returns the frame's index within the segment.
-    #[allow(dead_code)] // production packs via seal_compressed_batch; tests build plaintext worlds here
+    #[cfg(test)] // production packs via seal_compressed_batch; tests build plaintext worlds here
     pub fn add_frame(
         &mut self,
         inode: u64,
@@ -265,7 +265,7 @@ impl<'a> SegmentBuilder<'a> {
 /// Compress+encrypt one extent into a sealed frame body (no length prefix), bound
 /// to its `(segid, frame_index, inode, extent)` AAD. Shared by [`SegmentBuilder`]
 /// and the data plane's open-segment buffer.
-#[allow(dead_code)] // reached only from the test-only plaintext seal path (add_frame)
+#[cfg(test)]
 pub(crate) fn seal_frame(
     codec: &FrameCodec,
     segid: Segid,
