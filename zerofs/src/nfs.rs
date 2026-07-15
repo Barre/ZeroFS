@@ -6,14 +6,13 @@ use crate::fs::types::{FileType, InodeWithId, SetAttributes};
 use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::debug;
 use zerofs::fs::EXTENT_SIZE;
 use zerofs_nfsserve::nfs::{
     FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, fattr3, fileid3, filename3, fsinfo3,
     fsstat3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr, sattr3, specdata3, writeverf3,
 };
-use zerofs_nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use zerofs_nfsserve::tcp::NFSTcpListener;
 use zerofs_nfsserve::vfs::{AuthContext as NfsAuthContext, NFSFileSystem, VFSCapabilities};
 
 /// Adapter struct that implements the NFS trait for ZeroFS.
@@ -436,20 +435,15 @@ impl NFSFileSystem for NFSAdapter {
     }
 }
 
-pub async fn start_nfs_server_with_config(
+pub async fn bind_nfs_server_with_config(
     filesystem: Arc<ZeroFS>,
     socket: SocketAddr,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<NFSTcpListener<NFSAdapter>> {
     let adapter = NFSAdapter::new(filesystem);
     let listener = NFSTcpListener::bind(socket, adapter)
         .await
         .map_err(|e| crate::net_util::tcp_bind_error("NFS", socket, &e))?;
-
-    info!("NFS server listening on {}", socket);
-
-    listener.handle_with_shutdown(shutdown).await?;
-    Ok(())
+    Ok(listener)
 }
 
 #[cfg(test)]

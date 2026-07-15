@@ -30,6 +30,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+use zerofs_nfsserve::tcp::NFSTcp;
 
 /// Parse a WAL config into an object store rooted at the full URL path.
 pub(crate) fn parse_wal_object_store(
@@ -93,10 +94,10 @@ async fn start_nfs_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NfsConfig>,
     shutdown: CancellationToken,
-) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
+) -> Result<Vec<JoinHandle<Result<(), std::io::Error>>>> {
     let config = match config {
         Some(c) => c,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let mut handles = Vec::new();
 
@@ -106,9 +107,16 @@ async fn start_nfs_servers(
             let fs_clone = Arc::clone(&fs);
             let addr = *addr;
             let shutdown_clone = shutdown.clone();
+
+            let listener = crate::nfs::bind_nfs_server_with_config(fs_clone, addr).await?;
             handles.push(spawn_named("nfs-server", async move {
-                match crate::nfs::start_nfs_server_with_config(fs_clone, addr, shutdown_clone).await
-                {
+                info!(
+                    "NFS server listening on {}:{}",
+                    listener.get_listen_ip(),
+                    listener.get_listen_port()
+                );
+
+                match listener.handle_with_shutdown(shutdown_clone).await {
                     Ok(()) => Ok(()),
                     Err(e) => Err(std::io::Error::other(e.to_string())),
                 }
@@ -116,7 +124,7 @@ async fn start_nfs_servers(
         }
     }
 
-    handles
+    Ok(handles)
 }
 
 async fn start_ninep_servers(
@@ -133,7 +141,7 @@ async fn start_ninep_servers(
     if let Some(addresses) = &config.addresses {
         for addr in addresses {
             info!("Starting 9P server on {}", addr);
-            let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr);
+            let ninep_tcp_server = crate::ninep::NinePServer::new(Arc::clone(&fs), *addr).await?;
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("9p-server", async move {
                 ninep_tcp_server.start(shutdown_clone).await
@@ -148,7 +156,7 @@ async fn start_ninep_servers(
         );
         let ninep_unix_fs = Arc::clone(&fs);
         let ninep_unix_server =
-            crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone());
+            crate::ninep::NinePServer::new_unix(ninep_unix_fs, socket_path.clone())?;
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("9p-unix-server", async move {
             ninep_unix_server.start(shutdown_clone).await
@@ -190,10 +198,10 @@ async fn start_nbd_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NbdConfig>,
     shutdown: CancellationToken,
-) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
+) -> Result<Vec<JoinHandle<Result<(), std::io::Error>>>> {
     let config = match config {
         Some(c) => c,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let mut handles = Vec::new();
 
@@ -203,7 +211,7 @@ async fn start_nbd_servers(
                 "Starting NBD server on {} (devices dynamically discovered from .nbd/)",
                 addr
             );
-            let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr);
+            let nbd_tcp_server = NBDServer::new_tcp(Arc::clone(&fs), *addr).await?;
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("nbd-server", async move {
                 if let Err(e) = nbd_tcp_server.start(shutdown_clone).await {
@@ -220,7 +228,7 @@ async fn start_nbd_servers(
             "Starting NBD server on Unix socket {} (devices dynamically discovered from .nbd/)",
             socket_path.display()
         );
-        let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs), socket_path);
+        let nbd_unix_server = NBDServer::new_unix(Arc::clone(&fs), socket_path)?;
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("nbd-unix-server", async move {
             if let Err(e) = nbd_unix_server.start(shutdown_clone).await {
@@ -231,7 +239,7 @@ async fn start_nbd_servers(
         }));
     }
 
-    handles
+    Ok(handles)
 }
 
 async fn start_rpc_servers(
@@ -928,7 +936,7 @@ pub async fn run_server(
         settings.servers.nfs.as_ref(),
         shutdown.clone(),
     )
-    .await;
+    .await?;
 
     let ninep_handles = start_ninep_servers(
         Arc::clone(&fs),
@@ -942,7 +950,7 @@ pub async fn run_server(
         settings.servers.nbd.as_ref(),
         shutdown.clone(),
     )
-    .await;
+    .await?;
 
     // A read-only admin over the same store for the GC's checkpoint gate; built
     // before the store/path are moved into the checkpoint manager below.

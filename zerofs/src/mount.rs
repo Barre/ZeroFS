@@ -2014,7 +2014,7 @@ mod client_tests {
     }
 
     fn start_server(fs: Arc<ZeroFS>, sock: std::path::PathBuf) -> CancellationToken {
-        let server = NinePServer::new_unix(fs, sock);
+        let server = NinePServer::new_unix(fs, sock).unwrap();
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         tokio::spawn(async move {
