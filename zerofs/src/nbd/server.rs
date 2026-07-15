@@ -17,8 +17,8 @@ const MAX_REQUEST_LENGTH: u32 = 128 * 1024 * 1024;
 const DISCARD_CHUNK_SIZE: usize = 64 * 1024;
 
 pub enum Transport {
-    Tcp(SocketAddr),
-    Unix(std::path::PathBuf),
+    Tcp(TcpListener),
+    Unix(UnixListener),
 }
 
 pub struct NBDServer {
@@ -27,18 +27,36 @@ pub struct NBDServer {
 }
 
 impl NBDServer {
-    pub fn new_tcp(filesystem: Arc<ZeroFS>, socket: SocketAddr) -> Self {
-        Self {
+    pub async fn new_tcp(filesystem: Arc<ZeroFS>, socket: SocketAddr) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(socket)
+            .await
+            .map_err(|e| crate::net_util::tcp_bind_error("NBD", socket, &e))?;
+
+        Ok(Self {
             filesystem,
-            transport: Transport::Tcp(socket),
-        }
+            transport: Transport::Tcp(listener),
+        })
     }
 
-    pub fn new_unix(filesystem: Arc<ZeroFS>, socket_path: impl Into<std::path::PathBuf>) -> Self {
-        Self {
+    pub fn new_unix(
+        filesystem: Arc<ZeroFS>,
+        socket_path: impl Into<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
+        let path = socket_path.into();
+
+        // Remove existing socket file if it exists
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to bind NBD Unix socket at {:?}: {}", path, e),
+            )
+        })?;
+
+        Ok(Self {
             filesystem,
-            transport: Transport::Unix(socket_path.into()),
-        }
+            transport: Transport::Unix(listener),
+        })
     }
 
     fn spawn_client_handler<S>(&self, stream: S, shutdown: &CancellationToken, client_name: String)
@@ -57,16 +75,13 @@ impl NBDServer {
 
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
-            Transport::Tcp(socket) => {
-                let listener = TcpListener::bind(socket)
-                    .await
-                    .map_err(|e| crate::net_util::tcp_bind_error("NBD", socket, &e))?;
-                info!("NBD server listening on {}", socket);
+            Transport::Tcp(listener) => {
+                info!("NBD server listening on {}", listener.local_addr()?);
 
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => {
-                            info!("NBD TCP server shutting down on {}", socket);
+                            info!("NBD TCP server shutting down on {}", listener.local_addr()?);
                             break;
                         }
                         result = listener.accept() => {
@@ -78,22 +93,16 @@ impl NBDServer {
                     }
                 }
             }
-            Transport::Unix(path) => {
-                // Remove existing socket file if it exists
-                let _ = std::fs::remove_file(path);
-
-                let listener = UnixListener::bind(path).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to bind NBD Unix socket at {:?}: {}", path, e),
-                    )
-                })?;
-                info!("NBD server listening on Unix socket {:?}", path);
+            Transport::Unix(listener) => {
+                info!(
+                    "NBD server listening on Unix socket {:?}",
+                    listener.local_addr()?
+                );
 
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => {
-                            info!("NBD Unix socket server shutting down at {:?}", path);
+                            info!("NBD Unix socket server shutting down at {:?}", listener.local_addr()?);
                             break;
                         }
                         result = listener.accept() => {
