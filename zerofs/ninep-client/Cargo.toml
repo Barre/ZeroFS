@@ -21,7 +21,7 @@ arc-swap = "1.9"
 deku = "0.20"
 bytes = "1.11"
 tracing = "0.1"
-rand = "0.8"
+uuid = { version = "1.24", features = ["v4"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2"
@@ -31,7 +31,7 @@ socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.3", features = ["futures"] }
-getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1.24", features = ["js"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

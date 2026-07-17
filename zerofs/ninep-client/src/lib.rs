@@ -37,6 +37,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 mod linux;
 mod runtime;
@@ -47,17 +48,6 @@ mod web_transport;
 const NOTAG: u16 = 0xFFFF;
 /// The 9P "no fid" sentinel, used as the `afid` in attach when not authenticating.
 pub const NOFID: u32 = 0xFFFF_FFFF;
-
-/// A fresh random idempotency op-id, stamped on each plain mutating call so a
-/// resend-on-reply-loss is deduplicated rather than double-applied. A higher
-/// layer retrying the same logical op across a failover passes its own stable id
-/// via the `_op_id` methods.
-fn new_op_id() -> [u8; 16] {
-    use rand::RngCore;
-    let mut id = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut id);
-    id
-}
 
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(50);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
@@ -1436,7 +1426,7 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<(Qid, u32)> {
-        self.lcreate_op_id(fid, name, flags, mode, gid, new_op_id())
+        self.lcreate_op_id(fid, name, flags, mode, gid, Uuid::new_v4().into_bytes())
             .await
     }
 
@@ -1495,8 +1485,16 @@ impl NinePClient {
         mode: u32,
         gid: u32,
     ) -> ClientResult<(Stat, u32)> {
-        self.lcreateattr_op_id(dfid, newfid, name, flags, mode, gid, new_op_id())
-            .await
+        self.lcreateattr_op_id(
+            dfid,
+            newfid,
+            name,
+            flags,
+            mode,
+            gid,
+            Uuid::new_v4().into_bytes(),
+        )
+        .await
     }
 
     /// [`Self::lcreateattr`] with an idempotency op-id (all-zero to opt out).
@@ -1661,7 +1659,8 @@ impl NinePClient {
     }
 
     pub async fn mkdir(&self, dfid: u32, name: &[u8], mode: u32, gid: u32) -> ClientResult<Qid> {
-        self.mkdir_op_id(dfid, name, mode, gid, new_op_id()).await
+        self.mkdir_op_id(dfid, name, mode, gid, Uuid::new_v4().into_bytes())
+            .await
     }
 
     /// [`Self::mkdir`] with an idempotency op-id (all-zero to opt out).
@@ -1736,7 +1735,7 @@ impl NinePClient {
         target: &[u8],
         gid: u32,
     ) -> ClientResult<Qid> {
-        self.symlink_op_id(dfid, name, target, gid, new_op_id())
+        self.symlink_op_id(dfid, name, target, gid, Uuid::new_v4().into_bytes())
             .await
     }
 
@@ -1814,8 +1813,16 @@ impl NinePClient {
         minor: u32,
         gid: u32,
     ) -> ClientResult<Qid> {
-        self.mknod_op_id(dfid, name, mode, major, minor, gid, new_op_id())
-            .await
+        self.mknod_op_id(
+            dfid,
+            name,
+            mode,
+            major,
+            minor,
+            gid,
+            Uuid::new_v4().into_bytes(),
+        )
+        .await
     }
 
     /// [`Self::mknod`] with an idempotency op-id (all-zero to opt out).
@@ -1903,7 +1910,8 @@ impl NinePClient {
     }
 
     pub async fn link(&self, dfid: u32, fid: u32, name: &[u8]) -> ClientResult<()> {
-        self.link_op_id(dfid, fid, name, new_op_id()).await
+        self.link_op_id(dfid, fid, name, Uuid::new_v4().into_bytes())
+            .await
     }
 
     /// [`Self::link`] with an idempotency op-id (all-zero to opt out).
@@ -1967,8 +1975,14 @@ impl NinePClient {
         newdirfid: u32,
         newname: &[u8],
     ) -> ClientResult<()> {
-        self.renameat_op_id(olddirfid, oldname, newdirfid, newname, new_op_id())
-            .await
+        self.renameat_op_id(
+            olddirfid,
+            oldname,
+            newdirfid,
+            newname,
+            Uuid::new_v4().into_bytes(),
+        )
+        .await
     }
 
     /// [`Self::renameat`] with an idempotency op-id (all-zero to opt out).
@@ -1998,7 +2012,8 @@ impl NinePClient {
     }
 
     pub async fn unlinkat(&self, dirfid: u32, name: &[u8], flags: u32) -> ClientResult<()> {
-        self.unlinkat_op_id(dirfid, name, flags, new_op_id()).await
+        self.unlinkat_op_id(dirfid, name, flags, Uuid::new_v4().into_bytes())
+            .await
     }
 
     /// [`Self::unlinkat`] with an idempotency op-id (all-zero to opt out).
