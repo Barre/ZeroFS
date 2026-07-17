@@ -317,24 +317,6 @@ impl StartupContext {
             && !db_mode.is_read_only()
             && !params.peers.is_empty()
         {
-            let marker = crate::replication::leader_record::inspect(
-                &self.retrying_object_store,
-                &self.actual_db_path,
-            )
-            .await
-            .context("HA: cannot resolve a boot role without the leader record")?;
-            let was_latest = marker
-                .latest_writer()
-                .is_some_and(|(_, node)| node == params.node_id);
-            let unresolved_handoff = matches!(
-                marker.phase(),
-                Some(
-                    crate::replication::leader_record::LeaderRecordPhase::Claiming
-                        | crate::replication::leader_record::LeaderRecordPhase::Opening
-                )
-            );
-            let handoff_blockers = marker.startup_blockers();
-
             let peers = params.peers.clone();
             let config_leader = matches!(
                 self.configured_replication_role,
@@ -383,6 +365,24 @@ impl StartupContext {
                         }
                     }
                 }
+                let marker = crate::replication::leader_record::inspect(
+                    &self.retrying_object_store,
+                    &self.actual_db_path,
+                )
+                .await
+                .context("HA: cannot resolve a boot role without the leader record")?;
+                let was_latest = marker
+                    .latest_writer()
+                    .is_some_and(|(_, node)| node == params.node_id);
+                let unresolved_handoff = matches!(
+                    marker.phase(),
+                    Some(
+                        crate::replication::leader_record::LeaderRecordPhase::Claiming
+                            | crate::replication::leader_record::LeaderRecordPhase::Opening
+                    )
+                );
+                let handoff_blockers = marker.startup_blockers();
+
                 match immediate_role_decision(unresolved_handoff, any_active) {
                     Some(ImmediateRoleDecision::RecoverHandoff) => {
                         // Claiming and Opening liveness is determined from the
@@ -1102,7 +1102,12 @@ pub async fn initialize_filesystem(
 
 #[cfg(test)]
 mod role_decision_tests {
-    use super::{ImmediateRoleDecision, immediate_role_decision};
+    use super::{ImmediateRoleDecision, StartupContext, immediate_role_decision};
+    use crate::config::{CompressionConfig, ReplicationRole};
+    use crate::fault_store::FaultStore;
+    use crate::replication::ReplicationParams;
+    use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+    use std::{sync::Arc, time::Duration};
 
     #[test]
     fn unresolved_handoff_uses_recovery_even_if_peer_still_answers_active() {
@@ -1115,5 +1120,84 @@ mod role_decision_tests {
             Some(ImmediateRoleDecision::FollowActivePeer)
         );
         assert_eq!(immediate_role_decision(false, false), None);
+    }
+
+    #[tokio::test]
+    async fn peer_silence_refreshes_the_leader_record() {
+        let (fault_store, faults) = FaultStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = fault_store;
+        store
+            .put(
+                &Path::from("db").join(".zerofs_ha_leader"),
+                b"1 node-a".to_vec().into(),
+            )
+            .await
+            .unwrap();
+
+        let mut startup = StartupContext {
+            object_store: store.clone(),
+            retrying_object_store: store.clone(),
+            wal_object_store: None,
+            object_tracer: crate::object_trace::ObjectTracer::new(),
+            actual_db_path: "db".into(),
+            block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
+                &[0; 32],
+                CompressionConfig::default(),
+            ),
+            segment_codec: crate::frame_codec::FrameCodec::new(
+                &[0; 32],
+                crate::segment::SEGMENT_INFO,
+                CompressionConfig::default(),
+            ),
+            cache_config: crate::fs::CacheConfig {
+                root_folder: std::env::temp_dir(),
+                max_cache_size_gb: 0.0,
+                memory_cache_size_gb: None,
+            },
+            dedup: Arc::new(crate::dedup::DedupCache::new()),
+            replication_params: Some(ReplicationParams {
+                node_id: "node-a".into(),
+                role: ReplicationRole::Leader,
+                peers: vec!["http://[invalid".into()],
+                replication_listen: None,
+                force_recovery: false,
+            }),
+            configured_replication_role: Some(ReplicationRole::Leader),
+            db_mode: super::DatabaseMode::ReadWrite,
+            ha: None,
+            took_over_from_standby: false,
+            recovering_handoff: false,
+            opening: None,
+        };
+        let election = tokio::spawn(async move {
+            startup.become_writer().await?;
+            Ok::<_, anyhow::Error>((
+                startup.recovering_handoff,
+                startup.replication_params.unwrap().is_leader(),
+            ))
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while faults.get_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("role election must inspect the initial leader record");
+
+        let abandoned = crate::replication::leader_record::claim(&store, "db", "node-b", false)
+            .await
+            .unwrap();
+        drop(abandoned);
+
+        let (recovering_handoff, elected_leader) =
+            tokio::time::timeout(Duration::from_secs(2), election)
+                .await
+                .expect("role election must observe the abandoned handoff")
+                .unwrap()
+                .unwrap();
+        assert!(recovering_handoff);
+        assert!(elected_leader);
+        assert!(faults.get_count() >= 3);
     }
 }
