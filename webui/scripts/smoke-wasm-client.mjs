@@ -10,8 +10,7 @@ await init({ module_or_path: wasm });
 
 const client = await Client.connect(endpoint);
 const capabilities = client.capabilities();
-assert.equal(capabilities.extensions_v1, true);
-assert.equal(capabilities.extensions_v2, true);
+assert.equal(capabilities.msize > 0, true);
 assert.equal(typeof client.trafficStats().bytes_sent, "bigint");
 
 await client.createDir("/wasm-smoke", 0o755);

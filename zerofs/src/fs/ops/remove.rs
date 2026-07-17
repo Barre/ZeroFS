@@ -5,6 +5,7 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
+use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
@@ -41,19 +42,42 @@ impl ZeroFS {
     ) -> Result<(), FsError> {
         validate_filename(name)?;
 
-        // Applied retry of our own op: the entry is gone, report success.
-        if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+        // Replay a completed remove before resolving the missing entry.
+        if self
+            .replay_dedup_result(&op_id, DedupResult::into_remove)?
+            .is_some()
+        {
             return Ok(());
         }
 
         let creds = Credentials::from_auth_context(auth);
 
-        let (file_id, cookie) = self
+        let (file_id, cookie) = match self
             .directory_store
             .get_entry_with_cookie(dirid, name)
-            .await?;
+            .await
+        {
+            Ok(entry) => entry,
+            Err(error) => {
+                if self
+                    .replay_dedup_result(&op_id, DedupResult::into_remove)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
 
         let _guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
+
+        // Recheck replay state after waiting for inode locks.
+        if self
+            .replay_dedup_result(&op_id, DedupResult::into_remove)?
+            .is_some()
+        {
+            return Ok(());
+        }
 
         let mut dir_inode = self.inode_store.get(dirid).await?;
         check_access(&dir_inode, &creds, AccessMode::Write)?;
@@ -62,6 +86,9 @@ impl ZeroFS {
         let is_dir = matches!(dir_inode, Inode::Directory(_));
         if !is_dir {
             return Err(FsError::NotDirectory);
+        }
+        if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
+            return Err(FsError::StaleHandle);
         }
 
         // Re-check inside lock to verify entry still points to same inode
@@ -74,6 +101,7 @@ impl ZeroFS {
         }
 
         let mut file_inode = self.inode_store.get(file_id).await?;
+        let defer_unlinked = self.should_defer_unlinked_inode(file_id);
 
         let original_nlink = match &file_inode {
             Inode::File(f) => f.nlink,
@@ -95,7 +123,7 @@ impl ZeroFS {
         match &mut dir_inode {
             Inode::Directory(dir) => {
                 let mut txn = self.db.new_transaction()?;
-                txn.set_op_id(op_id);
+                txn.set_dedup_result(op_id, DedupResult::Remove);
                 let (now_sec, now_nsec) = get_current_time();
 
                 // Set when the last link is dropped but a 9P fid still holds
@@ -112,7 +140,7 @@ impl ZeroFS {
                             file.ctime_nsec = now_nsec;
 
                             self.inode_store.save(&mut txn, file_id, &file_inode)?;
-                        } else if self.open_handle_count(file_id) > 0 {
+                        } else if defer_unlinked {
                             // POSIX open-unlink: defer reclaim until last clunk.
                             file.nlink = 0;
                             file.ctime = now_sec;
@@ -159,23 +187,39 @@ impl ZeroFS {
                         if subdir.entry_count > 0 {
                             return Err(FsError::NotEmpty);
                         }
-                        self.inode_store.delete(&mut txn, file_id);
+                        if defer_unlinked {
+                            // An open directory retains its inode and cookie counter
+                            // until last clunk.
+                            subdir.nlink = 0;
+                            subdir.ctime = now_sec;
+                            subdir.ctime_nsec = now_nsec;
+                            subdir.name = None;
+                            self.inode_store.save(&mut txn, file_id, &file_inode)?;
+                            self.orphan_store.add(&mut txn, file_id);
+                            deferred = true;
 
-                        #[cfg(feature = "failpoints")]
-                        fail_point!(fp::RMDIR_AFTER_INODE_DELETE);
+                            #[cfg(feature = "failpoints")]
+                            fail_point!(fp::REMOVE_AFTER_ORPHAN_ADD);
+                        } else {
+                            self.inode_store.delete(&mut txn, file_id);
 
-                        self.directory_store.delete_directory(&mut txn, file_id);
+                            #[cfg(feature = "failpoints")]
+                            fail_point!(fp::RMDIR_AFTER_INODE_DELETE);
 
-                        #[cfg(feature = "failpoints")]
-                        fail_point!(fp::RMDIR_AFTER_DIR_CLEANUP);
+                            self.directory_store.delete_directory(&mut txn, file_id);
+
+                            #[cfg(feature = "failpoints")]
+                            fail_point!(fp::RMDIR_AFTER_DIR_CLEANUP);
+
+                            self.stats
+                                .directories_deleted
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
 
                         dir.nlink = dir.nlink.saturating_sub(1);
-                        self.stats
-                            .directories_deleted
-                            .fetch_add(1, Ordering::Relaxed);
                     }
                     Inode::Symlink(symlink) => {
-                        if self.open_handle_count(file_id) > 0 {
+                        if defer_unlinked {
                             // POSIX open-unlink: defer reclaim until last clunk.
                             symlink.nlink = 0;
                             symlink.ctime = now_sec;
@@ -203,7 +247,7 @@ impl ZeroFS {
                             special.ctime_nsec = now_nsec;
 
                             self.inode_store.save(&mut txn, file_id, &file_inode)?;
-                        } else if self.open_handle_count(file_id) > 0 {
+                        } else if defer_unlinked {
                             // POSIX open-unlink: defer reclaim until last clunk.
                             special.nlink = 0;
                             special.ctime = now_sec;
@@ -261,6 +305,10 @@ impl ZeroFS {
 
                 self.write_coordinator.commit(txn).await?;
 
+                if deferred {
+                    self.schedule_deferred_orphan_reclaim(file_id);
+                }
+
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::REMOVE_AFTER_COMMIT);
 
@@ -281,6 +329,7 @@ impl ZeroFS {
 #[cfg(test)]
 mod tests {
 
+    use crate::dedup::DedupResult;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
@@ -358,5 +407,37 @@ mod tests {
 
         let result = fs.remove(&(&test_auth()).into(), 0, b"testdir").await;
         assert!(matches!(result, Err(FsError::NotEmpty)));
+    }
+
+    #[tokio::test]
+    async fn remove_retry_requires_a_remove_result() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [0x31; 16];
+        fs.create_idempotent(&test_creds(), 0, b"file", &SetAttributes::default(), op_id)
+            .await
+            .unwrap();
+
+        let result = fs
+            .remove_idempotent(&(&test_auth()).into(), 0, b"file", op_id)
+            .await;
+        assert!(matches!(result, Err(FsError::InvalidArgument)));
+        assert!(fs.lookup(&test_creds(), 0, b"file").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_retry_replays_success_after_entry_is_gone() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [0x32; 16];
+        fs.create(&test_creds(), 0, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.remove_idempotent(&(&test_auth()).into(), 0, b"file", op_id)
+            .await
+            .unwrap();
+        fs.remove_idempotent(&(&test_auth()).into(), 0, b"file", op_id)
+            .await
+            .unwrap();
+        assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Remove)));
     }
 }

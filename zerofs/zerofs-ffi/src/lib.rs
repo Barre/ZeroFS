@@ -1,11 +1,8 @@
-//! Foreign-language bindings for `zerofs-client`, generated with uniffi.
+//! UniFFI bindings for `zerofs-client`.
 //!
-//! This crate is a thin, FFI-shaped re-export of the Rust client: paths cross
-//! as `String` (and child names in the `Dir` `*_at` suite as `Vec<u8>` for
-//! non-UTF-8), byte payloads as owned `Vec<u8>`, handles as `Arc` objects, and
-//! errors as a flat exhaustive enum. It deliberately drops the Rust-only sugar
-//! (the `impl AsRef<Path>` polymorphism, `Bytes` returns, `tokio-io` cursor,
-//! `Stream`, serde), hence `default-features = false` on `zerofs-client`.
+//! Paths use `String`; byte-exact `Dir` child names and payloads use `Vec<u8>`;
+//! handles use `Arc`; errors use an exhaustive enum. Rust-only adapters and
+//! feature traits are not exposed.
 
 uniffi::setup_scaffolding!();
 
@@ -25,8 +22,8 @@ pub use types::{
     SetTime, StatFs,
 };
 
-/// One ZeroFS session, one identity. Safe to share and call concurrently;
-/// reconnects transparently.
+/// One concurrent ZeroFS session and identity. Open-unlinked handles produce
+/// `ESTALE` after connection loss.
 #[derive(uniffi::Object)]
 pub struct Client {
     inner: Arc<zerofs_client::Client>,
@@ -43,7 +40,8 @@ impl Client {
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     /// Connect with defaults. Targets: `unix:/sock`, `tcp://host:port`,
-    /// `host:port`, `host` (port 5564), or a bare filesystem path.
+    /// `host:port`, `host` (port 5564), or a bare filesystem path. A
+    /// comma-separated string forms an HA target set.
     #[uniffi::constructor]
     pub async fn connect(target: String) -> Result<Arc<Client>, ZeroFsError> {
         let inner = zerofs_client::Client::connect(&target).await?;

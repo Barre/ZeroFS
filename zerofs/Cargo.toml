@@ -81,7 +81,7 @@ tikv-jemalloc-ctl = { version = "0.7", features = [
     "stats",
 ] }
 tokio = { version = "1.49", features = ["full", "tracing"] }
-tokio-util = { version = "0.7", features = ["codec", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "rt", "time"] }
 async-trait = "0.1"
 backon = { version = "1.5", features = ["tokio-sleep"] }
 tracing = "0.1"
@@ -137,6 +137,7 @@ fail = { version = "0.5", features = ["failpoints"], optional = true }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 serde_json = "1.0"
+socket2 = { version = "0.6", features = ["all"] }
 hyper = { version = "1", features = ["http1", "server"] }
 http-body-util = "0.1"
 ratatui = "0.30"

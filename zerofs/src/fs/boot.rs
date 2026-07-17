@@ -42,7 +42,7 @@ impl ZeroFS {
             false,
             None,
             None,
-            Arc::new(crate::dedup::DedupCache::new(65_536)),
+            Arc::new(crate::dedup::DedupCache::new()),
             None, // single-node / test: no HA coverage proof, always regenerate
             ObjectTracer::new(),
             object_store,
@@ -63,7 +63,7 @@ impl ZeroFS {
         sync_writes: bool,
         ignore_fsync: bool,
         lease: Option<Arc<crate::replication::Lease>>,
-        replicator: Option<Arc<crate::replication::Replicator>>,
+        replicator: Option<crate::replication::Replicator>,
         dedup: Arc<crate::dedup::DedupCache>,
         // Present only when takeover reconciliation produced an epoch-bound proof.
         lineage_proof: Option<LineageProof>,
@@ -73,8 +73,11 @@ impl ZeroFS {
         segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         seal_threshold_override: Option<usize>,
     ) -> anyhow::Result<Self> {
+        // The expiry reaper may already be running from CLI setup.
+        dedup.start_expiry_reaper();
         let lock_manager = Arc::new(KeyedLockManager::new());
         let key_codec = Arc::new(KeyCodec::new());
+        let ha_writer = lease.is_some();
 
         // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
         // open). Used as a fresh, never-reused lineage token whenever the durability
@@ -86,6 +89,7 @@ impl ZeroFS {
             ),
             SlateDbHandle::ReadOnly(_) => (0, None),
         };
+        let serving_writer_epoch = if ha_writer { writer_epoch } else { 0 };
 
         let db = Arc::new(match slatedb {
             SlateDbHandle::ReadWrite(db) => {
@@ -221,6 +225,7 @@ impl ZeroFS {
         extent_store.set_coordinator(write_coordinator.downgrade());
 
         let (reclaim_tx, reclaim_rx) = tokio::sync::mpsc::unbounded_channel();
+        dedup.set_reclaim_sender(&reclaim_tx);
 
         let fs = Self {
             db: db.clone(),
@@ -239,15 +244,14 @@ impl ZeroFS {
             write_coordinator,
             ignore_fsync,
             lineage_token,
+            serving_writer_epoch,
             max_bytes,
             tracer: AccessTracer::new(),
             object_tracer,
             dedup,
         };
 
-        // Drain the durable orphan set left by any prior life: open-unlinked
-        // inodes whose handles did not survive the crash/shutdown. Post-crash
-        // there are zero open handles, so every orphan is reclaimable.
+        // Reclaim durable orphans before a writer starts serving.
         if !db.is_read_only() {
             fs.drain_orphans().await?;
         }
@@ -255,11 +259,9 @@ impl ZeroFS {
         Ok(fs)
     }
 
-    /// Resolve the durability lineage token at bring-up. Carry the stored token
-    /// only when takeover reconciliation proved complete coverage and the lineage is
-    /// untainted, so the client's verified fsync remains transparent. Otherwise
-    /// persist a fresh, never-reused `writer_epoch` token; pre-break clients then
-    /// fail verified fsync rather than matching a stale lineage.
+    /// Resolve the durability lineage token at startup.
+    /// A coverage-proven, untainted takeover retains the stored token; other
+    /// startups persist the new writer epoch.
     async fn resolve_lineage_token(
         db: &Db,
         key_codec: &KeyCodec,
@@ -295,8 +297,7 @@ impl ZeroFS {
             },
         )
         .await?;
-        // await_durable:false + explicit flush (a durable write here can stall
-        // bring-up on file://); the token must be durable before this node serves.
+        // The lineage token is durable before serving starts.
         db.flush().await?;
         Ok(token)
     }
@@ -310,15 +311,8 @@ impl ZeroFS {
         self.flush_coordinator.flush().await
     }
 
-    /// Durability-verified fsync (9P `Tfsyncdur`, `.zerofs4`). `client_token` is the
-    /// lineage token of the client's oldest un-fsync'd write (`0` = nothing
-    /// un-fsync'd). We flush first (so every write made on this instance becomes
-    /// durable), then verify the lineage: OK iff the client wrote nothing, or its
-    /// writes belong to the live lineage (so the flush just made them durable, or a
-    /// clean takeover carried them). Otherwise the client's writes were made under a
-    /// lineage that broke (a cold restart or a Solo-tainted takeover) and may be
-    /// lost, so we return ESTALE rather than a false success. With `ignore_fsync`,
-    /// the administrator explicitly opts out and this barrier returns immediately.
+    /// Flush and verify the client's oldest unflushed-write lineage token.
+    /// Token zero means no unflushed write. A mismatched token returns `ESTALE`.
     pub async fn client_fsync_verified(
         &self,
         client_token: u64,

@@ -5,6 +5,7 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
+use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, FileInode, Inode, InodeId, SpecialInode};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
@@ -46,6 +47,9 @@ impl ZeroFS {
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
+            return Ok(result);
+        }
         validate_filename(name)?;
 
         debug!(
@@ -55,6 +59,10 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
+        // Direct filesystem callers do not pass through the 9P single-flight.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
+            return Ok(result);
+        }
         let (mut dir_inode, exists) = tokio::try_join!(
             self.inode_store.get(dirid),
             self.directory_store.exists(dirid, name)
@@ -65,11 +73,10 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
+                if dir.nlink == 0 {
+                    return Err(FsError::StaleHandle);
+                }
                 if exists {
-                    // Applied retry of our own create: return the existing file.
-                    if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
-                        return self.existing_child_result(dirid, name).await;
-                    }
                     return Err(FsError::Exists);
                 }
 
@@ -110,13 +117,24 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
-                txn.set_op_id(op_id);
                 let cookie = self
                     .directory_store
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
                 let file_inode_enum = Inode::File(file_inode.clone());
+                let file_attrs: FileAttributes = InodeWithId {
+                    inode: &file_inode_enum,
+                    id: file_id,
+                }
+                .into();
+                txn.set_dedup_result(
+                    op_id,
+                    crate::dedup::DedupResult::Create {
+                        inode_id: file_id,
+                        attrs: file_attrs.clone(),
+                    },
+                );
                 self.inode_store.save(&mut txn, file_id, &file_inode_enum)?;
 
                 #[cfg(feature = "failpoints")]
@@ -172,12 +190,6 @@ impl ZeroFS {
                     },
                 );
 
-                let inode = Inode::File(file_inode);
-                let file_attrs = InodeWithId {
-                    inode: &inode,
-                    id: file_id,
-                }
-                .into();
                 Ok((file_id, file_attrs))
             }
             _ => Err(FsError::NotDirectory),
@@ -226,6 +238,9 @@ impl ZeroFS {
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
+            return Ok(result);
+        }
         validate_filename(name)?;
 
         debug!(
@@ -235,6 +250,10 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
+        // Direct filesystem callers do not pass through the 9P single-flight.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mkdir)? {
+            return Ok(result);
+        }
         let (mut dir_inode, exists) = tokio::try_join!(
             self.inode_store.get(dirid),
             self.directory_store.exists(dirid, name)
@@ -245,18 +264,10 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
+                if dir.nlink == 0 {
+                    return Err(FsError::StaleHandle);
+                }
                 if exists {
-                    // Applied retry of our own op: return the existing directory.
-                    if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
-                        let existing_id = self.directory_store.get(dirid, name).await?;
-                        let existing = self.inode_store.get(existing_id).await?;
-                        let attrs = InodeWithId {
-                            inode: &existing,
-                            id: existing_id,
-                        }
-                        .into();
-                        return Ok((existing_id, attrs));
-                    }
                     return Err(FsError::Exists);
                 }
 
@@ -317,13 +328,24 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
-                txn.set_op_id(op_id);
                 let cookie = self
                     .directory_store
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
                 let new_dir_inode_enum = Inode::Directory(new_dir_inode.clone());
+                let attrs: FileAttributes = InodeWithId {
+                    inode: &new_dir_inode_enum,
+                    id: new_dir_id,
+                }
+                .into();
+                txn.set_dedup_result(
+                    op_id,
+                    crate::dedup::DedupResult::Mkdir {
+                        inode_id: new_dir_id,
+                        attrs: attrs.clone(),
+                    },
+                );
                 self.inode_store
                     .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
 
@@ -384,12 +406,6 @@ impl ZeroFS {
                     },
                 );
 
-                let new_inode = Inode::Directory(new_dir_inode);
-                let attrs = InodeWithId {
-                    inode: &new_inode,
-                    id: new_dir_id,
-                }
-                .into();
                 Ok((new_dir_id, attrs))
             }
             _ => Err(FsError::NotDirectory),
@@ -424,6 +440,9 @@ impl ZeroFS {
         rdev: Option<(u32, u32)>,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
+            return Ok(result);
+        }
         validate_filename(name)?;
 
         debug!(
@@ -434,6 +453,10 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
+        // Direct filesystem callers do not pass through the 9P single-flight.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_mknod)? {
+            return Ok(result);
+        }
         let (mut dir_inode, exists) = tokio::try_join!(
             self.inode_store.get(dirid),
             self.directory_store.exists(dirid, name)
@@ -444,11 +467,10 @@ impl ZeroFS {
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
+                if dir.nlink == 0 {
+                    return Err(FsError::StaleHandle);
+                }
                 if exists {
-                    // Applied retry of our own op: return the existing node.
-                    if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
-                        return self.existing_child_result(dirid, name).await;
-                    }
                     debug!("File already exists");
                     return Err(FsError::Exists);
                 }
@@ -500,11 +522,23 @@ impl ZeroFS {
                 };
 
                 let mut txn = self.db.new_transaction()?;
-                txn.set_op_id(op_id);
                 let cookie = self
                     .directory_store
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
+
+                let attrs: FileAttributes = InodeWithId {
+                    inode: &inode,
+                    id: special_id,
+                }
+                .into();
+                txn.set_dedup_result(
+                    op_id,
+                    crate::dedup::DedupResult::Mknod {
+                        inode_id: special_id,
+                        attrs: attrs.clone(),
+                    },
+                );
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
 
@@ -551,14 +585,7 @@ impl ZeroFS {
                     FileOperation::Mknod { mode: final_mode },
                 );
 
-                Ok((
-                    special_id,
-                    InodeWithId {
-                        inode: &inode,
-                        id: special_id,
-                    }
-                    .into(),
-                ))
+                Ok((special_id, attrs))
             }
             _ => Err(FsError::NotDirectory),
         }
@@ -570,6 +597,7 @@ mod tests {
 
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
+    use crate::test_helpers::test_helpers_mod::test_auth;
 
     use crate::fs::inode::Inode;
     use crate::fs::key_codec::KeyCodec;
@@ -623,6 +651,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_retry_replays_original_result_after_name_is_replaced() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [1u8; 16];
+        let attrs = SetAttributes {
+            mode: SetMode::Set(0o640),
+            ..Default::default()
+        };
+
+        let (original_id, original_attrs) = fs
+            .create_idempotent(&test_creds(), 0, b"file", &attrs, op_id)
+            .await
+            .unwrap();
+        fs.remove(&(&test_auth()).into(), 0, b"file").await.unwrap();
+        let (replacement_id, _) = fs
+            .create(&test_creds(), 0, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let (retry_id, retry_attrs) = fs
+            .create_idempotent(&test_creds(), 0, b"file", &attrs, op_id)
+            .await
+            .unwrap();
+        assert_eq!(retry_id, original_id);
+        assert_eq!(retry_attrs.fileid, original_attrs.fileid);
+        assert_eq!(retry_attrs.mode, original_attrs.mode);
+        assert_eq!(retry_attrs.mtime, original_attrs.mtime);
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"file").await.unwrap(),
+            replacement_id
+        );
+        assert_ne!(replacement_id, original_id);
+    }
+
+    #[tokio::test]
     async fn test_process_mkdir() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
@@ -642,6 +704,85 @@ mod tests {
             }
             _ => panic!("Should be a directory"),
         }
+    }
+
+    #[tokio::test]
+    async fn mkdir_and_mknod_retries_do_not_retarget_replacements() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let mkdir_op = [2u8; 16];
+        let (old_dir, old_dir_attrs) = fs
+            .mkdir_idempotent(
+                &test_creds(),
+                0,
+                b"dir",
+                &SetAttributes::default(),
+                mkdir_op,
+            )
+            .await
+            .unwrap();
+        fs.remove(&(&test_auth()).into(), 0, b"dir").await.unwrap();
+        let (new_dir, _) = fs
+            .mkdir(&test_creds(), 0, b"dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (retry_dir, retry_dir_attrs) = fs
+            .mkdir_idempotent(
+                &test_creds(),
+                0,
+                b"dir",
+                &SetAttributes::default(),
+                mkdir_op,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_dir, old_dir);
+        assert_eq!(retry_dir_attrs.fileid, old_dir_attrs.fileid);
+        assert_eq!(fs.lookup(&test_creds(), 0, b"dir").await.unwrap(), new_dir);
+
+        let mknod_op = [3u8; 16];
+        let (old_node, old_node_attrs) = fs
+            .mknod_idempotent(
+                &test_creds(),
+                0,
+                b"node",
+                FileType::Fifo,
+                &SetAttributes::default(),
+                None,
+                mknod_op,
+            )
+            .await
+            .unwrap();
+        fs.remove(&(&test_auth()).into(), 0, b"node").await.unwrap();
+        let (new_node, _) = fs
+            .mknod(
+                &test_creds(),
+                0,
+                b"node",
+                FileType::Fifo,
+                &SetAttributes::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (retry_node, retry_node_attrs) = fs
+            .mknod_idempotent(
+                &test_creds(),
+                0,
+                b"node",
+                FileType::Fifo,
+                &SetAttributes::default(),
+                None,
+                mknod_op,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_node, old_node);
+        assert_eq!(retry_node_attrs.fileid, old_node_attrs.fileid);
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"node").await.unwrap(),
+            new_node
+        );
     }
 
     #[tokio::test]

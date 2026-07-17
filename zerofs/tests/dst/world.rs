@@ -152,7 +152,7 @@ impl Storage {
                 false,
                 None,
                 None,
-                Arc::new(zerofs::dedup::DedupCache::new(65_536)),
+                Arc::new(zerofs::dedup::DedupCache::new()),
                 None,
                 zerofs::object_trace::ObjectTracer::new(),
                 object_store,

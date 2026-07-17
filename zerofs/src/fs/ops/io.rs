@@ -5,6 +5,7 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
+use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
@@ -26,6 +27,22 @@ impl ZeroFS {
         offset: u64,
         data: &Bytes,
     ) -> Result<FileAttributes, FsError> {
+        self.write_idempotent(auth, id, offset, data, [0u8; 16])
+            .await
+    }
+
+    /// Idempotent write retaining the original post-write attributes.
+    pub async fn write_idempotent(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+        offset: u64,
+        data: &Bytes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_write)? {
+            return Ok(result);
+        }
         let start_time = std::time::Instant::now();
         debug!(
             "Processing write of {} bytes to inode {} at offset {}",
@@ -37,6 +54,11 @@ impl ZeroFS {
         let creds = Credentials::from_auth_context(auth);
 
         let _guard = self.lock_manager.acquire(id).await;
+        // Direct filesystem callers do not pass through the 9P single-flight,
+        // so re-check after waiting for the inode lock.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_write)? {
+            return Ok(result);
+        }
         let mut inode = self.inode_store.get(id).await?;
 
         // NFS RFC 1813 section 4.4: Allow owners to write to their files regardless of permission bits
@@ -103,6 +125,13 @@ impl ZeroFS {
                         .await?;
                 }
 
+                let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+                txn.set_dedup_result(
+                    op_id,
+                    crate::dedup::DedupResult::Write {
+                        attrs: post_attrs.clone(),
+                    },
+                );
                 txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                 let db_write_start = std::time::Instant::now();
@@ -137,7 +166,7 @@ impl ZeroFS {
                     },
                 );
 
-                Ok(InodeWithId { inode: &inode, id }.into())
+                Ok(post_attrs)
             }
             _ => Err(FsError::IsDirectory),
         }
@@ -264,6 +293,24 @@ impl ZeroFS {
         length: u64,
         mode: FallocateMode,
     ) -> Result<FileAttributes, FsError> {
+        self.fallocate_idempotent(auth, id, offset, length, mode, [0u8; 16])
+            .await
+    }
+
+    /// Idempotent fallocate. Delayed punch-hole and zero-range retries do not
+    /// apply after newer writes.
+    pub async fn fallocate_idempotent(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+        offset: u64,
+        length: u64,
+        mode: FallocateMode,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {
+            return Ok(result);
+        }
         debug!(
             "Processing fallocate on inode {} at offset {} length {} mode {:?}",
             id, offset, length, mode
@@ -275,6 +322,10 @@ impl ZeroFS {
         let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
         let _guard = self.lock_manager.acquire(id).await;
+        // Direct filesystem callers do not pass through the 9P single-flight.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {
+            return Ok(result);
+        }
         let mut inode = self.inode_store.get(id).await?;
 
         let creds = Credentials::from_auth_context(auth);
@@ -345,6 +396,13 @@ impl ZeroFS {
                 .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
                 .await?;
         }
+        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+        txn.set_dedup_result(
+            op_id,
+            crate::dedup::DedupResult::Fallocate {
+                attrs: post_attrs.clone(),
+            },
+        );
         txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
         self.write_coordinator.commit(txn).await.inspect_err(|e| {
@@ -369,7 +427,7 @@ impl ZeroFS {
             },
         );
 
-        Ok(InodeWithId { inode: &inode, id }.into())
+        Ok(post_attrs)
     }
 }
 
@@ -421,6 +479,70 @@ mod tests {
 
         assert_eq!(read_data.as_ref(), data);
         assert!(eof);
+    }
+
+    #[tokio::test]
+    async fn write_retry_replays_result_without_overwriting_a_later_write() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"retry.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let op_id = [0x41; 16];
+        let auth: AuthContext = (&test_auth()).into();
+
+        let original = fs
+            .write_idempotent(&auth, file_id, 0, &Bytes::from_static(b"first"), op_id)
+            .await
+            .unwrap();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"later"))
+            .await
+            .unwrap();
+
+        let replayed = fs
+            .write_idempotent(&auth, file_id, 0, &Bytes::from_static(b"first"), op_id)
+            .await
+            .unwrap();
+        assert_eq!(replayed.size, original.size);
+        assert_eq!(replayed.mtime, original.mtime);
+        let (data, _) = fs.read_file(&auth, file_id, 0, 5).await.unwrap();
+        assert_eq!(data.as_ref(), b"later");
+    }
+
+    #[tokio::test]
+    async fn fallocate_retry_does_not_zero_a_later_write() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"range-retry.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let auth: AuthContext = (&test_auth()).into();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let op_id = [0x43; 16];
+        let mode = FallocateMode::ZeroRange { keep_size: true };
+
+        let original = fs
+            .fallocate_idempotent(&auth, file_id, 0, 5, mode, op_id)
+            .await
+            .unwrap();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"later"))
+            .await
+            .unwrap();
+
+        let replayed = fs
+            .fallocate_idempotent(&auth, file_id, 0, 5, mode, op_id)
+            .await
+            .unwrap();
+        assert_eq!(replayed.mtime, original.mtime);
+        let (data, _) = fs.read_file(&auth, file_id, 0, 5).await.unwrap();
+        assert_eq!(data.as_ref(), b"later");
     }
 
     #[tokio::test]

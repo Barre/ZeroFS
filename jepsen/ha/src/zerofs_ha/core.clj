@@ -710,10 +710,19 @@
                                    (reset! cluster-roles {:a :dead :b :dead})
                                    :killed-both)
                  :pause-minio  (do (pause-pid! (:minio-pid c)) :paused-minio)
-                 :resume-minio (do (resume-pid! (:minio-pid c)) :resumed-minio)
-                 ;; SIGSTOP the leader past its lease so the standby promotes +
-                 ;; fences it; on thaw (resume-leader) the stale leader must fence
-                 ;; ITSELF (expired lease + superseded epoch), not serve/corrupt.
+                 :resume-minio (do (resume-pid! (:minio-pid c))
+                                   ;; Restart ZeroFS after store recovery.
+                                   (Thread/sleep 500)
+                                   (heal-restart! c)
+                                   :resumed-minio)
+                 :await-serving (do (await-fn
+                                     (fn [] (or (node-9p-up? c :a)
+                                                (node-9p-up? c :b)
+                                                (throw+ {:type ::no-serving-node})))
+                                     {:retry-interval 500 :log-interval 5000 :timeout 40000
+                                      :log-message "failover: waiting for an authoritative listener"})
+                                    :serving)
+                 ;; Hold the leader through failure detection and claim grace.
                  :pause-leader  (let [n (leader-node) s (standby-node)]
                                   (pause-pid! (node-pid c n))
                                   (swap! cluster-roles assoc n :paused)
@@ -724,7 +733,7 @@
                                     (do (info "resume: thawing stale leader" p
                                               "-- must fence itself under new leader" ldr)
                                         (resume-pid! (node-pid c p))
-                                        (Thread/sleep 10000) ; window for the stale node to (not) serve/corrupt
+                                        (Thread/sleep 10000) ; allow stale-writer detection
                                         (info "resume: stale leader" p
                                               (if (proc-alive? (node-pid c p))
                                                 "still up (should be refusing)" "self-fenced (exited)"))
@@ -737,11 +746,8 @@
                                         (swap! cluster-roles assoc p :standby)
                                         (str "resumed-" (name p)))
                                     (do (heal-restart! c) "resume-fell-back-to-restart")))
-                 ;; Bounce the leader (kill + fast restart, under takeover_ttl): the
-                 ;; restarted leader must DEFER (its Hello sees the standby active)
-                 ;; and let the standby take over (active trigger), not re-take and
-                 ;; drop the tail. With an active workload the standby holds a tail,
-                 ;; so it promotes; roles flip (heal-restart resets them regardless).
+                 ;; Restart before peer-failure detection. Hello must defer to the
+                 ;; active standby and preserve its tail.
                  :bounce-leader (let [n (leader-node) s (standby-node)]
                                   (kill-pid! (node-pid c n))
                                   (Thread/sleep 500)
@@ -749,12 +755,8 @@
                                   (when s (swap! cluster-roles assoc s :leader))
                                   (swap! cluster-roles assoc n :standby)
                                   (str "bounced-leader-" (name n)))
-                 ;; Liveness: kill the leader (leave it dead), let the standby
-                 ;; promote, then restart the promoted standby. It must RE-TAKE (its
-                 ;; Hello sees the original leader dead), not stall in the standby
-                 ;; watch. The re-take await fails the test if it stalls; it also
-                 ;; exercises store re-open after a crash on MinIO (resolves whether
-                 ;; the local-fs "error transforming block" is a file:// artifact).
+                 ;; A promoted standby must reclaim ownership after restart while
+                 ;; its peer remains down.
                  :liveness-restart (let [n (leader-node) s (standby-node)]
                                      (kill-pid! (node-pid c n))
                                      (swap! cluster-roles assoc n :dead)
@@ -764,7 +766,6 @@
                                                {:retry-interval 500 :log-interval 5000 :timeout 40000
                                                 :log-message "liveness: waiting for standby to promote"})
                                      (Thread/sleep 3000)
-                                     ;; Restart the promoted standby while the original leader is dead.
                                      (kill-pid! (node-pid c s))
                                      (sh! :rm :-f (get-in c [:nodes s :ninep]))
                                      (Thread/sleep 500)
@@ -775,11 +776,9 @@
                                                 :log-message "liveness: promoted standby must re-take"})
                                      (str "liveness-restarted-" (name s)))
                  :heal-rejoin  (do (heal-rejoin! c) :healed-rejoin)
-                 ;; Network partition (no iptables): cut the relays carrying ALL
-                 ;; leader<->standby traffic. Both nodes stay up + serve clients +
-                 ;; reach MinIO but isolate from each other -> the standby promotes
-                 ;; and the old leader, on its next flush, is fenced (epoch CAS) and
-                 ;; exits. Exercises split-brain safety + no acked loss.
+                 ;; Cut replication traffic while retaining client and store access.
+                 ;; Marker validation retires the old server; the writer epoch
+                 ;; remains the durable-write fence.
                  :partition  (let [r @relays]
                                ((:cut! (:to-b r)))
                                ((:cut! (:to-a r)))
@@ -787,14 +786,13 @@
                  :heal-partition (let [r @relays]
                                    ((:heal! (:to-b r)))
                                    ((:heal! (:to-a r)))
-                                   (heal-restart! c) ; restore connectivity, reset to canonical
+                                   (heal-restart! c) ; restore canonical topology
                                    :healed-partition)
                  :heal-restart (do (heal-restart! c) :healed-restart)))))
     (teardown! [_ _test])))
 
-;; Each scenario pairs a fault with a heal. MinIO is paused/resumed, not killed:
-;; SIGKILL+restart of single-drive MinIO can lose acked PUTs (no fsync) and look
-;; like ZeroFS data loss, whereas a real object store stays durable.
+;; Each fault has a paired recovery. MinIO is paused because restarting the
+;; single-drive test instance can lose acknowledged, un-fsynced PUTs.
 (def scenarios
   [{:fault :kill-leader  :heal :heal-rejoin}
    {:fault :kill-standby :heal :heal-rejoin}
@@ -802,24 +800,18 @@
    {:fault :kill-standby :heal :heal-restart}
    {:fault :kill-both    :heal :heal-restart}
    {:fault :pause-minio  :heal :resume-minio}
-   ;; Fencing test: freeze the leader well past lease+takeover (~3s) so the
-   ;; standby promotes + fences it, then thaw and verify it self-fences.
+   ;; Hold through failure detection and the pre-open claim grace.
    {:fault :pause-leader :heal :resume-leader :hold 32}
-   ;; Leadership handoff (dynamic Hello-based election): a bounced leader defers
-   ;; and the standby takes over; a promoted standby that restarts while the
-   ;; original leader stays down must re-take. The op bodies do their own waits,
-   ;; so a short hold suffices before the heal.
-   {:fault :bounce-leader    :heal :heal-restart :hold 8}
+   ;; Hello makes a restarted leader defer to an active standby. A restarted
+   ;; promoted standby must reclaim ownership while its peer remains down.
+   {:fault :bounce-leader    :heal :heal-restart :hold 13}
    {:fault :liveness-restart :heal :heal-restart :hold 6}
-   ;; Network partition: peer-only cut; both nodes still reach the store. The
-   ;; standby promotes and the deposed leader self-fences: its next flush loses
-   ;; the epoch CAS, so an fsync in the window fails instead of lying, and plain
-   ;; un-fsync'd acks die with the zombie (the documented Solo degradation).
-   {:fault :partition       :heal :heal-partition :hold 12}])
+   ;; Peer-only partition; both nodes retain object-store access.
+   {:fault :partition       :heal :heal-partition :hold 17}])
 
 (defn nemesis-gen
-  "Cycle scenarios; each fault held :hold seconds (default 20, well past the 2s
-  takeover_ttl so a leader fault triggers a real promotion) then its paired heal."
+  "Cycle fault/recovery pairs. The default 20-second hold exceeds failure
+  detection and the pre-open claim grace."
   []
   (->> (for [s scenarios]
          [(gen/sleep 6) {:type :info :f (:fault s)}
@@ -1219,7 +1211,7 @@
    (gen/clients (gen/once {:f :truncate :file "m" :to 7})) ; un-fsync'd, shipped Connected
    (gen/sleep 1)
    (gen/nemesis (gen/once {:type :info :f :kill-leader})) ; clean failover, standby replays the truncate
-   (gen/sleep 8)
+   (gen/nemesis (gen/once {:type :info :f :await-serving}))
    (gen/clients (gen/once {:f :fsync :file "m"}))         ; must :ok (transparent), size stays 7
    (gen/sleep 2)
    (gen/clients (gen/once {:f :read}))))
@@ -1236,7 +1228,7 @@
    (gen/clients (gen/time-limit 4 (repeat {:f :write :file "h"}))) ; un-fsync'd, shipped
    (gen/sleep 1)
    (gen/nemesis (gen/once {:type :info :f :kill-leader})) ; failover 1: standby promotes, keeps token, replays
-   (gen/sleep 6)
+   (gen/nemesis (gen/once {:type :info :f :await-serving}))
    (gen/nemesis (gen/once {:type :info :f :kill-both}))   ; failover 2: the promoted leader also dies
    (gen/sleep 1)
    (gen/nemesis (gen/once {:type :info :f :heal-restart})) ; cold restart regenerates the token
@@ -1291,7 +1283,7 @@
    ;; Un-fsync'd writes onto the still-serving Solo leader: acked, but never shipped.
    (gen/clients (gen/time-limit 3 (repeat {:f :write :file "h"})))
    ;; The standby promotes + fences the old leader; the client re-routes to it.
-   (gen/sleep 8)
+   (gen/nemesis (gen/once {:type :info :f :await-serving}))
    ;; fsync of the file on the new leader: must FAIL (the Solo writes are gone).
    (gen/clients (gen/once {:f :fsync :file "h"}))
    (gen/sleep 1)
@@ -1321,7 +1313,7 @@
    (gen/sleep 1)
    ;; Clean kill-leader: the standby promotes + replays the tail, so the writes live on.
    (gen/nemesis (gen/once {:type :info :f :kill-leader}))
-   (gen/sleep 8)
+   (gen/nemesis (gen/once {:type :info :f :await-serving}))
    ;; fsync of the file on the promoted leader: must be :ok (transparent, survived).
    (gen/clients (gen/once {:f :fsync :file "h"}))
    (gen/sleep 1)

@@ -1,14 +1,11 @@
 use ninep_proto::{Rstatfs, Stat};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Options for [`crate::Client::connect_with`]. All defaults are
-/// literal-expressible so uniffi record defaults can reproduce them in every
-/// binding; `None` identity fields are resolved Rust-side (euid/egid/`$USER`)
-/// inside connect.
+/// Options for [`crate::Client::connect_with`]. Defaults are representable in
+/// UniFFI records. Rust resolves `None` identity fields during connect.
 ///
-/// There is deliberately no per-operation timeout: bound waits with your
-/// language's async facilities (`tokio::time::timeout`, `asyncio.wait_for`,
-/// `withTimeout`, `Promise.race`); every public future is cancel-safe.
+/// The API has no per-operation timeout. Cancellation reclaims resources but
+/// does not revoke a dispatched mutation.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectOptions {
@@ -43,17 +40,10 @@ impl Default for ConnectOptions {
     }
 }
 
-/// Live snapshot of negotiated session properties. msize and the extension
-/// level are re-negotiated on every transparent reconnect; treat this as
-/// advisory at the instant of the call, not a constant for the life of the
-/// client.
+/// Current negotiated session properties. Reconnect may change these values.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Capabilities {
-    /// ZeroFS v1 extensions active: one-round-trip lookup+stat and readdirplus.
-    pub extensions_v1: bool,
-    /// ZeroFS v2 extensions active: stat-carrying create/open/setattr fast paths.
-    pub extensions_v2: bool,
     /// Negotiated 9P message size in bytes.
     pub msize: u32,
     /// Largest single-message read payload (larger reads chunk transparently).
@@ -62,11 +52,8 @@ pub struct Capabilities {
     pub max_write_chunk: u32,
 }
 
-/// Plain record so it crosses FFI as a dictionary; constructors are Rust sugar.
-/// All field defaults are literals (bools false, mode 420 = 0o644), so
-/// keyword-style construction in the bindings does the right thing. There is
-/// deliberately no `append` flag: the server ignores open flags on writes, so
-/// appending is the explicit [`crate::Client::append`] composition.
+/// FFI-compatible open options. Defaults are false and mode 420 (`0o644`).
+/// Append is exposed as [`crate::Client::append`].
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OpenOptions {
@@ -80,8 +67,8 @@ pub struct OpenOptions {
     /// Fail with `AlreadyExists` unless this call creates the file. This is
     /// the atomic primitive (server creates are natively exclusive).
     pub create_new: bool,
-    /// Truncate to zero length on open. For a pre-existing file this is an
-    /// extra setattr round trip after the open, NOT atomic with it.
+    /// Truncate to zero length on open. Existing-file truncation is a separate,
+    /// non-atomic setattr request.
     pub truncate: bool,
     /// Permission bits when the open creates the file. Default 0o644.
     pub mode: u32,
@@ -183,19 +170,6 @@ impl FileType {
             x if x == crate::linux::S_IFSOCK => Self::Socket,
             x if x == crate::linux::S_IFCHR => Self::CharDevice,
             x if x == crate::linux::S_IFBLK => Self::BlockDevice,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub(crate) fn from_dt(dt: u8) -> Self {
-        match dt {
-            crate::linux::DT_REG => Self::File,
-            crate::linux::DT_DIR => Self::Dir,
-            crate::linux::DT_LNK => Self::Symlink,
-            crate::linux::DT_FIFO => Self::Fifo,
-            crate::linux::DT_SOCK => Self::Socket,
-            crate::linux::DT_CHR => Self::CharDevice,
-            crate::linux::DT_BLK => Self::BlockDevice,
             _ => Self::Unknown,
         }
     }
@@ -311,7 +285,7 @@ pub enum NodeKind {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Metadata {
-    /// Stable inode number (ZeroFS never reuses inode ids).
+    /// Stable, non-reused inode number.
     pub ino: u64,
     /// File type.
     pub file_type: FileType,
@@ -337,12 +311,10 @@ pub struct Metadata {
     pub mtime: Timestamp,
     /// Last status-change time.
     pub ctime: Timestamp,
-    /// RESERVED. The wire carries a creation time, but current ZeroFS servers
-    /// always report 0 (the epoch). Do not display as a real birth time yet.
+    /// Reserved creation time. Current servers report the epoch.
     pub btime: Timestamp,
-    /// RESERVED. The wire carries a content-change counter, but current ZeroFS
-    /// servers always report 0; do NOT build cache invalidation on it. For
-    /// change detection today, use `mtime`.
+    /// Reserved content-change counter. Current servers report zero; use `mtime`
+    /// for change detection.
     pub data_version: u64,
 }
 
@@ -468,11 +440,10 @@ pub struct DirEntry {
     pub name_is_utf8: bool,
     /// Entry type, known without a stat.
     pub file_type: FileType,
-    /// Stable inode number (ZeroFS never reuses inode ids).
+    /// Stable, non-reused inode number.
     pub ino: u64,
-    /// Full metadata when readdirplus is negotiated (v1+); `None` on plain
-    /// 9P2000.L.
-    pub metadata: Option<Metadata>,
+    /// Full metadata returned by the ZeroFS directory-read operation.
+    pub metadata: Metadata,
 }
 
 impl DirEntry {
@@ -483,19 +454,7 @@ impl DirEntry {
             name_is_utf8: std::str::from_utf8(&name_bytes).is_ok(),
             file_type: FileType::from_mode(e.stat.mode),
             ino: e.qid.path,
-            metadata: Some(Metadata::from_stat(&e.stat)),
-            name_bytes,
-        }
-    }
-
-    pub(crate) fn from_plain(e: &ninep_proto::DirEntry) -> Self {
-        let name_bytes = e.name.data.clone();
-        Self {
-            name: String::from_utf8_lossy(&name_bytes).into_owned(),
-            name_is_utf8: std::str::from_utf8(&name_bytes).is_ok(),
-            file_type: FileType::from_dt(e.type_),
-            ino: e.qid.path,
-            metadata: None,
+            metadata: Metadata::from_stat(&e.stat),
             name_bytes,
         }
     }

@@ -1,17 +1,12 @@
 use ninep_client::ClientError;
 use ninep_proto::P9_ENOTLEADER;
 
-/// The single error type: flat and exhaustive (deliberately NOT
-/// `#[non_exhaustive]`, so `zerofs-ffi` can apply uniffi remote derives and
-/// match exhaustively; a new variant must break its build, not silently
-/// degrade to a catch-all).
+/// Flat, exhaustive error type. New variants require matching updates in
+/// `zerofs-ffi`.
 ///
-/// `path`/`name` payloads are lossy display strings (invalid bytes become
-/// U+FFFD), never round-trippable inputs.
+/// `path` and `name` payloads are lossy display strings and are not inputs.
 ///
-/// The variant↔errno table is strict and 1:1; every server errno without a
-/// dedicated variant surfaces as [`ZeroFsError::Io`] verbatim, so
-/// [`ZeroFsError::to_errno`] is lossless by construction.
+/// Unclassified server errnos retain their numeric value in [`ZeroFsError::Io`].
 #[derive(Debug, Clone)]
 pub enum ZeroFsError {
     /// No entry at the path (ENOENT).
@@ -68,26 +63,18 @@ pub enum ZeroFsError {
     },
     /// Handle or client used after `close()`.
     Closed,
-    /// The initial connection or attach failed (including connect timeout
-    /// expiry). Connectivity errors only ever surface here: after a successful
-    /// connect, calls block through outages instead of failing.
+    /// Initial connection, negotiation, or attach failure.
     ConnectFailed {
         /// What failed during connect/attach.
         message: String,
     },
-    /// The node served the op but is no longer the HA leader (P9_ENOTLEADER): its
-    /// lease has lapsed or it was fenced by a takeover. Re-routing to the current
-    /// leader and retrying is safe; a [`crate::FailoverClient`] does so transparently.
+    /// The target is no longer the HA leader (`P9_ENOTLEADER`).
     NotLeader {
         /// The path the operation targeted (lossy display).
         path: String,
     },
-    /// Stale handle (ESTALE). From [`crate::File::sync_all`]/[`crate::File::sync_data`]
-    /// this is the durability signal: the `.zerofs4` lineage broke (a failover the
-    /// surviving node could not prove it inherited), so every write acked on this handle
-    /// before the fsync may not be durable. Treat those writes as lost, redo them, and
-    /// fsync again. From other operations it is a plain stale inode/handle (re-open the
-    /// path).
+    /// Stale handle (`ESTALE`). From sync methods, prior acknowledged writes may
+    /// be non-durable and require replacement. Other operations require reopen.
     Stale {
         /// The path the operation targeted (lossy display).
         path: String,

@@ -1,5 +1,6 @@
 use super::errors::FsError;
 use super::inode::InodeId;
+use crate::replication::types::{HaStamp, ShipSeqno, SoloHistory, WriterEpoch};
 use bytes::Bytes;
 
 // Key layout for the underlying LSM.
@@ -360,10 +361,10 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    /// Key for the HA provenance stamp: (writer epoch, last shipped batch seqno,
-    /// solo commits since that ship), flushed atomically with every replicated
-    /// leader's batch. The takeover replay guard validates the buffered tail
-    /// against this durable head.
+    /// Key for HA provenance flushed atomically with each replicated leader
+    /// batch. The stamp records the writer epoch, acknowledged ship, Solo
+    /// history, and highest locally applied ship attempt; takeover validates the
+    /// volatile tail and exact-result ledger against it.
     pub fn ha_seqno_key(&self) -> Bytes {
         let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
         self.push_prefix(&mut key, KeyPrefix::System);
@@ -371,11 +372,18 @@ impl KeyCodec {
         Bytes::from(key)
     }
 
-    pub fn encode_ha_stamp(writer_epoch: u64, seqno: u64, solo: u64) -> Bytes {
-        let mut v = Vec::with_capacity(U64_SIZE * 3);
-        v.extend_from_slice(&writer_epoch.to_le_bytes());
-        v.extend_from_slice(&seqno.to_le_bytes());
-        v.extend_from_slice(&solo.to_le_bytes());
+    pub(crate) fn encode_ha_stamp(stamp: &HaStamp) -> Bytes {
+        let mut v = Vec::with_capacity(U64_SIZE * 5);
+        v.extend_from_slice(&stamp.writer_epoch().get().to_le_bytes());
+        v.extend_from_slice(&stamp.last_shipped().map_or(0, ShipSeqno::get).to_le_bytes());
+        v.extend_from_slice(&stamp.solo_history().commits_since_last_ship().to_le_bytes());
+        v.extend_from_slice(
+            &stamp
+                .applied_through()
+                .map_or(0, ShipSeqno::get)
+                .to_le_bytes(),
+        );
+        v.extend_from_slice(&u64::from(stamp.solo_history().ran_solo()).to_le_bytes());
         Bytes::from(v)
     }
 
@@ -442,20 +450,51 @@ impl KeyCodec {
         }
     }
 
-    /// Returns `(writer_epoch, last shipped seqno, solo commits since)`. A
-    /// two-field value predates the solo counter and reads as solo 0.
-    pub fn decode_ha_stamp(data: &[u8]) -> Option<(u64, u64, u64)> {
-        if data.len() != U64_SIZE * 2 && data.len() != U64_SIZE * 3 {
+    /// Decode and validate a durable HA provenance stamp.
+    ///
+    /// The 16- and 24-byte layouts predate the applied frontier and Solo-history
+    /// latch. They are durable data and can survive a coordinated binary upgrade,
+    /// so decode them conservatively: the acknowledged ship is known applied, but
+    /// the term cannot prove it never ran Solo and therefore cannot authorize
+    /// promotion retry grace.
+    pub(crate) fn decode_ha_stamp(data: &[u8]) -> Option<HaStamp> {
+        if data.len() != U64_SIZE * 2 && data.len() != U64_SIZE * 3 && data.len() != U64_SIZE * 5 {
             return None;
         }
-        let epoch = u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?);
-        let seqno = u64::from_le_bytes(data[U64_SIZE..U64_SIZE * 2].try_into().ok()?);
-        let solo = if data.len() == U64_SIZE * 3 {
-            u64::from_le_bytes(data[U64_SIZE * 2..].try_into().ok()?)
-        } else {
-            0
+        let writer_epoch = WriterEpoch::new(u64::from_le_bytes(data[..U64_SIZE].try_into().ok()?))?;
+        let last_shipped = ShipSeqno::new(u64::from_le_bytes(
+            data[U64_SIZE..U64_SIZE * 2].try_into().ok()?,
+        ));
+        if data.len() == U64_SIZE * 2 {
+            return HaStamp::new(
+                writer_epoch,
+                last_shipped,
+                SoloHistory::ever(0),
+                last_shipped,
+            )
+            .ok();
+        }
+        let solo = u64::from_le_bytes(data[U64_SIZE * 2..U64_SIZE * 3].try_into().ok()?);
+        if data.len() == U64_SIZE * 3 {
+            return HaStamp::new(
+                writer_epoch,
+                last_shipped,
+                SoloHistory::ever(solo),
+                last_shipped,
+            )
+            .ok();
+        }
+        let applied_through = ShipSeqno::new(u64::from_le_bytes(
+            data[U64_SIZE * 3..U64_SIZE * 4].try_into().ok()?,
+        ));
+        let solo_ever = u64::from_le_bytes(data[U64_SIZE * 4..].try_into().ok()?);
+        let ran_solo = match solo_ever {
+            0 => false,
+            1 => true,
+            _ => return None,
         };
-        Some((epoch, seqno, solo))
+        let solo_history = SoloHistory::from_parts(solo, ran_solo)?;
+        HaStamp::new(writer_epoch, last_shipped, solo_history, applied_through).ok()
     }
 
     pub fn parse_key(&self, key: &[u8]) -> ParsedKey {
@@ -696,20 +735,101 @@ mod tests {
 
     #[test]
     fn test_ha_stamp_encoding() {
-        let (epoch, seqno, solo) = (7u64, 123456u64, 3u64);
-        let encoded = KeyCodec::encode_ha_stamp(epoch, seqno, solo);
+        let (epoch, seqno, solo, applied_through) = (7u64, 123456u64, 3u64, 123458u64);
+        let stamp = HaStamp::new(
+            WriterEpoch::new(epoch).unwrap(),
+            ShipSeqno::new(seqno),
+            SoloHistory::ever(solo),
+            ShipSeqno::new(applied_through),
+        )
+        .unwrap();
+        let encoded = KeyCodec::encode_ha_stamp(&stamp);
+        assert_eq!(KeyCodec::decode_ha_stamp(&encoded), Some(stamp));
+        // A transitional four-field layout never existed and remains invalid.
+        assert_eq!(KeyCodec::decode_ha_stamp(&encoded[..32]), None);
+        // Durable legacy layouts migrate conservatively: the shipped seqno is
+        // known applied, but missing Solo history disables retry grace.
+        let legacy_three_field = HaStamp::new(
+            WriterEpoch::new(epoch).unwrap(),
+            ShipSeqno::new(seqno),
+            SoloHistory::ever(solo),
+            ShipSeqno::new(seqno),
+        )
+        .unwrap();
         assert_eq!(
-            KeyCodec::decode_ha_stamp(&encoded),
-            Some((epoch, seqno, solo))
+            KeyCodec::decode_ha_stamp(&encoded[..24]),
+            Some(legacy_three_field)
         );
-        // A pre-solo two-field value still decodes, as solo 0.
+        let legacy_two_field = HaStamp::new(
+            WriterEpoch::new(epoch).unwrap(),
+            ShipSeqno::new(seqno),
+            SoloHistory::ever(0),
+            ShipSeqno::new(seqno),
+        )
+        .unwrap();
         assert_eq!(
             KeyCodec::decode_ha_stamp(&encoded[..16]),
-            Some((epoch, seqno, 0))
+            Some(legacy_two_field)
+        );
+        let mut legacy_solo_from_birth = Vec::with_capacity(U64_SIZE * 3);
+        legacy_solo_from_birth.extend_from_slice(&epoch.to_le_bytes());
+        legacy_solo_from_birth.extend_from_slice(&0u64.to_le_bytes());
+        legacy_solo_from_birth.extend_from_slice(&2u64.to_le_bytes());
+        let legacy_solo_from_birth_stamp = HaStamp::new(
+            WriterEpoch::new(epoch).unwrap(),
+            None,
+            SoloHistory::ever(2),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&legacy_solo_from_birth),
+            Some(legacy_solo_from_birth_stamp),
+            "a pre-upgrade writer may have committed Solo before its first ship"
         );
         // Wrong length is rejected, not silently misread.
         assert_eq!(KeyCodec::decode_ha_stamp(&encoded[..8]), None);
         assert_eq!(KeyCodec::decode_ha_stamp(&[]), None);
+
+        let mut zero_epoch = encoded.to_vec();
+        zero_epoch[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&zero_epoch),
+            None,
+            "zero is the absence sentinel, not a valid HA writer epoch"
+        );
+
+        let mut regressed = encoded.to_vec();
+        regressed[24..32].copy_from_slice(&(seqno - 1).to_le_bytes());
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&regressed),
+            None,
+            "an applied frontier behind an acknowledged ship is invalid"
+        );
+
+        let mut invalid_solo_ever = encoded.to_vec();
+        invalid_solo_ever[32..].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&invalid_solo_ever),
+            None,
+            "the durable Solo-history bit accepts only canonical boolean values"
+        );
+
+        let never_solo = HaStamp::new(
+            WriterEpoch::new(epoch).unwrap(),
+            ShipSeqno::new(seqno),
+            SoloHistory::never(),
+            ShipSeqno::new(seqno),
+        )
+        .unwrap();
+        let inconsistent_solo_history = KeyCodec::encode_ha_stamp(&never_solo);
+        let mut inconsistent_solo_history = inconsistent_solo_history.to_vec();
+        inconsistent_solo_history[16..24].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(
+            KeyCodec::decode_ha_stamp(&inconsistent_solo_history),
+            None,
+            "a positive current Solo count cannot claim the term never ran Solo"
+        );
 
         // The HA-stamp key is distinct from the inode counter (both System-prefixed).
         let codec = KeyCodec::new();
@@ -839,16 +959,23 @@ mod prop_tests {
         }
 
         #[test]
-        fn value_codecs_roundtrip(x in any::<u64>(), y in any::<u64>()) {
+        fn value_codecs_roundtrip(x in 1u64..=u64::MAX, y in any::<u64>()) {
             prop_assert_eq!(KeyCodec::decode_u64(&KeyCodec::encode_u64(x)), Some(x));
             prop_assert_eq!(KeyCodec::decode_counter(&KeyCodec::encode_counter(x)).unwrap(), x);
             prop_assert_eq!(
                 KeyCodec::decode_tombstone_size(&KeyCodec::encode_tombstone_size(x)).unwrap(),
                 x
             );
+            let last_shipped = ShipSeqno::new(y);
+            let stamp = HaStamp::new(
+                WriterEpoch::new(x).unwrap(),
+                last_shipped,
+                SoloHistory::ever(x),
+                last_shipped,
+            ).unwrap();
             prop_assert_eq!(
-                KeyCodec::decode_ha_stamp(&KeyCodec::encode_ha_stamp(x, y, x ^ y)),
-                Some((x, y, x ^ y))
+                KeyCodec::decode_ha_stamp(&KeyCodec::encode_ha_stamp(&stamp)),
+                Some(stamp)
             );
             prop_assert_eq!(
                 KeyCodec::decode_dir_entry(&KeyCodec::encode_dir_entry(x, y)).unwrap(),

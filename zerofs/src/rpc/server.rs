@@ -17,17 +17,47 @@ use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream, UnixListenerStream};
 
-/// Wrap a tokio_stream Stream so it ends when the CancellationToken fires.
-fn take_until_cancelled<S: tokio_stream::Stream + Unpin + Send + 'static>(
-    mut stream: S,
+fn serving_authority_lost() -> Status {
+    Status::unavailable("leader lease expired (not the current leader)")
+}
+
+/// Gate successful stream items at the admin service response boundary.
+fn gate_serving_stream<T, S>(
+    stream: S,
+    fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
-) -> Pin<Box<dyn tokio_stream::Stream<Item = S::Item> + Send>> {
-    let output = futures::stream::poll_fn(move |cx| {
-        if shutdown.is_cancelled() {
-            return std::task::Poll::Ready(None);
-        }
-        Pin::new(&mut stream).poll_next(cx)
-    });
+) -> Pin<Box<dyn tokio_stream::Stream<Item = Result<T, Status>> + Send>>
+where
+    T: Send + 'static,
+    S: tokio_stream::Stream<Item = Result<T, Status>> + Unpin + Send + 'static,
+{
+    let output = futures::stream::unfold(
+        (stream, fs, shutdown, false),
+        |(mut stream, fs, shutdown, terminal)| async move {
+            if terminal {
+                return None;
+            }
+
+            let shutdown_wait = shutdown.clone();
+            let db = Arc::clone(&fs.db);
+            tokio::select! {
+                biased;
+                _ = shutdown_wait.cancelled() => None,
+                _ = db.serving_authority_lost() => Some((
+                    Err(serving_authority_lost()),
+                    (stream, fs, shutdown, true),
+                )),
+                item = stream.next() => match item {
+                    Some(Ok(_)) if !fs.db.permits_successful_response() => Some((
+                        Err(serving_authority_lost()),
+                        (stream, fs, shutdown, true),
+                    )),
+                    Some(item) => Some((item, (stream, fs, shutdown, false))),
+                    None => None,
+                }
+            }
+        },
+    );
     Box::pin(output)
 }
 use tikv_jemalloc_ctl::{epoch as jemalloc_epoch, stats as jemalloc_stats};
@@ -137,6 +167,14 @@ impl AdminRpcServer {
         // otherwise the leftovers sit there until the next RemoveDirectory.
         server.spawn_trash_sweep();
         server
+    }
+
+    /// Construct a successful response only with current serving authority.
+    fn success_response<T>(&self, message: T) -> Result<Response<T>, Status> {
+        if !self.fs.db.permits_successful_response() {
+            return Err(serving_authority_lost());
+        }
+        Ok(Response::new(message))
     }
 
     /// Sweep /.zerofs_trash in the background. Spawned at construction and
@@ -289,9 +327,9 @@ impl AdminService for AdminRpcServer {
             .await
             .map_err(|e| Status::internal(format!("Failed to create checkpoint: {}", e)))?;
 
-        Ok(Response::new(proto::CreateCheckpointResponse {
+        self.success_response(proto::CreateCheckpointResponse {
             checkpoint: Some(info.into()),
-        }))
+        })
     }
 
     async fn list_checkpoints(
@@ -304,9 +342,9 @@ impl AdminService for AdminRpcServer {
             .await
             .map_err(|e| Status::internal(format!("Failed to list checkpoints: {}", e)))?;
 
-        Ok(Response::new(proto::ListCheckpointsResponse {
+        self.success_response(proto::ListCheckpointsResponse {
             checkpoints: checkpoints.into_iter().map(|c| c.into()).collect(),
-        }))
+        })
     }
 
     async fn delete_checkpoint(
@@ -320,7 +358,7 @@ impl AdminService for AdminRpcServer {
             .await
             .map_err(|e| Status::internal(format!("Failed to delete checkpoint: {}", e)))?;
 
-        Ok(Response::new(proto::DeleteCheckpointResponse {}))
+        self.success_response(proto::DeleteCheckpointResponse {})
     }
 
     async fn get_checkpoint_info(
@@ -336,9 +374,9 @@ impl AdminService for AdminRpcServer {
             .map_err(|e| Status::internal(format!("Failed to get checkpoint info: {}", e)))?;
 
         match info {
-            Some(checkpoint) => Ok(Response::new(proto::GetCheckpointInfoResponse {
+            Some(checkpoint) => self.success_response(proto::GetCheckpointInfoResponse {
                 checkpoint: Some(checkpoint.into()),
-            })),
+            }),
             None => Err(Status::not_found(format!(
                 "Checkpoint '{}' not found",
                 name
@@ -356,10 +394,9 @@ impl AdminService for AdminRpcServer {
             .filter_map(|result| result.ok())
             .map(|event| Ok(event.into()));
 
-        Ok(Response::new(take_until_cancelled(
-            stream,
-            self.shutdown.clone(),
-        )))
+        let stream: Self::WatchFileAccessStream =
+            gate_serving_stream(stream, Arc::clone(&self.fs), self.shutdown.clone());
+        self.success_response(stream)
     }
 
     async fn watch_object_access(
@@ -372,10 +409,9 @@ impl AdminService for AdminRpcServer {
             .filter_map(|result| result.ok())
             .map(|event| Ok(event.into()));
 
-        Ok(Response::new(take_until_cancelled(
-            stream,
-            self.shutdown.clone(),
-        )))
+        let stream: Self::WatchObjectAccessStream =
+            gate_serving_stream(stream, Arc::clone(&self.fs), self.shutdown.clone());
+        self.success_response(stream)
     }
 
     async fn flush(
@@ -388,7 +424,7 @@ impl AdminService for AdminRpcServer {
             .await
             .map_err(|e| Status::internal(format!("Flush failed: {:?}", e)))?;
 
-        Ok(Response::new(proto::FlushResponse {}))
+        self.success_response(proto::FlushResponse {})
     }
 
     async fn stream_stats(
@@ -465,10 +501,9 @@ impl AdminService for AdminRpcServer {
             })
         });
 
-        Ok(Response::new(take_until_cancelled(
-            stream,
-            self.shutdown.clone(),
-        )))
+        let stream: Self::StreamStatsStream =
+            gate_serving_stream(stream, Arc::clone(&self.fs), self.shutdown.clone());
+        self.success_response(stream)
     }
 
     async fn create_directory(
@@ -555,7 +590,7 @@ impl AdminService for AdminRpcServer {
             created = was_created;
         }
 
-        Ok(Response::new(proto::CreateDirectoryResponse { created }))
+        self.success_response(proto::CreateDirectoryResponse { created })
     }
 
     async fn remove_directory(
@@ -588,7 +623,7 @@ impl AdminService for AdminRpcServer {
             match self.fs.lookup(&creds, dir_id, component).await {
                 Ok(id) => dir_id = id,
                 Err(FsError::NotFound | FsError::NotDirectory) => {
-                    return Ok(Response::new(proto::RemoveDirectoryResponse {}));
+                    return self.success_response(proto::RemoveDirectoryResponse {});
                 }
                 Err(e) => {
                     return Err(Status::internal(format!(
@@ -602,7 +637,7 @@ impl AdminService for AdminRpcServer {
         let target_id = match self.fs.lookup(&creds, dir_id, name).await {
             Ok(id) => id,
             Err(FsError::NotFound | FsError::NotDirectory) => {
-                return Ok(Response::new(proto::RemoveDirectoryResponse {}));
+                return self.success_response(proto::RemoveDirectoryResponse {});
             }
             Err(e) => {
                 return Err(Status::internal(format!(
@@ -634,7 +669,7 @@ impl AdminService for AdminRpcServer {
             Ok(()) => {}
             // A concurrent removal won the race; nothing left to do.
             Err(FsError::NotFound) => {
-                return Ok(Response::new(proto::RemoveDirectoryResponse {}));
+                return self.success_response(proto::RemoveDirectoryResponse {});
             }
             Err(e) => {
                 return Err(Status::internal(format!(
@@ -649,7 +684,7 @@ impl AdminService for AdminRpcServer {
 
         self.spawn_trash_sweep();
 
-        Ok(Response::new(proto::RemoveDirectoryResponse {}))
+        self.success_response(proto::RemoveDirectoryResponse {})
     }
 }
 
@@ -719,6 +754,12 @@ mod tests {
     /// needs. The slatedb handle is constructed here (instead of via
     /// ZeroFS::new_in_memory) because the CheckpointManager needs it too.
     async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+        make_fs_with_lease(None).await
+    }
+
+    async fn make_fs_with_lease(
+        lease: Option<Arc<crate::replication::Lease>>,
+    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
         let test_key = [0u8; 32];
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -736,17 +777,25 @@ mod tests {
         );
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
         let fs = Arc::new(
-            ZeroFS::new_with_slatedb(
+            ZeroFS::new_with_slatedb_and_lease(
                 db_handle.clone(),
                 u64::MAX,
                 None,
                 false,
+                false,
+                lease,
+                None,
+                Arc::new(crate::dedup::DedupCache::new()),
+                None,
+                crate::object_trace::ObjectTracer::new(),
                 Arc::clone(&object_store),
                 crate::frame_codec::FrameCodec::new(
                     &test_key,
                     crate::segment::SEGMENT_INFO,
                     CompressionConfig::default(),
                 ),
+                None,
+                None,
             )
             .await
             .unwrap(),
@@ -839,6 +888,52 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("trash directory was not drained");
+    }
+
+    #[tokio::test]
+    async fn revocation_filters_admin_success() {
+        let lease = crate::replication::Lease::new();
+        lease.renew(Duration::from_secs(60));
+        let (fs, checkpoint_manager) = make_fs_with_lease(Some(Arc::clone(&lease))).await;
+        let shutdown = CancellationToken::new();
+        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+
+        // Hold the response at tonic's boundary until authority changes.
+        let completed_unary = proto::FlushResponse {};
+        let quiet_stream = futures::stream::pending::<Result<proto::StatsSnapshot, Status>>();
+        let mut gated_stream = gate_serving_stream(quiet_stream, Arc::clone(&fs), shutdown.clone());
+
+        let stream_shutdown = CancellationToken::new();
+        let mut shutdown_stream = gate_serving_stream(
+            futures::stream::pending::<Result<proto::StatsSnapshot, Status>>(),
+            Arc::clone(&fs),
+            stream_shutdown.clone(),
+        );
+        stream_shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), shutdown_stream.next())
+                .await
+                .expect("shutdown must wake a quiet admin stream")
+                .is_none()
+        );
+
+        lease.revoke();
+
+        let unary_error = match service.success_response(completed_unary) {
+            Ok(_) => panic!("revoked leader returned a successful unary response"),
+            Err(error) => error,
+        };
+        assert_eq!(unary_error.code(), tonic::Code::Unavailable);
+
+        let stream_error = tokio::time::timeout(Duration::from_secs(1), gated_stream.next())
+            .await
+            .expect("authority loss must wake a quiet admin stream")
+            .expect("authority loss must terminate with one error")
+            .expect_err("revoked leader returned a successful stream item");
+        assert_eq!(stream_error.code(), tonic::Code::Unavailable);
+        assert!(gated_stream.next().await.is_none());
+
+        shutdown.cancel();
     }
 
     #[tokio::test]

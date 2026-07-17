@@ -1,8 +1,8 @@
-//! Type-state filesystem bring-up: each phase consumes the previous, so the
-//! ordering is compile-time enforced. Receiver listening before any Hello
-//! (`ReceiverUp`); db opened only from `Writer`, so a follower can't open it and
-//! fence a live leader; tail reconciled only from `DbOpen`; fs assembled only from
-//! `Reconciled`, so the surviving tail is accounted for before serving.
+//! Filesystem startup and HA role election.
+//!
+//! The replication receiver starts before role election. Marker capabilities
+//! enforce the claim, open, and activation order. A promoted writer reconciles
+//! its frozen tail before activation.
 //!
 //! `ha: None` is single-node mode; the HA steps are then no-ops.
 
@@ -18,7 +18,7 @@ use crate::key_management;
 use crate::object_trace::{ObjectTracer, TracingObjectStore};
 use crate::parse_object_store::parse_url_opts;
 use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
-use crate::replication::{LineageProof, ReplicationParams};
+use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
@@ -28,12 +28,10 @@ use std::sync::Arc;
 use tokio::sync::{Notify, watch};
 use tracing::info;
 
-/// Storage, crypto, and parsed config in hand; no db or receiver yet.
-struct Prepared {
+/// State retained across role-election and writer-open retries.
+struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
-    /// `object_store` behind the shared retry wrapper, for I/O ZeroFS issues
-    /// directly (segments, GC/checkpoint listings, the HA leader record).
-    /// SlateDB traffic stays on `object_store`: it brings its own retry layer.
+    /// Retrying store for direct ZeroFS I/O. SlateDB retries its own store I/O.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
@@ -45,40 +43,31 @@ struct Prepared {
     cache_config: CacheConfig,
     dedup: Arc<crate::dedup::DedupCache>,
     replication_params: Option<ReplicationParams>,
+    /// Configured role. `replication_params.role` holds the elected role.
+    configured_replication_role: Option<crate::config::ReplicationRole>,
     db_mode: DatabaseMode,
+    ha: Option<HaReceiver>,
+    /// Whether this startup observed predecessor failure.
+    took_over_from_standby: bool,
+    /// Use the recovery-only claim for an observed Claiming or Opening marker.
+    recovering_handoff: bool,
+    /// Opening capability retained across writer-open retries.
+    opening: Option<crate::replication::leader_record::OpeningToken>,
 }
 
 /// Receiver handles carried through role election and takeover reconciliation.
 struct HaReceiver {
     control: ReceiverControl,
     takeover_trigger: Arc<Notify>,
-    liveness: Option<watch::Receiver<u64>>,
-}
-
-/// The receiver is listening, so a peer's concurrent Hello is answered before we
-/// decide our role.
-struct ReceiverUp {
-    prepared: Prepared,
-    ha: Option<HaReceiver>,
-}
-
-/// The role is resolved and this node will write: a config leader with no active
-/// peer, or a standby whose leader stopped.
-struct Writer {
-    prepared: Prepared,
-    ha: Option<HaReceiver>,
+    /// Cloned for each standby watch; the receiver remains bound across retries.
+    liveness: watch::Receiver<u64>,
 }
 
 /// The data db is open as the writer.
 struct DbOpen {
-    prepared: Prepared,
     promotion: Option<PromotionSnapshot>,
     slatedb: SlateDbHandle,
-    db_handle: SlateDbHandle,
-    maintenance_runtime: Option<tokio::runtime::Handle>,
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
-    sync_writes: bool,
-    ignore_fsync: bool,
     /// Prefetch-wrapped object store for the segment data plane (cold read-ahead).
     segment_object_store: Arc<dyn object_store::ObjectStore>,
     /// Warms the parts cache with a just-sealed segment (multipart uploads bypass
@@ -87,13 +76,51 @@ struct DbOpen {
     segment_warm: Option<crate::segment_store::SegmentWarmHook>,
 }
 
-/// The standby tail has been reconciled with the open db.
-struct Reconciled {
-    db: DbOpen,
+/// Open database with a reconciled replication tail.
+struct ReconciledDb {
+    open: DbOpen,
     lineage_proof: Option<LineageProof>,
+    retry_grace_proof: Option<PromotionRetryGraceProof>,
 }
 
-impl Prepared {
+enum ClaimOutcome {
+    Claimed(Option<crate::replication::leader_record::OpeningToken>),
+    RetryRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImmediateRoleDecision {
+    RecoverHandoff,
+    FollowActivePeer,
+}
+
+/// Resolve marker recovery before advisory peer state.
+fn immediate_role_decision(
+    unresolved_handoff: bool,
+    any_active: bool,
+) -> Option<ImmediateRoleDecision> {
+    if unresolved_handoff {
+        Some(ImmediateRoleDecision::RecoverHandoff)
+    } else if any_active {
+        Some(ImmediateRoleDecision::FollowActivePeer)
+    } else {
+        None
+    }
+}
+
+enum OpenOutcome {
+    Opened(DbOpen),
+    RetryRole,
+    RetryWriter,
+}
+
+enum ReconcileOutcome {
+    Reconciled(Box<ReconciledDb>),
+    RetryRole,
+    RetryWriter,
+}
+
+impl StartupContext {
     async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
         let url = settings.storage.url.clone();
 
@@ -178,9 +205,11 @@ impl Prepared {
             .replication
             .as_ref()
             .map(crate::replication::ReplicationParams::from_config);
+        let configured_replication_role = settings.replication.as_ref().map(|cfg| cfg.role);
 
         // Shared by request handling and takeover reconciliation.
-        let dedup = Arc::new(crate::dedup::DedupCache::new(65_536));
+        let dedup = Arc::new(crate::dedup::DedupCache::new());
+        dedup.start_expiry_reaper();
 
         // Trace at the bottom of the stack so otrace sees the requests that
         // actually leave the process. Everything above (length-check, prefetch,
@@ -214,14 +243,19 @@ impl Prepared {
             cache_config,
             dedup,
             replication_params,
+            configured_replication_role,
             db_mode,
+            ha: None,
+            took_over_from_standby: false,
+            recovering_handoff: false,
+            opening: None,
         })
     }
 
     /// Answers Hello (so a peer learns our state) and buffers the leader's stream
     /// (the un-flushed tail, for reconciliation on takeover). Started before the role
     /// decision so a peer's concurrent Hello is answered.
-    fn start_receiver(self) -> Result<ReceiverUp> {
+    fn start_receiver(mut self) -> Result<Self> {
         let listen = self
             .replication_params
             .as_ref()
@@ -240,7 +274,7 @@ impl Prepared {
                 node_id.clone(),
             );
             let control = receiver.control();
-            let liveness = Some(receiver.liveness());
+            let liveness = receiver.liveness();
             let server = receiver.into_server();
             info!("HA {node_id}: replication receiver listening on {addr}");
             tokio::spawn(async move {
@@ -261,39 +295,51 @@ impl Prepared {
             None
         };
 
-        Ok(ReceiverUp { prepared: self, ha })
+        self.ha = ha;
+        Ok(self)
     }
-}
 
-impl ReceiverUp {
-    /// Resolve the role by asking peers (Hello) and not the static config: a failover
-    /// makes the config-standby the live leader, so a (re)starting node must learn
-    /// the situation. Defer to an active peer. On silence, the recorded latest
-    /// writer and any configured standby block until a peer answers (see
-    /// [`crate::replication::leader_record`]); only a configured leader the record
-    /// does not name leads through it (fresh db, or recovery after losing both
-    /// nodes). A follower then watches heartbeats and promotes once they stop.
-    /// Resolving to writer here, before `open_db`, is what keeps a follower from
-    /// opening the db and fencing a live leader; the writer-epoch CAS is the hard
-    /// single-writer guarantee.
-    async fn become_writer(mut self) -> Result<Writer> {
-        let db_mode = self.prepared.db_mode;
+    /// Elect a runtime role from the durable marker and peer Hello responses.
+    /// The recorded latest writer and configured standby wait on ambiguous peer
+    /// silence. Only a writer elected here may open the database.
+    async fn become_writer(&mut self) -> Result<()> {
+        debug_assert!(self.opening.is_none());
+        self.recovering_handoff = false;
+        // Acknowledgements remain enabled during role election and are quiesced
+        // before a durable claim.
+        if let Some(receiver) = &self.ha {
+            receiver.control.resume_heartbeat_acks().await;
+        }
+        let db_mode = self.db_mode;
+        let mut recovered_handoff = false;
 
-        if let Some(params) = self.prepared.replication_params.as_mut()
+        if let Some(params) = self.replication_params.as_mut()
             && !db_mode.is_read_only()
             && !params.peers.is_empty()
-            && params.replication_listen.is_some()
         {
-            let was_latest = crate::replication::leader_record::read(
-                &self.prepared.retrying_object_store,
-                &self.prepared.actual_db_path,
+            let marker = crate::replication::leader_record::inspect(
+                &self.object_store,
+                &self.actual_db_path,
             )
             .await
-            .context("HA: cannot resolve a boot role without the latest-leader record")?
-            .is_some_and(|(_, node)| node == params.node_id);
+            .context("HA: cannot resolve a boot role without the leader record")?;
+            let was_latest = marker
+                .latest_writer()
+                .is_some_and(|(_, node)| node == params.node_id);
+            let unresolved_handoff = matches!(
+                marker.phase(),
+                Some(
+                    crate::replication::leader_record::LeaderRecordPhase::Claiming
+                        | crate::replication::leader_record::LeaderRecordPhase::Opening
+                )
+            );
+            let handoff_blockers = marker.startup_blockers();
 
             let peers = params.peers.clone();
-            let config_leader = params.is_leader();
+            let config_leader = matches!(
+                self.configured_replication_role,
+                Some(crate::config::ReplicationRole::Leader)
+            );
             let lead;
             let mut silent_rounds = 0u32;
             loop {
@@ -310,7 +356,7 @@ impl ReceiverUp {
                         Ok(answer) => {
                             // Identity keys the latest-leader record; a duplicated
                             // node_id is a config error.
-                            if !answer.node_id.is_empty() && answer.node_id == params.node_id {
+                            if answer.node_id == params.node_id {
                                 anyhow::bail!(
                                     "HA: peer {peer} reports the same node_id {:?} as this \
                                      node; node_id must be unique within the pair",
@@ -324,14 +370,32 @@ impl ReceiverUp {
                             }
                         }
                         Err(e) => {
+                            if crate::replication::transport::hello_protocol_incompatible(&e) {
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "HA: peer {peer} answered Hello with an incompatible \
+                                         protocol; refusing role election"
+                                    )
+                                });
+                            }
                             all_answered = false;
                             tracing::debug!("HA: Hello to peer {peer} failed: {e:#}");
                         }
                     }
                 }
-                if any_active {
-                    lead = false; // a peer serves and will preserve the tail: defer
-                    break;
+                match immediate_role_decision(unresolved_handoff, any_active) {
+                    Some(ImmediateRoleDecision::RecoverHandoff) => {
+                        // Claiming and Opening liveness is determined from the
+                        // durable marker, not a predecessor's Hello response.
+                        lead = true;
+                        recovered_handoff = true;
+                        break;
+                    }
+                    Some(ImmediateRoleDecision::FollowActivePeer) => {
+                        lead = false;
+                        break;
+                    }
+                    None => {}
                 }
                 if was_latest && !all_answered {
                     // This node was the last writer and a peer is silent. That peer
@@ -340,11 +404,12 @@ impl ReceiverUp {
                     // abandon the tail or fence the live writer.
                     if silent_rounds.is_multiple_of(20) {
                         tracing::warn!(
-                            "HA {}: this node was the latest writer and a peer does not \
-                             answer Hello; blocking startup until it does (if the peer is \
-                             permanently gone, remove it from replication.peers, and set \
-                             role = \"leader\" if this node was the standby)",
-                            params.node_id
+                            "HA {}: the durable leader record makes peer silence ambiguous \
+                             (startup blockers: {:?}); blocking startup until every peer \
+                             answers (if the recorded process is permanently gone, remove it \
+                             from replication.peers and set role = \"leader\")",
+                            params.node_id,
+                            handoff_blockers
                         );
                     }
                     silent_rounds += 1;
@@ -367,8 +432,8 @@ impl ReceiverUp {
                 if silent_rounds.is_multiple_of(20) {
                     tracing::warn!(
                         "HA {}: configured standby and no peer answers Hello; waiting \
-                         for one (if the peer is permanently gone, set role = \"leader\" \
-                         and remove it from replication.peers to promote this node)",
+                         for one (if the peer is permanently gone, set role = \"leader\" and \
+                         remove it from replication.peers)",
                         params.node_id
                     );
                 }
@@ -391,86 +456,254 @@ impl ReceiverUp {
         // A standby opens no db while it waits; it promotes only once the leader's
         // heartbeats stop.
         let need_watch = self
-            .prepared
             .replication_params
             .as_ref()
-            .map(|p| !db_mode.is_read_only() && !p.is_leader())
-            .unwrap_or(false);
+            .is_some_and(|p| !db_mode.is_read_only() && !p.is_leader());
         if need_watch {
-            let (node_id, takeover_ttl) = {
-                let params = self.prepared.replication_params.as_ref().unwrap();
-                (params.node_id.clone(), params.takeover_ttl)
-            };
+            let node_id = self.replication_params.as_ref().unwrap().node_id.clone();
             info!(
-                "HA standby {node_id}: watching leader heartbeats; will take over when they stop"
+                "HA standby {node_id}: watching leader heartbeats; silence will trigger a durable claim attempt"
             );
             let liveness = self
                 .ha
-                .as_mut()
-                .and_then(|h| h.liveness.take())
+                .as_ref()
+                .map(|h| h.liveness.clone())
                 .ok_or_else(|| {
                     anyhow::anyhow!("HA standby has no replication_listen; cannot watch heartbeats")
                 })?;
             let takeover_trigger = self.ha.as_ref().unwrap().takeover_trigger.clone();
             let (_watch_tx, watch_rx) = tokio::sync::watch::channel(false);
-            let took_over = crate::replication::watch_heartbeats_until_takeover(
+            let should_attempt_takeover = crate::replication::watch_heartbeats_until_takeover_hint(
                 liveness,
-                takeover_ttl,
+                crate::replication::TAKEOVER_HINT_AFTER,
                 watch_rx,
                 takeover_trigger,
             )
             .await
             .context("HA standby heartbeat watch failed")?;
-            if !took_over {
-                anyhow::bail!("HA standby was shut down before it could take over");
+            if !should_attempt_takeover {
+                anyhow::bail!("HA standby was shut down before its durable claim attempt");
             }
-            info!("HA standby {node_id}: leader heartbeats stopped, taking over as leader");
-            self.prepared.replication_params.as_mut().unwrap().role =
-                crate::config::ReplicationRole::Leader;
+            info!(
+                "HA standby {node_id}: leader heartbeats stopped; attempting the durable takeover claim"
+            );
+            self.replication_params.as_mut().unwrap().role = crate::config::ReplicationRole::Leader;
         }
 
-        Ok(Writer {
-            prepared: self.prepared,
-            ha: self.ha,
-        })
+        self.recovering_handoff = recovered_handoff;
+        self.took_over_from_standby |= recovered_handoff || need_watch;
+        Ok(())
     }
-}
 
-impl Writer {
-    async fn open_db(self, settings: &Settings) -> Result<DbOpen> {
+    /// Acquire Claiming and advance it to an Opening capability.
+    async fn claim_opening(&self) -> Result<ClaimOutcome> {
+        let claim_request = self
+            .replication_params
+            .as_ref()
+            .filter(|_| !self.db_mode.is_read_only())
+            .map(|params| {
+                (
+                    params.node_id.clone(),
+                    params.force_recovery,
+                    self.recovering_handoff,
+                )
+            });
+
+        let Some((node_id, force, recovering_handoff)) = claim_request else {
+            return Ok(ClaimOutcome::Claimed(None));
+        };
+
+        // Heartbeat admission uses the same receiver phase lock. No new
+        // acknowledgement can linearize between this fence and the claim CAS.
+        if let Some(receiver) = &self.ha {
+            receiver.control.quiesce_heartbeat_acks().await;
+        }
+        let claim_result = if recovering_handoff && !force {
+            crate::replication::leader_record::recover_handoff(
+                &self.object_store,
+                &self.actual_db_path,
+                &node_id,
+            )
+            .await
+        } else {
+            crate::replication::leader_record::claim(
+                &self.object_store,
+                &self.actual_db_path,
+                &node_id,
+                force,
+            )
+            .await
+        };
+        let claim = match claim_result {
+            Ok(claim) => claim,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::replication::leader_record::ClaimRejected>()
+                    .is_some() =>
+            {
+                if force {
+                    return Err(error).context(
+                        "HA: forced solo recovery raced another initializer; verify no \
+                         other process is using this database before retrying",
+                    );
+                }
+                tracing::warn!(
+                    "HA: another initializer owns the durable pre-open marker \
+                     ({error}); returning to role election"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                return Ok(ClaimOutcome::RetryRole);
+            }
+            Err(error) => {
+                return Err(error).context("HA: acquiring durable writer claim failed");
+            }
+        };
+
+        let opening = match crate::replication::leader_record::begin_open(claim).await {
+            Ok(opening) => opening,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::replication::leader_record::OwnershipLost>()
+                    .is_some() =>
+            {
+                tracing::warn!(
+                    "HA: durable Claiming ownership was superseded before database open; \
+                     returning to role election"
+                );
+                return Ok(ClaimOutcome::RetryRole);
+            }
+            Err(error) => {
+                return Err(error).context("HA: writer claim lost before database open");
+            }
+        };
+        Ok(ClaimOutcome::Claimed(Some(opening)))
+    }
+
+    /// Close a superseded writer and revalidate its Opening capability.
+    async fn close_writer_for_retry(
+        &mut self,
+        slatedb: &SlateDbHandle,
+        validation_context: &'static str,
+    ) -> Result<bool> {
+        if let SlateDbHandle::ReadWrite(raw_db) = slatedb
+            && let Err(error) = raw_db.close().await
+        {
+            // Fenced and already-closed handles are dropped after this check.
+            tracing::warn!("HA: closing a superseded writer returned: {error}");
+        }
+        let opening = self
+            .opening
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HA writer retry lost its Opening capability"))?;
+        let still_owns_opening = crate::replication::leader_record::validate_opening(opening)
+            .await
+            .context(validation_context)?;
+        if !still_owns_opening {
+            tracing::warn!(
+                "HA: durable Opening ownership was superseded while closing a stale writer; \
+                 returning to role election"
+            );
+            self.opening.take();
+        }
+        Ok(still_owns_opening)
+    }
+
+    async fn open_db(&mut self, settings: &Settings) -> Result<OpenOutcome> {
+        if let Some(opening) = self.opening.as_ref() {
+            let owns_opening = crate::replication::leader_record::validate_opening(opening)
+                .await
+                .context("HA: validating Opening before database open failed")?;
+            if !owns_opening {
+                tracing::warn!(
+                    "HA: durable Opening ownership was superseded before database open; \
+                     returning to role election"
+                );
+                self.opening.take();
+                return Ok(OpenOutcome::RetryRole);
+            }
+        }
         let opened = build_slatedb(
-            self.prepared.object_store.clone(),
-            &self.prepared.cache_config,
-            self.prepared.actual_db_path.clone(),
-            self.prepared.db_mode,
+            self.object_store.clone(),
+            &self.cache_config,
+            self.actual_db_path.clone(),
+            self.db_mode,
             settings.lsm,
-            self.prepared.block_transformer.clone(),
-            self.prepared.wal_object_store.clone(),
-            self.prepared.replication_params.as_ref(),
+            self.block_transformer.clone(),
+            self.wal_object_store.clone(),
+            self.replication_params.as_ref(),
         )
         .await
         .context("Failed to open database")?;
 
         let SlateDbOpen {
             data: slatedb,
-            maintenance_runtime,
             metrics_recorder,
             parts_cache,
         } = opened;
 
+        if let Some(opening) = self.opening.as_ref() {
+            let owns_opening = crate::replication::leader_record::validate_opening(opening)
+                .await
+                .context("HA: validating Opening after database open failed")?;
+            if !owns_opening {
+                if let SlateDbHandle::ReadWrite(raw_db) = &slatedb
+                    && let Err(error) = raw_db.close().await
+                {
+                    tracing::warn!(
+                        "HA: closing a writer whose Opening ownership was superseded returned: \
+                         {error}"
+                    );
+                }
+                tracing::warn!(
+                    "HA: durable Opening ownership was superseded during database open; \
+                     returning to role election"
+                );
+                self.opening.take();
+                return Ok(OpenOutcome::RetryRole);
+            }
+        }
+
         // Atomically fence receiver admission and take ownership of the standby
         // tail. Later status manifests may belong to a writer that fenced us.
-        let promotion = if let (SlateDbHandle::ReadWrite(raw_db), Some(ha)) = (&slatedb, &self.ha) {
-            let writer_epoch = raw_db.subscribe().borrow().current_manifest.writer_epoch();
-            Some(
-                ha.control
-                    .begin_promotion(writer_epoch)
-                    .await
-                    .context("HA: freezing the standby tail for promotion failed")?,
-            )
-        } else {
-            None
-        };
+        let promotion =
+            if let (SlateDbHandle::ReadWrite(raw_db), Some(receiver)) = (&slatedb, &self.ha) {
+                let writer_epoch = raw_db.subscribe().borrow().current_manifest.writer_epoch();
+                match receiver.control.begin_promotion(writer_epoch).await {
+                    Ok(promotion) => Some(promotion),
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::replication::transport::PromotionSuperseded>()
+                            .is_some() =>
+                    {
+                        let superseded = error
+                            .downcast_ref::<crate::replication::transport::PromotionSuperseded>()
+                            .expect("guard checked the error type");
+                        tracing::warn!(
+                            "HA: local writer epoch {} is behind observed peer epoch {}; \
+                         closing it and retrying under the same durable Opening capability",
+                            superseded.writer_epoch,
+                            superseded.observed_epoch
+                        );
+                        let still_owns_opening = self
+                            .close_writer_for_retry(
+                                &slatedb,
+                                "HA: revalidating Opening before writer retry failed",
+                            )
+                            .await?;
+                        return Ok(if still_owns_opening {
+                            OpenOutcome::RetryWriter
+                        } else {
+                            OpenOutcome::RetryRole
+                        });
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("HA: freezing the standby tail for promotion failed");
+                    }
+                }
+            } else {
+                None
+            };
 
         // Segment reads share SlateDB's prefetch parts cache (one budget, keyed
         // by path); the seal-cache still serves same-process read-after-write.
@@ -483,10 +716,10 @@ impl Writer {
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
         let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
-            self.prepared.retrying_object_store.clone(),
+            self.retrying_object_store.clone(),
             parts_cache,
         ));
-        let db_prefix = Path::from(self.prepared.actual_db_path.clone());
+        let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::prefix::PrefixStore::new(
                 Arc::clone(&prefetch) as Arc<dyn object_store::ObjectStore>,
@@ -501,101 +734,171 @@ impl Writer {
                 prefetch.warm_object(&full, bytes);
             }));
 
-        let db_handle = slatedb.clone();
-
-        let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
-        let ignore_fsync = settings
-            .filesystem
-            .as_ref()
-            .map(|f| f.ignore_fsync)
-            .unwrap_or(false);
-        if ignore_fsync {
-            tracing::warn!(
-                "[filesystem] ignore_fsync is set: fsync/COMMIT will NOT force a flush to \
-                 object storage; durability of un-flushed writes then relies on replication, \
-                 and without it un-flushed writes are lost on any crash"
-            );
-        }
-
-        Ok(DbOpen {
-            prepared: self.prepared,
+        Ok(OpenOutcome::Opened(DbOpen {
             promotion,
             slatedb,
-            db_handle,
-            maintenance_runtime,
             metrics_recorder,
-            sync_writes,
-            ignore_fsync,
             segment_object_store,
             segment_warm,
-        })
+        }))
     }
 }
 
 impl DbOpen {
     /// Reconcile a standby's frozen tail before serving.
-    async fn reconcile_tail(mut self) -> Result<Reconciled> {
-        let lineage_proof = match self.promotion.take() {
+    async fn reconcile_tail(mut self, startup: &mut StartupContext) -> Result<ReconcileOutcome> {
+        let (lineage_proof, retry_grace_proof) = match self.promotion.take() {
             Some(promotion) => {
                 let SlateDbHandle::ReadWrite(raw_db) = &self.slatedb else {
                     anyhow::bail!("HA promotion requires a writable data db");
                 };
-                promotion
-                    .reconcile_into(
-                        raw_db,
-                        &self.segment_object_store,
-                        &self.prepared.segment_codec,
-                    )
+                match promotion
+                    .reconcile_into(raw_db, &self.segment_object_store, &startup.segment_codec)
                     .await?
+                {
+                    crate::replication::ReconcileOutcome::Promoted {
+                        lineage_proof,
+                        retry_grace_proof,
+                    } => {
+                        // Retry grace applies only after standby takeover.
+                        let retry_grace_proof = if startup.took_over_from_standby {
+                            retry_grace_proof
+                        } else {
+                            None
+                        };
+                        (lineage_proof, retry_grace_proof)
+                    }
+                    crate::replication::ReconcileOutcome::RetryRole {
+                        writer_epoch,
+                        observed_epoch,
+                    } => {
+                        tracing::warn!(
+                            "HA: promotion at writer epoch {writer_epoch} lost to observed \
+                             epoch {observed_epoch}; closing the stale writer and retrying \
+                             under the same durable Opening capability"
+                        );
+                        let still_owns_opening = startup
+                            .close_writer_for_retry(
+                                &self.slatedb,
+                                "HA: revalidating Opening after reconciliation retry failed",
+                            )
+                            .await?;
+                        return Ok(if still_owns_opening {
+                            ReconcileOutcome::RetryWriter
+                        } else {
+                            ReconcileOutcome::RetryRole
+                        });
+                    }
+                }
             }
-            None => None,
+            None => (None, None),
         };
 
-        // Every HA writer names itself in the latest-leader record before it
-        // serves, so its next boot blocks on a silent peer instead of electing.
-        // After the writer-epoch CAS, so concurrent openers are serialized.
-        if let Some(params) = self.prepared.replication_params.as_ref()
-            && !self.prepared.db_mode.is_read_only()
-            && let SlateDbHandle::ReadWrite(raw_db) = &self.slatedb
-        {
-            let epoch = raw_db.subscribe().borrow().current_manifest.writer_epoch();
-            crate::replication::leader_record::write(
-                &self.prepared.retrying_object_store,
-                &self.prepared.actual_db_path,
-                epoch,
-                &params.node_id,
-            )
-            .await
-            .context("HA: writing the latest-leader record failed")?;
-        }
-
-        Ok(Reconciled {
-            db: self,
+        Ok(ReconcileOutcome::Reconciled(Box::new(ReconciledDb {
+            open: self,
             lineage_proof,
-        })
+            retry_grace_proof,
+        })))
     }
 }
 
-impl Reconciled {
-    async fn into_filesystem(self, settings: &Settings) -> Result<InitResult> {
-        let Reconciled { db, lineage_proof } = self;
+impl ReconciledDb {
+    async fn into_filesystem(
+        self,
+        mut startup: StartupContext,
+        settings: &Settings,
+    ) -> Result<InitResult> {
+        let ReconciledDb {
+            open,
+            lineage_proof,
+            retry_grace_proof,
+        } = self;
         let DbOpen {
-            prepared,
             promotion: _,
             slatedb,
-            db_handle,
-            maintenance_runtime,
             metrics_recorder,
-            sync_writes,
-            ignore_fsync,
             segment_object_store,
             segment_warm,
-        } = db;
+        } = open;
+        // Activation requires the Opening token and a reconciled tail.
+        let ownership = match startup.opening.take() {
+            Some(opening) => {
+                let writer_epoch = match &slatedb {
+                    SlateDbHandle::ReadWrite(db) => {
+                        db.subscribe().borrow().current_manifest.writer_epoch()
+                    }
+                    SlateDbHandle::ReadOnly(_) => {
+                        anyhow::bail!("HA marker activation requires a writable data db")
+                    }
+                };
+                Some(
+                    crate::replication::leader_record::activate(opening, writer_epoch)
+                        .await
+                        .context("HA: activating durable writer ownership failed")?,
+                )
+            }
+            None => None,
+        };
+        let StartupContext {
+            object_store,
+            retrying_object_store,
+            wal_object_store,
+            object_tracer,
+            actual_db_path,
+            block_transformer: _,
+            segment_codec,
+            cache_config: _,
+            dedup,
+            replication_params,
+            configured_replication_role: _,
+            db_mode,
+            ha,
+            took_over_from_standby: _,
+            recovering_handoff: _,
+            opening: _,
+        } = startup;
+
+        let serving_writer_epoch = match &slatedb {
+            SlateDbHandle::ReadWrite(db) => db.subscribe().borrow().current_manifest.writer_epoch(),
+            SlateDbHandle::ReadOnly(_) => 0,
+        };
+        // Initial authority comes from an exact Active-marker read. Current-epoch
+        // standby acknowledgements provide the steady-state authority signal.
+        let pending_authority = match (replication_params.as_ref(), ownership) {
+            (Some(_), Some(ownership)) if !db_mode.is_read_only() => {
+                let lease = crate::replication::Lease::new();
+                crate::replication::activate_lease_from_marker(
+                    &lease,
+                    &object_store,
+                    &actual_db_path,
+                    &ownership,
+                )
+                .await
+                .context("HA: fresh Active-marker validation failed")?;
+
+                let status = match &slatedb {
+                    SlateDbHandle::ReadWrite(raw_db) => raw_db.subscribe(),
+                    SlateDbHandle::ReadOnly(_) => {
+                        anyhow::bail!("HA Active ownership requires a writable data db")
+                    }
+                };
+                Some((lease, ownership, status))
+            }
+            (Some(_), None) if !db_mode.is_read_only() => {
+                anyhow::bail!("HA writer reached serving assembly without Active ownership")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("non-HA startup unexpectedly acquired HA marker ownership")
+            }
+            _ => None,
+        };
 
         // Leader replicator: ships to the standby when connected, runs solo
         // otherwise, reconnecting when it reappears. Never blocks startup or writes.
-        let replicator = match prepared.replication_params.as_ref() {
-            Some(params) if params.is_leader() && !params.peers.is_empty() => {
+        let (replicator, replication_control) = match replication_params.as_ref() {
+            Some(params)
+                if !db_mode.is_read_only() && params.is_leader() && !params.peers.is_empty() =>
+            {
                 let peer = params.peers[0].clone();
                 let endpoint = if peer.starts_with("http://") || peer.starts_with("https://") {
                     peer
@@ -604,74 +907,121 @@ impl Reconciled {
                 };
                 // Tag every ship with this leader's data-db writer epoch, so a
                 // deposed leader ships a lower epoch and the standby rejects it.
-                let writer_epoch = match &slatedb {
-                    SlateDbHandle::ReadWrite(db) => {
-                        db.subscribe().borrow().current_manifest.writer_epoch()
-                    }
-                    SlateDbHandle::ReadOnly(_) => 0,
-                };
+                let writer_epoch = serving_writer_epoch;
+                let typed_writer_epoch = crate::replication::types::WriterEpoch::new(writer_epoch)
+                    .context("HA writer opened with an invalid zero writer epoch")?;
                 info!(
                     "HA leader: replicating to standby peer {} (writer epoch {})",
                     endpoint, writer_epoch
                 );
-                // Stream heartbeats so the standby detects this leader's death
-                // (near-instant on a crash via the broken stream; periodic beats
-                // cover an idle leader), reconnecting on break.
+                let (replicator, control) =
+                    crate::replication::Replicator::new(endpoint.clone(), typed_writer_epoch);
+                // Heartbeat acknowledgements require coverage of the local
+                // applied frontier for this writer epoch.
                 let hb_endpoint = endpoint.clone();
-                let hb_interval = params.heartbeat_interval;
+                let heartbeat_control = control.clone();
                 tokio::spawn(async move {
                     loop {
-                        if let Err(e) = crate::replication::transport::run_heartbeat_sender(
-                            hb_endpoint.clone(),
-                            writer_epoch,
-                            hb_interval,
-                        )
-                        .await
-                        {
-                            tracing::debug!(
-                                "HA: heartbeat stream to standby ended ({e:#}); reconnecting"
-                            );
+                        tokio::select! {
+                            _ = heartbeat_control.deposed() => {
+                                tracing::warn!(
+                                    "HA: stopping outbound heartbeats for deposed epoch \
+                                     {writer_epoch}"
+                                );
+                                return;
+                            }
+                            exit = crate::replication::transport::run_heartbeat_sender(
+                                hb_endpoint.clone(),
+                                typed_writer_epoch,
+                                crate::replication::COVERAGE_HEARTBEAT_INTERVAL,
+                                heartbeat_control.clone(),
+                            ) => {
+                                match exit {
+                                    crate::replication::transport::HeartbeatExit::BaseNotCovered(status) => {
+                                        tracing::warn!(
+                                            "HA: standby heartbeat rejected an uncovered applied \
+                                             replication base; repairing durability ({status})"
+                                        );
+                                        // Base repair is serialized after outstanding ship
+                                        // and apply permits.
+                                        if let Err(error) = heartbeat_control.repair_base().await {
+                                            tracing::error!(
+                                                "HA: receiver-base repair could not reach the commit \
+                                                 sequencer: {error:#}"
+                                            );
+                                            return;
+                                        }
+                                        continue;
+                                    }
+                                    crate::replication::transport::HeartbeatExit::ProtocolIncompatible(status) => {
+                                        tracing::error!(
+                                            "HA: heartbeat sender stopped after a terminal peer error \
+                                             ({status})"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 });
-                let replicator = crate::replication::Replicator::new(endpoint, writer_epoch);
                 tokio::spawn(crate::replication::replicator::run_reconnect(
-                    Arc::downgrade(&replicator),
+                    Arc::downgrade(&control),
                 ));
                 // Drive the standby's prune watermark from the data db's durable_seq.
                 if let SlateDbHandle::ReadWrite(raw_db) = &slatedb {
                     tokio::spawn(crate::replication::replicator::run_watermark(
-                        replicator.clone(),
+                        control.clone(),
                         raw_db.subscribe(),
                     ));
                 }
-                Some(replicator)
-            }
-            _ => None,
-        };
-
-        // Leader lease, driven by the data db's own status: renewed while open,
-        // revoked the instant SlateDB closes it (CloseReason::Fenced on a takeover).
-        let (heartbeat_shutdown, lease) = match prepared.replication_params.as_ref() {
-            Some(params) if !prepared.db_mode.is_read_only() => {
-                let lease = crate::replication::Lease::new();
-                lease.renew(params.lease_ttl);
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                if let SlateDbHandle::ReadWrite(raw_db) = &slatedb {
-                    tokio::spawn(crate::replication::run_lease_from_status(
-                        lease.clone(),
-                        raw_db.subscribe(),
-                        params.heartbeat_interval,
-                        params.lease_ttl,
-                        rx,
-                    ));
-                }
-                (Some(tx), Some(lease))
+                (Some(replicator), Some(control))
             }
             _ => (None, None),
         };
 
+        if let (Some(receiver), Some((lease, ..))) = (&ha, &pending_authority) {
+            receiver
+                .control
+                .attach_serving_lease(serving_writer_epoch, lease);
+        }
+
+        // Configuration permits one acknowledging standby.
+        let peer_acks = replication_control
+            .as_ref()
+            .map(|control| control.heartbeat_acks());
+
+        let authority = match pending_authority {
+            Some((lease, ownership, status)) => Some(
+                crate::replication::AuthoritySupervisor::start(
+                    lease,
+                    object_store.clone(),
+                    actual_db_path.clone(),
+                    ownership,
+                    status,
+                    replication_control,
+                    peer_acks,
+                )
+                .context("HA: starting serving authority supervisor failed")?,
+            ),
+            None => None,
+        };
+        let lease = authority.as_ref().map(|authority| authority.lease());
+
+        let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
+        let ignore_fsync = settings
+            .filesystem
+            .as_ref()
+            .is_some_and(|filesystem| filesystem.ignore_fsync);
+        if ignore_fsync {
+            tracing::warn!(
+                "[filesystem] ignore_fsync is set: fsync/COMMIT will NOT force a flush to \
+                 object storage; durability of un-flushed writes then relies on replication, \
+                 and without it un-flushed writes are lost on any crash"
+            );
+        }
+
+        let db_handle = slatedb.clone();
         let fs = ZeroFS::new_with_slatedb_and_lease(
             slatedb,
             settings.max_bytes(),
@@ -680,11 +1030,11 @@ impl Reconciled {
             ignore_fsync,
             lease,
             replicator,
-            prepared.dedup,
+            dedup,
             lineage_proof,
-            prepared.object_tracer.clone(),
+            object_tracer.clone(),
             segment_object_store,
-            prepared.segment_codec,
+            segment_codec,
             segment_warm,
             None,
         )
@@ -695,36 +1045,75 @@ impl Reconciled {
         // Reclaims open-unlinked inodes once their last open handle is dropped.
         fs.start_reclaim_drainer();
 
+        // Arm retry grace only after successful filesystem construction.
+        if let Some(proof) = retry_grace_proof
+            && !proof.arm()
+        {
+            tracing::info!(
+                "HA takeover retry grace elapsed during filesystem initialization; unseen \
+                 predecessor retries remain stale"
+            );
+        }
+
         Ok(InitResult {
             fs,
             // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
-            object_store: prepared.retrying_object_store,
-            wal_object_store: prepared.wal_object_store,
-            db_path: prepared.actual_db_path,
+            object_store: retrying_object_store,
+            wal_object_store,
+            db_path: actual_db_path,
             db_handle,
-            maintenance_runtime,
-            heartbeat_shutdown,
+            authority,
         })
     }
 }
 
-/// Bring the filesystem up through the type-state phases; the chain is the whole
-/// control flow.
+/// Run role election, database open, reconciliation, and activation.
 pub async fn initialize_filesystem(
     settings: &Settings,
     db_mode: DatabaseMode,
 ) -> Result<InitResult> {
-    Prepared::prepare(settings, db_mode)
+    let mut startup = StartupContext::prepare(settings, db_mode)
         .await?
-        .start_receiver()?
-        .become_writer()
-        .await?
-        .open_db(settings)
-        .await?
-        .reconcile_tail()
-        .await?
-        .into_filesystem(settings)
-        .await
+        .start_receiver()?;
+    'role_election: loop {
+        startup.become_writer().await?;
+        startup.opening = match startup.claim_opening().await? {
+            ClaimOutcome::Claimed(opening) => opening,
+            ClaimOutcome::RetryRole => continue,
+        };
+        loop {
+            let db = match startup.open_db(settings).await? {
+                OpenOutcome::Opened(db) => db,
+                OpenOutcome::RetryWriter => continue,
+                OpenOutcome::RetryRole => continue 'role_election,
+            };
+            match db.reconcile_tail(&mut startup).await? {
+                ReconcileOutcome::Reconciled(db) => {
+                    return (*db).into_filesystem(startup, settings).await;
+                }
+                ReconcileOutcome::RetryRole => continue 'role_election,
+                ReconcileOutcome::RetryWriter => continue,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod role_decision_tests {
+    use super::{ImmediateRoleDecision, immediate_role_decision};
+
+    #[test]
+    fn unresolved_handoff_uses_recovery_even_if_peer_still_answers_active() {
+        assert_eq!(
+            immediate_role_decision(true, true),
+            Some(ImmediateRoleDecision::RecoverHandoff)
+        );
+        assert_eq!(
+            immediate_role_decision(false, true),
+            Some(ImmediateRoleDecision::FollowActivePeer)
+        );
+        assert_eq!(immediate_role_decision(false, false), None);
+    }
 }

@@ -7,11 +7,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// An open directory: a pull-based listing cursor plus at-style child
-/// operations taking ONE byte-exact name component (no `/` or NUL). The `*_at`
-/// suite is the FFI-clean escape hatch for non-UTF-8 names discovered via
-/// [`DirEntry::name_bytes`]; chain [`Dir::open_dir_at`] to reach arbitrary
-/// depth.
+/// An open directory with a listing cursor and at-style child operations.
+/// Child names are one byte-exact component without `/` or NUL. Use
+/// [`DirEntry::name_bytes`] with the `*_at` methods for non-UTF-8 names.
 ///
 /// Internally a `Dir` holds two fids, because the server rejects creates on an
 /// already-opened fid: an unopened fid serves the `*_at` operations, and a
@@ -87,8 +85,7 @@ impl Dir {
         let mut st = self.list.lock().await;
 
         if st.guard.is_none() {
-            // Open the listing sibling on a fresh fid (shared op: Tlopenat on
-            // v2, clone + lopen otherwise), leaving the ops fid unopened.
+            // Listing uses a separate fid because open state is fid-scoped.
             let flags = crate::linux::O_RDONLY | crate::linux::O_DIRECTORY;
             let g = self.session.alloc_guard();
             let guard = match self
@@ -97,7 +94,7 @@ impl Dir {
                 .open_clone(fid, g.fid(), flags, None)
                 .await
             {
-                Ok((_list_fid, _, _)) => g,
+                Ok((_qid, _iounit)) => g,
                 Err(e) => {
                     g.discard();
                     return Err(ZeroFsError::from_client(&e, &self.path));
@@ -110,41 +107,22 @@ impl Dir {
         // Fetch until at least one entry survives the `.`/`..` filter or EOF.
         while st.buf.is_empty() && !st.eof {
             let count = self.session.client.max_io();
-            if self.session.ext_v1() {
-                let entries = self
-                    .session
-                    .client
-                    .readdirplus(list_fid, st.cookie, count)
-                    .await
-                    .ctx(&self.path)?;
-                match entries.last() {
-                    Some(last) => st.cookie = last.offset,
-                    None => st.eof = true,
-                }
-                st.buf.extend(
-                    entries
-                        .iter()
-                        .filter(|e| e.name.data != b"." && e.name.data != b"..")
-                        .map(DirEntry::from_plus),
-                );
-            } else {
-                let entries = self
-                    .session
-                    .client
-                    .readdir(list_fid, st.cookie, count)
-                    .await
-                    .ctx(&self.path)?;
-                match entries.last() {
-                    Some(last) => st.cookie = last.offset,
-                    None => st.eof = true,
-                }
-                st.buf.extend(
-                    entries
-                        .iter()
-                        .filter(|e| e.name.data != b"." && e.name.data != b"..")
-                        .map(DirEntry::from_plain),
-                );
+            let entries = self
+                .session
+                .client
+                .readdirplus(list_fid, st.cookie, count)
+                .await
+                .ctx(&self.path)?;
+            match entries.last() {
+                Some(last) => st.cookie = last.offset,
+                None => st.eof = true,
             }
+            st.buf.extend(
+                entries
+                    .iter()
+                    .filter(|e| e.name.data != b"." && e.name.data != b"..")
+                    .map(DirEntry::from_plus),
+            );
         }
 
         let want = max_entries.map_or(usize::MAX, |n| n as usize);
@@ -199,9 +177,7 @@ impl Dir {
     pub async fn open_dir_at(&self, name: &[u8]) -> Result<Arc<Dir>, ZeroFsError> {
         let (fid, display) = self.at(name)?;
         let (guard, stat) = self.session.walk_from(fid, &[name], &display).await?;
-        if let Some(stat) = &stat
-            && FileType::from_mode(stat.mode) != FileType::Dir
-        {
+        if FileType::from_mode(stat.mode) != FileType::Dir {
             return Err(ZeroFsError::NotADirectory { path: display });
         }
         Ok(Dir::new(Arc::clone(&self.session), guard, display))
@@ -210,7 +186,7 @@ impl Dir {
     /// fstatat(2)-alike; never follows symlinks.
     pub async fn metadata_at(&self, name: &[u8]) -> Result<Metadata, ZeroFsError> {
         let (fid, display) = self.at(name)?;
-        let (_guard, stat) = self.session.walk_stat_from(fid, &[name], &display).await?;
+        let (_guard, stat) = self.session.walk_from(fid, &[name], &display).await?;
         Ok(Metadata::from_stat(&stat))
     }
 
@@ -316,12 +292,9 @@ impl Dir {
             .ctx(&display)
     }
 
-    /// Mark the handle closed (later calls return `Closed`). Both fids are
-    /// clunked and their numbers recycled when the handle is dropped. Always
-    /// succeeds; idempotent; never blocks.
+    /// Marks the handle closed. Drop schedules both fids for release. This call
+    /// is idempotent and non-blocking.
     pub async fn close(&self) {
-        // Mark closed so later calls return `Closed`. Both fids (ops + listing)
-        // are clunked and their numbers recycled when the handle is dropped.
         self.closed.store(true, Ordering::Release);
     }
 }

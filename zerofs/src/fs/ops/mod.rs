@@ -2,6 +2,10 @@
 //! [`ZeroFS`](crate::fs::ZeroFS), each mutation with its idempotent
 //! (op-id deduped) variant.
 
+use crate::dedup::{DedupResult, OpId};
+use crate::fs::ZeroFS;
+use crate::fs::errors::FsError;
+
 mod create;
 mod io;
 mod link;
@@ -10,21 +14,17 @@ mod remove;
 mod rename;
 mod setattr;
 
-use crate::fs::ZeroFS;
-use crate::fs::errors::FsError;
-use crate::fs::inode::InodeId;
-use crate::fs::types::{FileAttributes, InodeWithId};
-
 impl ZeroFS {
-    /// Reconstruct the `(id, attrs)` reply for an existing child of `dirid`, for
-    /// the create ops' idempotency path (return the entry instead of EEXIST).
-    async fn existing_child_result(
+    /// Decode a cached result as the operation's expected variant.
+    /// An incompatible operation ID reuse returns an error.
+    fn replay_dedup_result<T>(
         &self,
-        dirid: InodeId,
-        name: &[u8],
-    ) -> Result<(InodeId, FileAttributes), FsError> {
-        let id = self.directory_store.get(dirid, name).await?;
-        let inode = self.inode_store.get(id).await?;
-        Ok((id, InodeWithId { inode: &inode, id }.into()))
+        op_id: &OpId,
+        extract: fn(DedupResult) -> Option<T>,
+    ) -> Result<Option<T>, FsError> {
+        match self.dedup.get(op_id) {
+            None => Ok(None),
+            Some(result) => extract(result).map(Some).ok_or(FsError::InvalidArgument),
+        }
     }
 }

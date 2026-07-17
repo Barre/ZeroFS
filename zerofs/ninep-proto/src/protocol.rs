@@ -1,36 +1,13 @@
 use crate::deku_bytes::DekuBytes;
+use deku::ctx::Endian;
 use deku::prelude::*;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
-/// `.zerofs` fast paths (Twalkgetattr/Treaddirattr). A stock v9fs client never
-/// proposes this, so the server falls back to plain `9P2000.L`.
-pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.zerofs";
-/// `.zerofs2`: adds the compound create/open messages and the stat-carrying
-/// mkdir/symlink/mknod/link/setattr replies. Substring matching lets an old
-/// server reply `.zerofs` so a new client degrades instead of sending unparseable
-/// messages.
-pub const VERSION_9P2000L_ZEROFS2: &[u8] = b"9P2000.L.zerofs2";
-/// `.zerofs3`: adds a per-request idempotency op-id in the frame (after the tag)
-/// for safe retry across a reconnect/failover. Gated by negotiation, so an older
-/// peer never sees the extra field and standard framing is unchanged for it.
-pub const VERSION_9P2000L_ZEROFS3: &[u8] = b"9P2000.L.zerofs3";
-/// `.zerofs4`: durability-verified fsync. The client learns its connection's
-/// durability lineage token via Tgetlineage and presents it on Tfsyncdur; the
-/// server flushes and returns Rfsync only if that token is still the live
-/// durable lineage, else Rlerror(ESTALE). So a successful fsync implies every
-/// write the client acked before it is durable (survives a crash/failover),
-/// unless the administrator explicitly configured `ignore_fsync`.
-pub const VERSION_9P2000L_ZEROFS4: &[u8] = b"9P2000.L.zerofs4";
-/// `.zerofs5`: folds a file open and its first read into one round trip.
-/// Tlopenatread opens `fid`'s inode on a fresh `newfid` (exactly like Tlopenat)
-/// and also returns up to `count` bytes from offset 0, so reading a file that
-/// fits in the prefetch window needs no follow-up Tread. The inline read is
-/// best-effort and never affects the open: on a read error the reply carries the
-/// open result with empty data, and the client issues a normal Tread. Implies
-/// `.zerofs4` because the levels are cumulative.
-pub const VERSION_9P2000L_ZEROFS5: &[u8] = b"9P2000.L.zerofs5";
-/// `.zerofs6`: adds the atomic ZeroFS-private Tfallocate message.
-pub const VERSION_9P2000L_ZEROFS6: &[u8] = b"9P2000.L.zerofs6";
+/// ZeroFS private dialect identifier. `.Z` distinguishes this wire generation
+/// from legacy `.zerofs*` layouts. The dialect includes compound operations,
+/// stat-bearing replies, replay, mutation envelopes, durability lineage,
+/// open-prefetch, and atomic fallocate.
+pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.Z";
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -78,7 +55,11 @@ pub fn classify_fallocate_mode(mode: u32) -> Option<FallocateKind> {
 }
 
 #[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
-#[deku(id_type = "u8")]
+#[deku(
+    id_type = "u8",
+    ctx = "_endian: Endian",
+    ctx_default = "Endian::Little"
+)]
 pub enum LockType {
     #[deku(id = "0")]
     ReadLock, // F_RDLCK
@@ -90,25 +71,26 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-/// `Rlerror` code for leadership loss after possible dispatch. Linux `ESHUTDOWN`.
+/// `Rlerror` code for leadership loss with a potentially dispatched request.
+/// Resends retain `P9_OP_FLAG_RETRY`. Numeric value: Linux `ESHUTDOWN`.
 pub const P9_ENOTLEADER: u32 = 108;
 
-/// `Rlerror` code for leadership rejection before any logical effect. Linux `ENOTCONN`.
+/// `Rlerror` code proving no logical effect. A CLEAN response to FIRST permits
+/// another FIRST; CLEAN on RETRY does not clear earlier ambiguity. Numeric
+/// value: Linux `ENOTCONN`.
 pub const P9_ENOTLEADER_CLEAN: u32 = 107;
 
-/// `Rlerror` code for a retry op-id absent from the deduplication ledgers.
-/// Linux `ESTALE`.
+/// `Rlerror` code for a RETRY absent from the in-flight and completed ledgers.
+/// The request must not be dispatched. Numeric value: Linux `ESTALE`.
 pub const P9_EOPIDSTALE: u32 = 116;
 
-/// Marks a resend after a potentially dispatched attempt.
+/// The frame is an ambiguous resend of an op-id, not its sole initial attempt.
+/// An unseen request carrying this flag is invalid and must not be dispatched.
 pub const P9_OP_FLAG_RETRY: u8 = 1 << 0;
-/// All defined private request-flag bits.
+/// All currently defined op-envelope flag bits. Unknown bits fail closed.
 pub const P9_OP_KNOWN_FLAGS: u8 = P9_OP_FLAG_RETRY;
 
-/// Maximum 9P message size. This bounds the negotiated msize: the server clamps
-/// every client's requested msize to this value, and both the server and client
-/// reader codecs reject frames larger than it. Shared by the 9P server and the
-/// `zerofs mount` client.
+/// Maximum negotiated message size and codec frame size.
 pub const P9_MAX_MSIZE: u32 = 10 * 1024 * 1024;
 
 pub const P9_CHANNEL_SIZE: usize = 1000;
@@ -125,10 +107,8 @@ pub const P9_IOHDRSZ: u32 = (P9_HEADER_SIZE + P9_COUNT_FIELD_LEN) as u32;
 /// header + fid[4] + offset[8] + count[4]. A Twrite carrying `count` bytes is
 /// `P9_TWRITE_HDR + count` bytes on the wire and must not exceed the msize.
 pub const P9_TWRITE_HDR: u32 = (P9_HEADER_SIZE + 4 + 8 + P9_COUNT_FIELD_LEN) as u32;
-/// Wire overhead of an Rlopenatread reply preceding its data payload:
-/// header + qid[13] + iounit[4] + eof[1] + count[4]. This is 18 bytes larger than
-/// `P9_IOHDRSZ` (the extra qid+iounit+eof), so the `.zerofs5` open+read fold must
-/// clamp its prefetch with this, not `P9_IOHDRSZ`, to respect a small msize.
+/// `Rlopenatread` overhead before data: header + qid[13] + iounit[4] + eof[1]
+/// + count[4]. Prefetch limits use this value.
 pub const P9_RLOPENATREAD_HDR: u32 = (P9_HEADER_SIZE + 13 + 4 + 1 + P9_COUNT_FIELD_LEN) as u32;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
@@ -151,11 +131,14 @@ pub enum LockStatus {
 
 // Basic structures
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(
+    endian = "endian",
+    ctx = "endian: Endian",
+    ctx_default = "Endian::Little"
+)]
 pub struct Qid {
     pub type_: u8,
-    #[deku(endian = "little")]
     pub version: u32,
-    #[deku(endian = "little")]
     pub path: u64,
 }
 
@@ -165,43 +148,26 @@ impl Qid {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Stat {
     pub qid: Qid,
-    #[deku(endian = "little")]
     pub mode: u32,
-    #[deku(endian = "little")]
     pub uid: u32,
-    #[deku(endian = "little")]
     pub gid: u32,
-    #[deku(endian = "little")]
     pub nlink: u64,
-    #[deku(endian = "little")]
     pub rdev: u64,
-    #[deku(endian = "little")]
     pub size: u64,
-    #[deku(endian = "little")]
     pub blksize: u64,
-    #[deku(endian = "little")]
     pub blocks: u64,
-    #[deku(endian = "little")]
     pub atime_sec: u64,
-    #[deku(endian = "little")]
     pub atime_nsec: u64,
-    #[deku(endian = "little")]
     pub mtime_sec: u64,
-    #[deku(endian = "little")]
     pub mtime_nsec: u64,
-    #[deku(endian = "little")]
     pub ctime_sec: u64,
-    #[deku(endian = "little")]
     pub ctime_nsec: u64,
-    #[deku(endian = "little")]
     pub btime_sec: u64,
-    #[deku(endian = "little")]
     pub btime_nsec: u64,
-    #[deku(endian = "little")]
     pub r#gen: u64,
-    #[deku(endian = "little")]
     pub data_version: u64,
 }
 
@@ -211,8 +177,13 @@ impl Stat {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(
+    endian = "endian",
+    ctx = "endian: Endian",
+    ctx_default = "Endian::Little"
+)]
 pub struct P9String {
-    #[deku(endian = "little", update = "self.data.len()")]
+    #[deku(update = "self.data.len()")]
     pub len: u16,
     #[deku(count = "len")]
     pub data: Vec<u8>,
@@ -246,8 +217,7 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// Serialized size on the wire, without paying for an encode pass.
-    /// Pinned to the deku layout by `wire_size_matches_serialization`.
+    /// Serialized wire size.
     pub fn wire_size(&self) -> usize {
         Qid::WIRE_SIZE + 8 + 1 + self.name.wire_size()
     }
@@ -261,57 +231,48 @@ pub struct Tversion {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tattach {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub afid: u32,
     pub uname: P9String,
     pub aname: P9String,
-    #[deku(endian = "little")]
     pub n_uname: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Twalk {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub newfid: u32,
-    #[deku(endian = "little", update = "self.wnames.len()")]
+    #[deku(update = "self.wnames.len()")]
     pub nwname: u16,
     #[deku(count = "nwname")]
     pub wnames: Vec<P9String>,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlopen {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub flags: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlcreate {
-    #[deku(endian = "little")]
     pub fid: u32,
     pub name: P9String,
-    #[deku(endian = "little")]
     pub flags: u32,
-    #[deku(endian = "little")]
     pub mode: u32,
-    #[deku(endian = "little")]
     pub gid: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tread {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub offset: u64,
-    #[deku(endian = "little")]
     pub count: u32,
 }
 
@@ -334,57 +295,42 @@ pub struct Tclunk {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Treaddir {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub offset: u64,
-    #[deku(endian = "little")]
     pub count: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tgetattr {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub request_mask: u64,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tsetattr {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub valid: u32,
-    #[deku(endian = "little")]
     pub mode: u32,
-    #[deku(endian = "little")]
     pub uid: u32,
-    #[deku(endian = "little")]
     pub gid: u32,
-    #[deku(endian = "little")]
     pub size: u64,
-    #[deku(endian = "little")]
     pub atime_sec: u64,
-    #[deku(endian = "little")]
     pub atime_nsec: u64,
-    #[deku(endian = "little")]
     pub mtime_sec: u64,
-    #[deku(endian = "little")]
     pub mtime_nsec: u64,
 }
 
-/// ZeroFS-private fallocate request, negotiated via `.zerofs6`.
+/// ZeroFS-private atomic fallocate request.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tfallocate {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub offset: u64,
-    #[deku(endian = "little")]
     pub length: u64,
-    #[deku(endian = "little")]
     pub mode: u32,
 }
 
@@ -392,83 +338,71 @@ pub struct Tfallocate {
 pub struct Rfallocate;
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tmkdir {
-    #[deku(endian = "little")]
     pub dfid: u32,
     pub name: P9String,
-    #[deku(endian = "little")]
     pub mode: u32,
-    #[deku(endian = "little")]
     pub gid: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tsymlink {
-    #[deku(endian = "little")]
     pub dfid: u32,
     pub name: P9String,
     pub symtgt: P9String,
-    #[deku(endian = "little")]
     pub gid: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tmknod {
-    #[deku(endian = "little")]
     pub dfid: u32,
     pub name: P9String,
-    #[deku(endian = "little")]
     pub mode: u32,
-    #[deku(endian = "little")]
     pub major: u32,
-    #[deku(endian = "little")]
     pub minor: u32,
-    #[deku(endian = "little")]
     pub gid: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlink {
-    #[deku(endian = "little")]
     pub dfid: u32,
-    #[deku(endian = "little")]
     pub fid: u32,
     pub name: P9String,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Trename {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub dfid: u32,
     pub name: P9String,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Trenameat {
-    #[deku(endian = "little")]
     pub olddirfid: u32,
     pub oldname: P9String,
-    #[deku(endian = "little")]
     pub newdirfid: u32,
     pub newname: P9String,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tunlinkat {
-    #[deku(endian = "little")]
     pub dirfid: u32,
     pub name: P9String,
-    #[deku(endian = "little")]
     pub flags: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tfsync {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub datasync: u32,
 }
 
@@ -496,40 +430,32 @@ pub struct Rflush;
 
 // Extended attributes
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Txattrwalk {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub newfid: u32,
     pub name: P9String,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlock {
-    #[deku(endian = "little")]
     pub fid: u32,
     pub lock_type: LockType,
-    #[deku(endian = "little")]
     pub flags: u32,
-    #[deku(endian = "little")]
     pub start: u64,
-    #[deku(endian = "little")]
     pub length: u64,
-    #[deku(endian = "little")]
     pub proc_id: u32,
     pub client_id: P9String,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tgetlock {
-    #[deku(endian = "little")]
     pub fid: u32,
     pub lock_type: LockType,
-    #[deku(endian = "little")]
     pub start: u64,
-    #[deku(endian = "little")]
     pub length: u64,
-    #[deku(endian = "little")]
     pub proc_id: u32,
     pub client_id: P9String,
 }
@@ -546,13 +472,11 @@ pub struct Rlock {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Rgetlock {
     pub lock_type: LockType,
-    #[deku(endian = "little")]
     pub start: u64,
-    #[deku(endian = "little")]
     pub length: u64,
-    #[deku(endian = "little")]
     pub proc_id: u32,
     pub client_id: P9String,
 }
@@ -573,13 +497,22 @@ pub struct Rattach {
 // ZeroFS-private reconnect extension: binds a fresh fid to an existing inode by
 // id (not by re-walking a path), so reconnection survives renames/hardlinks.
 // Only our own client sends it.
+pub const P9_REBIND_REPLAY: u8 = 1 << 0;
+pub const P9_REBIND_OPENED: u8 = 1 << 1;
+pub const P9_REBIND_KNOWN_FLAGS: u8 = P9_REBIND_REPLAY | P9_REBIND_OPENED;
+
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Trebind {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub inode_id: u64,
-    #[deku(endian = "little")]
+    /// Attach-root inode. A root-self request has `inode_id == root_inode`.
+    pub root_inode: u64,
+    /// Replay flags. `P9_REBIND_OPENED` requires `P9_REBIND_REPLAY` and applies
+    /// only to still-linked inodes.
+    pub flags: u8,
+    /// Original `Tattach` username for `n_uname == -1` credential lookup.
+    pub uname: P9String,
     pub n_uname: u32,
 }
 
@@ -588,16 +521,13 @@ pub struct Rrebind {
     pub qid: Qid,
 }
 
-// ZeroFS-private fast-path extensions, negotiated via the "9P2000.L.zerofs"
-// version. Twalkgetattr folds walk+getattr into one round trip; Treaddirattr
-// returns each directory entry together with its full stat (readdirplus).
+// Private compound requests require the ZeroFS dialect.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Twalkgetattr {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub newfid: u32,
-    #[deku(endian = "little", update = "self.wnames.len()")]
+    #[deku(update = "self.wnames.len()")]
     pub nwname: u16,
     #[deku(count = "nwname")]
     pub wnames: Vec<P9String>,
@@ -614,12 +544,10 @@ pub struct Rwalkgetattr {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Treaddirattr {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub offset: u64,
-    #[deku(endian = "little")]
     pub count: u32,
 }
 
@@ -634,8 +562,7 @@ pub struct DirEntryPlus {
 }
 
 impl DirEntryPlus {
-    /// Serialized size on the wire, without paying for an encode pass.
-    /// Pinned to the deku layout by `wire_size_matches_serialization`.
+    /// Serialized wire size.
     pub fn wire_size(&self) -> usize {
         Qid::WIRE_SIZE + 8 + 1 + self.name.wire_size() + Stat::WIRE_SIZE
     }
@@ -649,25 +576,14 @@ pub struct Rreaddirattr {
     pub data: DekuBytes,
 }
 
-// ZeroFS-private compound messages, negotiated via "9P2000.L.zerofs2". Each
-// folds a fixed client-side sequence into one round trip:
-//
-//   Tlopenat     = Twalk(clone) + Tlopen — opens `fid`'s inode on a fresh
-//                  `newfid`, leaving `fid` untouched.
-//   Tlcreateattr = Twalk(clone) + Tlcreate + Tgetattr — creates and opens the
-//                  child on `newfid` (the directory fid is NOT mutated, unlike
-//                  Tlcreate) and returns the child's full stat.
-//
-// The remaining *attr variants reuse the standard request layout but reply
-// with the post-operation stat, which the server computes anyway and the
-// standard replies throw away (forcing the client into a follow-up getattr).
+// Tlopenat preserves `fid` and opens `newfid`. Tlcreateattr preserves `dfid`,
+// creates and opens `newfid`, and returns stat. Other *attr replies add stat to
+// the corresponding standard request layout.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlopenat {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub newfid: u32,
-    #[deku(endian = "little")]
     pub flags: u32,
 }
 
@@ -678,20 +594,14 @@ pub struct Rlopenat {
     pub iounit: u32,
 }
 
-// Tlopenatread = Tlopenat + Tread(offset 0, count), negotiated via ".zerofs5".
-// Opens `fid`'s inode on `newfid` and prefetches the start of the file in the
-// same round trip. The read is best-effort: the server returns whatever it could
-// read (possibly nothing) without failing the open.
+// Tlopenatread combines Tlopenat with a best-effort Tread at offset zero.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlopenatread {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub newfid: u32,
-    #[deku(endian = "little")]
     pub flags: u32,
     /// Bytes to prefetch from offset 0. The server clamps this to fit msize.
-    #[deku(endian = "little")]
     pub count: u32,
 }
 
@@ -700,9 +610,7 @@ pub struct Rlopenatread {
     pub qid: Qid,
     #[deku(endian = "little")]
     pub iounit: u32,
-    /// 1 when `data` reaches end of file (the whole file fit in `count`), so the
-    /// client may serve the file's reads entirely from `data`; 0 otherwise, when
-    /// the client discards the partial prefetch and reads normally.
+    /// One when `data` reaches EOF; zero for an incomplete prefetch.
     pub eof: u8,
     #[deku(endian = "little", update = "self.data.len()")]
     pub count: u32,
@@ -711,17 +619,13 @@ pub struct Rlopenatread {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tlcreateattr {
-    #[deku(endian = "little")]
     pub dfid: u32,
-    #[deku(endian = "little")]
     pub newfid: u32,
     pub name: P9String,
-    #[deku(endian = "little")]
     pub flags: u32,
-    #[deku(endian = "little")]
     pub mode: u32,
-    #[deku(endian = "little")]
     pub gid: u32,
 }
 
@@ -773,11 +677,10 @@ impl Rreaddirattr {
     pub fn to_entries(&self) -> Result<Vec<DirEntryPlus>, DekuError> {
         use deku::DekuContainerRead;
         let mut entries = Vec::new();
-        let mut offset = 0;
-        while offset < self.data.len() {
-            let remaining = &self.data.0[offset..];
-            let (_, entry) = DirEntryPlus::from_bytes((remaining, 0))?;
-            offset += entry.to_bytes()?.len();
+        let mut input = (&self.data.0[..], 0);
+        while !input.0.is_empty() {
+            let (remaining, entry) = DirEntryPlus::from_bytes(input)?;
+            input = remaining;
             entries.push(entry);
         }
         Ok(entries)
@@ -848,16 +751,10 @@ impl Rreaddir {
         use deku::DekuContainerRead;
 
         let mut entries = Vec::new();
-        let mut offset = 0;
-
-        while offset < self.data.len() {
-            let remaining = &self.data.0[offset..];
-            let (_, entry) = DirEntry::from_bytes((remaining, 0))?;
-
-            // Calculate how many bytes were consumed
-            let entry_bytes = entry.to_bytes()?;
-            offset += entry_bytes.len();
-
+        let mut input = (&self.data.0[..], 0);
+        while !input.0.is_empty() {
+            let (remaining, entry) = DirEntry::from_bytes(input)?;
+            input = remaining;
             entries.push(entry);
         }
 
@@ -921,63 +818,49 @@ pub struct Runlinkat;
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rfsync;
 
-/// `.zerofs4`: query the connection's current durability lineage token. Sent
-/// once per (re)connection after negotiating `.zerofs4`; off the hot path.
+/// Queries the connection's durability lineage and writer epoch.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Tgetlineage;
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Rgetlineage {
-    #[deku(endian = "little")]
     pub token: u64,
+    /// HA writer epoch used as mutation-envelope origin; zero when standalone.
+    pub writer_epoch: u64,
 }
 
-/// `.zerofs4` durability-verified fsync. Like Tfsync but carries the lineage
-/// token of the client's oldest un-fsync'd write (`0` = nothing un-fsync'd). The
-/// server flushes, then replies Rfsync iff the token is still the live durable
-/// lineage, else Rlerror(ESTALE).
+/// Durability-verified fsync carrying the oldest unsynced lineage token.
+/// Token zero denotes no pending write. A lineage mismatch returns `ESTALE`.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Tfsyncdur {
-    #[deku(endian = "little")]
     pub fid: u32,
-    #[deku(endian = "little")]
     pub datasync: u32,
-    #[deku(endian = "little")]
     pub token: u64,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(endian = "little")]
 pub struct Rstatfs {
-    #[deku(endian = "little")]
-    pub r#type: u32, // filesystem type
-    #[deku(endian = "little")]
-    pub bsize: u32, // optimal transfer block size
-    #[deku(endian = "little")]
-    pub blocks: u64, // total data blocks in filesystem
-    #[deku(endian = "little")]
-    pub bfree: u64, // free blocks in filesystem
-    #[deku(endian = "little")]
-    pub bavail: u64, // free blocks available to non-superuser
-    #[deku(endian = "little")]
-    pub files: u64, // total file nodes in filesystem
-    #[deku(endian = "little")]
-    pub ffree: u64, // free file nodes in filesystem
-    #[deku(endian = "little")]
-    pub fsid: u64, // filesystem id
-    #[deku(endian = "little")]
+    pub r#type: u32,  // filesystem type
+    pub bsize: u32,   // optimal transfer block size
+    pub blocks: u64,  // total data blocks in filesystem
+    pub bfree: u64,   // free blocks in filesystem
+    pub bavail: u64,  // free blocks available to non-superuser
+    pub files: u64,   // total file nodes in filesystem
+    pub ffree: u64,   // free file nodes in filesystem
+    pub fsid: u64,    // filesystem id
     pub namelen: u32, // maximum length of filenames
 }
 
-// The 9P2000.L request types that carry an op-id under `.zerofs3`. Named because
-// each is referenced in three places that must agree, the variant `deku(id)`
-// below, the type byte in `P9Message::new`, and `carries_op_id`, so a single
-// const is the source of truth. The first group is the base non-idempotent
-// mutations; the second is their `.zerofs2` compound (create-and-return-stat)
-// forms. The remaining message types are single-use and stay as literal ids.
+// These IDs define mutation-envelope coverage and must match the enum layout.
 pub const T_LCREATE: u8 = 14;
 pub const T_SYMLINK: u8 = 16;
 pub const T_MKNOD: u8 = 18;
 pub const T_RENAME: u8 = 20;
+pub const T_SETATTR: u8 = 26;
+pub const T_WRITE: u8 = 118;
 pub const T_LINK: u8 = 70;
 pub const T_MKDIR: u8 = 72;
 pub const T_RENAMEAT: u8 = 74;
@@ -987,9 +870,8 @@ pub const T_MKDIRATTR: u8 = 240;
 pub const T_SYMLINKATTR: u8 = 242;
 pub const T_MKNODATTR: u8 = 244;
 pub const T_LINKATTR: u8 = 246;
-// The supported fallocate modes are idempotent with respect to file data,
-// size, and quota, so retries do not require an op-id. The request still
-// participates in fsync durability tracking.
+pub const T_SETATTRATTR: u8 = 248;
+// Delayed fallocate retries can reorder with writes and therefore carry op-ids.
 pub const T_FALLOCATE: u8 = 228;
 pub const R_FALLOCATE: u8 = 229;
 
@@ -1021,7 +903,7 @@ pub enum Message {
     Tread(Tread),
     #[deku(id = "117")]
     Rread(Rread),
-    #[deku(id = "118")]
+    #[deku(id = "T_WRITE")]
     Twrite(Twrite),
     #[deku(id = "119")]
     Rwrite(Rwrite),
@@ -1037,7 +919,7 @@ pub enum Message {
     Tgetattr(Tgetattr),
     #[deku(id = "25")]
     Rgetattr(Rgetattr),
-    #[deku(id = "26")]
+    #[deku(id = "T_SETATTR")]
     Tsetattr(Tsetattr),
     #[deku(id = "27")]
     Rsetattr(Rsetattr),
@@ -1109,14 +991,12 @@ pub enum Message {
     Tstatfs(Tstatfs),
     #[deku(id = "9")]
     Rstatfs(Rstatfs),
-    // ZeroFS-private compound extensions (ids outside the standard 9P range),
-    // negotiated via "9P2000.L.zerofs2". The *attr requests reuse the standard
-    // request layout; only their replies differ (they carry the post-op stat).
+    // Private compound extensions use IDs outside the standard 9P range. The
+    // *attr requests keep the standard request layout and return a richer reply.
     #[deku(id = "236")]
     Tlopenat(Tlopenat),
     #[deku(id = "237")]
     Rlopenat(Rlopenat),
-    // .zerofs5 open+first-read fold.
     #[deku(id = "230")]
     Tlopenatread(Tlopenatread),
     #[deku(id = "231")]
@@ -1141,7 +1021,7 @@ pub enum Message {
     Tlinkattr(Tlink),
     #[deku(id = "247")]
     Rlinkattr(Rlinkattr),
-    #[deku(id = "248")]
+    #[deku(id = "T_SETATTRATTR")]
     Tsetattrattr(Tsetattr),
     #[deku(id = "249")]
     Rsetattrattr(Rsetattrattr),
@@ -1161,23 +1041,96 @@ pub enum Message {
 }
 
 impl Message {
-    /// Whether this REQUEST mutates durable filesystem state, so a `.zerofs4`
-    /// client must track it as un-fsync'd for durability-verified fsync. Defined as
-    /// "has a durability fid"; see [`Self::durability_fid`].
+    /// Whether this request requires the private ZeroFS dialect.
+    pub fn is_zerofs_private_request(&self) -> bool {
+        match self {
+            Message::Tfallocate(_)
+            | Message::Tfsyncdur(_)
+            | Message::Tgetlineage(_)
+            | Message::Tlopenat(_)
+            | Message::Tlopenatread(_)
+            | Message::Tlcreateattr(_)
+            | Message::Tmkdirattr(_)
+            | Message::Tsymlinkattr(_)
+            | Message::Tmknodattr(_)
+            | Message::Tlinkattr(_)
+            | Message::Tsetattrattr(_)
+            | Message::Trebind(_)
+            | Message::Twalkgetattr(_)
+            | Message::Treaddirattr(_) => true,
+            Message::Tversion(_)
+            | Message::Rversion(_)
+            | Message::Tattach(_)
+            | Message::Rattach(_)
+            | Message::Twalk(_)
+            | Message::Rwalk(_)
+            | Message::Tlopen(_)
+            | Message::Rlopen(_)
+            | Message::Tlcreate(_)
+            | Message::Rlcreate(_)
+            | Message::Tread(_)
+            | Message::Rread(_)
+            | Message::Twrite(_)
+            | Message::Rwrite(_)
+            | Message::Tclunk(_)
+            | Message::Rclunk(_)
+            | Message::Treaddir(_)
+            | Message::Rreaddir(_)
+            | Message::Tgetattr(_)
+            | Message::Rgetattr(_)
+            | Message::Tsetattr(_)
+            | Message::Rsetattr(_)
+            | Message::Rfallocate(_)
+            | Message::Tmkdir(_)
+            | Message::Rmkdir(_)
+            | Message::Tsymlink(_)
+            | Message::Rsymlink(_)
+            | Message::Tmknod(_)
+            | Message::Rmknod(_)
+            | Message::Treadlink(_)
+            | Message::Rreadlink(_)
+            | Message::Tlink(_)
+            | Message::Rlink(_)
+            | Message::Trename(_)
+            | Message::Rrename(_)
+            | Message::Trenameat(_)
+            | Message::Rrenameat(_)
+            | Message::Tunlinkat(_)
+            | Message::Runlinkat(_)
+            | Message::Tfsync(_)
+            | Message::Rfsync(_)
+            | Message::Rgetlineage(_)
+            | Message::Tlock(_)
+            | Message::Rlock(_)
+            | Message::Tgetlock(_)
+            | Message::Rgetlock(_)
+            | Message::Rlerror(_)
+            | Message::Tflush(_)
+            | Message::Rflush(_)
+            | Message::Txattrwalk(_)
+            | Message::Rxattrwalk(_)
+            | Message::Tstatfs(_)
+            | Message::Rstatfs(_)
+            | Message::Rlopenat(_)
+            | Message::Rlopenatread(_)
+            | Message::Rlcreateattr(_)
+            | Message::Rmkdirattr(_)
+            | Message::Rsymlinkattr(_)
+            | Message::Rmknodattr(_)
+            | Message::Rlinkattr(_)
+            | Message::Rsetattrattr(_)
+            | Message::Rrebind(_)
+            | Message::Rwalkgetattr(_)
+            | Message::Rreaddirattr(_) => false,
+        }
+    }
+
+    /// Whether this request creates an obligation for durability-verified fsync.
     pub fn is_mutation(&self) -> bool {
         self.durability_fid().is_some()
     }
 
-    /// The fid this mutation's durability binds to: a verified `fsync` covers the write
-    /// only if it presents this fid. It is the fid of the mutated inode, so the change
-    /// is persisted by `fsync` on the object POSIX holds responsible. File ops
-    /// (write/setattr) use the file fid; directory mutations (mkdir/symlink/mknod/link/
-    /// rename/unlink, and a create's directory entry) use the directory fid, since the
-    /// entry lives in the parent and only `fsync(parent)` persists it. A created file's
-    /// data is covered by `fsync` on its open fid. The FUSE mount aggregates per inode,
-    /// so an obligation on any fid bound to the fsync'd handle's inode is honoured.
-    /// Non-mutating ops (fsync, read, walk, open, clunk) return `None`; truncate-on-open
-    /// arrives as a separate `Tsetattr`, so `Tlopen`/`Tlopenat` are excluded.
+    /// Fid owning the mutation's primary durability obligation.
     pub fn durability_fid(&self) -> Option<u32> {
         match self {
             Message::Twrite(m) => Some(m.fid),
@@ -1185,7 +1138,6 @@ impl Message {
             Message::Tsetattrattr(m) => Some(m.fid),
             Message::Tfallocate(m) => Some(m.fid),
             Message::Tlcreate(m) => Some(m.fid),
-            // The directory ENTRY is in the parent; `fsync(parent)` must cover it.
             Message::Tlcreateattr(m) => Some(m.dfid),
             Message::Tmkdir(m) => Some(m.dfid),
             Message::Tmkdirattr(m) => Some(m.dfid),
@@ -1202,11 +1154,7 @@ impl Message {
         }
     }
 
-    /// Every fid whose inode this mutation changes, so a verified `fsync` of any of them
-    /// accounts for it. For almost all ops this is just [`Self::durability_fid`]; a
-    /// `Trenameat` changes both directories in one atomic op (the source loses the entry,
-    /// the dest gains it), so it also yields the source dir fid, letting `fsync` on either
-    /// directory verify the rename.
+    /// Fids changed by the mutation. `Trenameat` includes both directories.
     pub fn durability_fids(&self) -> impl Iterator<Item = u32> {
         let extra = match self {
             Message::Trenameat(m) => Some(m.olddirfid),
@@ -1220,12 +1168,16 @@ impl Message {
 pub const P9_TYPE_OFFSET: usize = 4;
 /// Length of the standard 9P frame header: size(u32) + type(u8) + tag(u16).
 pub const P9_FRAME_HEADER_LEN: usize = 7;
-/// Length of the idempotency op-id spliced into the frame under `.zerofs3`.
+/// Length of the idempotency op-id in the ZeroFS request envelope.
 pub const P9_OP_ID_LEN: usize = 16;
+/// Length of the attempt flags in the ZeroFS request envelope.
+pub const P9_OP_FLAGS_LEN: usize = 1;
+/// Length of the originating writer epoch in the ZeroFS request envelope.
+pub const P9_OP_ORIGIN_EPOCH_LEN: usize = 8;
+/// Total bytes spliced after the tag for a mutation in the ZeroFS dialect.
+pub const P9_OP_ENVELOPE_LEN: usize = P9_OP_ID_LEN + P9_OP_FLAGS_LEN + P9_OP_ORIGIN_EPOCH_LEN;
 
-// Standard 9P framing is size+type+tag+body; the op-id is deliberately NOT part
-// of the deku layout. Under `.zerofs3` it is spliced in after the tag (requests
-// only), so existing call sites keep producing/parsing standard frames.
+// Deku retains standard framing; private mutation envelopes are spliced after tag.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct P9Message {
     #[deku(endian = "little")]
@@ -1235,6 +1187,10 @@ pub struct P9Message {
     pub tag: u16,
     #[deku(skip, default = "[0u8; 16]")]
     pub op_id: [u8; 16],
+    #[deku(skip, default = "0")]
+    pub op_flags: u8,
+    #[deku(skip, default = "0")]
+    pub op_origin_epoch: u64,
     #[deku(ctx = "*type_")]
     pub body: Message,
 }
@@ -1244,15 +1200,18 @@ impl P9Message {
         self.to_bytes_ctx(false)
     }
 
-    /// Encode. Under `.zerofs3` the op-id is spliced in after the tag (requests
-    /// only); otherwise this is standard 9P framing.
+    /// Encodes covered mutations with a private envelope after the tag.
     pub fn to_bytes_ctx(&self, op_id_enabled: bool) -> Result<Vec<u8>, DekuError> {
-        // deku produces the standard frame (op_id is #[deku(skip)]).
+        // Deku produces the standard frame; op fields are skipped.
         let mut bytes = DekuContainerWrite::to_bytes(self)?;
         if op_id_enabled && Self::carries_op_id(self.type_) {
             bytes.splice(
                 P9_FRAME_HEADER_LEN..P9_FRAME_HEADER_LEN,
-                self.op_id.iter().copied(),
+                self.op_id
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(self.op_flags))
+                    .chain(self.op_origin_epoch.to_le_bytes()),
             );
         }
         let size = bytes.len() as u32;
@@ -1260,26 +1219,34 @@ impl P9Message {
         Ok(bytes)
     }
 
-    /// Decode. Under `.zerofs3` the op-id is read from the frame (requests only)
-    /// and stripped before the body is parsed; otherwise standard 9P framing.
+    /// Decodes a standard frame with an optional private mutation envelope.
     pub fn from_bytes_ctx(input: &[u8], op_id_enabled: bool) -> Result<P9Message, DekuError> {
         if op_id_enabled
             && input.len() > P9_FRAME_HEADER_LEN
             && Self::carries_op_id(input[P9_TYPE_OFFSET])
         {
-            if input.len() < P9_FRAME_HEADER_LEN + P9_OP_ID_LEN {
+            if input.len() < P9_FRAME_HEADER_LEN + P9_OP_ENVELOPE_LEN {
                 return Err(DekuError::Parse(
-                    "frame too short to contain an op-id".into(),
+                    "frame too short to contain an op envelope".into(),
                 ));
             }
             let mut op_id = [0u8; 16];
             op_id.copy_from_slice(&input[P9_FRAME_HEADER_LEN..P9_FRAME_HEADER_LEN + P9_OP_ID_LEN]);
-            // Rebuild the standard frame (without the op-id) to parse the body.
-            let mut standard = Vec::with_capacity(input.len() - P9_OP_ID_LEN);
+            let op_flags = input[P9_FRAME_HEADER_LEN + P9_OP_ID_LEN];
+            let origin_start = P9_FRAME_HEADER_LEN + P9_OP_ID_LEN + P9_OP_FLAGS_LEN;
+            let op_origin_epoch = u64::from_le_bytes(
+                input[origin_start..origin_start + P9_OP_ORIGIN_EPOCH_LEN]
+                    .try_into()
+                    .expect("the envelope length was checked"),
+            );
+            // Deku parses the body from standard framing.
+            let mut standard = Vec::with_capacity(input.len() - P9_OP_ENVELOPE_LEN);
             standard.extend_from_slice(&input[..P9_FRAME_HEADER_LEN]);
-            standard.extend_from_slice(&input[P9_FRAME_HEADER_LEN + P9_OP_ID_LEN..]);
+            standard.extend_from_slice(&input[P9_FRAME_HEADER_LEN + P9_OP_ENVELOPE_LEN..]);
             let (_, mut msg) = P9Message::from_bytes((&standard, 0))?;
             msg.op_id = op_id;
+            msg.op_flags = op_flags;
+            msg.op_origin_epoch = op_origin_epoch;
             Ok(msg)
         } else {
             let (_, msg) = P9Message::from_bytes((input, 0))?;
@@ -1287,119 +1254,52 @@ impl P9Message {
         }
     }
 
-    /// Whether a request of this 9P type carries an op-id under `.zerofs3`. The
-    /// single source of truth shared by encode and decode, so the two always
-    /// agree and a missed type is only a coverage gap, never a framing break.
-    /// Covers the non-idempotent mutations (create family, rename, unlink);
-    /// idempotent ops (reads/walks/attach/clunk/write/setattr/Tlopenat) are out.
-    /// The second group is those same mutations in their `.zerofs2` compound
-    /// (create-and-return-stat) form; the op-id is a `.zerofs3` feature applied to
-    /// both groups, not something `.zerofs2` carried.
-    fn carries_op_id(type_: u8) -> bool {
+    /// Whether this request type carries the private mutation envelope.
+    pub fn carries_op_id(type_: u8) -> bool {
         matches!(
             type_,
             // base 9P2000.L mutations
-            T_LCREATE | T_SYMLINK | T_MKNOD | T_RENAME | T_LINK | T_MKDIR | T_RENAMEAT | T_UNLINKAT
-            // their .zerofs2 compound (create-and-return-stat) forms
+            T_LCREATE | T_SYMLINK | T_MKNOD | T_RENAME | T_SETATTR | T_WRITE | T_LINK | T_MKDIR | T_RENAMEAT | T_UNLINKAT | T_FALLOCATE
+            // compound mutation forms
             | T_LCREATEATTR | T_MKDIRATTR | T_SYMLINKATTR | T_MKNODATTR | T_LINKATTR
+            // setattr compound form
+            | T_SETATTRATTR
         )
     }
 
     pub fn new(tag: u16, body: Message) -> Self {
-        let type_ = match &body {
-            Message::Tversion(_) => 100,
-            Message::Rversion(_) => 101,
-            Message::Tattach(_) => 104,
-            Message::Rattach(_) => 105,
-            Message::Twalk(_) => 110,
-            Message::Rwalk(_) => 111,
-            Message::Tlopen(_) => 12,
-            Message::Rlopen(_) => 13,
-            Message::Tlcreate(_) => T_LCREATE,
-            Message::Rlcreate(_) => 15,
-            Message::Tread(_) => 116,
-            Message::Rread(_) => 117,
-            Message::Twrite(_) => 118,
-            Message::Rwrite(_) => 119,
-            Message::Tclunk(_) => 120,
-            Message::Rclunk(_) => 121,
-            Message::Treaddir(_) => 40,
-            Message::Rreaddir(_) => 41,
-            Message::Tgetattr(_) => 24,
-            Message::Rgetattr(_) => 25,
-            Message::Tsetattr(_) => 26,
-            Message::Rsetattr(_) => 27,
-            Message::Tfallocate(_) => T_FALLOCATE,
-            Message::Rfallocate(_) => R_FALLOCATE,
-            Message::Tmkdir(_) => T_MKDIR,
-            Message::Rmkdir(_) => 73,
-            Message::Tsymlink(_) => T_SYMLINK,
-            Message::Rsymlink(_) => 17,
-            Message::Tmknod(_) => T_MKNOD,
-            Message::Rmknod(_) => 19,
-            Message::Treadlink(_) => 22,
-            Message::Rreadlink(_) => 23,
-            Message::Tlink(_) => T_LINK,
-            Message::Rlink(_) => 71,
-            Message::Trename(_) => T_RENAME,
-            Message::Rrename(_) => 21,
-            Message::Trenameat(_) => T_RENAMEAT,
-            Message::Rrenameat(_) => 75,
-            Message::Tunlinkat(_) => T_UNLINKAT,
-            Message::Runlinkat(_) => 77,
-            Message::Tfsync(_) => 50,
-            Message::Rfsync(_) => 51,
-            Message::Tfsyncdur(_) => 232,
-            Message::Tgetlineage(_) => 233,
-            Message::Rgetlineage(_) => 234,
-            Message::Tlock(_) => 52,
-            Message::Rlock(_) => 53,
-            Message::Tgetlock(_) => 54,
-            Message::Rgetlock(_) => 55,
-            Message::Rlerror(_) => 7,
-            Message::Tflush(_) => 108,
-            Message::Rflush(_) => 109,
-            Message::Txattrwalk(_) => 30,
-            Message::Rxattrwalk(_) => 31,
-            Message::Tstatfs(_) => 8,
-            Message::Rstatfs(_) => 9,
-            Message::Tlopenat(_) => 236,
-            Message::Rlopenat(_) => 237,
-            Message::Tlopenatread(_) => 230,
-            Message::Rlopenatread(_) => 231,
-            Message::Tlcreateattr(_) => T_LCREATEATTR,
-            Message::Rlcreateattr(_) => 239,
-            Message::Tmkdirattr(_) => T_MKDIRATTR,
-            Message::Rmkdirattr(_) => 241,
-            Message::Tsymlinkattr(_) => T_SYMLINKATTR,
-            Message::Rsymlinkattr(_) => 243,
-            Message::Tmknodattr(_) => T_MKNODATTR,
-            Message::Rmknodattr(_) => 245,
-            Message::Tlinkattr(_) => T_LINKATTR,
-            Message::Rlinkattr(_) => 247,
-            Message::Tsetattrattr(_) => 248,
-            Message::Rsetattrattr(_) => 249,
-            Message::Trebind(_) => 250,
-            Message::Rrebind(_) => 251,
-            Message::Twalkgetattr(_) => 252,
-            Message::Rwalkgetattr(_) => 253,
-            Message::Treaddirattr(_) => 254,
-            Message::Rreaddirattr(_) => 255,
-        };
+        let type_ = body
+            .deku_id()
+            .expect("every Message variant has a fixed 9P type id");
 
         Self {
-            size: 0, // Will be calculated during serialization
+            size: 0,
             type_,
             tag,
             op_id: [0u8; 16],
+            op_flags: 0,
+            op_origin_epoch: 0,
             body,
         }
     }
 
     /// Construct a request carrying an idempotency op-id (encode with `to_bytes_ctx(true)`).
     pub fn new_with_op_id(tag: u16, op_id: [u8; 16], body: Message) -> Self {
+        Self::new_with_op_id_flags_and_origin(tag, op_id, 0, 0, body)
+    }
+
+    /// Constructs an op-id request with flags and origin writer epoch.
+    pub fn new_with_op_id_flags_and_origin(
+        tag: u16,
+        op_id: [u8; 16],
+        op_flags: u8,
+        op_origin_epoch: u64,
+        body: Message,
+    ) -> Self {
         let mut msg = Self::new(tag, body);
         msg.op_id = op_id;
+        msg.op_flags = op_flags;
+        msg.op_origin_epoch = op_origin_epoch;
         msg
     }
 }
@@ -1490,18 +1390,43 @@ mod tests {
     }
 
     #[test]
-    fn op_id_round_trips_on_a_request_under_zerofs3() {
-        // Tmkdir is a covered (non-idempotent) request, so it carries the op-id.
+    fn op_id_round_trips_on_a_zerofs_request() {
         let op_id = [7u8; 16];
-        let msg = P9Message::new_with_op_id(5, op_id, tmkdir());
+        let msg =
+            P9Message::new_with_op_id_flags_and_origin(5, op_id, P9_OP_FLAG_RETRY, 42, tmkdir());
         let bytes = msg.to_bytes_ctx(true).unwrap();
         let decoded = P9Message::from_bytes_ctx(&bytes, true).unwrap();
         assert_eq!(
             decoded.op_id, op_id,
-            "the op-id must round-trip under .zerofs3"
+            "the op-id must round-trip in the ZeroFS dialect"
         );
+        assert_eq!(decoded.op_flags, P9_OP_FLAG_RETRY);
+        assert_eq!(decoded.op_origin_epoch, 42);
         assert_eq!(decoded.tag, 5);
         assert!(matches!(decoded.body, Message::Tmkdir(_)));
+    }
+
+    #[test]
+    fn op_id_write_payload_at_advertised_boundary_fits_msize() {
+        let msize = 4096u32;
+        let count = msize - P9_TWRITE_HDR - P9_OP_ENVELOPE_LEN as u32;
+        let msg = P9Message::new_with_op_id(
+            5,
+            [7u8; 16],
+            Message::Twrite(Twrite {
+                fid: 9,
+                offset: 0,
+                count,
+                data: vec![0u8; count as usize].into(),
+            }),
+        );
+        let bytes = msg.to_bytes_ctx(true).unwrap();
+        assert_eq!(bytes.len(), msize as usize);
+        let decoded = P9Message::from_bytes_ctx(&bytes, true).unwrap();
+        assert_eq!(decoded.op_id, [7u8; 16]);
+        assert_eq!(decoded.op_flags, 0);
+        assert_eq!(decoded.op_origin_epoch, 0);
+        assert!(matches!(decoded.body, Message::Twrite(_)));
     }
 
     #[test]
@@ -1512,28 +1437,53 @@ mod tests {
         let without = msg.to_bytes_ctx(false).unwrap();
         assert_eq!(
             with.len(),
-            without.len() + 16,
-            "the op-id adds exactly 16 bytes on the wire, and nothing without .zerofs3"
+            without.len() + P9_OP_ENVELOPE_LEN,
+            "the op envelope is present only in the ZeroFS dialect"
         );
-        // Standard 9P framing (no extension) carries no op-id.
         let decoded = P9Message::from_bytes_ctx(&without, false).unwrap();
         assert_eq!(
             decoded.op_id, [0u8; 16],
             "standard framing carries no op-id"
         );
-        // And a stock decoder (default ctx) reads the standard frame unchanged.
+        assert_eq!(decoded.op_flags, 0);
         let (_, plain) = P9Message::from_bytes((&without, 0)).unwrap();
         assert_eq!(plain.tag, 5);
     }
 
     #[test]
     fn idempotent_requests_carry_no_op_id() {
-        // A read-side request (Tclunk) is not covered, so even under .zerofs3 it
-        // is framed exactly as standard 9P (no op-id bytes).
         let msg = P9Message::new_with_op_id(5, [7u8; 16], Message::Tclunk(Tclunk { fid: 9 }));
         let with = msg.to_bytes_ctx(true).unwrap();
         let without = msg.to_bytes_ctx(false).unwrap();
         assert_eq!(with, without, "an uncovered op must not carry an op-id");
+    }
+
+    #[test]
+    fn rebind_round_trips_explicit_root_inode() {
+        let msg = P9Message::new(
+            17,
+            Message::Trebind(Trebind {
+                fid: 9,
+                inode_id: 42,
+                root_inode: 7,
+                flags: P9_REBIND_REPLAY | P9_REBIND_OPENED,
+                uname: P9String::new(b"root".to_vec()),
+                n_uname: 1000,
+            }),
+        );
+        let bytes = msg.to_bytes().unwrap();
+        let (_, decoded) = P9Message::from_bytes((&bytes, 0)).unwrap();
+        match decoded.body {
+            Message::Trebind(rebind) => {
+                assert_eq!(rebind.fid, 9);
+                assert_eq!(rebind.inode_id, 42);
+                assert_eq!(rebind.root_inode, 7);
+                assert_eq!(rebind.flags, P9_REBIND_REPLAY | P9_REBIND_OPENED);
+                assert_eq!(rebind.uname.as_str().unwrap(), "root");
+                assert_eq!(rebind.n_uname, 1000);
+            }
+            _ => panic!("expected Trebind"),
+        }
     }
 
     #[test]

@@ -31,10 +31,6 @@ use tokio::process::Command;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-/// Default 9P port, matching `zerofs mount`'s own default, used when the
-/// gateway address omits one.
-const DEFAULT_9P_PORT: u16 = 5564;
-
 /// How long NodePublishVolume waits for the mount to come up before killing
 /// the child and failing.
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -276,23 +272,17 @@ async fn gateway_reachable(gateway: &str) -> bool {
 /// [`gateway_reachable`] bounds the whole probe. Address parsing mirrors
 /// `zerofs mount`'s own.
 async fn segment_reachable(gateway: &str) -> bool {
-    let connect = async {
-        if let Some(rest) = gateway.strip_prefix("unix:") {
-            let path = rest.strip_prefix("//").unwrap_or(rest);
-            return tokio::net::UnixStream::connect(path).await.map(drop);
-        }
-        let hostport = gateway.strip_prefix("tcp://").unwrap_or(gateway);
-        if hostport.starts_with('/') || hostport.starts_with('.') {
-            return tokio::net::UnixStream::connect(hostport).await.map(drop);
-        }
-        let with_port = if hostport.contains(':') {
-            hostport.to_string()
-        } else {
-            format!("{hostport}:{DEFAULT_9P_PORT}")
-        };
-        tokio::net::TcpStream::connect(with_port).await.map(drop)
+    let Ok(target) = gateway.parse::<ninep_client::Target>() else {
+        return false;
     };
-    connect.await.is_ok()
+    match target {
+        ninep_client::Target::Unix(path) => tokio::net::UnixStream::connect(path).await.map(drop),
+        ninep_client::Target::Tcp(addr) => tokio::net::TcpStream::connect(addr).await.map(drop),
+        ninep_client::Target::TcpHost(endpoint) => {
+            tokio::net::TcpStream::connect(endpoint).await.map(drop)
+        }
+    }
+    .is_ok()
 }
 
 /// Classify a publish target without issuing a syscall that can hang on a

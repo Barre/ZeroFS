@@ -243,7 +243,6 @@ async fn volume_exists_on_gateway(gateway: &str, aname: &str) -> Result<bool, St
     const ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let targets = crate::targets::parse_9p_targets(gateway)
-        .await
         .map_err(|e| Status::unavailable(format!("gateway {}: {}", gateway, e)))?;
     let client = ninep_client::NinePClient::connect_multi(targets, MSIZE)
         .await

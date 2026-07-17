@@ -12,13 +12,13 @@ use crate::fs::types::{
 };
 use crate::fs::{OpenHandle, ZeroFS};
 use bytes::Bytes;
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 use ninep_proto::*;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::debug;
 
 pub const DEFAULT_MSIZE: u32 = 256 * 1024;
@@ -51,7 +51,7 @@ pub const DEFAULT_BLKSIZE: u64 = 4096;
 // Block size for calculating block count
 pub const BLOCK_SIZE: u64 = 512;
 
-/// Maps post-dispatch errors to 9P errno values.
+/// Classify a post-dispatch error for failover retry semantics.
 fn post_dispatch_errno(error: P9Error, lease_is_valid: bool) -> u32 {
     if matches!(error, P9Error::Fs(FsError::LeaderRejectedBeforeApply)) {
         ninep_proto::P9_ENOTLEADER_CLEAN
@@ -60,6 +60,21 @@ fn post_dispatch_errno(error: P9Error, lease_is_valid: bool) -> u32 {
     } else {
         ninep_proto::P9_ENOTLEADER
     }
+}
+
+/// Errors that conclusively completed without mutation effects.
+/// I/O, corruption, and leadership-transition failures remain ambiguous.
+fn is_terminal_dedup_error(error: P9Error) -> bool {
+    !matches!(
+        error,
+        P9Error::Fs(
+            FsError::IoError
+                | FsError::InvalidData
+                | FsError::LeaderLeaseExpired
+                | FsError::LeaderRejectedBeforeApply
+                | FsError::ShuttingDown,
+        )
+    )
 }
 
 /// Upper bound on the number of parent-pointer hops an aname membership walk
@@ -88,13 +103,11 @@ pub struct Fid {
 
 /// A session fid-table entry: the cloneable `Fid` data, plus the guards that
 /// tie its open-handle count and byte-range locks to the entry's lifetime.
-/// `get_fid` clones out `.fid` only, so the guards stay in the table — meaning
-/// the resources are released exactly once, whenever and however the entry is
-/// dropped (clunk, close_all, an overwriting walk/open, teardown).
+/// Resource guards remain in the table when fid metadata is cloned.
 #[derive(Debug)]
 pub struct FidSlot {
     pub fid: Fid,
-    /// Present once the fid is opened; pins the inode's open-handle count.
+    /// Open-handle pin, including provisional replay pins before `Tlopen`.
     pub handle: Option<OpenHandle>,
     /// Present once the fid takes its first byte-range lock; releases the fid's
     /// locks on drop.
@@ -111,16 +124,13 @@ impl FidSlot {
     }
 }
 
-#[derive(Debug)]
-pub struct Session {
-    pub msize: AtomicU32,
-    pub fids: Arc<DashMap<u32, FidSlot>>,
-    /// The inode the session's last Tattach aname resolved to (0 when the
-    /// session is rooted at the whole filesystem). Trebind validates rebound
-    /// inodes against this subtree.
-    pub attach_root: AtomicU64,
-    /// Negotiated cumulative ZeroFS extension level (0 for plain 9P2000.L).
-    pub extensions: AtomicU8,
+#[derive(Debug, Default)]
+struct SessionState {
+    msize: u32,
+    zerofs_protocol: bool,
+    fids: HashMap<u32, FidSlot>,
+    /// Blocks installation of new resource-bearing fid slots.
+    disconnected: bool,
 }
 
 impl From<&Tsetattr> for SetAttributes {
@@ -173,23 +183,42 @@ impl From<&Tsetattr> for SetAttributes {
 #[derive(Clone)]
 pub struct NinePHandler {
     filesystem: Arc<ZeroFS>,
-    session: Arc<Session>,
+    session: Arc<Mutex<SessionState>>,
     lock_manager: Arc<FileLockManager>,
     handler_id: u64,
     /// If set, overrides the client-provided credentials on attach.
     credential_override: Option<(u32, u32)>,
 }
 
+/// Retires a transport session on exit or unwind.
+pub(crate) struct SessionReleaseGuard(Option<Arc<NinePHandler>>);
+
+impl SessionReleaseGuard {
+    pub(crate) fn new(handler: Arc<NinePHandler>) -> Self {
+        Self(Some(handler))
+    }
+
+    pub(crate) fn release(&mut self) {
+        if let Some(handler) = self.0.take() {
+            handler.close_for_disconnect();
+        }
+    }
+}
+
+impl Drop for SessionReleaseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl NinePHandler {
     pub fn new(filesystem: Arc<ZeroFS>, lock_manager: Arc<FileLockManager>) -> Self {
         static HANDLER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-        let session = Arc::new(Session {
-            msize: AtomicU32::new(DEFAULT_MSIZE),
-            fids: Arc::new(DashMap::new()),
-            attach_root: AtomicU64::new(0),
-            extensions: AtomicU8::new(0),
-        });
+        let session = Arc::new(Mutex::new(SessionState {
+            msize: DEFAULT_MSIZE,
+            ..Default::default()
+        }));
 
         Self {
             filesystem,
@@ -208,13 +237,100 @@ impl NinePHandler {
         self
     }
 
+    #[cfg(test)]
     pub fn handler_id(&self) -> u64 {
         self.handler_id
     }
 
-    /// Whether this connection negotiated `.zerofs3`.
-    pub fn op_id_enabled(&self) -> bool {
-        self.session.extensions.load(AtomicOrdering::Relaxed) >= 3
+    /// Session table used for atomic guard installation and retirement.
+    fn session_state(&self) -> MutexGuard<'_, SessionState> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn connected_session(&self) -> P9Result<MutexGuard<'_, SessionState>> {
+        let guard = self.session_state();
+        if guard.disconnected {
+            Err(FsError::StaleHandle.into())
+        } else {
+            Ok(guard)
+        }
+    }
+
+    /// Publish an opened compound-operation fid under the session lock.
+    fn install_open_fid(
+        &self,
+        state: &mut SessionState,
+        newfid: u32,
+        replace_fid: u32,
+        fid: Fid,
+    ) -> P9Result<()> {
+        let inode_id = fid.inode_id;
+        let slot = match state.fids.entry(newfid) {
+            Entry::Vacant(entry) => entry.insert(FidSlot::unopened(fid)),
+            Entry::Occupied(_) if newfid != replace_fid => return Err(P9Error::FidInUse),
+            Entry::Occupied(entry) if entry.get().fid.opened => {
+                return Err(P9Error::FidAlreadyOpen);
+            }
+            Entry::Occupied(entry) => {
+                let slot = entry.into_mut();
+                slot.fid = fid;
+                slot
+            }
+        };
+        slot.handle = Some(self.filesystem.new_open_handle(inode_id));
+        Ok(())
+    }
+
+    fn install_walk_fid(&self, source: u32, newfid: u32, fid: Fid) -> P9Result<()> {
+        let replaced = {
+            let mut state = self.session_state();
+            if source != newfid && state.fids.contains_key(&newfid) {
+                return Err(P9Error::FidInUse);
+            }
+            state.fids.insert(newfid, FidSlot::unopened(fid))
+        };
+        drop(replaced);
+        Ok(())
+    }
+
+    /// Whether this connection negotiated the private ZeroFS dialect.
+    pub fn zerofs_protocol_enabled(&self) -> bool {
+        self.session_state().zerofs_protocol
+    }
+
+    /// Reserve a valid FIRST mutation before task detachment.
+    pub(crate) fn try_reserve_received_first(
+        &self,
+        op_id: crate::dedup::OpId,
+        op_flags: u8,
+        type_byte: u8,
+    ) -> Option<crate::dedup::DedupGuard> {
+        if !self.zerofs_protocol_enabled()
+            || !P9Message::carries_op_id(type_byte)
+            || op_flags & !ninep_proto::P9_OP_KNOWN_FLAGS != 0
+            || op_flags & ninep_proto::P9_OP_FLAG_RETRY != 0
+            || !self.filesystem.db.permits_successful_response()
+        {
+            return None;
+        }
+        self.filesystem.dedup.reserve_initial(op_id)
+    }
+
+    /// Commit terminal no-op and error outcomes to the mutation ledger.
+    async fn ensure_terminal_dedup_result(
+        &self,
+        op_id: crate::dedup::OpId,
+        result: crate::dedup::DedupResult,
+    ) -> P9Result<()> {
+        if !crate::dedup::has_op_id(&op_id) || self.filesystem.dedup.get(&op_id).is_some() {
+            return Ok(());
+        }
+        let mut txn = self.filesystem.db.new_transaction()?;
+        txn.set_dedup_result(op_id, result);
+        self.filesystem.write_coordinator.commit(txn).await?;
+        Ok(())
     }
 
     /// Returns the effective GID for a create-type operation. When a credential
@@ -235,11 +351,15 @@ impl NinePHandler {
     }
 
     fn get_fid(&self, fid: u32) -> P9Result<Fid> {
-        self.session
+        self.session_state()
             .fids
             .get(&fid)
             .ok_or(P9Error::BadFid)
             .map(|s| s.fid.clone())
+    }
+
+    fn clamp_count(&self, count: u32, header: u32) -> u32 {
+        count.min(self.session_state().msize.saturating_sub(header))
     }
 
     /// Op-id-less dispatch for the unit tests; production passes the frame op-id.
@@ -248,29 +368,143 @@ impl NinePHandler {
         self.handle_message_with_op_id(tag, [0u8; 16], msg).await
     }
 
-    /// Dispatch a request, threading a client idempotency op-id (all-zero = none)
-    /// into the op so a non-idempotent mutation is deduplicated on retry.
+    /// Test dispatch using initial-attempt framing.
+    #[cfg(test)]
     pub async fn handle_message_with_op_id(
         &self,
         tag: u16,
         op_id: crate::dedup::OpId,
         msg: Message,
     ) -> P9Message {
-        // Leader gate: a fenced/lapsed leader answers every op (bar Tversion) with
-        // the distinct P9_ENOTLEADER signal so the client re-routes. Checked here
-        // because the per-op db gate's error is flattened to EIO; that gate stays
-        // the safety net for a lapse racing an already-dispatched op.
-        if !matches!(msg, Message::Tversion(_)) && !self.filesystem.db.lease_is_valid() {
+        self.handle_message_with_op_envelope(tag, op_id, 0, msg)
+            .await
+    }
+
+    /// Dispatch a request with its idempotency envelope.
+    #[cfg(test)]
+    async fn handle_message_with_op_envelope(
+        &self,
+        tag: u16,
+        op_id: crate::dedup::OpId,
+        op_flags: u8,
+        msg: Message,
+    ) -> P9Message {
+        self.handle_message_with_op_envelope_origin(tag, op_id, op_flags, 0, msg)
+            .await
+    }
+
+    pub async fn handle_message_with_op_envelope_origin(
+        &self,
+        tag: u16,
+        op_id: crate::dedup::OpId,
+        op_flags: u8,
+        op_origin_epoch: u64,
+        msg: Message,
+    ) -> P9Message {
+        self.handle_message_with_received_admission(
+            tag,
+            op_id,
+            op_flags,
+            op_origin_epoch,
+            msg,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch using a FIRST reservation created by the connection reader.
+    pub(crate) async fn handle_message_with_received_admission(
+        &self,
+        tag: u16,
+        op_id: crate::dedup::OpId,
+        op_flags: u8,
+        op_origin_epoch: u64,
+        msg: Message,
+        received_guard: Option<crate::dedup::DedupGuard>,
+    ) -> P9Message {
+        let zerofs_protocol = self.zerofs_protocol_enabled();
+        let private_request = msg.is_zerofs_private_request();
+        let has_private_envelope =
+            crate::dedup::has_op_id(&op_id) || op_flags != 0 || op_origin_epoch != 0;
+        if !zerofs_protocol && (private_request || has_private_envelope) {
             return P9Message::new(
                 tag,
                 Message::Rlerror(Rlerror {
-                    ecode: ninep_proto::P9_ENOTLEADER,
+                    ecode: P9Error::NotSupported.to_errno(),
                 }),
             );
         }
-        // Single-flight: holding the op-id's slot makes a concurrent retry wait
-        // then dedup instead of applying twice. No-op for an absent op-id.
-        let _single_flight = self.filesystem.dedup.begin(op_id).await;
+
+        if op_flags & !ninep_proto::P9_OP_KNOWN_FLAGS != 0 {
+            return P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: ninep_proto::P9_EOPIDSTALE,
+                }),
+            );
+        }
+        if has_private_envelope && !msg.is_mutation() {
+            // Operation envelopes are valid only on mutation messages.
+            return P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: ninep_proto::P9_EOPIDSTALE,
+                }),
+            );
+        }
+        let is_retry = op_flags & ninep_proto::P9_OP_FLAG_RETRY != 0;
+
+        // Pre-dispatch rejection is CLEAN; loss during dispatch is ambiguous.
+        let lease_gated = !matches!(msg, Message::Tversion(_));
+        if lease_gated && !self.filesystem.db.permits_successful_response() {
+            return P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: ninep_proto::P9_ENOTLEADER_CLEAN,
+                }),
+            );
+        }
+        // Dedup admission precedes mutation dispatch.
+        let _dedup_guard = if let Some(guard) = received_guard {
+            Some(guard)
+        } else {
+            match self
+                .filesystem
+                .dedup
+                .begin_attempt_from_origin(op_id, is_retry, op_origin_epoch)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    // Authority loss while waiting for admission remains pre-dispatch.
+                    if lease_gated && !self.filesystem.db.permits_successful_response() {
+                        return P9Message::new(
+                            tag,
+                            Message::Rlerror(Rlerror {
+                                ecode: ninep_proto::P9_ENOTLEADER_CLEAN,
+                            }),
+                        );
+                    }
+                    let ecode = match error {
+                        crate::dedup::DedupAdmissionError::UnseenRetry => {
+                            ninep_proto::P9_EOPIDSTALE
+                        }
+                    };
+                    return P9Message::new(tag, Message::Rlerror(Rlerror { ecode }));
+                }
+            }
+        };
+
+        // Replay retained protocol errors before operation-specific dispatch.
+        if let Some(crate::dedup::DedupResult::Error { errno }) = self.filesystem.dedup.get(&op_id)
+        {
+            let ecode = if !lease_gated || self.filesystem.db.permits_successful_response() {
+                errno
+            } else {
+                ninep_proto::P9_ENOTLEADER
+            };
+            return P9Message::new(tag, Message::Rlerror(Rlerror { ecode }));
+        }
         let result = match msg {
             Message::Tversion(tv) => self.version(tv).await,
             Message::Tattach(ta) => self.attach(ta).await,
@@ -278,12 +512,12 @@ impl NinePHandler {
             Message::Tlopen(tl) => self.lopen(tl).await,
             Message::Tlcreate(tc) => self.lcreate(tc, op_id).await,
             Message::Tread(tr) => self.read(tr).await,
-            Message::Twrite(tw) => self.write(tw).await,
+            Message::Twrite(tw) => self.write(tw, op_id).await,
             Message::Tclunk(tc) => Ok(self.clunk(tc).await),
             Message::Treaddir(tr) => self.readdir(tr).await,
             Message::Tgetattr(tg) => self.getattr(tg).await,
-            Message::Tsetattr(ts) => self.setattr(ts).await,
-            Message::Tfallocate(tf) => self.fallocate(tf).await,
+            Message::Tsetattr(ts) => self.setattr(ts, op_id).await,
+            Message::Tfallocate(tf) => self.fallocate(tf, op_id).await,
             Message::Tmkdir(tm) => self.mkdir(tm, op_id).await,
             Message::Tsymlink(ts) => self.symlink(ts, op_id).await,
             Message::Tmknod(tm) => self.mknod(tm, op_id).await,
@@ -310,14 +544,54 @@ impl NinePHandler {
             Message::Tsymlinkattr(ts) => self.symlink_attr(ts, op_id).await,
             Message::Tmknodattr(tm) => self.mknod_attr(tm, op_id).await,
             Message::Tlinkattr(tl) => self.link_attr(tl, op_id).await,
-            Message::Tsetattrattr(ts) => self.setattr_attr(ts).await,
+            Message::Tsetattrattr(ts) => self.setattr_attr(ts, op_id).await,
             _ => Err(P9Error::NotImplemented),
         };
 
+        // Publish terminal outcomes before releasing single-flight ownership.
+        let result = match result {
+            Ok(body) => match self
+                .ensure_terminal_dedup_result(op_id, crate::dedup::DedupResult::Applied)
+                .await
+            {
+                Ok(()) => Ok(body),
+                Err(error) => Err(error),
+            },
+            Err(error)
+                if self.filesystem.db.permits_successful_response()
+                    && is_terminal_dedup_error(error) =>
+            {
+                match self
+                    .ensure_terminal_dedup_result(
+                        op_id,
+                        crate::dedup::DedupResult::Error {
+                            errno: error.to_errno(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(commit_error) => Err(commit_error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+
         match result {
-            Ok(body) => P9Message::new(tag, body),
-            Err(error) => {
-                let ecode = post_dispatch_errno(error, self.filesystem.db.lease_is_valid());
+            Ok(body) if !lease_gated || self.filesystem.db.permits_successful_response() => {
+                P9Message::new(tag, body)
+            }
+            // Authority loss after dispatch suppresses successful responses.
+            Ok(_) => P9Message::new(
+                tag,
+                Message::Rlerror(Rlerror {
+                    ecode: ninep_proto::P9_ENOTLEADER,
+                }),
+            ),
+            Err(e) => {
+                // CLEAN requires proof that neither replica applied the batch.
+                let ecode =
+                    post_dispatch_errno(e, self.filesystem.db.permits_successful_response());
                 P9Message::new(tag, Message::Rlerror(Rlerror { ecode }))
             }
         }
@@ -335,13 +609,17 @@ impl NinePHandler {
         // the fids releases their handle counts (reclaiming any now-last
         // open-unlinked inode) and their locks; the explicit lock sweep is a
         // safety net in case some path ever leaves a lock without a guard.
-        self.close_all_open_handles();
+        let fids = {
+            let mut state = self.session_state();
+            state.zerofs_protocol = false;
+            std::mem::take(&mut state.fids)
+        };
+        drop(fids);
         self.lock_manager.release_session_locks(self.handler_id);
-        self.session.attach_root.store(0, AtomicOrdering::Relaxed);
 
-        if !version_str.contains("9P2000.L") {
-            // We only support 9P2000.L
-            debug!("Client doesn't support 9P2000.L, returning unknown");
+        let requested = version_str.as_bytes();
+        if requested != VERSION_9P2000L && requested != VERSION_9P2000L_ZEROFS {
+            debug!("Client requested an unsupported 9P dialect, returning unknown");
             return Ok(Message::Rversion(Rversion {
                 msize: tv.msize,
                 version: P9String::new(b"unknown".to_vec()),
@@ -349,38 +627,14 @@ impl NinePHandler {
         }
 
         let msize = tv.msize.min(P9_MAX_MSIZE);
-        self.session.msize.store(msize, AtomicOrdering::Relaxed);
-
-        // Advertise the highest ZeroFS extension level the client asked for.
-        // v9fs proposes plain `9P2000.L`, so it gets the plain reply and the
-        // extension handlers are not used. An old client proposing `.zerofs` gets
-        // `.zerofs` back and never sends the compound messages.
-        // The extension level describes protocol capabilities. `ignore_fsync`
-        // deliberately weakens fsync semantics but does not hide later protocol
-        // features from a client whose administrator chose that tradeoff.
-        let (version, extensions) = if version_str.contains(".zerofs6") {
-            (VERSION_9P2000L_ZEROFS6, 6)
-        } else if version_str.contains(".zerofs5") {
-            (VERSION_9P2000L_ZEROFS5, 5)
-        } else if version_str.contains(".zerofs4") {
-            (VERSION_9P2000L_ZEROFS4, 4)
-        } else if version_str.contains(".zerofs3") {
-            (VERSION_9P2000L_ZEROFS3, 3)
-        } else if version_str.contains(".zerofs2") {
-            (VERSION_9P2000L_ZEROFS2, 2)
-        } else if version_str.contains(".zerofs") {
-            (VERSION_9P2000L_ZEROFS, 1)
-        } else {
-            (VERSION_9P2000L, 0)
-        };
-
-        self.session
-            .extensions
-            .store(extensions, AtomicOrdering::Relaxed);
+        let zerofs_protocol = requested == VERSION_9P2000L_ZEROFS;
+        let mut state = self.session_state();
+        state.msize = msize;
+        state.zerofs_protocol = zerofs_protocol;
 
         Ok(Message::Rversion(Rversion {
             msize,
-            version: P9String::new(version.to_vec()),
+            version: P9String::new(requested.to_vec()),
         }))
     }
 
@@ -430,7 +684,7 @@ impl NinePHandler {
 
         let creds = self.creds_for(ta.n_uname, username);
 
-        if self.session.fids.contains_key(&ta.fid) {
+        if self.session_state().fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
         }
 
@@ -457,10 +711,11 @@ impl NinePHandler {
 
         let qid = inode_to_qid(&root_inode, root_id);
 
-        self.session
-            .attach_root
-            .store(root_id, AtomicOrdering::Relaxed);
-        self.session.fids.insert(
+        let mut state = self.session_state();
+        if state.fids.contains_key(&ta.fid) {
+            return Err(P9Error::FidInUse);
+        }
+        state.fids.insert(
             ta.fid,
             FidSlot::unopened(Fid {
                 // The fid's path stays absolute (rename resolves it from
@@ -477,51 +732,74 @@ impl NinePHandler {
                 creds,
             }),
         );
-
         Ok(Message::Rattach(Rattach { qid }))
     }
 
-    /// Bind a fresh fid to an existing inode by id, for a client recovering its
-    /// session after a reconnect. `ENOENT` if the inode is gone (deleted during
-    /// the outage), which the client takes as "this fid is gone".
+    /// Bind a replay fid to a linked inode by ID.
     async fn rebind(&self, tr: Trebind) -> P9Result<Message> {
+        let username = tr.uname.as_str().map_err(|e| {
+            debug!("Invalid rebind username encoding: {:?}", e);
+            P9Error::InvalidEncoding
+        })?;
+        if tr.flags & !P9_REBIND_KNOWN_FLAGS != 0
+            || tr.flags & P9_REBIND_OPENED != 0 && tr.flags & P9_REBIND_REPLAY == 0
+        {
+            return Err(P9Error::InvalidArgument);
+        }
+        let replay = tr.flags & P9_REBIND_REPLAY != 0;
+        let opened = tr.flags & P9_REBIND_OPENED != 0;
+
         // Like attach/walk, refuse to clobber a fid that's already in use.
-        if self.session.fids.contains_key(&tr.fid) {
+        if self.session_state().fids.contains_key(&tr.fid) {
             return Err(P9Error::FidInUse);
         }
+        // The inode lock orders validation and fid installation against unlink.
+        let _inode_guard = self.filesystem.lock_manager.acquire(tr.inode_id).await;
         let inode = self.filesystem.inode_store.get(tr.inode_id).await?;
 
-        // On an aname-rooted session, only inodes still under the attach
-        // subtree may be rebound: walk the parent chain up to the attach root.
-        // Best-effort hygiene, not a security boundary (aname is client-chosen):
-        // a hardlinked file has no parent chain (`parent()` is `None`) and is
-        // refused here even if one of its links lives inside the subtree.
-        let attach_root = self.session.attach_root.load(AtomicOrdering::Relaxed);
-        if attach_root != 0 {
-            let mut current_id = tr.inode_id;
-            let mut current = inode.clone();
-            let mut hops = 0u32;
-            while current_id != attach_root {
-                if hops >= MAX_ANCESTOR_HOPS {
-                    // The chain is implausibly long or being ping-ponged by a
-                    // concurrent rename workload: deny (the safe direction)
-                    // rather than spin.
-                    return Err(P9Error::Fs(FsError::PermissionDenied));
+        let root_inode = tr.root_inode;
+        let establishing_root = tr.inode_id == root_inode;
+
+        // Replay does not restore connection-local open-unlinked handles.
+        if inode.nlink() == 0 {
+            return Err(P9Error::Fs(if replay {
+                FsError::StaleHandle
+            } else {
+                FsError::PermissionDenied
+            }));
+        }
+
+        if establishing_root {
+            // Attach-root replay uses stable directory identity.
+            if !matches!(inode, Inode::Directory(_)) {
+                return Err(P9Error::NotADirectory);
+            }
+        } else {
+            // Manual rebind requires current ancestry below the attach root.
+            // Automatic replay may restore a previously recorded linked fid.
+            if root_inode != 0 && !replay {
+                let mut current_id = tr.inode_id;
+                let mut current = inode.clone();
+                let mut hops = 0u32;
+                while current_id != root_inode {
+                    if hops >= MAX_ANCESTOR_HOPS {
+                        // Bound ancestry traversal under concurrent rename.
+                        return Err(P9Error::Fs(FsError::PermissionDenied));
+                    }
+                    hops += 1;
+                    if current_id == 0 {
+                        // The inode is outside the attach subtree.
+                        return Err(P9Error::Fs(FsError::PermissionDenied));
+                    }
+                    current_id = current
+                        .parent()
+                        .ok_or(P9Error::Fs(FsError::PermissionDenied))?;
+                    current = self.filesystem.inode_store.get(current_id).await?;
                 }
-                hops += 1;
-                if current_id == 0 {
-                    // Reached the filesystem root without passing the attach
-                    // root: the inode is outside the subtree.
-                    return Err(P9Error::Fs(FsError::PermissionDenied));
-                }
-                current_id = current
-                    .parent()
-                    .ok_or(P9Error::Fs(FsError::PermissionDenied))?;
-                current = self.filesystem.inode_store.get(current_id).await?;
             }
         }
 
-        let creds = self.creds_for(tr.n_uname, "");
+        let creds = self.creds_for(tr.n_uname, username);
         let path = self
             .filesystem
             .inode_store
@@ -532,19 +810,29 @@ impl NinePHandler {
             .collect();
         let qid = inode_to_qid(&inode, tr.inode_id);
 
-        self.session.fids.insert(
+        // Opened replay installs one provisional pin under the inode lock;
+        // `Tlopen` consumes that pin.
+        let mut state = self.connected_session()?;
+        if state.fids.contains_key(&tr.fid) {
+            return Err(P9Error::FidInUse);
+        }
+        let handle = opened.then(|| self.filesystem.new_open_handle(tr.inode_id));
+        state.fids.insert(
             tr.fid,
-            FidSlot::unopened(Fid {
-                path,
-                inode_id: tr.inode_id,
-                root: attach_root,
-                qid: qid.clone(),
-                opened: false,
-                mode: None,
-                creds,
-            }),
+            FidSlot {
+                fid: Fid {
+                    path,
+                    inode_id: tr.inode_id,
+                    root: root_inode,
+                    qid: qid.clone(),
+                    opened: false,
+                    mode: None,
+                    creds,
+                },
+                handle,
+                lock_guard: None,
+            },
         );
-
         Ok(Message::Rrebind(Rrebind { qid }))
     }
 
@@ -661,11 +949,6 @@ impl NinePHandler {
 
         // Only create newfid if the walk fully succeeded
         if tw.newfid != tw.fid || !tw.wnames.is_empty() {
-            // Check if newfid is already in use
-            if tw.newfid != tw.fid && self.session.fids.contains_key(&tw.newfid) {
-                return Err(P9Error::FidInUse);
-            }
-
             let new_fid = Fid {
                 path: current_path,
                 inode_id: current_id,
@@ -675,11 +958,8 @@ impl NinePHandler {
                 mode: None,
                 creds: src_fid.creds, // Inherit credentials from source fid
             };
-            // An in-place walk (newfid == fid) overwrites the slot; if it held an
-            // open handle, the old guard drops here and releases the count.
-            self.session
-                .fids
-                .insert(tw.newfid, FidSlot::unopened(new_fid));
+            // In-place replacement drops the old slot's resource guards.
+            self.install_walk_fid(tw.fid, tw.newfid, new_fid)?;
         }
 
         Ok(Message::Rwalk(Rwalk {
@@ -711,12 +991,15 @@ impl NinePHandler {
             last_inode = Some(child_inode);
         }
 
-        if tw.newfid != tw.fid && self.session.fids.contains_key(&tw.newfid) {
-            return Err(P9Error::FidInUse);
-        }
-        self.session.fids.insert(
+        // Complete fallible reads before publishing `newfid`.
+        let stat_inode = match last_inode {
+            Some(inode) => inode,
+            None => self.filesystem.inode_store.get(current_id).await?,
+        };
+        self.install_walk_fid(
+            tw.fid,
             tw.newfid,
-            FidSlot::unopened(Fid {
+            Fid {
                 path: current_path,
                 inode_id: current_id,
                 root: src_fid.root,
@@ -724,15 +1007,9 @@ impl NinePHandler {
                 opened: false,
                 mode: None,
                 creds: src_fid.creds,
-            }),
-        );
+            },
+        )?;
 
-        // For a named walk the final inode is already in hand; an empty walk
-        // (clone) returns the source inode's stat.
-        let stat_inode = match last_inode {
-            Some(inode) => inode,
-            None => self.filesystem.inode_store.get(current_id).await?,
-        };
         Ok(Message::Rwalkgetattr(Rwalkgetattr {
             nwqid: wqids.len() as u16,
             wqids,
@@ -761,23 +1038,20 @@ impl NinePHandler {
             let _guard = self.filesystem.lock_manager.acquire(inode_id).await;
             let inode = self.filesystem.inode_store.get(inode_id).await?;
             let qid = inode_to_qid(&inode, inode_id);
-            match self.session.fids.get_mut(&tl.fid) {
-                Some(mut slot) => {
-                    // The opened check at the top read a clone, so two concurrent
-                    // Tlopen on this fid can both reach here; re-check under the
-                    // shard lock or both install a guard and the lone clunk
-                    // under-counts.
+            let mut state = self.connected_session()?;
+            match state.fids.get_mut(&tl.fid) {
+                Some(slot) => {
+                    // Serialize racing opens under the session lock.
                     if slot.fid.opened {
                         return Err(P9Error::FidAlreadyOpen);
                     }
                     slot.fid.qid = qid;
                     slot.fid.opened = true;
                     slot.fid.mode = Some(tl.flags);
-                    // Install the guard while still holding the shard (via `slot`)
-                    // so the count and the opened flag land together: a clunk or
-                    // close_all blocks on the shard and never sees an opened fid
-                    // that isn't yet counted.
-                    slot.handle = Some(self.filesystem.new_open_handle(inode_id));
+                    // Publish open state and its guard atomically.
+                    if slot.handle.is_none() {
+                        slot.handle = Some(self.filesystem.new_open_handle(inode_id));
+                    }
                 }
                 None => return Err(P9Error::BadFid),
             }
@@ -799,17 +1073,16 @@ impl NinePHandler {
     async fn lopenat(&self, tl: Tlopenat) -> P9Result<Message> {
         let src_fid = self.get_fid(tl.fid)?;
 
-        if tl.newfid != tl.fid && self.session.fids.contains_key(&tl.newfid) {
+        if tl.newfid != tl.fid && self.session_state().fids.contains_key(&tl.newfid) {
             return Err(P9Error::FidInUse);
         }
 
-        // Liveness check + handle increment under the inode lock (see lopen).
-        // The new fid is inserted as opened in the same critical section so the
-        // count and the opened fid become visible together.
+        // The inode lock orders fid publication against unlink.
         let inode = {
             let _guard = self.filesystem.lock_manager.acquire(src_fid.inode_id).await;
             let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);
+            let mut state = self.connected_session()?;
             let new_fid = Fid {
                 path: src_fid.path.clone(),
                 inode_id: src_fid.inode_id,
@@ -819,34 +1092,7 @@ impl NinePHandler {
                 mode: Some(tl.flags),
                 creds: src_fid.creds,
             };
-            // Install the guard under the entry's shard lock (atomic vs clunk,
-            // as in lopen), and only after the error checks so a rejected open
-            // doesn't transiently bump the count.
-            match self.session.fids.entry(tl.newfid) {
-                Entry::Vacant(v) => {
-                    let handle = self.filesystem.new_open_handle(src_fid.inode_id);
-                    v.insert(FidSlot {
-                        fid: new_fid,
-                        handle: Some(handle),
-                        lock_guard: None,
-                    });
-                }
-                Entry::Occupied(mut o) => {
-                    if tl.newfid != tl.fid {
-                        return Err(P9Error::FidInUse);
-                    }
-                    if o.get().fid.opened {
-                        return Err(P9Error::FidAlreadyOpen);
-                    }
-                    // In-place open: replace the fid data and add the handle
-                    // guard, but keep any lock_guard — a lock taken while the fid
-                    // was unopened must survive being opened.
-                    let handle = self.filesystem.new_open_handle(src_fid.inode_id);
-                    let slot = o.get_mut();
-                    slot.fid = new_fid;
-                    slot.handle = Some(handle);
-                }
-            }
+            self.install_open_fid(&mut state, tl.newfid, tl.fid, new_fid)?;
             inode
         };
 
@@ -879,11 +1125,9 @@ impl NinePHandler {
         // means the read reached end of file, i.e. (offset 0) the whole file fit in
         // `count`, which is what lets the client serve the file's reads from `data`.
         let new_fid = self.get_fid(tl.newfid)?;
-        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
         // Clamp with the Rlopenatread overhead (not P9_IOHDRSZ): its reply carries an
         // extra qid+iounit+eof, so the whole `29 + count` frame must fit the msize.
-        // At a small msize this is what keeps the reply from overrunning it.
-        let count = tl.count.min(msize.saturating_sub(P9_RLOPENATREAD_HDR));
+        let count = self.clamp_count(tl.count, P9_RLOPENATREAD_HDR);
         let auth = AuthContext::from(&new_fid.creds);
         let (data, eof) = match self
             .filesystem
@@ -904,22 +1148,37 @@ impl NinePHandler {
     }
 
     async fn clunk(&self, tc: Tclunk) -> Message {
-        if let Some((_, slot)) = self.session.fids.remove(&tc.fid) {
-            // Dropping the slot releases its handle count (enqueuing reclaim if it
-            // was the last) and its byte-range locks. `remove` returns the slot to
-            // exactly one caller, so a racing clunk/close_all can't double-release.
-            drop(slot);
-        }
+        let slot = self.session_state().fids.remove(&tc.fid);
+        // Release resources outside the session lock.
+        drop(slot);
         Message::Rclunk(Rclunk)
     }
 
-    /// Drop every fid in the session, releasing their handle counts and locks.
-    /// Used by Tversion (which implicitly clunks all fids) and by teardown.
-    pub fn close_all_open_handles(&self) {
-        // Each cleared slot's guards release on drop; `remove` vs this `clear` is
-        // still single-winner per fid, so no double-release. A fid an in-flight
-        // open inserts after the clear is released when the table itself drops.
-        self.session.fids.clear();
+    /// Implicitly clunk every fid, as required by Tversion.
+    #[cfg(test)]
+    fn close_all_open_handles(&self) {
+        let fids = std::mem::take(&mut self.session_state().fids);
+        drop(fids);
+    }
+
+    /// Retire resources while retaining fid metadata for received tasks.
+    pub fn close_for_disconnect(&self) {
+        let resources = {
+            let mut state = self.session_state();
+            if state.disconnected {
+                return;
+            }
+            state.disconnected = true;
+
+            state
+                .fids
+                .values_mut()
+                .map(|slot| (slot.handle.take(), slot.lock_guard.take()))
+                .collect::<Vec<_>>()
+        };
+        drop(resources);
+        // Release locks not represented by slot guards.
+        self.lock_manager.release_session_locks(self.handler_id);
     }
 
     /// At the attach root of an aname-rooted session, rewrite the synthesized
@@ -953,10 +1212,7 @@ impl NinePHandler {
             return Err(P9Error::FidNotOpen);
         }
 
-        // Clamp count to fit response within negotiated msize
-        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
-        let max_count = msize.saturating_sub(P9_IOHDRSZ);
-        let count = tr.count.min(max_count);
+        let count = self.clamp_count(tr.count, P9_IOHDRSZ);
 
         let auth = AuthContext::from(&fid_entry.creds);
 
@@ -1008,9 +1264,7 @@ impl NinePHandler {
             return Err(P9Error::FidNotOpen);
         }
 
-        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
-        let max_count = msize.saturating_sub(P9_IOHDRSZ);
-        let count = tr.count.min(max_count);
+        let count = self.clamp_count(tr.count, P9_IOHDRSZ);
 
         let auth = AuthContext::from(&fid_entry.creds);
         let mut result = self
@@ -1088,15 +1342,17 @@ impl NinePHandler {
 
         let qid = attrs_to_qid(&post_attr, child_id);
 
-        // Move the parent fid onto the new child and install its handle guard,
-        // under the child inode lock so the increment is ordered against a
-        // concurrent remove/rename of the just-created file (as in lopen).
+        // The child lock orders fid publication against unlink.
         {
             let _guard = self.filesystem.lock_manager.acquire(child_id).await;
-            let mut slot = self.session.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
-            // Re-check opened (the check above read a clone): a concurrent Tlcreate
-            // on this fid must not also install a guard. A child created by a loser
-            // is harmless — it has a name and nlink 1, like any other file.
+            match self.filesystem.inode_store.get(child_id).await {
+                Ok(_) => {}
+                Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
+                Err(error) => return Err(error.into()),
+            }
+            let mut state = self.connected_session()?;
+            let slot = state.fids.get_mut(&tc.fid).ok_or(P9Error::BadFid)?;
+            // Serialize racing creates under the session lock.
             if slot.fid.opened {
                 return Err(P9Error::FidAlreadyOpen);
             }
@@ -1105,8 +1361,6 @@ impl NinePHandler {
             slot.fid.qid = qid.clone();
             slot.fid.opened = true;
             slot.fid.mode = Some(tc.flags);
-            // Install the guard while `slot` (the shard lock) is still held, so
-            // the count and the opened fid are visible atomically (see lopen).
             slot.handle = Some(self.filesystem.new_open_handle(child_id));
         }
 
@@ -1122,7 +1376,7 @@ impl NinePHandler {
     async fn lcreateattr(&self, tc: Tlcreateattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let parent_fid = self.get_fid(tc.dfid)?;
 
-        if tc.newfid != tc.dfid && self.session.fids.contains_key(&tc.newfid) {
+        if tc.newfid != tc.dfid && self.session_state().fids.contains_key(&tc.newfid) {
             return Err(P9Error::FidInUse);
         }
 
@@ -1132,10 +1386,15 @@ impl NinePHandler {
 
         let mut path = parent_fid.path.clone();
         path.push(Bytes::from(tc.name.data));
-        // Insert the opened newfid and bump the child's open-handle count under
-        // the child inode lock (uniform with lopen/lopenat).
+        // The child lock orders fid publication against unlink.
         {
             let _guard = self.filesystem.lock_manager.acquire(child_id).await;
+            match self.filesystem.inode_store.get(child_id).await {
+                Ok(_) => {}
+                Err(FsError::NotFound) => return Err(FsError::StaleHandle.into()),
+                Err(error) => return Err(error.into()),
+            }
+            let mut state = self.connected_session()?;
             let new_fid = Fid {
                 path,
                 inode_id: child_id,
@@ -1145,33 +1404,7 @@ impl NinePHandler {
                 mode: Some(tc.flags),
                 creds: parent_fid.creds,
             };
-            // Atomic check-and-insert (see lopenat): single-winner so concurrent
-            // Tlcreateattr with the same newfid cannot double-count the handle.
-            // Install the guard under the entry's shard lock (see lopen).
-            match self.session.fids.entry(tc.newfid) {
-                Entry::Vacant(v) => {
-                    let handle = self.filesystem.new_open_handle(child_id);
-                    v.insert(FidSlot {
-                        fid: new_fid,
-                        handle: Some(handle),
-                        lock_guard: None,
-                    });
-                }
-                Entry::Occupied(mut o) => {
-                    if tc.newfid != tc.dfid {
-                        return Err(P9Error::FidInUse);
-                    }
-                    if o.get().fid.opened {
-                        return Err(P9Error::FidAlreadyOpen);
-                    }
-                    // In-place: update fid data + install the handle guard, but
-                    // PRESERVE any lock_guard (see lopenat).
-                    let handle = self.filesystem.new_open_handle(child_id);
-                    let slot = o.get_mut();
-                    slot.fid = new_fid;
-                    slot.handle = Some(handle);
-                }
-            }
+            self.install_open_fid(&mut state, tc.newfid, tc.dfid, new_fid)?;
         }
 
         Ok(Message::Rlcreateattr(Rlcreateattr {
@@ -1187,10 +1420,7 @@ impl NinePHandler {
             return Err(P9Error::FidNotOpen);
         }
 
-        // Clamp count to fit response within negotiated msize
-        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
-        let max_count = msize.saturating_sub(P9_IOHDRSZ);
-        let count = tr.count.min(max_count);
+        let count = self.clamp_count(tr.count, P9_IOHDRSZ);
 
         let auth = AuthContext::from(&fid_entry.creds);
 
@@ -1205,7 +1435,7 @@ impl NinePHandler {
         }))
     }
 
-    async fn write(&self, tw: Twrite) -> P9Result<Message> {
+    async fn write(&self, tw: Twrite, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let fid_entry = self.get_fid(tw.fid)?;
 
         if !fid_entry.opened {
@@ -1227,7 +1457,7 @@ impl NinePHandler {
         let data = Bytes::from(tw.data);
 
         self.filesystem
-            .write(&auth, fid_entry.inode_id, tw.offset, &data)
+            .write_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
             .await
             .inspect_err(|&e| {
                 debug!("write: failed with error: {:?}", e);
@@ -1250,18 +1480,18 @@ impl NinePHandler {
         }))
     }
 
-    async fn setattr(&self, ts: Tsetattr) -> P9Result<Message> {
+    async fn setattr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let fid_entry = self.get_fid(ts.fid)?;
         let attr = SetAttributes::from(&ts);
 
         self.filesystem
-            .setattr(&fid_entry.creds, fid_entry.inode_id, &attr)
+            .setattr_idempotent(&fid_entry.creds, fid_entry.inode_id, &attr, op_id)
             .await?;
         Ok(Message::Rsetattr(Rsetattr))
     }
 
-    async fn fallocate(&self, tf: Tfallocate) -> P9Result<Message> {
-        if self.session.extensions.load(AtomicOrdering::Relaxed) < 6 {
+    async fn fallocate(&self, tf: Tfallocate, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        if !self.zerofs_protocol_enabled() {
             return Err(P9Error::NotSupported);
         }
         let fid_entry = self.get_fid(tf.fid)?;
@@ -1276,21 +1506,27 @@ impl NinePHandler {
         };
 
         let auth = AuthContext::from(&fid_entry.creds);
-        self.filesystem
-            .fallocate(&auth, fid_entry.inode_id, tf.offset, tf.length, mode)
-            .await?;
+        if crate::dedup::has_op_id(&op_id) {
+            self.filesystem
+                .fallocate_idempotent(&auth, fid_entry.inode_id, tf.offset, tf.length, mode, op_id)
+                .await?;
+        } else {
+            self.filesystem
+                .fallocate(&auth, fid_entry.inode_id, tf.offset, tf.length, mode)
+                .await?;
+        }
         Ok(Message::Rfallocate(Rfallocate))
     }
 
     // ZeroFS fast path: Tsetattr whose reply carries the post-op stat (which the
     // filesystem computes anyway), sparing the client its follow-up Tgetattr.
-    async fn setattr_attr(&self, ts: Tsetattr) -> P9Result<Message> {
+    async fn setattr_attr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let fid_entry = self.get_fid(ts.fid)?;
         let attr = SetAttributes::from(&ts);
 
         let post_attr = self
             .filesystem
-            .setattr(&fid_entry.creds, fid_entry.inode_id, &attr)
+            .setattr_idempotent(&fid_entry.creds, fid_entry.inode_id, &attr, op_id)
             .await?;
         Ok(Message::Rsetattrattr(Rsetattrattr {
             stat: attrs_to_stat(&post_attr, fid_entry.inode_id),
@@ -1459,9 +1695,12 @@ impl NinePHandler {
         }
     }
 
-    /// The body of Tlink, returning the linked inode's id. Shared by Tlink and
-    /// Tlinkattr.
-    async fn make_link(&self, tl: &Tlink, op_id: crate::dedup::OpId) -> P9Result<InodeId> {
+    /// Shared `Tlink` implementation returning the retained post-link result.
+    async fn make_link(
+        &self,
+        tl: &Tlink,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<(InodeId, FileAttributes)> {
         let dir_fid = self.get_fid(tl.dfid)?;
         let file_fid = self.get_fid(tl.fid)?;
 
@@ -1477,11 +1716,10 @@ impl NinePHandler {
 
         let auth = AuthContext::from(&creds);
 
-        self.filesystem
+        Ok(self
+            .filesystem
             .link_idempotent(&auth, file_id, dir_id, name_bytes, op_id)
-            .await?;
-
-        Ok(file_id)
+            .await?)
     }
 
     async fn link(&self, tl: Tlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
@@ -1490,10 +1728,9 @@ impl NinePHandler {
     }
 
     async fn link_attr(&self, tl: Tlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let file_id = self.make_link(&tl, op_id).await?;
-        let inode = self.filesystem.inode_store.get(file_id).await?;
+        let (file_id, attrs) = self.make_link(&tl, op_id).await?;
         Ok(Message::Rlinkattr(Rlinkattr {
-            stat: inode_to_stat(&inode, file_id),
+            stat: attrs_to_stat(&attrs, file_id),
         }))
     }
 
@@ -1623,11 +1860,8 @@ impl NinePHandler {
         Ok(Message::Rfsync(Rfsync))
     }
 
-    /// `.zerofs4` durability-verified fsync. `tf.token` is the lineage token of the
-    /// client's oldest un-fsync'd write (`0` = nothing). The filesystem flushes, then
-    /// returns Ok only if that token is still the live durable lineage; otherwise it
-    /// returns `StaleHandle`, which becomes Rlerror(ESTALE), so the client surfaces the
-    /// lost write rather than receiving a false success.
+    /// Flush and verify the client's oldest unflushed-write lineage token.
+    /// Token zero means no unflushed write; a broken lineage returns `ESTALE`.
     async fn fsyncdur(&self, tf: Tfsyncdur) -> P9Result<Message> {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
@@ -1655,16 +1889,16 @@ impl NinePHandler {
         Ok(Message::Rfsync(Rfsync))
     }
 
-    /// `.zerofs4`: return this connection's durability lineage token, so the client
-    /// can tag its writes and present it on a later verified fsync.
+    /// Return the connection's durability lineage token.
     async fn getlineage(&self) -> P9Result<Message> {
         Ok(Message::Rgetlineage(Rgetlineage {
             token: self.filesystem.lineage_token,
+            writer_epoch: self.filesystem.serving_writer_epoch,
         }))
     }
 
     async fn statfs(&self, ts: Tstatfs) -> P9Result<Message> {
-        if !self.session.fids.contains_key(&ts.fid) {
+        if !self.session_state().fids.contains_key(&ts.fid) {
             return Err(P9Error::BadFid);
         }
 
@@ -1716,12 +1950,9 @@ impl NinePHandler {
             }));
         }
 
-        // Register the lock and install its guard while holding the fid's shard
-        // lock, so a concurrent clunk/close_all/Tversion can't drop the slot in
-        // between and strand a registered-but-unguarded lock — which, since
-        // Tversion doesn't sweep the manager, would leak for the whole connection.
-        // (Same atomic-install discipline as lopen's handle guard.)
-        let mut slot = match self.session.fids.get_mut(&tl.fid) {
+        // Publish lock state and its guard under the session lock.
+        let mut state = self.connected_session()?;
+        let slot = match state.fids.get_mut(&tl.fid) {
             Some(slot) => slot,
             None => return Err(P9Error::BadFid),
         };
@@ -1750,8 +1981,7 @@ impl NinePHandler {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD);
 
-        // Still under the shard lock. The guard releases by (session, fid) on any
-        // inode, so one per fid is enough.
+        // One guard releases all locks for this session and fid.
         if slot.lock_guard.is_none() {
             slot.lock_guard = Some(LockGuard::new(
                 self.lock_manager.clone(),
@@ -1932,9 +2162,242 @@ mod tests {
     use crate::fs::types::SetAttributes;
     use libc::O_RDONLY;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    async fn request(handler: &NinePHandler, tag: u16, body: Message) -> P9Message {
+        handler.handle_message(tag, body).await
+    }
+
+    async fn negotiate(handler: &NinePHandler, msize: u32, version: &[u8]) -> P9Message {
+        request(
+            handler,
+            0,
+            Message::Tversion(Tversion {
+                msize,
+                version: P9String::new(version.to_vec()),
+            }),
+        )
+        .await
+    }
+
+    async fn attach(
+        handler: &NinePHandler,
+        tag: u16,
+        fid: u32,
+        uname: &[u8],
+        aname: &[u8],
+        n_uname: u32,
+    ) -> P9Message {
+        request(
+            handler,
+            tag,
+            Message::Tattach(Tattach {
+                fid,
+                afid: u32::MAX,
+                uname: P9String::new(uname.to_vec()),
+                aname: P9String::new(aname.to_vec()),
+                n_uname,
+            }),
+        )
+        .await
+    }
+
+    async fn start_session(handler: &NinePHandler, msize: u32, version: &[u8], aname: &[u8]) {
+        assert!(matches!(
+            negotiate(handler, msize, version).await.body,
+            Message::Rversion(_)
+        ));
+        assert!(matches!(
+            attach(handler, 1, 1, b"test", aname, 1000).await.body,
+            Message::Rattach(_)
+        ));
+    }
+
+    async fn start_plain_session(handler: &NinePHandler) {
+        start_session(handler, DEFAULT_MSIZE, VERSION_9P2000L, b"").await;
+    }
+
+    async fn negotiate_zerofs(handler: &NinePHandler) {
+        let response = negotiate(handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS).await;
+        assert!(matches!(response.body, Message::Rversion(_)));
+        assert!(handler.zerofs_protocol_enabled());
+    }
+
+    async fn zerofs_handler(fs: &Arc<ZeroFS>) -> NinePHandler {
+        let handler = NinePHandler::new(Arc::clone(fs), Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+        handler
+    }
+
+    async fn rebind(
+        handler: &NinePHandler,
+        tag: u16,
+        fid: u32,
+        inode_id: u64,
+        root_inode: u64,
+        flags: u8,
+    ) -> Message {
+        request(
+            handler,
+            tag,
+            Message::Trebind(Trebind {
+                fid,
+                inode_id,
+                root_inode,
+                flags,
+                uname: P9String::new(Vec::new()),
+                n_uname: test_creds().uid,
+            }),
+        )
+        .await
+        .body
+    }
+
+    async fn walk_fid(
+        handler: &NinePHandler,
+        tag: u16,
+        fid: u32,
+        newfid: u32,
+        names: &[&[u8]],
+    ) -> P9Message {
+        request(
+            handler,
+            tag,
+            Message::Twalk(Twalk {
+                fid,
+                newfid,
+                nwname: names.len() as u16,
+                wnames: names
+                    .iter()
+                    .map(|name| P9String::new(name.to_vec()))
+                    .collect(),
+            }),
+        )
+        .await
+    }
+
+    async fn expect_walk(handler: &NinePHandler, tag: u16, fid: u32, newfid: u32, names: &[&[u8]]) {
+        assert!(matches!(
+            walk_fid(handler, tag, fid, newfid, names).await.body,
+            Message::Rwalk(_)
+        ));
+    }
+
+    async fn open_fid(handler: &NinePHandler, tag: u16, fid: u32, flags: u32) {
+        assert!(matches!(
+            request(handler, tag, Message::Tlopen(Tlopen { fid, flags }))
+                .await
+                .body,
+            Message::Rlopen(_)
+        ));
+    }
+
+    async fn create_file(handler: &NinePHandler, tag: u16, fid: u32, name: &[u8]) {
+        assert!(matches!(
+            request(
+                handler,
+                tag,
+                Message::Tlcreate(Tlcreate {
+                    fid,
+                    name: P9String::new(name.to_vec()),
+                    flags: 0x8002,
+                    mode: 0o644,
+                    gid: 1000,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlcreate(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_empty_walk_getattr_does_not_publish_newfid() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let mut stale = handler.get_fid(1).unwrap();
+        stale.inode_id = u64::MAX;
+        handler
+            .session_state()
+            .fids
+            .insert(2, FidSlot::unopened(stale));
+        assert!(
+            handler
+                .walk_getattr(Twalkgetattr {
+                    fid: 2,
+                    newfid: 3,
+                    nwname: 0,
+                    wnames: Vec::new(),
+                })
+                .await
+                .is_err()
+        );
+        assert!(!handler.session_state().fids.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn rebind_preserves_name_derived_credentials() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let attached = handler
+            .handle_message(
+                1,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"root".to_vec()),
+                    aname: P9String::new(Vec::new()),
+                    n_uname: u32::MAX,
+                }),
+            )
+            .await;
+        assert!(matches!(attached.body, Message::Rattach(_)));
+        assert_eq!(handler.get_fid(1).unwrap().creds.uid, 0);
+
+        let rebound = handler
+            .handle_message(
+                2,
+                Message::Trebind(Trebind {
+                    fid: 2,
+                    inode_id: 0,
+                    root_inode: 0,
+                    flags: P9_REBIND_REPLAY,
+                    uname: P9String::new(b"root".to_vec()),
+                    n_uname: u32::MAX,
+                }),
+            )
+            .await;
+        assert!(matches!(rebound.body, Message::Rrebind(_)));
+        assert_eq!(handler.get_fid(2).unwrap().creds.uid, 0);
+
+        let numeric = handler
+            .handle_message(
+                3,
+                Message::Trebind(Trebind {
+                    fid: 3,
+                    inode_id: 0,
+                    root_inode: 0,
+                    flags: P9_REBIND_REPLAY,
+                    uname: P9String::new(b"root".to_vec()),
+                    n_uname: 1234,
+                }),
+            )
+            .await;
+        assert!(matches!(numeric.body, Message::Rrebind(_)));
+        assert_eq!(handler.get_fid(3).unwrap().creds.uid, 1234);
+    }
 
     #[test]
-    fn post_dispatch_errors_preserve_only_proven_rejection() {
+    fn only_proven_unapplied_deposal_stays_clean_after_lease_loss() {
+        assert_eq!(
+            FsError::LeaderRejectedBeforeApply.to_errno(),
+            libc::EIO as u32,
+            "the private CLEAN code must not leak through generic errno consumers"
+        );
         assert_eq!(
             post_dispatch_errno(P9Error::Fs(FsError::LeaderRejectedBeforeApply), false),
             ninep_proto::P9_ENOTLEADER_CLEAN
@@ -1947,20 +2410,232 @@ mod tests {
             post_dispatch_errno(P9Error::Fs(FsError::IoError), true),
             libc::EIO as u32
         );
-        assert_eq!(
-            FsError::LeaderRejectedBeforeApply.to_errno(),
-            libc::EIO as u32,
-            "generic errno conversion remains EIO"
+    }
+
+    #[tokio::test]
+    async fn nonmutation_op_envelope_is_rejected_without_entering_dedup() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let response = handler
+            .handle_message_with_op_id(1, [0x5a; 16], Message::Tgetlineage(Tgetlineage))
+            .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror {
+                ecode: ninep_proto::P9_EOPIDSTALE
+            })
+        ));
+        assert!(
+            fs.dedup.is_empty(),
+            "a tagged read/control request must not occupy the mutation ledger"
         );
     }
 
     #[tokio::test]
-    async fn version_negotiation_gates_zerofs_extensions() {
+    async fn unseen_retry_is_rejected_before_mutation_dispatch() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let attach = handler
+            .handle_message(
+                0,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(b"/".to_vec()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+
+        let op_id = [0x5au8; 16];
+        let mkdir = Message::Tmkdir(Tmkdir {
+            dfid: 1,
+            name: P9String::new(b"once".to_vec()),
+            mode: 0o755,
+            gid: 1000,
+        });
+        let stale = handler
+            .handle_message_with_op_envelope(1, op_id, ninep_proto::P9_OP_FLAG_RETRY, mkdir.clone())
+            .await;
+        assert!(matches!(
+            stale.body,
+            Message::Rlerror(Rlerror {
+                ecode: ninep_proto::P9_EOPIDSTALE
+            })
+        ));
+
+        let initial = handler.handle_message_with_op_id(2, op_id, mkdir).await;
+        assert!(
+            matches!(initial.body, Message::Rmkdir(_)),
+            "the rejected resend must not have dispatched the mkdir: {:?}",
+            initial.body
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_bad_fid_remains_a_terminal_dedup_result() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let op_id = [0x64; 16];
+        let mkdir = Message::Tmkdir(Tmkdir {
+            dfid: 77,
+            name: P9String::new(b"must-stay-absent".to_vec()),
+            mode: 0o755,
+            gid: 1000,
+        });
+        let first = handler
+            .handle_message_with_op_id(1, op_id, mkdir.clone())
+            .await;
+        assert!(matches!(
+            first.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+        assert!(matches!(
+            fs.dedup.get(&op_id),
+            Some(crate::dedup::DedupResult::Error { errno })
+                if errno == libc::EBADF as u32
+        ));
+
+        // The fid becomes valid only after the recorded `EBADF` result.
+        let attach = handler
+            .handle_message(
+                2,
+                Message::Tattach(Tattach {
+                    fid: 77,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(b"/".to_vec()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+
+        let retry = handler
+            .handle_message_with_op_envelope(3, op_id, ninep_proto::P9_OP_FLAG_RETRY, mkdir)
+            .await;
+        assert!(matches!(
+            retry.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"must-stay-absent").await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn promotion_grace_accepts_only_predecessor_retry() {
+        let mut fs = ZeroFS::new_in_memory().await.unwrap();
+        let dedup = Arc::new(crate::dedup::DedupCache::new_for_test(
+            Duration::from_secs(60),
+            Instant::now,
+        ));
+        dedup.arm_promotion_retry_grace(7);
+        fs.dedup = dedup;
+        let handler = NinePHandler::new(Arc::new(fs), Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let attach = handler
+            .handle_message(
+                0,
+                Message::Tattach(Tattach {
+                    fid: 1,
+                    afid: u32::MAX,
+                    uname: P9String::new(b"test".to_vec()),
+                    aname: P9String::new(b"/".to_vec()),
+                    n_uname: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(attach.body, Message::Rattach(_)));
+
+        let mkdir = |name: &'static [u8]| {
+            Message::Tmkdir(Tmkdir {
+                dfid: 1,
+                name: P9String::new(name.to_vec()),
+                mode: 0o755,
+                gid: 1000,
+            })
+        };
+        let admitted = handler
+            .handle_message_with_op_envelope_origin(
+                1,
+                [0x71; 16],
+                ninep_proto::P9_OP_FLAG_RETRY,
+                7,
+                mkdir(b"direct-predecessor"),
+            )
+            .await;
+        assert!(
+            matches!(admitted.body, Message::Rmkdir(_)),
+            "the coverage-proven direct predecessor retry must dispatch: {:?}",
+            admitted.body
+        );
+
+        for (tag, op_id, origin, name) in [
+            (2, [0x72; 16], 0, b"zero-origin".as_slice()),
+            (3, [0x73; 16], 6, b"older-origin".as_slice()),
+            (4, [0x74; 16], 8, b"successor-origin".as_slice()),
+        ] {
+            let stale = handler
+                .handle_message_with_op_envelope_origin(
+                    tag,
+                    op_id,
+                    ninep_proto::P9_OP_FLAG_RETRY,
+                    origin,
+                    mkdir(name),
+                )
+                .await;
+            assert!(matches!(
+                stale.body,
+                Message::Rlerror(Rlerror {
+                    ecode: ninep_proto::P9_EOPIDSTALE
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_op_envelope_flags_fail_closed() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+        let response = handler
+            .handle_message_with_op_envelope(
+                1,
+                [0x33; 16],
+                !ninep_proto::P9_OP_KNOWN_FLAGS,
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(b"never".to_vec()),
+                    mode: 0o755,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror {
+                ecode: ninep_proto::P9_EOPIDSTALE
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_negotiation_accepts_only_exact_dialects() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
 
-        // A stock v9fs client proposes plain 9P2000.L and must get exactly that
-        // back — the server must never upgrade to a version it wasn't offered.
+        // Standard clients retain the requested 9P2000.L dialect.
         let resp = handler
             .handle_message(
                 0,
@@ -1974,9 +2649,32 @@ mod tests {
             Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L),
             other => panic!("expected Rversion, got {other:?}"),
         }
+        assert!(!handler.zerofs_protocol_enabled());
+        let private_response = handler
+            .handle_message(1, Message::Tgetlineage(Tgetlineage))
+            .await;
+        assert!(matches!(
+            private_response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EOPNOTSUPP as u32
+        ));
+        let enveloped_response = handler
+            .handle_message_with_op_id(
+                2,
+                [0x11; 16],
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(b"not-dispatched".to_vec()),
+                    mode: 0o755,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            enveloped_response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EOPNOTSUPP as u32
+        ));
 
-        // An older ZeroFS client opts in via the .zerofs suffix and gets exactly
-        // that echoed back not the newer .zerofs2 it doesn't understand.
+        // The private dialect enables all ZeroFS extensions together.
         let resp = handler
             .handle_message(
                 0,
@@ -1990,25 +2688,36 @@ mod tests {
             Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS),
             other => panic!("expected Rversion, got {other:?}"),
         }
+        assert!(handler.zerofs_protocol_enabled());
 
-        // A current client proposes .zerofs2 and gets the full extension set.
-        let resp = handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L_ZEROFS2.to_vec()),
-                }),
-            )
-            .await;
-        match resp.body {
-            Message::Rversion(rv) => assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS2),
-            other => panic!("expected Rversion, got {other:?}"),
+        // Version matching is exact; failed renegotiation clears private framing.
+        for unsupported in [
+            b"9P2000.L.zerofs".as_slice(),
+            b"9P2000.L.zerofs6".as_slice(),
+            b"9P2000.L.zerofs7".as_slice(),
+            b"9P2000.L.zerofs.extra".as_slice(),
+            b"9P2000.L.Z2".as_slice(),
+            b"prefix-9P2000.L.zerofs".as_slice(),
+        ] {
+            let resp = handler
+                .handle_message(
+                    0,
+                    Message::Tversion(Tversion {
+                        msize: DEFAULT_MSIZE,
+                        version: P9String::new(unsupported.to_vec()),
+                    }),
+                )
+                .await;
+            match resp.body {
+                Message::Rversion(rv) => assert_eq!(rv.version.data, b"unknown"),
+                other => panic!("expected Rversion, got {other:?}"),
+            }
+            assert!(!handler.zerofs_protocol_enabled());
         }
     }
 
     #[tokio::test]
-    async fn fallocate_is_negotiated_as_zerofs6() {
+    async fn zerofs_dialect_enables_fallocate_with_ignore_fsync() {
         let mut fs = ZeroFS::new_in_memory().await.unwrap();
         fs.ignore_fsync = true;
         let handler = NinePHandler::new(Arc::new(fs), Arc::new(FileLockManager::new()));
@@ -2017,20 +2726,16 @@ mod tests {
                 0,
                 Message::Tversion(Tversion {
                     msize: DEFAULT_MSIZE,
-                    version: P9String::new(b"9P2000.L.zerofs6.zerofs5.zerofs4.zerofs3".to_vec()),
+                    version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
                 }),
             )
             .await;
         match resp.body {
             Message::Rversion(rv) => {
-                assert_eq!(
-                    rv.version.data, VERSION_9P2000L_ZEROFS6,
-                    "ignore_fsync is an explicit opt-out, not a protocol-level cap"
-                );
-                assert_eq!(handler.session.extensions.load(AtomicOrdering::Relaxed), 6);
+                assert_eq!(rv.version.data, VERSION_9P2000L_ZEROFS);
                 assert!(
-                    handler.op_id_enabled(),
-                    "level 6 must include level 3 op-ids"
+                    handler.zerofs_protocol_enabled(),
+                    "ignore_fsync is an explicit opt-out, not a protocol-level cap"
                 );
             }
             other => panic!("expected Rversion, got {other:?}"),
@@ -2042,26 +2747,7 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs.clone(), lock_manager);
-
-        let version_msg = Message::Tversion(Tversion {
-            msize: DEFAULT_MSIZE,
-            version: P9String::new(VERSION_9P2000L.to_vec()),
-        });
-        handler.handle_message(0, version_msg).await;
-
-        let attach_msg = Message::Tattach(Tattach {
-            fid: 1,
-            afid: u32::MAX,
-            uname: P9String::new(b"test".to_vec()),
-            aname: P9String::new(Vec::new()),
-            n_uname: 1000,
-        });
-        let attach_resp = handler.handle_message(1, attach_msg).await;
-
-        match &attach_resp.body {
-            Message::Rattach(_) => {}
-            _ => panic!("Expected Rattach, got {:?}", attach_resp.body),
-        }
+        start_plain_session(&handler).await;
 
         let statfs_msg = Message::Tstatfs(Tstatfs { fid: 1 });
         let statfs_resp = handler.handle_message(2, statfs_msg).await;
@@ -2105,23 +2791,7 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs.clone(), lock_manager);
-
-        // Set up a session
-        let version_msg = Message::Tversion(Tversion {
-            msize: DEFAULT_MSIZE,
-            version: P9String::new(VERSION_9P2000L.to_vec()),
-        });
-        handler.handle_message(0, version_msg).await;
-
-        // Attach to the filesystem
-        let attach_msg = Message::Tattach(Tattach {
-            fid: 1,
-            afid: u32::MAX,
-            uname: P9String::new(b"test".to_vec()),
-            aname: P9String::new(Vec::new()),
-            n_uname: 1000,
-        });
-        handler.handle_message(1, attach_msg).await;
+        start_plain_session(&handler).await;
 
         // Get initial statfs
         let statfs_msg = Message::Tstatfs(Tstatfs { fid: 1 });
@@ -2132,24 +2802,8 @@ mod tests {
             _ => panic!("Expected Rstatfs"),
         };
 
-        // Walk to create a new fid for the file we'll create
-        let walk_msg = Message::Twalk(Twalk {
-            fid: 1,
-            newfid: 2,
-            nwname: 0,
-            wnames: vec![],
-        });
-        handler.handle_message(3, walk_msg).await;
-
-        // Create a file using the new fid
-        let create_msg = Message::Tlcreate(Tlcreate {
-            fid: 2,
-            name: P9String::new(b"test.txt".to_vec()),
-            flags: 0x8002, // O_RDWR | O_CREAT
-            mode: 0o644,
-            gid: 1000,
-        });
-        handler.handle_message(4, create_msg).await;
+        expect_walk(&handler, 3, 1, 2, &[]).await;
+        create_file(&handler, 4, 2, b"test.txt").await;
 
         // Write 10KB of data
         let data = vec![0u8; 10240];
@@ -2201,27 +2855,8 @@ mod tests {
 
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs, lock_manager);
-
-        let version_msg = Message::Tversion(Tversion {
-            msize: 8192,
-            version: P9String::new(b"9P2000.L".to_vec()),
-        });
-        handler.handle_message(0, version_msg).await;
-
-        let attach_msg = Message::Tattach(Tattach {
-            fid: 1,
-            afid: u32::MAX,
-            uname: P9String::new(b"test".to_vec()),
-            aname: P9String::new(b"/".to_vec()),
-            n_uname: 1000,
-        });
-        handler.handle_message(1, attach_msg).await;
-
-        let open_msg = Message::Tlopen(Tlopen {
-            fid: 1,
-            flags: O_RDONLY as u32,
-        });
-        handler.handle_message(200, open_msg).await;
+        start_session(&handler, 8192, VERSION_9P2000L, b"/").await;
+        open_fid(&handler, 200, 1, O_RDONLY as u32).await;
 
         let readdir_msg = Message::Treaddir(Treaddir {
             fid: 1,
@@ -2287,29 +2922,8 @@ mod tests {
 
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs, lock_manager);
-
-        // Initialize
-        let version_msg = Message::Tversion(Tversion {
-            msize: 8192,
-            version: P9String::new(b"9P2000.L".to_vec()),
-        });
-        handler.handle_message(0, version_msg).await;
-
-        let attach_msg = Message::Tattach(Tattach {
-            fid: 1,
-            afid: u32::MAX,
-            uname: P9String::new(b"test".to_vec()),
-            aname: P9String::new(b"/".to_vec()),
-            n_uname: 1000,
-        });
-        handler.handle_message(1, attach_msg).await;
-
-        // Open directory
-        let open_msg = Message::Tlopen(Tlopen {
-            fid: 1,
-            flags: O_RDONLY as u32,
-        });
-        handler.handle_message(20, open_msg).await;
+        start_session(&handler, 8192, VERSION_9P2000L, b"/").await;
+        open_fid(&handler, 20, 1, O_RDONLY as u32).await;
 
         // Read from offset 3
         let readdir_msg = Message::Treaddir(Treaddir {
@@ -2364,27 +2978,8 @@ mod tests {
 
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs, lock_manager);
-
-        let version_msg = Message::Tversion(Tversion {
-            msize: DEFAULT_MSIZE,
-            version: P9String::new(VERSION_9P2000L.to_vec()),
-        });
-        handler.handle_message(0, version_msg).await;
-
-        let attach_msg = Message::Tattach(Tattach {
-            fid: 1,
-            afid: u32::MAX,
-            uname: P9String::new(b"test".to_vec()),
-            aname: P9String::new(Vec::new()),
-            n_uname: 1000,
-        });
-        handler.handle_message(1, attach_msg).await;
-
-        let open_msg = Message::Tlopen(Tlopen {
-            fid: 1,
-            flags: O_RDONLY as u32,
-        });
-        handler.handle_message(2, open_msg).await;
+        start_plain_session(&handler).await;
+        open_fid(&handler, 2, 1, O_RDONLY as u32).await;
 
         let mut all_names = Vec::new();
         let mut seen_offsets = std::collections::HashSet::new();
@@ -2513,35 +3108,9 @@ mod tests {
 
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs, lock_manager);
-
-        let version_msg = Message::Tversion(Tversion {
-            msize: 8192,
-            version: P9String::new(b"9P2000.L".to_vec()),
-        });
-        handler.handle_message(0, version_msg).await;
-
-        let attach_msg = Message::Tattach(Tattach {
-            fid: 1,
-            afid: u32::MAX,
-            uname: P9String::new(b"test".to_vec()),
-            aname: P9String::new(b"/".to_vec()),
-            n_uname: 1000,
-        });
-        handler.handle_message(1, attach_msg).await;
-
-        let walk_msg = Message::Twalk(Twalk {
-            fid: 1,
-            newfid: 2,
-            nwname: 1,
-            wnames: vec![P9String::new(b"emptydir".to_vec())],
-        });
-        handler.handle_message(2, walk_msg).await;
-
-        let open_msg = Message::Tlopen(Tlopen {
-            fid: 2,
-            flags: O_RDONLY as u32,
-        });
-        handler.handle_message(3, open_msg).await;
+        start_session(&handler, 8192, VERSION_9P2000L, b"/").await;
+        expect_walk(&handler, 2, 1, 2, &[b"emptydir"]).await;
+        open_fid(&handler, 3, 2, O_RDONLY as u32).await;
 
         let readdir_msg = Message::Treaddir(Treaddir {
             fid: 2,
@@ -2603,55 +3172,9 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = NinePHandler::new(fs.clone(), lock_manager);
-
-        // Tversion + Tattach (root fid 1).
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"test".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
-
-        // Clone root onto fid 2 and create + open file "a" (fid 2 is now open).
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        let create_resp = handler
-            .handle_message(
-                3,
-                Message::Tlcreate(Tlcreate {
-                    fid: 2,
-                    name: P9String::new(b"a".to_vec()),
-                    flags: 0x8002, // O_RDWR | O_CREAT
-                    mode: 0o644,
-                    gid: 1000,
-                }),
-            )
-            .await;
-        assert!(matches!(create_resp.body, Message::Rlcreate(_)));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[]).await;
+        create_file(&handler, 3, 2, b"a").await;
 
         let data = b"open-unlink via 9p";
         handler
@@ -2666,11 +3189,9 @@ mod tests {
             )
             .await;
 
-        // The created file is now open on fid 2, holding an open handle.
         let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
         assert_eq!(fs.open_handle_count(file_id), 1);
 
-        // `rm a`: Tunlinkat from the root fid. Defers because fid 2 is open.
         let unlink_resp = handler
             .handle_message(
                 5,
@@ -2682,14 +3203,12 @@ mod tests {
             )
             .await;
         assert!(matches!(unlink_resp.body, Message::Runlinkat(_)));
-        // Name is gone; inode is kept alive for the open fid.
         assert!(matches!(
             fs.lookup(&test_creds(), 0, b"a").await,
             Err(FsError::NotFound)
         ));
         assert!(fs.inode_store.get(file_id).await.is_ok());
 
-        // `cat <&3`: Tread on the still-open fid 2 must succeed (the bug).
         let read_resp = handler
             .handle_message(
                 6,
@@ -2705,15 +3224,11 @@ mod tests {
             other => panic!("expected Rread with data, got {other:?}"),
         }
 
-        // Closing fd 3 (Tclunk fid 2) is the last handle: reclaim now.
         let clunk_resp = handler
             .handle_message(7, Message::Tclunk(Tclunk { fid: 2 }))
             .await;
         assert!(matches!(clunk_resp.body, Message::Rclunk(_)));
-        // The clunk dropped the fid slot, whose RAII guard released the last
-        // handle (count 0) and enqueued the inode for the reclaim drainer. This
-        // fs has no drainer running, so drive the same reclaim path the drainer
-        // would (lock + recheck count==0 + reclaim) and confirm the inode is gone.
+        // Reclaim is invoked directly without a drainer.
         assert_eq!(fs.open_handle_count(file_id), 0);
         fs.reclaim_if_unreferenced(file_id).await;
         assert!(matches!(
@@ -2722,9 +3237,529 @@ mod tests {
         ));
     }
 
-    // With the drainer running, the last clunk of an open-unlinked inode must
-    // reclaim it asynchronously, with no explicit reclaim call — exercising the
-    // whole guard-drop → enqueue → drainer path.
+    #[tokio::test]
+    async fn disconnect_releases_open_handle_immediately() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = zerofs_handler(&fs).await;
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"plain-disconnect", &SetAttributes::default())
+            .await
+            .unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        let handle = {
+            let _lock = fs.lock_manager.acquire(file_id).await;
+            fs.new_open_handle(file_id)
+        };
+        handler.session_state().fids.insert(
+            2,
+            FidSlot {
+                fid: Fid {
+                    path: vec![Bytes::from_static(b"plain-disconnect")],
+                    inode_id: file_id,
+                    root: 0,
+                    qid: inode_to_qid(&inode, file_id),
+                    opened: true,
+                    mode: Some(O_RDONLY as u32),
+                    creds,
+                },
+                handle: Some(handle),
+                lock_guard: None,
+            },
+        );
+        assert_eq!(fs.open_handle_count(file_id), 1);
+
+        // Reconnect restores linked identity but not old-session handle pins.
+        handler.close_for_disconnect();
+        {
+            let state = handler.session_state();
+            let slot = state
+                .fids
+                .get(&2)
+                .expect("retired fid metadata remains available to received tasks");
+            assert!(slot.handle.is_none());
+            assert!(slot.lock_guard.is_none());
+        }
+        assert_eq!(fs.open_handle_count(file_id), 0);
+    }
+
+    #[tokio::test]
+    async fn confined_rebind_uses_new_hardlink_subtree() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (tenant_id, _) = fs
+            .mkdir(&creds, 0, b"tenant", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (other_id, _) = fs
+            .mkdir(&creds, 0, b"other", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (file_id, _) = fs
+            .create(
+                &creds,
+                tenant_id,
+                b"open-unlinked",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        // Relink restores the parent/name representation used by `Trebind`.
+        let _handle = {
+            let _lock = fs.lock_manager.acquire(file_id).await;
+            fs.new_open_handle(file_id)
+        };
+        let auth = AuthContext::from(&creds);
+        fs.remove(&auth, tenant_id, b"open-unlinked").await.unwrap();
+
+        let stale_replay = zerofs_handler(&fs).await;
+        let stale = rebind(
+            &stale_replay,
+            1,
+            1,
+            file_id,
+            tenant_id,
+            P9_REBIND_REPLAY | P9_REBIND_OPENED,
+        )
+        .await;
+        assert!(matches!(
+            stale,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 1);
+
+        fs.link(&auth, file_id, tenant_id, b"restored")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            fs.inode_store.get(file_id).await.unwrap(),
+            Inode::File(ref file)
+                if file.nlink == 1
+                    && file.parent == Some(tenant_id)
+                    && file.name.as_deref() == Some(b"restored".as_slice())
+        ));
+
+        let reconnect = zerofs_handler(&fs).await;
+        assert!(matches!(
+            attach(&reconnect, 1, 1, b"test", b"/tenant", creds.uid)
+                .await
+                .body,
+            Message::Rattach(_)
+        ));
+        assert!(matches!(
+            rebind(&reconnect, 2, 2, file_id, tenant_id, 0).await,
+            Message::Rrebind(_)
+        ));
+
+        let outsider = zerofs_handler(&fs).await;
+        assert!(matches!(
+            attach(&outsider, 3, 1, b"test", b"/other", creds.uid)
+                .await
+                .body,
+            Message::Rattach(_)
+        ));
+        assert!(matches!(
+            rebind(&outsider, 4, 2, file_id, other_id, 0).await,
+            Message::Rlerror(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn automatic_replay_recovers_parentless_hardlink() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (tenant_id, _) = fs
+            .mkdir(&creds, 0, b"tenant", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (other_id, _) = fs
+            .mkdir(&creds, 0, b"other", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (wrong_id, _) = fs
+            .mkdir(&creds, 0, b"wrong", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (file_id, _) = fs
+            .create(&creds, tenant_id, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let old_pin = {
+            let _lock = fs.lock_manager.acquire(file_id).await;
+            fs.new_open_handle(file_id)
+        };
+        fs.link(&auth, file_id, other_id, b"alias").await.unwrap();
+        assert!(matches!(
+            fs.inode_store.get(file_id).await.unwrap(),
+            Inode::File(ref file) if file.nlink == 2 && file.parent.is_none()
+        ));
+
+        // Manual binding cannot establish ancestry for a parentless hardlink.
+        let live = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&live, 1, 1, file_id, tenant_id, 0).await,
+            Message::Rlerror(_)
+        ));
+
+        // Unrelated attach roots cannot establish ancestry.
+        let wrong = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&wrong, 2, 1, file_id, wrong_id, 0).await,
+            Message::Rlerror(_)
+        ));
+
+        // Automatic replay restores the recorded linked fid without an open pin.
+        drop(old_pin);
+        assert_eq!(fs.open_handle_count(file_id), 0);
+        let lock_only = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&lock_only, 3, 1, file_id, tenant_id, P9_REBIND_REPLAY).await,
+            Message::Rrebind(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 0);
+        assert!(matches!(
+            lock_only
+                .handle_message(
+                    4,
+                    Message::Tlock(Tlock {
+                        fid: 1,
+                        lock_type: LockType::WriteLock,
+                        flags: 0,
+                        start: 0,
+                        length: 0,
+                        proc_id: 7,
+                        client_id: P9String::new(b"replayed-lock".to_vec()),
+                    }),
+                )
+                .await
+                .body,
+            Message::Rlock(Rlock {
+                status: LockStatus::Success
+            })
+        ));
+        assert_eq!(
+            fs.open_handle_count(file_id),
+            0,
+            "a replayed lock-only fid remains unpinned"
+        );
+
+        // `Tlopen` consumes the provisional replay pin.
+        let promoted = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(
+                &promoted,
+                4,
+                1,
+                file_id,
+                tenant_id,
+                P9_REBIND_REPLAY | P9_REBIND_OPENED,
+            )
+            .await,
+            Message::Rrebind(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 1);
+        assert!(matches!(
+            promoted
+                .handle_message(
+                    5,
+                    Message::Tlopen(Tlopen {
+                        fid: 1,
+                        flags: O_RDONLY as u32,
+                    }),
+                )
+                .await
+                .body,
+            Message::Rlopen(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 1);
+        assert!(matches!(
+            promoted
+                .handle_message(6, Message::Tclunk(Tclunk { fid: 1 }))
+                .await
+                .body,
+            Message::Rclunk(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 0);
+    }
+
+    #[tokio::test]
+    async fn moved_open_fid_rebinds_to_its_old_root_after_promotion() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (old_root, _) = fs
+            .mkdir(&creds, 0, b"old", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (new_root, _) = fs
+            .mkdir(&creds, 0, b"new", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (wrong_root, _) = fs
+            .mkdir(&creds, 0, b"wrong", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (file_id, _) = fs
+            .create(&creds, old_root, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+        let old_pin = {
+            let _lock = fs.lock_manager.acquire(file_id).await;
+            fs.new_open_handle(file_id)
+        };
+        fs.write(
+            &auth,
+            file_id,
+            0,
+            &Bytes::from_static(b"moved-open contents"),
+        )
+        .await
+        .unwrap();
+
+        fs.rename(&auth, old_root, b"file", new_root, b"moved")
+            .await
+            .unwrap();
+
+        // Manual binding follows current ancestry after rename.
+        let live = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&live, 1, 1, file_id, old_root, 0).await,
+            Message::Rlerror(_)
+        ));
+        let wrong = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&wrong, 2, 1, file_id, wrong_root, 0).await,
+            Message::Rlerror(_)
+        ));
+
+        // Promotion replay restores the recorded fid by identity.
+        drop(old_pin);
+        let promoted = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(
+                &promoted,
+                3,
+                1,
+                file_id,
+                old_root,
+                P9_REBIND_REPLAY | P9_REBIND_OPENED,
+            )
+            .await,
+            Message::Rrebind(_)
+        ));
+        assert_eq!(promoted.get_fid(1).unwrap().root, old_root);
+        assert_eq!(fs.open_handle_count(file_id), 1);
+        assert!(matches!(
+            promoted
+                .handle_message(
+                    4,
+                    Message::Tlopen(Tlopen {
+                        fid: 1,
+                        flags: O_RDONLY as u32,
+                    }),
+                )
+                .await
+                .body,
+            Message::Rlopen(_)
+        ));
+        assert_eq!(
+            fs.open_handle_count(file_id),
+            1,
+            "Tlopen must consume the moved fid's provisional pin"
+        );
+        let read = promoted
+            .handle_message(
+                5,
+                Message::Tread(Tread {
+                    fid: 1,
+                    offset: 0,
+                    count: 64,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            read.body,
+            Message::Rread(Rread { ref data, .. })
+                if data.as_ref() == b"moved-open contents"
+        ));
+    }
+
+    #[tokio::test]
+    async fn root_self_orphan_rebind_is_always_stale() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (root_id, _) = fs
+            .mkdir(&creds, 0, b"orphan-root", &SetAttributes::default())
+            .await
+            .unwrap();
+        let old_pin = {
+            let _lock = fs.lock_manager.acquire(root_id).await;
+            fs.new_open_handle(root_id)
+        };
+        fs.remove(&auth, 0, b"orphan-root").await.unwrap();
+        assert_eq!(fs.open_handle_count(root_id), 1);
+
+        let handler = zerofs_handler(&fs).await;
+        for (tag, flags) in [
+            (1, P9_REBIND_REPLAY),
+            (2, P9_REBIND_REPLAY | P9_REBIND_OPENED),
+        ] {
+            let stale = rebind(&handler, tag, tag.into(), root_id, root_id, flags).await;
+            assert!(matches!(
+                stale,
+                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            ));
+        }
+        assert_eq!(
+            fs.open_handle_count(root_id),
+            1,
+            "rejected replay must not install a provisional pin"
+        );
+
+        let denied = rebind(&handler, 3, 3, root_id, root_id, 0).await;
+        assert!(matches!(
+            denied,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        drop(old_pin);
+        assert_eq!(fs.open_handle_count(root_id), 0);
+    }
+
+    #[tokio::test]
+    async fn linked_provisional_rebind_pin_releases_on_disconnect() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+        let handler = zerofs_handler(&fs).await;
+
+        let invalid = rebind(&handler, 1, 1, file_id, 0, P9_REBIND_OPENED).await;
+        assert!(matches!(
+            invalid,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 0);
+
+        assert!(matches!(
+            rebind(
+                &handler,
+                2,
+                1,
+                file_id,
+                0,
+                P9_REBIND_REPLAY | P9_REBIND_OPENED,
+            )
+            .await,
+            Message::Rrebind(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 1);
+
+        assert!(matches!(
+            handler
+                .handle_message(3, Message::Tclunk(Tclunk { fid: 1 }))
+                .await
+                .body,
+            Message::Rclunk(_)
+        ));
+        assert_eq!(
+            fs.open_handle_count(file_id),
+            0,
+            "clunk immediately releases an abandoned provisional pin"
+        );
+
+        let retry = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(
+                &retry,
+                4,
+                1,
+                file_id,
+                0,
+                P9_REBIND_REPLAY | P9_REBIND_OPENED,
+            )
+            .await,
+            Message::Rrebind(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 1);
+
+        retry.close_for_disconnect();
+        {
+            let state = retry.session_state();
+            let retired = state
+                .fids
+                .get(&1)
+                .expect("provisional replay fid metadata remains available");
+            assert!(retired.handle.is_none());
+            assert!(retired.lock_guard.is_none());
+        }
+        assert_eq!(
+            fs.open_handle_count(file_id),
+            0,
+            "disconnect must release an incomplete Trebind/Tlopen pin immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebind_tracks_renamed_attach_root() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (root_a, _) = fs
+            .mkdir(&creds, 0, b"root-a", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (root_b, _) = fs
+            .mkdir(&creds, 0, b"root-b", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (child_a, _) = fs
+            .create(&creds, root_a, b"a", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (child_b, _) = fs
+            .create(&creds, root_b, b"b", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        // Root-self replay restores the renamed attach root by identity.
+        fs.rename(&auth, 0, b"root-a", 0, b"renamed-a")
+            .await
+            .unwrap();
+        assert!(matches!(
+            fs.lookup(&creds, 0, b"root-a").await,
+            Err(FsError::NotFound)
+        ));
+
+        let handler = zerofs_handler(&fs).await;
+        for (tag, fid, inode_id, root_inode) in [
+            (1, 1, root_a, root_a),
+            (2, 2, root_b, root_b),
+            (3, 3, child_a, root_a),
+            (4, 4, child_b, root_b),
+        ] {
+            assert!(matches!(
+                rebind(&handler, tag, fid, inode_id, root_inode, P9_REBIND_REPLAY).await,
+                Message::Rrebind(_)
+            ));
+        }
+        assert_eq!(handler.get_fid(3).unwrap().root, root_a);
+        assert_eq!(handler.get_fid(4).unwrap().root, root_b);
+
+        assert!(matches!(
+            rebind(&handler, 5, 5, child_a, root_b, 0).await,
+            Message::Rlerror(_)
+        ));
+    }
+
+    /// Last clunk reclaims an open-unlinked inode through the async drainer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_reclaim_drainer_reclaims_after_last_clunk() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
@@ -2733,51 +3768,9 @@ mod tests {
             fs.clone(),
             Arc::new(FileLockManager::new()),
         ));
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"test".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
-        // create + open "a" on fid 2
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                3,
-                Message::Tlcreate(Tlcreate {
-                    fid: 2,
-                    name: P9String::new(b"a".to_vec()),
-                    flags: 0x8002,
-                    mode: 0o644,
-                    gid: 1000,
-                }),
-            )
-            .await;
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[]).await;
+        create_file(&handler, 3, 2, b"a").await;
         let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
         // unlink (defers: fid 2 holds it open)
         handler
@@ -2816,52 +3809,10 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager));
-
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"test".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
+        start_plain_session(&handler).await;
         // Create "a" (fid 2 via lcreate), then clunk so it exists with 0 handles.
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                3,
-                Message::Tlcreate(Tlcreate {
-                    fid: 2,
-                    name: P9String::new(b"a".to_vec()),
-                    flags: 0x8002,
-                    mode: 0o644,
-                    gid: 1000,
-                }),
-            )
-            .await;
+        expect_walk(&handler, 2, 1, 2, &[]).await;
+        create_file(&handler, 3, 2, b"a").await;
         handler
             .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
             .await;
@@ -2870,17 +3821,7 @@ mod tests {
 
         for round in 0..200u32 {
             // Walk a fresh, unopened fid 3 to "a".
-            handler
-                .handle_message(
-                    10,
-                    Message::Twalk(Twalk {
-                        fid: 1,
-                        newfid: 3,
-                        nwname: 1,
-                        wnames: vec![P9String::new(b"a".to_vec())],
-                    }),
-                )
-                .await;
+            expect_walk(&handler, 10, 1, 3, &[b"a"]).await;
 
             let h1 = handler.clone();
             let h2 = handler.clone();
@@ -2928,52 +3869,10 @@ mod tests {
             let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
             let lock_manager = Arc::new(FileLockManager::new());
             let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager));
-
-            handler
-                .handle_message(
-                    0,
-                    Message::Tversion(Tversion {
-                        msize: DEFAULT_MSIZE,
-                        version: P9String::new(VERSION_9P2000L.to_vec()),
-                    }),
-                )
-                .await;
-            handler
-                .handle_message(
-                    1,
-                    Message::Tattach(Tattach {
-                        fid: 1,
-                        afid: u32::MAX,
-                        uname: P9String::new(b"test".to_vec()),
-                        aname: P9String::new(Vec::new()),
-                        n_uname: 1000,
-                    }),
-                )
-                .await;
+            start_plain_session(&handler).await;
             // Create + open "a" on fid 2 (this session's handle) -> count 1.
-            handler
-                .handle_message(
-                    2,
-                    Message::Twalk(Twalk {
-                        fid: 1,
-                        newfid: 2,
-                        nwname: 0,
-                        wnames: vec![],
-                    }),
-                )
-                .await;
-            handler
-                .handle_message(
-                    3,
-                    Message::Tlcreate(Tlcreate {
-                        fid: 2,
-                        name: P9String::new(b"a".to_vec()),
-                        flags: 0x8002,
-                        mode: 0o644,
-                        gid: 1000,
-                    }),
-                )
-                .await;
+            expect_walk(&handler, 2, 1, 2, &[]).await;
+            create_file(&handler, 3, 2, b"a").await;
             let file_id = fs.lookup(&test_creds(), 0, b"a").await.unwrap();
 
             // Simulate a SECOND session also holding "a" open (not torn down here).
@@ -3034,70 +3933,17 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager));
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"test".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
+        start_plain_session(&handler).await;
         // Create a child "x" so the in-place walk has a target.
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                3,
-                Message::Tlcreate(Tlcreate {
-                    fid: 2,
-                    name: P9String::new(b"x".to_vec()),
-                    flags: 0x8002,
-                    mode: 0o644,
-                    gid: 1000,
-                }),
-            )
-            .await;
+        expect_walk(&handler, 2, 1, 2, &[]).await;
+        create_file(&handler, 3, 2, b"x").await;
         handler
             .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
             .await;
 
         // Open a *directory* fid on the root (fid 10).
-        handler
-            .handle_message(
-                5,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 10,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(6, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
-            .await;
+        expect_walk(&handler, 5, 1, 10, &[]).await;
+        open_fid(&handler, 6, 10, 0).await;
         assert_eq!(
             fs.open_handle_count(0),
             1,
@@ -3142,69 +3988,16 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"test".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
+        start_plain_session(&handler).await;
         // child "x" for the in-place walk target
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 2,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                3,
-                Message::Tlcreate(Tlcreate {
-                    fid: 2,
-                    name: P9String::new(b"x".to_vec()),
-                    flags: 0x8002,
-                    mode: 0o644,
-                    gid: 1000,
-                }),
-            )
-            .await;
+        expect_walk(&handler, 2, 1, 2, &[]).await;
+        create_file(&handler, 3, 2, b"x").await;
         handler
             .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
             .await;
         // open root dir on fid 10, then write-lock it
-        handler
-            .handle_message(
-                5,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 10,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(6, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
-            .await;
+        expect_walk(&handler, 5, 1, 10, &[]).await;
+        open_fid(&handler, 6, 10, 0).await;
         handler
             .handle_message(
                 7,
@@ -3251,41 +4044,9 @@ mod tests {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let lock_manager = Arc::new(FileLockManager::new());
         let handler = Arc::new(NinePHandler::new(fs.clone(), lock_manager.clone()));
-        handler
-            .handle_message(
-                0,
-                Message::Tversion(Tversion {
-                    msize: DEFAULT_MSIZE,
-                    version: P9String::new(VERSION_9P2000L.to_vec()),
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                1,
-                Message::Tattach(Tattach {
-                    fid: 1,
-                    afid: u32::MAX,
-                    uname: P9String::new(b"test".to_vec()),
-                    aname: P9String::new(Vec::new()),
-                    n_uname: 1000,
-                }),
-            )
-            .await;
-        handler
-            .handle_message(
-                2,
-                Message::Twalk(Twalk {
-                    fid: 1,
-                    newfid: 10,
-                    nwname: 0,
-                    wnames: vec![],
-                }),
-            )
-            .await;
-        handler
-            .handle_message(3, Message::Tlopen(Tlopen { fid: 10, flags: 0 }))
-            .await;
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 10, &[]).await;
+        open_fid(&handler, 3, 10, 0).await;
         handler
             .handle_message(
                 4,
@@ -3387,8 +4148,7 @@ mod tests {
             .await
         });
 
-        // Wait until the lock registers; the lock task is now paused at the
-        // failpoint, holding the fid shard if the install is atomic.
+        // Wait for lock registration under the session lock.
         let mut registered = false;
         for _ in 0..400 {
             if lock_manager.session_has_locks(handler.handler_id()) {
@@ -3399,8 +4159,7 @@ mod tests {
         }
         assert!(registered, "lock task did not register/pause in time");
 
-        // Concurrent Tversion reset. Atomic fix: blocks on the held shard.
-        // Buggy: clears the guardless slot freely.
+        // `Tversion` blocks on the session lock.
         let h2 = handler.clone();
         let version_task = tokio::spawn(async move {
             h2.handle_message(
@@ -3413,9 +4172,8 @@ mod tests {
             .await
         });
 
-        // Let Tversion run (buggy: clears; atomic: blocks on the shard).
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Resume lock(): install the guard (atomic) or find the slot gone (buggy).
+        // Resume lock installation before session reset.
         fail::cfg(fp::LOCK_AFTER_REGISTER_BEFORE_GUARD, "off").unwrap();
 
         let _ = lock_task.await;
@@ -3490,7 +4248,7 @@ mod tests {
                     0,
                     Message::Tversion(Tversion {
                         msize: DEFAULT_MSIZE,
-                        version: P9String::new(VERSION_9P2000L.to_vec()),
+                        version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
                     }),
                 )
                 .await;

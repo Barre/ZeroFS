@@ -5,6 +5,7 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
+use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::{
@@ -30,6 +31,21 @@ impl ZeroFS {
         id: InodeId,
         setattr: &SetAttributes,
     ) -> Result<FileAttributes, FsError> {
+        self.setattr_idempotent(creds, id, setattr, [0u8; 16]).await
+    }
+
+    /// Idempotent setattr retaining the original post-operation attributes.
+    /// A delayed truncate retry does not affect later writes.
+    pub async fn setattr_idempotent(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
         debug!(
             "setattr: id={}, setattr={:?}, creds=(uid={}, gid={}, groups={:?})",
             id,
@@ -39,6 +55,11 @@ impl ZeroFS {
             &creds.groups[..creds.groups_count]
         );
         let _guard = self.lock_manager.acquire(id).await;
+        // A same-id call may have completed while this one waited for the inode
+        // lock (direct filesystem callers do not pass through the 9P single-flight).
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
         let mut inode = self.inode_store.get(id).await?;
 
         // For chmod (mode change), must be owner
@@ -155,6 +176,14 @@ impl ZeroFS {
                                 .await?;
                         }
 
+                        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+                        txn.set_dedup_result(
+                            op_id,
+                            crate::dedup::DedupResult::Setattr {
+                                attrs: post_attrs.clone(),
+                            },
+                        );
+
                         txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                         self.write_coordinator.commit(txn).await?;
@@ -176,7 +205,7 @@ impl ZeroFS {
                             },
                         );
 
-                        return Ok(InodeWithId { inode: &inode, id }.into());
+                        return Ok(post_attrs);
                     }
                 }
 
@@ -452,6 +481,14 @@ impl ZeroFS {
                 .await?;
         }
 
+        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+        txn.set_dedup_result(
+            op_id,
+            crate::dedup::DedupResult::Setattr {
+                attrs: post_attrs.clone(),
+            },
+        );
+
         self.write_coordinator.commit(txn).await?;
 
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -467,7 +504,7 @@ impl ZeroFS {
             },
         );
 
-        Ok(InodeWithId { inode: &inode, id }.into())
+        Ok(post_attrs)
     }
 }
 
@@ -512,5 +549,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_data.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn truncate_retry_replays_result_without_destroying_a_later_write() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"retry.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = (&test_auth()).into();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"old"))
+            .await
+            .unwrap();
+        let truncate = SetAttributes {
+            size: SetSize::Set(0),
+            ..Default::default()
+        };
+        let op_id = [0x42; 16];
+
+        let original = fs
+            .setattr_idempotent(&test_creds(), file_id, &truncate, op_id)
+            .await
+            .unwrap();
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+
+        let replayed = fs
+            .setattr_idempotent(&test_creds(), file_id, &truncate, op_id)
+            .await
+            .unwrap();
+        assert_eq!(original.size, 0);
+        assert_eq!(replayed.size, 0, "retry returns the original exact stat");
+        let (data, _) = fs.read_file(&auth, file_id, 0, 3).await.unwrap();
+        assert_eq!(data.as_ref(), b"new", "retry must not truncate again");
     }
 }

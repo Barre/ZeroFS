@@ -8,24 +8,22 @@ use crate::types::{
     SetTime, StatFs,
 };
 use bytes::{Bytes, BytesMut};
-use ninep_client::{NOFID, NinePClient};
+use ninep_client::{NOFID, NinePClient, Target};
 use ninep_proto::Stat;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-#[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_9P_PORT: u16 = 5564;
+const MULTI_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 /// Symlink resolution cap, mirroring Linux's SYMLOOP_MAX headroom.
 const MAX_SYMLINK_HOPS: u32 = 40;
 
-/// One ZeroFS session, one identity. Share via `Arc`; every method takes
-/// `&self` and is safe to call concurrently. The underlying connection
-/// reconnects transparently, blocking calls through outages; bound waits with
-/// your async runtime's timeout facilities (every future is cancel-safe).
+/// One concurrent ZeroFS session and identity. Calls wait during reconnect.
+/// Cancelling a dispatched mutation leaves its outcome ambiguous.
 ///
 /// Paths are bytes, as on POSIX and the 9P wire: every path parameter is
 /// `impl AsRef<Path>`, so `&str`, `PathBuf`, and `OsStr::from_bytes(..)` for
@@ -45,8 +43,8 @@ impl std::fmt::Debug for Client {
 impl Client {
     /// Connect with defaults. Native targets: `"unix:/sock"`,
     /// `"tcp://host:port"`, `"host:port"`, `"host"` (port 5564), or a bare
-    /// filesystem path (unix socket). Browser WASM targets are `"ws://..."`
-    /// and `"wss://..."`.
+    /// filesystem path (unix socket). A comma-separated string forms an HA
+    /// target set. Browser WASM targets are `"ws://..."` and `"wss://..."`.
     pub async fn connect(target: &str) -> Result<Arc<Client>, ZeroFsError> {
         Self::connect_with(target, ConnectOptions::default()).await
     }
@@ -56,22 +54,47 @@ impl Client {
         target: &str,
         opts: ConnectOptions,
     ) -> Result<Arc<Client>, ZeroFsError> {
-        let fut = Self::establish(target, &opts);
-        match opts.connect_timeout_ms {
-            Some(ms) => {
-                match crate::runtime::timeout(Duration::from_millis(ms as u64), fut).await {
-                    Ok(result) => result,
-                    Err(_) => Err(ZeroFsError::ConnectFailed {
-                        message: format!("connecting to {target}: timed out after {ms} ms"),
-                    }),
-                }
-            }
-            None => fut.await,
-        }
+        let targets = parse_targets([target])?;
+        connect_before(
+            opts.connect_timeout_ms,
+            Self::establish(targets, target, &opts),
+            |ms| format!("connecting to {target}: timed out after {ms} ms"),
+        )
+        .await
     }
 
-    async fn establish(target: &str, opts: &ConnectOptions) -> Result<Arc<Client>, ZeroFsError> {
-        let client = dial(target, opts.msize).await?;
+    /// Connect across a target set, probing for the serving leader on reconnect.
+    pub async fn connect_multi(targets: &[String]) -> Result<Arc<Client>, ZeroFsError> {
+        if targets.is_empty() {
+            return Err(ZeroFsError::ConnectFailed {
+                message: "no targets given".into(),
+            });
+        }
+        let opts = ConnectOptions::default();
+        let label = targets.join(", ");
+        let targets = parse_targets(targets.iter().map(String::as_str))?;
+        let connect = async {
+            loop {
+                match Self::establish(targets.clone(), &label, &opts).await {
+                    Ok(client) => return Ok(client),
+                    Err(_) => crate::runtime::sleep(MULTI_CONNECT_RETRY_DELAY).await,
+                }
+            }
+        };
+        connect_before(opts.connect_timeout_ms, connect, |ms| {
+            format!("no serving leader found among [{label}] within {ms} ms")
+        })
+        .await
+    }
+
+    async fn establish(
+        targets: Vec<Target>,
+        target: &str,
+        opts: &ConnectOptions,
+    ) -> Result<Arc<Client>, ZeroFsError> {
+        let client = NinePClient::connect_multi(targets, opts.msize)
+            .await
+            .map_err(|error| connect_failed(format!("9P target set: {error}")))?;
         #[cfg(not(target_arch = "wasm32"))]
         let uid = opts.uid.unwrap_or_else(|| unsafe { libc::geteuid() });
         #[cfg(target_arch = "wasm32")]
@@ -109,8 +132,6 @@ impl Client {
     pub fn capabilities(&self) -> Capabilities {
         let c = &self.session.client;
         Capabilities {
-            extensions_v1: c.extensions_enabled(),
-            extensions_v2: c.extensions_v2_enabled(),
             msize: c.msize(),
             max_read_chunk: c.max_io(),
             max_write_chunk: c.max_write_payload(),
@@ -136,11 +157,8 @@ impl Client {
         self.session.client.outstanding_fids()
     }
 
-    /// Mark the client closed (later calls return `Closed`), then hand the root
-    /// fid to the janitor for a background clunk + recycle. Always succeeds,
-    /// idempotent, and never blocks (no await), so a cancelled close still
-    /// reclaims the root fid. Outstanding `File`/`Dir` handles keep working until
-    /// individually closed.
+    /// Marks the client closed and schedules the root fid for release. This call
+    /// is idempotent and non-blocking. Existing `File` and `Dir` handles remain open.
     pub async fn close(&self) {
         if self.session.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -155,7 +173,7 @@ impl Client {
         let pd = display(path);
         let (guard, stat) = self.open_read(path, &pd).await?;
         let max = self.session.client.max_io().max(1);
-        // A short first chunk means the whole file fit; hand it back uncopied.
+        // Return the single received chunk without copying.
         let first = self
             .session
             .client
@@ -165,12 +183,8 @@ impl Client {
         if (first.len() as u32) < max {
             return Ok(first);
         }
-        // Cap the up-front reservation: `stat.size` is server-reported and may
-        // be wildly large (or hostile); the loop grows `out` as it fills.
-        let cap = stat
-            .as_ref()
-            .map_or(0, |s| s.size as usize)
-            .min((max as usize).saturating_mul(2));
+        // Bound allocation derived from server-provided size.
+        let cap = (stat.size as usize).min((max as usize).saturating_mul(2));
         let mut out = BytesMut::with_capacity(cap);
         out.extend_from_slice(&first);
         loop {
@@ -230,8 +244,7 @@ impl Client {
         Ok(stat.size)
     }
 
-    /// Shared namespace-op preamble: closed check, then walk to the parent of
-    /// `path`, returning the parent's guard and the final name component.
+    /// Resolves a namespace operation's parent and final component.
     async fn parent_of<'a>(
         &self,
         path: &'a Path,
@@ -244,13 +257,8 @@ impl Client {
         Ok((guard, name))
     }
 
-    /// Walk to `path` and open it read-only, returning the opened guard plus
-    /// the stat when the walk made it free.
-    async fn open_read(
-        &self,
-        path: &Path,
-        pd: &str,
-    ) -> Result<(FidGuard, Option<Stat>), ZeroFsError> {
+    /// Opens `path` read-only and returns its guard and stat.
+    async fn open_read(&self, path: &Path, pd: &str) -> Result<(FidGuard, Stat), ZeroFsError> {
         self.session.check_open()?;
         let names = components(path)?;
         let (guard, stat) = self.session.walk(&names, pd).await?;
@@ -267,22 +275,9 @@ impl Client {
         pd: &str,
         opts: &OpenOptions,
     ) -> Result<FidGuard, ZeroFsError> {
-        self.open_relative_path_op_id(path, pd, opts, [0u8; 16])
-            .await
-    }
-
-    /// [`Self::open_relative_path`] threading an op-id to the create step (only
-    /// relevant when `opts` creates the file).
-    async fn open_relative_path_op_id(
-        &self,
-        path: &Path,
-        pd: &str,
-        opts: &OpenOptions,
-        op_id: [u8; 16],
-    ) -> Result<FidGuard, ZeroFsError> {
         let (dir_guard, name) = self.parent_of(path, pd).await?;
         self.session
-            .open_relative_op_id(dir_guard.fid(), name, opts, pd, op_id)
+            .open_relative(dir_guard.fid(), name, opts, pd)
             .await
     }
 
@@ -295,10 +290,7 @@ impl Client {
         let pd = display(path);
         self.session.check_open()?;
         let names = components(path)?;
-        let (_guard, stat) = self
-            .session
-            .walk_stat_from(self.session.root_fid, &names, &pd)
-            .await?;
+        let (_guard, stat) = self.session.walk(&names, &pd).await?;
         Ok(Metadata::from_stat(&stat))
     }
 
@@ -450,23 +442,11 @@ impl Client {
         path: impl AsRef<Path>,
         mode: u32,
     ) -> Result<Metadata, ZeroFsError> {
-        self.create_dir_op_id(path, mode, [0u8; 16]).await
-    }
-
-    /// [`Self::create_dir`] with a caller-supplied idempotency op-id (all-zero to
-    /// opt out), passed through to the create step. Generated by the failover
-    /// layer, never here (so it stays stable across retries).
-    pub async fn create_dir_op_id(
-        &self,
-        path: impl AsRef<Path>,
-        mode: u32,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
         let path = path.as_ref();
         let pd = display(path);
         let (dir_guard, name) = self.parent_of(path, &pd).await?;
         self.session
-            .mkdir_at_op_id(dir_guard.fid(), name, mode, &pd, op_id)
+            .mkdir_at(dir_guard.fid(), name, mode, &pd)
             .await
     }
 
@@ -509,44 +489,24 @@ impl Client {
 
     /// Remove a file, symlink, or device node.
     pub async fn remove_file(&self, path: impl AsRef<Path>) -> Result<(), ZeroFsError> {
-        self.remove_file_op_id(path, [0u8; 16]).await
-    }
-
-    /// [`Self::remove_file`] with a caller-supplied idempotency op-id (all-zero to
-    /// opt out). See [`Self::create_dir_op_id`].
-    pub async fn remove_file_op_id(
-        &self,
-        path: impl AsRef<Path>,
-        op_id: [u8; 16],
-    ) -> Result<(), ZeroFsError> {
         let path = path.as_ref();
         let pd = display(path);
         let (dir_guard, name) = self.parent_of(path, &pd).await?;
         self.session
             .client
-            .unlinkat_op_id(dir_guard.fid(), name, 0, op_id)
+            .unlinkat(dir_guard.fid(), name, 0)
             .await
             .ctx(&pd)
     }
 
     /// Remove an empty directory.
     pub async fn remove_dir(&self, path: impl AsRef<Path>) -> Result<(), ZeroFsError> {
-        self.remove_dir_op_id(path, [0u8; 16]).await
-    }
-
-    /// [`Self::remove_dir`] with a caller-supplied idempotency op-id (all-zero to
-    /// opt out). See [`Self::create_dir_op_id`].
-    pub async fn remove_dir_op_id(
-        &self,
-        path: impl AsRef<Path>,
-        op_id: [u8; 16],
-    ) -> Result<(), ZeroFsError> {
         let path = path.as_ref();
         let pd = display(path);
         let (dir_guard, name) = self.parent_of(path, &pd).await?;
         self.session
             .client
-            .unlinkat_op_id(dir_guard.fid(), name, crate::linux::AT_REMOVEDIR, op_id)
+            .unlinkat(dir_guard.fid(), name, crate::linux::AT_REMOVEDIR)
             .await
             .ctx(&pd)
     }
@@ -575,24 +535,13 @@ impl Client {
         from: impl AsRef<Path>,
         to: impl AsRef<Path>,
     ) -> Result<(), ZeroFsError> {
-        self.rename_op_id(from, to, [0u8; 16]).await
-    }
-
-    /// [`Self::rename`] with a caller-supplied idempotency op-id (all-zero to opt
-    /// out). See [`Self::create_dir_op_id`].
-    pub async fn rename_op_id(
-        &self,
-        from: impl AsRef<Path>,
-        to: impl AsRef<Path>,
-        op_id: [u8; 16],
-    ) -> Result<(), ZeroFsError> {
         let (from, to) = (from.as_ref(), to.as_ref());
         let (fd, td) = (display(from), display(to));
         let (from_guard, from_name) = self.parent_of(from, &fd).await?;
         let (to_guard, to_name) = self.parent_of(to, &td).await?;
         self.session
             .client
-            .renameat_op_id(from_guard.fid(), from_name, to_guard.fid(), to_name, op_id)
+            .renameat(from_guard.fid(), from_name, to_guard.fid(), to_name)
             .await
             .ctx(&fd)
     }
@@ -603,24 +552,13 @@ impl Client {
         original: impl AsRef<Path>,
         link: impl AsRef<Path>,
     ) -> Result<Metadata, ZeroFsError> {
-        self.hard_link_op_id(original, link, [0u8; 16]).await
-    }
-
-    /// [`Self::hard_link`] with a caller-supplied idempotency op-id (all-zero to
-    /// opt out). See [`Self::create_dir_op_id`].
-    pub async fn hard_link_op_id(
-        &self,
-        original: impl AsRef<Path>,
-        link: impl AsRef<Path>,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
         let (original, link) = (original.as_ref(), link.as_ref());
         let (od, ld) = (display(original), display(link));
         let (dir_guard, link_name) = self.parent_of(link, &ld).await?;
         let orig_names = components(original)?;
         let (orig_guard, _) = self.session.walk(&orig_names, &od).await?;
         self.session
-            .link_at_op_id(dir_guard.fid(), orig_guard.fid(), link_name, &ld, op_id)
+            .link_at(dir_guard.fid(), orig_guard.fid(), link_name, &ld)
             .await
     }
 
@@ -631,28 +569,12 @@ impl Client {
         target: impl AsRef<Path>,
         link_path: impl AsRef<Path>,
     ) -> Result<Metadata, ZeroFsError> {
-        self.symlink_op_id(target, link_path, [0u8; 16]).await
-    }
-
-    /// [`Self::symlink`] with a caller-supplied idempotency op-id (all-zero to opt
-    /// out). See [`Self::create_dir_op_id`].
-    pub async fn symlink_op_id(
-        &self,
-        target: impl AsRef<Path>,
-        link_path: impl AsRef<Path>,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
         let link_path = link_path.as_ref();
         let ld = display(link_path);
         let (dir_guard, name) = self.parent_of(link_path, &ld).await?;
+        let target = path_bytes(target.as_ref())?;
         self.session
-            .symlink_at_op_id(
-                dir_guard.fid(),
-                name,
-                path_bytes(target.as_ref())?,
-                &ld,
-                op_id,
-            )
+            .symlink_at(dir_guard.fid(), name, target, &ld)
             .await
     }
 
@@ -675,28 +597,16 @@ impl Client {
         kind: NodeKind,
         mode: u32,
     ) -> Result<Metadata, ZeroFsError> {
-        self.mknod_op_id(path, kind, mode, [0u8; 16]).await
-    }
-
-    /// [`Self::mknod`] with a caller-supplied idempotency op-id (all-zero to opt
-    /// out). See [`Self::create_dir_op_id`].
-    pub async fn mknod_op_id(
-        &self,
-        path: impl AsRef<Path>,
-        kind: NodeKind,
-        mode: u32,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
         let path = path.as_ref();
         let pd = display(path);
         let (dir_guard, name) = self.parent_of(path, &pd).await?;
         self.session
-            .mknod_at_op_id(dir_guard.fid(), name, kind, mode, &pd, op_id)
+            .mknod_at(dir_guard.fid(), name, kind, mode, &pd)
             .await
     }
 
-    /// List a whole directory (`.`/`..` excluded); metadata inline when the
-    /// server supports readdirplus.
+    /// List a whole directory (`.`/`..` excluded), with metadata inline via
+    /// readdirplus.
     pub async fn read_dir(&self, path: impl AsRef<Path>) -> Result<Vec<DirEntry>, ZeroFsError> {
         let dir = self.open_dir(path).await?;
         let mut out = Vec::new();
@@ -719,9 +629,7 @@ impl Client {
         self.session.check_open()?;
         let names = components(path)?;
         let (guard, stat) = self.session.walk(&names, &pd).await?;
-        if let Some(stat) = &stat
-            && FileType::from_mode(stat.mode) != FileType::Dir
-        {
+        if FileType::from_mode(stat.mode) != FileType::Dir {
             return Err(ZeroFsError::NotADirectory { path: pd });
         }
         Ok(Dir::new(
@@ -746,50 +654,12 @@ impl Client {
 
     /// Shorthand: open read-write with create+truncate, mode 0o644.
     pub async fn create(&self, path: impl AsRef<Path>) -> Result<Arc<File>, ZeroFsError> {
-        self.create_op_id(path, [0u8; 16]).await
-    }
-
-    /// [`Self::create`] with a caller-supplied idempotency op-id (all-zero to opt
-    /// out), passed through to the create step. See [`Self::create_dir_op_id`].
-    pub async fn create_op_id(
-        &self,
-        path: impl AsRef<Path>,
-        op_id: [u8; 16],
-    ) -> Result<Arc<File>, ZeroFsError> {
         let path = path.as_ref();
         let pd = display(path);
         self.session.check_open()?;
         let opts = OpenOptions::read_write().create(true).truncate(true);
-        let guard = self
-            .open_relative_path_op_id(path, &pd, &opts, op_id)
-            .await?;
+        let guard = self.open_relative_path(path, &pd, &opts).await?;
         Ok(File::new(Arc::clone(&self.session), guard, pd))
-    }
-
-    /// Open `path` with `opts` and return the raw (session, fid) binding instead
-    /// of a [`File`] wrapper, so a failover-aware handle can re-bind to a freshly
-    /// probed leader after a failover.
-    pub(crate) async fn open_guard(
-        &self,
-        path: &Path,
-        opts: &OpenOptions,
-    ) -> Result<(Arc<Session>, FidGuard), ZeroFsError> {
-        self.open_guard_op_id(path, opts, [0u8; 16]).await
-    }
-
-    /// [`Self::open_guard`] threading an op-id to the create step.
-    pub(crate) async fn open_guard_op_id(
-        &self,
-        path: &Path,
-        opts: &OpenOptions,
-        op_id: [u8; 16],
-    ) -> Result<(Arc<Session>, FidGuard), ZeroFsError> {
-        let pd = display(path);
-        self.session.check_open()?;
-        let guard = self
-            .open_relative_path_op_id(path, &pd, opts, op_id)
-            .await?;
-        Ok((Arc::clone(&self.session), guard))
     }
 
     /// Resolve symlinks in `path` (final and intermediate), returning the
@@ -803,7 +673,7 @@ impl Client {
         // symlink; done in one round trip. Any failure falls back to the
         // component-wise resolver to find the offending symlink.
         let literal: Vec<&[u8]> = components(path)?;
-        if let Ok((_guard, stat)) = session.walk_stat_from(session.root_fid, &literal, pd).await
+        if let Ok((_guard, stat)) = session.walk(&literal, pd).await
             && FileType::from_mode(stat.mode) != FileType::Symlink
         {
             return Ok((literal.iter().map(|c| c.to_vec()).collect(), stat));
@@ -814,8 +684,7 @@ impl Client {
         let mut hops = 0u32;
         // A fid pinned at the directory `stack` denotes, advanced one
         // component at a time.
-        let (mut cur, _) = session.walk(&[], pd).await?;
-        let mut cur_stat = session.stat_fid(cur.fid(), pd).await?;
+        let (mut cur, mut cur_stat) = session.walk(&[], pd).await?;
 
         while let Some(name) = todo.pop_front() {
             if name == b".." {
@@ -823,15 +692,13 @@ impl Client {
                 // canonical stack ("/.." stays at the root, like POSIX).
                 stack.pop();
                 let refs: Vec<&[u8]> = stack.iter().map(|c| c.as_slice()).collect();
-                let (guard, stat) = session.walk_stat_from(session.root_fid, &refs, pd).await?;
+                let (guard, stat) = session.walk(&refs, pd).await?;
                 cur = guard;
                 cur_stat = stat;
                 continue;
             }
 
-            let (guard, stat) = session
-                .walk_stat_from(cur.fid(), &[name.as_slice()], pd)
-                .await?;
+            let (guard, stat) = session.walk_from(cur.fid(), &[name.as_slice()], pd).await?;
             if FileType::from_mode(stat.mode) == FileType::Symlink {
                 hops += 1;
                 if hops > MAX_SYMLINK_HOPS {
@@ -842,9 +709,9 @@ impl Client {
                 let target = session.client.readlink(guard.fid()).await.ctx(pd)?;
                 if target.first() == Some(&b'/') {
                     stack.clear();
-                    let (root_clone, _) = session.walk(&[], pd).await?;
+                    let (root_clone, root_stat) = session.walk(&[], pd).await?;
                     cur = root_clone;
-                    cur_stat = session.stat_fid(cur.fid(), pd).await?;
+                    cur_stat = root_stat;
                 }
                 // Prepend the target's components ahead of the remaining path.
                 for comp in target
@@ -865,8 +732,7 @@ impl Client {
     }
 }
 
-/// Empty a directory recursively: lists in rounds (rewinding between them so
-/// deletion never races the cursor) until nothing is left.
+/// Removes directory contents in repeated listing rounds.
 #[cfg(not(target_arch = "wasm32"))]
 type RemoveDirFuture<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<(), ZeroFsError>> + Send + 'a>>;
@@ -896,64 +762,26 @@ fn remove_dir_contents<'a>(dir: &'a Dir) -> RemoveDirFuture<'a> {
     })
 }
 
-/// Open a transport to `target`. Mirrors the FUSE mount's target grammar.
-async fn dial(target: &str, msize: u32) -> Result<Arc<NinePClient>, ZeroFsError> {
-    let connect_failed = |message: String| ZeroFsError::ConnectFailed { message };
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        if target.starts_with("ws://") || target.starts_with("wss://") {
-            return NinePClient::connect_websocket(target, msize)
-                .await
-                .map_err(|e| connect_failed(format!("9P WebSocket {target}: {e}")));
-        }
-        Err(connect_failed(format!(
-            "browser clients require a ws:// or wss:// target, got {target:?}"
-        )))
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if let Some(rest) = target.strip_prefix("unix:") {
-            let path = rest.strip_prefix("//").unwrap_or(rest);
-            return NinePClient::connect_unix(path, msize)
-                .await
-                .map_err(|e| connect_failed(format!("9P unix socket {path}: {e}")));
-        }
-
-        let hostport = target.strip_prefix("tcp://").unwrap_or(target);
-
-        // A path-like target without a scheme is treated as a unix socket.
-        if hostport.starts_with('/') || hostport.starts_with('.') {
-            return NinePClient::connect_unix(hostport, msize)
-                .await
-                .map_err(|e| connect_failed(format!("9P unix socket {hostport}: {e}")));
-        }
-
-        let addr = resolve_addr(hostport).await?;
-        NinePClient::connect_tcp(addr, msize)
-            .await
-            .map_err(|e| connect_failed(format!("9P server {addr}: {e}")))
-    }
+fn parse_targets<'a>(specs: impl IntoIterator<Item = &'a str>) -> Result<Vec<Target>, ZeroFsError> {
+    specs.into_iter().try_fold(Vec::new(), |mut targets, spec| {
+        targets.extend(Target::parse_list(spec).map_err(connect_failed)?);
+        Ok(targets)
+    })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-async fn resolve_addr(s: &str) -> Result<std::net::SocketAddr, ZeroFsError> {
-    if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
-        return Ok(addr);
+fn connect_failed(message: String) -> ZeroFsError {
+    ZeroFsError::ConnectFailed { message }
+}
+
+async fn connect_before<T>(
+    timeout_ms: Option<u32>,
+    future: impl Future<Output = Result<T, ZeroFsError>>,
+    timeout_message: impl FnOnce(u32) -> String,
+) -> Result<T, ZeroFsError> {
+    match timeout_ms {
+        Some(ms) => crate::runtime::timeout(Duration::from_millis(ms.into()), future)
+            .await
+            .unwrap_or_else(|_| Err(connect_failed(timeout_message(ms)))),
+        None => future.await,
     }
-    let with_port = if s.contains(':') {
-        s.to_string()
-    } else {
-        format!("{s}:{DEFAULT_9P_PORT}")
-    };
-    tokio::net::lookup_host(&with_port)
-        .await
-        .map_err(|e| ZeroFsError::ConnectFailed {
-            message: format!("resolving {with_port}: {e}"),
-        })?
-        .next()
-        .ok_or_else(|| ZeroFsError::ConnectFailed {
-            message: format!("no addresses resolved for {with_port}"),
-        })
 }

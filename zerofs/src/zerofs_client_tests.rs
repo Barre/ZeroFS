@@ -116,8 +116,6 @@ async fn large_file_chunks_across_msize() {
     let (fs, _shutdown, _dir) = setup().await;
 
     let caps = fs.capabilities();
-    assert!(caps.extensions_v1);
-    assert!(caps.extensions_v2);
 
     // Cover the read/write chunking paths: 2.5x the largest single-message
     // payload, with a recognizable pattern.
@@ -212,10 +210,10 @@ async fn directories_and_listing() {
     entries.sort_by(|x, y| x.name.cmp(&y.name));
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["b", "one.txt", "two.txt"]);
-    // readdirplus carries inline metadata on this server.
+    // Directory reads always carry inline metadata.
     assert_eq!(entries[0].file_type, FileType::Dir);
     let two = entries.iter().find(|e| e.name == "two.txt").unwrap();
-    assert_eq!(two.metadata.as_ref().unwrap().size, 2);
+    assert_eq!(two.metadata.size, 2);
 
     // Incremental listing with a cap, then rewind and drain.
     let dir = fs.open_dir("/a").await.unwrap();

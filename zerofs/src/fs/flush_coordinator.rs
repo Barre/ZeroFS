@@ -15,6 +15,21 @@ type SealHook =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), FsError>> + Send>> + Send + Sync>;
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
+/// Move-only evidence that the shared flush coordinator completed a durability
+/// barrier. The private field keeps callers from manufacturing a receipt and
+/// clearing an HA reconnect barrier without performing the flush.
+#[must_use = "the receipt must discharge the HA base-flush requirement"]
+pub(crate) struct FlushReceipt {
+    _private: (),
+}
+
+#[cfg(test)]
+impl FlushReceipt {
+    pub(crate) const fn for_tests() -> Self {
+        Self { _private: () }
+    }
+}
+
 enum Request {
     Flush(Reply),
     Close(Reply),
@@ -24,6 +39,10 @@ enum Request {
 pub struct FlushCoordinator {
     sender: mpsc::UnboundedSender<Request>,
     seal_hook: Arc<OnceLock<SealHook>>,
+    /// Test-only count of submitted flush requests. Unlike completed cycles,
+    /// this advances before the worker can block acquiring the flush barrier.
+    #[cfg(test)]
+    requested_flushes: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only count of successful coordinator flush cycles.
     #[cfg(test)]
     completed_flushes: Arc<std::sync::atomic::AtomicU64>,
@@ -34,6 +53,8 @@ impl FlushCoordinator {
         let seal_hook: Arc<OnceLock<SealHook>> = Arc::new(OnceLock::new());
         let hook = Arc::clone(&seal_hook);
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
+        #[cfg(test)]
+        let requested_flushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
         let completed_flushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
@@ -106,6 +127,8 @@ impl FlushCoordinator {
             sender,
             seal_hook,
             #[cfg(test)]
+            requested_flushes,
+            #[cfg(test)]
             completed_flushes,
         }
     }
@@ -119,11 +142,27 @@ impl FlushCoordinator {
     pub async fn flush(&self) -> Result<(), FsError> {
         let (tx, rx) = oneshot::channel();
 
+        #[cfg(test)]
+        self.requested_flushes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         self.sender
             .send(Request::Flush(tx))
             .map_err(|_| FsError::ShuttingDown)?;
 
         rx.await.map_err(|_| FsError::ShuttingDown)?
+    }
+
+    /// Flush and return proof suitable for discharging an HA Solo-base barrier.
+    pub(crate) async fn flush_with_receipt(&self) -> Result<FlushReceipt, FsError> {
+        self.flush().await?;
+        Ok(FlushReceipt { _private: () })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requested_flush_count(&self) -> u64 {
+        self.requested_flushes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]

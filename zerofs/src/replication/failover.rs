@@ -1,49 +1,77 @@
-//! Standby failover: watch the leader's heartbeat liveness and decide when to
-//! take over.
+//! Standby heartbeat monitoring.
 
+use crate::replication::transport::INCOMPATIBLE_HEARTBEAT_LIVENESS;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// `liveness` ticks on each heartbeat accepted from the current-or-newer writer
-/// epoch. A standby NEVER bootstraps: it waits to observe the leader at least
-/// once before the staleness timer runs, so an absent leader is never elected.
-/// Once seen, no beat for `takeover_ttl` (crash or hang) means take over
-/// (`Ok(true)`); `Ok(false)` on shutdown.
-pub async fn watch_heartbeats_until_takeover(
+fn require_compatible_heartbeat_protocol(liveness: u64) -> Result<()> {
+    anyhow::ensure!(
+        liveness != INCOMPATIBLE_HEARTBEAT_LIVENESS,
+        "incompatible heartbeat protocol; upgrade both peers and restart the receiver"
+    );
+    Ok(())
+}
+
+/// Waits for a fresh accepted heartbeat, then reports lost heartbeat liveness.
+/// A preexisting counter does not arm the timer. An incompatible-protocol latch
+/// is terminal. The result authorizes only a durable marker claim attempt.
+/// Returns `Ok(true)` for a claim attempt and `Ok(false)` on shutdown.
+pub async fn watch_heartbeats_until_takeover_hint(
     mut liveness: tokio::sync::watch::Receiver<u64>,
-    takeover_ttl: Duration,
+    takeover_hint_after: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     takeover_trigger: Arc<tokio::sync::Notify>,
 ) -> Result<bool> {
-    // Phase 1: wait until the leader is observed at least once. No timeout: never
-    // take over a leader never seen (no split brain on bring-up).
-    while *liveness.borrow() == 0 {
+    // A preexisting counter does not arm this invocation's timer.
+    let baseline = *liveness.borrow_and_update();
+    require_compatible_heartbeat_protocol(baseline)?;
+
+    // Arm the timer on a fresh heartbeat only.
+    loop {
         tokio::select! {
-            // Told (via Hello) to take over now: only fired for a node holding a
-            // tail, which has therefore observed the leader.
-            _ = takeover_trigger.notified() => return Ok(true),
+            // Hello triggers only for a node holding a replicated tail.
+            _ = takeover_trigger.notified() => {
+                require_compatible_heartbeat_protocol(*liveness.borrow())?;
+                return Ok(true);
+            }
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() { return Ok(false); }
             }
             res = liveness.changed() => {
-                // A closed channel pre-takeover means teardown, so stand down.
+                // A closed channel before observation is shutdown.
                 if res.is_err() { return Ok(false); }
+                let observed = *liveness.borrow_and_update();
+                require_compatible_heartbeat_protocol(observed)?;
+                if observed != 0 && observed != baseline {
+                    break;
+                }
             }
         }
     }
-    // Phase 2: take over when the observed leader's heartbeats stop.
+    // The durable marker claim determines authority.
     loop {
+        require_compatible_heartbeat_protocol(*liveness.borrow())?;
         tokio::select! {
-            _ = takeover_trigger.notified() => return Ok(true),
+            _ = takeover_trigger.notified() => {
+                require_compatible_heartbeat_protocol(*liveness.borrow())?;
+                return Ok(true);
+            }
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() { return Ok(false); }
             }
-            res = tokio::time::timeout(takeover_ttl, liveness.changed()) => {
+            res = tokio::time::timeout(takeover_hint_after, liveness.changed()) => {
                 match res {
-                    Ok(Ok(())) => {}               // a beat: the leader is alive
-                    Ok(Err(_)) => return Ok(true), // liveness channel closed
-                    Err(_) => return Ok(true),     // no beat for takeover_ttl
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        // Source teardown after observation is lost liveness.
+                        require_compatible_heartbeat_protocol(*liveness.borrow())?;
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        require_compatible_heartbeat_protocol(*liveness.borrow())?;
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -56,58 +84,124 @@ mod tests {
     use tokio::sync::watch;
 
     #[tokio::test]
-    async fn takes_over_only_after_observed_then_silent() {
+    async fn hints_only_after_observed_then_silent() {
         let (live_tx, live_rx) = watch::channel(0u64);
         let (_sd_tx, sd_rx) = watch::channel(false);
-        let watcher = tokio::spawn(watch_heartbeats_until_takeover(
+        let watcher = tokio::spawn(watch_heartbeats_until_takeover_hint(
             live_rx,
             Duration::from_millis(200),
             sd_rx,
             Arc::new(tokio::sync::Notify::new()),
         ));
 
-        // No beat ever observed: must not take over even well past the ttl.
         tokio::time::sleep(Duration::from_millis(350)).await;
-        assert!(
-            !watcher.is_finished(),
-            "must not take over a leader that was never seen"
-        );
+        assert!(!watcher.is_finished(), "no claim hint before a heartbeat");
 
-        // Observe the leader, then keep beating: still no takeover.
         live_tx.send_modify(|c| *c += 1);
         tokio::time::sleep(Duration::from_millis(90)).await;
         live_tx.send_modify(|c| *c += 1);
         tokio::time::sleep(Duration::from_millis(90)).await;
         assert!(
             !watcher.is_finished(),
-            "must not take over while beats continue"
+            "no claim hint while heartbeats continue"
         );
 
-        let took_over = tokio::time::timeout(Duration::from_secs(2), watcher)
+        let should_attempt = tokio::time::timeout(Duration::from_secs(2), watcher)
             .await
             .expect("the watch should finish after beats stop")
             .unwrap()
             .unwrap();
-        assert!(took_over, "take over after the leader's beats go silent");
+        assert!(should_attempt, "claim hint after heartbeat timeout");
     }
 
-    // A shutdown before any takeover stands the standby down (`Ok(false)`).
+    #[tokio::test]
+    async fn a_second_watch_pass_requires_a_fresh_heartbeat() {
+        let (live_tx, live_rx) = watch::channel(0u64);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let takeover_trigger = Arc::new(tokio::sync::Notify::new());
+
+        let first = tokio::spawn(watch_heartbeats_until_takeover_hint(
+            live_rx,
+            Duration::from_millis(50),
+            sd_rx.clone(),
+            takeover_trigger.clone(),
+        ));
+        tokio::task::yield_now().await;
+        live_tx.send(1).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first)
+                .await
+                .expect("the first pass should hint after its fresh heartbeat goes silent")
+                .unwrap()
+                .unwrap()
+        );
+
+        let second = tokio::spawn(watch_heartbeats_until_takeover_hint(
+            live_tx.subscribe(),
+            Duration::from_millis(50),
+            sd_rx,
+            takeover_trigger,
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !second.is_finished(),
+            "preexisting counter armed a new watch"
+        );
+
+        live_tx.send(2).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), second)
+                .await
+                .expect("the second pass should hint after a fresh heartbeat goes silent")
+                .unwrap()
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn shutdown_stands_down() {
         let (_live_tx, live_rx) = watch::channel(0u64);
         let (sd_tx, sd_rx) = watch::channel(false);
-        let watcher = tokio::spawn(watch_heartbeats_until_takeover(
+        let watcher = tokio::spawn(watch_heartbeats_until_takeover_hint(
             live_rx,
             Duration::from_millis(200),
             sd_rx,
             Arc::new(tokio::sync::Notify::new()),
         ));
         sd_tx.send(true).unwrap();
-        let took_over = tokio::time::timeout(Duration::from_secs(2), watcher)
+        let should_attempt = tokio::time::timeout(Duration::from_secs(2), watcher)
             .await
             .expect("the watch should finish on shutdown")
             .unwrap()
             .unwrap();
-        assert!(!took_over, "shutdown means stand down, not take over");
+        assert!(!should_attempt, "shutdown produced a claim hint");
+    }
+
+    #[tokio::test]
+    async fn incompatible_heartbeat_blocks_an_already_armed_takeover() {
+        let (live_tx, live_rx) = watch::channel(1u64);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let watcher = tokio::spawn(watch_heartbeats_until_takeover_hint(
+            live_rx,
+            Duration::from_millis(50),
+            sd_rx,
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        tokio::task::yield_now().await;
+        live_tx.send(2).unwrap();
+        tokio::task::yield_now().await;
+        live_tx.send(INCOMPATIBLE_HEARTBEAT_LIVENESS).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), watcher)
+            .await
+            .expect("the watcher must fail closed immediately")
+            .unwrap();
+
+        let error = result.expect_err("an incompatible live peer must never fund takeover");
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible heartbeat protocol")
+        );
     }
 }

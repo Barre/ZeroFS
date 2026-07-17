@@ -36,7 +36,6 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::debug;
 
-const DEFAULT_9P_PORT: u16 = 5564;
 const FUSE_ROOT: u64 = 1;
 const OFFSET_MAX: u64 = i64::MAX as u64;
 const LOCAL_LOCK_FID: u32 = 0;
@@ -50,9 +49,7 @@ const READDIR_BATCH: u32 = 256 * 1024;
 /// the expected ENAMETOOLONG.
 const NAME_MAX: usize = 255;
 
-/// Upper bound on the bytes a `.zerofs5` open folds in as a first read. A file no
-/// larger than this is served from the open's reply with no follow-up Tread; larger
-/// files fall back to normal reads. Clamped down to the negotiated msize at open.
+/// Maximum inline read requested with a ZeroFS open, capped by negotiated msize.
 const PREFETCH_WINDOW: u32 = 128 * 1024;
 
 /// Attribute/entry cache lifetime handed to the kernel (relaxed mode), and the
@@ -99,11 +96,8 @@ struct InodeEntry {
     /// One fid per uid that holds this inode. Every request acts as its caller
     /// (v9fs `access=user` semantics), so each user gets its own server-side fid.
     fids: HashMap<u32, u32>,
-    /// The open-handle fids (from `open`/`opendir`/`create`) for this inode. A `.zerofs4`
-    /// data write rides its open handle, so a verified `fsync` presents every open handle
-    /// of the inode, not just the one being fsync'd: POSIX `fsync(fd)` persists the whole
-    /// file, including a write made through another handle. Populated on open, removed on
-    /// release.
+    /// Open fids for this inode. Verified fsync checks every handle because
+    /// `fsync(fd)` persists writes issued through any handle to the file.
     handles: std::collections::HashSet<u32>,
     /// The server inode id behind this FUSE ino when it differs from the
     /// default `ino - 1` bijection: only the mount root of an `--aname` mount,
@@ -130,11 +124,7 @@ struct Fuse9P {
     dir_reads: Arc<DashMap<u64, Arc<AsyncMutex<DirRead>>>>,
     /// Same, for directories the kernel reads via readdirplus.
     dir_reads_plus: Arc<DashMap<u64, Arc<AsyncMutex<DirReadPlus>>>>,
-    /// Whole-file bytes prefetched by a `.zerofs5` open+read fold, keyed by the open
-    /// file handle, with the instant they were fetched. Present only when the file fit
-    /// in the prefetch window (so a short read is a legitimate EOF). A `read` serves
-    /// from here and drops the entry once it is consumed or older than `ttl`; `release`
-    /// drops any that the kernel never read. See `open_inner`.
+    /// Complete-file open prefetches keyed by file handle and fetch time.
     prefetch: Arc<DashMap<u64, (Instant, Bytes)>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
@@ -352,18 +342,13 @@ fn node_name() -> Vec<u8> {
     b"zerofs-mount".to_vec()
 }
 
-/// Count a kernel lookup reference against `ino` without binding a fid, like
-/// the readdirplus path: the per-user fid is bound lazily by `user_fid` (via
-/// `Trebind`) on the first operation that needs one and never if none does.
-/// Used by the v2 fast paths, where the create-family reply already carries the
-/// child's stat and no walk takes place. Balanced by `forget`.
+/// Register a lookup without binding a fid. `user_fid` binds lazily on use.
 fn register_lookup(inodes: &Arc<DashMap<u64, InodeEntry>>, ino: u64) {
     inodes.entry(ino).or_default().lookup += 1;
 }
 
 /// Walk `parent_fid` to `name`, getattr the result, and register (or reuse) the
-/// inode entry, returning the child's attributes. Shared by lookup and every
-/// operation that has to return a freshly created child's entry.
+/// inode entry, returning the child's attributes for lookup.
 async fn resolve_child(
     client: &Arc<NinePClient>,
     inodes: &Arc<DashMap<u64, InodeEntry>>,
@@ -372,22 +357,18 @@ async fn resolve_child(
     name: &[u8],
 ) -> Result<FileAttr, ClientError> {
     let nf = client.alloc_fid();
-    let (newfid, stat) = match client.walk_stat(parent_fid, nf, &[name]).await {
-        Ok(v) => v,
+    let stat = match client.walk_getattr(parent_fid, nf, &[name]).await {
+        Ok((_qids, stat)) => stat,
         Err(e) => {
             client.free_fid(nf);
             return Err(e);
         }
     };
-    Ok(register_entry(client, inodes, uid, Some(newfid), &stat).await)
+    Ok(register_entry(client, inodes, uid, Some(nf), &stat).await)
 }
 
-/// Count a kernel lookup reference against `stat`'s inode and, when a freshly
-/// walked fid is supplied, keep it as this user's fid for the inode — unless
-/// the user already has one (hard link, or already looked up), in which case
-/// the new fid is discarded. With `None` (the stat-carrying v2 fast paths,
-/// where no walk took place) the fid binds lazily via `user_fid` later.
-/// Balanced by `forget`.
+/// Register a lookup and retain at most one walked fid per user and inode.
+/// A missing fid is bound lazily by `user_fid`.
 async fn register_entry(
     client: &Arc<NinePClient>,
     inodes: &Arc<DashMap<u64, InodeEntry>>,
@@ -440,15 +421,10 @@ impl Filesystem for Fuse9P {
             let _ = config.add_capabilities(InitFlags::FUSE_CACHE_SYMLINKS);
         }
 
-        // When the server speaks the fast path, let the kernel use readdirplus so
-        // a directory listing returns entries with their attributes in one shot
-        // (no lookup/getattr per entry). AUTO lets the kernel pick plain readdir
-        // when it won't stat the entries.
-        if self.client.extensions_enabled() {
-            let _ = config.add_capabilities(
-                InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO,
-            );
-        }
+        // Readdirplus avoids a lookup/getattr per entry; AUTO lets the kernel
+        // use plain readdir when attributes are unnecessary.
+        let _ = config
+            .add_capabilities(InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO);
 
         if self.writeback
             && let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
@@ -595,7 +571,7 @@ impl Filesystem for Fuse9P {
                 .atime(atime.map(setattr_time))
                 .mtime(mtime.map(setattr_time))
                 .build();
-            match client.setattr_stat(ts).await {
+            match client.setattr_attr(ts).await {
                 Ok(stat) => reply.attr(&ttl, &stat_to_attr(&stat)),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -651,11 +627,9 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
-            // Stat-carrying create (one round trip on v2); the walked fid is
-            // present only on the fallback path, else it binds lazily.
-            match client.mkdir_stat(parent_fid, None, &name, mode, gid).await {
-                Ok((walked, stat)) => {
-                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+            match client.mkdir_attr(parent_fid, &name, mode, gid).await {
+                Ok(stat) => {
+                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -700,11 +674,11 @@ impl Filesystem for Fuse9P {
                 }
             };
             match client
-                .mknod_stat(parent_fid, None, &name, mode, major, minor, gid)
+                .mknod_attr(parent_fid, &name, mode, major, minor, gid)
                 .await
             {
-                Ok((walked, stat)) => {
-                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+                Ok(stat) => {
+                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -740,12 +714,9 @@ impl Filesystem for Fuse9P {
                     return;
                 }
             };
-            match client
-                .symlink_stat(parent_fid, None, &name, &target, gid)
-                .await
-            {
-                Ok((walked, stat)) => {
-                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+            match client.symlink_attr(parent_fid, &name, &target, gid).await {
+                Ok(stat) => {
+                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -829,10 +800,9 @@ impl Filesystem for Fuse9P {
                 reply.error(Errno::ESTALE);
                 return;
             };
-            // Stat-carrying link (one round trip on v2, with the updated nlink).
-            match client.link_stat(dir_fid, None, file_fid, &newname).await {
-                Ok((walked, stat)) => {
-                    let attr = register_entry(&client, &inodes, uid, walked, &stat).await;
+            match client.link_attr(dir_fid, file_fid, &newname).await {
+                Ok(stat) => {
+                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -841,10 +811,7 @@ impl Filesystem for Fuse9P {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        // Fold the first read into the open (.zerofs5) for a plain read-only,
-        // non-truncating open: those reliably read from the start, while writable or
-        // O_TRUNC opens may never read or are about to zero the file. Strict
-        // consistency disables the fold (it serves open-time bytes on a later read).
+        // Prefetch applies to relaxed, read-only, non-truncating opens.
         let raw = flags.0;
         let prefetch = if !self.strict
             && (raw & libc::O_ACCMODE) == libc::O_RDONLY
@@ -881,15 +848,9 @@ impl Filesystem for Fuse9P {
         reply: ReplyData,
     ) {
         let fid = fh.0 as u32;
-        // Serve a folded-in read (.zerofs5) from the open's prefetch. The buffer is
-        // the whole file, so a slice shorter than `size` is a legitimate EOF. Once a
-        // read reaches its end the buffer is consumed and dropped; a read starting
-        // past it (a file grown elsewhere since open) drops it and goes to the server.
+        // Prefetch expiry matches the attribute cache. Reads past it reach the server.
         if let Some(entry) = self.prefetch.get(&fh.0) {
             let (fetched, buf) = entry.value();
-            // Bound the fold's staleness to the attribute-cache TTL: a buffer whose
-            // first read arrives late (an open that read much later) is dropped and
-            // served fresh from the server rather than handing back open-time bytes.
             if fetched.elapsed() <= self.ttl && (offset as usize) <= buf.len() {
                 let start = offset as usize;
                 let end = (start + size as usize).min(buf.len());
@@ -1074,12 +1035,6 @@ impl Filesystem for Fuse9P {
         mut reply: ReplyDirectoryPlus,
     ) {
         let client = Arc::clone(&self.client);
-        // Capability is only advertised when the server supports it, but guard
-        // anyway: ENOSYS makes the kernel fall back to plain readdir.
-        if !client.extensions_enabled() {
-            reply.error(Errno::ENOSYS);
-            return;
-        }
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
         let fid = fh.0 as u32;
@@ -1179,55 +1134,27 @@ impl Filesystem for Fuse9P {
                 }
             };
 
-            // Create-and-open on a fresh fid (Tlcreateattr on v2, where the
-            // stat comes free; clone + lcreate otherwise).
             let nf = client.alloc_fid();
-            let open_fid = match client
-                .create_open(parent_fid, nf, &name, lflags, mode, gid)
+            match client
+                .lcreateattr(parent_fid, nf, &name, lflags, mode, gid)
                 .await
             {
-                Ok((open_fid, Some(stat), _iounit)) => {
+                Ok((stat, _iounit)) => {
                     let new_ino = ino_of(stat.qid.path);
                     register_lookup(&inodes, new_ino);
                     if let Some(mut e) = inodes.get_mut(&new_ino) {
-                        e.handles.insert(open_fid);
+                        e.handles.insert(nf);
                     }
                     reply.created(
                         &ttl,
                         &stat_to_attr(&stat),
                         Generation(0),
-                        FileHandle(open_fid as u64),
+                        FileHandle(nf as u64),
                         open_flags,
                     );
-                    return;
                 }
-                Ok((open_fid, None, _iounit)) => open_fid,
                 Err(e) => {
                     client.free_fid(nf);
-                    reply.error(errno(&e));
-                    return;
-                }
-            };
-
-            // Fallback path carried no stat: register a separate path fid for
-            // the inode so future lookups and getattrs work after this handle
-            // is released.
-            match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
-                Ok(attr) => {
-                    if let Some(mut e) = inodes.get_mut(&attr.ino.0) {
-                        e.handles.insert(open_fid);
-                    }
-                    reply.created(
-                        &ttl,
-                        &attr,
-                        Generation(0),
-                        FileHandle(open_fid as u64),
-                        open_flags,
-                    );
-                }
-                Err(e) => {
-                    let _ = client.clunk(open_fid).await;
-                    client.free_fid(open_fid);
                     reply.error(errno(&e));
                 }
             }
@@ -1610,12 +1537,7 @@ impl Fuse9P {
                     return;
                 }
             };
-            // Open on a fresh fid, leaving the inode fid untouched (Tlopenat
-            // on v2, clone + lopen otherwise); a refused writeback upgrade is
-            // retried with the original flags. A read-only open additionally folds
-            // in the first read (.zerofs5); `prefetch` is the window (0 = none), and
-            // the writeback upgrade only applies to writable opens, so the two paths
-            // are mutually exclusive.
+            // Keep the inode fid stable across compound-open fallback.
             let nf = client.alloc_fid();
             let opened = if prefetch > 0 {
                 client
@@ -1625,21 +1547,21 @@ impl Fuse9P {
                 client
                     .open_clone(inode_fid, nf, lflags, upgrade.then_some(orig))
                     .await
-                    .map(|(fid, qid, iounit)| (fid, qid, iounit, None))
+                    .map(|(qid, iounit)| (qid, iounit, None))
             };
             match opened {
-                Ok((fid, _, _, buf)) => {
+                Ok((_qid, _iounit, buf)) => {
                     // Track the open handle so a verified fsync of this inode (through
                     // ANY of its handles) presents this one's un-fsync'd writes too.
                     if let Some(mut e) = inodes.get_mut(&ino) {
-                        e.handles.insert(fid);
+                        e.handles.insert(nf);
                     }
                     // Stash the folded-in bytes for `read` to serve, keyed by the
                     // handle, stamped now so a late first read can expire it.
                     if let Some(buf) = buf {
-                        prefetch_map.insert(fid as u64, (Instant::now(), buf));
+                        prefetch_map.insert(nf as u64, (Instant::now(), buf));
                     }
-                    reply.opened(FileHandle(fid as u64), open_flags);
+                    reply.opened(FileHandle(nf as u64), open_flags);
                 }
                 Err(e) => {
                     client.free_fid(nf);
@@ -1723,47 +1645,10 @@ impl Fuse9P {
 
 async fn connect(target: &str, msize: u32) -> Result<Arc<NinePClient>> {
     // A comma-separated list is an HA node set (dials the leader, re-routes on failover).
-    let mut targets = Vec::new();
-    for spec in target.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        targets.push(parse_target(spec).await?);
-    }
-    if targets.is_empty() {
-        anyhow::bail!("no 9P target given");
-    }
+    let targets = Target::parse_list(target).map_err(anyhow::Error::msg)?;
     NinePClient::connect_multi(targets, msize)
         .await
         .with_context(|| format!("connecting to 9P server(s) {target}"))
-}
-
-/// Parse one 9P target spec into a dial [`Target`]: `unix:/path`,
-/// `tcp://host:port`, a bare `host:port`, or a path-like value (a Unix socket).
-async fn parse_target(spec: &str) -> Result<Target> {
-    if let Some(rest) = spec.strip_prefix("unix:") {
-        let path = rest.strip_prefix("//").unwrap_or(rest);
-        return Ok(Target::Unix(path.into()));
-    }
-    let hostport = spec.strip_prefix("tcp://").unwrap_or(spec);
-    // A path-like target without a scheme is treated as a Unix socket.
-    if hostport.starts_with('/') || hostport.starts_with('.') {
-        return Ok(Target::Unix(hostport.into()));
-    }
-    Ok(Target::Tcp(resolve_addr(hostport).await?))
-}
-
-async fn resolve_addr(s: &str) -> Result<std::net::SocketAddr> {
-    if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
-        return Ok(addr);
-    }
-    let with_port = if s.contains(':') {
-        s.to_string()
-    } else {
-        format!("{s}:{DEFAULT_9P_PORT}")
-    };
-    tokio::net::lookup_host(&with_port)
-        .await
-        .with_context(|| format!("resolving {with_port}"))?
-        .next()
-        .ok_or_else(|| anyhow!("no addresses resolved for {with_port}"))
 }
 
 async fn wait_for_signal() {
@@ -2135,7 +2020,6 @@ mod client_tests {
     #[tokio::test]
     async fn atomic_fallocate_modes_roundtrip() {
         let (client, shutdown, _dir, _sock) = setup().await;
-        assert!(client.fallocate_enabled());
         client
             .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
             .await
@@ -2232,17 +2116,9 @@ mod client_tests {
         shutdown.cancel();
     }
 
-    /// The fast-path extensions: the real connect path negotiates `9P2000.L.zerofs`,
-    /// `walk_getattr` matches a separate walk+getattr, and `readdirplus` returns
-    /// each entry with its correct stat.
     #[tokio::test]
     async fn walk_getattr_and_readdirplus() {
         let (client, shutdown, _dir, _sock) = setup().await;
-        assert!(
-            client.extensions_enabled(),
-            "server should negotiate the .zerofs extensions"
-        );
-
         client
             .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
             .await
@@ -2324,18 +2200,10 @@ mod client_tests {
         shutdown.cancel();
     }
 
-    /// The `.zerofs5` open+first-read fold: `lopenatread` opens on a fresh fid (leaving
-    /// the source untouched) and returns the start of the file. A file within the
-    /// window comes back whole with eof set; a larger file returns a prefix with eof
-    /// clear, and the opened fid still reads the remainder normally. The
-    /// `open_clone_prefetch` wrapper keeps a whole-file buffer and drops a partial one.
+    /// Partial open prefetch falls back to the opened fid.
     #[tokio::test]
     async fn open_read_fold() {
         let (client, shutdown, _dir, _sock) = setup().await;
-        assert!(
-            client.extensions_v5_enabled(),
-            "server should negotiate the .zerofs5 open+read fold"
-        );
         client
             .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
             .await
@@ -2417,7 +2285,7 @@ mod client_tests {
         // The wrapper keeps a whole-file buffer for a small file...
         let w1 = inode_fid(&client, b"small.txt").await;
         let o1 = client.alloc_fid();
-        let (_f, _q, _i, buf) = client
+        let (_q, _i, buf) = client
             .open_clone_prefetch(w1, o1, libc::O_RDONLY as u32, 1024)
             .await
             .unwrap();
@@ -2429,7 +2297,7 @@ mod client_tests {
         // ...and drops a partial prefetch of a large file (the mount reads normally).
         let w2 = inode_fid(&client, b"big.txt").await;
         let o2 = client.alloc_fid();
-        let (_f, _q, _i, buf) = client
+        let (_q, _i, buf) = client
             .open_clone_prefetch(w2, o2, libc::O_RDONLY as u32, 16)
             .await
             .unwrap();
@@ -2465,7 +2333,6 @@ mod client_tests {
         }
         let client = client.expect("client failed to connect");
         assert_eq!(client.msize(), msize, "server honors the small msize");
-        assert!(client.extensions_v5_enabled());
         client
             .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
             .await
@@ -2525,18 +2392,9 @@ mod client_tests {
         shutdown.cancel();
     }
 
-    /// The v2 compound extensions: `lcreateattr` creates+opens+stats in one
-    /// message without consuming the directory fid, `lopenat` opens on a fresh
-    /// fid leaving its source untouched, and the *attr create-family/setattr
-    /// replies carry stats that match a separate walk+getattr.
     #[tokio::test]
     async fn compound_create_open_and_attr_replies() {
         let (client, shutdown, _dir, _sock) = setup().await;
-        assert!(
-            client.extensions_v2_enabled(),
-            "server should negotiate the .zerofs2 extensions"
-        );
-
         client
             .attach(ROOT_FID_TEST, NOFID, "root", "", 0)
             .await
@@ -2599,7 +2457,6 @@ mod client_tests {
         assert_eq!(post.mode & 0o7777, 0o600);
         assert_eq!(post.qid.path, stat.qid.path);
 
-        // The remaining create-family fast paths reply with full stats.
         let dstat = client
             .mkdir_attr(ROOT_FID_TEST, b"dir", libc::S_IFDIR | 0o755, 0)
             .await
@@ -2632,9 +2489,7 @@ mod client_tests {
         shutdown.cancel();
     }
 
-    /// Fids created through the v2 compound messages must be recorded for
-    /// reconnect replay exactly like their multi-message equivalents: both an
-    /// lcreateattr handle and an lopenat handle survive a server restart.
+    // Compound fids require replay records.
     #[tokio::test]
     async fn reconnect_replays_compound_fids() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
