@@ -109,7 +109,7 @@
   restarts, so callers wait for this to increase, not to be non-zero."
   [db]
   (try (->> (slurp (get-in db [:nodes :a :log]))
-            (re-seq #"connected to standby")
+            (re-seq #"HA standby connected; replication resumed")
             count)
        (catch java.io.IOException _ 0)))
 

@@ -405,7 +405,10 @@ async fn run_expiry_reaper(
 impl DedupCache {
     /// Create an empty ledger with the protocol retention period.
     pub fn new() -> Self {
-        Self::new_with_clock(OP_ID_RETENTION, Arc::new(Instant::now))
+        Self::new_with_clock(
+            OP_ID_RETENTION,
+            Arc::new(|| tokio::time::Instant::now().into_std()),
+        )
     }
 
     fn new_with_clock(retention: Duration, now: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
@@ -949,6 +952,16 @@ mod tests {
         assert!(cache.get(&id(2)).is_none());
         assert!(cache.is_empty());
         drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_cache_uses_the_runtime_clock() {
+        let cache = Arc::new(DedupCache::new());
+        cache.start_expiry_reaper();
+        cache.record_result(id(1), DedupResult::Applied);
+
+        tokio::time::advance(OP_ID_RETENTION).await;
+        wait_for_retained_results(&cache, 0).await;
     }
 
     #[tokio::test(start_paused = true)]
