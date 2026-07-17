@@ -386,6 +386,13 @@ impl Db {
         !self.is_deposed()
     }
 
+    /// Permanently revokes the attached HA serving lease.
+    pub fn revoke_lease(&self) {
+        if let Some(lease) = &self.lease {
+            lease.revoke();
+        }
+    }
+
     /// True once no longer the serving leader: the lease is invalid, or the data
     /// db has been closed (fenced by a takeover).
     #[inline]
@@ -925,8 +932,10 @@ mod lease_gate_tests {
         lease.renew(Duration::from_millis(500));
         assert!(db.get_bytes(&key).await.unwrap().is_none());
 
-        // Revoked: refused again.
-        lease.invalidate();
+        db.revoke_lease();
+        lease.renew(Duration::from_millis(500));
+        assert!(!lease.is_valid(), "revocation must be terminal");
+
         assert!(
             db.get_bytes(&key).await.is_err(),
             "read must be refused after the lease is revoked"
