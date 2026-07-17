@@ -4,7 +4,7 @@
 //! are the hard guarantees.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Monotonic-clock validity checked on the read and write path. `valid_until_ms`
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub struct Lease {
     base: Instant,
     valid_until_ms: AtomicU64,
+    revoked: AtomicBool,
 }
 
 impl Lease {
@@ -19,6 +20,7 @@ impl Lease {
         Arc::new(Self {
             base: Instant::now(),
             valid_until_ms: AtomicU64::new(0),
+            revoked: AtomicBool::new(false),
         })
     }
 
@@ -28,15 +30,23 @@ impl Lease {
 
     /// Valid for `ttl` from now. Never stores 0 (reserved for "invalid").
     pub fn renew(&self, ttl: Duration) {
+        if self.revoked.load(Ordering::Acquire) {
+            return;
+        }
         let until = self.now_ms().saturating_add(ttl.as_millis() as u64).max(1);
         self.valid_until_ms.store(until, Ordering::Release);
     }
 
-    pub fn invalidate(&self) {
+    /// Permanently revokes the lease.
+    pub fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
         self.valid_until_ms.store(0, Ordering::Release);
     }
 
     pub fn is_valid(&self) -> bool {
+        if self.revoked.load(Ordering::Acquire) {
+            return false;
+        }
         let until = self.valid_until_ms.load(Ordering::Acquire);
         until != 0 && self.now_ms() < until
     }
@@ -69,7 +79,7 @@ pub async fn run_lease_from_status(
                      and stepping down"
                 ),
             }
-            lease.invalidate();
+            lease.revoke();
             return;
         }
         lease.renew(lease_ttl);
@@ -79,7 +89,7 @@ pub async fn run_lease_from_status(
             }
             res = status.changed() => {
                 // Channel closed: the data db was dropped, so stop serving.
-                if res.is_err() { lease.invalidate(); return; }
+                if res.is_err() { lease.revoke(); return; }
             }
             _ = tokio::time::sleep(renew_interval) => {}
         }
@@ -104,8 +114,10 @@ mod tests {
         lease.renew(Duration::from_millis(60));
         assert!(lease.is_valid());
 
-        lease.invalidate();
-        assert!(!lease.is_valid(), "invalidate revokes immediately");
+        lease.revoke();
+        assert!(!lease.is_valid(), "revoke takes effect immediately");
+        lease.renew(Duration::from_millis(60));
+        assert!(!lease.is_valid(), "revocation is terminal");
     }
 
     async fn open_db(name: &str) -> slatedb::Db {

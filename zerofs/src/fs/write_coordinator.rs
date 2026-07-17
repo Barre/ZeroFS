@@ -349,20 +349,20 @@ async fn worker_loop(
             (true, Some(repl)) => Some(repl.ship(&repl_ops, &batch_op_ids).await),
             _ => None,
         };
-        // Rejection is deposal evidence. Fail the batch and force a manifest
-        // update so fencing closes the database without waiting for its poller.
+        // Peer rejection proves this batch was not appended or applied locally.
+        // Revoke serving authority before returning the clean failure.
         let (shipped_seqno, ran_solo) = match ship_outcome {
             Some(ShipOutcome::Deposed) => {
                 tracing::error!(
                     "HA: standby rejected a ship: this leader is deposed; failing the \
                      batch and stepping down"
                 );
-                let _ = ctx.flush_coordinator.flush().await;
+                ctx.db.revoke_lease();
                 if counter_staged {
                     ctx.inode_store.allocate();
                 }
                 for reply in replies {
-                    let _ = reply.send(Err(FsError::IoError));
+                    let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
                 }
                 continue;
             }
@@ -846,12 +846,19 @@ mod tests {
 
         let codec = codec();
         let key = codec.extent_key(1, 0);
+        let flushes_before = fs.flush_coordinator.completed_flush_count();
         let mut txn = Transaction::new();
         txn.put_bytes(&key, Bytes::from_static(b"v"));
-        coord
+        let error = coord
             .commit(txn)
             .await
             .expect_err("a deposed leader must fail the batch, not ack it");
+        assert_eq!(error, FsError::LeaderRejectedBeforeApply);
+        assert_eq!(
+            fs.flush_coordinator.completed_flush_count(),
+            flushes_before,
+            "a stale writer must not flush after peer rejection"
+        );
         assert!(
             fs.db.get_bytes(&key).await.unwrap().is_none(),
             "a deposed leader must not apply the rejected batch"
@@ -860,7 +867,10 @@ mod tests {
         // Deposal is terminal: later batches fail too.
         let mut txn = Transaction::new();
         txn.put_bytes(&codec.extent_key(1, 1), Bytes::from_static(b"w"));
-        coord.commit(txn).await.expect_err("deposal must be sticky");
+        assert_eq!(
+            coord.commit(txn).await.expect_err("deposal must be sticky"),
+            FsError::LeaderRejectedBeforeApply
+        );
     }
 
     // The first shipped batch after a solo episode carries the stamp (solo=0)
