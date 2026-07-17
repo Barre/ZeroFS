@@ -1373,7 +1373,7 @@ impl Filesystem for Fuse9P {
                     fid: LOCAL_LOCK_FID,
                     inode_id: ino,
                 };
-                if locks.try_add_lock(owner, new_lock).is_none() {
+                if !locks.try_add_lock(owner, new_lock) {
                     if sleep {
                         tokio::time::sleep(LOCK_POLL).await;
                         continue;

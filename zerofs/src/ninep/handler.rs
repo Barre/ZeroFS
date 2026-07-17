@@ -1733,11 +1733,7 @@ impl NinePHandler {
             inode_id: slot.fid.inode_id,
         };
 
-        if self
-            .lock_manager
-            .try_add_lock(self.handler_id, new_lock)
-            .is_none()
-        {
+        if !self.lock_manager.try_add_lock(self.handler_id, new_lock) {
             debug!("Lock conflict on inode {}", slot.fid.inode_id);
             if (tl.flags & P9_LOCK_FLAGS_BLOCK) != 0 {
                 return Ok(Message::Rlock(Rlock {
