@@ -17,39 +17,36 @@ export const sections = [
 
 # 9P Protocol Extensions
 
-ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own client negotiates a set of private extensions on top of it: fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, durability-aware fsync, and atomic fallocate operations. This page documents what each one does and how it is framed on the wire. {{ className: 'lead' }}
+ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own client selects one private dialect, `9P2000.L.Z`, which includes fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, durability-aware fsync, and atomic fallocate operations. This page documents what that dialect does and how it is framed on the wire. {{ className: 'lead' }}
 
 ## Overview {{ id: 'overview' }}
 
-The extensions are transparent. A stock kernel 9P client never proposes them, so it negotiates plain `9P2000.L` and behaves exactly as it would against any other 9P server. ZeroFS's own clients use them: [`zerofs mount`](/9p-access#mounting-with-zerofs-mount), the [client libraries](/client-libraries), and the [Web UI file manager](/web-ui#9p-on-the-web) all use the same `zerofs-client` core (compiled to WebAssembly in the browser), so they share one set of capabilities and one negotiation path.
+The private dialect is separate from plain 9P2000.L. A stock kernel 9P client proposes `9P2000.L` and receives the standard protocol. ZeroFS's own clients propose `9P2000.L.Z`: [`zerofs mount`](/9p-access#mounting-with-zerofs-mount), the [client libraries](/client-libraries), and the [Web UI file manager](/web-ui#9p-on-the-web) all use the same `zerofs-client` core (compiled to WebAssembly in the browser), so they share one wire format and one negotiation path.
 
 Every extension was added to remove a specific cost in the standard protocol:
 
 - 9P2000.L makes the client walk a path and then stat it, or open a file and then read it, as separate requests. The fast paths fold those pairs into one round trip.
 - 9P2000.L has no way to retry a mutating request safely: a `mkdir` whose reply was lost cannot be re-sent without risking a double-apply. An op-id makes retries idempotent.
-- A reconnecting client cannot re-bind a fid to a file that was renamed while it was disconnected. Rebinding by inode id fixes that.
+- A reconnecting client cannot re-bind a fid to a still-linked file that was renamed while it was disconnected. Rebinding by inode id fixes that.
 - 9P `Tfsync` returns success whether or not the connection's writes are still the live durable copy. The durability-verified variant returns success only when they are.
 - 9P2000.L has no fallocate request. `Tfallocate` carries Linux range-allocation modes to an atomic server-side operation.
 
 ## Negotiation {{ id: 'negotiation' }}
 
-Capabilities are negotiated as part of the standard `Tversion`/`Rversion` exchange. The client proposes the highest level it supports as a single version string; the server echoes back the highest level it can honor. Levels are cumulative and the suffixes stack, so the client offers `9P2000.L.zerofs6.zerofs5.zerofs4.zerofs3` and an older server that only understands `.zerofs` replies with that, leaving the client to degrade rather than send messages the server cannot parse. Matching is by substring, so each side independently recognizes the levels it knows.
+Dialect selection happens in the standard `Tversion`/`Rversion` exchange. There are exactly two accepted version strings:
 
-| Level | Version string | Adds |
-| --- | --- | --- |
-| base | `9P2000.L` | Standard Linux 9P. What a stock kernel client gets. |
-| 1 | `9P2000.L.zerofs` | Fast paths: `Twalkgetattr` (walk + getattr) and `Treaddirattr` (readdirplus). |
-| 2 | `9P2000.L.zerofs2` | Compound create/open messages and stat-carrying mutation replies. |
-| 3 | `9P2000.L.zerofs3` | Per-request idempotency op-id in the frame, for safe retry. |
-| 4 | `9P2000.L.zerofs4` | Durability-verified fsync (`Tgetlineage`, `Tfsyncdur`). |
-| 5 | `9P2000.L.zerofs5` | Folds a file open and its first read into one round trip. |
-| 6 | `9P2000.L.zerofs6` | Atomic fallocate operations (`Tfallocate`). |
+| Version string | Protocol |
+| --- | --- |
+| `9P2000.L` | Standard Linux 9P, used by stock kernel clients. |
+| `9P2000.L.Z` | The complete current ZeroFS-private dialect, including every feature on this page. |
+
+The bundled client proposes exactly `9P2000.L.Z` and requires the server to echo that exact string. The name is indivisible: `.Z` identifies the current ZeroFS wire generation layered on the Linux dialect; it is not a capability list, and there is no substring matching or downgrade to a partial private protocol. A released server that recognizes only an older `.zerofs*` layout will answer with a different token, so negotiation fails cleanly before either side decodes an incompatible frame. A future incompatible generation will use a new token such as `.Z2`. This remains a private interface; upgrade the client, server, Web UI, and HA peers as one release set.
 
 <Note>
-The negotiated level describes protocol support. `ignore_fsync` does not lower it: that setting is an explicit administrator opt-out that makes both `Tfsync` and `Tfsyncdur` return without forcing stable storage.
+`ignore_fsync` does not select a different dialect. It is an explicit administrator opt-out that makes both `Tfsync` and `Tfsyncdur` return without forcing stable storage.
 </Note>
 
-The op-id at level 3 is spliced into the frame only on the request types that carry one, and only once both peers have negotiated `.zerofs3`. An older peer never sees the extra bytes, so standard framing is byte-for-byte unchanged for it. The fid rebinding extension (`Trebind`) is not gated by a version level: it is a private message the bundled client sends only after a reconnect, and the server accepts it from any session.
+Selecting `9P2000.L.Z` enables the whole private type set and the mutation envelope described below. A plain `9P2000.L` session uses standard framing and cannot send the private messages. There is no feature-by-feature negotiation within the private dialect.
 
 ## Fewer round trips {{ id: 'round-trips' }}
 
@@ -76,12 +73,12 @@ DirEntryPlus  qid[13] offset[8] type[1] name[s] stat[Stat]
 
 ### Compound create and open
 
-Level 2 adds messages that fold a fixed client-side sequence into one round trip:
+The private dialect adds messages that fold a fixed client-side sequence into one round trip:
 
 - `Tlopenat` is `Twalk(clone) + Tlopen`. It opens `fid`'s inode on a fresh `newfid` and leaves `fid` untouched, so the client keeps a handle on the directory it walked from.
 - `Tlcreateattr` is `Twalk(clone) + Tlcreate + Tgetattr`. It creates and opens the child on `newfid` (without mutating the directory fid, unlike plain `Tlcreate`) and returns the child's full stat.
 
-The remaining level-2 messages reuse the standard request layout but reply with the post-operation stat that the server computes anyway and the standard reply throws away: `Tmkdirattr`, `Tsymlinkattr`, `Tmknodattr`, `Tlinkattr`, and `Tsetattrattr`. Without them the client has to follow every create or attribute change with a `Tgetattr` to refresh its cache.
+The remaining stat-carrying messages reuse the standard request layout but reply with the post-operation stat that the server computes anyway and the standard reply throws away: `Tmkdirattr`, `Tsymlinkattr`, `Tmknodattr`, `Tlinkattr`, and `Tsetattrattr`. Without them the client has to follow every create or attribute change with a `Tgetattr` to refresh its cache.
 
 ```text {{ title: 'Tlopenat / Rlopenat' }}
 Tlopenat  fid[4] newfid[4] flags[4]
@@ -90,7 +87,7 @@ Rlopenat  qid[13] iounit[4]
 
 ### Open then read
 
-Level 5 goes one step further for reads. `Tlopenatread` opens `fid`'s inode on `newfid` exactly like `Tlopenat`, and also prefetches up to `count` bytes from offset 0 in the same round trip. A file that fits in the prefetch window is read with no follow-up `Tread` at all.
+`Tlopenatread` goes one step further for reads. It opens `fid`'s inode on `newfid` exactly like `Tlopenat`, and also prefetches up to `count` bytes from offset 0 in the same round trip. A file that fits in the prefetch window is read with no follow-up `Tread` at all.
 
 The inline read is best-effort and never affects the open. On a read error the reply still carries the open result with empty data, and the client falls back to a normal `Tread`. The `eof` flag tells the client whether `data` reached the end of the file: when set, the whole file fit in `count` and the client may serve the file's reads entirely from the prefetched buffer; when clear, it discards the partial prefetch and reads normally.
 
@@ -103,41 +100,49 @@ Rlopenatread  qid[13] iounit[4] eof[1] count[4] data[count]
 
 Standard 9P has no safe way to retry a mutating request. If a `Tmkdir` is sent and the connection drops before its reply arrives, the client cannot know whether the server applied it. Re-sending risks a double-apply (a second `mkdir` that fails with `EEXIST`, or worse, a second `rename` or `unlink` that acts on the wrong state). This matters most for the bundled client, which [reconnects on its own](/9p-access#mounting-with-zerofs-mount) and would otherwise have to surface an error for every in-flight mutation at the moment a server restarts.
 
-Level 3 attaches a 16-byte idempotency op-id to each non-idempotent mutation. The op-id is deliberately not part of the message body. It is spliced into the frame immediately after the tag, so existing encode and decode paths keep producing and parsing standard frames and the op-id is simply absent when `.zerofs3` is not negotiated.
+The private dialect attaches a 25-byte operation envelope to every reorder-sensitive mutation. The envelope is outside the message body: it appears immediately after the tag, and the frame's `size` includes it.
 
-```text {{ title: 'Frame layout under .zerofs3' }}
-standard      size[4] type[1] tag[2] body...
-with op-id    size[4] type[1] tag[2] op_id[16] body...
-                                     ^ spliced after the 7-byte header,
-                                       on request types that carry one
+```text {{ title: 'ZeroFS mutation frame' }}
+ordinary request   size[4] type[1] tag[2] body...
+covered mutation   size[4] type[1] tag[2] op_id[16] flags[1] origin_epoch[8] body...
+                                            ^ 25 bytes after the standard
+                                              7-byte header
 ```
 
-The server keeps a bounded cache keyed by op-id. The first time it sees an op-id it applies the operation and records the reply; a retry carrying the same op-id returns the recorded reply without re-applying. Concurrent retries of the same op-id are serialized through a single-flight gate, so two copies in flight at once still apply exactly once. An all-zero op-id means "no dedup requested" and always applies.
+`op_id` identifies one logical mutation. A frame with no flag bits set is its initial attempt (`FIRST`); after that attempt becomes ambiguous, every resend sets the `RETRY` bit and retains both the op-id and its original writer epoch. In standalone mode `origin_epoch` is zero. In HA it lets a coverage-proven direct successor recognize a retry that originated at its fenced predecessor.
 
-Only the non-idempotent mutations carry an op-id: the create family (`Tlcreate`, `Tsymlink`, `Tmknod`, `Tmkdir`, `Tlink`), `Trename`, `Trenameat`, `Tunlinkat`, and their level-2 compound forms. Operations that are already idempotent (reads, walks, attach, clunk, write, setattr, fallocate, and `Tlopenat`) are left out, so they pay nothing. The supported fallocate modes are idempotent with respect to file data, size, and quota; range-shifting modes are not supported.
+The server keeps a time-bounded ledger keyed by op-id. It serializes concurrent copies through a single-flight gate and retains each completed operation's exact result, including errors, so a known retry receives the original outcome without applying again. An unseen `RETRY` fails closed with `ESTALE` rather than being reinterpreted as new work, except during the narrowly scoped promotion window for the named predecessor epoch. An all-zero envelope opts out of deduplication.
 
-The op-id is what makes `zerofs mount` reconnect cleanly. On a dropped connection the client re-sends in-flight mutations with their original op-ids, and the [client-side failover path](/high-availability) keeps a stable op-id across a re-route so a retried `mkdir` or `rename` applies once even when the request lands on a different node after a failover.
+Automatic retry is bounded: the bundled client retries one ambiguous op-id for up to 120 seconds, while the server keeps its completed result for an additional 30-second margin. Both values come from the same static timing policy as client recovery and HA handoff, which checks that the retry horizon covers their conservative 108-second recovery budget. If the result is still unknown at the horizon, the client reports an ambiguous disconnect instead of starting a fresh attempt that might apply twice.
+
+The covered requests are the create family (`Tlcreate`, `Tsymlink`, `Tmknod`, `Tmkdir`, and `Tlink`), `Trename`, `Trenameat`, `Tunlinkat`, `Twrite`, `Tsetattr`, `Tfallocate`, and the stat-carrying create and setattr variants. Writes, setattr, and fallocate are included even where repeating the operation would produce the same immediate state: a delayed copy could otherwise execute after a later mutation and roll state backward. Reads, walks, attach, clunk, and the open-only fast paths carry no envelope.
+
+The envelope is what makes `zerofs mount` reconnect cleanly. On a dropped connection the client re-sends in-flight mutations with their original attempt state, and the [client-side failover path](/high-availability) preserves it across a re-route so a retried write, create, or rename has one authoritative outcome even when it reaches a successor after failover.
 
 ## Reconnect by inode id {{ id: 'reconnect' }}
 
-When the bundled client reconnects, it has to rebuild its open fids on the new session. Re-walking the original paths does not work if a file was renamed or had its last path link removed while the client was disconnected. `Trebind` binds a fresh fid directly to an inode by its server-assigned id rather than by a path, so a handle survives a rename or a hardlink shuffle across the outage.
+When the bundled client reconnects, it has to rebuild its open fids on the new session. Re-walking the original path does not work if a still-linked file was renamed. `Trebind` binds a fresh fid directly to an inode by its server-assigned id rather than by a path, so linked open handles survive a rename or hardlink shuffle across the outage.
 
 ```text {{ title: 'Trebind / Rrebind' }}
-Trebind  fid[4] inode_id[8] n_uname[4]
+Trebind  fid[4] inode_id[8] root_inode[8] flags[1] uname[s] n_uname[4]
 Rrebind  qid[13]
 ```
 
-The server only honors a rebind for an inode that is still reachable under the session's attach root, so the extension cannot be used to escape the directory the session attached to. This is a private message the bundled client sends only during reconnect; it is not tied to a version level.
+`root_inode` preserves the immutable attach root that governed the old fid, while `uname` and `n_uname` reconstruct its credentials. A root-self request first re-establishes an attach root by stable inode id, so renaming that directory during the outage does not strand the session. The `REPLAY` flag marks automatic session recovery. `OPENED` is valid only together with `REPLAY`; it marks a fid whose open state the client will restore after rebinding it.
+
+The server verifies that a rebound inode is still available to the session governed by its declared attach root. Reconnect does not resurrect an inode whose final namespace link has been removed.
+
+An open-unlinked handle therefore belongs to its current connection. It continues to work after the unlink, as POSIX requires, but a later disconnect or failover makes it unrecoverable. Replay is an indivisible session transition: if any recorded open handle can no longer be rebound, the client permanently fails the entire logical session with `ESTALE` instead of publishing a partial recovery. This is session-wide, not a per-fid error; the caller must establish a new client or mount.
 
 ## Durability-verified fsync {{ id: 'durable-fsync' }}
 
-A plain 9P `Tfsync` returns `Rfsync` once the server has flushed, but it says nothing about whether the connection's writes are still the live durable copy. After a failover, an old leader can flush and report success for writes that a new leader has already superseded. Level 4 closes that gap by tying fsync to a durability lineage token.
+A plain 9P `Tfsync` returns `Rfsync` once the server has flushed, but it says nothing about whether the connection's writes are still the live durable copy. After a failover, an old leader can flush and report success for writes that a new leader has already superseded. The private dialect closes that gap by tying fsync to a durability lineage token.
 
-After negotiating `.zerofs4`, the client asks for its connection's lineage token once with `Tgetlineage` (off the hot path, sent at connect time). It then tracks the token of its oldest un-fsync'd write and presents it on `Tfsyncdur`. The server flushes and replies `Rfsync` only if that token is still the live durable lineage; otherwise it returns `Rlerror(ESTALE)`. A successful fsync therefore implies that every write the client acked before it is durable and will survive a crash or failover. A `0` token means the client has nothing un-fsync'd.
+At connect time, the client asks for the connection's lineage with `Tgetlineage`, off the hot path. `Rgetlineage` returns both the durability token and the current HA writer epoch. The client tracks the token of its oldest un-fsync'd write and presents it on `Tfsyncdur`; it copies the writer epoch into the operation envelopes described above. The server flushes and replies `Rfsync` only if the token is still the live durable lineage; otherwise it returns `Rlerror(ESTALE)`. A successful fsync therefore implies that every write the client acknowledged before it is durable and will survive a crash or failover. A `0` token means the client has nothing un-fsync'd, and a `0` writer epoch identifies a standalone server.
 
-```text {{ title: 'Durability-verified fsync (.zerofs4)' }}
+```text {{ title: 'Durability-verified fsync' }}
 Tgetlineage                          (empty body)
-Rgetlineage  token[8]
+Rgetlineage  token[8] writer_epoch[8]
 
 Tfsyncdur    fid[4] datasync[4] token[8]
              -> Rfsync            if token is the live durable lineage
@@ -148,7 +153,7 @@ This is the protocol-level half of the [durability and consistency](/durability)
 
 ## Atomic fallocate {{ id: 'fallocate' }}
 
-Level 6 adds `Tfallocate`, since standard 9P2000.L has no message for Linux `fallocate(2)`. The request targets an open file fid and carries the byte range and Linux mode bits. The server applies extent edits, logical-size growth, quota accounting, timestamps, and cached directory metadata in one transaction.
+The private dialect adds `Tfallocate`, since standard 9P2000.L has no message for Linux `fallocate(2)`. The request targets an open file fid and carries the byte range and Linux mode bits. The server applies extent edits, logical-size growth, quota accounting, timestamps, and cached directory metadata in one transaction.
 
 ```text {{ title: 'Tfallocate / Rfallocate' }}
 Tfallocate  fid[4] offset[8] length[8] mode[4]
@@ -159,26 +164,26 @@ Supported modes are plain allocation (`0`), `PUNCH_HOLE | KEEP_SIZE`, and `ZERO_
 
 ## Message reference {{ id: 'message-reference' }}
 
-Every extension message and its 9P type id. Reply types are paired with their request.
+Every private message and its 9P type id. Reply types are paired with their request, and all are available only in `9P2000.L.Z`.
 
-| Type | Message | Level | Purpose |
-| --- | --- | --- | --- |
-| 228 / 229 | `Tfallocate` / `Rfallocate` | 6 | Atomically allocate, punch, or zero a file range. |
-| 230 / 231 | `Tlopenatread` / `Rlopenatread` | 5 | Open plus first read in one round trip. |
-| 232 | `Tfsyncdur` | 4 | Durability-verified fsync (replies with `Rfsync`, type 51). |
-| 233 / 234 | `Tgetlineage` / `Rgetlineage` | 4 | Query the connection's durability lineage token. |
-| 236 / 237 | `Tlopenat` / `Rlopenat` | 2 | Walk-clone plus open in one round trip. |
-| 238 / 239 | `Tlcreateattr` / `Rlcreateattr` | 2 | Create and open a child, returning its stat. |
-| 240 / 241 | `Tmkdirattr` / `Rmkdirattr` | 2 | `mkdir` returning the new directory's stat. |
-| 242 / 243 | `Tsymlinkattr` / `Rsymlinkattr` | 2 | `symlink` returning the new link's stat. |
-| 244 / 245 | `Tmknodattr` / `Rmknodattr` | 2 | `mknod` returning the new node's stat. |
-| 246 / 247 | `Tlinkattr` / `Rlinkattr` | 2 | `link` returning the target's stat. |
-| 248 / 249 | `Tsetattrattr` / `Rsetattrattr` | 2 | `setattr` returning the post-change stat. |
-| 250 / 251 | `Trebind` / `Rrebind` | private | Bind a fresh fid to an inode by id, for reconnect. |
-| 252 / 253 | `Twalkgetattr` / `Rwalkgetattr` | 1 | Walk plus getattr in one round trip. |
-| 254 / 255 | `Treaddirattr` / `Rreaddirattr` | 1 | Readdirplus: entries with their stat inline. |
+| Type | Message | Purpose |
+| --- | --- | --- |
+| 228 / 229 | `Tfallocate` / `Rfallocate` | Atomically allocate, punch, or zero a file range. |
+| 230 / 231 | `Tlopenatread` / `Rlopenatread` | Open plus first read in one round trip. |
+| 232 | `Tfsyncdur` | Durability-verified fsync (replies with `Rfsync`, type 51). |
+| 233 / 234 | `Tgetlineage` / `Rgetlineage` | Query the durability lineage token and writer epoch. |
+| 236 / 237 | `Tlopenat` / `Rlopenat` | Walk-clone plus open in one round trip. |
+| 238 / 239 | `Tlcreateattr` / `Rlcreateattr` | Create and open a child, returning its stat. |
+| 240 / 241 | `Tmkdirattr` / `Rmkdirattr` | `mkdir` returning the new directory's stat. |
+| 242 / 243 | `Tsymlinkattr` / `Rsymlinkattr` | `symlink` returning the new link's stat. |
+| 244 / 245 | `Tmknodattr` / `Rmknodattr` | `mknod` returning the new node's stat. |
+| 246 / 247 | `Tlinkattr` / `Rlinkattr` | `link` returning the target's stat. |
+| 248 / 249 | `Tsetattrattr` / `Rsetattrattr` | `setattr` returning the post-change stat. |
+| 250 / 251 | `Trebind` / `Rrebind` | Bind a fresh fid to an inode by id during reconnect. |
+| 252 / 253 | `Twalkgetattr` / `Rwalkgetattr` | Walk plus getattr in one round trip. |
+| 254 / 255 | `Treaddirattr` / `Rreaddirattr` | Readdirplus: entries with their stat inline. |
 
-The op-id at level 3 is not a separate message. It is a 16-byte field carried in the frame of the mutating request types listed under [idempotent retries](#idempotent-retries).
+The operation envelope is not a separate message. It is a 25-byte framing field carried by the request types listed under [idempotent retries](#idempotent-retries).
 
 ---
 

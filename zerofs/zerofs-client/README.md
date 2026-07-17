@@ -1,8 +1,8 @@
 # zerofs-client
 
 An async, path-based Rust client for a [ZeroFS](https://github.com/Barre/ZeroFS)
-server. It speaks 9P2000.L over TCP or a unix socket, and uses the ZeroFS
-fast-path extensions automatically when the server offers them.
+server. It speaks the private `9P2000.L.Z` dialect over TCP or a unix
+socket.
 
 The primary surface is one-shot path operations on a shared `Client` (`read`,
 `write`, `stat`, `rename`, `mkdir`), with `File` and `Dir` handles where
@@ -10,8 +10,7 @@ statefulness pays off (chunked I/O, incremental listing, `openat`-style child
 operations). Paths are bytes, as on POSIX and the 9P wire: every path parameter
 is `impl AsRef<Path>`, so non-UTF-8 names work with no separate API.
 
-This is a trusted-network client: you assert your uid at connect time,
-NFS-style.
+The client asserts its uid at connect time and assumes a trusted network.
 
 ## Usage
 
@@ -29,7 +28,7 @@ async fn main() -> Result<(), zerofs_client::ZeroFsError> {
     assert_eq!(&data[..], b"hello from zerofs");
 
     for entry in fs.read_dir("/projects/demo").await? {
-        let size = entry.metadata.as_ref().map_or(0, |m| m.size);
+        let size = entry.metadata.size;
         println!("{size:>8}  {}", entry.name);
     }
 
@@ -52,24 +51,34 @@ async fn main() -> Result<(), zerofs_client::ZeroFsError> {
 - `host:port` / `host`: TCP (default port 5564)
 - a bare filesystem path (`/run/zerofs/9p.sock`, `./sock`): unix socket
 
+For an HA pair, pass both nodes as one comma-separated string:
+
+```rust
+let fs = Client::connect("node-a:5564,node-b:5564").await?;
+```
+
+The client races the targets to find the serving leader and re-probes the set
+after a disconnect. Rust callers that already hold separate strings can use
+`Client::connect_multi(&targets)`.
+
 Use `Client::connect_with` for explicit identity (`uid`/`gid`/`uname`), the
 attach subtree (`aname`), `msize`, and `connect_timeout_ms`.
 
 ## Lifecycles
 
-- **Close & drop.** `close()` marks the handle closed immediately (later calls
-  return `Closed`); it always succeeds, is idempotent, and never hangs. A
-  handle's server-side fid is released and its number recycled when the handle
-  is dropped (for scope-bound use, right after `close()`); dropping a handle you
-  never closed does the same. Fid numbers are always reused, so a long-running
-  client never exhausts them.
-- **Cancellation.** Every public future is cancel-safe: dropping it at any
-  await point leaks nothing. There is no per-operation timeout parameter; bound
-  waits with `tokio::time::timeout`.
-- **Connection loss.** The underlying session reconnects forever with backoff
-  and replays its state; while the server is unreachable, calls block rather
-  than fail. An op in flight at a disconnect is resent, so a non-idempotent op
-  (rename, create, unlink) can apply twice across a reconnect.
+- **Close and drop.** `close()` marks the handle closed and is idempotent and
+  non-blocking. Dropping the handle schedules its server fid for release and
+  recycling. Dropping an open handle performs the same cleanup.
+- **Cancellation.** Dropping a public future releases its client-side fids. A
+  dispatched mutation may still complete, leaving an ambiguous outcome.
+  Per-operation timeouts are supplied by the caller when this ambiguity is
+  acceptable.
+- **Connection loss.** The session reconnects with backoff and restores fids
+  and locks before accepting requests. Undispatched calls wait while no server
+  is reachable. In-flight mutations retain their operation envelope across
+  resends. Resends stop at the 120-second protocol horizon; unresolved outcomes
+  return an ambiguous connection failure. Open-unlinked handles are
+  connection-local and produce `ESTALE` after connection loss.
 
 ## Reads return `Bytes`
 
@@ -81,7 +90,7 @@ in functions returning `io::Result`.
 
 ## Features
 
-All feature-gated additions are Rust-only and never cross the FFI boundary.
+Feature-gated additions are Rust-only and are excluded from the FFI boundary.
 
 - `tokio-io` *(off by default)*: `File::cursor()` returning an `io::FileCursor`
   that implements `AsyncRead + AsyncWrite + AsyncSeek` over the positioned API,

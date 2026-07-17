@@ -19,6 +19,24 @@ calls that block on the cgo thread and return `(value, error)`. The crate opts
 out of `zerofs-client`'s default features; the Rust-only sugar (`tokio-io`
 cursor, `Stream`, serde) does not cross the FFI boundary.
 
+## Connecting to an HA pair
+
+`Client.connect` and `Client.connect_with` accept a comma-separated target set
+in every binding. The shared Rust core probes the nodes concurrently, connects
+to the serving leader, and re-probes the complete set after a disconnect.
+
+```python
+fs = await zerofs_client.Client.connect("node-a:5564,node-b:5564")
+```
+
+```typescript
+const fs = await Client.connect("node-a:5564,node-b:5564");
+```
+
+```go
+fs, err := zerofs.ClientConnect("node-a:5564,node-b:5564")
+```
+
 ## Generating bindings
 
 The bindings are generated from the compiled `cdylib`, not checked in. Build
@@ -158,7 +176,7 @@ async def main():
     await fs.write("/hello.txt", b"hi")
     print(await fs.read("/hello.txt"))
     for e in await fs.read_dir("/"):
-        print(e.name, e.metadata.size if e.metadata else "?")
+        print(e.name, e.metadata.size)
     await fs.close()
 
 asyncio.run(main())

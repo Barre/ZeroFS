@@ -25,7 +25,9 @@ Volumes are plain subdirectories of one directory on the gateway filesystem
   because the client probes both nodes, follows the serving leader, and
   transparently reconnects and replays its protocol state (open file handles,
   locks, the aname-rooted attach), so a failover or network blip does not
-  invalidate existing mounts.
+  invalidate existing mounts. Open handles whose final filesystem link has
+  already been removed are the exception: they are connection-local and make
+  the logical session stale if it reconnects.
 
 There is no staging step (`NodePublishVolume` mounts directly) and no attach
 step (`attachRequired: false`). Both `gateway` and `adminEndpoint` are
