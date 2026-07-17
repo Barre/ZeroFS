@@ -1139,10 +1139,21 @@ pub async fn validate_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault_store::{FaultControls, FaultStore};
+    use crate::retrying_object_store::RetryingObjectStore;
     use slatedb::object_store::memory::InMemory;
 
     fn store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    fn retrying_fault_store() -> (Arc<dyn ObjectStore>, Arc<FaultControls>) {
+        let (store, faults) = FaultStore::new(Arc::new(InMemory::new()));
+        let store: Arc<dyn ObjectStore> = store;
+        (
+            Arc::new(RetryingObjectStore::new(store)) as Arc<dyn ObjectStore>,
+            faults,
+        )
     }
 
     async fn seed_legacy(store: &Arc<dyn ObjectStore>, db_path: &str, epoch: u64, node_id: &str) {
@@ -1218,6 +1229,41 @@ mod tests {
         let opening = open_now(first).await;
         let active = activate(opening, 1).await.unwrap();
         assert!(validate_active(&store, "db", &active).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn retrying_store_preserves_inspection_and_claim_across_transient_errors() {
+        let (store, faults) = retrying_fault_store();
+
+        faults.fail_gets(1);
+        assert_eq!(inspect(&store, "db").await.unwrap().phase(), None);
+
+        faults.fail_gets(1);
+        faults.fail_puts(1);
+        let claim = claim(&store, "db", "node-a", false)
+            .await
+            .expect("transient marker errors must not abort the claim");
+        assert_eq!(claim.generation(), 1);
+        assert_eq!(
+            inspect(&store, "db").await.unwrap().phase(),
+            Some(LeaderRecordPhase::Claiming)
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_store_reconciles_an_applied_claim_with_a_lost_response() {
+        let (store, faults) = retrying_fault_store();
+        faults.fail_puts_after_apply(1);
+
+        let claim = claim(&store, "db", "node-a", false)
+            .await
+            .expect("the exact applied claim must survive a lost response");
+        assert_eq!(claim.generation(), 1);
+        assert_eq!(faults.put_count(), 2);
+        assert_eq!(
+            inspect(&store, "db").await.unwrap().phase(),
+            Some(LeaderRecordPhase::Claiming)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1312,7 +1358,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn only_one_contender_can_recover_an_abandoned_handoff_snapshot() {
-        let store = store();
+        let (store, faults) = retrying_fault_store();
         drop(claim(&store, "db", "node-a", false).await.unwrap());
         tokio::task::yield_now().await;
 
@@ -1325,7 +1371,10 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!first.is_finished() && !second.is_finished());
 
+        faults.fail_puts(1);
         tokio::time::advance(HANDOFF_STALE_AFTER).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         let first = first.await.expect("first contender task");
         let second = second.await.expect("second contender task");
         assert_eq!(

@@ -31,7 +31,7 @@ use tracing::info;
 /// State retained across role-election and writer-open retries.
 struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
-    /// Retrying store for direct ZeroFS I/O. SlateDB retries its own store I/O.
+    /// Retrying store for direct ZeroFS I/O, including pre-serving HA marker coordination.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
@@ -318,7 +318,7 @@ impl StartupContext {
             && !params.peers.is_empty()
         {
             let marker = crate::replication::leader_record::inspect(
-                &self.object_store,
+                &self.retrying_object_store,
                 &self.actual_db_path,
             )
             .await
@@ -520,14 +520,14 @@ impl StartupContext {
         }
         let claim_result = if recovering_handoff && !force {
             crate::replication::leader_record::recover_handoff(
-                &self.object_store,
+                &self.retrying_object_store,
                 &self.actual_db_path,
                 &node_id,
             )
             .await
         } else {
             crate::replication::leader_record::claim(
-                &self.object_store,
+                &self.retrying_object_store,
                 &self.actual_db_path,
                 &node_id,
                 force,
