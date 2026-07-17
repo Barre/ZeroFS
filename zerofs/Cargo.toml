@@ -81,7 +81,7 @@ tikv-jemalloc-ctl = { version = "0.7", features = [
     "stats",
 ] }
 tokio = { version = "1.49", features = ["full", "tracing"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "time"] }
 async-trait = "0.1"
 backon = { version = "1.5", features = ["tokio-sleep"] }
 tracing = "0.1"
