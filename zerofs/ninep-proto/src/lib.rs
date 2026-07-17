@@ -5,7 +5,9 @@
 //! reconnect extension.
 
 mod deku_bytes;
+mod lock_range;
 mod protocol;
 
 pub use deku_bytes::*;
+pub use lock_range::*;
 pub use protocol::*;
