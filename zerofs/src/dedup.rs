@@ -580,6 +580,8 @@ impl DedupCache {
     }
 
     /// Reserves an initial attempt before asynchronous dispatch.
+    // The library target does not compile the 9P receive path that calls this.
+    #[allow(dead_code)]
     pub(crate) fn reserve_initial(self: &Arc<Self>, op_id: OpId) -> Option<DedupGuard> {
         if !has_op_id(&op_id) {
             return None;

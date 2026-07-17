@@ -503,6 +503,13 @@ where
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct AuthorityTiming {
+    marker_validation_interval: Duration,
+    marker_validation_timeout: Duration,
+    authority_ttl: Duration,
+}
+
 /// Owns lease renewal and retirement.
 pub struct AuthoritySupervisor {
     lease: Arc<Lease>,
@@ -513,7 +520,6 @@ pub struct AuthoritySupervisor {
 
 impl AuthoritySupervisor {
     #[cfg_attr(test, allow(dead_code))]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         lease: Arc<Lease>,
         object_store: Arc<dyn ObjectStore>,
@@ -525,9 +531,11 @@ impl AuthoritySupervisor {
     ) -> anyhow::Result<Self> {
         Self::start_with_validator(
             lease,
-            crate::replication::MARKER_VALIDATION_INTERVAL,
-            crate::replication::MARKER_VALIDATION_TIMEOUT,
-            crate::replication::AUTHORITY_TTL,
+            AuthorityTiming {
+                marker_validation_interval: crate::replication::MARKER_VALIDATION_INTERVAL,
+                marker_validation_timeout: crate::replication::MARKER_VALIDATION_TIMEOUT,
+                authority_ttl: crate::replication::AUTHORITY_TTL,
+            },
             status,
             replication,
             peer_acks,
@@ -542,9 +550,7 @@ impl AuthoritySupervisor {
 
     fn start_with_validator<F, Fut>(
         lease: Arc<Lease>,
-        marker_validation_interval: Duration,
-        marker_validation_timeout: Duration,
-        authority_ttl: Duration,
+        timing: AuthorityTiming,
         status: watch::Receiver<slatedb::DbStatus>,
         replication: Option<Arc<ReplicationControl>>,
         peer_acks: Option<watch::Receiver<Option<HeartbeatAck>>>,
@@ -556,9 +562,9 @@ impl AuthoritySupervisor {
     {
         let loss = CancellationToken::new();
         let deposal = replication.as_ref().map(|control| control.deposal_token());
-        let startup_error = if marker_validation_interval.is_zero()
-            || marker_validation_timeout.is_zero()
-            || authority_ttl.is_zero()
+        let startup_error = if timing.marker_validation_interval.is_zero()
+            || timing.marker_validation_timeout.is_zero()
+            || timing.authority_ttl.is_zero()
         {
             Some("HA authority intervals must be greater than zero")
         } else if !lease.is_valid() {
@@ -579,9 +585,7 @@ impl AuthoritySupervisor {
             status,
             replication,
             peer_acks,
-            marker_validation_interval,
-            marker_validation_timeout,
-            authority_ttl,
+            timing,
             validate,
         ));
         Ok(Self {
@@ -777,14 +781,17 @@ async fn run_authority<F, Fut>(
     mut status: watch::Receiver<slatedb::DbStatus>,
     replication: Option<Arc<ReplicationControl>>,
     mut peer_acks: Option<watch::Receiver<Option<HeartbeatAck>>>,
-    marker_validation_interval: Duration,
-    marker_validation_timeout: Duration,
-    authority_ttl: Duration,
+    timing: AuthorityTiming,
     mut validate: F,
 ) where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
 {
+    let AuthorityTiming {
+        marker_validation_interval,
+        marker_validation_timeout,
+        authority_ttl,
+    } = timing;
     let mut ack_fresh_until = None;
     if let Some(ack) = peer_acks
         .as_mut()
@@ -1722,9 +1729,11 @@ mod tests {
     {
         AuthoritySupervisor::start_with_validator(
             lease,
-            interval,
-            validation_timeout,
-            ttl,
+            AuthorityTiming {
+                marker_validation_interval: interval,
+                marker_validation_timeout: validation_timeout,
+                authority_ttl: ttl,
+            },
             status,
             replication,
             peer_acks,
@@ -1923,9 +1932,11 @@ mod tests {
         assert!(
             AuthoritySupervisor::start_with_validator(
                 lease.clone(),
-                Duration::from_secs(1),
-                Duration::from_secs(3),
-                Duration::from_secs(30),
+                AuthorityTiming {
+                    marker_validation_interval: Duration::from_secs(1),
+                    marker_validation_timeout: Duration::from_secs(3),
+                    authority_ttl: Duration::from_secs(30),
+                },
                 status,
                 None,
                 None,
