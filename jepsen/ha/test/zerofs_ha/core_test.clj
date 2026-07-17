@@ -59,8 +59,8 @@
     (is (= {:type :info :error :retried-create}
            (core/classify-add-error
             (java.io.IOException. "File exists")))))
-  (testing "other IO errors stay determinate failures"
-    (is (= :fail (:type (core/classify-add-error
+  (testing "other IO errors are indeterminate after a multi-step add"
+    (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Bad file descriptor")))))
-    (is (= :fail (:type (core/classify-add-error
+    (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Input/output error")))))))

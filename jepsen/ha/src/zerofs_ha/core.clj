@@ -426,15 +426,8 @@
        (into (sorted-set))))
 
 (defn classify-add-error
-  "Classify an IOException from the add path (create temp, rename into place,
-  read back) as indeterminate (:info) or determinate (:fail). ENOENT and EEXIST
-  are indeterminate: a resent create/rename re-executes when no surviving node
-  holds its op-id (e.g. two takeovers inside one retry window), and re-executing
-  an ALREADY-APPLIED rename fails exactly this way (source temp gone / target
-  present). The NIO two-path exceptions Files/move throws for those errnos carry
-  a null reason -- their message is just \"src -> dst\" -- so they must be
-  classified by class; the message patterns remain as a fallback for the
-  single-path java.io exceptions (e.g. the read-back's FileNotFoundException)."
+  "Classify add-path I/O failures as indeterminate. The target may have been
+  created or renamed before an exception, including an fsync failure."
   [e]
   (let [msg (str (.getMessage e))]
     (cond
@@ -446,7 +439,7 @@
       {:type :info :error :retried-create}
       (re-find #"(?i)no such file|not found" msg)
       {:type :info :error :not-durable-here}
-      :else {:type :fail :error msg})))
+      :else {:type :info :error msg})))
 
 ;; `counter` assigns globally-unique add values; `live` maps each worker (process)
 ;; to the values it has added and not yet removed, so a remove only ever targets a

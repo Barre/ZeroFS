@@ -3,7 +3,7 @@
 
 use crate::actor::{ActorContext, FloorSlot, Floors};
 use crate::checks::Checks;
-use crate::consistency::verify_consistency_sparse;
+use crate::consistency::{verify_consistency_sparse, verify_consistency_sparse_online};
 use crate::data::{FileOp, FileOpMix, FileSnapshot, FileState, Region, pattern};
 use crate::digest::Digest;
 #[cfg(feature = "failpoints")]
@@ -167,6 +167,7 @@ impl Storage {
             .await
             .expect("zerofs open"),
         );
+        fs.start_reclaim_drainer();
         fs.extent_store.enable_nominations();
         fs
     }
@@ -627,7 +628,7 @@ impl WorldHarness {
             .verify()
             .await;
 
-        let report = verify_consistency_sparse(fs)
+        let report = verify_consistency_sparse_online(fs)
             .await
             .expect("quiesced consistency scan");
         assert!(
