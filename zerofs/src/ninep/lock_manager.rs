@@ -1,13 +1,8 @@
 use crate::fs::inode::InodeId;
-use dashmap::DashMap;
 use ninep_proto::LockType;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct LockId(u64);
-
-// Represents a POSIX file lock
 #[derive(Debug, Clone)]
 pub struct FileLock {
     pub lock_type: LockType,
@@ -19,119 +14,97 @@ pub struct FileLock {
     pub inode_id: InodeId,
 }
 
-impl FileLock {
-    /// Returns the exclusive end of this lock's byte range.
-    /// A length of 0 means "to end of file" per POSIX, represented as u64::MAX.
-    pub fn end(&self) -> u64 {
-        if self.length == 0 {
-            u64::MAX
-        } else {
-            self.start.saturating_add(self.length)
-        }
-    }
+fn locks_conflict(requested: &FileLock, held: &FileLock) -> bool {
+    requested.start < ninep_proto::lock_range_end(held.start, held.length)
+        && ninep_proto::lock_range_end(requested.start, requested.length) > held.start
+        && !matches!(
+            (requested.lock_type, held.lock_type),
+            (LockType::ReadLock, LockType::ReadLock)
+        )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+struct HeldLock {
+    session_id: u64,
+    lock: FileLock,
+}
+
+fn subtract_matching_range(
+    locks: &mut Vec<HeldLock>,
+    start: u64,
+    length: u64,
+    mut matches: impl FnMut(&HeldLock) -> bool,
+) -> bool {
+    let end = ninep_proto::lock_range_end(start, length);
+    let mut changed = false;
+    let mut updated = Vec::with_capacity(locks.len());
+    for held in locks.drain(..) {
+        if matches(&held)
+            && held.lock.start < end
+            && ninep_proto::lock_range_end(held.lock.start, held.lock.length) > start
+        {
+            changed = true;
+            let session_id = held.session_id;
+            updated.extend(
+                ninep_proto::subtract_lock_range(held.lock.start, held.lock.length, start, length)
+                    .into_iter()
+                    .map(|(start, length)| HeldLock {
+                        session_id,
+                        lock: FileLock {
+                            start,
+                            length,
+                            ..held.lock.clone()
+                        },
+                    }),
+            );
+        } else {
+            updated.push(held);
+        }
+    }
+    *locks = updated;
+    changed
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct FileLockManager {
-    // Locks indexed by inode for conflict checking
-    locks_by_inode: Arc<DashMap<InodeId, Vec<LockId>>>,
-    // Lock IDs indexed by session for cleanup
-    locks_by_session: Arc<DashMap<u64, Vec<LockId>>>,
-    // Lock details
-    locks: Arc<DashMap<LockId, FileLock>>,
-    // Counter for generating unique lock IDs
-    next_lock_id: Arc<AtomicU64>,
-    // Serializes lock operations. A std (not tokio) mutex: every critical
-    // section below is await-free DashMap work, and being sync lets LockGuard
-    // release locks from its (sync) Drop.
-    lock_mutex: Arc<std::sync::Mutex<()>>,
+    state: Arc<Mutex<HashMap<InodeId, Vec<HeldLock>>>>,
 }
 
 impl FileLockManager {
     pub fn new() -> Self {
-        Self {
-            locks_by_inode: Arc::new(DashMap::new()),
-            locks_by_session: Arc::new(DashMap::new()),
-            locks: Arc::new(DashMap::new()),
-            next_lock_id: Arc::new(AtomicU64::new(1)),
-            lock_mutex: Arc::new(std::sync::Mutex::new(())),
-        }
+        Self::default()
     }
 
-    /// Cheap, mutex-free check for whether a session holds any byte-range locks.
-    /// Lets hot close/flush paths skip the global `lock_mutex` (and a task spawn)
-    /// in the common case where the session never took a POSIX lock.
+    fn lock_state(&self) -> MutexGuard<'_, HashMap<InodeId, Vec<HeldLock>>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn session_has_locks(&self, session_id: u64) -> bool {
-        self.locks_by_session
-            .get(&session_id)
-            .is_some_and(|v| !v.is_empty())
+        self.lock_state()
+            .values()
+            .flatten()
+            .any(|held| held.session_id == session_id)
     }
 
-    /// Inserts a lock into all tracking structures and returns the new lock ID.
-    /// Must be called while holding the lock_mutex.
-    fn insert_lock(&self, session_id: u64, lock: FileLock) -> LockId {
-        let lock_id = LockId(self.next_lock_id.fetch_add(1, AtomicOrdering::SeqCst));
-        let inode_id = lock.inode_id;
-        self.locks.insert(lock_id, lock);
-        self.locks_by_session
-            .entry(session_id)
-            .or_default()
-            .push(lock_id);
-        self.locks_by_inode
-            .entry(inode_id)
-            .or_default()
-            .push(lock_id);
-        lock_id
-    }
+    /// Attempts to add a lock, returning whether it was granted.
+    pub fn try_add_lock(&self, session_id: u64, lock: FileLock) -> bool {
+        let mut state = self.lock_state();
 
-    /// Removes a lock from all tracking structures.
-    /// Must be called while holding the lock_mutex.
-    fn remove_lock(&self, session_id: u64, lock_id: LockId) {
-        if let Some((_, lock)) = self.locks.remove(&lock_id) {
-            if let Some(mut session_locks) = self.locks_by_session.get_mut(&session_id) {
-                session_locks.retain(|id| id != &lock_id);
-            }
-            if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&lock.inode_id) {
-                inode_locks.retain(|id| id != &lock_id);
-            }
-        }
-    }
-
-    /// Attempts to add a lock, returning the lock ID on success or `None` on conflict.
-    pub fn try_add_lock(&self, session_id: u64, lock: FileLock) -> Option<LockId> {
-        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Check for conflicts *before* mutating any state. POSIX requires that a
-        // failed lock request leave the caller's existing locks untouched (e.g. a
-        // read->write upgrade that conflicts must not drop the held read lock).
-        // `check_lock_conflict` already skips same-session locks, so checking
-        // first yields the same verdict as checking after replacement would.
-        if self.check_lock_conflict(lock.inode_id, &lock, session_id) {
-            return None;
+        if state.get(&lock.inode_id).is_some_and(|locks| {
+            locks
+                .iter()
+                .any(|held| held.session_id != session_id && locks_conflict(&lock, &held.lock))
+        }) {
+            return false;
         }
 
-        // No conflict: replace any overlapping locks from this session (POSIX
-        // lock replacement) and then insert the new lock.
-        let mut to_remove = Vec::new();
-        if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
-            for lock_id in lock_ids.iter() {
-                if let Some(existing_lock) = self.locks.get(lock_id)
-                    && existing_lock.inode_id == lock.inode_id
-                    && existing_lock.fid == lock.fid
-                    && lock.start < existing_lock.end()
-                    && lock.end() > existing_lock.start
-                {
-                    // Overlapping lock from same session - mark for removal
-                    to_remove.push(*lock_id);
-                }
-            }
-        }
+        let locks = state.entry(lock.inode_id).or_default();
+        subtract_matching_range(locks, lock.start, lock.length, |held| {
+            held.session_id == session_id && held.lock.fid == lock.fid
+        });
+        locks.push(HeldLock { session_id, lock });
 
-        for lock_id in to_remove {
-            self.remove_lock(session_id, lock_id);
-        }
-
-        Some(self.insert_lock(session_id, lock))
+        true
     }
 
     pub fn unlock_range(
@@ -142,139 +115,17 @@ impl FileLockManager {
         length: u64,
         session_id: u64,
     ) -> bool {
-        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
-
-        let unlock_end = if length == 0 {
-            u64::MAX
-        } else {
-            start.saturating_add(length)
+        let mut state = self.lock_state();
+        let Some(locks) = state.get_mut(&inode_id) else {
+            return false;
         };
-
-        let mut locks_to_process = Vec::new();
-
-        // Find locks that overlap with unlock range
-        if let Some(lock_ids) = self.locks_by_session.get(&session_id) {
-            for lock_id in lock_ids.iter() {
-                if let Some(lock) = self.locks.get(lock_id)
-                    && lock.inode_id == inode_id
-                    && lock.fid == fid
-                {
-                    // Check if lock overlaps with unlock range
-                    if lock.start < unlock_end && lock.end() > start {
-                        locks_to_process.push((*lock_id, lock.clone()));
-                    }
-                }
-            }
+        let changed = subtract_matching_range(locks, start, length, |held| {
+            held.session_id == session_id && held.lock.fid == fid
+        });
+        if locks.is_empty() {
+            state.remove(&inode_id);
         }
-
-        if locks_to_process.is_empty() {
-            return false; // No locks to unlock
-        }
-
-        // Process each overlapping lock
-        for (lock_id, existing_lock) in locks_to_process {
-            let lock_end = existing_lock.end();
-
-            // Remove the original lock
-            self.remove_lock(session_id, lock_id);
-
-            // Handle lock splitting if necessary
-            if start > existing_lock.start && unlock_end < lock_end {
-                // Create first part (before unlock range)
-                let first_part = FileLock {
-                    lock_type: existing_lock.lock_type,
-                    start: existing_lock.start,
-                    length: start - existing_lock.start,
-                    proc_id: existing_lock.proc_id,
-                    client_id: existing_lock.client_id.clone(),
-                    fid: existing_lock.fid,
-                    inode_id: existing_lock.inode_id,
-                };
-                self.insert_lock(session_id, first_part);
-
-                // Create second part (after unlock range)
-                let second_length = if existing_lock.length == 0 {
-                    0 // Keep infinite length
-                } else {
-                    lock_end - unlock_end
-                };
-
-                let second_part = FileLock {
-                    lock_type: existing_lock.lock_type,
-                    start: unlock_end,
-                    length: second_length,
-                    proc_id: existing_lock.proc_id,
-                    client_id: existing_lock.client_id.clone(),
-                    fid: existing_lock.fid,
-                    inode_id: existing_lock.inode_id,
-                };
-                self.insert_lock(session_id, second_part);
-            } else if start <= existing_lock.start && unlock_end < lock_end {
-                // Keep only the part after unlock range
-                let new_length = if existing_lock.length == 0 {
-                    0 // Keep infinite length
-                } else {
-                    lock_end - unlock_end
-                };
-
-                let new_lock = FileLock {
-                    lock_type: existing_lock.lock_type,
-                    start: unlock_end,
-                    length: new_length,
-                    proc_id: existing_lock.proc_id,
-                    client_id: existing_lock.client_id,
-                    fid: existing_lock.fid,
-                    inode_id: existing_lock.inode_id,
-                };
-                self.insert_lock(session_id, new_lock);
-            } else if start > existing_lock.start && unlock_end >= lock_end {
-                // Keep only the part before unlock range
-                let new_lock = FileLock {
-                    lock_type: existing_lock.lock_type,
-                    start: existing_lock.start,
-                    length: start - existing_lock.start,
-                    proc_id: existing_lock.proc_id,
-                    client_id: existing_lock.client_id,
-                    fid: existing_lock.fid,
-                    inode_id: existing_lock.inode_id,
-                };
-                self.insert_lock(session_id, new_lock);
-            }
-        }
-
-        true
-    }
-
-    fn check_lock_conflict(&self, inode_id: InodeId, new_lock: &FileLock, session_id: u64) -> bool {
-        if let Some(lock_ids) = self.locks_by_inode.get(&inode_id) {
-            for lock_id in lock_ids.iter() {
-                if let Some(existing_lock) = self.locks.get(lock_id) {
-                    // Skip locks from the same session - they will be replaced
-                    if let Some(session_locks) = self.locks_by_session.get(&session_id)
-                        && session_locks.contains(lock_id)
-                    {
-                        continue;
-                    }
-
-                    // Check if ranges overlap
-                    if new_lock.start < existing_lock.end() && new_lock.end() > existing_lock.start
-                    {
-                        // Ranges overlap, check compatibility
-                        match (new_lock.lock_type, existing_lock.lock_type) {
-                            (LockType::ReadLock, LockType::ReadLock) => {
-                                // Read locks are compatible
-                                continue;
-                            }
-                            _ => {
-                                // Write locks conflict with everything
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
+        changed
     }
 
     pub fn check_would_block(
@@ -283,80 +134,36 @@ impl FileLockManager {
         test_lock: &FileLock,
         session_id: u64,
     ) -> Option<FileLock> {
-        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lock_ids) = self.locks_by_inode.get(&inode_id) {
-            for lock_id in lock_ids.iter() {
-                if let Some(existing_lock) = self.locks.get(lock_id) {
-                    // Skip locks from the same session
-                    if let Some(session_locks) = self.locks_by_session.get(&session_id)
-                        && session_locks.contains(lock_id)
-                    {
-                        continue;
-                    }
-
-                    // Check if ranges overlap
-                    if test_lock.start < existing_lock.end()
-                        && test_lock.end() > existing_lock.start
-                    {
-                        // Ranges overlap, check compatibility
-                        match (test_lock.lock_type, existing_lock.lock_type) {
-                            (LockType::ReadLock, LockType::ReadLock) => {
-                                // Read locks are compatible
-                                continue;
-                            }
-                            _ => {
-                                // Write locks conflict with everything
-                                return Some(existing_lock.value().clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.lock_state()
+            .get(&inode_id)?
+            .iter()
+            .find(|held| held.session_id != session_id && locks_conflict(test_lock, &held.lock))
+            .map(|held| held.lock.clone())
     }
 
     pub fn release_session_locks(&self, session_id: u64) {
-        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some((_, lock_ids)) = self.locks_by_session.remove(&session_id) {
-            for lock_id in lock_ids {
-                if let Some((_, lock)) = self.locks.remove(&lock_id) {
-                    // Remove from inode index
-                    if let Some(mut inode_locks) = self.locks_by_inode.get_mut(&lock.inode_id) {
-                        inode_locks.retain(|id| id != &lock_id);
-                    }
-                }
-            }
-        }
+        self.lock_state().retain(|_, locks| {
+            locks.retain(|held| held.session_id != session_id);
+            !locks.is_empty()
+        });
     }
 
-    /// Release every lock `fid` holds in `session_id`, on any inode; returns
-    /// whether anything was released. Backs `LockGuard::drop` — keyed by
-    /// (session, fid), not inode, so it covers a fid that was walked to another
-    /// inode while holding locks.
+    /// Releases all locks held by a session fid.
     pub fn release_fid_locks(&self, session_id: u64, fid: u32) -> bool {
-        let _guard = self.lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
-
-        let to_remove: Vec<LockId> = match self.locks_by_session.get(&session_id) {
-            Some(lock_ids) => lock_ids
-                .iter()
-                .filter(|id| self.locks.get(id).is_some_and(|l| l.fid == fid))
-                .copied()
-                .collect(),
-            None => return false,
-        };
-
-        for lock_id in &to_remove {
-            self.remove_lock(session_id, *lock_id);
-        }
-        !to_remove.is_empty()
+        let mut removed = false;
+        self.lock_state().retain(|_, locks| {
+            locks.retain(|held| {
+                let matches = held.session_id == session_id && held.lock.fid == fid;
+                removed |= matches;
+                !matches
+            });
+            !locks.is_empty()
+        });
+        removed
     }
 }
 
-/// Releases all of a fid's byte-range locks on drop. Created on the fid's first
-/// `Tlock` and stored in its session slot, so dropping or overwriting the slot
-/// frees the locks exactly once — the lock counterpart of `OpenHandle`.
+/// Releases a session fid's byte-range locks on drop.
 #[derive(Debug)]
 pub struct LockGuard {
     lock_manager: Arc<FileLockManager>,
@@ -388,42 +195,23 @@ mod tests {
     const INODE: InodeId = 1;
 
     fn lock(lock_type: LockType, start: u64, length: u64) -> FileLock {
-        FileLock {
-            lock_type,
-            start,
-            length,
-            proc_id: 0,
-            client_id: Vec::new(),
-            fid: 0,
-            inode_id: INODE,
-        }
+        lock_fid(lock_type, start, length, 0)
     }
 
-    /// POSIX requires that a lock request which fails leaves the caller's
-    /// existing locks intact. A read->write upgrade that conflicts with another
-    /// owner's read lock must be rejected *without* dropping the caller's own
-    /// read lock.
-    #[tokio::test]
-    async fn failed_upgrade_preserves_existing_lock() {
+    #[test]
+    fn failed_upgrade_preserves_existing_lock() {
         let m = FileLockManager::new();
 
-        // Owners 1 and 2 both hold a read lock over [0, 10) — compatible.
-        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).is_some());
-        assert!(m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)).is_some());
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)));
+        assert!(m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)));
 
-        // Owner 1 tries to upgrade to a write lock; owner 2's read lock conflicts.
         assert!(
-            m.try_add_lock(1, lock(LockType::WriteLock, 0, 10))
-                .is_none(),
+            !m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)),
             "conflicting upgrade must be refused"
         );
 
-        // Drop owner 2's lock so only owner 1's (read) lock could remain.
         m.unlock_range(INODE, 0, 0, 10, 2);
 
-        // A third owner testing a write lock must still see owner 1's surviving
-        // read lock. With the pre-fix behaviour, owner 1's read lock would have
-        // been destroyed by the failed upgrade and this would find no conflict.
         let conflict = m.check_would_block(INODE, &lock(LockType::WriteLock, 0, 10), 3);
         assert!(
             conflict.is_some(),
@@ -443,38 +231,21 @@ mod tests {
         }
     }
 
-    /// Does any lock overlap `[start, start+length)`? Probed as a write from a
-    /// session that holds nothing, so same-session skipping never hides a lock.
     fn occupied(m: &FileLockManager, start: u64, length: u64) -> bool {
         m.check_would_block(INODE, &lock(LockType::WriteLock, start, length), 99)
             .is_some()
     }
 
     #[test]
-    fn file_lock_end_handles_zero_length_and_overflow() {
-        assert_eq!(
-            lock(LockType::ReadLock, 10, 0).end(),
-            u64::MAX,
-            "length 0 = to EOF"
-        );
-        assert_eq!(lock(LockType::ReadLock, 10, 5).end(), 15);
-        assert_eq!(
-            lock(LockType::ReadLock, u64::MAX, 10).end(),
-            u64::MAX,
-            "end saturates"
-        );
-    }
-
-    #[test]
     fn read_locks_share_but_writes_conflict() {
         let m = FileLockManager::new();
-        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).is_some());
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)));
         assert!(
-            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)).is_some(),
+            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)),
             "read locks are compatible"
         );
         assert!(
-            m.try_add_lock(3, lock(LockType::WriteLock, 5, 2)).is_none(),
+            !m.try_add_lock(3, lock(LockType::WriteLock, 5, 2)),
             "a write conflicts with held reads"
         );
     }
@@ -482,21 +253,66 @@ mod tests {
     #[test]
     fn same_session_relock_replaces_in_place() {
         let m = FileLockManager::new();
-        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).is_some());
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)));
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)));
         assert!(
-            m.try_add_lock(1, lock(LockType::WriteLock, 0, 10))
+            !m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)),
+            "the same-session read was replaced by a write"
+        );
+    }
+
+    #[test]
+    fn same_session_subrange_relock_preserves_both_old_tails() {
+        let m = FileLockManager::new();
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 100)));
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 20, 30)));
+
+        let mut shape: Vec<_> = m
+            .lock_state()
+            .get(&INODE)
+            .unwrap()
+            .iter()
+            .filter(|held| held.session_id == 1)
+            .map(|held| {
+                (
+                    held.lock.start,
+                    held.lock.length,
+                    match held.lock.lock_type {
+                        LockType::ReadLock => "read",
+                        LockType::WriteLock => "write",
+                        LockType::Unlock => "unlock",
+                    },
+                )
+            })
+            .collect();
+        shape.sort();
+        assert_eq!(
+            shape,
+            vec![(0, 20, "write"), (20, 30, "read"), (50, 50, "write")]
+        );
+
+        assert!(
+            m.check_would_block(INODE, &lock(LockType::ReadLock, 5, 1), 2)
                 .is_some()
         );
         assert!(
-            m.try_add_lock(2, lock(LockType::ReadLock, 0, 10)).is_none(),
-            "the same-session read was replaced by a write"
+            m.check_would_block(INODE, &lock(LockType::ReadLock, 25, 1), 2)
+                .is_none()
+        );
+        assert!(
+            m.check_would_block(INODE, &lock(LockType::WriteLock, 25, 1), 2)
+                .is_some()
+        );
+        assert!(
+            m.check_would_block(INODE, &lock(LockType::ReadLock, 75, 1), 2)
+                .is_some()
         );
     }
 
     #[test]
     fn unlock_range_splits_a_lock_in_the_middle() {
         let m = FileLockManager::new();
-        m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)).unwrap();
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)));
         assert!(m.unlock_range(INODE, 0, 10, 10, 1));
         assert!(occupied(&m, 5, 1), "[0,10) stays locked");
         assert!(!occupied(&m, 12, 1), "[10,20) is freed");
@@ -506,7 +322,7 @@ mod tests {
     #[test]
     fn unlock_range_trims_the_front() {
         let m = FileLockManager::new();
-        m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)).unwrap();
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)));
         m.unlock_range(INODE, 0, 0, 10, 1);
         assert!(!occupied(&m, 5, 1), "[0,10) freed");
         assert!(occupied(&m, 15, 1), "[10,30) kept");
@@ -515,7 +331,7 @@ mod tests {
     #[test]
     fn unlock_range_trims_the_back() {
         let m = FileLockManager::new();
-        m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)).unwrap();
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 30)));
         m.unlock_range(INODE, 0, 20, 10, 1);
         assert!(occupied(&m, 5, 1), "[0,20) kept");
         assert!(!occupied(&m, 25, 1), "[20,30) freed");
@@ -524,7 +340,7 @@ mod tests {
     #[test]
     fn unlock_range_removes_a_whole_lock_then_reports_nothing_left() {
         let m = FileLockManager::new();
-        m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)).unwrap();
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)));
         assert!(m.unlock_range(INODE, 0, 0, 10, 1));
         assert!(!occupied(&m, 0, 10), "fully unlocked");
         assert!(
@@ -536,7 +352,7 @@ mod tests {
     #[test]
     fn check_would_block_returns_the_conflicting_lock() {
         let m = FileLockManager::new();
-        m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)).unwrap();
+        assert!(m.try_add_lock(1, lock(LockType::ReadLock, 0, 10)));
         let blocker = m
             .check_would_block(INODE, &lock(LockType::WriteLock, 5, 2), 2)
             .expect("a write over a held read must report the blocker");
@@ -552,9 +368,8 @@ mod tests {
     #[test]
     fn release_session_locks_clears_all_of_a_sessions_locks() {
         let m = FileLockManager::new();
-        m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)).unwrap();
-        m.try_add_lock(1, lock(LockType::WriteLock, 100, 10))
-            .unwrap();
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 0, 10)));
+        assert!(m.try_add_lock(1, lock(LockType::WriteLock, 100, 10)));
         assert!(m.session_has_locks(1));
 
         m.release_session_locks(1);
@@ -565,10 +380,8 @@ mod tests {
     #[test]
     fn release_fid_locks_targets_one_fid_and_backs_the_lock_guard() {
         let m = Arc::new(FileLockManager::new());
-        m.try_add_lock(1, lock_fid(LockType::WriteLock, 0, 10, 1))
-            .unwrap();
-        m.try_add_lock(1, lock_fid(LockType::WriteLock, 100, 10, 2))
-            .unwrap();
+        assert!(m.try_add_lock(1, lock_fid(LockType::WriteLock, 0, 10, 1)));
+        assert!(m.try_add_lock(1, lock_fid(LockType::WriteLock, 100, 10, 2)));
 
         assert!(m.release_fid_locks(1, 1), "fid 1's lock released");
         assert!(!occupied(&m, 0, 10), "fid 1's range freed");
