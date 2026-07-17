@@ -7,6 +7,7 @@
 mod deku_bytes;
 mod lock_range;
 mod protocol;
+pub mod retry;
 
 pub use deku_bytes::*;
 pub use lock_range::*;
