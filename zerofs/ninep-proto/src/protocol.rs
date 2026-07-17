@@ -90,12 +90,20 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-/// `Rlerror` ecode an HA node returns when it is no longer the serving leader
-/// (lease lapsed or fenced). A distinct signal, not generic `EIO`, so a
-/// failover-aware client re-probes and resends rather than failing. The value is
-/// `ESHUTDOWN`, which no filesystem op otherwise produces and degrades sensibly
-/// for clients that don't special-case it.
+/// `Rlerror` code for leadership loss after possible dispatch. Linux `ESHUTDOWN`.
 pub const P9_ENOTLEADER: u32 = 108;
+
+/// `Rlerror` code for leadership rejection before any logical effect. Linux `ENOTCONN`.
+pub const P9_ENOTLEADER_CLEAN: u32 = 107;
+
+/// `Rlerror` code for a retry op-id absent from the deduplication ledgers.
+/// Linux `ESTALE`.
+pub const P9_EOPIDSTALE: u32 = 116;
+
+/// Marks a resend after a potentially dispatched attempt.
+pub const P9_OP_FLAG_RETRY: u8 = 1 << 0;
+/// All defined private request-flag bits.
+pub const P9_OP_KNOWN_FLAGS: u8 = P9_OP_FLAG_RETRY;
 
 /// Maximum 9P message size. This bounds the negotiated msize: the server clamps
 /// every client's requested msize to this value, and both the server and client
