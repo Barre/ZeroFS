@@ -37,6 +37,8 @@ pub enum FsError {
     ReadOnlyFilesystem,
     #[error("Leader lease expired (not the current leader)")]
     LeaderLeaseExpired,
+    #[error("Leader rejected before applying the operation")]
+    LeaderRejectedBeforeApply,
     #[error("Server shutting down")]
     ShuttingDown,
 }
@@ -67,6 +69,7 @@ impl From<FsError> for nfsstat3 {
             FsError::InvalidData => nfsstat3::NFS3ERR_IO,
             FsError::ReadOnlyFilesystem => nfsstat3::NFS3ERR_ROFS,
             FsError::LeaderLeaseExpired => nfsstat3::NFS3ERR_IO,
+            FsError::LeaderRejectedBeforeApply => nfsstat3::NFS3ERR_IO,
             FsError::ShuttingDown => nfsstat3::NFS3ERR_IO,
         }
     }
@@ -113,9 +116,8 @@ impl FsError {
             FsError::StaleHandle => libc::ESTALE as u32,
             FsError::InvalidData => libc::EIO as u32,
             FsError::ReadOnlyFilesystem => libc::EROFS as u32,
-            // A distinct signal (not EIO) so a failover-aware 9P client re-probes
-            // the node set for the current leader and resends, instead of failing.
             FsError::LeaderLeaseExpired => ninep_proto::P9_ENOTLEADER,
+            FsError::LeaderRejectedBeforeApply => libc::EIO as u32,
             FsError::ShuttingDown => ninep_proto::P9_ENOTLEADER,
         }
     }
