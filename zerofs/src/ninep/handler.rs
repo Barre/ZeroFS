@@ -51,6 +51,17 @@ pub const DEFAULT_BLKSIZE: u64 = 4096;
 // Block size for calculating block count
 pub const BLOCK_SIZE: u64 = 512;
 
+/// Maps post-dispatch errors to 9P errno values.
+fn post_dispatch_errno(error: P9Error, lease_is_valid: bool) -> u32 {
+    if matches!(error, P9Error::Fs(FsError::LeaderRejectedBeforeApply)) {
+        ninep_proto::P9_ENOTLEADER_CLEAN
+    } else if lease_is_valid {
+        error.to_errno()
+    } else {
+        ninep_proto::P9_ENOTLEADER
+    }
+}
+
 /// Upper bound on the number of parent-pointer hops an aname membership walk
 /// (`..` clamp and `Trebind` confinement check) will follow before giving up.
 /// A single committed snapshot is always acyclic, but these walks read each
@@ -305,16 +316,8 @@ impl NinePHandler {
 
         match result {
             Ok(body) => P9Message::new(tag, body),
-            Err(e) => {
-                // Deposed mid-dispatch (db closed under an in-flight op = flattened
-                // EIO): re-label as P9_ENOTLEADER so the client re-routes. Catches a
-                // close that races an op past the pre-dispatch gate; the original
-                // errno is kept for a still-valid leader.
-                let ecode = if self.filesystem.db.lease_is_valid() {
-                    e.to_errno()
-                } else {
-                    ninep_proto::P9_ENOTLEADER
-                };
+            Err(error) => {
+                let ecode = post_dispatch_errno(error, self.filesystem.db.lease_is_valid());
                 P9Message::new(tag, Message::Rlerror(Rlerror { ecode }))
             }
         }
@@ -1929,6 +1932,27 @@ mod tests {
     use crate::fs::types::SetAttributes;
     use libc::O_RDONLY;
     use std::sync::Arc;
+
+    #[test]
+    fn post_dispatch_errors_preserve_only_proven_rejection() {
+        assert_eq!(
+            post_dispatch_errno(P9Error::Fs(FsError::LeaderRejectedBeforeApply), false),
+            ninep_proto::P9_ENOTLEADER_CLEAN
+        );
+        assert_eq!(
+            post_dispatch_errno(P9Error::Fs(FsError::IoError), false),
+            ninep_proto::P9_ENOTLEADER
+        );
+        assert_eq!(
+            post_dispatch_errno(P9Error::Fs(FsError::IoError), true),
+            libc::EIO as u32
+        );
+        assert_eq!(
+            FsError::LeaderRejectedBeforeApply.to_errno(),
+            libc::EIO as u32,
+            "generic errno conversion remains EIO"
+        );
+    }
 
     #[tokio::test]
     async fn version_negotiation_gates_zerofs_extensions() {
