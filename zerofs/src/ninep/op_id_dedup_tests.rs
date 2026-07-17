@@ -23,7 +23,7 @@ async fn setup() -> (Arc<NinePClient>, CancellationToken, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("dedup.9p.sock");
     let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
-    let server = NinePServer::new_unix(fs, sock.clone());
+    let server = NinePServer::new_unix(fs, sock.clone()).unwrap();
     let shutdown = CancellationToken::new();
     let server_shutdown = shutdown.clone();
     tokio::spawn(async move {
