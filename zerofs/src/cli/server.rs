@@ -16,6 +16,7 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
     S3FifoConfig, Spawner,
 };
+use libsystemd::daemon::{NotifyState, booted as systemd_booted, notify as systemd_notify};
 use slatedb::admin::AdminBuilder;
 use slatedb::config::GarbageCollectorDirectoryOptions;
 use slatedb::config::GarbageCollectorOptions;
@@ -1096,6 +1097,14 @@ pub async fn run_server(
             );
             true
         }
+    };
+
+    // If app starts in a systemd environment, notify the server is ready.
+    if systemd_booted() {
+        let _ = systemd_notify(false, &[NotifyState::Ready])?;
+    }
+
+    tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, initiating graceful shutdown...");
             false
