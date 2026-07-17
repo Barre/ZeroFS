@@ -2156,20 +2156,21 @@ impl NinePClient {
             Message::Rlock(r) => {
                 let mut st = self.state.lock().unwrap();
                 match lock_type {
-                    LockType::Unlock => st.locks.retain(|l| {
-                        !(l.fid == fid && ranges_overlap(l.start, l.length, start, length))
-                    }),
+                    LockType::Unlock if matches!(r.status, LockStatus::Success) => {
+                        unlock_recorded_range(&mut st.locks, fid, start, length);
+                    }
                     _ if matches!(r.status, LockStatus::Success) => {
-                        st.locks
-                            .retain(|l| !(l.fid == fid && l.start == start && l.length == length));
-                        st.locks.push(LockRecord {
-                            fid,
-                            lock_type,
-                            start,
-                            length,
-                            proc_id,
-                            client_id: client_id.to_vec(),
-                        });
+                        replace_recorded_lock(
+                            &mut st.locks,
+                            LockRecord {
+                                fid,
+                                lock_type,
+                                start,
+                                length,
+                                proc_id,
+                                client_id: client_id.to_vec(),
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -2216,19 +2217,42 @@ impl Drop for NinePClient {
     }
 }
 
-/// Two byte ranges overlap (length 0 means "to EOF").
-fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
-    let a_end = if a_len == 0 {
-        u64::MAX
-    } else {
-        a_start.saturating_add(a_len)
-    };
-    let b_end = if b_len == 0 {
-        u64::MAX
-    } else {
-        b_start.saturating_add(b_len)
-    };
-    a_start < b_end && b_start < a_end
+/// Applies an unlock to a recorded lock. Zero length extends to EOF.
+fn subtract_lock_record(
+    held: LockRecord,
+    unlock_start: u64,
+    unlock_length: u64,
+) -> Vec<LockRecord> {
+    ninep_proto::subtract_lock_range(held.start, held.length, unlock_start, unlock_length)
+        .into_iter()
+        .map(|(start, length)| LockRecord {
+            start,
+            length,
+            ..held.clone()
+        })
+        .collect()
+}
+
+fn unlock_recorded_range(locks: &mut Vec<LockRecord>, fid: u32, start: u64, length: u64) {
+    let prior = std::mem::take(locks);
+    for held in prior {
+        if held.fid == fid {
+            locks.extend(subtract_lock_record(held, start, length));
+        } else {
+            locks.push(held);
+        }
+    }
+}
+
+/// Applies POSIX replacement semantics to this fid's recorded locks.
+fn replace_recorded_lock(locks: &mut Vec<LockRecord>, replacement: LockRecord) {
+    unlock_recorded_range(
+        locks,
+        replacement.fid,
+        replacement.start,
+        replacement.length,
+    );
+    locks.push(replacement);
 }
 
 enum DialedTransport {
@@ -2462,6 +2486,73 @@ fn spawn_reader(read: Box<dyn AsyncRead + Unpin + Send>, conn: Arc<Conn>, reconn
         // Connection gone: fail in-flight requests, wake the writer, reconnect.
         conn.connection_lost(&reconnect);
     });
+}
+
+#[cfg(test)]
+mod lock_range_tests {
+    use super::*;
+
+    fn held(start: u64, length: u64) -> LockRecord {
+        LockRecord {
+            fid: 9,
+            lock_type: LockType::WriteLock,
+            start,
+            length,
+            proc_id: 42,
+            client_id: b"client".to_vec(),
+        }
+    }
+
+    #[test]
+    fn lock_record_subtraction_preserves_metadata() {
+        let survivors = subtract_lock_record(held(10, 90), 30, 20);
+        assert_eq!(
+            survivors
+                .iter()
+                .map(|record| (record.start, record.length))
+                .collect::<Vec<_>>(),
+            vec![(10, 20), (50, 50)]
+        );
+        assert!(survivors.iter().all(|record| {
+            record.fid == 9
+                && matches!(record.lock_type, LockType::WriteLock)
+                && record.proc_id == 42
+                && record.client_id == b"client"
+        }));
+    }
+
+    #[test]
+    fn subrange_relock_preserves_tails_for_replay() {
+        let mut locks = vec![held(0, 100)];
+        replace_recorded_lock(
+            &mut locks,
+            LockRecord {
+                lock_type: LockType::ReadLock,
+                start: 20,
+                length: 30,
+                ..held(0, 0)
+            },
+        );
+        locks.sort_by_key(|lock| lock.start);
+        let shape: Vec<_> = locks
+            .iter()
+            .map(|lock| {
+                (
+                    lock.start,
+                    lock.length,
+                    match lock.lock_type {
+                        LockType::ReadLock => "read",
+                        LockType::WriteLock => "write",
+                        LockType::Unlock => "unlock",
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(0, 20, "write"), (20, 30, "read"), (50, 50, "write")]
+        );
+    }
 }
 
 #[cfg(test)]
