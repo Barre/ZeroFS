@@ -197,10 +197,7 @@ impl<'de> Deserialize<'de> for ReplicationRole {
     }
 }
 
-/// HA replication: one node of a leader/standby pair over a single object-store
-/// endpoint. Leadership is the data db's writer epoch; the standby takes over
-/// when heartbeats stop. Read-only / checkpoint modes are rejected (a node must
-/// open the data db as a writer).
+/// Configuration for one node in a two-node HA pair.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
@@ -209,11 +206,10 @@ pub struct ReplicationConfig {
     pub node_id: String,
     /// Role: "leader" or "standby".
     pub role: ReplicationRole,
-    /// Peer address(es). On a leader, the standby's `replication_listen`.
+    /// Peer replication endpoint. Required with `replication_listen`.
     #[serde(default, deserialize_with = "deserialize_expandable_string_vec")]
     pub peers: Vec<String>,
-    /// Address this node listens on for the replication stream (a standby
-    /// receives the leader's ships here).
+    /// Local endpoint for replication, heartbeats, and role election.
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_string",
@@ -227,10 +223,10 @@ impl ReplicationConfig {
         if self.node_id.trim().is_empty() {
             anyhow::bail!("[replication] node_id must not be empty");
         }
+        if self.node_id.trim() != self.node_id {
+            anyhow::bail!("[replication] node_id must not contain leading or trailing whitespace");
+        }
 
-        // A standby must be reachable to receive the leader's ships and to watch
-        // its heartbeats; with no listen it can do neither (it would fail at startup
-        // with "standby has no replication_listen; cannot watch heartbeats").
         if self.role == ReplicationRole::Standby && self.replication_listen.is_none() {
             anyhow::bail!(
                 "[replication] role = \"standby\" requires replication_listen (the address it \
@@ -238,8 +234,6 @@ impl ReplicationConfig {
             );
         }
 
-        // The receiver binds replication_listen verbatim, so it must be a socket
-        // address (host:port); catch a typo here rather than at bind time.
         if let Some(listen) = &self.replication_listen {
             listen.parse::<SocketAddr>().with_context(|| {
                 format!(
@@ -253,7 +247,6 @@ impl ReplicationConfig {
             if peer.trim().is_empty() {
                 anyhow::bail!("[replication] peers must not contain an empty entry");
             }
-            // A node replicating to its own listen address is always a mistake.
             if let Some(listen) = &self.replication_listen {
                 let bare = peer
                     .trim_start_matches("http://")
@@ -267,21 +260,19 @@ impl ReplicationConfig {
             }
         }
 
-        // Asymmetric HA (only one of peers/listen set) works for the initial roles
-        // but not a role swap: dynamic election and a promoted standby both need
-        // peers AND a listen. Warn rather than fail: a deliberately one-directional
-        // setup is still usable, and a solo node (neither set) is fine.
+        if self.peers.len() > 1 {
+            anyhow::bail!(
+                "[replication] peers must contain at most one address; ZeroFS HA supports \
+                 exactly two participants"
+            );
+        }
+
+        // Automatic role swaps require both a local endpoint and a peer.
         let (has_peers, has_listen) = (!self.peers.is_empty(), self.replication_listen.is_some());
         if has_peers != has_listen {
-            let detail = if has_peers {
-                "has peers but no replication_listen, so it cannot receive ships if demoted to a follower"
-            } else {
-                "has replication_listen but no peers, so if promoted to leader it has nowhere to ship"
-            };
-            tracing::warn!(
-                "[replication] node {:?} {detail}; HA will be degraded across a role swap \
-                 (configure both peers and replication_listen for a balanced pair)",
-                self.node_id
+            anyhow::bail!(
+                "[replication] automatic HA requires peers and replication_listen together; \
+                 configure both for role swaps, or neither for a standalone node"
             );
         }
 
@@ -1551,7 +1542,8 @@ role = "leader""#,
             r#"[replication]
 node_id = "n2"
 role = "standby"
-replication_listen = "127.0.0.1:5599""#,
+replication_listen = "127.0.0.1:5599"
+peers = ["127.0.0.1:5600"]"#,
         );
         let settings = write_and_load(&content).unwrap();
         assert_eq!(settings.replication.unwrap().role, ReplicationRole::Standby);
@@ -1624,6 +1616,22 @@ node_id = ""
 role = "leader""#,
         );
         assert!(write_and_load(&content).is_err());
+    }
+
+    #[test]
+    fn replication_node_id_rejects_surrounding_whitespace() {
+        for node_id in [" n1", "n1 "] {
+            let content = base_config_with_replication(&format!(
+                r#"[replication]
+node_id = {node_id:?}
+role = "leader""#
+            ));
+            let err = format!("{:#}", write_and_load(&content).unwrap_err());
+            assert!(
+                err.contains("leading or trailing whitespace"),
+                "node_id {node_id:?}: got {err}"
+            );
+        }
     }
 
     #[test]
@@ -1864,19 +1872,34 @@ sync_writes = true"#,
         );
     }
 
-    // Asymmetric (peers set, listen unset) is usable for the initial role, so it
-    // validates with only a degraded-HA warning rather than an error.
     #[test]
-    fn replication_leader_with_peers_but_no_listen_validates() {
+    fn replication_leader_with_peers_but_no_listen_is_rejected() {
         let content = base_config_with_replication(
             r#"[replication]
 node_id = "n1"
 role = "leader"
 peers = ["127.0.0.1:5600"]"#,
         );
-        let repl = write_and_load(&content).unwrap().replication.unwrap();
-        assert!(repl.replication_listen.is_none());
-        assert_eq!(repl.peers, vec!["127.0.0.1:5600".to_string()]);
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(
+            err.contains("requires peers and replication_listen together"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn replication_leader_with_listen_but_no_peers_is_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+replication_listen = "127.0.0.1:5599""#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(
+            err.contains("requires peers and replication_listen together"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1890,6 +1913,19 @@ peers = ["127.0.0.1:5600", ""]"#,
         );
         let err = format!("{:#}", write_and_load(&content).unwrap_err());
         assert!(err.contains("empty entry"), "got: {err}");
+    }
+
+    #[test]
+    fn replication_more_than_one_peer_is_rejected() {
+        let content = base_config_with_replication(
+            r#"[replication]
+node_id = "n1"
+role = "leader"
+replication_listen = "127.0.0.1:5599"
+peers = ["127.0.0.1:5600", "127.0.0.1:5601"]"#,
+        );
+        let err = format!("{:#}", write_and_load(&content).unwrap_err());
+        assert!(err.contains("at most one address"), "got: {err}");
     }
 
     #[test]

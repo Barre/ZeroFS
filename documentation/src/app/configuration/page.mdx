@@ -408,10 +408,10 @@ peers = ["10.0.0.2:9000"]             # the other node's replication_listen
 | --- | --- | --- |
 | `node_id` | yes | Stable identity of this node within the pair. |
 | `role` | yes | `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
-| `replication_listen` | standby; both recommended | `host:port` this node receives the leader's ships and heartbeats on. |
-| `peers` | both recommended | The other node's `replication_listen`. |
+| `replication_listen` | automatic HA | `host:port` this node receives the leader's ships and heartbeats on. |
+| `peers` | automatic HA | The other node's `replication_listen`. |
 
-Set both `replication_listen` and `peers` on every node so either can lead after a role swap; ZeroFS warns at startup on an asymmetric config. Acknowledged writes that have not been `fsync`'d survive failover: the leader ships them to the standby, which rebuilds any missing segment objects at takeover. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
+Set both `replication_listen` and `peers` on every node so either can lead after a role swap. ZeroFS rejects a configuration that sets only one of them; a standalone node may omit both. Acknowledged writes that have not been `fsync`'d survive failover: the leader ships them to the standby, which rebuilds any missing segment objects at takeover. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
 
 ## Complete Examples
 
