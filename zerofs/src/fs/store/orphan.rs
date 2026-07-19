@@ -22,6 +22,7 @@ impl OrphanStore {
         Self { db, key_codec }
     }
 
+    /// Mark `inode_id` as an orphan in the surrounding namespace transaction.
     pub fn add(&self, txn: &mut Transaction, inode_id: InodeId) {
         let key = self.key_codec.orphan_key(inode_id);
         txn.put_bytes(&key, bytes::Bytes::new());

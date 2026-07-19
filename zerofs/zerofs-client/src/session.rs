@@ -1,6 +1,4 @@
-//! The shared session: one attached 9P connection, the fid-guard machinery
-//! that makes every public future cancel-safe, and the walk/open helpers the
-//! path layer is built from.
+//! Attached 9P session, fid guards, and path-operation primitives.
 
 use crate::error::{ClientResultExt, ZeroFsError};
 use crate::types::{Metadata, NodeKind, OpenOptions, SetAttrs, SetTime};
@@ -10,8 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
-/// Most 9P implementations cap Twalk at 16 name components per message;
-/// longer walks are chained transparently.
+/// Maximum `Twalk` components per request.
 const MAX_WELEM: usize = 16;
 
 pub(crate) struct Session {
@@ -24,17 +21,13 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// Wrap an attached connection and spawn the clunk janitor, which cleans
-    /// up fids whose owners were dropped (cancelled futures, dropped handles)
-    /// and runs until the session and every guard are gone.
+    /// Wraps an attached connection and starts background fid cleanup.
     pub(crate) fn new(client: Arc<NinePClient>, root_fid: u32, gid: u32) -> Arc<Self> {
         let (clunk_tx, mut rx) = mpsc::unbounded_channel::<u32>();
         let janitor_client = Arc::clone(&client);
         crate::runtime::spawn(async move {
             while let Some(fid) = rx.recv().await {
-                // The fid is gone server-side whatever the reply says; only
-                // return it to the allocator once the clunk has been answered,
-                // so an in-flight duplicate clunk can never hit a reused fid.
+                // Recycle only after clunk settlement prevents aliasing.
                 let _ = janitor_client.clunk(fid).await;
                 janitor_client.free_fid(fid);
             }
@@ -56,29 +49,18 @@ impl Session {
         }
     }
 
-    pub(crate) fn ext_v1(&self) -> bool {
-        self.client.extensions_enabled()
-    }
-
     /// Hand a fid to the janitor for a background clunk and recycle.
     pub(crate) fn enqueue_clunk(&self, fid: u32) {
         let _ = self.clunk_tx.send(fid);
     }
 
-    /// Allocate a fid already wrapped in its guard, so a fid never exists
-    /// unguarded across an await: a future cancelled mid-op drops the guard and
-    /// the janitor clunks whatever the server kept.
+    /// Allocates a fid with cancellation cleanup installed before any await.
     pub(crate) fn alloc_guard(self: &Arc<Self>) -> FidGuard {
         FidGuard::one_shot(self, self.client.alloc_fid())
     }
 }
 
-/// Owns one server-side fid and recycles its number. Dropping the guard (a
-/// cancelled future, or a closed/dropped handle) clunks the fid and returns its
-/// number to the allocator. The number recycles only at Drop, which runs only
-/// once no op can reference the fid (every handle method borrows `&self`, so the
-/// `Arc<File>`/`Arc<Dir>` outlives its operation futures), so a recycled number
-/// never aliases a live op.
+/// Owns one fid. Drop schedules server clunk and number recycling.
 pub(crate) struct FidGuard {
     session: Arc<Session>,
     fid: u32,
@@ -86,9 +68,9 @@ pub(crate) struct FidGuard {
 }
 
 enum GuardState {
-    /// Live: Drop clunks (via the janitor) and recycles the number.
+    /// Drop schedules clunk and recycle.
     Armed,
-    /// Never created server-side (a failed op): Drop only recycles, no clunk.
+    /// Drop recycles without clunk.
     Discarded,
 }
 
@@ -106,8 +88,7 @@ impl FidGuard {
         self.fid
     }
 
-    /// The guarded fid is not live server-side (a failed alloc-then-walk): return
-    /// the number to the allocator with no clunk.
+    /// Marks the fid as absent server-side.
     pub(crate) fn discard(mut self) {
         self.state = GuardState::Discarded;
     }
@@ -116,41 +97,21 @@ impl FidGuard {
 impl Drop for FidGuard {
     fn drop(&mut self) {
         match self.state {
-            // Sync Drop cannot await the clunk, so the janitor clunks then
-            // recycles the number after the reply.
             GuardState::Armed => self.session.enqueue_clunk(self.fid),
-            // Never created server-side: the number is free to reuse now, and
-            // Drop runs only with no op in flight.
             GuardState::Discarded => self.session.client.free_fid(self.fid),
         }
     }
 }
 
 impl Session {
-    /// Walk from `from` through `names` (chained in ≤16-component messages),
-    /// returning a guard for the new fid plus the final stat when the v1
-    /// fast path made it free. A partial walk (the server's way of reporting a
-    /// missing intermediate) maps to `NotFound`.
+    /// Walks from `from` in chunks of at most 16 components and returns stat.
+    /// Partial walks map to `NotFound`.
     pub(crate) async fn walk_from(
         self: &Arc<Self>,
         from: u32,
         names: &[&[u8]],
         display: &str,
-    ) -> Result<(FidGuard, Option<Stat>), ZeroFsError> {
-        // An empty walk clones the source fid; Twalkgetattr is full-walk-only,
-        // so the clone goes through the plain path.
-        if names.is_empty() {
-            let guard = self.alloc_guard();
-            return match self.client.walk(from, guard.fid(), &[]).await {
-                Ok(_) => Ok((guard, None)),
-                Err(e) => {
-                    // A failed walk never created the fid server-side.
-                    guard.discard();
-                    Err(ZeroFsError::from_client(&e, display))
-                }
-            };
-        }
-
+    ) -> Result<(FidGuard, Stat), ZeroFsError> {
         let mut cur: Option<FidGuard> = None;
         let mut idx = 0;
         loop {
@@ -161,11 +122,10 @@ impl Session {
             let guard = self.alloc_guard();
             let newfid = guard.fid();
 
-            if is_last && self.ext_v1() {
-                // One round trip for walk + stat; full-walk-only, so a missing
-                // component is a server error rather than a partial reply.
+            if is_last {
+                // The compound final walk also returns stat.
                 match self.client.walk_getattr(src, newfid, chunk).await {
-                    Ok((_, stat)) => return Ok((guard, Some(stat))),
+                    Ok((_, stat)) => return Ok((guard, stat)),
                     Err(e) => {
                         guard.discard();
                         return Err(ZeroFsError::from_client(&e, display));
@@ -175,15 +135,10 @@ impl Session {
 
             match self.client.walk(src, newfid, chunk).await {
                 Ok(qids) if qids.len() == chunk.len() => {
-                    if is_last {
-                        return Ok((guard, None));
-                    }
-                    // The previous intermediate guard drops here → janitor clunk.
                     cur = Some(guard);
                     idx = chunk_end;
                 }
                 Ok(_) => {
-                    // Partial walk: newfid was not created, the path is missing.
                     guard.discard();
                     return Err(ZeroFsError::NotFound {
                         path: display.to_string(),
@@ -202,38 +157,12 @@ impl Session {
         self: &Arc<Self>,
         names: &[&[u8]],
         display: &str,
-    ) -> Result<(FidGuard, Option<Stat>), ZeroFsError> {
+    ) -> Result<(FidGuard, Stat), ZeroFsError> {
         self.walk_from(self.root_fid, names, display).await
     }
 
     pub(crate) async fn stat_fid(&self, fid: u32, display: &str) -> Result<Stat, ZeroFsError> {
         self.client.getattr(fid, GETATTR_ALL).await.ctx(display)
-    }
-
-    /// Walk + stat regardless of extension level: chained walks for anything
-    /// past the per-message component limit, then the shared `walk_stat` op
-    /// (one round trip on v1) for the tail.
-    pub(crate) async fn walk_stat_from(
-        self: &Arc<Self>,
-        from: u32,
-        names: &[&[u8]],
-        display: &str,
-    ) -> Result<(FidGuard, Stat), ZeroFsError> {
-        let (head, tail) = names.split_at(names.len().saturating_sub(MAX_WELEM));
-        let head_guard = if head.is_empty() {
-            None
-        } else {
-            Some(self.walk_from(from, head, display).await?.0)
-        };
-        let src = head_guard.as_ref().map_or(from, FidGuard::fid);
-        let guard = self.alloc_guard();
-        match self.client.walk_stat(src, guard.fid(), tail).await {
-            Ok((_fid, stat)) => Ok((guard, stat)),
-            Err(e) => {
-                guard.discard();
-                Err(ZeroFsError::from_client(&e, display))
-            }
-        }
     }
 
     pub(crate) async fn lopen(
@@ -245,16 +174,14 @@ impl Session {
         self.client.lopen(fid, flags).await.map(|_| ()).ctx(display)
     }
 
-    /// Apply a setattr and return the post-op stat (one round trip on v2,
-    /// setattr + getattr otherwise).
+    /// Apply a setattr and return the post-op stat in one round trip.
     pub(crate) async fn setattr_fid(
         &self,
         fid: u32,
         attrs: &SetAttrs,
         display: &str,
     ) -> Result<Stat, ZeroFsError> {
-        // The 9P setattr wire encodes seconds as unsigned, so pre-epoch instants
-        // are not representable; reject them rather than wrapping to a huge value.
+        // The wire uses unsigned seconds and cannot encode pre-epoch instants.
         for t in [attrs.atime, attrs.mtime].into_iter().flatten() {
             if let SetTime::At { time } = t {
                 if time.secs < 0 {
@@ -274,11 +201,10 @@ impl Session {
             .atime(attrs.atime.map(ops_time))
             .mtime(attrs.mtime.map(ops_time))
             .build();
-        self.client.setattr_stat(ts).await.ctx(display)
+        self.client.setattr_attr(ts).await.ctx(display)
     }
 
-    /// Write all of `data` at `offset` (the transport chunks to msize); a
-    /// short write is an error, never a silent partial.
+    /// Writes all data at `offset`; short writes return an error.
     pub(crate) async fn write_all(
         &self,
         fid: u32,
@@ -297,30 +223,14 @@ impl Session {
         Ok(())
     }
 
-    /// Open (and optionally create) `name` under the directory fid `dfid`,
-    /// returning an opened fid guard. This is the composition documented in
-    /// the design: `create_new` maps to the server's natively exclusive
-    /// create; `create` is an open→exclusive-create→retry loop; `truncate` on
-    /// a pre-existing file is an explicit setattr after the open.
+    /// Opens or creates `name` under `dfid`. `create_new` uses exclusive create;
+    /// existing-file truncation is a separate setattr request.
     pub(crate) async fn open_relative(
         self: &Arc<Self>,
         dfid: u32,
         name: &[u8],
         opts: &OpenOptions,
         display: &str,
-    ) -> Result<FidGuard, ZeroFsError> {
-        self.open_relative_op_id(dfid, name, opts, display, [0u8; 16])
-            .await
-    }
-
-    /// [`Self::open_relative`] with an op-id (all-zero to opt out), threaded to the create step.
-    pub(crate) async fn open_relative_op_id(
-        self: &Arc<Self>,
-        dfid: u32,
-        name: &[u8],
-        opts: &OpenOptions,
-        display: &str,
-        op_id: [u8; 16],
     ) -> Result<FidGuard, ZeroFsError> {
         let acc = match (opts.read, opts.write) {
             (true, true) => crate::linux::O_RDWR,
@@ -333,14 +243,12 @@ impl Session {
             }
         };
 
-        // Bounded retries around the open/create race; each iteration observes
-        // a state another client may have changed in between.
+        // Each EEXIST retry starts a new logical operation with a new op-id.
         for _ in 0..4 {
             if !opts.create_new {
                 match self.walk_from(dfid, &[name], display).await {
                     Ok((guard, stat)) => {
                         if opts.write
-                            && let Some(stat) = &stat
                             && crate::types::FileType::from_mode(stat.mode)
                                 == crate::types::FileType::Dir
                         {
@@ -363,22 +271,20 @@ impl Session {
                 }
             }
 
-            // Create path: natively exclusive on the server (Tlcreateattr on
-            // v2, clone + lcreate otherwise; the shared op handles both).
             let mode = crate::linux::S_IFREG | (opts.mode & 0o7777);
             let flags = acc | crate::linux::O_CREAT;
             let guard = self.alloc_guard();
-            match self
+            let create = self
                 .client
-                .create_open_op_id(dfid, guard.fid(), name, flags, mode, self.gid, op_id)
-                .await
-            {
-                Ok((_fid, _stat, _iounit)) => return Ok(guard),
+                .lcreateattr(dfid, guard.fid(), name, flags, mode, self.gid)
+                .await;
+            match create {
+                Ok((_stat, _iounit)) => return Ok(guard),
                 Err(e) => {
                     guard.discard();
                     let mapped = ZeroFsError::from_client(&e, display);
                     if matches!(mapped, ZeroFsError::AlreadyExists { .. }) && !opts.create_new {
-                        continue; // lost the race to another creator; retry the open
+                        continue;
                     }
                     return Err(mapped);
                 }
@@ -395,34 +301,6 @@ impl Session {
 }
 
 impl Session {
-    /// Common tail of the create-family ops. The op ran on a guarded `newfid`:
-    /// on the fallback path that fid is the surplus walked child (drop the guard
-    /// to clunk + recycle it); on the v2 path it was never used (discard to
-    /// recycle just the number); on error nothing is left server-side (discard).
-    /// On cancellation the guard drops and the janitor reclaims whatever the
-    /// server kept, so no fid leaks.
-    fn finish_create(
-        &self,
-        guard: FidGuard,
-        res: ninep_client::ClientResult<(Option<u32>, Stat)>,
-        display: &str,
-    ) -> Result<Metadata, ZeroFsError> {
-        match res.ctx(display) {
-            Ok((walked, stat)) => {
-                if walked.is_some() {
-                    drop(guard);
-                } else {
-                    guard.discard();
-                }
-                Ok(Metadata::from_stat(&stat))
-            }
-            Err(e) => {
-                guard.discard();
-                Err(e)
-            }
-        }
-    }
-
     /// mkdir under `dfid`, returning the new directory's metadata.
     pub(crate) async fn mkdir_at(
         self: &Arc<Self>,
@@ -431,26 +309,13 @@ impl Session {
         mode: u32,
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
-        self.mkdir_at_op_id(dfid, name, mode, display, [0u8; 16])
-            .await
-    }
-
-    /// [`Self::mkdir_at`] with an idempotency op-id (all-zero to opt out).
-    pub(crate) async fn mkdir_at_op_id(
-        self: &Arc<Self>,
-        dfid: u32,
-        name: &[u8],
-        mode: u32,
-        display: &str,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
         let mode = crate::linux::S_IFDIR | (mode & 0o7777);
-        let guard = self.alloc_guard();
-        let res = self
+        let stat = self
             .client
-            .mkdir_stat_op_id(dfid, Some(guard.fid()), name, mode, self.gid, op_id)
-            .await;
-        self.finish_create(guard, res, display)
+            .mkdir_attr(dfid, name, mode, self.gid)
+            .await
+            .ctx(display)?;
+        Ok(Metadata::from_stat(&stat))
     }
 
     /// symlink under `dfid`, returning the new link's metadata.
@@ -461,25 +326,12 @@ impl Session {
         target: &[u8],
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
-        self.symlink_at_op_id(dfid, name, target, display, [0u8; 16])
-            .await
-    }
-
-    /// [`Self::symlink_at`] with an idempotency op-id (all-zero to opt out).
-    pub(crate) async fn symlink_at_op_id(
-        self: &Arc<Self>,
-        dfid: u32,
-        name: &[u8],
-        target: &[u8],
-        display: &str,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
-        let guard = self.alloc_guard();
-        let res = self
+        let stat = self
             .client
-            .symlink_stat_op_id(dfid, Some(guard.fid()), name, target, self.gid, op_id)
-            .await;
-        self.finish_create(guard, res, display)
+            .symlink_attr(dfid, name, target, self.gid)
+            .await
+            .ctx(display)?;
+        Ok(Metadata::from_stat(&stat))
     }
 
     /// mknod under `dfid`, returning the new node's metadata.
@@ -491,20 +343,6 @@ impl Session {
         mode: u32,
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
-        self.mknod_at_op_id(dfid, name, kind, mode, display, [0u8; 16])
-            .await
-    }
-
-    /// [`Self::mknod_at`] with an idempotency op-id (all-zero to opt out).
-    pub(crate) async fn mknod_at_op_id(
-        self: &Arc<Self>,
-        dfid: u32,
-        name: &[u8],
-        kind: NodeKind,
-        mode: u32,
-        display: &str,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
         let (type_bits, major, minor) = match kind {
             NodeKind::Fifo => (crate::linux::S_IFIFO, 0, 0),
             NodeKind::Socket => (crate::linux::S_IFSOCK, 0, 0),
@@ -512,21 +350,12 @@ impl Session {
             NodeKind::CharDevice { major, minor } => (crate::linux::S_IFCHR, major, minor),
         };
         let mode = type_bits | (mode & 0o7777);
-        let guard = self.alloc_guard();
-        let res = self
+        let stat = self
             .client
-            .mknod_stat_op_id(
-                dfid,
-                Some(guard.fid()),
-                name,
-                mode,
-                major,
-                minor,
-                self.gid,
-                op_id,
-            )
-            .await;
-        self.finish_create(guard, res, display)
+            .mknod_attr(dfid, name, mode, major, minor, self.gid)
+            .await
+            .ctx(display)?;
+        Ok(Metadata::from_stat(&stat))
     }
 
     /// Hard-link the inode at `target_fid` as `name` under `dfid`, returning
@@ -538,25 +367,12 @@ impl Session {
         name: &[u8],
         display: &str,
     ) -> Result<Metadata, ZeroFsError> {
-        self.link_at_op_id(dfid, target_fid, name, display, [0u8; 16])
-            .await
-    }
-
-    /// [`Self::link_at`] with an idempotency op-id (all-zero to opt out).
-    pub(crate) async fn link_at_op_id(
-        self: &Arc<Self>,
-        dfid: u32,
-        target_fid: u32,
-        name: &[u8],
-        display: &str,
-        op_id: [u8; 16],
-    ) -> Result<Metadata, ZeroFsError> {
-        let guard = self.alloc_guard();
-        let res = self
+        let stat = self
             .client
-            .link_stat_op_id(dfid, Some(guard.fid()), target_fid, name, op_id)
-            .await;
-        self.finish_create(guard, res, display)
+            .link_attr(dfid, target_fid, name)
+            .await
+            .ctx(display)?;
+        Ok(Metadata::from_stat(&stat))
     }
 }
 

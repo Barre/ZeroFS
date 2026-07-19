@@ -27,10 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let fs = Client::connect(&target).await?;
     let caps = fs.capabilities();
-    println!(
-        "connected to {target}  (msize={}, v1={}, v2={})",
-        caps.msize, caps.extensions_v1, caps.extensions_v2
-    );
+    println!("connected to {target}  (msize={})", caps.msize);
 
     // Start from a clean slate.
     if fs.exists(DIR).await? {
@@ -67,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut entries = dir.entries();
     while let Some(entry) = entries.next().await {
         let entry = entry?;
-        let size = entry.metadata.as_ref().map_or(0, |m| m.size);
+        let size = entry.metadata.size;
         print!("{} ({size}B)  ", entry.name);
     }
     println!();

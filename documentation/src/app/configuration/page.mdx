@@ -410,8 +410,11 @@ peers = ["10.0.0.2:9000"]             # the other node's replication_listen
 | `role` | yes | `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
 | `replication_listen` | automatic HA | `host:port` this node receives the leader's ships and heartbeats on. |
 | `peers` | automatic HA | The other node's `replication_listen`. |
+| `force_recovery` | no | Break-glass, one-startup replacement of the durable leader marker. Requires `role = "leader"` and `peers = []`; never leave it enabled. |
 
-Set both `replication_listen` and `peers` on every node so either can lead after a role swap. ZeroFS rejects a configuration that sets only one of them; a standalone node may omit both. Acknowledged writes that have not been `fsync`'d survive failover: the leader ships them to the standby, which rebuilds any missing segment objects at takeover. For a workload that tolerates the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and relies on the standby for durability.
+Set both `replication_listen` and `peers` on every node so either can lead after a role swap. ZeroFS rejects a configuration that sets only one of them. A standalone node may omit both, and one-shot forced recovery may remove `peers` as described below. While the pair is Connected, acknowledged writes that have not been `fsync`'d survive a single-node failure because the leader ships them before replying. In Solo mode, unflushed writes return to the standalone durability window. For a workload that accepts the risk, `[filesystem] ignore_fsync = true` makes `fsync` a no-op and supplies neither an object-store barrier nor a lineage check.
+
+`force_recovery` is only for a handoff that cannot recover normally after every former participant is known dead. A live or partitioned peer may hold the only copy of an acknowledged tail or an in-flight writer-open request. Quiesce that host and its object-store requests first, then remove `force_recovery` after the recovery startup succeeds.
 
 ## Complete Examples
 

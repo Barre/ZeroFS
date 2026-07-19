@@ -1,5 +1,4 @@
-//! Open-handle tracking and open-unlink reclaim: `OpenHandle` pins, the
-//! reclaim drainer, and the startup orphan drain.
+//! Open-handle tracking and open-unlink reclaim.
 
 #[cfg(feature = "failpoints")]
 use crate::failpoints as fp;
@@ -24,13 +23,13 @@ fn dec_open_handle(map: &DashMap<InodeId, u64>, id: InodeId) -> u64 {
     use dashmap::mapref::entry::Entry;
     match map.entry(id) {
         Entry::Occupied(mut e) => {
-            let v = e.get().saturating_sub(1);
-            if v == 0 {
+            let count = e.get().saturating_sub(1);
+            if count == 0 {
                 e.remove();
                 0
             } else {
-                *e.get_mut() = v;
-                v
+                *e.get_mut() = count;
+                count
             }
         }
         Entry::Vacant(_) => 0,
@@ -67,6 +66,8 @@ impl ZeroFS {
     /// `lock_manager.acquire(id)` together with the inode-liveness `get`, so
     /// that the increment and the "is the inode alive" check are serialized
     /// against `remove`/`rename`'s defer-vs-delete decision on the same id.
+    // Public for library integration and DST harnesses.
+    #[allow(dead_code)]
     pub fn open_handle_inc(&self, id: InodeId) {
         *self.open_handles.entry(id).or_insert(0) += 1;
     }
@@ -85,10 +86,17 @@ impl ZeroFS {
         self.open_handles.get(&id).map(|r| *r).unwrap_or(0)
     }
 
+    /// Whether open handles or replay results protect a last-link inode.
+    pub(crate) fn should_defer_unlinked_inode(&self, id: InodeId) -> bool {
+        self.open_handle_count(id) > 0 || self.dedup.protects_replay_inode(id)
+    }
+
     /// Increment the open-handle count and return a guard that releases it on
     /// drop; the caller stores it in the fid slot. Like `open_handle_inc`, must
     /// be called under `lock_manager.acquire(id)` alongside the liveness `get`,
     /// so the increment is ordered against `remove`/`rename`'s defer decision.
+    // Called by external library harnesses.
+    #[allow(dead_code)]
     pub fn new_open_handle(&self, id: InodeId) -> OpenHandle {
         self.open_handle_inc(id);
         OpenHandle {
@@ -118,6 +126,15 @@ impl ZeroFS {
         });
     }
 
+    /// Recheck a deferred inode after its orphan transaction commits.
+    /// Handle and replay protection can expire before the key becomes visible.
+    pub(crate) fn schedule_deferred_orphan_reclaim(&self, id: InodeId) {
+        let replay_protected = self.dedup.reclaim_when_unprotected(id);
+        if self.open_handle_count(id) == 0 && !replay_protected {
+            let _ = self.reclaim_tx.send(id);
+        }
+    }
+
     /// Synchronous decrement-then-reclaim. Production drives this through the
     /// `OpenHandle` guard (drop decrements) and the drainer.
     #[cfg(test)]
@@ -141,6 +158,9 @@ impl ZeroFS {
         let _guard = self.lock_manager.acquire(id).await;
 
         if self.open_handle_count(id) > 0 {
+            return;
+        }
+        if self.dedup.reclaim_when_unprotected(id) {
             return;
         }
 
@@ -195,6 +215,31 @@ impl ZeroFS {
                 self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
+            Ok(Inode::Directory(dir)) if dir.nlink == 0 => {
+                // Open directories retain their inode and cookie counter until
+                // last clunk. A directory with remaining children is retained.
+                if dir.entry_count != 0 {
+                    warn!(
+                        "Refusing to reclaim unlinked non-empty directory inode {} ({} entries)",
+                        id, dir.entry_count
+                    );
+                    return Ok(());
+                }
+                let mut txn = self.db.new_transaction()?;
+                self.inode_store.delete(&mut txn, id);
+                self.directory_store.delete_directory(&mut txn, id);
+
+                #[cfg(feature = "failpoints")]
+                fail_point!(fp::CLUNK_AFTER_RECLAIM_INODE_DELETE);
+
+                txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
+                self.orphan_store.remove(&mut txn, id);
+                self.write_coordinator.commit(txn).await?;
+                self.stats
+                    .directories_deleted
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Ok(Inode::Fifo(s))
             | Ok(Inode::Socket(s))
             | Ok(Inode::CharDevice(s))
@@ -229,10 +274,8 @@ impl ZeroFS {
         }
     }
 
-    /// Drain the durable orphan set at startup. Every entry is reclaimable
-    /// because no open handle survives a restart. Each reclaim is serialized
-    /// on its inode id and is idempotent, so a crash mid-drain is safe: the
-    /// not-yet-processed orphan keys are re-scanned on the next boot.
+    /// Drain durable orphans before serving. Replay pins remain authoritative
+    /// across restart; incomplete drains resume from remaining orphan keys.
     pub(super) async fn drain_orphans(&self) -> anyhow::Result<()> {
         let mut ids = Vec::new();
         {
@@ -249,10 +292,7 @@ impl ZeroFS {
         }
 
         for id in ids {
-            let _guard = self.lock_manager.acquire(id).await;
-            if let Err(e) = self.reclaim_orphan_inode(id).await {
-                error!("Startup drain of orphan inode {} failed: {:?}", id, e);
-            }
+            self.reclaim_if_unreferenced(id).await;
         }
 
         Ok(())
@@ -262,10 +302,9 @@ impl ZeroFS {
 #[cfg(test)]
 mod tests {
 
-    use crate::fs::inode::Inode;
-
     #[cfg(feature = "failpoints")]
     use crate::failpoints as fp;
+    use crate::fs::inode::Inode;
     use crate::fs::test_util::test_creds;
     use crate::fs::types::{FileType, SetAttributes};
     use crate::fs::*;
@@ -298,6 +337,19 @@ mod tests {
         .await
         .unwrap();
         id
+    }
+
+    async fn wait_for_inode_gone(fs: &ZeroFS, id: InodeId) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(fs.inode_store.get(id).await, Err(FsError::NotFound)) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("orphan reclaim did not finish");
     }
 
     /// The deterministic repro: open a fid, unlink the name, the open fid must
@@ -344,6 +396,25 @@ mod tests {
             fs.inode_store.get(file_id).await,
             Err(FsError::NotFound)
         ));
+        assert!(orphan_ids(&fs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_commit_schedule_rechecks_expired_deferral_protection() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.start_reclaim_drainer();
+        let file_id = make_file(&fs, b"boundary", b"data").await;
+
+        fs.open_handle_inc(file_id);
+        fs.remove(&(&test_auth()).into(), 0, b"boundary")
+            .await
+            .unwrap();
+        assert_eq!(orphan_ids(&fs).await, vec![file_id]);
+
+        // Suppress the drop wakeup to isolate post-commit scheduling.
+        assert_eq!(fs.open_handle_dec(file_id), 0);
+        fs.schedule_deferred_orphan_reclaim(file_id);
+        wait_for_inode_gone(&fs, file_id).await;
         assert!(orphan_ids(&fs).await.is_empty());
     }
 

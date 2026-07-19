@@ -116,8 +116,6 @@ async fn large_file_chunks_across_msize() {
     let (fs, _shutdown, _dir) = setup().await;
 
     let caps = fs.capabilities();
-    assert!(caps.extensions_v1);
-    assert!(caps.extensions_v2);
 
     // Cover the read/write chunking paths: 2.5x the largest single-message
     // payload, with a recognizable pattern.
@@ -212,10 +210,10 @@ async fn directories_and_listing() {
     entries.sort_by(|x, y| x.name.cmp(&y.name));
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["b", "one.txt", "two.txt"]);
-    // readdirplus carries inline metadata on this server.
+    // Directory reads always carry inline metadata.
     assert_eq!(entries[0].file_type, FileType::Dir);
     let two = entries.iter().find(|e| e.name == "two.txt").unwrap();
-    assert_eq!(two.metadata.as_ref().unwrap().size, 2);
+    assert_eq!(two.metadata.size, 2);
 
     // Incremental listing with a cap, then rewind and drain.
     let dir = fs.open_dir("/a").await.unwrap();
@@ -336,6 +334,53 @@ async fn dir_at_suite_create_rename_remove() {
 
     x.close().await;
     y.close().await;
+}
+
+#[tokio::test]
+async fn dir_at_rejects_cross_client_sessions_without_rpc() {
+    let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("cross-session.9p.sock");
+    let _shutdown = start_server(fs, sock.clone());
+    let client_a = connect_with_retry(&sock).await;
+    let client_b = connect_with_retry(&sock).await;
+
+    client_a.create_dir_all("/source", 0o755).await.unwrap();
+    client_a.create_dir_all("/target", 0o755).await.unwrap();
+    client_a.write("/source/file", b"data").await.unwrap();
+
+    let source_a = client_a.open_dir("/source").await.unwrap();
+    let source_b = client_b.open_dir("/source").await.unwrap();
+    let target_a = client_a.open_dir("/target").await.unwrap();
+    let target_b = client_b.open_dir("/target").await.unwrap();
+    quiesced_fids(&client_a).await;
+    quiesced_fids(&client_b).await;
+    let traffic_a = client_a.traffic_stats();
+    let traffic_b = client_b.traffic_stats();
+
+    let link_error = target_a
+        .link_at(&source_b, b"file", b"hard-link")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(link_error, ZeroFsError::InvalidArgument { .. }),
+        "{link_error}"
+    );
+
+    let rename_error = source_a
+        .rename_at(b"file", &target_b, b"renamed")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(rename_error, ZeroFsError::InvalidArgument { .. }),
+        "{rename_error}"
+    );
+
+    assert_eq!(client_a.traffic_stats(), traffic_a);
+    assert_eq!(client_b.traffic_stats(), traffic_b);
+    assert!(client_a.exists("/source/file").await.unwrap());
+    assert!(!client_a.exists("/target/hard-link").await.unwrap());
+    assert!(!client_a.exists("/target/renamed").await.unwrap());
 }
 
 #[tokio::test]

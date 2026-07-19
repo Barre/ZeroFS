@@ -5,6 +5,7 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
+use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky_bit_delete};
@@ -85,8 +86,11 @@ impl ZeroFS {
         validate_filename(from_name)?;
         validate_filename(to_name)?;
 
-        // Applied retry of our own op: the move already happened, report success.
-        if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
+        // Replay a completed rename before resolving source and target names.
+        if self
+            .replay_dedup_result(&op_id, DedupResult::into_rename)?
+            .is_some()
+        {
             return Ok(());
         }
 
@@ -98,6 +102,12 @@ impl ZeroFS {
         }
 
         if from_dirid == to_dirid && from_name == to_name {
+            // No-op renames still publish a durable replay result.
+            if crate::dedup::has_op_id(&op_id) {
+                let mut txn = self.db.new_transaction()?;
+                txn.set_dedup_result(op_id, DedupResult::Rename);
+                self.write_coordinator.commit(txn).await?;
+            }
             return Ok(());
         }
 
@@ -112,10 +122,22 @@ impl ZeroFS {
         let creds = Credentials::from_auth_context(auth);
 
         // Look up all inode IDs without holding any locks
-        let (source_inode_id, source_cookie) = self
+        let (source_inode_id, source_cookie) = match self
             .directory_store
             .get_entry_with_cookie(from_dirid, from_name)
-            .await?;
+            .await
+        {
+            Ok(entry) => entry,
+            Err(error) => {
+                if self
+                    .replay_dedup_result(&op_id, DedupResult::into_rename)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
 
         if to_dirid == source_inode_id {
             return Err(FsError::InvalidArgument);
@@ -141,6 +163,14 @@ impl ZeroFS {
         }
 
         let _guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
+
+        // Recheck replay state after waiting for inode locks.
+        if self
+            .replay_dedup_result(&op_id, DedupResult::into_rename)?
+            .is_some()
+        {
+            return Ok(());
+        }
 
         // Re-verify inside lock that entries still point to same inodes
         let (verified_source_id, verified_source_cookie) = self
@@ -178,6 +208,12 @@ impl ZeroFS {
         } else {
             None
         };
+
+        if matches!(&from_dir, Inode::Directory(dir) if dir.nlink == 0)
+            || matches!(&to_dir, Some(Inode::Directory(dir)) if dir.nlink == 0)
+        {
+            return Err(FsError::StaleHandle);
+        }
 
         check_access(&from_dir, &creds, AccessMode::Write)?;
         check_access(&from_dir, &creds, AccessMode::Execute)?;
@@ -235,10 +271,15 @@ impl ZeroFS {
             None
         };
 
+        let target_should_defer = target
+            .as_ref()
+            .is_some_and(|(target_id, _)| self.should_defer_unlinked_inode(*target_id));
+
         let mut txn = self.db.new_transaction()?;
-        txn.set_op_id(op_id);
+        txn.set_dedup_result(op_id, DedupResult::Rename);
 
         let mut target_was_directory = false;
+        let mut deferred_target_id = None;
         if let Some((target_id, existing_inode)) = target {
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
@@ -271,7 +312,7 @@ impl ZeroFS {
                             target_id,
                             &Inode::$inode_variant($special),
                         )?;
-                    } else if self.open_handle_count(target_id) > 0 {
+                    } else if target_should_defer {
                         // POSIX open-unlink on a rename-clobbered special file.
                         $special.nlink = 0;
                         let (now_sec, now_nsec) = get_current_time();
@@ -302,7 +343,7 @@ impl ZeroFS {
 
                         self.inode_store
                             .save(&mut txn, target_id, &Inode::File(file))?;
-                    } else if self.open_handle_count(target_id) > 0 {
+                    } else if target_should_defer {
                         // POSIX open-unlink on a rename-clobbered target.
                         file.nlink = 0;
                         let (now_sec, now_nsec) = get_current_time();
@@ -336,12 +377,24 @@ impl ZeroFS {
                         self.inode_store.delete(&mut txn, target_id);
                     }
                 }
-                Inode::Directory(_) => {
-                    self.inode_store.delete(&mut txn, target_id);
-                    self.directory_store.delete_directory(&mut txn, target_id);
+                Inode::Directory(mut dir) => {
+                    if target_should_defer {
+                        dir.nlink = 0;
+                        let (now_sec, now_nsec) = get_current_time();
+                        dir.ctime = now_sec;
+                        dir.ctime_nsec = now_nsec;
+                        dir.name = None;
+                        self.inode_store
+                            .save(&mut txn, target_id, &Inode::Directory(dir))?;
+                        self.orphan_store.add(&mut txn, target_id);
+                        target_deferred = true;
+                    } else {
+                        self.inode_store.delete(&mut txn, target_id);
+                        self.directory_store.delete_directory(&mut txn, target_id);
+                    }
                 }
                 Inode::Symlink(mut symlink) => {
-                    if self.open_handle_count(target_id) > 0 {
+                    if target_should_defer {
                         // POSIX open-unlink on a rename-clobbered symlink.
                         symlink.nlink = 0;
                         let (now_sec, now_nsec) = get_current_time();
@@ -384,6 +437,10 @@ impl ZeroFS {
                     stats::size_delta(original_file_size.unwrap_or(0), 0),
                     -1,
                 );
+            }
+
+            if target_deferred {
+                deferred_target_id = Some(target_id);
             }
 
             self.directory_store
@@ -538,6 +595,10 @@ impl ZeroFS {
 
         self.write_coordinator.commit(txn).await?;
 
+        if let Some(target_id) = deferred_target_id {
+            self.schedule_deferred_orphan_reclaim(target_id);
+        }
+
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RENAME_AFTER_COMMIT);
 
@@ -577,6 +638,7 @@ impl ZeroFS {
 #[cfg(test)]
 mod tests {
 
+    use crate::dedup::DedupResult;
     use crate::fs::inode::Inode;
     use crate::fs::key_codec::KeyCodec;
     use crate::fs::test_util::test_creds;
@@ -585,6 +647,48 @@ mod tests {
 
     use crate::fs::types::SetAttributes;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn rename_retry_replays_success_after_source_is_gone() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [0x41; 16];
+        fs.create(&test_creds(), 0, b"before", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.rename_idempotent(&(&test_auth()).into(), 0, b"before", 0, b"after", op_id)
+            .await
+            .unwrap();
+        fs.rename_idempotent(&(&test_auth()).into(), 0, b"before", 0, b"after", op_id)
+            .await
+            .unwrap();
+
+        assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Rename)));
+        assert!(fs.lookup(&test_creds(), 0, b"before").await.is_err());
+        assert!(fs.lookup(&test_creds(), 0, b"after").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rename_retry_requires_a_rename_result() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [0x42; 16];
+        fs.create(&test_creds(), 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.create(&test_creds(), 0, b"removed", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.remove_idempotent(&(&test_auth()).into(), 0, b"removed", op_id)
+            .await
+            .unwrap();
+
+        let result = fs
+            .rename_idempotent(&(&test_auth()).into(), 0, b"source", 0, b"target", op_id)
+            .await;
+        assert!(matches!(result, Err(FsError::InvalidArgument)));
+        assert!(fs.lookup(&test_creds(), 0, b"source").await.is_ok());
+        assert!(fs.lookup(&test_creds(), 0, b"target").await.is_err());
+    }
 
     #[tokio::test]
     async fn test_process_rename_same_directory() {

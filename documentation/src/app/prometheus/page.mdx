@@ -121,6 +121,9 @@ Read-directed compaction (nominations, hot seams, chains, tail scrub) only runs 
 | --- | --- | --- |
 | `zerofs_used_bytes` | gauge | Total bytes stored in the filesystem |
 | `zerofs_used_inodes` | gauge | Total active inodes (files, directories, symlinks, and special files) |
+| `zerofs_dedup_retained_results` | gauge | Completed mutation results retained for retry replay |
+| `zerofs_dedup_inflight_ids` | gauge | Mutation IDs currently being applied |
+| `zerofs_dedup_replay_pinned_results` | gauge | Retained results currently pinned while a retry response is reconstructed |
 
 ### Memory (jemalloc)
 

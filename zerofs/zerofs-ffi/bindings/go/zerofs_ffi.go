@@ -1219,14 +1219,14 @@ func (ffiObject *FfiObject) freeRustArcPtr() {
 	})
 }
 
-// One ZeroFS session, one identity. Safe to share and call concurrently;
-// reconnects transparently.
+// One concurrent ZeroFS session and identity. Open-unlinked handles produce
+// ESTALE after connection loss.
 type ClientInterface interface {
 	// Append `data` at end-of-file; returns the offset where it landed.
 	Append(path string, data []byte) (uint64, error)
 	// Resolve every symlink in `path` and return the canonical path bytes.
 	Canonicalize(path string) ([]byte, error)
-	// Snapshot of currently negotiated session properties.
+	// Negotiated session properties, fixed for this logical session.
 	Capabilities() Capabilities
 	// Change permission bits.
 	Chmod(path string, mode uint32) (Metadata, error)
@@ -1286,14 +1286,15 @@ type ClientInterface interface {
 	Write(path string, data []byte) error
 }
 
-// One ZeroFS session, one identity. Safe to share and call concurrently;
-// reconnects transparently.
+// One concurrent ZeroFS session and identity. Open-unlinked handles produce
+// ESTALE after connection loss.
 type Client struct {
 	ffiObject FfiObject
 }
 
 // Connect with defaults. Targets: `unix:/sock`, `tcp://host:port`,
-// `host:port`, `host` (port 5564), or a bare filesystem path.
+// `host:port`, `host` (port 5564), or a bare filesystem path. A
+// comma-separated string forms an HA target set.
 func ClientConnect(target string) (*Client, error) {
 	res, err := uniffiRustCallAsync[*ZeroFsError](
 		FfiConverterZeroFsErrorINSTANCE,
@@ -1425,7 +1426,7 @@ func (_self *Client) Canonicalize(path string) ([]byte, error) {
 	return res, err
 }
 
-// Snapshot of currently negotiated session properties.
+// Negotiated session properties, fixed for this logical session.
 func (_self *Client) Capabilities() Capabilities {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -2462,6 +2463,7 @@ type DirInterface interface {
 	// mkdirat(2) with explicit mode; returns the new directory's metadata.
 	CreateDirAt(name []byte, mode uint32) (Metadata, error)
 	// linkat(2): hard-link `original_dir`/`original_name` as `self`/`new_name`.
+	// Both directories must belong to the same client.
 	LinkAt(originalDir *Dir, originalName []byte, newName []byte) (Metadata, error)
 	// Metadata for the directory itself.
 	Metadata() (Metadata, error)
@@ -2482,7 +2484,8 @@ type DirInterface interface {
 	RemoveDirAt(name []byte) error
 	// unlinkat(2).
 	RemoveFileAt(name []byte) error
-	// renameat(2) across two open directories (`new_dir` may be `self`).
+	// renameat(2) across two open directories (`new_dir` may be `self`). Both
+	// directories must belong to the same client.
 	RenameAt(oldName []byte, newDir *Dir, newName []byte) error
 	// Restart iteration from the first entry.
 	Rewind() error
@@ -2563,6 +2566,7 @@ func (_self *Dir) CreateDirAt(name []byte, mode uint32) (Metadata, error) {
 }
 
 // linkat(2): hard-link `original_dir`/`original_name` as `self`/`new_name`.
+// Both directories must belong to the same client.
 func (_self *Dir) LinkAt(originalDir *Dir, originalName []byte, newName []byte) (Metadata, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Dir")
 	defer _self.ffiObject.decrementPointer()
@@ -2911,7 +2915,8 @@ func (_self *Dir) RemoveFileAt(name []byte) error {
 	return err
 }
 
-// renameat(2) across two open directories (`new_dir` may be `self`).
+// renameat(2) across two open directories (`new_dir` may be `self`). Both
+// directories must belong to the same client.
 func (_self *Dir) RenameAt(oldName []byte, newDir *Dir, newName []byte) error {
 	_pointer := _self.ffiObject.incrementPointer("*Dir")
 	defer _self.ffiObject.decrementPointer()
@@ -3481,12 +3486,8 @@ func (_ FfiDestroyerFile) Destroy(value *File) {
 	value.Destroy()
 }
 
-// Live snapshot of negotiated session properties (may change across reconnects).
+// Negotiated session properties, fixed for the logical session lifetime.
 type Capabilities struct {
-	// ZeroFS v1 extensions active.
-	ExtensionsV1 bool
-	// ZeroFS v2 extensions active.
-	ExtensionsV2 bool
 	// Negotiated 9P message size in bytes.
 	Msize uint32
 	// Largest single-message read payload.
@@ -3496,8 +3497,6 @@ type Capabilities struct {
 }
 
 func (r *Capabilities) Destroy() {
-	FfiDestroyerBool{}.Destroy(r.ExtensionsV1)
-	FfiDestroyerBool{}.Destroy(r.ExtensionsV2)
 	FfiDestroyerUint32{}.Destroy(r.Msize)
 	FfiDestroyerUint32{}.Destroy(r.MaxReadChunk)
 	FfiDestroyerUint32{}.Destroy(r.MaxWriteChunk)
@@ -3513,8 +3512,6 @@ func (c FfiConverterCapabilities) Lift(rb RustBufferI) Capabilities {
 
 func (c FfiConverterCapabilities) Read(reader io.Reader) Capabilities {
 	return Capabilities{
-		FfiConverterBoolINSTANCE.Read(reader),
-		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterUint32INSTANCE.Read(reader),
 		FfiConverterUint32INSTANCE.Read(reader),
 		FfiConverterUint32INSTANCE.Read(reader),
@@ -3530,8 +3527,6 @@ func (c FfiConverterCapabilities) LowerExternal(value Capabilities) ExternalCRus
 }
 
 func (c FfiConverterCapabilities) Write(writer io.Writer, value Capabilities) {
-	FfiConverterBoolINSTANCE.Write(writer, value.ExtensionsV1)
-	FfiConverterBoolINSTANCE.Write(writer, value.ExtensionsV2)
 	FfiConverterUint32INSTANCE.Write(writer, value.Msize)
 	FfiConverterUint32INSTANCE.Write(writer, value.MaxReadChunk)
 	FfiConverterUint32INSTANCE.Write(writer, value.MaxWriteChunk)
@@ -3623,8 +3618,8 @@ type DirEntry struct {
 	FileType FileType
 	// Stable inode number.
 	Ino uint64
-	// Full metadata when readdirplus is negotiated (v1+); `None` otherwise.
-	Metadata *Metadata
+	// Full metadata returned with the directory entry.
+	Metadata Metadata
 }
 
 func (r *DirEntry) Destroy() {
@@ -3633,7 +3628,7 @@ func (r *DirEntry) Destroy() {
 	FfiDestroyerBool{}.Destroy(r.NameIsUtf8)
 	FfiDestroyerFileType{}.Destroy(r.FileType)
 	FfiDestroyerUint64{}.Destroy(r.Ino)
-	FfiDestroyerOptionalMetadata{}.Destroy(r.Metadata)
+	FfiDestroyerMetadata{}.Destroy(r.Metadata)
 }
 
 type FfiConverterDirEntry struct{}
@@ -3651,7 +3646,7 @@ func (c FfiConverterDirEntry) Read(reader io.Reader) DirEntry {
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterFileTypeINSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
-		FfiConverterOptionalMetadataINSTANCE.Read(reader),
+		FfiConverterMetadataINSTANCE.Read(reader),
 	}
 }
 
@@ -3669,7 +3664,7 @@ func (c FfiConverterDirEntry) Write(writer io.Writer, value DirEntry) {
 	FfiConverterBoolINSTANCE.Write(writer, value.NameIsUtf8)
 	FfiConverterFileTypeINSTANCE.Write(writer, value.FileType)
 	FfiConverterUint64INSTANCE.Write(writer, value.Ino)
-	FfiConverterOptionalMetadataINSTANCE.Write(writer, value.Metadata)
+	FfiConverterMetadataINSTANCE.Write(writer, value.Metadata)
 }
 
 type FfiDestroyerDirEntry struct{}
@@ -4651,18 +4646,14 @@ func (self ZeroFsErrorNotLeader) Is(target error) bool {
 	return target == ErrZeroFsErrorNotLeader
 }
 
-// Stale handle (ESTALE). From `sync_all`/`sync_data` this is the durability signal:
-// the `.zerofs4` lineage broke, so writes acked on this handle before the fsync may
-// not be durable; redo them and fsync again. From other operations it is a plain
-// stale inode/handle (re-open the path).
+// Stale handle (ESTALE). From sync methods, prior acknowledged writes may be
+// non-durable and require replacement. Replay loss requires a new client.
 type ZeroFsErrorStale struct {
 	Path string
 }
 
-// Stale handle (ESTALE). From `sync_all`/`sync_data` this is the durability signal:
-// the `.zerofs4` lineage broke, so writes acked on this handle before the fsync may
-// not be durable; redo them and fsync again. From other operations it is a plain
-// stale inode/handle (re-open the path).
+// Stale handle (ESTALE). From sync methods, prior acknowledged writes may be
+// non-durable and require replacement. Replay loss requires a new client.
 func NewZeroFsErrorStale(
 	path string,
 ) *ZeroFsError {
@@ -5069,47 +5060,6 @@ type FfiDestroyerOptionalString struct{}
 func (_ FfiDestroyerOptionalString) Destroy(value *string) {
 	if value != nil {
 		FfiDestroyerString{}.Destroy(*value)
-	}
-}
-
-type FfiConverterOptionalMetadata struct{}
-
-var FfiConverterOptionalMetadataINSTANCE = FfiConverterOptionalMetadata{}
-
-func (c FfiConverterOptionalMetadata) Lift(rb RustBufferI) *Metadata {
-	return LiftFromRustBuffer[*Metadata](c, rb)
-}
-
-func (_ FfiConverterOptionalMetadata) Read(reader io.Reader) *Metadata {
-	if readInt8(reader) == 0 {
-		return nil
-	}
-	temp := FfiConverterMetadataINSTANCE.Read(reader)
-	return &temp
-}
-
-func (c FfiConverterOptionalMetadata) Lower(value *Metadata) C.RustBuffer {
-	return LowerIntoRustBuffer[*Metadata](c, value)
-}
-
-func (c FfiConverterOptionalMetadata) LowerExternal(value *Metadata) ExternalCRustBuffer {
-	return RustBufferFromC(LowerIntoRustBuffer[*Metadata](c, value))
-}
-
-func (_ FfiConverterOptionalMetadata) Write(writer io.Writer, value *Metadata) {
-	if value == nil {
-		writeInt8(writer, 0)
-	} else {
-		writeInt8(writer, 1)
-		FfiConverterMetadataINSTANCE.Write(writer, *value)
-	}
-}
-
-type FfiDestroyerOptionalMetadata struct{}
-
-func (_ FfiDestroyerOptionalMetadata) Destroy(value *Metadata) {
-	if value != nil {
-		FfiDestroyerMetadata{}.Destroy(*value)
 	}
 }
 

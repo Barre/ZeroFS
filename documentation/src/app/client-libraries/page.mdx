@@ -127,7 +127,7 @@ for entry, err := range dir.Entries() {
 
 ## Connecting
 
-`Client.connect(target)` takes the same target forms as `zerofs mount` and the kernel client:
+`Client.connect(target)` accepts these individual target forms:
 
 | Target | Transport |
 |--------|-----------|
@@ -135,6 +135,14 @@ for entry, err := range dir.Entries() {
 | `tcp://host:port` | TCP |
 | `host:port` / `host` | TCP (port defaults to 5564) |
 | `/path` or `./path` | Unix socket (bare path) |
+
+For [high availability](/high-availability), pass both 9P addresses as one comma-separated target string. The client probes the set concurrently and re-probes it on every reconnect:
+
+| Language | HA connection |
+| --- | --- |
+| Python | `await zerofs_client.Client.connect("node-a:5564,node-b:5564")` |
+| TypeScript | `await Client.connect("node-a:5564,node-b:5564")` |
+| Go | `zerofs.ClientConnect("node-a:5564,node-b:5564")` |
 
 For an explicit identity (`uid`/`gid`/`uname`), an attach subtree (`aname`), a custom `msize`, or a connect timeout, connect with a `ConnectOptions` (`connect_with` in Python/Go, `connectWith` in Node). The server clamps `msize` to 10 MiB, so requesting more has no effect (the same ceiling a 9P mount hits).
 
@@ -169,8 +177,8 @@ One identity, one session, safe to share across tasks. Path arguments are string
 
 | Operation | Signature | Notes |
 |-----------|-----------|-------|
-| `connect` | `(target) -> Client` | Constructor. Target forms above. |
-| `connect_with` | `(target, ConnectOptions) -> Client` | Constructor with identity and tuning. |
+| `connect` | `(target) -> Client` | Constructor. Accepts one target or a comma-separated HA set. |
+| `connect_with` | `(target, ConnectOptions) -> Client` | Constructor with identity and tuning; accepts the same target set. |
 | `capabilities` | `() -> Capabilities` | Negotiated session properties. Synchronous. |
 | `read` | `(path) -> bytes` | Whole file into memory. |
 | `read_range` | `(path, offset, len) -> bytes` | Up to `len` bytes at `offset`; a short result is EOF. |
@@ -258,11 +266,11 @@ A pull-based listing cursor plus `openat`-style child operations. **Child names 
 
 **`Metadata`**: `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, and `atime`/`mtime`/`ctime` timestamps. `btime` and `data_version` are reserved (servers currently report 0).
 
-**`DirEntry`**: `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (present only when readdirplus is negotiated; null otherwise).
+**`DirEntry`**: `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (always returned inline by the private dialect's directory read).
 
 **`StatFs`**: `block_size`, `blocks`, `blocks_free`, `blocks_available`, `files`, `files_free`, `filesystem_id`, `max_name_len`.
 
-**`Capabilities`**: `extensions_v1`, `extensions_v2`, `msize`, `max_read_chunk`, `max_write_chunk`. A live snapshot that can change across reconnects.
+**`Capabilities`**: `msize`, `max_read_chunk`, `max_write_chunk`. This is a live snapshot that can change across reconnects; successfully connecting already guarantees the exact `9P2000.L.Z` private dialect.
 
 ## Idiomatic additions
 
@@ -276,9 +284,11 @@ uniffi generates a faithful but mechanical surface (async methods, raw handle ob
 
 ## Connection loss and cancellation
 
-**Reconnection.** The underlying session reconnects forever with backoff and replays its state. While the server is unreachable, calls block rather than fail, the same behavior as `zerofs mount`. One caveat: an operation in flight at the instant the connection drops is resent, so a non-idempotent operation (`create`, `rename`, `unlink`) can apply twice across a reconnect.
+**Reconnection.** The session retries indefinitely with backoff. Undispatched calls block while no server is available. Session replay rebinds linked open handles by stable inode id and re-acquires recorded byte-range locks before publishing the connection.
 
-**Cancellation.** The libraries do not cancel server-side work; uniffi does not propagate host-side cancellation into Rust. Bound your own wait with the host's facilities: `asyncio.wait_for` (Python), `Promise.race` (TypeScript), or the `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers (Go). These *abandon the wait*: they return as soon as your timeout fires while the in-flight operation keeps running until the server answers, then discards its result and self-cleans. Pass a deadline to bound how long you wait, not how long the server works.
+An open handle with no remaining namespace link is connection-local. Disconnecting with such a handle makes the logical client terminal with `Stale`/`ESTALE`; recovery requires a new client and reopened paths. In-flight mutations retain their operation envelope across retries. Automatic retry ends at the 120-second protocol horizon, after which an unresolved result is reported as an ambiguous connection failure.
+
+**Cancellation.** Host-language cancellation does not cancel Rust or server-side work. Caller waits can be bounded with `asyncio.wait_for` (Python), `Promise.race` (TypeScript), or the `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers (Go). A timeout abandons the caller wait; the operation continues until it resolves or reaches the protocol horizon, and its result is discarded. The deadline bounds caller latency, not server execution.
 
 **Closing.** `close()` marks a handle closed immediately, is idempotent, and never hangs. The server-side fid is released and its number recycled when the handle is dropped (or right after `close()` for scope-bound use), so a long-running client never exhausts fids.
 
@@ -300,6 +310,7 @@ Every fallible call surfaces one flat, exhaustive `ZeroFsError`. Exhaustive is d
 | `TooManySymlinks` | `ELOOP` | Resolution exceeded the 40-hop cap. |
 | `Closed` | `EBADF` | A handle or client was used after `close()`. |
 | `ConnectFailed` | `EIO` | The initial connection or attach failed. |
+| `Stale` | `ESTALE` | Durability lineage was lost, or reconnect could not replay the complete logical session. |
 | `Io` | (its own) | Any other server errno, preserved verbatim. |
 | `Protocol` | `EIO` | Wire-level failure: codec, unexpected reply, or negotiation. |
 

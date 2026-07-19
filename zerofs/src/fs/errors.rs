@@ -37,6 +37,10 @@ pub enum FsError {
     ReadOnlyFilesystem,
     #[error("Leader lease expired (not the current leader)")]
     LeaderLeaseExpired,
+    /// The current mutation batch was authoritatively rejected by a newer
+    /// writer before either the peer or this process applied it. 9P can expose
+    /// this narrower fact as a clean failover hint; other protocols treat it as
+    /// an ordinary I/O failure.
     #[error("Leader rejected before applying the operation")]
     LeaderRejectedBeforeApply,
     #[error("Server shutting down")]
@@ -116,7 +120,12 @@ impl FsError {
             FsError::StaleHandle => libc::ESTALE as u32,
             FsError::InvalidData => libc::EIO as u32,
             FsError::ReadOnlyFilesystem => libc::EROFS as u32,
+            // A distinct signal (not EIO) so a failover-aware 9P client re-probes
+            // the node set for the current leader and resends, instead of failing.
             FsError::LeaderLeaseExpired => ninep_proto::P9_ENOTLEADER,
+            // The private CLEAN failover signal is selected only by the 9P
+            // handler, which can also preserve FIRST/RETRY semantics. Other
+            // errno consumers must see an ordinary I/O failure.
             FsError::LeaderRejectedBeforeApply => libc::EIO as u32,
             FsError::ShuttingDown => ninep_proto::P9_ENOTLEADER,
         }

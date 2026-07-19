@@ -97,7 +97,7 @@ zerofs run -c zerofs.toml
 - **[stress-ng](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: file-handling stressors run concurrently against live mounts.
 - **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
 - **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.
-- **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across failover. The local-fs model checker also runs with failovers injected.
+- **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a Connected leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across the tested failovers. The local-fs model checker also runs with failovers injected.
 - **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: data, namespace, segment-GC, and compaction paths run in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies and transient faults, and crashes at arbitrary await points or narrow failpoint windows. Recovery is checked against byte-level and namespace reference models, a full metadata consistency scan, segment-accounting reconciliation, and an authoritative footprint scan. One seed is one exact schedule, so a failure reproduces identically.
 
 ## Web UI
@@ -182,7 +182,7 @@ graph TB
 
 ## High Availability
 
-A `[replication]` section runs a leader and a standby backed by the same bucket; there is no second copy of the data to provision. The standby semi-synchronously replicates acknowledged-but-unflushed writes and takes over in seconds if the leader fails. Writer-epoch fencing prevents split-brain: a deposed leader cannot commit. Design, guarantees, configuration: [high availability](https://www.zerofs.net/high-availability).
+A `[replication]` section runs a leader and a standby backed by the same bucket; there is no second durable copy of the data to provision. While Connected, the standby receives each mutation before the leader replies, including unflushed file frames. If replication is unavailable, the leader keeps serving in Solo mode with the standalone durability window. Takeover uses a durable phased claim and writer-epoch fencing before the successor serves. Design, guarantees, configuration, and multi-target clients: [high availability](https://www.zerofs.net/high-availability).
 
 ## Configuration
 

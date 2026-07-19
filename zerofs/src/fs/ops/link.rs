@@ -5,6 +5,7 @@ use crate::failpoints as fp;
 #[cfg(feature = "failpoints")]
 use fp::fail_point;
 
+use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId, SymlinkInode};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
@@ -43,6 +44,9 @@ impl ZeroFS {
         attr: &SetAttributes,
         op_id: crate::dedup::OpId,
     ) -> Result<(InodeId, FileAttributes), FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
+            return Ok(result);
+        }
         validate_filename(linkname)?;
 
         debug!(
@@ -53,6 +57,10 @@ impl ZeroFS {
         );
 
         let _guard = self.lock_manager.acquire(dirid).await;
+        // Direct filesystem callers do not pass through the 9P single-flight.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_symlink)? {
+            return Ok(result);
+        }
         let (mut dir_inode, exists) = tokio::try_join!(
             self.inode_store.get(dirid),
             self.directory_store.exists(dirid, linkname)
@@ -65,12 +73,11 @@ impl ZeroFS {
             Inode::Directory(d) => d,
             _ => return Err(FsError::NotDirectory),
         };
+        if dir.nlink == 0 {
+            return Err(FsError::StaleHandle);
+        }
 
         if exists {
-            // Applied retry of our own op: return the existing link.
-            if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
-                return self.existing_child_result(dirid, linkname).await;
-            }
             return Err(FsError::Exists);
         }
 
@@ -109,11 +116,23 @@ impl ZeroFS {
         });
 
         let mut txn = self.db.new_transaction()?;
-        txn.set_op_id(op_id);
         let cookie = self
             .directory_store
             .allocate_cookie(dirid, &mut txn)
             .await?;
+
+        let attrs: FileAttributes = InodeWithId {
+            inode: &symlink_inode,
+            id: new_id,
+        }
+        .into();
+        txn.set_dedup_result(
+            op_id,
+            crate::dedup::DedupResult::Symlink {
+                inode_id: new_id,
+                attrs: attrs.clone(),
+            },
+        );
 
         self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
 
@@ -168,14 +187,7 @@ impl ZeroFS {
             },
         );
 
-        Ok((
-            new_id,
-            InodeWithId {
-                inode: &symlink_inode,
-                id: new_id,
-            }
-            .into(),
-        ))
+        Ok((new_id, attrs))
     }
 
     /// Hard-link `fileid` as `linkdirid/linkname`. Directories and symlinks
@@ -191,6 +203,7 @@ impl ZeroFS {
     ) -> Result<(), FsError> {
         self.link_idempotent(auth, fileid, linkdirid, linkname, [0u8; 16])
             .await
+            .map(|_| ())
     }
 
     /// `link` tagged with an idempotency op-id: an applied retry returns success
@@ -202,7 +215,10 @@ impl ZeroFS {
         linkdirid: InodeId,
         linkname: &[u8],
         op_id: crate::dedup::OpId,
-    ) -> Result<(), FsError> {
+    ) -> Result<(InodeId, FileAttributes), FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_link)? {
+            return Ok(result);
+        }
         validate_filename(linkname)?;
 
         let linkname_str = String::from_utf8_lossy(linkname);
@@ -215,6 +231,10 @@ impl ZeroFS {
             .lock_manager
             .acquire_multi(vec![fileid, linkdirid])
             .await;
+        // Direct filesystem callers do not pass through the 9P single-flight.
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_link)? {
+            return Ok(result);
+        }
 
         let creds = Credentials::from_auth_context(auth);
 
@@ -231,6 +251,9 @@ impl ZeroFS {
             Inode::Directory(d) => d,
             _ => return Err(FsError::NotDirectory),
         };
+        if link_dir.nlink == 0 {
+            return Err(FsError::StaleHandle);
+        }
 
         if matches!(file_inode, Inode::Directory(_)) {
             return Err(FsError::InvalidArgument);
@@ -241,10 +264,6 @@ impl ZeroFS {
         }
 
         if exists {
-            // Applied retry of our own op: the link is present, report success.
-            if crate::dedup::has_op_id(&op_id) && self.dedup.get(&op_id).is_some() {
-                return Ok(());
-            }
             return Err(FsError::Exists);
         }
 
@@ -253,17 +272,10 @@ impl ZeroFS {
             .zip(file_inode.name().map(|n| n.to_vec()));
 
         let mut txn = self.db.new_transaction()?;
-        txn.set_op_id(op_id);
         let cookie = self
             .directory_store
             .allocate_cookie(linkdirid, &mut txn)
             .await?;
-
-        self.directory_store
-            .add(&mut txn, linkdirid, linkname, fileid, cookie, None);
-
-        #[cfg(feature = "failpoints")]
-        fail_point!(fp::LINK_AFTER_DIR_ENTRY);
 
         if let Some((orig_parent, orig_name)) = original_parent_name {
             self.directory_store
@@ -284,7 +296,10 @@ impl ZeroFS {
                 }
                 resurrected = file.nlink == 0;
                 file.nlink += 1;
-                if file.nlink > 1 {
+                if resurrected {
+                    file.parent = Some(linkdirid);
+                    file.name = Some(linkname.to_vec());
+                } else if file.nlink > 1 {
                     file.parent = None;
                     file.name = None;
                 }
@@ -300,7 +315,10 @@ impl ZeroFS {
                 }
                 resurrected = special.nlink == 0;
                 special.nlink += 1;
-                if special.nlink > 1 {
+                if resurrected {
+                    special.parent = Some(linkdirid);
+                    special.name = Some(linkname.to_vec());
+                } else if special.nlink > 1 {
                     special.parent = None;
                     special.name = None;
                 }
@@ -309,6 +327,29 @@ impl ZeroFS {
             }
             _ => unreachable!(),
         }
+
+        // A 0 -> 1 relink restores the ordinary singly-linked representation:
+        // the inode carries its namespace parent/name and the directory entry
+        // embeds it. Multi-linked inodes continue to use reference entries.
+        let embed_inode = (file_inode.nlink() == 1).then_some(&file_inode);
+        self.directory_store
+            .add(&mut txn, linkdirid, linkname, fileid, cookie, embed_inode);
+
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::LINK_AFTER_DIR_ENTRY);
+
+        let attrs: FileAttributes = InodeWithId {
+            inode: &file_inode,
+            id: fileid,
+        }
+        .into();
+        txn.set_dedup_result(
+            op_id,
+            crate::dedup::DedupResult::Link {
+                inode_id: fileid,
+                attrs: attrs.clone(),
+            },
+        );
 
         if resurrected {
             self.orphan_store.remove(&mut txn, fileid);
@@ -364,7 +405,7 @@ impl ZeroFS {
             });
         }
 
-        Ok(())
+        Ok((fileid, attrs))
     }
 }
 
@@ -402,6 +443,98 @@ mod tests {
             }
             _ => panic!("Should be a symlink"),
         }
+    }
+
+    #[tokio::test]
+    async fn symlink_retry_replays_original_result_after_name_is_replaced() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [4u8; 16];
+        let (original_id, original_attrs) = fs
+            .symlink_idempotent(
+                &test_creds(),
+                0,
+                b"link",
+                b"old-target",
+                &SetAttributes::default(),
+                op_id,
+            )
+            .await
+            .unwrap();
+        fs.remove(&(&test_auth()).into(), 0, b"link").await.unwrap();
+        let (replacement_id, _) = fs
+            .symlink(
+                &test_creds(),
+                0,
+                b"link",
+                b"new-target",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        let (retry_id, retry_attrs) = fs
+            .symlink_idempotent(
+                &test_creds(),
+                0,
+                b"link",
+                b"old-target",
+                &SetAttributes::default(),
+                op_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_id, original_id);
+        assert_eq!(retry_attrs.fileid, original_attrs.fileid);
+        assert_eq!(retry_attrs.size, original_attrs.size);
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"link").await.unwrap(),
+            replacement_id
+        );
+        assert_ne!(replacement_id, original_id);
+    }
+
+    #[tokio::test]
+    async fn hardlink_retry_preserves_original_identity_and_post_link_attrs() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let (original_id, _) = fs
+            .create(&test_creds(), 0, b"original", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (other_id, _) = fs
+            .create(&test_creds(), 0, b"other", &SetAttributes::default())
+            .await
+            .unwrap();
+        let op_id = [5u8; 16];
+
+        let (linked_id, original_attrs) = fs
+            .link_idempotent(&auth, original_id, 0, b"alias", op_id)
+            .await
+            .unwrap();
+        assert_eq!(linked_id, original_id);
+        assert_eq!(original_attrs.nlink, 2);
+        fs.remove(&auth, 0, b"alias").await.unwrap();
+        fs.link(&auth, other_id, 0, b"alias").await.unwrap();
+
+        let (retry_id, retry_attrs) = fs
+            .link_idempotent(&auth, original_id, 0, b"alias", op_id)
+            .await
+            .unwrap();
+        assert_eq!(retry_id, original_id);
+        assert_eq!(retry_attrs.fileid, original_attrs.fileid);
+        assert_eq!(retry_attrs.nlink, original_attrs.nlink);
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"alias").await.unwrap(),
+            other_id
+        );
+        assert_eq!(
+            match fs.inode_store.get(original_id).await.unwrap() {
+                Inode::File(file) => file.nlink,
+                _ => panic!("expected regular file"),
+            },
+            1,
+            "the retry must not recreate the removed hardlink"
+        );
     }
 
     #[tokio::test]

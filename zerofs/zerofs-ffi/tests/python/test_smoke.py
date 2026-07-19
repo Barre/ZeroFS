@@ -16,7 +16,13 @@ async def main(target: str) -> None:
     fs = await z.Client.connect_with(target, z.ConnectOptions(msize=512 * 1024))
     caps = fs.capabilities()
     assert caps.msize <= 512 * 1024, caps.msize
-    print(f"connected: msize={caps.msize} v1={caps.extensions_v1} v2={caps.extensions_v2}")
+    assert 0 < caps.max_read_chunk <= caps.msize, caps.max_read_chunk
+    assert 0 < caps.max_write_chunk <= caps.msize, caps.max_write_chunk
+    print(
+        f"connected: msize={caps.msize} "
+        f"max_read_chunk={caps.max_read_chunk} "
+        f"max_write_chunk={caps.max_write_chunk}"
+    )
 
     await fs.create_dir_all("/ffi/logs", 0o755)
 

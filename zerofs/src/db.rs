@@ -134,7 +134,7 @@ pub struct Transaction {
     seg_deltas: Vec<(Bytes, (i64, i64))>,
     /// Pins FrameLoc publication from assignment through commit.
     extent_ref_guard: Option<ExtentRefGuard>,
-    op_id: crate::dedup::OpId,
+    dedup_entry: Option<crate::dedup::DedupEntry>,
 }
 
 /// Cloneable without re-acquiring the non-reentrant read lock.
@@ -147,7 +147,7 @@ impl Transaction {
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
             extent_ref_guard: None,
-            op_id: [0u8; 16],
+            dedup_entry: None,
         }
     }
 
@@ -167,15 +167,18 @@ impl Transaction {
         self.extent_ref_guard.take()
     }
 
-    /// Tag with a client idempotency op-id (all-zero = none). The commit worker
-    /// records it in the dedup cache and ships it to the standby atomically with
-    /// the data, so a retry (here or after failover) is recognized as applied.
-    pub fn set_op_id(&mut self, op_id: crate::dedup::OpId) {
-        self.op_id = op_id;
+    /// Attach the result published after this transaction applies.
+    pub fn set_dedup_result(
+        &mut self,
+        op_id: crate::dedup::OpId,
+        result: crate::dedup::DedupResult,
+    ) {
+        self.dedup_entry =
+            crate::dedup::has_op_id(&op_id).then_some(crate::dedup::DedupEntry { op_id, result });
     }
 
-    pub fn op_id(&self) -> crate::dedup::OpId {
-        self.op_id
+    pub fn take_dedup_entry(&mut self) -> Option<crate::dedup::DedupEntry> {
+        self.dedup_entry.take()
     }
 
     pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
@@ -356,10 +359,27 @@ impl Db {
         self
     }
 
-    /// Error if a lease is attached and currently invalid.
+    /// Check current serving authority.
     #[inline]
     fn check_lease(&self) -> Result<()> {
         if self.is_deposed() {
+            return Err(FsError::LeaderLeaseExpired.into());
+        }
+        Ok(())
+    }
+
+    /// Wait through recoverable suspension for admitted or durability work.
+    /// Terminal revocation and database fencing remain errors. It does not
+    /// authorize new requests or successful responses.
+    async fn check_internal_lease(&self) -> Result<()> {
+        if let Some(lease) = &self.lease
+            && !lease.wait_until_internal_work_is_permitted().await
+        {
+            return Err(FsError::LeaderLeaseExpired.into());
+        }
+        if let Some(status) = &self.status
+            && status.borrow().close_reason.is_some()
+        {
             return Err(FsError::LeaderLeaseExpired.into());
         }
         Ok(())
@@ -378,15 +398,21 @@ impl Db {
         self.closing.store(true, Ordering::Relaxed);
     }
 
-    /// Whether this node may serve as leader right now (always true in single-node
-    /// mode). The 9P layer checks this before dispatch so a deposed leader answers
-    /// with the "not leader" signal a failover client re-routes on, not EIO.
+    /// Whether a protocol adapter may emit a successful response.
     #[inline]
-    pub fn lease_is_valid(&self) -> bool {
+    pub fn permits_successful_response(&self) -> bool {
         !self.is_deposed()
     }
 
-    /// Permanently revokes the attached HA serving lease.
+    /// Waits for terminal HA lease revocation. Without a lease, this does not complete.
+    pub async fn serving_authority_lost(&self) {
+        match &self.lease {
+            Some(lease) => lease.revoked().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Permanently revoke the attached serving lease.
     pub fn revoke_lease(&self) {
         if let Some(lease) = &self.lease {
             lease.revoke();
@@ -562,10 +588,12 @@ impl Db {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
-        self.check_lease()?;
+        self.check_internal_lease().await?;
         // Read side of the flush barrier: a commit overlapping a seal+flush waits
         // for it, so its pointer lands after the flush, never in the flushed set.
         let _flush_guard = self.flush_barrier.read().await;
+        // Recheck authority after waiting on the flush barrier.
+        self.check_internal_lease().await?;
         self.check_closing()?;
 
         match &self.inner {
@@ -616,6 +644,9 @@ impl Db {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
+        // Recoverable suspension pauses durability work; terminal revocation
+        // rejects it.
+        self.check_internal_lease().await?;
         self.check_closing()?;
 
         match &self.inner {
@@ -932,13 +963,47 @@ mod lease_gate_tests {
         lease.renew(Duration::from_millis(500));
         assert!(db.get_bytes(&key).await.unwrap().is_none());
 
+        // Admitted local apply waits through recoverable suspension.
+        lease.suspend_for_tests();
+        assert!(!db.permits_successful_response());
+        assert!(db.get_bytes(&key).await.is_err());
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(key.clone(), Bytes::from_static(b"v"));
+        let options = WriteOptions::default();
+        let write = db.write_with_options(batch, &options);
+        tokio::pin!(write);
+        assert!(matches!(
+            futures::poll!(write.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(lease.recover_for_tests(Duration::from_millis(500)));
+        write.await.unwrap();
+        assert_eq!(
+            db.get_bytes(&key).await.unwrap(),
+            Some(Bytes::from_static(b"v"))
+        );
+
+        lease.suspend_for_tests();
+        let flush = db.flush();
+        tokio::pin!(flush);
+        assert!(matches!(
+            futures::poll!(flush.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(lease.recover_for_tests(Duration::from_millis(500)));
+        flush.await.unwrap();
+
+        // Terminal revocation cannot be reversed by a later renewal.
         db.revoke_lease();
         lease.renew(Duration::from_millis(500));
-        assert!(!lease.is_valid(), "revocation must be terminal");
-
+        assert!(!lease.is_valid());
         assert!(
             db.get_bytes(&key).await.is_err(),
             "read must be refused after the lease is revoked"
+        );
+        assert!(
+            db.flush().await.is_err(),
+            "flush must be refused after the lease is revoked"
         );
     }
 }

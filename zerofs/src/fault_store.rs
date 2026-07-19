@@ -23,8 +23,10 @@ pub struct FaultControls {
     partition_writes: AtomicBool,
     /// Fail the next N `get` calls with a transient error, then resume.
     fail_next_gets: AtomicUsize,
-    /// Fail the next N `put` calls with a transient error, then resume.
+    /// Fail the next N `put` calls before applying them, then resume.
     fail_next_puts: AtomicUsize,
+    /// Apply the next N `put` calls, then return a transient response error.
+    fail_after_puts: AtomicUsize,
     /// Return a body `truncate_bytes` short of the claimed length on the next N gets.
     truncate_next_gets: AtomicUsize,
     truncate_bytes: AtomicUsize,
@@ -41,6 +43,9 @@ impl FaultControls {
     }
     pub fn fail_puts(&self, n: usize) {
         self.fail_next_puts.store(n, Ordering::SeqCst);
+    }
+    pub fn fail_puts_after_apply(&self, n: usize) {
+        self.fail_after_puts.store(n, Ordering::SeqCst);
     }
     /// Make the next `n` gets return a body `by` bytes short of the claimed length.
     pub fn truncate_gets(&self, n: usize, by: usize) {
@@ -120,7 +125,11 @@ impl ObjectStore for FaultStore {
         if take_one(&self.ctl.fail_next_puts) {
             return Err(Self::transient("put"));
         }
-        self.inner.put_opts(location, payload, opts).await
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        if take_one(&self.ctl.fail_after_puts) {
+            return Err(Self::transient("put response"));
+        }
+        Ok(result)
     }
 
     async fn put_multipart_opts(

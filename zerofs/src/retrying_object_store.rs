@@ -1,18 +1,11 @@
-//! Retrying object-store wrapper for ZeroFS's own I/O, adapted from SlateDB's
-//! (crate-private) `RetryingObjectStore`.
+//! Retry policy for direct ZeroFS object-store I/O.
 //!
-//! SlateDB wraps the store we hand it with its own retrying layer, so SST and
-//! manifest traffic already rides out transient backend errors. Everything
-//! ZeroFS issues directly — segment GETs/PUTs, the GC's LIST/DELETE, checkpoint
-//! admin listings — did not, so one flaky response surfaced as an EIO to the
-//! client. This wrapper closes that gap: transient errors retry with exponential
-//! backoff forever; `NotFound`-class errors return immediately.
+//! Transient errors retry indefinitely with exponential backoff. Deterministic
+//! errors return immediately. SlateDB applies its own retry policy to SST and
+//! manifest traffic.
 //!
-//! Differences from SlateDB's version: no conditional-put ULID verification
-//! (every PUT ZeroFS issues through this store is an overwrite of an immutable,
-//! deterministically-keyed object, so a blind retry is idempotent; the fenced
-//! CAS writes that need verification happen inside SlateDB, behind its own
-//! wrapper) and backoff sleeps on the tokio clock rather than an injected one.
+//! Conditional writes are not generically verified. The HA marker protocol
+//! reconciles ambiguous writes by reading the record before continuing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +21,6 @@ use object_store::{
     PutResult, RenameOptions,
 };
 
-/// Retries transient errors with exponential backoff forever.
 #[derive(Debug)]
 pub struct RetryingObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -69,12 +61,8 @@ impl RetryingObjectStore {
         ) && !Self::is_unsatisfiable_range(err)
     }
 
-    /// A range the object can never satisfy (start at or past EOF) is
-    /// deterministic: retrying re-sends the same doomed request forever.
-    /// Every backend surfaces it as `Error::Generic`, so match the message:
-    /// "InvalidRange" is the S3/R2/Azure error code, "not satisfiable" the
-    /// HTTP 416 reason phrase (GCS), and "StartTooLarge" object_store's own
-    /// `InvalidGetRange` variant for the fs/memory backends.
+    /// Detect deterministic ranges beginning at or beyond EOF.
+    /// Backends expose these as generic errors with provider-specific text.
     fn is_unsatisfiable_range(err: &object_store::Error) -> bool {
         let s = format!("{err:?}");
         s.contains("InvalidRange") || s.contains("not satisfiable") || s.contains("StartTooLarge")

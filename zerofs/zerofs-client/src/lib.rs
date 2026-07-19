@@ -1,20 +1,16 @@
-//! Async, path-based client for a ZeroFS server, speaking 9P2000.L (plus the
-//! ZeroFS fast-path extensions, used automatically when the server offers
-//! them) over TCP or a unix socket natively, and over WebSocket in browser
-//! WASM builds.
+//! Async, path-based client for a ZeroFS server, speaking the private
+//! `9P2000.L.Z` dialect over TCP or a unix socket natively, and over
+//! WebSocket in browser WASM builds.
 //!
-//! The primary surface is one-shot path operations on a shared [`Client`] (
-//! read, write, stat, rename, mkdir), with [`File`] and [`Dir`] handles only
-//! where statefulness pays (chunked I/O, incremental listing, openat-style
-//! child operations). Paths are bytes, as on POSIX and the 9P wire: every
-//! path parameter is `impl AsRef<Path>`, so non-UTF-8 names need nothing
-//! special on Unix. Browser paths come from JavaScript strings and are UTF-8.
-//! The API otherwise stays FFI-friendly (owned buffers, a flat
-//! exhaustive error enum, `Arc` handles, explicit `close`, cancel-safe
-//! futures) for the `zerofs-ffi` bindings layer built on top.
+//! The primary surface is one-shot path operations on a shared [`Client`]
+//! (read, write, stat, rename, mkdir), with [`File`] and [`Dir`] handles
+//! for chunked I/O, incremental listing, and openat-style child operations.
+//! Paths are byte-oriented. Native APIs accept non-UTF-8 paths; browser paths
+//! originate as UTF-8 JavaScript strings. The API uses owned data, an
+//! exhaustive error enum, `Arc` handles, explicit close, and cancellation
+//! cleanup for FFI compatibility.
 //!
-//! This is a trusted-network client: you assert your uid at connect time,
-//! NFS-style.
+//! The client asserts its uid at connect time and assumes a trusted network.
 //!
 //! ```no_run
 //! use zerofs_client::{Client, OpenOptions};
@@ -29,7 +25,7 @@
 //! assert_eq!(&data[..], b"hello from zerofs");
 //!
 //! for entry in fs.read_dir("/projects/demo").await? {
-//!     let size = entry.metadata.as_ref().map_or(0, |m| m.size);
+//!     let size = entry.metadata.size;
 //!     println!("{size:>8}  {}", entry.name);
 //! }
 //!
@@ -45,31 +41,31 @@
 //!
 //! # Lifecycles
 //!
-//! **Close & drop.** `close()` marks the handle closed immediately (later calls
-//! return [`ZeroFsError::Closed`]); it always succeeds, is idempotent, and never
-//! hangs. A handle's server-side fid is released and its number recycled when
-//! the handle is dropped (for scope-bound use, right after `close()`); the
-//! janitor performs the clunk in the background. Dropping a handle you never
-//! closed does the same. Fid numbers are always reused, so a long-running client
-//! never exhausts them.
+//! **Close and drop.** `close()` marks the handle closed and is idempotent and
+//! non-blocking. Dropping the handle schedules its fid for release and recycling.
 //!
-//! **Cancellation.** Every public future is cancel-safe: dropping it at any
-//! await point leaks nothing (in-flight fids are reclaimed in the background).
-//! There is deliberately no per-operation timeout parameter; callers can bound
-//! waits with their runtime's timeout facility.
+//! **Cancellation.** Dropping a Rust operation future releases any temporary
+//! fids it owns. If the future is dropped while a fid-state request is dispatched
+//! and unsettled, the connection that carried the request is retired. If it is
+//! still current, the session reconnects and replays before other operations
+//! resume. A dispatched mutation may still complete, leaving an ambiguous
+//! outcome. Callers supply per-operation timeouts when this ambiguity is
+//! acceptable. `zerofs-ffi` timeouts abandon a timed-out wait without cancelling
+//! the Rust future.
 //!
-//! **Connection loss.** The underlying session reconnects forever with backoff
-//! and replays its state; while the server is unreachable, calls block rather
-//! than fail. An operation in flight at the instant of a disconnect is resent,
-//! so a non-idempotent op (rename, create, unlink) can apply twice across a
-//! reconnect.
+//! **Connection loss.** The session reconnects with backoff and restores state
+//! before accepting requests. In-flight mutations retain their op-id across
+//! resends. The retry horizon bounds automatic resends; expiry returns an
+//! ambiguous connection failure. An open-unlinked handle cannot be replayed and
+//! returns `ESTALE` after connection loss; other handles remain usable. The
+//! negotiated `msize` is fixed for the logical session; every reconnect target
+//! must accept that value.
 
 #![warn(missing_docs)]
 
 mod client;
 mod dir;
 mod error;
-pub mod failover;
 mod file;
 #[cfg(feature = "tokio-io")]
 pub mod io;
@@ -84,7 +80,6 @@ mod types;
 pub use client::Client;
 pub use dir::Dir;
 pub use error::ZeroFsError;
-pub use failover::FailoverClient;
 pub use file::File;
 #[cfg(feature = "stream")]
 pub use stream::DirStream;

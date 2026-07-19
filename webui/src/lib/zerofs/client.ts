@@ -56,12 +56,10 @@ interface WireDirEntry {
   name_is_utf8: boolean;
   file_type: WireFileType;
   ino: bigint | number;
-  metadata?: WireMetadata;
+  metadata: WireMetadata;
 }
 
 interface WireCapabilities {
-  extensions_v1: boolean;
-  extensions_v2: boolean;
   msize: number;
   max_read_chunk: number;
   max_write_chunk: number;
@@ -326,33 +324,23 @@ export class ZeroFsClient {
   async listDirectory(path: string, signal?: AbortSignal): Promise<FileEntry[]> {
     const fs = await this.fs();
     const entries = await this.readDirectoryEntries(fs, path, signal);
-    const results: FileEntry[] = [];
-    await pooled(entries, 20, async (entry) => {
-      if (signal?.aborted) return;
-      let metadata = entry.metadata;
-      if (!metadata) {
-        try {
-          metadata = (await fs.stat(join(path, entry.name))) as WireMetadata;
-        } catch {
-          // The entry may have disappeared between readdir and stat.
-        }
-      }
-      const resolvedIsDir = entry.file_type === "Dir";
-      results.push({
-        name: entry.name,
-        isDir: entry.file_type === "Dir",
-        isSymlink: entry.file_type === "Symlink",
-        resolvedIsDir,
-        size: metadata ? asBigInt(metadata.size) : 0n,
-        mtimeSec: metadata ? asBigInt(metadata.mtime.secs) : 0n,
-        mode: metadata?.mode ?? 0,
-        uid: metadata?.uid ?? 0,
-        gid: metadata?.gid ?? 0,
-        nlink: metadata ? asBigInt(metadata.nlink) : 0n,
-      });
-    });
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    return results;
+    return entries.map((entry): FileEntry => {
+      const metadata = entry.metadata;
+      const isDir = entry.file_type === "Dir";
+      return {
+        name: entry.name,
+        isDir,
+        isSymlink: entry.file_type === "Symlink",
+        resolvedIsDir: isDir,
+        size: asBigInt(metadata.size),
+        mtimeSec: asBigInt(metadata.mtime.secs),
+        mode: metadata.mode,
+        uid: metadata.uid,
+        gid: metadata.gid,
+        nlink: asBigInt(metadata.nlink),
+      };
+    });
   }
 
   async stat(path: string): Promise<FileInfo> {

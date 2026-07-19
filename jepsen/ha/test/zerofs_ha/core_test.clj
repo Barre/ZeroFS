@@ -1,10 +1,110 @@
 (ns zerofs-ha.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
-            [zerofs-ha.core :as core]))
+            [jepsen.util :as util]
+            [slingshot.slingshot :refer [try+]]
+            [zerofs-ha.core :as core])
+  (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
+           [java.nio.channels ServerSocketChannel]
+           [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
 
 (defn- check [history]
   (checker/check (core/set-checker) {} history {}))
+
+(deftest node-9p-up-requires-a-listener
+  (let [dir         (.toFile (Files/createTempDirectory
+                              "zerofs-ha-test"
+                              (make-array FileAttribute 0)))
+        socket      (io/file dir "ninep.sock")
+        socket-path (.getPath socket)
+        c           {:nodes {:a {:ninep socket-path}}}]
+    (try
+      (spit socket "")
+      (is (false? (core/node-9p-up? c :a)))
+      (is (.delete socket))
+      (with-open [server (ServerSocketChannel/open StandardProtocolFamily/UNIX)]
+        (.bind server (UnixDomainSocketAddress/of socket-path))
+        (is (true? (core/node-9p-up? c :a))))
+      (finally
+        (.delete socket)
+        (.delete dir)))))
+
+(deftest standby-ready-count-is-node-specific
+  (let [log (java.io.File/createTempFile "zerofs-ha-test" ".log")
+        c   {:nodes {:a {:log (.getPath log)}
+                     :b {:log (.getPath log)}}}]
+    (try
+      (spit log (str "HA standby a: watching leader heartbeats\n"
+                     "HA standby b: watching leader heartbeats\n"
+                     "HA standby b: watching leader heartbeats\n"))
+      (is (= 1 (core/standby-ready-count c :a)))
+      (is (= 2 (core/standby-ready-count c :b)))
+      (finally
+        (.delete log)))))
+
+(deftest make-bucket-waits-for-a-readable-bucket
+  (let [commands (atom [])
+        stats    (atom 0)
+        c        {:mc "/mc" :minio-addr "127.0.0.1:9000"
+                  :access-key "key" :secret-key "secret" :bucket "bucket"}]
+    (with-redefs [core/sh-ok!
+                  (fn [& args]
+                    (swap! commands conj args)
+                    (when (and (= "stat" (second args))
+                               (= 1 (swap! stats inc)))
+                      (throw (ex-info "bucket not ready" {})))
+                    {:exit 0})
+                  util/await-fn
+                  (fn [ready? _]
+                    (try
+                      (ready?)
+                      (catch clojure.lang.ExceptionInfo _
+                        (ready?))))]
+      (core/make-bucket! c)
+      (is (= ["alias" "mb" "stat" "alias" "mb" "stat"]
+             (mapv second @commands))))))
+
+(deftest heal-restart-starts-the-standby-before-waiting-for-the-leader
+  (let [events        (atom [])
+        standby-ready (atom 4)]
+    (with-redefs [core/cluster-roles (atom {})
+                  core/minio-up? (constantly true)
+                  core/node-pid (fn [_ node-key] node-key)
+                  core/kill-pid! (fn [_])
+                  core/standby-ready-count
+                  (fn [_ node-key]
+                    (swap! events conj [:standby-count node-key @standby-ready])
+                    @standby-ready)
+                  core/start-node!
+                  (fn [_ node-key role]
+                    (swap! events conj [:start node-key role]))
+                  core/node-9p-up? (fn [_ _] true)
+                  core/mounted? (fn [_] true)
+                  util/await-fn
+                  (fn [ready? options]
+                    (let [message (:log-message options)]
+                      (swap! events conj [:await message])
+                      (case message
+                        "heal: waiting for leader" (is (true? (ready?)))
+                        "Waiting for standby b" (do
+                                                   (is (thrown? clojure.lang.ExceptionInfo
+                                                                (ready?)))
+                                                   (swap! standby-ready inc)
+                                                   (is (true? (ready?))))
+                        "heal: waiting for mount" (is (true? (ready?))))))]
+      (core/heal-restart! {})
+      (is (= [[:standby-count :b 4]
+              [:start :b "standby"]
+              [:start :a "leader"]
+              [:await "heal: waiting for leader"]
+              [:await "Waiting for standby b"]
+              [:standby-count :b 4]
+              [:standby-count :b 5]
+              [:await "heal: waiting for mount"]]
+             @events))
+      (is (= {:a :leader :b :standby} @core/cluster-roles)))))
 
 (deftest set-checker-flags-lost-and-resurrected
   (testing "catches a lost add (present per ops, missing from the final read) and a
@@ -41,6 +141,23 @@
                     {:type :ok   :f :read   :value (sorted-set)}])]  ; absent, but that's allowed
       (is (true? (:valid? r))))))
 
+(deftest set-checker-bounds-anomaly-samples
+  (let [lost-values        (range 60)
+        resurrected-values (range 100 160)
+        history            (concat
+                            (map (fn [v] {:type :ok :f :add :value v}) lost-values)
+                            (mapcat (fn [v] [{:type :ok :f :add :value v}
+                                             {:type :ok :f :remove :value v}])
+                                    resurrected-values)
+                            [{:type :ok :f :read :value (into (sorted-set)
+                                                              resurrected-values)}])
+        r                  (check history)]
+    (is (false? (:valid? r)))
+    (is (= 60 (:lost-count r)))
+    (is (= (vec (range 50)) (:lost r)))
+    (is (= 60 (:resurrected-count r)))
+    (is (= (vec (range 100 150)) (:resurrected r)))))
+
 (deftest add-error-classification
   (testing "ENOENT/EEXIST from the rename are indeterminate: a resent rename whose
             original applied re-executes exactly this way. The NIO two-path
@@ -59,8 +176,42 @@
     (is (= {:type :info :error :retried-create}
            (core/classify-add-error
             (java.io.IOException. "File exists")))))
-  (testing "other IO errors stay determinate failures"
-    (is (= :fail (:type (core/classify-add-error
+  (testing "other IO errors are indeterminate after a multi-step add"
+    (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Bad file descriptor")))))
-    (is (= :fail (:type (core/classify-add-error
+    (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Input/output error")))))))
+
+(deftest inode-accounting-waits-for-replay-protected-orphans
+  (let [samples (atom [20 19])
+        options (atom nil)]
+    (with-redefs [core/count-all-inodes (constantly 20)
+                  core/statfs-used-inodes
+                  (fn [_]
+                    (let [sample (first @samples)]
+                      (swap! samples rest)
+                      sample))
+                  util/await-fn
+                  (fn [f opts]
+                    (reset! options opts)
+                    (try+
+                      (f)
+                      (catch [:type ::core/inode-reclamation-pending] pending
+                        (is (= 20 (:used-inodes pending)))
+                        (is (= 19 (:expected-used-inodes pending)))
+                        (f))))]
+      (is (= 19 (core/await-inode-accounting!
+                 "/mnt" {:used-inodes 17 :all-inodes 18})))
+      (is (empty? @samples))
+      (is (= core/inode-accounting-timeout-ms (:timeout @options)))
+      (is (> (:timeout @options) 150000)))))
+
+(deftest statfs-checker-retains-the-orphan-leak-check
+  (let [history [{:type :ok :f :read :value #{}
+                  :used-inodes 17 :all-inodes 18}
+                 {:type :ok :f :read :value #{1 2}
+                  :used-inodes 20 :all-inodes 20}]
+        result (checker/check (core/statfs-checker) {} history {})]
+    (is (false? (:valid? result)))
+    (is (= 3 (:inodes-grew result)))
+    (is (= 2 (:census-grew result)))))

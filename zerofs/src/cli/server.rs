@@ -24,7 +24,7 @@ use slatedb::object_store::path::Path;
 use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -118,14 +118,14 @@ async fn start_nfs_servers(
     handles
 }
 
-async fn start_ninep_servers(
+fn start_ninep_servers(
     fs: Arc<ZeroFS>,
     config: Option<&NinePConfig>,
     shutdown: CancellationToken,
-) -> Result<Vec<JoinHandle<Result<(), std::io::Error>>>> {
+) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
     let config = match config {
         Some(c) => c,
-        None => return Ok(Vec::new()),
+        None => return Vec::new(),
     };
     let mut handles = Vec::new();
 
@@ -154,7 +154,7 @@ async fn start_ninep_servers(
         }));
     }
 
-    Ok(handles)
+    handles
 }
 
 async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
@@ -309,6 +309,7 @@ fn start_periodic_flush(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => {
                     info!("Periodic flush task shutting down");
                     break;
@@ -321,6 +322,10 @@ fn start_periodic_flush(
             }
         }
     })
+}
+
+fn leadership_lost_error() -> anyhow::Error {
+    anyhow::anyhow!("HA writer was fenced or superseded; restart required")
 }
 
 /// Walk an error's source chain looking for an open-file-descriptor exhaustion
@@ -497,11 +502,24 @@ pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize) {
 /// Result of opening the ZeroFS database.
 pub struct SlateDbOpen {
     pub data: SlateDbHandle,
-    pub maintenance_runtime: Option<tokio::runtime::Handle>,
     pub metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     /// The raw-parts prefetch cache, returned so the segment store reuses it
     /// (one budget; segment objects and SST objects share it, keyed by path).
     pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
+}
+
+/// Process-wide runtime for cache, database, and GC maintenance.
+fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("zerofs-maintenance")
+                .build()
+                .expect("failed to build maintenance runtime")
+        })
+        .handle()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -583,6 +601,7 @@ pub async fn build_slatedb(
         l0_sst_size_bytes: usize::MAX,
         compactor_options: None,
         flush_interval: None,
+        // Independent of HA authority checks.
         manifest_poll_interval: std::time::Duration::from_secs(5),
         // Backpressure ceiling for frozen-but-not-yet-L0 memtables. Our flushes
         // are serialized, so at most one frozen memtable exists at a time and
@@ -621,22 +640,8 @@ pub async fn build_slatedb(
         ..Default::default()
     };
 
-    // Dedicated runtime for maintenance work (foyer cache I/O, slatedb GC,
-    // compactions, ZeroFS GC) so it doesn't compete with the serving runtime.
-    // The runtime is moved onto a parked thread and lives for the rest of the
-    // process; dropping it here would panic inside an async context.
-    let maintenance_runtime = {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("zerofs-maintenance")
-            .build()
-            .expect("failed to build maintenance runtime");
-        let handle = rt.handle().clone();
-        std::thread::spawn(move || {
-            rt.block_on(std::future::pending::<()>());
-        });
-        handle
-    };
+    // HA startup retries share the process-wide maintenance runtime.
+    let maintenance_runtime = shared_maintenance_runtime().clone();
 
     let hybrid_cache_root = cache_config.root_folder.join("hybrid_cache");
     let cache = build_block_hybrid(
@@ -735,7 +740,6 @@ pub async fn build_slatedb(
 
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadWrite(slatedb),
-                maintenance_runtime: Some(maintenance_runtime),
                 metrics_recorder: Some(metrics_recorder),
                 parts_cache: parts_cache.clone(),
             })
@@ -759,7 +763,6 @@ pub async fn build_slatedb(
 
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
-                maintenance_runtime: None,
                 metrics_recorder: None,
                 parts_cache: parts_cache.clone(),
             })
@@ -784,7 +787,6 @@ pub async fn build_slatedb(
 
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
-                maintenance_runtime: None,
                 metrics_recorder: None,
                 parts_cache: parts_cache.clone(),
             })
@@ -798,10 +800,8 @@ pub struct InitResult {
     pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
-    pub maintenance_runtime: Option<tokio::runtime::Handle>,
-    /// Keeps the HA heartbeat loop alive; dropping it (or sending `true`) stops
-    /// the loop. `None` in single-node mode.
-    pub heartbeat_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// HA authority monitors retained through database close.
+    pub authority: Option<crate::replication::AuthoritySupervisor>,
 }
 
 const STARTUP_BANNER: &str = r#"
@@ -872,18 +872,30 @@ pub async fn run_server(
             ));
         }
     };
+    let maintenance_runtime = if db_mode.is_read_only() {
+        None
+    } else {
+        Some(shared_maintenance_runtime().clone())
+    };
 
     crate::telemetry::send_startup_event(&settings);
 
     let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
     let fs = init_result.fs;
-    let heartbeat_shutdown = init_result.heartbeat_shutdown;
+    let authority = init_result.authority;
+    let leadership_deposed = authority
+        .as_ref()
+        .map_or_else(CancellationToken::new, |authority| authority.loss_token());
+    let shutdown = leadership_deposed.child_token();
+
+    // Do not start listeners after authority was revoked during initialization.
+    if leadership_deposed.is_cancelled() {
+        return Err(leadership_lost_error());
+    }
 
     if !db_mode.is_read_only() && settings.servers.nbd.is_some() {
         ensure_nbd_directory(&fs).await?;
     }
-
-    let shutdown = CancellationToken::new();
 
     let telemetry_handle = crate::telemetry::start_periodic_reporting(
         &settings,
@@ -898,6 +910,7 @@ pub async fn run_server(
             Arc::clone(&fs.stats),
             Arc::clone(&fs.global_stats),
             fs.extent_store.segment_gc_stats(),
+            Arc::clone(&fs.dedup),
             slatedb_registry,
             shutdown.clone(),
         )
@@ -933,8 +946,7 @@ pub async fn run_server(
         Arc::clone(&fs),
         settings.servers.ninep.as_ref(),
         shutdown.clone(),
-    )
-    .await?;
+    );
 
     let nbd_handles = start_nbd_servers(
         Arc::clone(&fs),
@@ -1001,7 +1013,7 @@ pub async fn run_server(
         let warm = async move {
             fs.db.warm_metadata_watch(warm_data, status, shutdown).await;
         };
-        match &init_result.maintenance_runtime {
+        match &maintenance_runtime {
             Some(handle) => {
                 handle.spawn(warm);
             }
@@ -1021,7 +1033,7 @@ pub async fn run_server(
             gc_admin,
             tuning,
         ));
-        Some(gc.start(shutdown.clone(), init_result.maintenance_runtime.clone()))
+        Some(gc.start(shutdown.clone(), maintenance_runtime.clone()))
     } else {
         None
     };
@@ -1075,46 +1087,93 @@ pub async fn run_server(
         ));
     }
 
-    tokio::select! {
+    let deposed = tokio::select! {
+        biased;
+        _ = leadership_deposed.cancelled() => {
+            tracing::error!(
+                "HA: this serving runtime was fenced or superseded; stopping without flushing \
+                 the stale database"
+            );
+            true
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, initiating graceful shutdown...");
+            false
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, initiating graceful shutdown...");
+            false
         }
-    }
+    };
 
     info!("Cancelling all servers and background tasks...");
     shutdown.cancel();
 
-    info!("Waiting for servers to exit...");
-    for handle in server_handles {
-        let _ = handle.await;
+    // Retain the join future so leadership loss cannot detach serving tasks.
+    let mut serving_drain = Box::pin(futures::future::join_all(server_handles));
+
+    let deposed_while_draining_servers = if deposed {
+        true
+    } else {
+        info!("Waiting for servers to exit...");
+        tokio::select! {
+            biased;
+            _ = leadership_deposed.cancelled() => true,
+            _ = &mut serving_drain => false,
+        }
+    };
+    if deposed_while_draining_servers {
+        // A deposed database is not flushed. Serving transports get one bounded
+        // interval to emit queued CLEAN responses.
+        if tokio::time::timeout(
+            crate::replication::RESPONSE_DRAIN_TIMEOUT,
+            &mut serving_drain,
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("serving response drain timed out after leadership loss");
+        }
+        return Err(leadership_lost_error());
     }
 
-    info!("Waiting for background tasks to exit...");
-    if let Some(gc_handles) = gc_handle {
-        for handle in gc_handles {
-            if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
-                .await
-                .is_err()
-            {
-                info!("a GC task is still mid-pass after 15s; proceeding to the final flush");
+    let drain = async move {
+        info!("Waiting for background tasks to exit...");
+        if let Some(gc_handles) = gc_handle {
+            for handle in gc_handles {
+                if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+                    .await
+                    .is_err()
+                {
+                    info!("a GC task is still mid-pass after 15s; proceeding to the final flush");
+                }
             }
         }
+        let _ = stats_handle.await;
+        if let Some(flush_handle) = flush_handle {
+            let _ = flush_handle.await;
+        }
+        if let Some(handle) = telemetry_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = digest_handle {
+            let _ = handle.await;
+        }
+        for handle in prometheus_handles {
+            let _ = handle.await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = leadership_deposed.cancelled() => {
+            return Err(leadership_lost_error());
+        }
+        _ = drain => {}
     }
-    let _ = stats_handle.await;
-    if let Some(flush_handle) = flush_handle {
-        let _ = flush_handle.await;
-    }
-    if let Some(handle) = telemetry_handle {
-        let _ = handle.await;
-    }
-    if let Some(handle) = digest_handle {
-        let _ = handle.await;
-    }
-    for handle in prometheus_handles {
-        let _ = handle.await;
+
+    // Flush remains lease-gated while background tasks drain.
+    if leadership_deposed.is_cancelled() {
+        return Err(leadership_lost_error());
     }
     info!("Performing final flush and closing database...");
     if db_mode.is_read_only() {
@@ -1122,18 +1181,33 @@ pub async fn run_server(
             tracing::error!("Database close failed: {:?}", e);
             return Err(e);
         }
-    } else if let Err(e) = fs.flush_coordinator.close().await {
-        // Never call db.close() after a seal failure: its implicit metadata
-        // flush could publish pointers to an un-PUT segment.
-        tracing::error!(
-            "Final flush+close failed ({e:?}); exiting without a separate database close"
-        );
-        std::process::exit(1);
+    } else {
+        let close_result = tokio::select! {
+            biased;
+            _ = leadership_deposed.cancelled() => {
+                return Err(leadership_lost_error());
+            }
+            result = fs.flush_coordinator.close() => result,
+        };
+        if let Err(e) = close_result {
+            // `db.close()` may flush metadata, so it is unsafe after seal failure.
+            tracing::error!(
+                "Final flush+close failed ({e:?}); exiting without a separate database close"
+            );
+            std::process::exit(1);
+        }
     }
 
-    // Keep the local lease valid until all writes are durable and the DB is closed.
-    if let Some(hb_shutdown) = heartbeat_shutdown {
-        let _ = hb_shutdown.send(true);
+    if leadership_deposed.is_cancelled() {
+        return Err(leadership_lost_error());
+    }
+
+    // Retain authority monitors until the database is closed.
+    if let Some(authority) = authority {
+        authority.finish_after_close().await;
+    }
+    if leadership_deposed.is_cancelled() {
+        return Err(leadership_lost_error());
     }
 
     info!("Shutdown complete");
@@ -1143,6 +1217,20 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_runtime_is_shared_across_open_attempts() {
+        let first = shared_maintenance_runtime();
+        let second = shared_maintenance_runtime();
+        assert!(std::ptr::eq(first, second));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        first.spawn(async move {
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("shared maintenance runtime did not execute a task");
+    }
 
     #[test]
     fn split_disk_budget_favors_segments() {

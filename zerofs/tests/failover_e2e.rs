@@ -1,13 +1,11 @@
-//! Real-process CLIENT failover: a leader + standby `zerofs run` over ONE
-//! file:// store, exercising client re-routing across a failover (the RPC
-//! FailoverClient and the multi-target ninep-client). This is the part the
-//! jepsen suites (FUSE mount) don't reach; only what needs two live processes
-//! plus a real client lives here.
+//! Real-process failover tests for multi-target 9P clients.
+//! Each test runs a leader and standby against one file-backed object store.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
-use zerofs_client::FailoverClient;
+use zerofs_client::Client;
 
 /// Locate the workspace zerofs binary, building it on demand.
 fn zerofs_binary() -> PathBuf {
@@ -54,12 +52,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Caps how many of these process-heavy e2e tests run at once, independent of the
-/// harness `--test-threads`. Each spawns a leader + standby, so on a many-core box
-/// the default thread count would start dozens at once and starve the failover
-/// timing. Each test holds a permit for its run. (The whole suite is `#[ignore]`d
-/// by default: it is flaky on shared CI runners and meant to be run explicitly
-/// with `--ignored`; the jepsen suites cover HA correctness in CI.)
+/// Limit concurrent two-process tests independently of `--test-threads`.
 static E2E_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 async fn e2e_gate() -> tokio::sync::SemaphorePermit<'static> {
@@ -107,8 +100,7 @@ fn write_config(
         }
         Err(_) => (format!("file://{}", data_dir.display()), String::new()),
     };
-    // Short HA timing for a fast test; still valid (heartbeat < lease,
-    // takeover > lease + 2s guard band).
+    // Tests use the production HA timing policy.
     let cfg = format!(
         r#"
 [cache]
@@ -142,11 +134,7 @@ enabled = false
 }
 
 fn spawn(config_path: &Path) -> Node {
-    // A spawned server inherits this test process's stderr, which bypasses cargo's
-    // output capture, so by default we silence it (RUST_LOG=off + discard stderr)
-    // to keep a normal run clean -- including SlateDB's expected fencing errors on
-    // failover. Set ZEROFS_TEST_LOG to a RUST_LOG filter (e.g. `warn` or `debug`)
-    // to surface server logs for debugging.
+    // `ZEROFS_TEST_LOG` enables child-process logs; the default discards stderr.
     let log = std::env::var("ZEROFS_TEST_LOG").ok();
     let child = Command::new(zerofs_binary())
         .args(["run", "-c"])
@@ -179,8 +167,7 @@ async fn wait_for_socket(sock: &Path, timeout: Duration) -> bool {
     false
 }
 
-/// A `FailoverClient` over both node addresses re-routes to the new leader
-/// across a failover with no manual reconnection.
+/// A multi-target client reroutes after leader failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
 async fn failover_client_transparently_reroutes() {
@@ -230,7 +217,7 @@ async fn failover_client_transparently_reroutes() {
         format!("unix:{}", l_9p.display()),
         format!("unix:{}", s_9p.display()),
     ];
-    let client = FailoverClient::connect(targets)
+    let client = Client::connect_multi(&targets)
         .await
         .expect("failover client connects to the leader");
 
@@ -260,8 +247,7 @@ async fn failover_client_transparently_reroutes() {
     drop(standby);
 }
 
-/// FailoverClient re-routes a non-idempotent mutating op (mkdir) across a
-/// failover, and the dir created on the old leader survives via semi-sync.
+/// A non-idempotent mutation reroutes and replays across failover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
 async fn failover_client_reroutes_mutating_ops() {
@@ -311,7 +297,7 @@ async fn failover_client_reroutes_mutating_ops() {
         format!("unix:{}", l_9p.display()),
         format!("unix:{}", s_9p.display()),
     ];
-    let client = FailoverClient::connect(targets)
+    let client = Client::connect_multi(&targets)
         .await
         .expect("failover client connects to the leader");
 
@@ -340,11 +326,7 @@ async fn failover_client_reroutes_mutating_ops() {
     drop(standby);
 }
 
-/// An OPEN `File` handle survives a leader failover: its I/O re-opens the path on
-/// the re-probed leader and keeps working, instead of hanging on (or erroring
-/// against) the dead leader's connection. This is the gap the audit flagged:
-/// the handle used to be pinned to one leader with no per-op timeout and no
-/// reroute, so an open-file workload could wedge across a failover.
+/// An open file handle reroutes after leader failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
 async fn open_file_handle_survives_failover() {
@@ -394,7 +376,7 @@ async fn open_file_handle_survives_failover() {
         format!("unix:{}", l_9p.display()),
         format!("unix:{}", s_9p.display()),
     ];
-    let client = FailoverClient::connect(targets)
+    let client = Client::connect_multi(&targets)
         .await
         .expect("failover client connects to the leader");
 
@@ -409,8 +391,7 @@ async fn open_file_handle_survives_failover() {
     leader.child.kill().expect("kill leader");
     leader.child.wait().expect("reap leader");
 
-    // The SAME handle must keep working: it re-opens /f on the new leader and
-    // retries, rather than hanging on the dead connection.
+    // Reuse the same handle to exercise fid replay.
     file.write_at(0, b"after!")
         .await
         .expect("write through the open handle must re-route across the failover");
@@ -493,23 +474,29 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
         .await
         .expect("mkdir d1 on leader");
 
-    // Freeze (partition, not death): heartbeat stops, listener stays up.
+    // Dispatch to a frozen connection; delivery remains ambiguous after fencing.
     let _ = Command::new("kill")
         .args(["-STOP", &leader_pid.to_string()])
         .status();
+    let in_flight = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.mkdir(1, b"d2", 0o755, 0).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         wait_for_socket(&s_9p, Duration::from_secs(90)).await,
         "standby never took over"
     );
-    // Thaw: leader is now fenced-but-alive (answers ops with P9_ENOTLEADER).
+
+    // The pending call completes on the promoted standby.
+    let rerouted = tokio::time::timeout(Duration::from_secs(90), in_flight).await;
+    // Resume the fenced process for teardown.
     let _ = Command::new("kill")
         .args(["-CONT", &leader_pid.to_string()])
         .status();
-
-    // Client still bound to the fenced leader must re-probe + re-route, not EIO.
-    client
-        .mkdir(1, b"d2", 0o755, 0)
-        .await
+    rerouted
+        .expect("in-flight op did not finish across failover")
+        .expect("in-flight task panicked")
         .expect("op must re-route around a fenced-but-alive leader, not EIO");
     // d1 survived to the new leader (shipped via semi-sync before the partition).
     assert!(
@@ -523,13 +510,10 @@ async fn client_reroutes_around_a_fenced_but_alive_leader() {
     drop(standby);
 }
 
-/// The higher-level `FailoverClient` must also re-route around a fenced-but-alive
-/// leader: its `is_transport_failure` has to treat `NotLeader` (P9_ENOTLEADER) as
-/// a re-route trigger, not surface it. (Pre-fix it only re-routed on EIO, so a
-/// deposed-but-responsive leader's ENOTLEADER fell straight through to the caller.)
+/// The high-level client reroutes on `P9_ENOTLEADER` from a fenced leader.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn failover_client_reroutes_around_a_fenced_but_alive_leader() {
+async fn facade_reroutes_on_fenced_leader() {
     let _e2e_permit = e2e_gate().await;
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -575,7 +559,7 @@ async fn failover_client_reroutes_around_a_fenced_but_alive_leader() {
         format!("unix:{}", l_9p.display()),
         format!("unix:{}", s_9p.display()),
     ];
-    let client = FailoverClient::connect(targets)
+    let client = Client::connect_multi(&targets)
         .await
         .expect("connect to leader");
     client
@@ -583,24 +567,26 @@ async fn failover_client_reroutes_around_a_fenced_but_alive_leader() {
         .await
         .expect("create_dir d1 on leader");
 
-    // Freeze (partition, not death) so the standby takes over, then thaw: the old
-    // leader is fenced-but-alive and answers ops with P9_ENOTLEADER.
+    // The post-takeover resend retains RETRY for ambiguous prior delivery.
     let _ = Command::new("kill")
         .args(["-STOP", &leader_pid.to_string()])
         .status();
+    let in_flight = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.create_dir("/d2", 0o755).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         wait_for_socket(&s_9p, Duration::from_secs(90)).await,
         "standby never took over"
     );
+    let rerouted = tokio::time::timeout(Duration::from_secs(90), in_flight).await;
     let _ = Command::new("kill")
         .args(["-CONT", &leader_pid.to_string()])
         .status();
-
-    // The cached connection still points at the fenced leader; the next op gets
-    // P9_ENOTLEADER and must re-probe + re-route, not surface it.
-    client
-        .create_dir("/d2", 0o755)
-        .await
+    rerouted
+        .expect("in-flight facade op did not finish across failover")
+        .expect("in-flight facade task panicked")
         .expect("must re-route around the fenced-but-alive leader, not surface ENOTLEADER");
     assert!(
         matches!(
@@ -677,8 +663,7 @@ async fn unflushed_op_survives_a_leader_restart_case() {
         .await
         .expect("mkdir keep on leader");
 
-    // Bounce the leader fast (within takeover_ttl): the returning leader must NOT
-    // re-take and drop the tail; the standby must take over and replay it.
+    // Restart within the takeover window while the standby holds the tail.
     leader.child.kill().expect("kill leader");
     leader.child.wait().expect("reap leader");
     // Restart with a fresh cache dir: a SIGKILL can leave the local cache torn,
@@ -834,11 +819,7 @@ async fn unflushed_file_write_survives_failover() {
     unflushed_file_write_survives_failover_case().await;
 }
 
-/// A solo episode leaves a durable solo>0 provenance stamp. The first shipped
-/// batch after the standby returns must be durable before its ack: a leader
-/// crash right after the ack used to leave the durable head stamped solo>0, and
-/// the takeover replay guard discarded the acked batch together with the
-/// outlived tail (solo -> reconnect -> crash lost an acked Connected write).
+/// The first post-Solo ship follows a flush of its local base.
 async fn post_solo_reconnect_write_survives_failover_case() {
     use ninep_client::{NOFID, NinePClient, Target};
     const O_CREAT_RDWR: u32 = 0x42; // O_CREAT | O_RDWR
@@ -903,8 +884,7 @@ async fn post_solo_reconnect_write_survives_failover_case() {
     client.write(10, 0, b"pre").await.expect("write pre");
     client.clunk(10).await.ok();
 
-    // Standby outage: the next write downgrades the leader to solo, and the
-    // fsync flushes, putting the solo>0 stamp on the durable head.
+    // Solo writes remain unflushed until the reconnect barrier.
     standby.child.kill().expect("kill standby");
     standby.child.wait().expect("reap standby");
     client.walk(1, 11, &[]).await.expect("clone root for solo");
@@ -913,7 +893,6 @@ async fn post_solo_reconnect_write_survives_failover_case() {
         .await
         .expect("lcreate solo");
     client.write(11, 0, b"solo").await.expect("write solo");
-    client.fsync(11, 0).await.expect("fsync solo");
     client.clunk(11).await.ok();
 
     // The standby returns (same identity, fresh cache); shipping re-establishes.
@@ -942,8 +921,7 @@ async fn post_solo_reconnect_write_survives_failover_case() {
     }
     tokio::time::sleep(Duration::from_secs(8)).await; // leader reconnect loop reconnects
 
-    // The acked write the old code lost: shipped and acked, then the leader
-    // dies before any further flush.
+    // Kill the leader after ship acknowledgement and before periodic flush.
     let data: Vec<u8> = (0..5000u32)
         .map(|i| i.wrapping_mul(2654435761) as u8)
         .collect();
@@ -984,8 +962,22 @@ async fn post_solo_reconnect_write_survives_failover_case() {
     assert_eq!(
         got, data,
         "an acked post-reconnect write must survive failover; losing it means the \
-         durable head still carried the solo>0 stamp when the leader died (the \
-         reconnect transition flush is missing)"
+         reconnect ship was allowed to overtake its unflushed Solo base"
+    );
+
+    // The promoted state contains both the Solo base and replicated suffix.
+    client
+        .walk(1, 21, &[b"solo"])
+        .await
+        .expect("walk to solo after failover");
+    client.lopen(21, O_RDONLY).await.expect("open solo");
+    let got_solo = client
+        .read(21, 0, 4)
+        .await
+        .expect("read solo after failover");
+    assert_eq!(
+        got_solo, b"solo",
+        "the flushed Solo base must survive takeover"
     );
 
     drop(standby2);
@@ -1088,105 +1080,6 @@ async fn client_reroutes_around_a_frozen_leader() {
         .expect("mkdir y must succeed on the promoted standby");
 }
 
-/// REPRO for the jepsen `(File exists)`: does the mount's compound create
-/// (lcreateattr) dedup when its retry lands on the PROMOTED STANDBY after a
-/// failover? Same-server dedup is covered (op_id_dedup_tests::op_id_dedups_lcreate);
-/// this is the cross-failover path that produced a spurious EEXIST and had no
-/// deterministic test. If it dedups, the jepsen line was something else (e.g. Solo).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn op_id_dedups_create_across_failover() {
-    let _e2e_permit = e2e_gate().await;
-    use ninep_client::{ClientError, NOFID, NinePClient, Target};
-    const O_CREAT_RDWR: u32 = 0x42; // O_CREAT | O_RDWR
-
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().join("data");
-    let a_9p = dir.path().join("a-9p.sock");
-    let b_9p = dir.path().join("b-9p.sock");
-    let a_cfg = dir.path().join("a.toml");
-    let b_cfg = dir.path().join("b.toml");
-    let a_repl = format!("127.0.0.1:{}", free_port());
-    let b_repl = format!("127.0.0.1:{}", free_port());
-    write_config(
-        &a_cfg,
-        &data_dir,
-        &dir.path().join("cache-a"),
-        "node-a",
-        "leader",
-        &a_9p,
-        &dir.path().join("a-rpc.sock"),
-        Some(&b_repl),
-        Some(&a_repl),
-    );
-    write_config(
-        &b_cfg,
-        &data_dir,
-        &dir.path().join("cache-b"),
-        "node-b",
-        "standby",
-        &b_9p,
-        &dir.path().join("b-rpc.sock"),
-        Some(&a_repl),
-        Some(&b_repl),
-    );
-
-    let mut a = spawn(&a_cfg);
-    assert!(
-        wait_for_socket(&a_9p, Duration::from_secs(90)).await,
-        "leader A 9P never came up"
-    );
-    let _b = spawn(&b_cfg);
-    tokio::time::sleep(Duration::from_secs(6)).await;
-
-    let client = NinePClient::connect_multi(
-        vec![Target::Unix(a_9p.clone()), Target::Unix(b_9p.clone())],
-        256 * 1024,
-    )
-    .await
-    .expect("connect lands on A");
-    client
-        .attach(1, NOFID, "root", "/", 0)
-        .await
-        .expect("attach");
-
-    // Create "f" with op-id cx on the leader. Commit-then-apply ships it to B before
-    // returning, so B holds both the inode and op-id cx (in its tail / dedup).
-    let cx = [40u8; 16];
-    client
-        .lcreateattr_op_id(1, 2, b"f", O_CREAT_RDWR, 0o644, 0, cx)
-        .await
-        .expect("create f on A");
-    client.clunk(2).await.ok();
-    tokio::time::sleep(Duration::from_secs(3)).await; // let the ship settle on B
-
-    a.child.kill().expect("kill A");
-    assert!(
-        wait_for_socket(&b_9p, Duration::from_secs(90)).await,
-        "B never promoted"
-    );
-
-    // The retry (same op-id cx) now lands on B. It MUST dedup (re-open the existing
-    // "f"), not EEXIST.
-    let retry = client
-        .lcreateattr_op_id(1, 3, b"f", O_CREAT_RDWR, 0o644, 0, cx)
-        .await;
-    assert!(
-        retry.is_ok(),
-        "cross-failover create retry (same op-id) must dedup, got {retry:?}"
-    );
-
-    // A DIFFERENT op-id is a genuine create of an existing name -> EEXIST, proving
-    // "f" really is present on B (so the dedup above was real, not a fresh create).
-    let genuine = client
-        .lcreateattr_op_id(1, 4, b"f", O_CREAT_RDWR, 0o644, 0, [99u8; 16])
-        .await;
-    assert!(
-        matches!(genuine, Err(ClientError::Errno(17))),
-        "a different op-id must see EEXIST (f exists on B), got {genuine:?}"
-    );
-}
-
 /// A restarting node that the latest-leader record names must NOT elect itself
 /// from Hello silence: its silent peer may be live behind a partition, holding
 /// acked writes in its RAM tail or already promoted. It blocks until a peer
@@ -1194,7 +1087,7 @@ async fn op_id_dedups_create_across_failover() {
 /// the peer from `replication.peers` (the escape hatch this test also proves).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn a_latest_leader_survivor_blocks_on_silence_until_the_peer_is_removed() {
+async fn latest_leader_waits_for_silent_peer_removal() {
     let _e2e_permit = e2e_gate().await;
     use ninep_client::{ClientError, NOFID, NinePClient, Target};
 
@@ -1324,7 +1217,7 @@ async fn a_latest_leader_survivor_blocks_on_silence_until_the_peer_is_removed() 
 /// config edit as for a blocked survivor (role = "leader", peer removed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn a_config_standby_never_elects_itself_from_silence() {
+async fn standby_does_not_self_elect_on_silence() {
     let _e2e_permit = e2e_gate().await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1661,14 +1554,14 @@ async fn connected_killboth_case(reuse_cache: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn flushed_metadata_survives_connected_killboth_reused_cache() {
+async fn kill_both_preserves_metadata_with_reused_cache() {
     let _e2e_permit = e2e_gate().await;
     connected_killboth_case(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real-process failover e2e: flaky on shared CI runners, run with --ignored. HA correctness is covered by the jepsen suites."]
-async fn flushed_metadata_survives_connected_killboth_fresh_cache() {
+async fn kill_both_preserves_metadata_with_fresh_cache() {
     let _e2e_permit = e2e_gate().await;
     connected_killboth_case(false).await;
 }

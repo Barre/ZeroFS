@@ -72,8 +72,9 @@ cd /tmp/local-fs
   --lose-unfsynced-writes --quickcheck-tests 200 --time-limit 60
 
 # HA failover consistency: a leader+standby cluster, where the fault fails the
-# leader over to the standby. Failovers are slow (takeover_ttl + a full
-# restart), so use shorter histories and fewer trials.
+# leader over to the standby. Failovers include the fixed takeover hint and
+# pre-open claim grace plus a full restart, so use shorter histories and fewer
+# trials.
 ./run.sh run quickcheck --db zerofs-ha --failover \
   --zerofs-bin "$OLDPWD/zerofs/target/debug/zerofs" \
   --quickcheck-tests 20 --history-scale 30 --time-limit 120
@@ -113,10 +114,11 @@ HA semi-syncs every acked write to the standby before acking (commit-then-apply)
 So the model treats `:failover` as a global flush, not a cache-dropping crash:
 everything written before the failover must still be present afterward, and the
 same fs model-checker catches any divergence (a lost write, a resurrected delete,
-a botched rename) across the failover. HA timeouts are shortened
-(`heartbeat=1s, lease_ttl=3s, takeover_ttl=8s`) so failover is quick, but it
-still takes ~20s (promotion + restart), so the fault ops get a longer op-timeout
-and runs use shorter histories than conformance.
+a botched rename) across the failover. HA uses the production fixed timings: a
+roughly two-second takeover hint followed by the nine-second pre-open claim
+grace, plus writer open, tail reconciliation, activation, and the full restart.
+The fault ops therefore get a longer op-timeout, and runs use shorter histories
+than conformance.
 
 ## Standalone HA suite (`jepsen/ha/`)
 

@@ -1,9 +1,6 @@
-//! FFI-shaped mirrors of the client's data records, with conversions in both
-//! directions (`From` for outputs, helper methods for inputs).
+//! FFI records and conversions for client data.
 //!
-//! Times cross as `std::time::SystemTime` (uniffi's built-in timestamp), so
-//! bindings get native time types (`datetime` in Python, `Instant` in Kotlin,
-//! `Date` in Swift/JS) rather than a raw `{secs, nanos}` record.
+//! Times use UniFFI's `SystemTime` mapping to native binding types.
 
 use std::time::SystemTime;
 
@@ -213,13 +210,9 @@ impl From<ConnectOptions> for zerofs_client::ConnectOptions {
     }
 }
 
-/// Live snapshot of negotiated session properties (may change across reconnects).
+/// Negotiated session properties, fixed for the logical session lifetime.
 #[derive(Clone, Copy, Debug, uniffi::Record)]
 pub struct Capabilities {
-    /// ZeroFS v1 extensions active.
-    pub extensions_v1: bool,
-    /// ZeroFS v2 extensions active.
-    pub extensions_v2: bool,
     /// Negotiated 9P message size in bytes.
     pub msize: u32,
     /// Largest single-message read payload.
@@ -231,8 +224,6 @@ pub struct Capabilities {
 impl From<zerofs_client::Capabilities> for Capabilities {
     fn from(c: zerofs_client::Capabilities) -> Self {
         Self {
-            extensions_v1: c.extensions_v1,
-            extensions_v2: c.extensions_v2,
             msize: c.msize,
             max_read_chunk: c.max_read_chunk,
             max_write_chunk: c.max_write_chunk,
@@ -346,8 +337,8 @@ pub struct DirEntry {
     pub file_type: FileType,
     /// Stable inode number.
     pub ino: u64,
-    /// Full metadata when readdirplus is negotiated (v1+); `None` otherwise.
-    pub metadata: Option<Metadata>,
+    /// Full metadata returned with the directory entry.
+    pub metadata: Metadata,
 }
 
 impl From<zerofs_client::DirEntry> for DirEntry {
@@ -358,7 +349,7 @@ impl From<zerofs_client::DirEntry> for DirEntry {
             name_is_utf8: e.name_is_utf8,
             file_type: e.file_type.into(),
             ino: e.ino,
-            metadata: e.metadata.map(Into::into),
+            metadata: e.metadata.into(),
         }
     }
 }

@@ -1,8 +1,8 @@
 use crate::config::WebUIConfig;
 use crate::fs::ZeroFS;
-use crate::ninep::handler::NinePHandler;
+use crate::ninep::handler::{NinePHandler, SessionReleaseGuard};
 use crate::ninep::lock_manager::FileLockManager;
-use crate::ninep::server::dispatch_9p_frame;
+use crate::ninep::server::{InflightRegistry, dispatch_9p_frame, response_may_be_emitted};
 use crate::rpc::proto;
 use crate::rpc::server::AdminRpcServer;
 use crate::task::spawn_named;
@@ -11,16 +11,17 @@ use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use dashmap::DashMap;
 use ninep_proto::P9_CHANNEL_SIZE;
 use rust_embed::Embed;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tonic_web::GrpcWebLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Embed)]
 #[folder = "../webui/dist"]
@@ -32,29 +33,49 @@ struct AppState {
     lock_manager: Arc<FileLockManager>,
     uid: u32,
     gid: u32,
+    shutdown: CancellationToken,
+    ws_drain: TaskTracker,
 }
+
+const WS_DRAIN_TIMEOUT: std::time::Duration = crate::replication::RESPONSE_DRAIN_TIMEOUT;
 
 async fn ws_9p_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_9p_ws(socket, state))
+    // Register the session before returning the upgrade response.
+    let drain_guard = state.ws_drain.token();
+    ws.on_upgrade(move |socket| handle_9p_ws(socket, state, drain_guard))
 }
 
-async fn handle_9p_ws(socket: WebSocket, state: AppState) {
+async fn handle_9p_ws(socket: WebSocket, state: AppState, _drain_guard: TaskTrackerToken) {
+    let response_db = Arc::clone(&state.filesystem.db);
     let handler = Arc::new(
-        NinePHandler::new(state.filesystem, state.lock_manager.clone())
-            .with_credential_override(state.uid, state.gid),
+        NinePHandler::new(
+            Arc::clone(&state.filesystem),
+            Arc::clone(&state.lock_manager),
+        )
+        .with_credential_override(state.uid, state.gid),
     );
-    let handler_id = handler.handler_id();
-    let inflight: crate::ninep::server::InflightRequests = Arc::new(DashMap::new());
-    let pending_flushes: crate::ninep::server::PendingFlushes = Arc::new(DashMap::new());
+    let mut release_guard = SessionReleaseGuard::new(Arc::clone(&handler));
+    let inflight = InflightRegistry::default();
 
     let (tx, mut rx) = mpsc::channel::<(u16, Vec<u8>)>(P9_CHANNEL_SIZE);
 
     // Writer task: sends response bytes as WS binary messages
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let response_authority_lost = CancellationToken::new();
+    let writer_authority_lost = response_authority_lost.clone();
 
-    let writer = spawn_named("9p-ws-writer", async move {
+    // Abort on early exit; normal teardown drains responses for a bounded interval.
+    let mut writer = AbortOnDropHandle::new(spawn_named("9p-ws-writer", async move {
         use futures::SinkExt;
-        while let Some((_tag, response_bytes)) = rx.recv().await {
+        while let Some((tag, response_bytes)) = rx.recv().await {
+            if !response_may_be_emitted(&response_db, &response_bytes) {
+                warn!(
+                    "Dropping successful WebSocket 9P response for tag {tag} after serving \
+                     authority was lost; closing the connection"
+                );
+                writer_authority_lost.cancel();
+                break;
+            }
             if ws_tx
                 .send(WsMessage::Binary(response_bytes.into()))
                 .await
@@ -63,14 +84,25 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState) {
                 break;
             }
         }
-    });
+    }));
 
     use futures::StreamExt;
     loop {
-        match ws_rx.next().await {
+        let next = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => {
+                debug!("9P WebSocket handler shutting down");
+                break;
+            }
+            _ = response_authority_lost.cancelled() => {
+                debug!("9P WebSocket handler closing after serving authority loss");
+                break;
+            }
+            next = ws_rx.next() => next,
+        };
+        match next {
             Some(Ok(WsMessage::Binary(data))) => {
-                if let Err(e) = dispatch_9p_frame(data, &handler, &tx, &inflight, &pending_flushes)
-                {
+                if let Err(e) = dispatch_9p_frame(data, &handler, &tx, &inflight) {
                     error!("9P WebSocket dispatch error: {}", e);
                     break;
                 }
@@ -87,13 +119,20 @@ async fn handle_9p_ws(socket: WebSocket, state: AppState) {
         }
     }
 
+    // Disconnect before awaiting request tasks to block late resource installs.
+    release_guard.release();
     drop(tx);
-    let _ = writer.await;
-    // Same teardown as the TCP/Unix path: release this session's handle counts
-    // and byte-range locks (rather than wait for the last in-flight task to drop
-    // its handler Arc).
-    handler.close_all_open_handles();
-    state.lock_manager.release_session_locks(handler_id);
+
+    // `SinkExt::send` flushes queued CLEAN responses to the WebSocket transport.
+    // Bound the drain for unrelated stalled handlers.
+    if tokio::time::timeout(WS_DRAIN_TIMEOUT, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+        tracing::warn!("timed out draining 9P WebSocket responses during shutdown");
+    }
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -158,11 +197,14 @@ pub fn start(
     rpc_service: AdminRpcServer,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
+    let ws_drain = TaskTracker::new();
     let state = AppState {
         filesystem,
         lock_manager,
         uid: config.uid,
         gid: config.gid,
+        shutdown: shutdown.clone(),
+        ws_drain: ws_drain.clone(),
     };
 
     // gRPC-web: wrap tonic service with GrpcWebService + CORS
@@ -189,9 +231,9 @@ pub fn start(
 
     let mut handles = Vec::new();
     for &addr in &config.addresses {
-        info!("Web UI server listening on http://{}", addr);
         let app = app.clone();
         let shutdown = shutdown.clone();
+        let ws_drain = ws_drain.clone();
         handles.push(spawn_named("webui-http", async move {
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
@@ -200,10 +242,19 @@ pub fn start(
                     return Ok(());
                 }
             };
-            axum::serve(listener, app)
+            info!("Web UI server listening on http://{}", addr);
+            let result = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()));
+            ws_drain.close();
+            if tokio::time::timeout(WS_DRAIN_TIMEOUT, ws_drain.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!("timed out waiting for 9P WebSocket sessions to drain");
+            }
+            result
         }));
     }
     handles
@@ -212,7 +263,6 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::post;
     use std::process::Stdio;
@@ -230,9 +280,10 @@ mod tests {
     ) -> impl IntoResponse {
         let connection_shutdown = state.connections.lock().unwrap().clone();
         let connection_closed = state.connection_closed.clone();
+        let drain_guard = state.app.ws_drain.token();
         ws.on_upgrade(move |socket| async move {
             tokio::select! {
-                _ = handle_9p_ws(socket, state.app) => {}
+                _ = handle_9p_ws(socket, state.app, drain_guard) => {}
                 _ = connection_shutdown.cancelled() => {}
             }
             connection_closed.notify_one();
@@ -254,9 +305,7 @@ mod tests {
         }
     }
 
-    /// End-to-end browser-runtime smoke test. Kept ignored because it requires
-    /// the generated wasm-pack output and Node 22's WebSocket implementation;
-    /// the WebUI workflow invokes it explicitly after `make webui`.
+    /// Browser-runtime smoke test requiring generated wasm output and Node 22.
     #[tokio::test]
     #[ignore]
     async fn wasm_client_smoke() {
@@ -267,6 +316,8 @@ mod tests {
                 lock_manager: Arc::new(FileLockManager::new()),
                 uid: 0,
                 gid: 0,
+                shutdown: CancellationToken::new(),
+                ws_drain: TaskTracker::new(),
             },
             connections: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             connection_closed: Arc::new(tokio::sync::Notify::new()),

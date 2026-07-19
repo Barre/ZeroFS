@@ -73,13 +73,20 @@ The commands above use the kernel's 9P client. ZeroFS also ships its own client,
 # TCP
 zerofs mount 127.0.0.1:5564 /mnt/zerofs-9p
 
+# HA pair
+zerofs mount node-a:5564,node-b:5564 /mnt/zerofs-9p
+
 # Unix socket
 zerofs mount /tmp/zerofs.sock /mnt/zerofs-9p
 ```
 
-The target is `host` (the port defaults to 5564), `host:port`, `tcp://host:port`, or `unix:/path/to.sock`. A bare path starting with `/` or `.` is treated as a Unix socket; hostnames are resolved through DNS.
+One target is `host` (the port defaults to 5564), `host:port`, `tcp://host:port`, or `unix:/path/to.sock`. A bare path starting with `/` or `.` is treated as a Unix socket; hostnames are resolved through DNS. For [high availability](/high-availability), pass both nodes as a comma-separated target set. `zerofs mount` probes them concurrently and re-probes the set after a disconnect.
 
-The main difference is what happens when the connection drops. The kernel client leaves the mount wedged after a server restart or a network interruption: it returns errors until you unmount and remount. `zerofs mount` reconnects by itself: it retries indefinitely (50–500 ms backoff) and rebuilds the session in the background. Operations issued during the outage block until the server is reachable again: the mount hangs rather than returns errors, which matters for health checks. On the new session, open file handles are rebound to their stable inode ids and byte-range locks are re-acquired, so handles survive a server restart. Non-idempotent mutations carry a stable operation id under the negotiated `.zerofs3` extension, allowing the server to deduplicate a request resent after a lost reply.
+Connection-loss behavior differs. The kernel client does not rebuild a session after a server restart or network interruption; operations fail until the filesystem is unmounted and remounted. `zerofs mount` retries indefinitely with 50–500 ms backoff and rebuilds the session. Undispatched operations block until a server is available.
+
+Session replay rebinds linked open handles by stable inode id and re-acquires recorded byte-range locks. An open file with no remaining namespace link is connection-local and cannot be replayed. Its presence during reconnect makes the logical mount session terminal with `ESTALE`; recovery requires a new mount.
+
+Reorder-sensitive `9P2000.L.Z` mutations retain the same operation envelope across retries. Automatic retry ends at the 120-second protocol horizon. An unresolved result is reported as an ambiguous connection failure.
 
 A few other practical differences:
 
@@ -128,13 +135,13 @@ The `cache=mmap` option doesn't create a cache - it enables support for memory-m
 
 ## File Locking
 
-ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`,  over 9P, from both the kernel client and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes. Under [high availability](/high-availability) they are not preserved across a failover, so an application needing mutual exclusion across a failover should fence at the resource it protects (see the HA limits).
+ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`, over 9P, from both the kernel client and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes.
 
 The server arbitrates locks between clients. Processes sharing one mount are arbitrated locally by that client, since the whole mount is a single 9P session. `F_GETLK` on a range locked by another client reports the holder's pid negated, the v9fs convention for a pid that has no meaning in the local pid namespace.
 
 Blocking acquisition (`F_SETLKW`) through `zerofs mount` is polled: the server answers a contended request immediately instead of queueing the waiter, and the client retries every 50 ms until the lock is grantable.
 
-Locks live in server memory, not in the object store. A client's locks are released when its connection closes. A server restart drops all locks: `zerofs mount` re-acquires the locks it held when it replays its session on reconnect (best-effort); the kernel client does not, since its mount is wedged after a disconnect.
+Locks live in server memory, not in the object store. A client's locks are released when its connection closes, and a server restart or HA takeover starts with an empty lock table. `zerofs mount` records its locks and re-acquires the complete set before publishing a rebuilt session; the kernel client does not, since its mount is wedged after a disconnect. Another session may acquire a lock during the gap, so replay is not continuous ownership and advisory locks are not a distributed fencing primitive.
 
 ## Configuration
 

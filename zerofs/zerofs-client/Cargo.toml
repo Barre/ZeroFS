@@ -33,8 +33,6 @@ ninep-client = { path = "../ninep-client", version = "0.1.2" }
 ninep-proto = { path = "../ninep-proto", version = "0.1.2" }
 tokio = { version = "1.52", features = ["sync"] }
 bytes = "1"
-arc-swap = "1"
-rand = "0.8"
 futures-core = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 

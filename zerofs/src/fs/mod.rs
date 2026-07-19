@@ -88,6 +88,7 @@ pub fn validate_filename(filename: &[u8]) -> Result<(), FsError> {
         Ok(())
     }
 }
+
 #[derive(Clone)]
 pub struct ZeroFS {
     pub db: Arc<Db>,
@@ -96,9 +97,9 @@ pub struct ZeroFS {
     pub inode_store: InodeStore,
     pub tombstone_store: TombstoneStore,
     pub orphan_store: OrphanStore,
-    /// In-memory, process-global count of open files pinning each inode.
-    /// Empty after a restart by construction (no handle survives a crash)
-    /// Its only role is to pick the defer-vs-delete branch in `remove`/`rename`
+    /// In-memory, process-global open-file pins for each inode. Empty after a
+    /// restart by construction; used to pick the defer-vs-delete branch in
+    /// `remove`/`rename`.
     pub open_handles: Arc<DashMap<InodeId, u64>>,
     /// Reclaim queue: an `OpenHandle` drop that takes a count to zero pushes the
     /// inode here for `start_reclaim_drainer` to reclaim.
@@ -117,9 +118,12 @@ pub struct ZeroFS {
     pub ignore_fsync: bool,
     /// Durability lineage token (see `client_fsync_verified`). Identifies the current
     /// unbroken durable lineage; set once at bring-up, constant for this process's life.
-    /// A `.zerofs4` client carries it, and a verified fsync succeeds only while it is
+    /// A ZeroFS client carries it, and a verified fsync succeeds only while it is
     /// still live, so a successful fsync implies the client's writes are durable.
     pub lineage_token: u64,
+    /// Current HA writer epoch advertised to clients as the origin for mutation
+    /// retries. Zero for standalone, read-only, and in-memory test filesystems.
+    pub serving_writer_epoch: u64,
     pub max_bytes: u64,
     pub tracer: AccessTracer,
     /// Traces backend object-store requests (the `otrace` feature). Created in

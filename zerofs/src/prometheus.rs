@@ -1,4 +1,5 @@
 use crate::config::PrometheusConfig;
+use crate::dedup::DedupCache;
 use crate::fs::metrics::{FileSystemStats, SegmentGcStats};
 use crate::fs::stats::FileSystemGlobalStats;
 use crate::task::spawn_named;
@@ -21,6 +22,7 @@ pub fn start(
     fs_stats: Arc<FileSystemStats>,
     global_stats: Arc<FileSystemGlobalStats>,
     segment_gc_stats: Arc<SegmentGcStats>,
+    dedup: Arc<DedupCache>,
     slatedb_registry: Option<Arc<DefaultMetricsRecorder>>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
@@ -56,6 +58,7 @@ pub fn start(
                     collect_fs_stats(&fs_stats);
                     collect_global_stats(&global_stats);
                     collect_segment_gc_stats(&segment_gc_stats);
+                    collect_dedup_stats(&dedup);
                     if let Some(ref registry) = slatedb_registry {
                         collect_lsm_stats(registry);
                     }
@@ -160,6 +163,13 @@ fn collect_global_stats(stats: &FileSystemGlobalStats) {
     let (used_bytes, used_inodes) = stats.get_totals();
     gauge!("zerofs_used_bytes").set(used_bytes as f64);
     gauge!("zerofs_used_inodes").set(used_inodes as f64);
+}
+
+fn collect_dedup_stats(dedup: &DedupCache) {
+    let stats = dedup.stats();
+    gauge!("zerofs_dedup_retained_results").set(stats.retained_results as f64);
+    gauge!("zerofs_dedup_inflight_ids").set(stats.inflight_ids as f64);
+    gauge!("zerofs_dedup_replay_pinned_results").set(stats.replay_pinned_results as f64);
 }
 
 fn collect_segment_gc_stats(stats: &SegmentGcStats) {

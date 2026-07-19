@@ -1,9 +1,6 @@
-//! The FFI error type: a faithful mirror of [`zerofs_client::ZeroFsError`].
+//! FFI mirror of [`zerofs_client::ZeroFsError`].
 //!
-//! It is a separate (not remote) enum so the bindings own their error type, but
-//! the `From` conversion below is an *exhaustive* match, so a new variant in
-//! `zerofs-client` breaks this crate's build rather than silently degrading to a
-//! catch-all in four language bindings.
+//! The exhaustive conversion requires updates for every upstream variant.
 
 /// The single error type, flat and exhaustive. The variant↔errno mapping is
 /// 1:1; any other server errno surfaces as [`ZeroFsError::Io`].
@@ -78,17 +75,14 @@ pub enum ZeroFsError {
         /// What failed during connect/attach.
         message: String,
     },
-    /// The node is no longer the HA leader (P9_ENOTLEADER); a re-route + retry is
-    /// safe, which a failover client does transparently.
+    /// The target is no longer the HA leader (`P9_ENOTLEADER`).
     #[error("not the leader (re-route): {path}")]
     NotLeader {
         /// The path the operation targeted (lossy display).
         path: String,
     },
-    /// Stale handle (ESTALE). From `sync_all`/`sync_data` this is the durability signal:
-    /// the `.zerofs4` lineage broke, so writes acked on this handle before the fsync may
-    /// not be durable; redo them and fsync again. From other operations it is a plain
-    /// stale inode/handle (re-open the path).
+    /// Stale handle (`ESTALE`). From sync methods, prior acknowledged writes may
+    /// be non-durable and require replacement. Replay loss requires a new client.
     #[error("stale handle (fsync: prior writes may not be durable): {path}")]
     Stale {
         /// The path the operation targeted (lossy display).
@@ -112,9 +106,7 @@ pub enum ZeroFsError {
     },
 }
 
-/// Linux errno for an error: the strict 1:1 variant↔errno mapping (the `Io`
-/// variant returns its own `errno`). A free function rather than an enum method
-/// so it crosses every binding (some generators forbid methods on enums).
+/// Linux errno for an error. `Io` retains its server-provided errno.
 #[uniffi::export]
 pub fn error_to_errno(error: &ZeroFsError) -> i32 {
     error.to_errno()
@@ -136,7 +128,6 @@ impl ZeroFsError {
             Self::TooManySymlinks { .. } => libc::ELOOP,
             Self::Closed => libc::EBADF,
             Self::ConnectFailed { .. } => libc::EIO,
-            // P9_ENOTLEADER; the test below enforces parity with the client's value.
             Self::NotLeader { .. } => 108,
             Self::Stale { .. } => libc::ESTALE,
             Self::Io { errno, .. } => *errno,
@@ -148,7 +139,6 @@ impl ZeroFsError {
 impl From<zerofs_client::ZeroFsError> for ZeroFsError {
     fn from(e: zerofs_client::ZeroFsError) -> Self {
         use zerofs_client::ZeroFsError as E;
-        // Exhaustive on purpose: a new upstream variant must fail this match.
         match e {
             E::NotFound { path } => Self::NotFound { path },
             E::PermissionDenied { path } => Self::PermissionDenied { path },
@@ -183,8 +173,7 @@ mod tests {
     use super::*;
     use zerofs_client::ZeroFsError as C;
 
-    /// The hand-maintained errno table must agree with the upstream client for
-    /// every variant, so it cannot silently drift from `zerofs-client`.
+    /// Verifies the FFI errno table against the Rust client.
     #[test]
     fn errno_matches_upstream_for_every_variant() {
         let p = || "p".to_string();
