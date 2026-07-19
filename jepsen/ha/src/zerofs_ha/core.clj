@@ -21,6 +21,7 @@
                     [util :as util :refer [await-fn]]]
             [jepsen.os :as os]
             [slingshot.slingshot :refer [try+ throw+]])
+  (:import [java.util BitSet])
   (:gen-class))
 
 ;; Local process + cluster management (no SSH).
@@ -193,41 +194,47 @@
                 (or (zero? (:exit r)) (throw+ {:type ::bucket-down :result r}))))
             {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO bucket"}))
 
-(defn node-cfg-str [c node-key role]
-  (let [n (get-in c [:nodes node-key])]
-    (str "[cache]\n"
-         "dir = \"" (:cache n) "\"\n"
-         "disk_size_gb = 1.0\n\n"
-         "[storage]\n"
-         "url = \"s3://" (:bucket c) "/data\"\n"
-         "encryption_password = \"" (:password c) "\"\n\n"
-         "[servers]\n\n[servers.ninep]\n"
-         "unix_socket = \"" (:ninep n) "\"\n\n"
-         "[servers.rpc]\n"
-         "unix_socket = \"" (:rpc n) "\"\n\n"
-         "[replication]\n"
-         "node_id = \"" (name node-key) "\"\n"
-         "role = \"" role "\"\n"
-         "replication_listen = \"127.0.0.1:" (:repl-port n) "\"\n"
-         "peers = [\"127.0.0.1:" (:peer-port n) "\"]\n\n"
-         "[aws]\n"
-         "access_key_id = \"" (:access-key c) "\"\n"
-         "secret_access_key = \"" (:secret-key c) "\"\n"
-         "endpoint = \"http://" (:minio-addr c) "\"\n"
-         "region = \"us-east-1\"\n"
-         "allow_http = \"true\"\n"
-         "conditional_put = \"etag\"\n\n"
-         "[telemetry]\nenabled = false\n")))
+(defn node-cfg-str
+  ([c node-key role] (node-cfg-str c node-key role false))
+  ([c node-key role force-recovery?]
+   (let [n (get-in c [:nodes node-key])]
+     (str "[cache]\n"
+          "dir = \"" (:cache n) "\"\n"
+          "disk_size_gb = 1.0\n\n"
+          "[storage]\n"
+          "url = \"s3://" (:bucket c) "/data\"\n"
+          "encryption_password = \"" (:password c) "\"\n\n"
+          "[servers]\n\n[servers.ninep]\n"
+          "unix_socket = \"" (:ninep n) "\"\n\n"
+          "[servers.rpc]\n"
+          "unix_socket = \"" (:rpc n) "\"\n\n"
+          "[replication]\n"
+          "node_id = \"" (name node-key) "\"\n"
+          "role = \"" role "\"\n"
+          "replication_listen = \"127.0.0.1:" (:repl-port n) "\"\n"
+          (if force-recovery?
+            "peers = []\nforce_recovery = true\n\n"
+            (str "peers = [\"127.0.0.1:" (:peer-port n) "\"]\n\n"))
+          "[aws]\n"
+          "access_key_id = \"" (:access-key c) "\"\n"
+          "secret_access_key = \"" (:secret-key c) "\"\n"
+          "endpoint = \"http://" (:minio-addr c) "\"\n"
+          "region = \"us-east-1\"\n"
+          "allow_http = \"true\"\n"
+          "conditional_put = \"etag\"\n\n"
+          "[telemetry]\nenabled = false\n"))))
 
 (defn node-cfg-path [c node-key]
   (str (:work c) "/" (name node-key) ".toml"))
 
-(defn start-node! [c node-key role]
-  (let [n    (get-in c [:nodes node-key])
-        path (node-cfg-path c node-key)]
-    (info "Starting ZeroFS node" node-key "as" role)
-    (spit path (node-cfg-str c node-key role))
-    (daemon-start! (:pid n) (:log n) {} (:zerofs c) ["run" "-c" path])))
+(defn start-node!
+  ([c node-key role] (start-node! c node-key role false))
+  ([c node-key role force-recovery?]
+   (let [n    (get-in c [:nodes node-key])
+         path (node-cfg-path c node-key)]
+     (info "Starting ZeroFS node" node-key "as" role)
+     (spit path (node-cfg-str c node-key role force-recovery?))
+     (daemon-start! (:pid n) (:log n) {} (:zerofs c) ["run" "-c" path]))))
 
 (defn node-9p-up? [c node-key]
   (.exists (io/file (get-in c [:nodes node-key :ninep]))))
@@ -647,8 +654,8 @@
   (teardown! [_ _test])
   (close! [_ _test]))
 
-;; Nemesis: kill/bounce leader, kill standby/both/minio, pause+fence, the
-;; liveness re-take (promoted standby restarts while the leader is down), and heal.
+;; Nemesis: process loss, object-store pauses, replication partitions, blocked
+;; survivor restart, forced recovery, and cluster repair.
 
 (defn heal-restart!
   "Clean full restart to canonical leader=:a, standby=:b. Works from any state
@@ -748,26 +755,35 @@
                                   (when s (swap! cluster-roles assoc s :leader))
                                   (swap! cluster-roles assoc n :standby)
                                   (str "bounced-leader-" (name n)))
-                 ;; A promoted standby must reclaim ownership after restart while
-                 ;; its peer remains down.
-                 :liveness-restart (let [n (leader-node) s (standby-node)]
-                                     (kill-pid! (node-pid c n))
-                                     (swap! cluster-roles assoc n :dead)
-                                     (swap! cluster-roles assoc s :leader)
-                                     (await-fn (fn [] (or (node-9p-up? c s)
-                                                          (throw+ {:type ::no-promote})))
-                                               {:retry-interval 500 :log-interval 5000 :timeout 40000
-                                                :log-message "liveness: waiting for standby to promote"})
-                                     (Thread/sleep 3000)
-                                     (kill-pid! (node-pid c s))
-                                     (sh! :rm :-f (get-in c [:nodes s :ninep]))
-                                     (Thread/sleep 500)
-                                     (start-node! c s "standby")
-                                     (await-fn (fn [] (or (node-9p-up? c s)
-                                                          (throw+ {:type ::no-retake})))
-                                               {:retry-interval 500 :log-interval 5000 :timeout 60000
-                                                :log-message "liveness: promoted standby must re-take"})
-                                     (str "liveness-restarted-" (name s)))
+                 :blocked-restart (let [n (leader-node) s (standby-node)]
+                                    (sh! :rm :-f (get-in c [:nodes s :ninep]))
+                                    (kill-pid! (node-pid c n))
+                                    (swap! cluster-roles assoc n :dead)
+                                    (swap! cluster-roles assoc s :leader)
+                                    (await-fn (fn [] (or (node-9p-up? c s)
+                                                         (throw+ {:type ::no-promote})))
+                                              {:retry-interval 500 :log-interval 5000 :timeout 40000
+                                               :log-message "recovery: waiting for standby to promote"})
+                                    (Thread/sleep 3000)
+                                    (kill-pid! (node-pid c s))
+                                    (sh! :rm :-f (get-in c [:nodes s :ninep]))
+                                    (Thread/sleep 500)
+                                    (start-node! c s "standby")
+                                    (Thread/sleep 5000)
+                                    (when-not (proc-alive? (node-pid c s))
+                                      (throw+ {:type ::blocked-survivor-exited}))
+                                    (when (node-9p-up? c s)
+                                      (throw+ {:type ::unsafe-retake}))
+                                    (kill-pid! (node-pid c s))
+                                    (sh! :rm :-f (get-in c [:nodes s :ninep]))
+                                    (Thread/sleep 500)
+                                    (start-node! c s "leader" true)
+                                    (await-fn (fn [] (or (node-9p-up? c s)
+                                                         (throw+ {:type ::no-forced-recovery})))
+                                              {:retry-interval 500 :log-interval 5000 :timeout 60000
+                                               :log-message "recovery: waiting for forced startup"})
+                                    (spit (node-cfg-path c s) (node-cfg-str c s "leader"))
+                                    (str "blocked-then-recovered-" (name s)))
                  :heal-rejoin  (do (heal-rejoin! c) :healed-rejoin)
                  ;; Cut replication traffic while retaining client and store access.
                  ;; Marker validation retires the old server; the writer epoch
@@ -795,10 +811,10 @@
    {:fault :pause-minio  :heal :resume-minio}
    ;; Hold through failure detection and the pre-open claim grace.
    {:fault :pause-leader :heal :resume-leader :hold 32}
-   ;; Hello makes a restarted leader defer to an active standby. A restarted
-   ;; promoted standby must reclaim ownership while its peer remains down.
+   ;; Hello makes a restarted leader defer to an active standby.
    {:fault :bounce-leader    :heal :heal-restart :hold 13}
-   {:fault :liveness-restart :heal :heal-restart :hold 6}
+   ;; A recorded writer blocks on a silent peer until explicit recovery.
+   {:fault :blocked-restart  :heal :heal-restart :hold 6}
    ;; Peer-only partition; both nodes retain object-store access.
    {:fault :partition       :heal :heal-partition :hold 17}])
 
@@ -827,31 +843,57 @@
                                (filter #(and (= :ok (:type %)) (= :read (:f %))))
                                last :value)
                           (sorted-set))
-            by-v (->> history
-                      (filter #(and (#{:ok :info :fail} (:type %))
-                                    (#{:add :remove} (:f %))
-                                    (some? (:value %))))
-                      (group-by :value))
-            final-state (fn [ops]
-                          (reduce (fn [st op]
-                                    (case [(:type op) (:f op)]
-                                      [:ok :add]    :present
-                                      [:ok :remove] :absent
-                                      ([:info :add] [:info :remove]) :unknown
-                                      st))
-                                  :absent ops))
-            states      (into {} (map (fn [[v ops]] [v (final-state ops)])) by-v)
-            present-req (keep (fn [[v s]] (when (= s :present) v)) states)
-            absent-req  (keep (fn [[v s]] (when (= s :absent)  v)) states)
-            lost        (->> present-req (remove final-set) sort vec)
-            resurrected (->> absent-req  (filter final-set) sort vec)]
-        {:valid?            (and (empty? lost) (empty? resurrected))
-         :present-required  (count present-req)
+            ^BitSet seen    (BitSet.)
+            ^BitSet present (BitSet.)
+            ^BitSet unknown (BitSet.)
+            _         (doseq [{:keys [type f value]} history
+                              :when (and (#{:ok :info :fail} type)
+                                         (#{:add :remove} f)
+                                         (some? value))]
+                        (let [i (int value)]
+                          (.set seen i)
+                          (case type
+                            :ok (do (.clear unknown i)
+                                    (if (= :add f)
+                                      (.set present i)
+                                      (.clear present i)))
+                            :info (do (.clear present i)
+                                      (.set unknown i))
+                            nil)))
+            lost      (loop [v (.nextSetBit present 0)
+                             n 0
+                             sample []]
+                        (if (neg? v)
+                          {:count n :sample sample}
+                          (let [missing? (not (contains? final-set v))]
+                            (recur (.nextSetBit present (inc v))
+                                   (if missing? (inc n) n)
+                                   (if (and missing? (< (count sample) 50))
+                                     (conj sample v)
+                                     sample)))))
+            resurrected
+            (loop [values (seq final-set)
+                   n 0
+                   sample []]
+              (if-let [v (first values)]
+                (let [i (int v)
+                      unexpected? (and (.get seen i)
+                                       (not (.get present i))
+                                       (not (.get unknown i)))]
+                  (recur (next values)
+                         (if unexpected? (inc n) n)
+                         (if (and unexpected? (< (count sample) 50))
+                           (conj sample v)
+                           sample)))
+                {:count n :sample sample}))]
+        {:valid?            (and (zero? (:count lost))
+                                 (zero? (:count resurrected)))
+         :present-required  (.cardinality present)
          :final-set-size    (count final-set)
-         :lost-count        (count lost)
-         :lost              (vec (take 50 lost))
-         :resurrected-count (count resurrected)
-         :resurrected       (vec (take 50 resurrected))}))))
+         :lost-count        (:count lost)
+         :lost              (:sample lost)
+         :resurrected-count (:count resurrected)
+         :resurrected       (:sample resurrected)}))))
 
 (defn statfs-checker
   "The growth in statfs-reported used inodes (a baseline read on the empty fs vs the

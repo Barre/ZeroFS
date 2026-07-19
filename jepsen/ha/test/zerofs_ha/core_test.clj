@@ -41,6 +41,23 @@
                     {:type :ok   :f :read   :value (sorted-set)}])]  ; absent, but that's allowed
       (is (true? (:valid? r))))))
 
+(deftest set-checker-bounds-anomaly-samples
+  (let [lost-values        (range 60)
+        resurrected-values (range 100 160)
+        history            (concat
+                            (map (fn [v] {:type :ok :f :add :value v}) lost-values)
+                            (mapcat (fn [v] [{:type :ok :f :add :value v}
+                                             {:type :ok :f :remove :value v}])
+                                    resurrected-values)
+                            [{:type :ok :f :read :value (into (sorted-set)
+                                                              resurrected-values)}])
+        r                  (check history)]
+    (is (false? (:valid? r)))
+    (is (= 60 (:lost-count r)))
+    (is (= (vec (range 50)) (:lost r)))
+    (is (= 60 (:resurrected-count r)))
+    (is (= (vec (range 100 150)) (:resurrected r)))))
+
 (deftest add-error-classification
   (testing "ENOENT/EEXIST from the rename are indeterminate: a resent rename whose
             original applied re-executes exactly this way. The NIO two-path
