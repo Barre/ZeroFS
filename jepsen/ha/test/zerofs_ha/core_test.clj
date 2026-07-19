@@ -44,6 +44,28 @@
       (finally
         (.delete log)))))
 
+(deftest make-bucket-waits-for-a-readable-bucket
+  (let [commands (atom [])
+        stats    (atom 0)
+        c        {:mc "/mc" :minio-addr "127.0.0.1:9000"
+                  :access-key "key" :secret-key "secret" :bucket "bucket"}]
+    (with-redefs [core/sh-ok!
+                  (fn [& args]
+                    (swap! commands conj args)
+                    (when (and (= "stat" (second args))
+                               (= 1 (swap! stats inc)))
+                      (throw (ex-info "bucket not ready" {})))
+                    {:exit 0})
+                  util/await-fn
+                  (fn [ready? _]
+                    (try
+                      (ready?)
+                      (catch clojure.lang.ExceptionInfo _
+                        (ready?))))]
+      (core/make-bucket! c)
+      (is (= ["alias" "mb" "stat" "alias" "mb" "stat"]
+             (mapv second @commands))))))
+
 (deftest heal-restart-starts-the-standby-before-waiting-for-the-leader
   (let [events        (atom [])
         standby-ready (atom 4)]

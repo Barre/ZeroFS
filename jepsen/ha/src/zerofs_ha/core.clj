@@ -184,16 +184,13 @@
             {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO"}))
 
 (defn make-bucket! [c]
-  ;; /minio/health/live only reports process liveness, not that the object layer
-  ;; can serve S3 yet, so both the alias check and the bucket create can hit a
-  ;; still-initializing MinIO (503). Retry until the bucket really exists;
-  ;; otherwise the leader launches against a missing bucket and dies with
-  ;; NoSuchBucket. mc mb --ignore-existing is idempotent, so retrying is safe.
+  ;; The liveness endpoint can precede S3 readiness. Require alias setup,
+  ;; idempotent creation, and a successful bucket stat before starting ZeroFS.
   (await-fn (fn []
-              (sh! (:mc c) "alias" "set" "j" (str "http://" (:minio-addr c))
-                   (:access-key c) (:secret-key c))
-              (let [r (sh! (:mc c) "mb" "--ignore-existing" (str "j/" (:bucket c)))]
-                (or (zero? (:exit r)) (throw+ {:type ::bucket-down :result r}))))
+              (sh-ok! (:mc c) "alias" "set" "j" (str "http://" (:minio-addr c))
+                      (:access-key c) (:secret-key c))
+              (sh-ok! (:mc c) "mb" "--ignore-existing" (str "j/" (:bucket c)))
+              (sh-ok! (:mc c) "stat" (str "j/" (:bucket c))))
             {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO bucket"}))
 
 (defn node-cfg-str
