@@ -1,9 +1,13 @@
 //! Durable HA ownership coordination beside the data database.
 //!
-//! Version 1 is a plain-text `<writer_epoch> <node_id>` marker. Version 2 uses
-//! the following conditional-write state machine:
+//! `.zerofs_ha_ownership` stores the conditional-write state machine:
 //!
-//! `Active/legacy/absent -> Claiming -> Opening -> Active`.
+//! `Active/absent -> Claiming -> Opening -> Active`.
+//!
+//! If the ownership record is absent, `.zerofs_ha_leader` is read as
+//! `<writer_epoch> <node_id>` and supplies the initial generation and last
+//! active writer. The first claim creates the ownership record. Once it exists,
+//! `.zerofs_ha_leader` is ignored.
 //!
 //! Claiming and Opening contain renewable revisions. They are recoverable only
 //! after the record and object version remain unchanged for the staleness
@@ -19,12 +23,12 @@ use slatedb::object_store::{
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
-const LEADER_RECORD_MARKER: &str = ".zerofs_ha_leader";
-const FORMAT_VERSION: u8 = 2;
+const LEADER_MARKER: &str = ".zerofs_ha_leader";
+const OWNERSHIP_RECORD: &str = ".zerofs_ha_ownership";
 
 /// Covers the previous owner's cached authority, final validation, and response drain.
 pub const CLAIM_GRACE: Duration = crate::replication::AUTHORITY_TTL
-    .saturating_add(crate::replication::FINAL_MARKER_RECOVERY_TIMEOUT)
+    .saturating_add(crate::replication::FINAL_OWNERSHIP_RECOVERY_TIMEOUT)
     .saturating_add(crate::replication::RESPONSE_DRAIN_TIMEOUT)
     .saturating_add(Duration::from_secs(1));
 
@@ -35,27 +39,31 @@ const HANDOFF_TRANSITION_RETRY: Duration = Duration::from_millis(100);
 /// Required unchanged interval before a Claiming or Opening record is recoverable.
 pub const HANDOFF_STALE_AFTER: Duration = HANDOFF_RENEW_INTERVAL.saturating_mul(5);
 
-fn record_path(db_path: &str) -> Path {
-    Path::from(db_path).join(LEADER_RECORD_MARKER)
+fn leader_marker_path(db_path: &str) -> Path {
+    Path::from(db_path).join(LEADER_MARKER)
+}
+
+fn ownership_path(db_path: &str) -> Path {
+    Path::from(db_path).join(OWNERSHIP_RECORD)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct LegacyRecord {
+struct LeaderMarker {
     epoch: u64,
     node_id: String,
 }
 
-impl LegacyRecord {
+impl LeaderMarker {
     fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let text = std::str::from_utf8(bytes)
-            .map_err(|e| anyhow::anyhow!("invalid HA leader record: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid HA leader marker: {e}"))?;
         // Preserve the complete durable node identity after the delimiter.
         let (epoch, node_id) = text
             .split_once(' ')
-            .ok_or_else(|| anyhow::anyhow!("invalid HA leader record: {text:?}"))?;
+            .ok_or_else(|| anyhow::anyhow!("invalid HA leader marker: {text:?}"))?;
         let epoch = epoch
             .parse()
-            .map_err(|e| anyhow::anyhow!("invalid HA leader record epoch: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid HA leader marker epoch: {e}"))?;
         Ok(Self {
             epoch,
             node_id: node_id.to_string(),
@@ -74,7 +82,7 @@ impl Owner {
     fn new(node_id: String) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !node_id.trim().is_empty(),
-            "HA leader-record owner node_id must not be empty"
+            "HA ownership node_id must not be empty"
         );
         Ok(Self {
             node_id,
@@ -85,13 +93,13 @@ impl Owner {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.node_id.trim().is_empty(),
-            "invalid v2 HA leader record: owner node_id is empty"
+            "invalid HA ownership record: owner node_id is empty"
         );
         let incarnation = Uuid::parse_str(&self.incarnation)
-            .map_err(|e| anyhow::anyhow!("invalid v2 HA leader incarnation: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid HA owner incarnation: {e}"))?;
         anyhow::ensure!(
             !incarnation.is_nil(),
-            "invalid v2 HA leader record: owner incarnation is nil"
+            "invalid HA ownership record: owner incarnation is nil"
         );
         Ok(())
     }
@@ -109,14 +117,14 @@ impl HistoricalOwner {
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.node_id.trim().is_empty(),
-            "invalid v2 HA leader record: last_active node_id is empty"
+            "invalid HA ownership record: last_active node_id is empty"
         );
         if let Some(incarnation) = &self.incarnation {
             let incarnation = Uuid::parse_str(incarnation)
-                .map_err(|e| anyhow::anyhow!("invalid v2 HA last-active incarnation: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("invalid HA last-active incarnation: {e}"))?;
             anyhow::ensure!(
                 !incarnation.is_nil(),
-                "invalid v2 HA leader record: last-active incarnation is nil"
+                "invalid HA ownership record: last-active incarnation is nil"
             );
         }
         Ok(())
@@ -132,9 +140,8 @@ struct LastActive {
 }
 
 impl LastActive {
-    fn from_legacy(record: &LegacyRecord) -> Self {
+    fn from_leader_marker(record: &LeaderMarker) -> Self {
         Self {
-            // V1 writer epochs seed the monotonic V2 generation.
             generation: record.epoch,
             owner: HistoricalOwner {
                 node_id: record.node_id.clone(),
@@ -159,13 +166,13 @@ impl LastActive {
         self.owner.validate()?;
         anyhow::ensure!(
             self.generation < current_generation,
-            "invalid v2 HA leader record: last_active generation {} is not below current generation {}",
+            "invalid HA ownership record: last_active generation {} is not below current generation {}",
             self.generation,
             current_generation
         );
         anyhow::ensure!(
             self.writer_epoch <= writer_epoch_floor,
-            "invalid v2 HA leader record: last_active writer epoch {} exceeds floor {}",
+            "invalid HA ownership record: last_active writer epoch {} exceeds floor {}",
             self.writer_epoch,
             writer_epoch_floor
         );
@@ -179,8 +186,6 @@ struct Handoff {
     owner: Owner,
     writer_epoch_floor: u64,
     /// Monotonic liveness revision for this exact generation/incarnation.
-    /// Zero is accepted for markers written by binaries predating leases.
-    #[serde(default)]
     revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_active: Option<LastActive>,
@@ -189,6 +194,10 @@ struct Handoff {
 impl Handoff {
     fn validate(&self, generation: u64) -> anyhow::Result<()> {
         self.owner.validate()?;
+        anyhow::ensure!(
+            self.revision > 0,
+            "invalid HA ownership record: handoff revision is zero"
+        );
         if let Some(last_active) = &self.last_active {
             last_active.validate(generation, self.writer_epoch_floor)?;
         }
@@ -205,7 +214,7 @@ impl Handoff {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
-enum V2State {
+enum RecordState {
     Claiming(Handoff),
     Opening(Handoff),
     Active { owner: Owner, writer_epoch: u64 },
@@ -213,46 +222,40 @@ enum V2State {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct V2Record {
-    version: u8,
+struct OwnershipRecord {
     generation: u64,
-    state: V2State,
+    state: RecordState,
 }
 
-impl V2Record {
+impl OwnershipRecord {
     fn encode(&self) -> anyhow::Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(Into::into)
     }
 
     fn parse(text: &str) -> anyhow::Result<Self> {
         let record: Self = serde_json::from_str(text)
-            .map_err(|e| anyhow::anyhow!("invalid v2 HA leader record: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid HA ownership record: {e}"))?;
         record.validate()?;
         Ok(record)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.version == FORMAT_VERSION,
-            "unsupported HA leader record version {}",
-            self.version
-        );
-        anyhow::ensure!(
             self.generation > 0,
-            "invalid v2 HA leader record: generation is zero"
+            "invalid HA ownership record: generation is zero"
         );
         match &self.state {
-            V2State::Claiming(handoff) | V2State::Opening(handoff) => {
+            RecordState::Claiming(handoff) | RecordState::Opening(handoff) => {
                 handoff.validate(self.generation)?
             }
-            V2State::Active {
+            RecordState::Active {
                 owner,
                 writer_epoch,
             } => {
                 owner.validate()?;
                 anyhow::ensure!(
                     *writer_epoch > 0,
-                    "invalid v2 HA leader record: active writer epoch is zero"
+                    "invalid HA ownership record: active writer epoch is zero"
                 );
             }
         }
@@ -262,9 +265,9 @@ impl V2Record {
     fn renewed_handoff(&self) -> anyhow::Result<Self> {
         let mut renewed = self.clone();
         let revision = match &mut renewed.state {
-            V2State::Claiming(handoff) | V2State::Opening(handoff) => &mut handoff.revision,
-            V2State::Active { .. } => {
-                anyhow::bail!("cannot renew an Active HA leader record as an in-progress handoff")
+            RecordState::Claiming(handoff) | RecordState::Opening(handoff) => &mut handoff.revision,
+            RecordState::Active { .. } => {
+                anyhow::bail!("cannot renew an Active HA ownership record as a handoff")
             }
         };
         *revision = revision.checked_add(1).ok_or_else(|| {
@@ -275,122 +278,78 @@ impl V2Record {
         })?;
         Ok(renewed)
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum StoredRecord {
-    Legacy(LegacyRecord),
-    V2(V2Record),
-}
-
-impl StoredRecord {
-    fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|e| anyhow::anyhow!("invalid HA leader record: {e}"))?;
-        if text.trim_start().starts_with('{') {
-            Ok(Self::V2(V2Record::parse(text)?))
-        } else {
-            Ok(Self::Legacy(LegacyRecord::parse(bytes)?))
-        }
-    }
-
-    fn phase(&self) -> LeaderRecordPhase {
-        match self {
-            Self::Legacy(_) => LeaderRecordPhase::Legacy,
-            Self::V2(record) => match record.state {
-                V2State::Claiming(_) => LeaderRecordPhase::Claiming,
-                V2State::Opening(_) => LeaderRecordPhase::Opening,
-                V2State::Active { .. } => LeaderRecordPhase::Active,
-            },
-        }
-    }
-
-    fn generation(&self) -> u64 {
-        match self {
-            Self::Legacy(record) => record.epoch,
-            Self::V2(record) => record.generation,
+    fn phase(&self) -> OwnershipPhase {
+        match self.state {
+            RecordState::Claiming(_) => OwnershipPhase::Claiming,
+            RecordState::Opening(_) => OwnershipPhase::Opening,
+            RecordState::Active { .. } => OwnershipPhase::Active,
         }
     }
 
     fn owner_node(&self) -> &str {
-        match self {
-            Self::Legacy(record) => &record.node_id,
-            Self::V2(record) => match &record.state {
-                V2State::Claiming(Handoff { owner, .. })
-                | V2State::Opening(Handoff { owner, .. })
-                | V2State::Active { owner, .. } => &owner.node_id,
-            },
+        match &self.state {
+            RecordState::Claiming(Handoff { owner, .. })
+            | RecordState::Opening(Handoff { owner, .. })
+            | RecordState::Active { owner, .. } => &owner.node_id,
         }
     }
 
     fn latest_writer(&self) -> Option<(u64, &str)> {
-        match self {
-            Self::Legacy(record) => Some((record.epoch, &record.node_id)),
-            Self::V2(record) => match &record.state {
-                V2State::Active {
-                    owner,
-                    writer_epoch,
-                } => Some((*writer_epoch, &owner.node_id)),
-                V2State::Claiming(handoff) | V2State::Opening(handoff) => handoff
-                    .last_active
-                    .as_ref()
-                    .map(|active| (active.writer_epoch, active.owner.node_id.as_str())),
-            },
+        match &self.state {
+            RecordState::Active {
+                owner,
+                writer_epoch,
+            } => Some((*writer_epoch, &owner.node_id)),
+            RecordState::Claiming(handoff) | RecordState::Opening(handoff) => handoff
+                .last_active
+                .as_ref()
+                .map(|active| (active.writer_epoch, active.owner.node_id.as_str())),
         }
     }
 
     fn startup_blockers(&self) -> Vec<String> {
         let mut blockers = Vec::new();
-        match self {
-            Self::Legacy(record) => blockers.push(record.node_id.clone()),
-            Self::V2(record) => match &record.state {
-                V2State::Active { owner, .. } => blockers.push(owner.node_id.clone()),
-                V2State::Claiming(handoff) | V2State::Opening(handoff) => {
-                    blockers.push(handoff.owner.node_id.clone());
-                    if let Some(last_active) = &handoff.last_active
-                        && last_active.owner.node_id != handoff.owner.node_id
-                    {
-                        blockers.push(last_active.owner.node_id.clone());
-                    }
+        match &self.state {
+            RecordState::Active { owner, .. } => blockers.push(owner.node_id.clone()),
+            RecordState::Claiming(handoff) | RecordState::Opening(handoff) => {
+                blockers.push(handoff.owner.node_id.clone());
+                if let Some(last_active) = &handoff.last_active
+                    && last_active.owner.node_id != handoff.owner.node_id
+                {
+                    blockers.push(last_active.owner.node_id.clone());
                 }
-            },
+            }
         }
         blockers
     }
 
     fn claim_base(&self) -> (u64, u64, Option<LastActive>) {
-        match self {
-            Self::Legacy(record) => (
-                record.epoch,
-                record.epoch,
-                Some(LastActive::from_legacy(record)),
-            ),
-            Self::V2(record) => match &record.state {
-                V2State::Active {
+        match &self.state {
+            RecordState::Active {
+                owner,
+                writer_epoch,
+            } => (
+                self.generation,
+                *writer_epoch,
+                Some(LastActive::from_active(
+                    self.generation,
                     owner,
-                    writer_epoch,
-                } => (
-                    record.generation,
                     *writer_epoch,
-                    Some(LastActive::from_active(
-                        record.generation,
-                        owner,
-                        *writer_epoch,
-                    )),
-                ),
-                V2State::Claiming(handoff) | V2State::Opening(handoff) => (
-                    record.generation,
-                    handoff.writer_epoch_floor,
-                    handoff.last_active.clone(),
-                ),
-            },
+                )),
+            ),
+            RecordState::Claiming(handoff) | RecordState::Opening(handoff) => (
+                self.generation,
+                handoff.writer_epoch_floor,
+                handoff.last_active.clone(),
+            ),
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct RecordSnapshot {
-    record: StoredRecord,
+    record: OwnershipRecord,
     version: UpdateVersion,
 }
 
@@ -416,19 +375,34 @@ async fn read_snapshot(
             };
             let bytes = result.bytes().await?;
             Ok(Some(RecordSnapshot {
-                record: StoredRecord::parse(&bytes)?,
+                record: OwnershipRecord::parse(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|e| anyhow::anyhow!("invalid HA ownership record: {e}"))?,
+                )?,
                 version,
             }))
         }
         Err(Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("reading the HA leader record failed: {e}")),
+        Err(e) => Err(anyhow::anyhow!(
+            "reading the HA ownership record failed: {e}"
+        )),
     }
 }
 
-/// Public durable phase.
+async fn read_leader_marker(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &str,
+) -> anyhow::Result<Option<LeaderMarker>> {
+    match object_store.get(&leader_marker_path(db_path)).await {
+        Ok(result) => Ok(Some(LeaderMarker::parse(&result.bytes().await?)?)),
+        Err(Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("reading the HA leader marker failed: {e}")),
+    }
+}
+
+/// Durable ownership phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LeaderRecordPhase {
-    Legacy,
+pub enum OwnershipPhase {
     Claiming,
     Opening,
     Active,
@@ -437,33 +411,26 @@ pub enum LeaderRecordPhase {
 /// Read-only, owned view used by startup role election.
 #[derive(Clone, Debug)]
 pub struct Inspection {
-    record: Option<StoredRecord>,
+    phase: Option<OwnershipPhase>,
+    startup_blockers: Vec<String>,
+    latest_writer: Option<(u64, String)>,
 }
 
-#[allow(dead_code)] // Some diagnostics are currently exercised only by tests.
 impl Inspection {
-    pub fn phase(&self) -> Option<LeaderRecordPhase> {
-        self.record.as_ref().map(StoredRecord::phase)
-    }
-
-    pub fn generation(&self) -> Option<u64> {
-        self.record.as_ref().map(StoredRecord::generation)
+    pub fn phase(&self) -> Option<OwnershipPhase> {
+        self.phase
     }
 
     /// Node identities that block startup on peer silence.
-    pub fn startup_blockers(&self) -> Vec<String> {
-        self.record
-            .as_ref()
-            .map(StoredRecord::startup_blockers)
-            .unwrap_or_default()
+    pub fn startup_blockers(&self) -> &[String] {
+        &self.startup_blockers
     }
 
-    /// Last term that reached the legacy marker or v2 Active phase.
-    pub fn latest_writer(&self) -> Option<(u64, String)> {
-        self.record
+    /// Last active writer, including the bootstrap marker when no ownership record exists.
+    pub fn latest_writer(&self) -> Option<(u64, &str)> {
+        self.latest_writer
             .as_ref()
-            .and_then(StoredRecord::latest_writer)
-            .map(|(epoch, node)| (epoch, node.to_string()))
+            .map(|(epoch, node)| (*epoch, node.as_str()))
     }
 }
 
@@ -471,59 +438,64 @@ pub async fn inspect(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
 ) -> anyhow::Result<Inspection> {
-    Ok(Inspection {
-        record: read_snapshot(object_store, &record_path(db_path))
-            .await?
-            .map(|snapshot| snapshot.record),
+    if let Some(snapshot) = read_snapshot(object_store, &ownership_path(db_path)).await? {
+        let record = snapshot.record;
+        return Ok(Inspection {
+            phase: Some(record.phase()),
+            startup_blockers: record.startup_blockers(),
+            latest_writer: record
+                .latest_writer()
+                .map(|(epoch, node)| (epoch, node.to_string())),
+        });
+    }
+    Ok(match read_leader_marker(object_store, db_path).await? {
+        Some(record) => Inspection {
+            phase: Some(OwnershipPhase::Active),
+            startup_blockers: vec![record.node_id.clone()],
+            latest_writer: Some((record.epoch, record.node_id)),
+        },
+        None => Inspection {
+            phase: None,
+            startup_blockers: Vec::new(),
+            latest_writer: None,
+        },
     })
 }
 
-/// Compatibility view of the last legacy or V2 Active term.
-#[allow(dead_code)] // Compatibility view retained for callers during migration.
+/// Last active writer from the ownership record or bootstrap marker.
+#[allow(dead_code)] // Retains the released read API.
 pub async fn read(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    Ok(inspect(object_store, db_path).await?.latest_writer())
+    Ok(inspect(object_store, db_path)
+        .await?
+        .latest_writer()
+        .map(|(epoch, node)| (epoch, node.to_string())))
 }
 
 /// The requested claim was not installed.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("HA leader claim rejected by {phase:?} generation {generation:?} owned by {owner:?}")]
 pub struct ClaimRejected {
-    phase: Option<LeaderRecordPhase>,
+    phase: Option<OwnershipPhase>,
     generation: Option<u64>,
     owner: Option<String>,
 }
 
-#[allow(dead_code)] // Structured diagnostics are useful to external callers/tests.
 impl ClaimRejected {
     fn from_snapshot(snapshot: Option<&RecordSnapshot>) -> Self {
         Self {
             phase: snapshot.map(|snapshot| snapshot.record.phase()),
-            generation: snapshot.map(|snapshot| snapshot.record.generation()),
+            generation: snapshot.map(|snapshot| snapshot.record.generation),
             owner: snapshot.map(|snapshot| snapshot.record.owner_node().to_string()),
         }
-    }
-
-    pub fn phase(&self) -> Option<LeaderRecordPhase> {
-        self.phase
-    }
-
-    pub fn generation(&self) -> Option<u64> {
-        self.generation
-    }
-
-    pub fn owner(&self) -> Option<&str> {
-        self.owner.as_deref()
     }
 }
 
 /// Loss of the generation/incarnation capability being advanced.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[error(
-    "lost HA leader-record ownership for generation {generation} node {node_id:?} incarnation {incarnation}"
-)]
+#[error("lost HA ownership for generation {generation} node {node_id:?} incarnation {incarnation}")]
 pub struct OwnershipLost {
     generation: u64,
     node_id: String,
@@ -548,10 +520,10 @@ enum ExactWriteOutcome {
 
 /// Performs one storage CAS. A reread accepts only the exact desired value;
 /// otherwise it reports the observed record.
-async fn write_v2_exact(
+async fn write_exact(
     object_store: &Arc<dyn ObjectStore>,
     path: &Path,
-    desired: &V2Record,
+    desired: &OwnershipRecord,
     mode: PutMode,
     require_version: bool,
 ) -> anyhow::Result<ExactWriteOutcome> {
@@ -568,17 +540,17 @@ async fn write_v2_exact(
             };
             if !require_version || has_version(&version) {
                 return Ok(ExactWriteOutcome::Applied(RecordSnapshot {
-                    record: StoredRecord::V2(desired.clone()),
+                    record: desired.clone(),
                     version,
                 }));
             }
 
             let current = read_snapshot(object_store, path).await?;
             match current {
-                Some(snapshot) if snapshot.record == StoredRecord::V2(desired.clone()) => {
+                Some(snapshot) if snapshot.record == *desired => {
                     anyhow::ensure!(
                         has_version(&snapshot.version),
-                        "HA leader record update returned neither an ETag nor an object version"
+                        "HA ownership update returned neither an ETag nor an object version"
                     );
                     Ok(ExactWriteOutcome::Applied(snapshot))
                 }
@@ -589,15 +561,15 @@ async fn write_v2_exact(
             // Reconcile a conditional write whose response may have been lost.
             let current = read_snapshot(object_store, path).await.map_err(|read_error| {
                 anyhow::anyhow!(
-                    "writing the HA leader record failed: {write_error}; rereading it to reconcile the ambiguous result also failed: {read_error:#}"
+                    "writing the HA ownership record failed: {write_error}; rereading it to reconcile the ambiguous result also failed: {read_error:#}"
                 )
             })?;
             if let Some(snapshot) = current.as_ref()
-                && snapshot.record == StoredRecord::V2(desired.clone())
+                && snapshot.record == *desired
             {
                 if require_version && !has_version(&snapshot.version) {
                     anyhow::bail!(
-                        "HA leader record update returned neither an ETag nor an object version"
+                        "HA ownership update returned neither an ETag nor an object version"
                     );
                 }
                 return Ok(ExactWriteOutcome::Applied(
@@ -612,7 +584,7 @@ async fn write_v2_exact(
                 Ok(ExactWriteOutcome::Changed(current))
             } else {
                 Err(anyhow::anyhow!(
-                    "writing the HA leader record failed before the desired transition was visible: {write_error}"
+                    "writing the HA ownership record failed before the desired transition was visible: {write_error}"
                 ))
             }
         }
@@ -620,7 +592,7 @@ async fn write_v2_exact(
 }
 
 struct HandoffState {
-    record: V2Record,
+    record: OwnershipRecord,
     version: UpdateVersion,
     ownership_lost: bool,
     renewal_failure: Option<String>,
@@ -631,13 +603,11 @@ fn reconcile_own_handoff_revision(
     state: &mut HandoffState,
     snapshot: RecordSnapshot,
 ) -> anyhow::Result<bool> {
-    let StoredRecord::V2(current) = &snapshot.record else {
-        return Ok(false);
-    };
+    let current = &snapshot.record;
     let same_attempt = current.generation == state.record.generation
         && match (&state.record.state, &current.state) {
-            (V2State::Claiming(expected), V2State::Claiming(current))
-            | (V2State::Opening(expected), V2State::Opening(current)) => {
+            (RecordState::Claiming(expected), RecordState::Claiming(current))
+            | (RecordState::Opening(expected), RecordState::Opening(current)) => {
                 expected.is_same_attempt_as(current)
             }
             _ => false,
@@ -671,12 +641,12 @@ impl HandoffLease {
     fn start(
         object_store: Arc<dyn ObjectStore>,
         path: Path,
-        record: V2Record,
+        record: OwnershipRecord,
         version: UpdateVersion,
     ) -> Self {
         let owner = match &record.state {
-            V2State::Claiming(handoff) | V2State::Opening(handoff) => handoff.owner.clone(),
-            V2State::Active { .. } => unreachable!("handoff lease cannot contain Active"),
+            RecordState::Claiming(handoff) | RecordState::Opening(handoff) => handoff.owner.clone(),
+            RecordState::Active { .. } => unreachable!("handoff lease cannot contain Active"),
         };
         let generation = record.generation;
         let state = Arc::new(tokio::sync::Mutex::new(HandoffState {
@@ -709,7 +679,7 @@ impl HandoffLease {
                     }
                 };
                 let mode = PutMode::Update(state.version.clone());
-                match write_v2_exact(&renewal_store, &renewal_path, &desired, mode, true).await {
+                match write_exact(&renewal_store, &renewal_path, &desired, mode, true).await {
                     Ok(ExactWriteOutcome::Applied(snapshot)) => {
                         state.record = desired;
                         state.version = snapshot.version;
@@ -731,7 +701,7 @@ impl HandoffLease {
                     Err(error) => {
                         // Retry the same revision and object version.
                         tracing::warn!(
-                            "HA handoff marker renewal failed; generation={generation}; \
+                            "HA handoff renewal failed; generation={generation}; \
                              retrying: {error:#}"
                         );
                     }
@@ -787,18 +757,14 @@ pub struct HandoffToken<const OPENING: bool> {
     lease: HandoffLease,
 }
 
-#[allow(dead_code)] // Optional token diagnostics.
+#[cfg(test)]
 impl<const OPENING: bool> HandoffToken<OPENING> {
-    pub fn generation(&self) -> u64 {
+    fn generation(&self) -> u64 {
         self.lease.generation
     }
 
-    pub fn node_id(&self) -> &str {
+    fn node_id(&self) -> &str {
         &self.lease.owner.node_id
-    }
-
-    pub fn incarnation(&self) -> &str {
-        &self.lease.owner.incarnation
     }
 }
 
@@ -826,16 +792,16 @@ pub async fn validate_opening(token: &OpeningToken) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Exact V2 Active identity.
+/// Exact Active ownership identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveOwnership {
-    record: V2Record,
+    record: OwnershipRecord,
 }
 
-#[allow(dead_code)] // Identity diagnostics are not needed by the serving path.
+#[cfg(test)]
 impl ActiveOwnership {
     fn active(&self) -> (&Owner, u64) {
-        let V2State::Active {
+        let RecordState::Active {
             owner,
             writer_epoch,
         } = &self.record.state
@@ -845,23 +811,18 @@ impl ActiveOwnership {
         (owner, *writer_epoch)
     }
 
-    pub fn generation(&self) -> u64 {
+    fn generation(&self) -> u64 {
         self.record.generation
     }
 
-    pub fn node_id(&self) -> &str {
+    fn node_id(&self) -> &str {
         self.active().0.node_id.as_str()
     }
 
-    pub fn incarnation(&self) -> &str {
-        self.active().0.incarnation.as_str()
-    }
-
-    pub fn writer_epoch(&self) -> u64 {
+    fn writer_epoch(&self) -> u64 {
         self.active().1
     }
 
-    #[cfg(test)]
     pub(crate) fn for_test(
         generation: u64,
         node_id: &str,
@@ -869,10 +830,9 @@ impl ActiveOwnership {
         writer_epoch: u64,
     ) -> Self {
         Self {
-            record: V2Record {
-                version: FORMAT_VERSION,
+            record: OwnershipRecord {
                 generation,
-                state: V2State::Active {
+                state: RecordState::Active {
                     owner: Owner {
                         node_id: node_id.to_string(),
                         incarnation: incarnation.to_string(),
@@ -897,8 +857,8 @@ pub async fn claim(
     claim_inner(object_store, db_path, node_id, force, false).await
 }
 
-/// Recovers only a Claiming or Opening record. Active, legacy, and absent
-/// records return [`ClaimRejected`].
+/// Recovers only a Claiming or Opening record. Active and absent records return
+/// [`ClaimRejected`].
 pub async fn recover_handoff(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
@@ -915,17 +875,30 @@ async fn claim_inner(
     recovery_only: bool,
 ) -> anyhow::Result<ClaimToken> {
     debug_assert!(!(force && recovery_only));
-    let path = record_path(db_path);
+    let path = ownership_path(db_path);
     let mut current = read_snapshot(object_store, &path).await?;
+    let leader_marker = if current.is_none() {
+        read_leader_marker(object_store, db_path).await?
+    } else {
+        None
+    };
     let handoff_in_progress = current.as_ref().is_some_and(|snapshot| {
         matches!(
             snapshot.record.phase(),
-            LeaderRecordPhase::Claiming | LeaderRecordPhase::Opening
+            OwnershipPhase::Claiming | OwnershipPhase::Opening
         )
     });
 
     if recovery_only && !handoff_in_progress {
-        return Err(ClaimRejected::from_snapshot(current.as_ref()).into());
+        let rejected = match current.as_ref() {
+            Some(_) => ClaimRejected::from_snapshot(current.as_ref()),
+            None => ClaimRejected {
+                phase: leader_marker.as_ref().map(|_| OwnershipPhase::Active),
+                generation: leader_marker.as_ref().map(|record| record.epoch),
+                owner: leader_marker.as_ref().map(|record| record.node_id.clone()),
+            },
+        };
+        return Err(rejected.into());
     }
 
     if !force && handoff_in_progress {
@@ -946,16 +919,22 @@ async fn claim_inner(
 
     let (generation, writer_epoch_floor, last_active) = match current.as_ref() {
         Some(snapshot) => snapshot.record.claim_base(),
-        None => (0, 0, None),
+        None => match leader_marker.as_ref() {
+            Some(record) => (
+                record.epoch,
+                record.epoch,
+                Some(LastActive::from_leader_marker(record)),
+            ),
+            None => (0, 0, None),
+        },
     };
     let generation = generation.checked_add(1).ok_or_else(|| {
-        anyhow::anyhow!("cannot claim HA leadership: leader-record generation exhausted")
+        anyhow::anyhow!("cannot claim HA leadership: ownership generation exhausted")
     })?;
     let owner = Owner::new(node_id.to_string())?;
-    let desired = V2Record {
-        version: FORMAT_VERSION,
+    let desired = OwnershipRecord {
         generation,
-        state: V2State::Claiming(Handoff {
+        state: RecordState::Claiming(Handoff {
             owner,
             writer_epoch_floor,
             revision: 1,
@@ -966,14 +945,14 @@ async fn claim_inner(
         Some(snapshot) => {
             anyhow::ensure!(
                 has_version(&snapshot.version),
-                "HA leader claim returned neither an ETag nor an object version"
+                "HA ownership claim returned neither an ETag nor an object version"
             );
             PutMode::Update(snapshot.version.clone())
         }
         None => PutMode::Create,
     };
 
-    match write_v2_exact(object_store, &path, &desired, mode, true).await? {
+    match write_exact(object_store, &path, &desired, mode, true).await? {
         ExactWriteOutcome::Applied(snapshot) => {
             let lease =
                 HandoffLease::start(Arc::clone(object_store), path, desired, snapshot.version);
@@ -1007,15 +986,14 @@ async fn begin_open_after(token: ClaimToken, grace: Duration) -> anyhow::Result<
     }
     loop {
         let renewed = state.record.renewed_handoff()?;
-        let V2State::Claiming(handoff) = renewed.state else {
+        let RecordState::Claiming(handoff) = renewed.state else {
             unreachable!("ClaimToken always contains Claiming");
         };
-        let desired = V2Record {
-            version: FORMAT_VERSION,
+        let desired = OwnershipRecord {
             generation: token.lease.generation,
-            state: V2State::Opening(handoff),
+            state: RecordState::Opening(handoff),
         };
-        match write_v2_exact(
+        match write_exact(
             &token.lease.object_store,
             &token.lease.path,
             &desired,
@@ -1068,7 +1046,7 @@ pub async fn activate(
             token.lease.generation
         );
     }
-    let V2State::Opening(handoff) = &state.record.state else {
+    let RecordState::Opening(handoff) = &state.record.state else {
         unreachable!("OpeningToken always contains Opening");
     };
     anyhow::ensure!(
@@ -1076,10 +1054,9 @@ pub async fn activate(
         "refusing to activate HA writer epoch {writer_epoch}: it does not advance the recorded floor {}",
         handoff.writer_epoch_floor
     );
-    let desired = V2Record {
-        version: FORMAT_VERSION,
+    let desired = OwnershipRecord {
         generation: token.lease.generation,
-        state: V2State::Active {
+        state: RecordState::Active {
             owner: handoff.owner.clone(),
             writer_epoch,
         },
@@ -1088,7 +1065,7 @@ pub async fn activate(
         record: desired.clone(),
     };
     loop {
-        match write_v2_exact(
+        match write_exact(
             &token.lease.object_store,
             &token.lease.path,
             &desired,
@@ -1124,16 +1101,16 @@ pub async fn activate(
     }
 }
 
-/// Returns true only for the exact V2 Active generation, owner, incarnation,
+/// Returns true only for the exact Active generation, owner, incarnation,
 /// and writer epoch. Read and parse failures propagate.
 pub async fn validate_active(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
     ownership: &ActiveOwnership,
 ) -> anyhow::Result<bool> {
-    Ok(read_snapshot(object_store, &record_path(db_path))
+    Ok(read_snapshot(object_store, &ownership_path(db_path))
         .await?
-        .is_some_and(|snapshot| snapshot.record == StoredRecord::V2(ownership.record.clone())))
+        .is_some_and(|snapshot| snapshot.record == ownership.record))
 }
 
 #[cfg(test)]
@@ -1156,9 +1133,17 @@ mod tests {
         )
     }
 
-    async fn seed_legacy(store: &Arc<dyn ObjectStore>, db_path: &str, epoch: u64, node_id: &str) {
+    async fn seed_leader_marker(
+        store: &Arc<dyn ObjectStore>,
+        db_path: &str,
+        epoch: u64,
+        node_id: &str,
+    ) {
         store
-            .put(&record_path(db_path), format!("{epoch} {node_id}").into())
+            .put(
+                &leader_marker_path(db_path),
+                format!("{epoch} {node_id}").into(),
+            )
             .await
             .unwrap();
     }
@@ -1168,44 +1153,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_decodes_and_preserves_identity_whitespace() {
+    async fn leader_marker_decodes_and_preserves_identity_whitespace() {
         let store = store();
         assert_eq!(read(&store, "db").await.unwrap(), None);
 
-        seed_legacy(&store, "db", 7, "node-a \t").await;
+        seed_leader_marker(&store, "db", 7, "node-a \t").await;
         assert_eq!(
             read(&store, "db").await.unwrap(),
             Some((7, "node-a \t".to_string()))
         );
         let inspection = inspect(&store, "db").await.unwrap();
-        assert_eq!(inspection.phase(), Some(LeaderRecordPhase::Legacy));
+        assert_eq!(inspection.phase(), Some(OwnershipPhase::Active));
         assert_eq!(inspection.startup_blockers(), vec!["node-a \t"]);
     }
 
     #[tokio::test]
-    async fn legacy_migrates_through_claiming_opening_and_active() {
+    async fn leader_marker_bootstraps_the_ownership_record() {
         let store = store();
-        seed_legacy(&store, "db", 7, "node-a").await;
+        seed_leader_marker(&store, "db", 7, "node-a").await;
 
         let claim = claim(&store, "db", "node-b", false).await.unwrap();
         assert_eq!(claim.generation(), 8);
         let inspection = inspect(&store, "db").await.unwrap();
-        assert_eq!(inspection.phase(), Some(LeaderRecordPhase::Claiming));
+        assert_eq!(inspection.phase(), Some(OwnershipPhase::Claiming));
         assert_eq!(
             inspection.startup_blockers(),
             vec!["node-b".to_string(), "node-a".to_string()]
         );
-        assert_eq!(inspection.latest_writer(), Some((7, "node-a".into())));
+        assert_eq!(inspection.latest_writer(), Some((7, "node-a")));
 
         let opening = open_now(claim).await;
         let inspection = inspect(&store, "db").await.unwrap();
-        assert_eq!(inspection.phase(), Some(LeaderRecordPhase::Opening));
+        assert_eq!(inspection.phase(), Some(OwnershipPhase::Opening));
 
         let active = activate(opening, 8).await.unwrap();
         assert_eq!(active.generation(), 8);
         assert_eq!(active.node_id(), "node-b");
         assert_eq!(active.writer_epoch(), 8);
         assert!(validate_active(&store, "db", &active).await.unwrap());
+        assert_eq!(
+            read(&store, "db").await.unwrap(),
+            Some((8, "node-b".to_string()))
+        );
+
+        let leader_marker = store
+            .get(&leader_marker_path("db"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(leader_marker.as_ref(), b"7 node-a");
+        assert!(store.get(&ownership_path("db")).await.is_ok());
+
+        seed_leader_marker(&store, "db", 99, "obsolete-node").await;
         assert_eq!(
             read(&store, "db").await.unwrap(),
             Some((8, "node-b".to_string()))
@@ -1222,9 +1223,9 @@ mod tests {
             .err()
             .expect("second claim must be rejected");
         let rejected = error.downcast_ref::<ClaimRejected>().unwrap();
-        assert_eq!(rejected.phase(), Some(LeaderRecordPhase::Claiming));
-        assert_eq!(rejected.owner(), Some("node-a"));
-        assert_eq!(rejected.generation(), Some(1));
+        assert_eq!(rejected.phase, Some(OwnershipPhase::Claiming));
+        assert_eq!(rejected.owner.as_deref(), Some("node-a"));
+        assert_eq!(rejected.generation, Some(1));
 
         let opening = open_now(first).await;
         let active = activate(opening, 1).await.unwrap();
@@ -1242,11 +1243,11 @@ mod tests {
         faults.fail_puts(1);
         let claim = claim(&store, "db", "node-a", false)
             .await
-            .expect("transient marker errors must not abort the claim");
+            .expect("transient ownership errors must not abort the claim");
         assert_eq!(claim.generation(), 1);
         assert_eq!(
             inspect(&store, "db").await.unwrap().phase(),
-            Some(LeaderRecordPhase::Claiming)
+            Some(OwnershipPhase::Claiming)
         );
     }
 
@@ -1262,7 +1263,7 @@ mod tests {
         assert_eq!(faults.put_count(), 2);
         assert_eq!(
             inspect(&store, "db").await.unwrap().phase(),
-            Some(LeaderRecordPhase::Claiming)
+            Some(OwnershipPhase::Claiming)
         );
     }
 
@@ -1279,7 +1280,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         let covered = crate::replication::AUTHORITY_TTL
-            + crate::replication::FINAL_MARKER_RECOVERY_TIMEOUT
+            + crate::replication::FINAL_OWNERSHIP_RECOVERY_TIMEOUT
             + crate::replication::RESPONSE_DRAIN_TIMEOUT;
         tokio::time::advance(covered + Duration::from_millis(1)).await;
         assert!(
@@ -1301,7 +1302,7 @@ mod tests {
     #[tokio::test]
     async fn live_opening_renews_and_force_recovery_can_supersede_it() {
         let store = store();
-        seed_legacy(&store, "db", 7, "node-a").await;
+        seed_leader_marker(&store, "db", 7, "node-a").await;
         let old_opening = open_now(claim(&store, "db", "node-b", false).await.unwrap()).await;
         assert!(validate_opening(&old_opening).await.unwrap());
 
@@ -1310,8 +1311,8 @@ mod tests {
             .err()
             .expect("Opening must reject a normal claim");
         let rejected = error.downcast_ref::<ClaimRejected>().unwrap();
-        assert_eq!(rejected.phase(), Some(LeaderRecordPhase::Opening));
-        assert_eq!(rejected.owner(), Some("node-b"));
+        assert_eq!(rejected.phase, Some(OwnershipPhase::Opening));
+        assert_eq!(rejected.owner.as_deref(), Some("node-b"));
 
         let recovery = claim(&store, "db", "node-c", true).await.unwrap();
         assert!(!validate_opening(&old_opening).await.unwrap());
@@ -1416,7 +1417,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn handoff_recovery_cannot_replace_a_marker_that_reached_active() {
+    async fn handoff_recovery_cannot_replace_an_active_record() {
         let store = store();
         let original = claim(&store, "db", "node-a", false).await.unwrap();
 
@@ -1437,7 +1438,7 @@ mod tests {
             .err()
             .expect("Active must not be replaced by recovery-only claim");
         let rejected = error.downcast_ref::<ClaimRejected>().unwrap();
-        assert_eq!(rejected.phase(), Some(LeaderRecordPhase::Active));
+        assert_eq!(rejected.phase, Some(OwnershipPhase::Active));
         assert!(validate_active(&store, "db", &active).await.unwrap());
     }
 
@@ -1477,8 +1478,8 @@ mod tests {
             .expect("stale token must not enter Opening");
         assert!(error.downcast_ref::<OwnershipLost>().is_some());
         assert_eq!(
-            inspect(&store, "db").await.unwrap().generation(),
-            Some(replacement.generation())
+            inspect(&store, "db").await.unwrap().startup_blockers(),
+            [replacement.node_id().to_string()]
         );
     }
 }

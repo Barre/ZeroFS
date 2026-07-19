@@ -1,5 +1,6 @@
-//! Bounded serving authority from an exact Active marker or epoch-bound standby
-//! acknowledgement. Expiry suspends serving for one final marker validation.
+//! Bounded serving authority from an exact Active ownership record or
+//! epoch-bound standby acknowledgement. Expiry suspends serving for one final
+//! ownership validation.
 //! Ownership loss, validation failure, and database fencing are terminal.
 #![cfg_attr(not(test), allow(dead_code))] // The CLI compiles this module separately.
 
@@ -35,7 +36,7 @@ impl WallClock for SystemWallClock {
 
 /// Atomic serving-authority state. Values 0 through 3 represent uninitialized,
 /// revoked, cleanly closed, and suspended. Larger values encode a nanosecond
-/// deadline relative to `base`. Only final marker recovery may replace
+/// deadline relative to `base`. Only final ownership recovery may replace
 /// `SUSPENDED` with a deadline.
 pub struct Lease {
     base: Instant,
@@ -227,7 +228,7 @@ impl Lease {
         }
     }
 
-    /// Replaces `SUSPENDED` with a deadline after final marker validation.
+    /// Replaces `SUSPENDED` with a deadline after final ownership validation.
     fn recover_from(&self, start: Instant, ttl: Duration) -> bool {
         let Some(deadline) = self.encoded_deadline(start, ttl) else {
             return false;
@@ -412,8 +413,8 @@ impl Lease {
 }
 
 /// Validates newly published Active ownership before listener startup. The
-/// grant begins at marker-read start time.
-pub async fn activate_lease_from_marker(
+/// grant begins when the ownership-record read starts.
+pub async fn activate_lease_from_ownership(
     lease: &Lease,
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
@@ -441,16 +442,16 @@ where
             Err(error) if lease.is_uninitialized() => {
                 if failures == 0 {
                     tracing::warn!(
-                        "initial HA Active marker validation failed; listeners closed: {error:#}"
+                        "initial HA Active ownership validation failed; listeners closed: {error:#}"
                     );
                 } else {
                     tracing::debug!(
-                        "initial HA Active marker validation still failing; listeners closed: \
+                        "initial HA Active ownership validation still failing; listeners closed: \
                          {error:#}"
                     );
                 }
                 failures = failures.saturating_add(1);
-                tokio::time::sleep(crate::replication::MARKER_VALIDATION_INTERVAL).await;
+                tokio::time::sleep(crate::replication::OWNERSHIP_VALIDATION_INTERVAL).await;
             }
             Err(error) => return Err(error),
         }
@@ -475,12 +476,12 @@ where
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "timed out after {authority_ttl:?} validating the active HA leader record"
+                "timed out after {authority_ttl:?} validating the active HA ownership record"
             )
         })??;
     if !exact {
         lease.revoke();
-        anyhow::bail!("the active HA leader record no longer names this writer");
+        anyhow::bail!("the active HA ownership record no longer names this writer");
     }
     let minimum_headroom = authority_ttl / 3;
     let remaining = validation_started
@@ -490,13 +491,13 @@ where
         });
     if remaining < minimum_headroom {
         anyhow::bail!(
-            "the exact HA leader record validation left only {remaining:?} of its \
+            "validation of the exact HA ownership record left only {remaining:?} of its \
              request-start authority; retrying before listeners are exposed"
         );
     }
     if !lease.activate_from(validation_started, authority_ttl) {
         anyhow::bail!(
-            "the HA leader record validation did not activate a fresh serving lease before its \
+            "the HA ownership validation did not activate a fresh serving lease before its \
              deadline"
         );
     }
@@ -505,8 +506,8 @@ where
 
 #[derive(Clone, Copy)]
 struct AuthorityTiming {
-    marker_validation_interval: Duration,
-    marker_validation_timeout: Duration,
+    ownership_validation_interval: Duration,
+    ownership_validation_timeout: Duration,
     authority_ttl: Duration,
 }
 
@@ -532,8 +533,8 @@ impl AuthoritySupervisor {
         Self::start_with_validator(
             lease,
             AuthorityTiming {
-                marker_validation_interval: crate::replication::MARKER_VALIDATION_INTERVAL,
-                marker_validation_timeout: crate::replication::MARKER_VALIDATION_TIMEOUT,
+                ownership_validation_interval: crate::replication::OWNERSHIP_VALIDATION_INTERVAL,
+                ownership_validation_timeout: crate::replication::OWNERSHIP_VALIDATION_TIMEOUT,
                 authority_ttl: crate::replication::AUTHORITY_TTL,
             },
             status,
@@ -562,8 +563,8 @@ impl AuthoritySupervisor {
     {
         let loss = CancellationToken::new();
         let deposal = replication.as_ref().map(|control| control.deposal_token());
-        let startup_error = if timing.marker_validation_interval.is_zero()
-            || timing.marker_validation_timeout.is_zero()
+        let startup_error = if timing.ownership_validation_interval.is_zero()
+            || timing.ownership_validation_timeout.is_zero()
             || timing.authority_ttl.is_zero()
         {
             Some("HA authority intervals must be greater than zero")
@@ -729,9 +730,9 @@ async fn next_peer_ack(
     *peer_acks.borrow_and_update()
 }
 
-/// Runs the single marker recovery attempt after lease suspension. Heartbeat
+/// Runs the single ownership recovery attempt after lease suspension. Heartbeat
 /// acknowledgements cannot recover a suspended lease.
-async fn final_marker_recovery<F, Fut>(
+async fn final_ownership_recovery<F, Fut>(
     lease: &Lease,
     status: &mut watch::Receiver<slatedb::DbStatus>,
     authority_ttl: Duration,
@@ -742,7 +743,7 @@ where
     Fut: Future<Output = anyhow::Result<bool>>,
 {
     let started = Instant::now();
-    let timeout = authority_ttl.min(crate::replication::FINAL_MARKER_RECOVERY_TIMEOUT);
+    let timeout = authority_ttl.min(crate::replication::FINAL_OWNERSHIP_RECOVERY_TIMEOUT);
     let db_close = wait_for_db_close(status);
     let validation = tokio::time::timeout(timeout, validate());
     tokio::pin!(db_close, validation);
@@ -788,8 +789,8 @@ async fn run_authority<F, Fut>(
     Fut: Future<Output = anyhow::Result<bool>> + Send + 'static,
 {
     let AuthorityTiming {
-        marker_validation_interval,
-        marker_validation_timeout,
+        ownership_validation_interval,
+        ownership_validation_timeout,
         authority_ttl,
     } = timing;
     let mut ack_fresh_until = None;
@@ -825,7 +826,7 @@ async fn run_authority<F, Fut>(
                 let started = Instant::now();
                 (
                     started,
-                    tokio::time::timeout(marker_validation_timeout, validate()).await,
+                    tokio::time::timeout(ownership_validation_timeout, validate()).await,
                 )
             };
             tokio::pin!(db_close, peer_ack, stale, validation);
@@ -859,11 +860,16 @@ async fn run_authority<F, Fut>(
             }
             AuthorityEvent::Suspended => {
                 tracing::warn!(
-                    "HA serving authority expired; responses suspended during final marker \
+                    "HA serving authority expired; responses suspended during final ownership \
                      validation"
                 );
-                match final_marker_recovery(&guard.lease, &mut status, authority_ttl, &mut validate)
-                    .await
+                match final_ownership_recovery(
+                    &guard.lease,
+                    &mut status,
+                    authority_ttl,
+                    &mut validate,
+                )
+                .await
                 {
                     FinalRecoveryEvent::Revoked => {
                         finish_authority(&mut guard, true, replication.as_ref()).await;
@@ -889,15 +895,15 @@ async fn run_authority<F, Fut>(
                         match result {
                             Ok(Ok(true)) if guard.lease.recover_from(started, authority_ttl) => {
                                 tracing::info!(
-                                    "HA serving authority recovered from exact Active marker"
+                                    "HA serving authority recovered from the exact Active ownership record"
                                 );
                                 ack_fresh_until = None;
-                                next_validation = started + marker_validation_interval;
+                                next_validation = started + ownership_validation_interval;
                                 failures = 0;
                             }
                             Ok(Ok(true)) => {
                                 tracing::error!(
-                                    "HA final marker validation exceeded recovery deadline; \
+                                    "HA final ownership validation exceeded recovery deadline; \
                                      stepping down"
                                 );
                                 finish_authority(&mut guard, true, replication.as_ref()).await;
@@ -905,14 +911,14 @@ async fn run_authority<F, Fut>(
                             }
                             Ok(Ok(false)) => {
                                 tracing::error!(
-                                    "HA Active marker changed during final recovery; stepping down"
+                                    "HA Active ownership changed during final recovery; stepping down"
                                 );
                                 finish_authority(&mut guard, true, replication.as_ref()).await;
                                 return;
                             }
                             Ok(Err(error)) => {
                                 tracing::error!(
-                                    "HA final Active marker validation failed; stepping down: \
+                                    "HA final Active ownership validation failed; stepping down: \
                                      {error:#}"
                                 );
                                 finish_authority(&mut guard, true, replication.as_ref()).await;
@@ -920,7 +926,7 @@ async fn run_authority<F, Fut>(
                             }
                             Err(_) => {
                                 tracing::error!(
-                                    "HA final Active marker validation timed out; stepping down"
+                                    "HA final Active ownership validation timed out; stepping down"
                                 );
                                 finish_authority(&mut guard, true, replication.as_ref()).await;
                                 return;
@@ -959,7 +965,7 @@ async fn run_authority<F, Fut>(
                 next_validation = Instant::now();
             }
             AuthorityEvent::Validated(started, result) => {
-                next_validation = started + marker_validation_interval;
+                next_validation = started + ownership_validation_interval;
                 // Terminal state takes precedence over renewal.
                 if guard.lease.is_terminal() {
                     finish_authority(&mut guard, true, replication.as_ref()).await;
@@ -981,39 +987,43 @@ async fn run_authority<F, Fut>(
                         if guard.lease.is_suspended()
                             && guard.lease.recover_from(started, authority_ttl) =>
                     {
-                        tracing::info!("HA serving authority recovered from exact Active marker");
+                        tracing::info!(
+                            "HA serving authority recovered from the exact Active ownership record"
+                        );
                         ack_fresh_until = None;
-                        next_validation = started + marker_validation_interval;
+                        next_validation = started + ownership_validation_interval;
                         failures = 0;
                     }
                     Ok(Ok(true)) => {
-                        tracing::error!("HA marker validation completed after authority expiry");
+                        tracing::error!("HA ownership validation completed after authority expiry");
                         finish_authority(&mut guard, true, replication.as_ref()).await;
                         return;
                     }
                     Ok(Ok(false)) => {
-                        tracing::error!("HA Active marker changed; stepping down");
+                        tracing::error!("HA Active ownership changed; stepping down");
                         finish_authority(&mut guard, true, replication.as_ref()).await;
                         return;
                     }
                     Ok(Err(error)) => {
                         if failures == 0 {
                             tracing::warn!(
-                                "HA Active marker validation failed; lease not renewed: {error:#}"
+                                "HA Active ownership validation failed; lease not renewed: {error:#}"
                             );
                         } else {
-                            tracing::debug!("HA Active marker validation still failing: {error:#}");
+                            tracing::debug!(
+                                "HA Active ownership validation still failing: {error:#}"
+                            );
                         }
                         failures = failures.saturating_add(1);
                     }
                     Err(_) => {
                         if failures == 0 {
                             tracing::warn!(
-                                "HA Active marker validation timed out; timeout=\
-                                 {marker_validation_timeout:?}; lease not renewed"
+                                "HA Active ownership validation timed out; timeout=\
+                                 {ownership_validation_timeout:?}; lease not renewed"
                             );
                         } else {
-                            tracing::debug!("HA Active marker validation still timing out");
+                            tracing::debug!("HA Active ownership validation still timing out");
                         }
                         failures = failures.saturating_add(1);
                     }
@@ -1104,7 +1114,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn initial_marker_grant_is_anchored_at_request_start() {
+    async fn initial_ownership_grant_is_anchored_at_request_start() {
         let lease = test_lease();
         let activating = tokio::spawn({
             let lease = lease.clone();
@@ -1124,7 +1134,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slow_initial_marker_result_retries_before_exposing_a_short_grant() {
+    async fn slow_initial_ownership_result_retries_before_exposing_a_short_grant() {
         let ttl = Duration::from_millis(300);
         let lease = test_lease();
         let validating = tokio::spawn({
@@ -1152,7 +1162,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fresh_peer_acks_short_circuit_marker_validation() {
+    async fn fresh_peer_acks_short_circuit_ownership_validation() {
         let (db, _tx, status) = status_channel("lease-ack-fast-path").await;
         let lease = active(Duration::from_secs(1));
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1191,7 +1201,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stale_peer_ack_resumes_marker_validation() {
+    async fn stale_peer_ack_resumes_ownership_validation() {
         let (db, _tx, status) = status_channel("lease-ack-stale").await;
         let lease = active(Duration::from_secs(1));
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1223,14 +1233,14 @@ mod tests {
         assert!(attempts.load(Ordering::SeqCst) >= 1);
         assert!(
             lease.is_valid(),
-            "the exact marker preserves Solo authority"
+            "the exact ownership record preserves Solo authority"
         );
         drop(authority);
         db.close().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
-    async fn delayed_ack_does_not_suppress_the_marker_path() {
+    async fn delayed_ack_does_not_suppress_ownership_validation() {
         let (db, _tx, status) = status_channel("lease-delayed-ack").await;
         let lease = active(Duration::from_secs(1));
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1261,8 +1271,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn marker_mismatch_is_terminal_and_a_later_ack_cannot_revive_it() {
-        let (db, _tx, status) = status_channel("lease-marker-mismatch").await;
+    async fn ownership_mismatch_is_terminal_and_a_later_ack_cannot_revive_it() {
+        let (db, _tx, status) = status_channel("lease-ownership-mismatch").await;
         let lease = active(Duration::from_secs(1));
         let (ack_tx, ack_rx) = watch::channel(None);
         let authority = test_authority(
@@ -1289,7 +1299,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn expiry_gates_serving_until_one_exact_marker_recovery_succeeds() {
+    async fn expiry_gates_serving_until_one_exact_ownership_recovery_succeeds() {
         let (db, _tx, status) = status_channel("lease-final-recovery").await;
         let ttl = Duration::from_millis(300);
         let lease = active(ttl);
@@ -1337,7 +1347,7 @@ mod tests {
         assert!(!lease.is_valid(), "the expired gate must remain closed");
         assert!(
             !loss.is_cancelled(),
-            "the final marker attempt is recoverable"
+            "the final ownership attempt is recoverable"
         );
 
         ack_tx
@@ -1358,7 +1368,7 @@ mod tests {
         settle().await;
         assert!(
             lease.is_valid(),
-            "the one exact marker result should reopen the gate"
+            "the exact ownership record should reopen the gate"
         );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -1373,7 +1383,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn final_marker_timeout_is_once_and_terminal_despite_a_later_ack() {
+    async fn final_ownership_timeout_is_once_and_terminal_despite_a_later_ack() {
         let (db, _tx, status) = status_channel("lease-final-timeout").await;
         let ttl = Duration::from_millis(300);
         let lease = active(ttl);
@@ -1431,16 +1441,16 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum FinalMarkerFailure {
+    enum FinalOwnershipFailure {
         Mismatch,
         Error,
     }
 
     #[tokio::test(start_paused = true)]
-    async fn final_marker_mismatch_and_error_are_terminal() {
+    async fn final_ownership_mismatch_and_error_are_terminal() {
         for (name, failure) in [
-            ("lease-final-mismatch", FinalMarkerFailure::Mismatch),
-            ("lease-final-error", FinalMarkerFailure::Error),
+            ("lease-final-mismatch", FinalOwnershipFailure::Mismatch),
+            ("lease-final-error", FinalOwnershipFailure::Error),
         ] {
             let (db, _tx, status) = status_channel(name).await;
             let ttl = Duration::from_millis(300);
@@ -1455,9 +1465,9 @@ mod tests {
                             std::future::pending::<()>().await;
                         }
                         match failure {
-                            FinalMarkerFailure::Mismatch => Ok(false),
-                            FinalMarkerFailure::Error => {
-                                Err(anyhow::anyhow!("injected marker read failure"))
+                            FinalOwnershipFailure::Mismatch => Ok(false),
+                            FinalOwnershipFailure::Error => {
+                                Err(anyhow::anyhow!("injected ownership read failure"))
                             }
                         }
                     }
@@ -1730,8 +1740,8 @@ mod tests {
         AuthoritySupervisor::start_with_validator(
             lease,
             AuthorityTiming {
-                marker_validation_interval: interval,
-                marker_validation_timeout: validation_timeout,
+                ownership_validation_interval: interval,
+                ownership_validation_timeout: validation_timeout,
                 authority_ttl: ttl,
             },
             status,
@@ -1743,7 +1753,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ordinary_marker_read_may_outlive_the_poll_cadence() {
+    async fn ordinary_ownership_read_may_outlive_the_poll_cadence() {
         let (db, _tx, status) = status_channel("lease-slow-ordinary-validation").await;
         let ttl = Duration::from_millis(300);
         let lease = active(ttl);
@@ -1933,8 +1943,8 @@ mod tests {
             AuthoritySupervisor::start_with_validator(
                 lease.clone(),
                 AuthorityTiming {
-                    marker_validation_interval: Duration::from_secs(1),
-                    marker_validation_timeout: Duration::from_secs(3),
+                    ownership_validation_interval: Duration::from_secs(1),
+                    ownership_validation_timeout: Duration::from_secs(3),
                     authority_ttl: Duration::from_secs(30),
                 },
                 status,

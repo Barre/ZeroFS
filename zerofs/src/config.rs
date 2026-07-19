@@ -216,7 +216,7 @@ pub struct ReplicationConfig {
         default
     )]
     pub replication_listen: Option<String>,
-    /// One-startup authorization to replace the durable leader marker.
+    /// One-startup authorization to replace durable HA ownership.
     /// All former participants must be stopped before this is enabled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub force_recovery: bool,

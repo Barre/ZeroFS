@@ -1,6 +1,6 @@
 //! Filesystem startup and HA role election.
 //!
-//! The replication receiver starts before role election. Marker capabilities
+//! The replication receiver starts before role election. Ownership capabilities
 //! enforce the claim, open, and activation order. A promoted writer reconciles
 //! its frozen tail before activation.
 //!
@@ -31,7 +31,7 @@ use tracing::info;
 /// State retained across role-election and writer-open retries.
 struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
-    /// Retrying store for direct ZeroFS I/O, including pre-serving HA marker coordination.
+    /// Retrying store for direct ZeroFS I/O, including pre-serving HA ownership.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
     wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
@@ -49,7 +49,7 @@ struct StartupContext {
     ha: Option<HaReceiver>,
     /// Whether this startup observed predecessor failure.
     took_over_from_standby: bool,
-    /// Use the recovery-only claim for an observed Claiming or Opening marker.
+    /// Use the recovery-only claim for observed Claiming or Opening ownership.
     recovering_handoff: bool,
     /// Opening capability retained across writer-open retries.
     opening: Option<crate::replication::leader_record::OpeningToken>,
@@ -94,7 +94,7 @@ enum ImmediateRoleDecision {
     FollowActivePeer,
 }
 
-/// Resolve marker recovery before advisory peer state.
+/// Resolve ownership recovery before advisory peer state.
 fn immediate_role_decision(
     unresolved_handoff: bool,
     any_active: bool,
@@ -299,7 +299,7 @@ impl StartupContext {
         Ok(self)
     }
 
-    /// Elect a runtime role from the durable marker and peer Hello responses.
+    /// Elect a runtime role from durable ownership and peer Hello responses.
     /// The recorded latest writer and configured standby wait on ambiguous peer
     /// silence. Only a writer elected here may open the database.
     async fn become_writer(&mut self) -> Result<()> {
@@ -336,8 +336,7 @@ impl StartupContext {
                     };
                     match crate::replication::transport::hello_peer(endpoint).await {
                         Ok(answer) => {
-                            // Identity keys the latest-leader record; a duplicated
-                            // node_id is a config error.
+                            // A node_id must identify one member of the HA pair.
                             if answer.node_id == params.node_id {
                                 anyhow::bail!(
                                     "HA: peer {peer} reports the same node_id {:?} as this \
@@ -365,28 +364,28 @@ impl StartupContext {
                         }
                     }
                 }
-                let marker = crate::replication::leader_record::inspect(
+                let ownership = crate::replication::leader_record::inspect(
                     &self.retrying_object_store,
                     &self.actual_db_path,
                 )
                 .await
-                .context("HA: cannot resolve a boot role without the leader record")?;
-                let was_latest = marker
+                .context("HA: cannot resolve a boot role without the ownership record")?;
+                let was_latest = ownership
                     .latest_writer()
                     .is_some_and(|(_, node)| node == params.node_id);
                 let unresolved_handoff = matches!(
-                    marker.phase(),
+                    ownership.phase(),
                     Some(
-                        crate::replication::leader_record::LeaderRecordPhase::Claiming
-                            | crate::replication::leader_record::LeaderRecordPhase::Opening
+                        crate::replication::leader_record::OwnershipPhase::Claiming
+                            | crate::replication::leader_record::OwnershipPhase::Opening
                     )
                 );
-                let handoff_blockers = marker.startup_blockers();
+                let handoff_blockers = ownership.startup_blockers();
 
                 match immediate_role_decision(unresolved_handoff, any_active) {
                     Some(ImmediateRoleDecision::RecoverHandoff) => {
-                        // Claiming and Opening liveness is determined from the
-                        // durable marker, not a predecessor's Hello response.
+                        // Claiming and Opening liveness comes from the ownership
+                        // record, not a predecessor's Hello response.
                         lead = true;
                         recovered_handoff = true;
                         break;
@@ -404,7 +403,7 @@ impl StartupContext {
                     // abandon the tail or fence the live writer.
                     if silent_rounds.is_multiple_of(20) {
                         tracing::warn!(
-                            "HA {}: the durable leader record makes peer silence ambiguous \
+                            "HA {}: the durable ownership record makes peer silence ambiguous \
                              (startup blockers: {:?}); blocking startup until every peer \
                              answers (if the recorded process is permanently gone, remove it \
                              from replication.peers and set role = \"leader\")",
@@ -548,7 +547,7 @@ impl StartupContext {
                     );
                 }
                 tracing::warn!(
-                    "HA: another initializer owns the durable pre-open marker \
+                    "HA: another initializer owns the durable pre-open claim \
                      ({error}); returning to role election"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -828,7 +827,7 @@ impl ReconciledDb {
                         db.subscribe().borrow().current_manifest.writer_epoch()
                     }
                     SlateDbHandle::ReadOnly(_) => {
-                        anyhow::bail!("HA marker activation requires a writable data db")
+                        anyhow::bail!("HA ownership activation requires a writable data db")
                     }
                 };
                 Some(
@@ -862,19 +861,19 @@ impl ReconciledDb {
             SlateDbHandle::ReadWrite(db) => db.subscribe().borrow().current_manifest.writer_epoch(),
             SlateDbHandle::ReadOnly(_) => 0,
         };
-        // Initial authority comes from an exact Active-marker read. Current-epoch
-        // standby acknowledgements provide the steady-state authority signal.
+        // Initial authority comes from the exact Active ownership record.
+        // Current-epoch standby acknowledgements provide steady-state authority.
         let pending_authority = match (replication_params.as_ref(), ownership) {
             (Some(_), Some(ownership)) if !db_mode.is_read_only() => {
                 let lease = crate::replication::Lease::new();
-                crate::replication::activate_lease_from_marker(
+                crate::replication::activate_lease_from_ownership(
                     &lease,
                     &object_store,
                     &actual_db_path,
                     &ownership,
                 )
                 .await
-                .context("HA: fresh Active-marker validation failed")?;
+                .context("HA: fresh Active ownership validation failed")?;
 
                 let status = match &slatedb {
                     SlateDbHandle::ReadWrite(raw_db) => raw_db.subscribe(),
@@ -888,7 +887,7 @@ impl ReconciledDb {
                 anyhow::bail!("HA writer reached serving assembly without Active ownership")
             }
             (None, Some(_)) => {
-                anyhow::bail!("non-HA startup unexpectedly acquired HA marker ownership")
+                anyhow::bail!("non-HA startup unexpectedly acquired HA ownership")
             }
             _ => None,
         };
@@ -1123,7 +1122,7 @@ mod role_decision_tests {
     }
 
     #[tokio::test]
-    async fn peer_silence_refreshes_the_leader_record() {
+    async fn peer_silence_refreshes_ownership() {
         let (fault_store, faults) = FaultStore::new(Arc::new(InMemory::new()));
         let store: Arc<dyn ObjectStore> = fault_store;
         store
@@ -1183,7 +1182,7 @@ mod role_decision_tests {
             }
         })
         .await
-        .expect("role election must inspect the initial leader record");
+        .expect("role election must inspect the initial ownership record");
 
         let abandoned = crate::replication::leader_record::claim(&store, "db", "node-b", false)
             .await
