@@ -852,6 +852,7 @@
                                                          (throw+ {:type ::no-forced-recovery})))
                                               {:retry-interval 500 :log-interval 5000 :timeout 60000
                                                :log-message "recovery: waiting for forced startup"})
+                                    ;; Do not leave force_recovery enabled after startup.
                                     (spit (node-cfg-path c s) (node-cfg-str c s "leader"))
                                     (str "blocked-then-recovered-" (name s)))
                  :heal-rejoin  (do (heal-rejoin! c) :healed-rejoin)
@@ -913,9 +914,10 @@
                                (filter #(and (= :ok (:type %)) (= :read (:f %))))
                                last :value)
                           (sorted-set))
-            ^BitSet seen    (BitSet.)
-            ^BitSet present (BitSet.)
-            ^BitSet unknown (BitSet.)
+            ^BitSet seen       (BitSet.)
+            ^BitSet present    (BitSet.)
+            ^BitSet unknown    (BitSet.)
+            ^BitSet final-bits (BitSet.)
             _         (doseq [{:keys [type f value]} history
                               :when (and (#{:ok :info :fail} type)
                                          (#{:add :remove} f)
@@ -930,40 +932,21 @@
                             :info (do (.clear present i)
                                       (.set unknown i))
                             nil)))
-            lost      (loop [v (.nextSetBit present 0)
-                             n 0
-                             sample []]
-                        (if (neg? v)
-                          {:count n :sample sample}
-                          (let [missing? (not (contains? final-set v))]
-                            (recur (.nextSetBit present (inc v))
-                                   (if missing? (inc n) n)
-                                   (if (and missing? (< (count sample) 50))
-                                     (conj sample v)
-                                     sample)))))
-            resurrected
-            (loop [values (seq final-set)
-                   n 0
-                   sample []]
-              (if-let [v (first values)]
-                (let [i (int v)
-                      unexpected? (and (.get seen i)
-                                       (not (.get present i))
-                                       (not (.get unknown i)))]
-                  (recur (next values)
-                         (if unexpected? (inc n) n)
-                         (if (and unexpected? (< (count sample) 50))
-                           (conj sample v)
-                           sample)))
-                {:count n :sample sample}))]
-        {:valid?            (and (zero? (:count lost))
-                                 (zero? (:count resurrected)))
+            _         (doseq [v final-set]
+                        (.set final-bits (int v)))
+            ^BitSet lost (.clone present)
+            _         (.andNot lost final-bits)
+            ^BitSet resurrected (.clone final-bits)
+            _         (.and resurrected seen)
+            _         (.andNot resurrected present)
+            _         (.andNot resurrected unknown)]
+        {:valid?            (and (.isEmpty lost) (.isEmpty resurrected))
          :present-required  (.cardinality present)
          :final-set-size    (count final-set)
-         :lost-count        (:count lost)
-         :lost              (:sample lost)
-         :resurrected-count (:count resurrected)
-         :resurrected       (:sample resurrected)}))))
+         :lost-count        (.cardinality lost)
+         :lost              (vec (.toArray (.limit (.stream lost) 50)))
+         :resurrected-count (.cardinality resurrected)
+         :resurrected       (vec (.toArray (.limit (.stream resurrected) 50)))}))))
 
 (defn statfs-checker
   "The growth in statfs-reported used inodes (a baseline read on the empty fs vs the

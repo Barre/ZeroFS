@@ -8,6 +8,8 @@ pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 /// stat-bearing replies, replay, mutation envelopes, durability lineage,
 /// open-prefetch, and atomic fallocate.
 pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.Z";
+/// The 9P sentinel for an absent fid, including an unauthenticated `Tattach.afid`.
+pub const NOFID: u32 = u32::MAX;
 
 // QID type constants
 pub const QID_TYPE_DIR: u8 = 0x80;
@@ -1125,6 +1127,87 @@ impl Message {
         }
     }
 
+    /// Fids referenced or allocated by this request. The exhaustive match requires
+    /// each new message to declare its fid footprint.
+    pub fn request_fids(&self) -> impl Iterator<Item = u32> {
+        let fids = match self {
+            Message::Tattach(m) => [Some(m.fid), (m.afid != NOFID).then_some(m.afid)],
+            Message::Twalk(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Tlopen(m) => [Some(m.fid), None],
+            Message::Tlcreate(m) => [Some(m.fid), None],
+            Message::Tread(m) => [Some(m.fid), None],
+            Message::Twrite(m) => [Some(m.fid), None],
+            Message::Tclunk(m) => [Some(m.fid), None],
+            Message::Treaddir(m) => [Some(m.fid), None],
+            Message::Tgetattr(m) => [Some(m.fid), None],
+            Message::Tsetattr(m) | Message::Tsetattrattr(m) => [Some(m.fid), None],
+            Message::Tfallocate(m) => [Some(m.fid), None],
+            Message::Tmkdir(m) | Message::Tmkdirattr(m) => [Some(m.dfid), None],
+            Message::Tsymlink(m) | Message::Tsymlinkattr(m) => [Some(m.dfid), None],
+            Message::Tmknod(m) | Message::Tmknodattr(m) => [Some(m.dfid), None],
+            Message::Treadlink(m) => [Some(m.fid), None],
+            Message::Tlink(m) | Message::Tlinkattr(m) => [Some(m.dfid), Some(m.fid)],
+            Message::Trename(m) => [Some(m.fid), Some(m.dfid)],
+            Message::Trenameat(m) => [Some(m.olddirfid), Some(m.newdirfid)],
+            Message::Tunlinkat(m) => [Some(m.dirfid), None],
+            Message::Tfsync(m) => [Some(m.fid), None],
+            Message::Tfsyncdur(m) => [Some(m.fid), None],
+            Message::Tlock(m) => [Some(m.fid), None],
+            Message::Tgetlock(m) => [Some(m.fid), None],
+            Message::Txattrwalk(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Tstatfs(m) => [Some(m.fid), None],
+            Message::Tlopenat(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Tlopenatread(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Tlcreateattr(m) => [Some(m.dfid), Some(m.newfid)],
+            Message::Trebind(m) => [Some(m.fid), None],
+            Message::Twalkgetattr(m) => [Some(m.fid), Some(m.newfid)],
+            Message::Treaddirattr(m) => [Some(m.fid), None],
+            Message::Tversion(_)
+            | Message::Rversion(_)
+            | Message::Rattach(_)
+            | Message::Rwalk(_)
+            | Message::Rlopen(_)
+            | Message::Rlcreate(_)
+            | Message::Rread(_)
+            | Message::Rwrite(_)
+            | Message::Rclunk(_)
+            | Message::Rreaddir(_)
+            | Message::Rgetattr(_)
+            | Message::Rsetattr(_)
+            | Message::Rfallocate(_)
+            | Message::Rmkdir(_)
+            | Message::Rsymlink(_)
+            | Message::Rmknod(_)
+            | Message::Rreadlink(_)
+            | Message::Rlink(_)
+            | Message::Rrename(_)
+            | Message::Rrenameat(_)
+            | Message::Runlinkat(_)
+            | Message::Rfsync(_)
+            | Message::Tgetlineage(_)
+            | Message::Rgetlineage(_)
+            | Message::Rlock(_)
+            | Message::Rgetlock(_)
+            | Message::Rlerror(_)
+            | Message::Tflush(_)
+            | Message::Rflush(_)
+            | Message::Rxattrwalk(_)
+            | Message::Rstatfs(_)
+            | Message::Rlopenat(_)
+            | Message::Rlopenatread(_)
+            | Message::Rlcreateattr(_)
+            | Message::Rmkdirattr(_)
+            | Message::Rsymlinkattr(_)
+            | Message::Rmknodattr(_)
+            | Message::Rlinkattr(_)
+            | Message::Rsetattrattr(_)
+            | Message::Rrebind(_)
+            | Message::Rwalkgetattr(_)
+            | Message::Rreaddirattr(_) => [None, None],
+        };
+        fids.into_iter().flatten()
+    }
+
     /// Whether this request creates an obligation for durability-verified fsync.
     pub fn is_mutation(&self) -> bool {
         self.durability_fid().is_some()
@@ -1347,6 +1430,45 @@ mod tests {
             vec![1],
             "a single-directory op yields just its own fid"
         );
+    }
+
+    #[test]
+    fn request_fids_omits_the_nofid_attach_sentinel() {
+        let attach = |afid| {
+            Message::Tattach(Tattach {
+                fid: 7,
+                afid,
+                uname: P9String::new(Vec::new()),
+                aname: P9String::new(Vec::new()),
+                n_uname: 0,
+            })
+        };
+
+        assert_eq!(attach(NOFID).request_fids().collect::<Vec<_>>(), vec![7]);
+        assert_eq!(attach(8).request_fids().collect::<Vec<_>>(), vec![7, 8]);
+    }
+
+    #[test]
+    fn request_fids_includes_both_rename_directories() {
+        let request = Message::Trenameat(Trenameat {
+            olddirfid: 11,
+            oldname: P9String::new(b"old".to_vec()),
+            newdirfid: 22,
+            newname: P9String::new(b"new".to_vec()),
+        });
+
+        assert_eq!(request.request_fids().collect::<Vec<_>>(), vec![11, 22]);
+    }
+
+    #[test]
+    fn request_fids_is_empty_for_fidless_messages() {
+        assert!(
+            Message::Tflush(Tflush { oldtag: 1 })
+                .request_fids()
+                .next()
+                .is_none()
+        );
+        assert!(Message::Rflush(Rflush).request_fids().next().is_none());
     }
 
     #[test]

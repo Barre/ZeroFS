@@ -30,6 +30,7 @@ use dashmap::{DashMap, DashSet};
 use deku::prelude::*;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+pub use ninep_proto::NOFID;
 use ninep_proto::retry::MUTATION_RETRY_HORIZON;
 use ninep_proto::*;
 use std::collections::HashMap;
@@ -58,8 +59,6 @@ mod web_transport;
 
 /// The 9P "no tag" sentinel. We never allocate it for a normal request.
 const NOTAG: u16 = 0xFFFF;
-/// The 9P "no fid" sentinel, used as the `afid` in attach when not authenticating.
-pub const NOFID: u32 = 0xFFFF_FFFF;
 /// Default TCP port used when a target omits one.
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_9P_PORT: u16 = 5564;
@@ -549,6 +548,13 @@ struct SessionState {
     locks: Vec<LockRecord>,
     /// Default root for the public `rebind` helper.
     default_root: Option<u64>,
+}
+
+impl SessionState {
+    fn forget_fid(&mut self, fid: u32) {
+        self.fids.remove(&fid);
+        self.locks.retain(|lock| lock.fid != fid);
+    }
 }
 
 pub struct NinePClient {
@@ -1110,19 +1116,8 @@ impl NinePClient {
         matches!(errno, linux::ENOENT | linux::ESTALE)
     }
 
-    fn validate_request_fids(&self, body: &Message) -> ClientResult<()> {
-        if request_fids(body)
-            .into_iter()
-            .flatten()
-            .any(|fid| self.stale_fids.contains(&fid))
-        {
-            return Err(ClientError::Errno(linux::ESTALE));
-        }
-        Ok(())
-    }
-
-    fn validate_fids(&self, fids: &[u32]) -> ClientResult<()> {
-        if fids.iter().any(|fid| self.stale_fids.contains(fid)) {
+    fn validate_fids(&self, fids: impl IntoIterator<Item = u32>) -> ClientResult<()> {
+        if fids.into_iter().any(|fid| self.stale_fids.contains(&fid)) {
             return Err(ClientError::Errno(linux::ESTALE));
         }
         Ok(())
@@ -1293,10 +1288,10 @@ impl NinePClient {
         stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
     ) -> ClientResult<(Message, Arc<Conn>)> {
         'resend: loop {
-            self.validate_request_fids(&body)?;
+            self.validate_fids(body.request_fids())?;
             await_resend_bounded(attempt, self.wait_until_live()).await??;
             let conn = self.conn.load_full();
-            self.validate_request_fids(&body)?;
+            self.validate_fids(body.request_fids())?;
 
             // Reserve capacity before registering a response tag.
             let permit = match await_resend_bounded(attempt, conn.writer_tx.reserve()).await? {
@@ -1786,8 +1781,7 @@ impl NinePClient {
         };
         // Remove local state before releasing the replay transition.
         let mut st = self.state.lock().unwrap();
-        st.fids.remove(&fid);
-        st.locks.retain(|l| l.fid != fid);
+        st.forget_fid(fid);
         drop(st);
         self.stale_fids.remove(&fid);
         match resp {
@@ -1806,8 +1800,7 @@ impl NinePClient {
             return false;
         }
         let mut state = self.state.lock().unwrap();
-        state.fids.remove(&fid);
-        state.locks.retain(|lock| lock.fid != fid);
+        state.forget_fid(fid);
         true
     }
 
@@ -2049,6 +2042,7 @@ impl NinePClient {
         if size <= max || first.len() < first_count {
             return Ok(first);
         }
+        // `size` can be `u32::MAX`; cap the initial allocation at two response chunks.
         let mut out = BytesMut::with_capacity(size.min(max.saturating_mul(2)));
         let mut off = offset + first.len() as u64;
         out.extend_from_slice(&first);
@@ -2350,7 +2344,7 @@ impl NinePClient {
     /// Verifies fsync for all fids associated with one inode. `primary` carries
     /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
     pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
-        self.validate_fids(fids)?;
+        self.validate_fids(fids.iter().copied())?;
         // Generations prevent the result from clearing writes concurrent with fsync.
         let mut token: Option<u64> = None;
         let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
@@ -2497,43 +2491,6 @@ impl Drop for NinePClient {
         // Reader and writer tasks retain `Arc<Conn>` until explicit shutdown.
         self.conn.load().shutdown();
         self.reconnect_notify.notify_waiters();
-    }
-}
-
-fn request_fids(body: &Message) -> [Option<u32>; 2] {
-    match body {
-        Message::Tattach(m) => [Some(m.fid), (m.afid != NOFID).then_some(m.afid)],
-        Message::Twalk(m) => [Some(m.fid), Some(m.newfid)],
-        Message::Tlopen(m) => [Some(m.fid), None],
-        Message::Tlcreate(m) => [Some(m.fid), None],
-        Message::Tread(m) => [Some(m.fid), None],
-        Message::Twrite(m) => [Some(m.fid), None],
-        Message::Tclunk(m) => [Some(m.fid), None],
-        Message::Treaddir(m) => [Some(m.fid), None],
-        Message::Tgetattr(m) => [Some(m.fid), None],
-        Message::Tsetattr(m) | Message::Tsetattrattr(m) => [Some(m.fid), None],
-        Message::Tfallocate(m) => [Some(m.fid), None],
-        Message::Tmkdir(m) | Message::Tmkdirattr(m) => [Some(m.dfid), None],
-        Message::Tsymlink(m) | Message::Tsymlinkattr(m) => [Some(m.dfid), None],
-        Message::Tmknod(m) | Message::Tmknodattr(m) => [Some(m.dfid), None],
-        Message::Treadlink(m) => [Some(m.fid), None],
-        Message::Tlink(m) | Message::Tlinkattr(m) => [Some(m.dfid), Some(m.fid)],
-        Message::Trename(m) => [Some(m.fid), Some(m.dfid)],
-        Message::Trenameat(m) => [Some(m.olddirfid), Some(m.newdirfid)],
-        Message::Tunlinkat(m) => [Some(m.dirfid), None],
-        Message::Tfsync(m) => [Some(m.fid), None],
-        Message::Tfsyncdur(m) => [Some(m.fid), None],
-        Message::Tlock(m) => [Some(m.fid), None],
-        Message::Tgetlock(m) => [Some(m.fid), None],
-        Message::Txattrwalk(m) => [Some(m.fid), Some(m.newfid)],
-        Message::Tstatfs(m) => [Some(m.fid), None],
-        Message::Tlopenat(m) => [Some(m.fid), Some(m.newfid)],
-        Message::Tlopenatread(m) => [Some(m.fid), Some(m.newfid)],
-        Message::Tlcreateattr(m) => [Some(m.dfid), Some(m.newfid)],
-        Message::Trebind(m) => [Some(m.fid), None],
-        Message::Twalkgetattr(m) => [Some(m.fid), Some(m.newfid)],
-        Message::Treaddirattr(m) => [Some(m.fid), None],
-        _ => [None, None],
     }
 }
 
@@ -3138,6 +3095,25 @@ mod session_transition_tests {
         }
     }
 
+    #[test]
+    fn forgetting_a_fid_removes_only_its_locks() {
+        let mut state = SessionState::default();
+        state.fids.insert(7, inode_fid(70, 0, 0, None));
+        state.fids.insert(8, inode_fid(80, 0, 0, None));
+        state.locks.extend([
+            write_lock(7, 0, 10),
+            write_lock(8, 0, 10),
+            write_lock(7, 20, 10),
+        ]);
+
+        state.forget_fid(7);
+
+        assert!(!state.fids.contains_key(&7));
+        assert!(state.fids.contains_key(&8));
+        assert_eq!(state.locks.len(), 1);
+        assert_eq!(state.locks[0].fid, 8);
+    }
+
     async fn replay_rebind_error(
         client: &NinePClient,
         conn: &Arc<Conn>,
@@ -3515,17 +3491,20 @@ mod session_transition_tests {
             Message::Tclunk(Tclunk { fid: 7 }),
         ] {
             assert!(matches!(
-                client.validate_request_fids(&request),
+                client.validate_fids(request.request_fids()),
                 Err(ClientError::Errno(errno)) if errno == linux::ESTALE
             ));
         }
         assert!(
             client
-                .validate_request_fids(&Message::Tread(Tread {
-                    fid: 8,
-                    offset: 0,
-                    count: 1,
-                }))
+                .validate_fids(
+                    Message::Tread(Tread {
+                        fid: 8,
+                        offset: 0,
+                        count: 1,
+                    })
+                    .request_fids()
+                )
                 .is_ok()
         );
     }
