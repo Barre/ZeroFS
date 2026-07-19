@@ -88,6 +88,7 @@ impl Dir {
     }
 
     /// linkat(2): hard-link `original_dir`/`original_name` as `self`/`new_name`.
+    /// Both directories must belong to the same client.
     pub async fn link_at(
         &self,
         original_dir: Arc<Dir>,
@@ -123,7 +124,8 @@ impl Dir {
         Ok(())
     }
 
-    /// renameat(2) across two open directories (`new_dir` may be `self`).
+    /// renameat(2) across two open directories (`new_dir` may be `self`). Both
+    /// directories must belong to the same client.
     pub async fn rename_at(
         &self,
         old_name: Vec<u8>,

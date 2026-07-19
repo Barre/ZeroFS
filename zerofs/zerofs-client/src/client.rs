@@ -23,6 +23,8 @@ const MULTI_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_SYMLINK_HOPS: u32 = 40;
 
 /// One concurrent ZeroFS session and identity. Calls wait during reconnect.
+/// Cancelling an unsettled fid-state request retires the connection that carried
+/// it; the session reconnects and replays if that connection is still current.
 /// Cancelling a dispatched mutation leaves its outcome ambiguous.
 ///
 /// Paths are bytes, as on POSIX and the 9P wire: every path parameter is
@@ -127,8 +129,7 @@ impl Client {
         Ok(Arc::new(Client { session }))
     }
 
-    /// Snapshot of currently negotiated session properties (may change across
-    /// transparent reconnects).
+    /// Negotiated properties, fixed for the lifetime of this logical session.
     pub fn capabilities(&self) -> Capabilities {
         let c = &self.session.client;
         Capabilities {

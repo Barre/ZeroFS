@@ -210,7 +210,7 @@ impl From<ConnectOptions> for zerofs_client::ConnectOptions {
     }
 }
 
-/// Live snapshot of negotiated session properties (may change across reconnects).
+/// Negotiated session properties, fixed for the logical session lifetime.
 #[derive(Clone, Copy, Debug, uniffi::Record)]
 pub struct Capabilities {
     /// Negotiated 9P message size in bytes.

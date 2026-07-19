@@ -31,7 +31,7 @@ pub struct Client {
 
 #[uniffi::export]
 impl Client {
-    /// Snapshot of currently negotiated session properties.
+    /// Negotiated session properties, fixed for this logical session.
     pub fn capabilities(&self) -> Capabilities {
         self.inner.capabilities().into()
     }

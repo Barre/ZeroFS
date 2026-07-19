@@ -58,8 +58,11 @@ let fs = Client::connect("node-a:5564,node-b:5564").await?;
 ```
 
 The client races the targets to find the serving leader and re-probes the set
-after a disconnect. Rust callers that already hold separate strings can use
-`Client::connect_multi(&targets)`.
+after a disconnect. The initially negotiated `msize` is retained for the
+logical session, and reconnect candidates that negotiate another value are
+skipped. Every node in an HA or rolling deployment must therefore accept the
+session's established `msize`. Rust callers that already hold separate strings
+can use `Client::connect_multi(&targets)`.
 
 Use `Client::connect_with` for explicit identity (`uid`/`gid`/`uname`), the
 attach subtree (`aname`), `msize`, and `connect_timeout_ms`.
@@ -69,16 +72,20 @@ attach subtree (`aname`), `msize`, and `connect_timeout_ms`.
 - **Close and drop.** `close()` marks the handle closed and is idempotent and
   non-blocking. Dropping the handle schedules its server fid for release and
   recycling. Dropping an open handle performs the same cleanup.
-- **Cancellation.** Dropping a public future releases its client-side fids. A
-  dispatched mutation may still complete, leaving an ambiguous outcome.
-  Per-operation timeouts are supplied by the caller when this ambiguity is
-  acceptable.
+- **Cancellation.** Dropping a Rust operation future releases any temporary
+  fids it owns. If it is dropped while a fid-state request is dispatched and
+  unsettled, the client retires the connection that carried the request. If it
+  is still current, the session reconnects and replays before other operations
+  resume. A dispatched mutation may still complete, leaving an ambiguous
+  outcome. `zerofs-ffi` timeouts abandon the caller's wait without cancelling
+  the Rust operation.
 - **Connection loss.** The session reconnects with backoff and restores fids
   and locks before accepting requests. Undispatched calls wait while no server
   is reachable. In-flight mutations retain their operation envelope across
   resends. Resends stop at the 120-second protocol horizon; unresolved outcomes
-  return an ambiguous connection failure. Open-unlinked handles are
-  connection-local and produce `ESTALE` after connection loss.
+  return an ambiguous connection failure. Reconnect requires the established
+  `msize`. An open-unlinked handle cannot be replayed and returns `ESTALE` after
+  connection loss; other handles remain usable.
 
 ## Reads return `Bytes`
 

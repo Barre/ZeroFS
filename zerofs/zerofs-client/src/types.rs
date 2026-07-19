@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Options for [`crate::Client::connect_with`]. Defaults are representable in
 /// UniFFI records. Rust resolves `None` identity fields during connect.
 ///
-/// The API has no per-operation timeout. Cancellation reclaims resources but
-/// does not revoke a dispatched mutation.
+/// The API has no per-operation timeout. Cancellation reclaims temporary
+/// operation resources but does not revoke a dispatched mutation.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectOptions {
@@ -40,7 +40,7 @@ impl Default for ConnectOptions {
     }
 }
 
-/// Current negotiated session properties. Reconnect may change these values.
+/// Negotiated session properties, fixed for the logical session lifetime.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Capabilities {

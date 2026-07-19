@@ -215,13 +215,19 @@ impl Dir {
     }
 
     /// linkat(2): hard-link `original_dir`/`original_name` (any file type) as
-    /// `self`/`new_name`; returns metadata with the updated nlink.
+    /// `self`/`new_name`; returns metadata with the updated nlink. Both
+    /// directories must belong to the same [`crate::Client`].
     pub async fn link_at(
         &self,
         original_dir: &Dir,
         original_name: &[u8],
         new_name: &[u8],
     ) -> Result<Metadata, ZeroFsError> {
+        if !Arc::ptr_eq(&self.session, &original_dir.session) {
+            return Err(ZeroFsError::InvalidArgument {
+                message: "link_at directories belong to different client sessions".into(),
+            });
+        }
         let (fid, display) = self.at(new_name)?;
         let (original_fid, original_display) = original_dir.at(original_name)?;
 
@@ -265,13 +271,19 @@ impl Dir {
             .ctx(&display)
     }
 
-    /// renameat(2) across two open directories (`new_dir` may be `self`).
+    /// renameat(2) across two open directories (`new_dir` may be `self`). Both
+    /// directories must belong to the same [`crate::Client`].
     pub async fn rename_at(
         &self,
         old_name: &[u8],
         new_dir: &Dir,
         new_name: &[u8],
     ) -> Result<(), ZeroFsError> {
+        if !Arc::ptr_eq(&self.session, &new_dir.session) {
+            return Err(ZeroFsError::InvalidArgument {
+                message: "rename_at directories belong to different client sessions".into(),
+            });
+        }
         let (fid, old_display) = self.at(old_name)?;
         let (new_fid, _) = new_dir.at(new_name)?;
         self.session

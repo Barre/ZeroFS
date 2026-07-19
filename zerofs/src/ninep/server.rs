@@ -551,9 +551,24 @@ struct RequestLease {
 }
 
 impl RequestLease {
-    /// Retire this tag without notifying request-order waiters.
-    /// Queue capacity must already be reserved so tag reuse cannot race removal.
-    fn retire_tag_for_response(&self) {
+    /// Publish a terminal response before making the tag reusable.
+    fn publish_terminal_response(&self, publish: impl FnOnce()) {
+        let retired = self
+            .registry
+            .inner
+            .entries
+            .remove_if(&self.tag, |_, current| {
+                if !Arc::ptr_eq(current, &self.state) {
+                    return false;
+                }
+                publish();
+                true
+            });
+        assert!(retired.is_some(), "request tag retired before its response");
+    }
+
+    /// Remove this lease's registry entry if it is still present.
+    fn retire_registration(&self) {
         self.registry
             .inner
             .entries
@@ -563,7 +578,7 @@ impl RequestLease {
 
 impl Drop for RequestLease {
     fn drop(&mut self) {
-        self.retire_tag_for_response();
+        self.retire_registration();
         if let Some(oldtag) = self.flush_oldtag {
             self.registry
                 .inner
@@ -574,17 +589,14 @@ impl Drop for RequestLease {
     }
 }
 
-/// Reserve response capacity, retire the tag, then enqueue the terminal response.
-/// Tag retirement and enqueue have no intervening yield.
+/// Reserve response capacity, enqueue the terminal response, then retire its tag.
 async fn enqueue_terminal_response(
     tx: &mpsc::Sender<(u16, Vec<u8>)>,
-    tag: u16,
     response_bytes: Vec<u8>,
     request_lease: &RequestLease,
 ) -> Result<(), mpsc::error::SendError<()>> {
     let permit = tx.reserve().await?;
-    request_lease.retire_tag_for_response();
-    permit.send((tag, response_bytes));
+    request_lease.publish_terminal_response(|| permit.send((request_lease.tag, response_bytes)));
     Ok(())
 }
 
@@ -789,8 +801,7 @@ pub(crate) fn dispatch_9p_frame(
 
         match response_bytes {
             Some(response_bytes) => {
-                if let Err(e) =
-                    enqueue_terminal_response(&tx, tag, response_bytes, &request_lease).await
+                if let Err(e) = enqueue_terminal_response(&tx, response_bytes, &request_lease).await
                 {
                     warn!("Failed to send response for tag {}: {}", tag, e);
                 }
@@ -1483,8 +1494,23 @@ mod tests {
         drop(replacement);
     }
 
+    #[test]
+    fn response_publication_holds_the_tag_registry_lock() {
+        let inflight = InflightRegistry::default();
+        let original = inflight.register(7, FidFootprint::None).unwrap();
+        original.publish_terminal_response(|| {
+            assert!(
+                inflight.inner.entries.try_get(&7).is_locked(),
+                "response publication must exclude Tflush lookup and tag reuse"
+            );
+        });
+        assert!(inflight.waiter(7).is_none());
+
+        drop(original);
+    }
+
     #[tokio::test]
-    async fn backpressured_response_retires_tag_before_publication() {
+    async fn backpressured_response_keeps_tag_until_publication() {
         let inflight = InflightRegistry::default();
         let original = inflight.register(7, FidFootprint::None).unwrap();
         let original_waiter = inflight.waiter(7).expect("original request");
@@ -1492,12 +1518,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.send((99, vec![0])).await.unwrap();
 
-        let mut enqueue = Box::pin(enqueue_terminal_response(
-            &tx,
-            7,
-            response.clone(),
-            &original,
-        ));
+        let mut enqueue = Box::pin(enqueue_terminal_response(&tx, response.clone(), &original));
         tokio::select! {
             biased;
             result = &mut enqueue => panic!("full response queue accepted a send: {result:?}"),
@@ -1518,7 +1539,7 @@ mod tests {
 
         let replacement = inflight
             .register(7, FidFootprint::None)
-            .expect("a tag is reusable as soon as its response is observable");
+            .expect("the queued response makes its tag reusable");
         expect_pending(
             &original_waiter,
             "response publication need not wait for the old task to reach Drop",

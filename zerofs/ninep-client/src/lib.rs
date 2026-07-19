@@ -11,14 +11,22 @@
 //! An op-id is local to one public mutation future and is not reusable after the
 //! future completes or is cancelled.
 //!
-//! Replay installs all recorded fids and locks atomically. Failure to restore
-//! observed state terminates the logical session with `ESTALE`. Open-unlinked
-//! fids cannot survive reconnection.
+//! Dropping a future after a fid- or lock-state request is dispatched retires
+//! the connection that carried it. If that connection is still current,
+//! requests wait for reconnect and replay before resuming.
+//!
+//! The negotiated message size is fixed for the logical session. Reconnect
+//! candidates must negotiate the same value.
+//!
+//! Replay restores recorded fids and locks before the replacement connection
+//! becomes live. An opened fid that no longer exists becomes an `ESTALE`
+//! tombstone; its operations fail without affecting other fids. Failure to
+//! restore a held lock terminates the logical session.
 
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::{DashMap, DashSet};
 use deku::prelude::*;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -112,6 +120,7 @@ impl OpAttemptState {
     fn proven_predispatch(&mut self, sent_flags: u8) {
         if sent_flags & P9_OP_FLAG_RETRY == 0 {
             self.origin_epoch = None;
+            self.started = None;
         }
     }
 
@@ -556,10 +565,14 @@ pub struct NinePClient {
     /// Negotiated once for the logical session. Reconnects must match it so an
     /// ambiguous mutation can be resent byte-for-byte.
     msize: u32,
+    /// Suppresses repeated message-size mismatch warnings for this logical session.
+    msize_mismatch_warned: Arc<AtomicBool>,
     fid_ctr: AtomicU32,
     fid_free: Mutex<Vec<u32>>,
     /// Recorded fids (by inode id) and held locks, replayed on reconnect.
     state: Mutex<SessionState>,
+    /// Opened fids that could not be restored and remain allocated by the caller.
+    stale_fids: DashSet<u32>,
     /// Orders stateful response settlement against snapshot/replay/install.
     session_transition: tokio::sync::Mutex<()>,
     /// Per-fid durability obligations carried across reconnects.
@@ -648,12 +661,14 @@ impl NinePClient {
     async fn connect(targets: Vec<Target>, requested_msize: u32) -> ClientResult<Arc<Self>> {
         let reconnect_notify = Arc::new(Notify::new());
         let counters = Arc::new(TrafficCounters::default());
+        let msize_mismatch_warned = Arc::new(AtomicBool::new(false));
         let (conn, msize) = Self::probe(
             &targets,
             requested_msize,
             None,
             Arc::clone(&reconnect_notify),
             Arc::clone(&counters),
+            Arc::clone(&msize_mismatch_warned),
         )
         .await?;
 
@@ -665,9 +680,11 @@ impl NinePClient {
             live_notify: Notify::new(),
             reconnect_notify,
             msize,
+            msize_mismatch_warned,
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
+            stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
             unsynced: DashMap::new(),
             counters,
@@ -683,6 +700,7 @@ impl NinePClient {
         required_msize: Option<u32>,
         reconnect_notify: Arc<Notify>,
         counters: Arc<TrafficCounters>,
+        msize_mismatch_warned: Arc<AtomicBool>,
     ) -> ClientResult<(Arc<Conn>, u32)> {
         let transport = dial(target).await?;
         let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(P9_CHANNEL_SIZE);
@@ -723,9 +741,15 @@ impl NinePClient {
                 if let Some(required) = required_msize
                     && msize != required
                 {
-                    debug!(
-                        "9P reconnect candidate negotiated msize {msize}; logical session requires {required}"
-                    );
+                    if !msize_mismatch_warned.swap(true, Ordering::AcqRel) {
+                        warn!(
+                            "9P reconnect candidate negotiated msize {msize}; logical session requires {required}"
+                        );
+                    } else {
+                        debug!(
+                            "9P reconnect candidate still negotiates msize {msize}; logical session requires {required}"
+                        );
+                    }
                     conn.shutdown();
                     return Err(ClientError::Unexpected("version"));
                 }
@@ -750,14 +774,24 @@ impl NinePClient {
         required_msize: Option<u32>,
         reconnect_notify: Arc<Notify>,
         counters: Arc<TrafficCounters>,
+        msize_mismatch_warned: Arc<AtomicBool>,
     ) -> ClientResult<(Arc<Conn>, u32)> {
         let mut probes = FuturesUnordered::new();
         for target in targets {
             let target = target.clone();
             let notify = Arc::clone(&reconnect_notify);
             let counters = Arc::clone(&counters);
+            let warned = Arc::clone(&msize_mismatch_warned);
             probes.push(async move {
-                Self::connect_once(&target, requested_msize, required_msize, notify, counters).await
+                Self::connect_once(
+                    &target,
+                    requested_msize,
+                    required_msize,
+                    notify,
+                    counters,
+                    warned,
+                )
+                .await
             });
         }
 
@@ -849,6 +883,7 @@ impl NinePClient {
             Some(msize),
             Arc::clone(&self.reconnect_notify),
             Arc::clone(&self.counters),
+            Arc::clone(&self.msize_mismatch_warned),
         )
         .await?;
 
@@ -890,24 +925,27 @@ impl NinePClient {
     }
 
     /// Rebuilds recorded fids and locks on `conn`. Roots precede descendants.
-    /// Missing unopened fids are dropped; missing observed state is terminal.
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
         let snapshot = self.state.lock().unwrap().clone();
         let mut gone_unopened = Vec::new();
+        let mut stale_opened = Vec::new();
 
         let (roots, descendants): (Vec<_>, Vec<_>) = snapshot
             .fids
             .iter()
             .partition(|(_, rec)| rec.inode_id == rec.root_inode);
         for (&fid, rec) in roots.into_iter().chain(descendants) {
+            let has_lock = snapshot.locks.iter().any(|lock| lock.fid == fid);
             let restored = self.replay_fid(conn, fid, rec).await?;
             if !restored {
-                if rec.opened.is_some() || snapshot.locks.iter().any(|lock| lock.fid == fid) {
-                    return Err(
-                        self.replay_state_lost("fid with observed state could not be rebound")
-                    );
+                if has_lock {
+                    return Err(self.replay_state_lost("fid with a held lock could not be rebound"));
                 }
-                gone_unopened.push(fid);
+                if rec.opened.is_some() {
+                    stale_opened.push(fid);
+                } else {
+                    gone_unopened.push(fid);
+                }
                 continue;
             }
             if let Some(flags) = rec.opened {
@@ -919,22 +957,19 @@ impl NinePClient {
                         );
                     }
                     Err(ClientError::Errno(errno)) if Self::replay_state_lost_errno(errno) => {
-                        return Err(self.replay_state_lost("opened fid could not be reopened"));
+                        if has_lock {
+                            return Err(self.replay_state_lost("locked fid could not be reopened"));
+                        }
+                        match Self::send_raw_rpc(conn, Message::Tclunk(Tclunk { fid })).await {
+                            Ok(Message::Rclunk(_)) => {}
+                            Ok(_) => return Err(ClientError::Unexpected("replay clunk")),
+                            Err(error) => return Err(error),
+                        }
+                        stale_opened.push(fid);
                     }
                     Err(e) => return Err(e),
                 }
             }
-        }
-
-        // Remove missing unopened fids within the replay transition.
-        if !gone_unopened.is_empty() {
-            let mut state = self.state.lock().unwrap();
-            for fid in &gone_unopened {
-                state.fids.remove(fid);
-            }
-            state
-                .locks
-                .retain(|lock| !gone_unopened.contains(&lock.fid));
         }
 
         let mut conflict_backoff = RECONNECT_BACKOFF_MIN;
@@ -985,6 +1020,19 @@ impl NinePClient {
                         Self::rollback_replayed_locks(conn, &acquired).await;
                         return Err(e);
                     }
+                }
+            }
+            if !gone_unopened.is_empty() || !stale_opened.is_empty() {
+                let mut state = self.state.lock().unwrap();
+                for fid in gone_unopened.iter().chain(&stale_opened) {
+                    state.fids.remove(fid);
+                }
+                state.locks.retain(|lock| {
+                    !gone_unopened.contains(&lock.fid) && !stale_opened.contains(&lock.fid)
+                });
+                drop(state);
+                for fid in &stale_opened {
+                    self.stale_fids.insert(*fid);
                 }
             }
             return Ok(());
@@ -1062,7 +1110,25 @@ impl NinePClient {
         matches!(errno, linux::ENOENT | linux::ESTALE)
     }
 
-    /// The negotiated message size.
+    fn validate_request_fids(&self, body: &Message) -> ClientResult<()> {
+        if request_fids(body)
+            .into_iter()
+            .flatten()
+            .any(|fid| self.stale_fids.contains(&fid))
+        {
+            return Err(ClientError::Errno(linux::ESTALE));
+        }
+        Ok(())
+    }
+
+    fn validate_fids(&self, fids: &[u32]) -> ClientResult<()> {
+        if fids.iter().any(|fid| self.stale_fids.contains(fid)) {
+            return Err(ClientError::Errno(linux::ESTALE));
+        }
+        Ok(())
+    }
+
+    /// The message size negotiated for the logical session.
     pub fn msize(&self) -> u32 {
         self.msize
     }
@@ -1140,6 +1206,7 @@ impl NinePClient {
     /// Return a fid to the free list. The caller must have clunked it already.
     pub fn free_fid(&self, fid: u32) {
         self.forget_unsynced(fid);
+        self.stale_fids.remove(&fid);
         self.fid_free.lock().unwrap().push(fid);
     }
 
@@ -1226,8 +1293,10 @@ impl NinePClient {
         stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
     ) -> ClientResult<(Message, Arc<Conn>)> {
         'resend: loop {
+            self.validate_request_fids(&body)?;
             await_resend_bounded(attempt, self.wait_until_live()).await??;
             let conn = self.conn.load_full();
+            self.validate_request_fids(&body)?;
 
             // Reserve capacity before registering a response tag.
             let permit = match await_resend_bounded(attempt, conn.writer_tx.reserve()).await? {
@@ -1294,8 +1363,6 @@ impl NinePClient {
                     }
                     Ok(())
                 })?;
-            let attempt_was_retry = op_flags & P9_OP_FLAG_RETRY != 0;
-
             // Preserve the in-flight request while bounded liveness checks succeed.
             let mut extra_windows = 0u32;
             let frame = loop {
@@ -1325,9 +1392,7 @@ impl NinePClient {
                 && matches!(e.ecode, P9_ENOTLEADER | P9_ENOTLEADER_CLEAN)
             {
                 if e.ecode == P9_ENOTLEADER_CLEAN {
-                    if !attempt_was_retry {
-                        attempt.proven_predispatch(op_flags);
-                    }
+                    attempt.proven_predispatch(op_flags);
                     if let Some(dispatched_conn) = stateful_dispatched_conn {
                         dispatched_conn.lock().unwrap().take();
                     }
@@ -1702,19 +1767,48 @@ impl NinePClient {
     }
 
     pub async fn clunk(&self, fid: u32) -> ClientResult<()> {
-        let (resp, _transition) = self
+        if self.stale_fids.contains(&fid) && self.clear_stale_fid(fid).await {
+            return Ok(());
+        }
+        let (resp, _transition) = match self
             .send_stateful_request(Message::Tclunk(Tclunk { fid }))
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(&error, ClientError::Errno(errno) if *errno == linux::ESTALE)
+                    && self.clear_stale_fid(fid).await
+                {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         // Remove local state before releasing the replay transition.
         let mut st = self.state.lock().unwrap();
         st.fids.remove(&fid);
         st.locks.retain(|l| l.fid != fid);
         drop(st);
+        self.stale_fids.remove(&fid);
         match resp {
             Message::Rclunk(_) => Ok(()),
             Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
             _ => Err(ClientError::Unexpected("clunk")),
         }
+    }
+
+    async fn clear_stale_fid(&self, fid: u32) -> bool {
+        let _transition = self.session_transition.lock().await;
+        if self.terminal_errno.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        if self.stale_fids.remove(&fid).is_none() {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.fids.remove(&fid);
+        state.locks.retain(|lock| lock.fid != fid);
+        true
     }
 
     pub async fn getattr(&self, fid: u32, mask: u64) -> ClientResult<Stat> {
@@ -1948,21 +2042,20 @@ impl NinePClient {
         if size == 0 {
             return Ok(Bytes::new());
         }
-        let max = self.max_io().max(1);
-        let first = self.read_once(fid, offset, size.min(max)).await?;
-        if size <= max || (first.len() as u32) < size.min(max) {
+        let size = size as usize;
+        let max = self.max_io().max(1) as usize;
+        let first_count = size.min(max);
+        let first = self.read_once(fid, offset, first_count as u32).await?;
+        if size <= max || first.len() < first_count {
             return Ok(first);
         }
-        // Bound the initial allocation independently of caller-supplied `size`.
-        let mut out = BytesMut::with_capacity(size.min(max.saturating_mul(2)) as usize);
+        let mut out = BytesMut::with_capacity(size.min(max.saturating_mul(2)));
         let mut off = offset + first.len() as u64;
         out.extend_from_slice(&first);
-        while (out.len() as u32) < size {
-            // Reconnect may reduce `msize`; refresh the chunk cap per request.
-            let max = self.max_io().max(1);
-            let want = (size - out.len() as u32).min(max);
-            let data = self.read_once(fid, off, want).await?;
-            let got = data.len() as u32;
+        while out.len() < size {
+            let want = (size - out.len()).min(max);
+            let data = self.read_once(fid, off, want as u32).await?;
+            let got = data.len();
             out.extend_from_slice(&data);
             off += got as u64;
             if got < want {
@@ -1977,7 +2070,8 @@ impl NinePClient {
             .rpc(Message::Tread(Tread { fid, offset, count }))
             .await?;
         match resp {
-            Message::Rread(r) => Ok(r.data.0),
+            Message::Rread(r) if r.data.len() <= count as usize => Ok(r.data.0),
+            Message::Rread(_) => Err(ClientError::Unexpected("read count")),
             _ => Err(ClientError::Unexpected("read")),
         }
     }
@@ -2017,7 +2111,8 @@ impl NinePClient {
             }))
             .await?;
         match resp {
-            Message::Rwrite(r) => Ok((r.count, attempted as u32)),
+            Message::Rwrite(r) if r.count <= attempted as u32 => Ok((r.count, attempted as u32)),
+            Message::Rwrite(_) => Err(ClientError::Unexpected("write count")),
             _ => Err(ClientError::Unexpected("write")),
         }
     }
@@ -2255,6 +2350,7 @@ impl NinePClient {
     /// Verifies fsync for all fids associated with one inode. `primary` carries
     /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
     pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
+        self.validate_fids(fids)?;
         // Generations prevent the result from clearing writes concurrent with fsync.
         let mut token: Option<u64> = None;
         let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
@@ -2401,6 +2497,43 @@ impl Drop for NinePClient {
         // Reader and writer tasks retain `Arc<Conn>` until explicit shutdown.
         self.conn.load().shutdown();
         self.reconnect_notify.notify_waiters();
+    }
+}
+
+fn request_fids(body: &Message) -> [Option<u32>; 2] {
+    match body {
+        Message::Tattach(m) => [Some(m.fid), (m.afid != NOFID).then_some(m.afid)],
+        Message::Twalk(m) => [Some(m.fid), Some(m.newfid)],
+        Message::Tlopen(m) => [Some(m.fid), None],
+        Message::Tlcreate(m) => [Some(m.fid), None],
+        Message::Tread(m) => [Some(m.fid), None],
+        Message::Twrite(m) => [Some(m.fid), None],
+        Message::Tclunk(m) => [Some(m.fid), None],
+        Message::Treaddir(m) => [Some(m.fid), None],
+        Message::Tgetattr(m) => [Some(m.fid), None],
+        Message::Tsetattr(m) | Message::Tsetattrattr(m) => [Some(m.fid), None],
+        Message::Tfallocate(m) => [Some(m.fid), None],
+        Message::Tmkdir(m) | Message::Tmkdirattr(m) => [Some(m.dfid), None],
+        Message::Tsymlink(m) | Message::Tsymlinkattr(m) => [Some(m.dfid), None],
+        Message::Tmknod(m) | Message::Tmknodattr(m) => [Some(m.dfid), None],
+        Message::Treadlink(m) => [Some(m.fid), None],
+        Message::Tlink(m) | Message::Tlinkattr(m) => [Some(m.dfid), Some(m.fid)],
+        Message::Trename(m) => [Some(m.fid), Some(m.dfid)],
+        Message::Trenameat(m) => [Some(m.olddirfid), Some(m.newdirfid)],
+        Message::Tunlinkat(m) => [Some(m.dirfid), None],
+        Message::Tfsync(m) => [Some(m.fid), None],
+        Message::Tfsyncdur(m) => [Some(m.fid), None],
+        Message::Tlock(m) => [Some(m.fid), None],
+        Message::Tgetlock(m) => [Some(m.fid), None],
+        Message::Txattrwalk(m) => [Some(m.fid), Some(m.newfid)],
+        Message::Tstatfs(m) => [Some(m.fid), None],
+        Message::Tlopenat(m) => [Some(m.fid), Some(m.newfid)],
+        Message::Tlopenatread(m) => [Some(m.fid), Some(m.newfid)],
+        Message::Tlcreateattr(m) => [Some(m.dfid), Some(m.newfid)],
+        Message::Trebind(m) => [Some(m.fid), None],
+        Message::Twalkgetattr(m) => [Some(m.fid), Some(m.newfid)],
+        Message::Treaddirattr(m) => [Some(m.fid), None],
+        _ => [None, None],
     }
 }
 
@@ -2602,6 +2735,7 @@ mod target_dial_tests {
             Some(8192),
             Arc::new(Notify::new()),
             Arc::new(TrafficCounters::default()),
+            Arc::new(AtomicBool::new(false)),
         )
         .await;
         assert!(matches!(result, Err(ClientError::Unexpected("version"))));
@@ -2934,9 +3068,11 @@ mod session_transition_tests {
             live_notify: Notify::new(),
             reconnect_notify: Arc::new(Notify::new()),
             msize: 8192,
+            msize_mismatch_warned: Arc::new(AtomicBool::new(false)),
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
+            stale_fids: DashSet::new(),
             session_transition: tokio::sync::Mutex::new(()),
             unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
@@ -3285,8 +3421,8 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn missing_opened_fid_is_a_terminal_replay_error() {
-        let (conn, requests) = test_conn_with_receiver();
+    async fn missing_opened_fid_is_quarantined_without_terminating_the_session() {
+        let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
         client
             .state
@@ -3295,12 +3431,167 @@ mod session_transition_tests {
             .fids
             .insert(7, inode_fid(70, 0, 0, Some(0)));
 
+        let responder_conn = Arc::clone(&conn);
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut requests, "opened fid rebind").await;
+            assert!(matches!(
+                request.body,
+                Message::Trebind(Trebind {
+                    fid: 7,
+                    inode_id: 70,
+                    flags: OPEN_REPLAY,
+                    ..
+                })
+            ));
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rlerror(Rlerror {
+                    ecode: linux::ESTALE,
+                }),
+            );
+
+            let request = recv_request(&mut requests, "unrelated read").await;
+            assert!(matches!(
+                request.body,
+                Message::Tread(Tread {
+                    fid: 8,
+                    count: 1,
+                    ..
+                })
+            ));
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rread(Rread {
+                    count: 1,
+                    data: DekuBytes::from(vec![b'x']),
+                }),
+            );
+        });
+
+        client.replay(&conn).await.unwrap();
+        assert!(!client.state.lock().unwrap().fids.contains_key(&7));
+        assert!(client.stale_fids.contains(&7));
+        assert_eq!(client.terminal_errno.load(Ordering::Acquire), 0);
         assert!(matches!(
-            replay_rebind_error(&client, &conn, requests, (7, 70, 0, OPEN_REPLAY), linux::ESTALE)
-                .await,
+            client.read(7, 0, 1).await,
             Err(ClientError::Errno(errno)) if errno == linux::ESTALE
         ));
-        assert_eq!(client.terminal_errno.load(Ordering::Acquire), linux::ESTALE);
+        assert_eq!(client.read(8, 0, 1).await.unwrap(), vec![b'x']);
+        tokio::time::timeout(Duration::from_secs(1), client.clunk(7))
+            .await
+            .expect("stale clunk must not reach the server")
+            .unwrap();
+        assert!(!client.stale_fids.contains(&7));
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn freeing_a_fid_clears_its_stale_tombstone() {
+        let client = test_client(test_conn());
+        client.stale_fids.insert(7);
+        client.free_fid(7);
+        assert!(!client.stale_fids.contains(&7));
+    }
+
+    #[test]
+    fn stale_tombstones_cover_source_destination_and_clunk_fids() {
+        let client = test_client(test_conn());
+        client.stale_fids.insert(7);
+
+        for request in [
+            Message::Tlink(Tlink {
+                dfid: 8,
+                fid: 7,
+                name: P9String::new(b"link".to_vec()),
+            }),
+            Message::Twalk(Twalk {
+                fid: 8,
+                newfid: 7,
+                nwname: 0,
+                wnames: Vec::new(),
+            }),
+            Message::Tclunk(Tclunk { fid: 7 }),
+        ] {
+            assert!(matches!(
+                client.validate_request_fids(&request),
+                Err(ClientError::Errno(errno)) if errno == linux::ESTALE
+            ));
+        }
+        assert!(
+            client
+                .validate_request_fids(&Message::Tread(Tread {
+                    fid: 8,
+                    offset: 0,
+                    count: 1,
+                }))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn clunk_does_not_mask_a_terminal_session_estale() {
+        let client = test_client(test_conn());
+        client.stale_fids.insert(7);
+        client.fail_session(linux::ESTALE);
+
+        assert!(matches!(
+            client.clunk(7).await,
+            Err(ClientError::Errno(errno)) if errno == linux::ESTALE
+        ));
+        assert!(client.stale_fids.contains(&7));
+    }
+
+    #[tokio::test]
+    async fn failed_reopen_clunks_the_provisional_rebind() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(7, inode_fid(70, 0, 0, Some(0)));
+
+        let responder_conn = Arc::clone(&conn);
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut requests, "opened fid rebind").await;
+            assert!(matches!(
+                request.body,
+                Message::Trebind(Trebind { fid: 7, .. })
+            ));
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rrebind(Rrebind { qid: qid(70) }),
+            );
+
+            let request = recv_request(&mut requests, "fid reopen").await;
+            assert!(matches!(
+                request.body,
+                Message::Tlopen(Tlopen { fid: 7, .. })
+            ));
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rlerror(Rlerror {
+                    ecode: linux::ESTALE,
+                }),
+            );
+
+            let request = recv_request(&mut requests, "provisional fid clunk").await;
+            assert!(matches!(request.body, Message::Tclunk(Tclunk { fid: 7 })));
+            reply(&responder_conn, request.tag, Message::Rclunk(Rclunk));
+        });
+
+        client.replay(&conn).await.unwrap();
+        responder.await.unwrap();
+        let state = client.state.lock().unwrap();
+        assert!(!state.fids.contains_key(&7));
+        drop(state);
+        assert!(client.stale_fids.contains(&7));
+        assert_eq!(client.terminal_errno.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -3492,6 +3783,33 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
+    async fn refused_lock_replay_terminates_the_session() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client.state.lock().unwrap().locks.push(write_lock(7, 0, 0));
+
+        let responder_conn = Arc::clone(&conn);
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut requests, "lock replay").await;
+            assert!(matches!(request.body, Message::Tlock(_)));
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rlock(Rlock {
+                    status: LockStatus::LockError,
+                }),
+            );
+        });
+
+        assert!(matches!(
+            client.replay(&conn).await,
+            Err(ClientError::Errno(errno)) if errno == linux::ESTALE
+        ));
+        responder.await.unwrap();
+        assert_eq!(client.terminal_errno.load(Ordering::Acquire), linux::ESTALE);
+    }
+
+    #[tokio::test]
     async fn lock_replay_retries_through_old_session_teardown() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
@@ -3618,13 +3936,15 @@ mod session_transition_tests {
     }
 
     #[test]
-    fn clean_rejection_of_first_frame_preserves_first_attempt() {
+    fn clean_rejection_of_first_frame_restarts_the_retry_horizon() {
         let mut attempt = OpAttemptState::default();
         let (first_flags, first_origin) = attempt
             .dispatch_frame(true, 7, |_, origin| Ok(origin))
             .unwrap();
         assert_eq!((first_flags, first_origin), (0, 7));
+        assert!(attempt.started.is_some());
         attempt.proven_predispatch(first_flags);
+        assert!(attempt.started.is_none());
         let (next_flags, next_origin) = attempt
             .dispatch_frame(true, 8, |_, origin| Ok(origin))
             .unwrap();
@@ -3647,7 +3967,9 @@ mod session_transition_tests {
             .dispatch_frame(true, 8, |_, origin| Ok(origin))
             .unwrap();
         assert_eq!((retry_flags, retry_origin), (P9_OP_FLAG_RETRY, 7));
+        assert!(attempt.started.is_some());
         attempt.proven_predispatch(retry_flags);
+        assert!(attempt.started.is_some());
         let (next_flags, next_origin) = attempt
             .dispatch_frame(true, 9, |_, origin| Ok(origin))
             .unwrap();
@@ -3745,6 +4067,50 @@ mod session_transition_tests {
         reply(&conn, sent.tag, Message::Rwrite(Rwrite { count: expected }));
 
         assert_eq!(request.await.unwrap().unwrap(), (expected, expected));
+    }
+
+    #[tokio::test]
+    async fn read_once_rejects_a_payload_larger_than_requested() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move { request_client.read_once(7, 0, 1).await });
+        let sent = recv_request(&mut requests, "read request").await;
+        assert!(matches!(sent.body, Message::Tread(Tread { count: 1, .. })));
+        reply(
+            &conn,
+            sent.tag,
+            Message::Rread(Rread {
+                count: 2,
+                data: DekuBytes::from(vec![b'x', b'y']),
+            }),
+        );
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(ClientError::Unexpected("read count"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_once_rejects_a_count_larger_than_attempted() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move { request_client.write_once(7, 0, b"x").await });
+        let sent = recv_op_request(&mut requests, "write request").await;
+        assert!(matches!(
+            sent.body,
+            Message::Twrite(Twrite { count: 1, .. })
+        ));
+        reply(&conn, sent.tag, Message::Rwrite(Rwrite { count: 2 }));
+
+        assert!(matches!(
+            request.await.unwrap(),
+            Err(ClientError::Unexpected("write count"))
+        ));
     }
 
     #[tokio::test]

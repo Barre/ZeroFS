@@ -44,15 +44,22 @@
 //! **Close and drop.** `close()` marks the handle closed and is idempotent and
 //! non-blocking. Dropping the handle schedules its fid for release and recycling.
 //!
-//! **Cancellation.** Dropping a future releases its client-side fids. A
-//! dispatched mutation may still complete, leaving an ambiguous outcome.
-//! Callers supply per-operation timeouts when this ambiguity is acceptable.
+//! **Cancellation.** Dropping a Rust operation future releases any temporary
+//! fids it owns. If the future is dropped while a fid-state request is dispatched
+//! and unsettled, the connection that carried the request is retired. If it is
+//! still current, the session reconnects and replays before other operations
+//! resume. A dispatched mutation may still complete, leaving an ambiguous
+//! outcome. Callers supply per-operation timeouts when this ambiguity is
+//! acceptable. `zerofs-ffi` timeouts abandon a timed-out wait without cancelling
+//! the Rust future.
 //!
 //! **Connection loss.** The session reconnects with backoff and restores state
 //! before accepting requests. In-flight mutations retain their op-id across
 //! resends. The retry horizon bounds automatic resends; expiry returns an
-//! ambiguous connection failure. Open-unlinked handles are connection-local and
-//! produce `ESTALE` after connection loss.
+//! ambiguous connection failure. An open-unlinked handle cannot be replayed and
+//! returns `ESTALE` after connection loss; other handles remain usable. The
+//! negotiated `msize` is fixed for the logical session; every reconnect target
+//! must accept that value.
 
 #![warn(missing_docs)]
 

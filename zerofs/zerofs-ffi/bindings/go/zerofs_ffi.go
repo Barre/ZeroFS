@@ -1226,7 +1226,7 @@ type ClientInterface interface {
 	Append(path string, data []byte) (uint64, error)
 	// Resolve every symlink in `path` and return the canonical path bytes.
 	Canonicalize(path string) ([]byte, error)
-	// Snapshot of currently negotiated session properties.
+	// Negotiated session properties, fixed for this logical session.
 	Capabilities() Capabilities
 	// Change permission bits.
 	Chmod(path string, mode uint32) (Metadata, error)
@@ -1426,7 +1426,7 @@ func (_self *Client) Canonicalize(path string) ([]byte, error) {
 	return res, err
 }
 
-// Snapshot of currently negotiated session properties.
+// Negotiated session properties, fixed for this logical session.
 func (_self *Client) Capabilities() Capabilities {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -2463,6 +2463,7 @@ type DirInterface interface {
 	// mkdirat(2) with explicit mode; returns the new directory's metadata.
 	CreateDirAt(name []byte, mode uint32) (Metadata, error)
 	// linkat(2): hard-link `original_dir`/`original_name` as `self`/`new_name`.
+	// Both directories must belong to the same client.
 	LinkAt(originalDir *Dir, originalName []byte, newName []byte) (Metadata, error)
 	// Metadata for the directory itself.
 	Metadata() (Metadata, error)
@@ -2483,7 +2484,8 @@ type DirInterface interface {
 	RemoveDirAt(name []byte) error
 	// unlinkat(2).
 	RemoveFileAt(name []byte) error
-	// renameat(2) across two open directories (`new_dir` may be `self`).
+	// renameat(2) across two open directories (`new_dir` may be `self`). Both
+	// directories must belong to the same client.
 	RenameAt(oldName []byte, newDir *Dir, newName []byte) error
 	// Restart iteration from the first entry.
 	Rewind() error
@@ -2564,6 +2566,7 @@ func (_self *Dir) CreateDirAt(name []byte, mode uint32) (Metadata, error) {
 }
 
 // linkat(2): hard-link `original_dir`/`original_name` as `self`/`new_name`.
+// Both directories must belong to the same client.
 func (_self *Dir) LinkAt(originalDir *Dir, originalName []byte, newName []byte) (Metadata, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Dir")
 	defer _self.ffiObject.decrementPointer()
@@ -2912,7 +2915,8 @@ func (_self *Dir) RemoveFileAt(name []byte) error {
 	return err
 }
 
-// renameat(2) across two open directories (`new_dir` may be `self`).
+// renameat(2) across two open directories (`new_dir` may be `self`). Both
+// directories must belong to the same client.
 func (_self *Dir) RenameAt(oldName []byte, newDir *Dir, newName []byte) error {
 	_pointer := _self.ffiObject.incrementPointer("*Dir")
 	defer _self.ffiObject.decrementPointer()
@@ -3482,7 +3486,7 @@ func (_ FfiDestroyerFile) Destroy(value *File) {
 	value.Destroy()
 }
 
-// Live snapshot of negotiated session properties (may change across reconnects).
+// Negotiated session properties, fixed for the logical session lifetime.
 type Capabilities struct {
 	// Negotiated 9P message size in bytes.
 	Msize uint32
