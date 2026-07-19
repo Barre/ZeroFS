@@ -132,7 +132,7 @@ impl OpAttemptState {
 /// server state that is absent from [`SessionState`].
 struct StatefulCancellationGuard<'a> {
     client: &'a NinePClient,
-    frame_enqueued: &'a AtomicBool,
+    dispatched_conn: &'a Mutex<Option<Arc<Conn>>>,
     armed: bool,
 }
 
@@ -144,8 +144,11 @@ impl StatefulCancellationGuard<'_> {
 
 impl Drop for StatefulCancellationGuard<'_> {
     fn drop(&mut self) {
-        if self.armed && self.frame_enqueued.load(Ordering::Acquire) {
-            let conn = self.client.conn.load_full();
+        let conn = self
+            .armed
+            .then(|| self.dispatched_conn.lock().unwrap().take())
+            .flatten();
+        if let Some(conn) = conn {
             self.client.force_reprobe(&conn);
         }
     }
@@ -542,7 +545,6 @@ struct SessionState {
 pub struct NinePClient {
     /// Targets probed by the reconnect supervisor.
     targets: Vec<Target>,
-    requested_msize: u32,
     /// Current transport, swapped atomically by the reconnect supervisor.
     conn: ArcSwap<Conn>,
     /// False while a reconnect+replay is in progress; requests block until true.
@@ -551,7 +553,9 @@ pub struct NinePClient {
     terminal_errno: AtomicU32,
     live_notify: Notify,
     reconnect_notify: Arc<Notify>,
-    msize: AtomicU32,
+    /// Negotiated once for the logical session. Reconnects must match it so an
+    /// ambiguous mutation can be resent byte-for-byte.
+    msize: u32,
     fid_ctr: AtomicU32,
     fid_free: Mutex<Vec<u32>>,
     /// Recorded fids (by inode id) and held locks, replayed on reconnect.
@@ -647,6 +651,7 @@ impl NinePClient {
         let (conn, msize) = Self::probe(
             &targets,
             requested_msize,
+            None,
             Arc::clone(&reconnect_notify),
             Arc::clone(&counters),
         )
@@ -654,13 +659,12 @@ impl NinePClient {
 
         let client = Arc::new(Self {
             targets,
-            requested_msize,
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify,
-            msize: AtomicU32::new(msize),
+            msize,
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
@@ -676,6 +680,7 @@ impl NinePClient {
     async fn connect_once(
         target: &Target,
         requested_msize: u32,
+        required_msize: Option<u32>,
         reconnect_notify: Arc<Notify>,
         counters: Arc<TrafficCounters>,
     ) -> ClientResult<(Arc<Conn>, u32)> {
@@ -714,7 +719,18 @@ impl NinePClient {
         }
 
         match runtime::timeout(PROBE_TIMEOUT, negotiate_on(&conn, requested_msize)).await {
-            Ok(Ok(msize)) => Ok((conn, msize)),
+            Ok(Ok(msize)) => {
+                if let Some(required) = required_msize
+                    && msize != required
+                {
+                    debug!(
+                        "9P reconnect candidate negotiated msize {msize}; logical session requires {required}"
+                    );
+                    conn.shutdown();
+                    return Err(ClientError::Unexpected("version"));
+                }
+                Ok((conn, msize))
+            }
             // Healthy socket but the handshake failed/stalled; tear down so the fd is not leaked.
             Ok(Err(e)) => {
                 conn.shutdown();
@@ -731,6 +747,7 @@ impl NinePClient {
     async fn probe(
         targets: &[Target],
         requested_msize: u32,
+        required_msize: Option<u32>,
         reconnect_notify: Arc<Notify>,
         counters: Arc<TrafficCounters>,
     ) -> ClientResult<(Arc<Conn>, u32)> {
@@ -740,7 +757,7 @@ impl NinePClient {
             let notify = Arc::clone(&reconnect_notify);
             let counters = Arc::clone(&counters);
             probes.push(async move {
-                Self::connect_once(&target, requested_msize, notify, counters).await
+                Self::connect_once(&target, requested_msize, required_msize, notify, counters).await
             });
         }
 
@@ -825,9 +842,11 @@ impl NinePClient {
 
     /// Dials, replays, and installs one replacement connection.
     async fn reconnect_once(&self) -> ClientResult<()> {
+        let msize = self.msize();
         let (conn, msize) = Self::probe(
             &self.targets,
-            self.requested_msize,
+            msize,
+            Some(msize),
             Arc::clone(&self.reconnect_notify),
             Arc::clone(&self.counters),
         )
@@ -835,7 +854,7 @@ impl NinePClient {
 
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
-        self.msize.store(msize, Ordering::Relaxed);
+        debug_assert_eq!(msize, self.msize);
         match runtime::timeout(REPLAY_TIMEOUT, self.replay(&conn)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -858,7 +877,7 @@ impl NinePClient {
     /// Resets a failed candidate before close. The ordered `Tversion` reply
     /// confirms release of replay-created server state.
     async fn discard_replay_candidate(&self, conn: &Conn) {
-        match runtime::timeout(PROBE_TIMEOUT, version_on(conn, self.requested_msize)).await {
+        match runtime::timeout(PROBE_TIMEOUT, version_on(conn, self.msize)).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 debug!("9P replay candidate reset failed ({error}); closing connection");
@@ -1045,7 +1064,7 @@ impl NinePClient {
 
     /// The negotiated message size.
     pub fn msize(&self) -> u32 {
-        self.msize.load(Ordering::Relaxed)
+        self.msize
     }
 
     /// Whether requests currently have a live connection rather than waiting
@@ -1204,7 +1223,7 @@ impl NinePClient {
         op_id: [u8; 16],
         body: Message,
         attempt: &mut OpAttemptState,
-        stateful_frame_enqueued: Option<&AtomicBool>,
+        stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
     ) -> ClientResult<(Message, Arc<Conn>)> {
         'resend: loop {
             await_resend_bounded(attempt, self.wait_until_live()).await??;
@@ -1270,8 +1289,8 @@ impl NinePClient {
                     // Registration-to-enqueue has no cancellation point.
                     pending.mark_dispatched();
                     permit.send(bytes);
-                    if let Some(frame_enqueued) = stateful_frame_enqueued {
-                        frame_enqueued.store(true, Ordering::Release);
+                    if let Some(dispatched_conn) = stateful_dispatched_conn {
+                        *dispatched_conn.lock().unwrap() = Some(Arc::clone(&conn));
                     }
                     Ok(())
                 })?;
@@ -1305,11 +1324,12 @@ impl NinePClient {
             if let Message::Rlerror(ref e) = msg.body
                 && matches!(e.ecode, P9_ENOTLEADER | P9_ENOTLEADER_CLEAN)
             {
-                // CLEAN proves pre-dispatch rejection only for the original FIRST.
-                if e.ecode == P9_ENOTLEADER_CLEAN && !attempt_was_retry {
-                    attempt.proven_predispatch(op_flags);
-                    if let Some(frame_enqueued) = stateful_frame_enqueued {
-                        frame_enqueued.store(false, Ordering::Release);
+                if e.ecode == P9_ENOTLEADER_CLEAN {
+                    if !attempt_was_retry {
+                        attempt.proven_predispatch(op_flags);
+                    }
+                    if let Some(dispatched_conn) = stateful_dispatched_conn {
+                        dispatched_conn.lock().unwrap().take();
                     }
                 }
                 self.force_reprobe(&conn);
@@ -1369,15 +1389,15 @@ impl NinePClient {
             [0u8; 16]
         };
         let mut attempt = OpAttemptState::default();
-        let frame_enqueued = AtomicBool::new(false);
+        let dispatched_conn = Mutex::new(None);
         let mut cancellation = StatefulCancellationGuard {
             client: self,
-            frame_enqueued: &frame_enqueued,
+            dispatched_conn: &dispatched_conn,
             armed: true,
         };
         let result = loop {
             let (response, response_conn) = match self
-                .send_request_on_current(op_id, body.clone(), &mut attempt, Some(&frame_enqueued))
+                .send_request_on_current(op_id, body.clone(), &mut attempt, Some(&dispatched_conn))
                 .await
             {
                 Ok(response) => response,
@@ -1967,37 +1987,37 @@ impl NinePClient {
     pub async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> ClientResult<u64> {
         let mut written = 0usize;
         while written < data.len() {
-            // Reconnect may reduce `msize`; refresh the chunk cap per request.
-            let max = self.max_write_payload().max(1) as usize;
-            let end = (written + max).min(data.len());
-            let chunk = &data[written..end];
-            let n = self.write_once(fid, offset + written as u64, chunk).await?;
-            if n == 0 {
-                break;
-            }
+            let (n, attempted) = self
+                .write_once(fid, offset + written as u64, &data[written..])
+                .await?;
             written += n as usize;
-            if (n as usize) < chunk.len() {
+            if n < attempted {
                 break;
             }
         }
         Ok(written as u64)
     }
 
-    async fn write_once(&self, fid: u32, offset: u64, data: &[u8]) -> ClientResult<u32> {
-        // Each chunk owns one op-id across resends; the outer loop is not replayed.
-        if data.len() > self.max_write_payload() as usize {
-            return Err(ClientError::Errno(linux::EINVAL));
-        }
+    async fn write_once(
+        &self,
+        fid: u32,
+        offset: u64,
+        remaining: &[u8],
+    ) -> ClientResult<(u32, u32)> {
+        let attempted = remaining
+            .len()
+            .min(self.max_write_payload().max(1) as usize);
+        let data = &remaining[..attempted];
         let resp = self
             .rpc(Message::Twrite(Twrite {
                 fid,
                 offset,
-                count: data.len() as u32,
+                count: attempted as u32,
                 data: DekuBytes::from(data.to_vec()),
             }))
             .await?;
         match resp {
-            Message::Rwrite(r) => Ok(r.count),
+            Message::Rwrite(r) => Ok((r.count, attempted as u32)),
             _ => Err(ClientError::Unexpected("write")),
         }
     }
@@ -2490,7 +2510,29 @@ fn configure_tcp(stream: TcpStream) -> ClientResult<DialedTransport> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod target_dial_tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    async fn recv_message(stream: &mut TcpStream) -> P9Message {
+        let mut size = [0u8; P9_SIZE_FIELD_LEN];
+        stream.read_exact(&mut size).await.unwrap();
+        let frame_len = u32::from_le_bytes(size) as usize;
+        let mut frame = Vec::with_capacity(frame_len);
+        frame.extend_from_slice(&size);
+        frame.resize(frame_len, 0);
+        stream
+            .read_exact(&mut frame[P9_SIZE_FIELD_LEN..])
+            .await
+            .unwrap();
+        P9Message::from_bytes((&frame, 0)).unwrap().1
+    }
+
+    async fn send_message(stream: &mut TcpStream, tag: u16, body: Message) {
+        stream
+            .write_all(&P9Message::new(tag, body).to_bytes().unwrap())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn hostname_lookup_failure_is_isolated_from_healthy_target_dials() {
@@ -2521,6 +2563,49 @@ mod target_dial_tests {
         assert_eq!(successes, 1);
         assert_eq!(failures, 1);
         accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_rejects_a_smaller_negotiated_msize() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let version = recv_message(&mut stream).await;
+            assert!(matches!(version.body, Message::Tversion(_)));
+            send_message(
+                &mut stream,
+                version.tag,
+                Message::Rversion(Rversion {
+                    msize: 4096,
+                    version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
+                }),
+            )
+            .await;
+
+            let lineage = recv_message(&mut stream).await;
+            assert!(matches!(lineage.body, Message::Tgetlineage(_)));
+            send_message(
+                &mut stream,
+                lineage.tag,
+                Message::Rgetlineage(Rgetlineage {
+                    token: 1,
+                    writer_epoch: 1,
+                }),
+            )
+            .await;
+        });
+
+        let result = NinePClient::connect_once(
+            &Target::Tcp(addr),
+            8192,
+            Some(8192),
+            Arc::new(Notify::new()),
+            Arc::new(TrafficCounters::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ClientError::Unexpected("version"))));
+        server.await.unwrap();
     }
 }
 
@@ -2843,13 +2928,12 @@ mod session_transition_tests {
     fn test_client(conn: Arc<Conn>) -> Arc<NinePClient> {
         Arc::new(NinePClient {
             targets: Vec::new(),
-            requested_msize: 8192,
             conn: ArcSwap::new(conn),
             live: AtomicBool::new(true),
             terminal_errno: AtomicU32::new(0),
             live_notify: Notify::new(),
             reconnect_notify: Arc::new(Notify::new()),
-            msize: AtomicU32::new(8192),
+            msize: 8192,
             fid_ctr: AtomicU32::new(1),
             fid_free: Mutex::new(Vec::new()),
             state: Mutex::new(SessionState::default()),
@@ -3643,6 +3727,27 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
+    async fn write_once_chunks_remaining_data_at_pinned_msize() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        let expected = client.max_write_payload();
+        let remaining = vec![b'x'; expected as usize + 1];
+
+        let request_client = Arc::clone(&client);
+        let request =
+            tokio::spawn(async move { request_client.write_once(7, 0, &remaining).await });
+        let sent = recv_op_request(&mut requests, "write request").await;
+        let Message::Twrite(write) = sent.body else {
+            panic!("expected Twrite");
+        };
+        assert_eq!(write.count, expected);
+        assert_eq!(write.data.len(), expected as usize);
+        reply(&conn, sent.tag, Message::Rwrite(Rwrite { count: expected }));
+
+        assert_eq!(request.await.unwrap().unwrap(), (expected, expected));
+    }
+
+    #[tokio::test]
     async fn ambiguous_reply_loss_marks_the_next_frame_as_retry() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
@@ -3710,6 +3815,40 @@ mod session_transition_tests {
         );
         assert_eq!(client.state.lock().unwrap().fids[&7].inode_id, 1);
         old_conn.connection_lost(&client.reconnect_notify);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stateful_request_does_not_retire_an_unseen_successor() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&old_conn));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(7, inode_fid(1, 1, 0, None));
+
+        let request_client = Arc::clone(&client);
+        let request = tokio::spawn(async move {
+            request_client
+                .lcreate(7, b"child", linux::O_CREAT, 0o644, 0)
+                .await
+        });
+        let sent = recv_op_request(&mut old_requests, "create request").await;
+        assert!(matches!(sent.body, Message::Tlcreate(_)));
+
+        client.live.store(false, Ordering::Release);
+        old_conn.connection_lost(&client.reconnect_notify);
+        let (successor, _successor_requests) = test_conn_with_receiver();
+        client.conn.store(Arc::clone(&successor));
+
+        request.abort();
+        let _ = request.await;
+        assert!(old_conn.dead.load(Ordering::Acquire));
+        assert!(
+            !successor.dead.load(Ordering::Acquire),
+            "cancellation must not retire a connection that did not receive the request"
+        );
     }
 
     #[tokio::test]

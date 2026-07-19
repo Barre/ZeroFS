@@ -3,7 +3,6 @@
 pub(crate) const EIO: i32 = 5;
 pub(crate) const EAGAIN: u32 = 11;
 pub(crate) const ENOENT: u32 = 2;
-pub(crate) const EINVAL: u32 = 22;
 pub(crate) const ESTALE: u32 = 116;
 pub(crate) const O_CREAT: u32 = 0o100;
 pub(crate) const O_EXCL: u32 = 0o200;
