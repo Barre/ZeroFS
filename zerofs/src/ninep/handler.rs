@@ -1742,6 +1742,14 @@ impl NinePHandler {
             return Err(P9Error::InvalidArgument);
         }
 
+        if self
+            .filesystem
+            .replay_dedup_result(&op_id, crate::dedup::DedupResult::into_rename)?
+            .is_some()
+        {
+            return Ok(Message::Rrename(Rrename));
+        }
+
         let source_name = source_fid.path.last().unwrap();
         let source_parent_path = source_fid.path[..source_fid.path.len() - 1].to_vec();
         let dest_parent_id = dest_fid.inode_id;
@@ -1799,9 +1807,11 @@ impl NinePHandler {
         let parent_id = dir_fid.inode_id;
         let creds = dir_fid.creds;
 
-        // Own dedup check: unlike the create ops, this resolves the child before
-        // the fs's own check, and the lookup below would ENOENT on an applied retry.
-        if crate::dedup::has_op_id(&op_id) && self.filesystem.dedup.get(&op_id).is_some() {
+        if self
+            .filesystem
+            .replay_dedup_result(&op_id, crate::dedup::DedupResult::into_remove)?
+            .is_some()
+        {
             return Ok(Message::Runlinkat(Runlinkat));
         }
 
@@ -2530,6 +2540,88 @@ mod tests {
             fs.lookup(&test_creds(), 0, b"must-stay-absent").await,
             Err(FsError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn trename_retry_replays_after_source_parent_is_removed() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (source_parent, _) = fs
+            .mkdir(&creds, 0, b"source-parent", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.create(&creds, source_parent, b"source", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"source-parent", b"source"]).await;
+
+        let op_id = [0x65; 16];
+        let rename = Message::Trename(Trename {
+            fid: 2,
+            dfid: 1,
+            name: P9String::new(b"destination".to_vec()),
+        });
+        let first = handler
+            .handle_message_with_op_id(3, op_id, rename.clone())
+            .await;
+        assert!(matches!(first.body, Message::Rrename(_)));
+
+        fs.remove(&AuthContext::from(&creds), 0, b"source-parent")
+            .await
+            .unwrap();
+
+        let retry = handler
+            .handle_message_with_op_envelope(4, op_id, ninep_proto::P9_OP_FLAG_RETRY, rename)
+            .await;
+        assert!(matches!(retry.body, Message::Rrename(_)));
+        assert!(matches!(
+            fs.lookup(&creds, 0, b"source-parent").await,
+            Err(FsError::NotFound)
+        ));
+        assert!(fs.lookup(&creds, 0, b"destination").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn tunlinkat_retry_rejects_mismatched_result_type() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let op_id = [0x66; 16];
+        let mkdir = handler
+            .handle_message_with_op_id(
+                2,
+                op_id,
+                Message::Tmkdir(Tmkdir {
+                    dfid: 1,
+                    name: P9String::new(b"kept".to_vec()),
+                    mode: 0o755,
+                    gid: 1000,
+                }),
+            )
+            .await;
+        assert!(matches!(mkdir.body, Message::Rmkdir(_)));
+
+        let unlink = handler
+            .handle_message_with_op_envelope(
+                3,
+                op_id,
+                ninep_proto::P9_OP_FLAG_RETRY,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"kept".to_vec()),
+                    flags: AT_REMOVEDIR,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            unlink.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+        assert!(fs.lookup(&test_creds(), 0, b"kept").await.is_ok());
     }
 
     #[tokio::test]

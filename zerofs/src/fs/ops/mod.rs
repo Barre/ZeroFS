@@ -17,7 +17,7 @@ mod setattr;
 impl ZeroFS {
     /// Decode a cached result as the operation's expected variant.
     /// An incompatible operation ID reuse returns an error.
-    fn replay_dedup_result<T>(
+    pub(crate) fn replay_dedup_result<T>(
         &self,
         op_id: &OpId,
         extract: fn(DedupResult) -> Option<T>,
