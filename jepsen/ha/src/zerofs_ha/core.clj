@@ -450,6 +450,30 @@
           [total free] (->> (str/split (str/trim out) #"\s+") (mapv bigint))]
       (long (- (u64 total) (u64 free))))))
 
+(def inode-accounting-timeout-ms 300000)
+
+(defn await-inode-accounting!
+  "Poll statfs after namespace mutations stop until its inode excess is gone.
+  The expected count preserves the offset measured by the baseline read. Completed
+  create results pin their inodes for 150 seconds, and unlink defers reclamation
+  while a pin remains. The remaining timeout covers expiry processing and serial
+  orphan reclamation. An undercount returns immediately for the statfs checker to
+  report."
+  [dir {:keys [used-inodes all-inodes]}]
+  (let [expected-used (+ used-inodes (- (count-all-inodes dir) all-inodes))]
+    (await-fn
+     (fn []
+       (let [used (statfs-used-inodes dir)]
+         (if (<= used expected-used)
+           used
+           (throw+ {:type ::inode-reclamation-pending
+                    :used-inodes used
+                    :expected-used-inodes expected-used}))))
+     {:retry-interval 1000
+      :log-interval 10000
+      :timeout inode-accounting-timeout-ms
+      :log-message "Waiting for inode reclamation"})))
+
 (defn corrupt-files
   "Integer-named files whose content isn't \"<name>\\n\", e.g. two names that
   ended up sharing an inode after an inode-id allocator regression. Returns names."
@@ -476,11 +500,11 @@
       {:type :info :error :not-durable-here}
       :else {:type :info :error msg})))
 
-;; `counter` assigns globally-unique add values; `live` maps each worker (process)
-;; to the values it has added and not yet removed, so a remove only ever targets a
-;; value this same worker added, so no concurrent add/remove of one value. Both are
-;; shared (open! returns `this`) across workers.
-(defrecord SetClient [dir fsync? counter live]
+;; `counter` assigns globally-unique add values. `live` maps each worker to values
+;; it added and has not removed, preventing concurrent add/remove of one value.
+;; `inode-baseline` is the first read's statfs and census pair. All three are shared
+;; because open! returns this record for every worker.
+(defrecord SetClient [dir fsync? counter live inode-baseline]
   client/Client
   (open! [this _test _node] this)
   (setup! [_ _test]
@@ -500,12 +524,20 @@
       ;; :all-inodes = the real inode census (for the statfs check, robust to a leftover
       ;; temp); :non-integer = those temps/sentinel by name (diagnostic); :corrupt =
       ;; files whose content != name.
-      (try (assoc op :type :ok
-                  :value (read-set dir)
-                  :used-inodes (statfs-used-inodes dir)
-                  :all-inodes (count-all-inodes dir)
-                  :non-integer (non-integer-files dir)
-                  :corrupt (corrupt-files dir))
+      (try (let [used-inodes (statfs-used-inodes dir)
+                 all-inodes  (count-all-inodes dir)
+                 value       (read-set dir)
+                 non-integer (non-integer-files dir)
+                 corrupt     (corrupt-files dir)]
+             (compare-and-set! inode-baseline nil
+                               {:used-inodes used-inodes
+                                :all-inodes all-inodes})
+             (assoc op :type :ok
+                    :value value
+                    :used-inodes used-inodes
+                    :all-inodes all-inodes
+                    :non-integer non-integer
+                    :corrupt corrupt))
            (catch java.io.IOException e
              (assoc op :type :fail :error (.getMessage e))))
       (case (:f op)
@@ -569,11 +601,20 @@
                  (try (fsync-sentinel! dir) (assoc op :type :ok)
                       (catch java.io.IOException e
                         (assoc op :type :fail :error (str (.getMessage e))))))
-        ;; Drop leftover temps (interrupted renames) before the final read/statfs.
-        :cleanup (util/timeout 30000 (assoc op :type :info :error :timeout)
-                   (try (cleanup-temps! dir) (assoc op :type :ok)
-                        (catch java.io.IOException e
-                          (assoc op :type :fail :error (.getMessage e))))))))
+        ;; Remove interrupted-rename temps, then wait for replay-protected orphans.
+        :cleanup (util/timeout (+ inode-accounting-timeout-ms 30000)
+                   (assoc op :type :info :error :timeout)
+                   (try
+                     (cleanup-temps! dir)
+                     (if-let [baseline @inode-baseline]
+                       (try+
+                         (await-inode-accounting! dir baseline)
+                         (assoc op :type :ok)
+                         (catch [:type :timeout] _
+                           (assoc op :type :info :error :inode-accounting-timeout)))
+                       (assoc op :type :fail :error :missing-inode-baseline))
+                     (catch java.io.IOException e
+                       (assoc op :type :fail :error (.getMessage e))))))))
   (teardown! [_ _test])
   (close! [_ _test]))
 
@@ -1438,7 +1479,7 @@
           :client    (if durability?
                        (->DurabilityClient (str (:work-dir opts) "/mnt/dc") (atom {}) (atom 0))
                        (->SetClient (str (:work-dir opts) "/mnt") (:fsync opts)
-                                    (atom -1) (atom {})))
+                                    (atom -1) (atom {}) (atom nil)))
           :nemesis   (ha-nemesis)
           :checker   (if durability?
                        (checker/compose

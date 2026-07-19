@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
             [jepsen.util :as util]
+            [slingshot.slingshot :refer [try+]]
             [zerofs-ha.core :as core])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels ServerSocketChannel]
@@ -158,3 +159,37 @@
                          (java.io.IOException. "Bad file descriptor")))))
     (is (= :info (:type (core/classify-add-error
                          (java.io.IOException. "Input/output error")))))))
+
+(deftest inode-accounting-waits-for-replay-protected-orphans
+  (let [samples (atom [20 19])
+        options (atom nil)]
+    (with-redefs [core/count-all-inodes (constantly 20)
+                  core/statfs-used-inodes
+                  (fn [_]
+                    (let [sample (first @samples)]
+                      (swap! samples rest)
+                      sample))
+                  util/await-fn
+                  (fn [f opts]
+                    (reset! options opts)
+                    (try+
+                      (f)
+                      (catch [:type ::core/inode-reclamation-pending] pending
+                        (is (= 20 (:used-inodes pending)))
+                        (is (= 19 (:expected-used-inodes pending)))
+                        (f))))]
+      (is (= 19 (core/await-inode-accounting!
+                 "/mnt" {:used-inodes 17 :all-inodes 18})))
+      (is (empty? @samples))
+      (is (= core/inode-accounting-timeout-ms (:timeout @options)))
+      (is (> (:timeout @options) 150000)))))
+
+(deftest statfs-checker-retains-the-orphan-leak-check
+  (let [history [{:type :ok :f :read :value #{}
+                  :used-inodes 17 :all-inodes 18}
+                 {:type :ok :f :read :value #{1 2}
+                  :used-inodes 20 :all-inodes 20}]
+        result (checker/check (core/statfs-checker) {} history {})]
+    (is (false? (:valid? result)))
+    (is (= 3 (:inodes-grew result)))
+    (is (= 2 (:census-grew result)))))
