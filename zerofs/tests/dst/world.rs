@@ -3,7 +3,7 @@
 
 use crate::actor::{ActorContext, FloorSlot, Floors};
 use crate::checks::Checks;
-use crate::consistency::{verify_consistency_sparse, verify_consistency_sparse_online};
+use crate::consistency::verify_consistency_sparse;
 use crate::data::{FileOp, FileOpMix, FileSnapshot, FileState, Region, pattern};
 use crate::digest::Digest;
 #[cfg(feature = "failpoints")]
@@ -14,6 +14,7 @@ use crate::sim::{SimClock, SimStore};
 use crate::{FILES, Scale, auth, creds, env_or, scale_for};
 use bytes::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
 use rand::rngs::StdRng;
@@ -27,6 +28,31 @@ use zerofs::db::SlateDbHandle;
 use zerofs::fs::inode::InodeId;
 use zerofs::fs::types::{SetAttributes, SetSize};
 use zerofs::fs::{EXTENT_SIZE, ZeroFS};
+
+const ORPHAN_DRAIN_GRACE: Duration = Duration::from_secs(30);
+const ORPHAN_DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn wait_for_orphan_set_to_drain(fs: &ZeroFS) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(
+        zerofs::dedup::OP_ID_RETENTION.saturating_add(ORPHAN_DRAIN_GRACE),
+        async {
+            let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
+            if orphans.next().await.is_none() {
+                return;
+            }
+
+            tokio::time::sleep(zerofs::dedup::OP_ID_RETENTION).await;
+            loop {
+                let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
+                if orphans.next().await.is_none() {
+                    return;
+                }
+                tokio::time::sleep(ORPHAN_DRAIN_POLL_INTERVAL).await;
+            }
+        },
+    )
+    .await
+}
 
 struct WorldConfig {
     seed: u64,
@@ -628,7 +654,13 @@ impl WorldHarness {
             .verify()
             .await;
 
-        let report = verify_consistency_sparse_online(fs)
+        wait_for_orphan_set_to_drain(fs).await.unwrap_or_else(|_| {
+            panic!(
+                "orphan set did not drain at quiesce (seed {}, round {round})",
+                self.config.seed
+            )
+        });
+        let report = verify_consistency_sparse(fs)
             .await
             .expect("quiesced consistency scan");
         assert!(
@@ -857,4 +889,82 @@ pub(crate) fn run_seed_mode(seed: u64, failpoint_crashes: bool) -> (u64, Vec<Str
         let (harness, model) = WorldHarness::new(seed, failpoint_crashes).await;
         harness.run(model).await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn orphan_ids(fs: &ZeroFS) -> Vec<InodeId> {
+        let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
+        let mut ids = Vec::new();
+        while let Some(id) = orphans.next().await {
+            ids.push(id.expect("orphan-set entry"));
+        }
+        ids
+    }
+
+    #[test]
+    fn quiescent_orphan_wait_covers_retention_and_stalled_reclaim() {
+        let seed = 1u64;
+        zerofs::fs::DST_FIXED_TIME.store(true, Relaxed);
+        zerofs::db::DST_PANIC_ON_WRITE_ERROR.store(true, Relaxed);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()))
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let config = WorldConfig {
+                seed,
+                failpoint_crashes: false,
+                rounds: 0,
+                ops_per_file: 0,
+                gc_passes: 0,
+                crash_pct: 0,
+                fault_ppm: 0,
+                scale: scale_for(seed),
+                file_mix: FileOpMix::new(1, 1, 1, 1),
+            };
+            let digest = Digest::default();
+            let storage = Storage::new(&config, &digest).await;
+            let fs = storage.fs();
+            let creds = creds();
+            let auth = auth();
+
+            let replay_op_id = [1; 16];
+            let (replay_id, _) = fs
+                .create_idempotent(
+                    &creds,
+                    0,
+                    b"replay-pinned",
+                    &SetAttributes::default(),
+                    replay_op_id,
+                )
+                .await
+                .expect("create");
+            fs.remove(&auth, 0, b"replay-pinned").await.expect("remove");
+            assert_eq!(orphan_ids(fs).await, vec![replay_id]);
+            wait_for_orphan_set_to_drain(fs)
+                .await
+                .expect("replay-pinned orphan must drain after retention");
+            assert!(orphan_ids(fs).await.is_empty());
+
+            let (open_id, _) = fs
+                .create(&creds, 0, b"open-pinned", &SetAttributes::default())
+                .await
+                .expect("create");
+            let open_handle = {
+                let _guard = fs.lock_manager.acquire(open_id).await;
+                fs.new_open_handle(open_id)
+            };
+            fs.remove(&auth, 0, b"open-pinned").await.expect("remove");
+            assert!(wait_for_orphan_set_to_drain(fs).await.is_err());
+
+            drop(open_handle);
+            fs.reclaim_if_unreferenced(open_id).await;
+            assert!(orphan_ids(fs).await.is_empty());
+        });
+    }
 }

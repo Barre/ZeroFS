@@ -401,8 +401,6 @@ pub struct ConsistencyChecker<'a> {
     /// not apply. The invariant checked instead is that no extent key exists at
     /// or beyond EOF.
     sparse_files: bool,
-    /// Whether durable open-unlink entries must have been drained.
-    require_orphan_set_drained: bool,
 }
 
 impl<'a> ConsistencyChecker<'a> {
@@ -420,7 +418,6 @@ impl<'a> ConsistencyChecker<'a> {
             directory_inodes: BTreeSet::new(),
             orphan_inodes: BTreeSet::new(),
             sparse_files: false,
-            require_orphan_set_drained: true,
         }
     }
 
@@ -433,9 +430,7 @@ impl<'a> ConsistencyChecker<'a> {
         self.verify_nlink_counts().await?;
         self.verify_directory_nlinks().await?;
         self.find_orphaned_inodes()?;
-        if self.require_orphan_set_drained {
-            self.verify_orphan_set_drained();
-        }
+        self.verify_orphan_set_drained();
         self.verify_stats_counters().await?;
         self.verify_tombstones().await?;
         self.verify_file_extents().await?;
@@ -638,10 +633,7 @@ impl<'a> ConsistencyChecker<'a> {
         let mut calculated_inodes = 0u64;
 
         for &inode_id in &self.valid_inodes {
-            let referenced = self.inode_refs.contains_key(&inode_id);
-            let deferred =
-                !self.require_orphan_set_drained && self.orphan_inodes.contains(&inode_id);
-            if inode_id == ROOT_INODE_ID || (!referenced && !deferred) {
+            if inode_id == ROOT_INODE_ID || !self.inode_refs.contains_key(&inode_id) {
                 continue;
             }
             if let Ok(inode) = self.fs.inode_store.get(inode_id).await {
@@ -700,9 +692,6 @@ impl<'a> ConsistencyChecker<'a> {
 
     async fn verify_directory_nlinks(&mut self) -> Result<(), FsError> {
         for &inode_id in &self.valid_inodes.clone() {
-            if !self.require_orphan_set_drained && self.orphan_inodes.contains(&inode_id) {
-                continue;
-            }
             if let Ok(Inode::Directory(dir)) = self.fs.inode_store.get(inode_id).await {
                 let subdir_count = self.subdir_counts.get(&inode_id).copied().unwrap_or(0);
                 let expected_nlink = DIR_BASE_NLINK + subdir_count;
@@ -724,10 +713,7 @@ impl<'a> ConsistencyChecker<'a> {
 
     async fn verify_file_extents(&mut self) -> Result<(), FsError> {
         for &inode_id in &self.valid_inodes.clone() {
-            let referenced = self.inode_refs.contains_key(&inode_id);
-            let deferred =
-                !self.require_orphan_set_drained && self.orphan_inodes.contains(&inode_id);
-            if !referenced && !deferred {
+            if !self.inode_refs.contains_key(&inode_id) {
                 continue;
             }
             if let Ok(Inode::File(file)) = self.fs.inode_store.get(inode_id).await {
@@ -1096,15 +1082,6 @@ pub async fn verify_consistency(fs: &ZeroFS) -> Result<ConsistencyReport, FsErro
 pub async fn verify_consistency_sparse(fs: &ZeroFS) -> Result<ConsistencyReport, FsError> {
     let mut checker = ConsistencyChecker::new(fs);
     checker.sparse_files = true;
-    checker.verify_all().await
-}
-
-/// Sparse-file verification while open-unlink entries may still be pinned.
-#[cfg(dst)]
-pub async fn verify_consistency_sparse_online(fs: &ZeroFS) -> Result<ConsistencyReport, FsError> {
-    let mut checker = ConsistencyChecker::new(fs);
-    checker.sparse_files = true;
-    checker.require_orphan_set_drained = false;
     checker.verify_all().await
 }
 
