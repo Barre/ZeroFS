@@ -228,7 +228,7 @@ The storage backend must support exact conditional object updates, either native
 
 ### Forced recovery
 
-`force_recovery` bypasses normal stale-handoff observation. It is a break-glass assertion that every former participant is dead:
+`force_recovery` bypasses normal stale-handoff observation. It is a break-glass assertion that all former participants are dead and their object-store requests are quiesced. A replacement node cannot distinguish this condition from a network partition or a suspended process. The unreachable process may still hold the only copy of acknowledged writes in its in-memory tail or resume a writer-open request. Normal failover is automatic only when a surviving standby can prove complete coverage. Without that proof, takeover requires an operator who has fenced every former participant.
 
 ```toml
 [replication]
@@ -238,6 +238,8 @@ replication_listen = "10.0.0.1:9000"
 peers = []
 force_recovery = true
 ```
+
+Within the handoff state machine, the flag skips only the five-second unchanged-record observation for an abandoned `Claiming` or `Opening` owner. It does not skip the nine-second `Claiming` grace, writer-epoch fencing, tail reconciliation, or the exact `Opening`-to-`Active` transition.
 
 <Warning>
 Do not force recovery against a live or partitioned peer. It can discard an acknowledged tail held only by that process and fence its database writer. If the peer died during `Opening`, also ensure its object-store requests are quiesced. Remove `force_recovery` after the recovery startup succeeds.
