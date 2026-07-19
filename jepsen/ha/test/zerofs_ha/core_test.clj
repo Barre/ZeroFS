@@ -2,6 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
+            [jepsen.util :as util]
             [zerofs-ha.core :as core])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels ServerSocketChannel]
@@ -41,6 +42,46 @@
       (is (= 2 (core/standby-ready-count c :b)))
       (finally
         (.delete log)))))
+
+(deftest heal-restart-starts-the-standby-before-waiting-for-the-leader
+  (let [events        (atom [])
+        standby-ready (atom 4)]
+    (with-redefs [core/cluster-roles (atom {})
+                  core/minio-up? (constantly true)
+                  core/node-pid (fn [_ node-key] node-key)
+                  core/kill-pid! (fn [_])
+                  core/standby-ready-count
+                  (fn [_ node-key]
+                    (swap! events conj [:standby-count node-key @standby-ready])
+                    @standby-ready)
+                  core/start-node!
+                  (fn [_ node-key role]
+                    (swap! events conj [:start node-key role]))
+                  core/node-9p-up? (fn [_ _] true)
+                  core/mounted? (fn [_] true)
+                  util/await-fn
+                  (fn [ready? options]
+                    (let [message (:log-message options)]
+                      (swap! events conj [:await message])
+                      (case message
+                        "heal: waiting for leader" (is (true? (ready?)))
+                        "Waiting for standby b" (do
+                                                   (is (thrown? clojure.lang.ExceptionInfo
+                                                                (ready?)))
+                                                   (swap! standby-ready inc)
+                                                   (is (true? (ready?))))
+                        "heal: waiting for mount" (is (true? (ready?))))))]
+      (core/heal-restart! {})
+      (is (= [[:standby-count :b 4]
+              [:start :b "standby"]
+              [:start :a "leader"]
+              [:await "heal: waiting for leader"]
+              [:await "Waiting for standby b"]
+              [:standby-count :b 4]
+              [:standby-count :b 5]
+              [:await "heal: waiting for mount"]]
+             @events))
+      (is (= {:a :leader :b :standby} @core/cluster-roles)))))
 
 (deftest set-checker-flags-lost-and-resurrected
   (testing "catches a lost add (present per ops, missing from the final read) and a

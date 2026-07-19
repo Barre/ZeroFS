@@ -256,14 +256,17 @@
            count))
     (catch java.io.IOException _ 0)))
 
+(defn await-standby-ready! [c node-key base]
+  (await-fn
+   (fn [] (or (> (standby-ready-count c node-key) base)
+              (throw+ {:type ::standby-not-ready :node node-key})))
+   {:retry-interval 200 :log-interval 5000 :timeout 120000
+    :log-message (str "Waiting for standby " (name node-key))}))
+
 (defn start-standby! [c node-key]
   (let [base (standby-ready-count c node-key)]
     (start-node! c node-key "standby")
-    (await-fn
-     (fn [] (or (> (standby-ready-count c node-key) base)
-                (throw+ {:type ::standby-not-ready :node node-key})))
-     {:retry-interval 200 :log-interval 5000 :timeout 120000
-      :log-message (str "Waiting for standby " (name node-key))})))
+    (await-standby-ready! c node-key base)))
 
 (defn mounted? [c]
   (zero? (:exit (sh! :findmnt :-n (:mount c)))))
@@ -690,10 +693,14 @@
   (kill-pid! (node-pid c :a))
   (kill-pid! (node-pid c :b))
   (Thread/sleep 1000)
-  (start-node! c :a "leader")
-  (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
-            {:retry-interval 200 :log-interval 5000 :log-message "heal: waiting for leader"})
-  (start-standby! c :b)
+  (let [standby-base (standby-ready-count c :b)]
+    ;; Start both receivers before waiting; the recorded latest writer may block
+    ;; until its peer answers Hello.
+    (start-node! c :b "standby")
+    (start-node! c :a "leader")
+    (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
+              {:retry-interval 200 :log-interval 5000 :log-message "heal: waiting for leader"})
+    (await-standby-ready! c :b standby-base))
   (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
             {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
   (reset! cluster-roles {:a :leader :b :standby}))
