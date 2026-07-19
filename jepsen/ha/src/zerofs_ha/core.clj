@@ -21,7 +21,9 @@
                     [util :as util :refer [await-fn]]]
             [jepsen.os :as os]
             [slingshot.slingshot :refer [try+ throw+]])
-  (:import [java.util BitSet])
+  (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
+           [java.nio.channels SocketChannel]
+           [java.util BitSet])
   (:gen-class))
 
 ;; Local process + cluster management (no SSH).
@@ -237,7 +239,31 @@
      (daemon-start! (:pid n) (:log n) {} (:zerofs c) ["run" "-c" path]))))
 
 (defn node-9p-up? [c node-key]
-  (.exists (io/file (get-in c [:nodes node-key :ninep]))))
+  (try
+    (with-open [channel (SocketChannel/open StandardProtocolFamily/UNIX)]
+      (.connect channel
+                (UnixDomainSocketAddress/of
+                 (get-in c [:nodes node-key :ninep]))))
+    true
+    (catch Exception _ false)))
+
+(defn standby-ready-count [c node-key]
+  (try
+    (let [marker (str "HA standby " (name node-key)
+                      ": watching leader heartbeats")]
+      (->> (slurp (get-in c [:nodes node-key :log]))
+           (re-seq (re-pattern (java.util.regex.Pattern/quote marker)))
+           count))
+    (catch java.io.IOException _ 0)))
+
+(defn start-standby! [c node-key]
+  (let [base (standby-ready-count c node-key)]
+    (start-node! c node-key "standby")
+    (await-fn
+     (fn [] (or (> (standby-ready-count c node-key) base)
+                (throw+ {:type ::standby-not-ready :node node-key})))
+     {:retry-interval 200 :log-interval 5000 :timeout 120000
+      :log-message (str "Waiting for standby " (name node-key))})))
 
 (defn mounted? [c]
   (zero? (:exit (sh! :findmnt :-n (:mount c)))))
@@ -298,8 +324,7 @@
         (start-node! c :a "leader")
         (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
                   {:retry-interval 200 :log-interval 5000 :log-message "Waiting for leader 9P"})
-        (start-node! c :b "standby")
-        (Thread/sleep 4000)
+        (start-standby! c :b)
         (mount! c)
         (reset! cluster-roles {:a :leader :b :standby})
         (info "ZeroFS HA cluster ready")))
@@ -668,8 +693,7 @@
   (start-node! c :a "leader")
   (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
             {:retry-interval 200 :log-interval 5000 :log-message "heal: waiting for leader"})
-  (start-node! c :b "standby")
-  (Thread/sleep 4000)
+  (start-standby! c :b)
   (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
             {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
   (reset! cluster-roles {:a :leader :b :standby}))
@@ -682,8 +706,7 @@
   (let [dead (dead-node) ldr (leader-node)]
     (if (and dead ldr (not= dead ldr))
       (do (info "heal: rejoining" dead "as standby under leader" ldr)
-          (start-node! c dead "standby")
-          (Thread/sleep 4000)
+          (start-standby! c dead)
           (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
                     {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
           (swap! cluster-roles assoc dead :standby))
@@ -738,8 +761,7 @@
                                               (if (proc-alive? (node-pid c p))
                                                 "still up (should be refusing)" "self-fenced (exited)"))
                                         (kill-pid! (node-pid c p))   ; discard the fenced zombie
-                                        (start-node! c p "standby")
-                                        (Thread/sleep 4000)
+                                        (start-standby! c p)
                                         (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
                                                   {:retry-interval 500 :log-interval 5000
                                                    :log-message "resume: waiting for mount"})

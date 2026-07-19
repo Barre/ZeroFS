@@ -1,10 +1,46 @@
 (ns zerofs-ha.core-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
-            [zerofs-ha.core :as core]))
+            [zerofs-ha.core :as core])
+  (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
+           [java.nio.channels ServerSocketChannel]
+           [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
 
 (defn- check [history]
   (checker/check (core/set-checker) {} history {}))
+
+(deftest node-9p-up-requires-a-listener
+  (let [dir         (.toFile (Files/createTempDirectory
+                              "zerofs-ha-test"
+                              (make-array FileAttribute 0)))
+        socket      (io/file dir "ninep.sock")
+        socket-path (.getPath socket)
+        c           {:nodes {:a {:ninep socket-path}}}]
+    (try
+      (spit socket "")
+      (is (false? (core/node-9p-up? c :a)))
+      (is (.delete socket))
+      (with-open [server (ServerSocketChannel/open StandardProtocolFamily/UNIX)]
+        (.bind server (UnixDomainSocketAddress/of socket-path))
+        (is (true? (core/node-9p-up? c :a))))
+      (finally
+        (.delete socket)
+        (.delete dir)))))
+
+(deftest standby-ready-count-is-node-specific
+  (let [log (java.io.File/createTempFile "zerofs-ha-test" ".log")
+        c   {:nodes {:a {:log (.getPath log)}
+                     :b {:log (.getPath log)}}}]
+    (try
+      (spit log (str "HA standby a: watching leader heartbeats\n"
+                     "HA standby b: watching leader heartbeats\n"
+                     "HA standby b: watching leader heartbeats\n"))
+      (is (= 1 (core/standby-ready-count c :a)))
+      (is (= 2 (core/standby-ready-count c :b)))
+      (finally
+        (.delete log)))))
 
 (deftest set-checker-flags-lost-and-resurrected
   (testing "catches a lost add (present per ops, missing from the final read) and a
