@@ -28,14 +28,23 @@ export const metadata: Metadata = {
   },
   description: 'ZeroFS documentation - Learn how to mount S3 as a high-performance filesystem with NFS and NBD support, encryption, and caching.',
   icons: {
-    icon: '/images/favicons/browser.png',
-    apple: '/images/favicons/iPhone.png',
-    other: [
+    icon: [
       {
-        rel: 'icon',
+        url: '/docs/images/favicons/browser.png',
         type: 'image/png',
-        sizes: '192x192',
-        url: '/images/favicons/Android.png',
+        sizes: '32x32',
+      },
+      {
+        url: '/docs/images/favicons/Android.png',
+        type: 'image/png',
+        sizes: '196x196',
+      },
+    ],
+    apple: [
+      {
+        url: '/docs/images/favicons/iPhone.png',
+        type: 'image/png',
+        sizes: '180x180',
       },
     ],
   },
