@@ -218,6 +218,27 @@ fn validate_fallocate(offset: u64, length: u64, mode: i32) -> Result<u32, Errno>
         .ok_or(Errno::EOPNOTSUPP)
 }
 
+/// Placeholder attributes for a node-ID-zero negative lookup reply.
+fn negative_attr() -> FileAttr {
+    FileAttr {
+        ino: INodeNo(0),
+        size: 0,
+        blocks: 0,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 0,
+        flags: 0,
+    }
+}
+
 fn stat_to_attr(stat: &Stat) -> FileAttr {
     FileAttr {
         ino: INodeNo(ino_of(stat.qid.path)),
@@ -476,6 +497,10 @@ impl Filesystem for Fuse9P {
             };
             match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
                 Ok(attr) => reply.entry(&ttl, &attr, Generation(0)),
+                // Cache misses only in relaxed mode.
+                Err(e) if !ttl.is_zero() && e.to_errno() == libc::ENOENT => {
+                    reply.entry(&ttl, &negative_attr(), Generation(0));
+                }
                 Err(e) => reply.error(errno(&e)),
             }
         });
