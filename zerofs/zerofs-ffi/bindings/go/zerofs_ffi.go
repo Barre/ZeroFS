@@ -375,7 +375,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_zerofs_ffi_checksum_func_error_to_errno()
 		})
-		if checksum != 60097 {
+		if checksum != 27662 {
 			// If this happens try cleaning and rebuilding your project
 			panic("zerofs_ffi: uniffi_zerofs_ffi_checksum_func_error_to_errno: UniFFI API checksum mismatch")
 		}
@@ -402,7 +402,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_zerofs_ffi_checksum_method_client_capabilities()
 		})
-		if checksum != 27337 {
+		if checksum != 55680 {
 			// If this happens try cleaning and rebuilding your project
 			panic("zerofs_ffi: uniffi_zerofs_ffi_checksum_method_client_capabilities: UniFFI API checksum mismatch")
 		}
@@ -681,7 +681,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_zerofs_ffi_checksum_method_dir_link_at()
 		})
-		if checksum != 14961 {
+		if checksum != 62744 {
 			// If this happens try cleaning and rebuilding your project
 			panic("zerofs_ffi: uniffi_zerofs_ffi_checksum_method_dir_link_at: UniFFI API checksum mismatch")
 		}
@@ -771,7 +771,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_zerofs_ffi_checksum_method_dir_rename_at()
 		})
-		if checksum != 64253 {
+		if checksum != 24785 {
 			// If this happens try cleaning and rebuilding your project
 			panic("zerofs_ffi: uniffi_zerofs_ffi_checksum_method_dir_rename_at: UniFFI API checksum mismatch")
 		}
@@ -888,7 +888,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_zerofs_ffi_checksum_constructor_client_connect()
 		})
-		if checksum != 40788 {
+		if checksum != 23069 {
 			// If this happens try cleaning and rebuilding your project
 			panic("zerofs_ffi: uniffi_zerofs_ffi_checksum_constructor_client_connect: UniFFI API checksum mismatch")
 		}
@@ -1220,7 +1220,7 @@ func (ffiObject *FfiObject) freeRustArcPtr() {
 }
 
 // One concurrent ZeroFS session and identity. Open-unlinked handles produce
-// ESTALE after connection loss.
+// `ESTALE` after connection loss.
 type ClientInterface interface {
 	// Append `data` at end-of-file; returns the offset where it landed.
 	Append(path string, data []byte) (uint64, error)
@@ -1287,7 +1287,7 @@ type ClientInterface interface {
 }
 
 // One concurrent ZeroFS session and identity. Open-unlinked handles produce
-// ESTALE after connection loss.
+// `ESTALE` after connection loss.
 type Client struct {
 	ffiObject FfiObject
 }
@@ -4614,14 +4614,12 @@ func (self ZeroFsErrorConnectFailed) Is(target error) bool {
 	return target == ErrZeroFsErrorConnectFailed
 }
 
-// The node is no longer the HA leader (P9_ENOTLEADER); a re-route + retry is
-// safe, which a failover client does transparently.
+// The target is no longer the HA leader (`P9_ENOTLEADER`).
 type ZeroFsErrorNotLeader struct {
 	Path string
 }
 
-// The node is no longer the HA leader (P9_ENOTLEADER); a re-route + retry is
-// safe, which a failover client does transparently.
+// The target is no longer the HA leader (`P9_ENOTLEADER`).
 func NewZeroFsErrorNotLeader(
 	path string,
 ) *ZeroFsError {
@@ -4646,14 +4644,14 @@ func (self ZeroFsErrorNotLeader) Is(target error) bool {
 	return target == ErrZeroFsErrorNotLeader
 }
 
-// Stale handle (ESTALE). From sync methods, prior acknowledged writes may be
-// non-durable and require replacement. Replay loss requires a new client.
+// Stale handle (`ESTALE`). From sync methods, prior acknowledged writes may
+// be non-durable and require replacement. Replay loss requires a new client.
 type ZeroFsErrorStale struct {
 	Path string
 }
 
-// Stale handle (ESTALE). From sync methods, prior acknowledged writes may be
-// non-durable and require replacement. Replay loss requires a new client.
+// Stale handle (`ESTALE`). From sync methods, prior acknowledged writes may
+// be non-durable and require replacement. Replay loss requires a new client.
 func NewZeroFsErrorStale(
 	path string,
 ) *ZeroFsError {
@@ -5211,9 +5209,7 @@ func zerofs_ffi_uniffiFreeGorutine(data C.uint64_t) {
 	guard <- struct{}{}
 }
 
-// Linux errno for an error: the strict 1:1 variant↔errno mapping (the `Io`
-// variant returns its own `errno`). A free function rather than an enum method
-// so it crosses every binding (some generators forbid methods on enums).
+// Linux errno for an error. `Io` retains its server-provided errno.
 func ErrorToErrno(error *ZeroFsError) int32 {
 	return FfiConverterInt32INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int32_t {
 		return C.uniffi_zerofs_ffi_fn_func_error_to_errno(FfiConverterZeroFsErrorINSTANCE.Lower(error), _uniffiStatus)
