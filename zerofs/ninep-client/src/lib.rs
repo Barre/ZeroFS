@@ -1382,7 +1382,9 @@ impl NinePClient {
                 }
             };
 
-            let (_, msg) = P9Message::from_bytes((&frame, 0)).map_err(ClientError::Codec)?;
+            // Responses never carry the private mutation envelope. Retain the
+            // transport frame so bulk response payloads can borrow its storage.
+            let msg = P9Message::from_owned_bytes_ctx(frame, false).map_err(ClientError::Codec)?;
             if let Message::Rlerror(ref e) = msg.body
                 && matches!(e.ecode, P9_ENOTLEADER | P9_ENOTLEADER_CLEAN)
             {
@@ -1560,7 +1562,7 @@ impl NinePClient {
         pending.mark_dispatched();
         permit.send(bytes);
         let frame = orx.await.map_err(|_| ClientError::Disconnected)?;
-        let (_, msg) = P9Message::from_bytes((&frame, 0)).map_err(ClientError::Codec)?;
+        let msg = P9Message::from_owned_bytes_ctx(frame, false).map_err(ClientError::Codec)?;
         if msg.tag != tag {
             return Err(ClientError::Unexpected("response tag"));
         }
@@ -2073,12 +2075,41 @@ impl NinePClient {
     /// Write all of `data` at `offset`, splitting into multiple Twrite requests
     /// when it exceeds the negotiated msize. Returns the total bytes written.
     pub async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> ClientResult<u64> {
+        let len = data.len();
+        self.write_chunks(fid, offset, len, move |start, end| {
+            Bytes::copy_from_slice(&data[start..end])
+        })
+        .await
+    }
+
+    /// Like [`Self::write`], but takes ownership of an existing [`Bytes`] buffer.
+    /// Chunk selection uses shallow `Bytes` slices, adding no staging copy
+    /// before each request is serialized.
+    pub async fn write_bytes(&self, fid: u32, offset: u64, data: Bytes) -> ClientResult<u64> {
+        let len = data.len();
+        self.write_chunks(fid, offset, len, move |start, end| data.slice(start..end))
+            .await
+    }
+
+    async fn write_chunks<F>(
+        &self,
+        fid: u32,
+        offset: u64,
+        len: usize,
+        mut chunk: F,
+    ) -> ClientResult<u64>
+    where
+        F: FnMut(usize, usize) -> Bytes,
+    {
         let mut written = 0usize;
-        while written < data.len() {
-            let (n, attempted) = self
-                .write_once(fid, offset + written as u64, &data[written..])
-                .await?;
-            written += n as usize;
+        let max = self.max_write_payload().max(1) as usize;
+        while written < len {
+            let end = written + (len - written).min(max);
+            let data = chunk(written, end);
+            debug_assert_eq!(data.len(), end - written);
+            let attempted = data.len();
+            let n = self.write_chunk(fid, offset + written as u64, data).await? as usize;
+            written += n;
             if n < attempted {
                 break;
             }
@@ -2086,26 +2117,19 @@ impl NinePClient {
         Ok(written as u64)
     }
 
-    async fn write_once(
-        &self,
-        fid: u32,
-        offset: u64,
-        remaining: &[u8],
-    ) -> ClientResult<(u32, u32)> {
-        let attempted = remaining
-            .len()
-            .min(self.max_write_payload().max(1) as usize);
-        let data = &remaining[..attempted];
+    async fn write_chunk(&self, fid: u32, offset: u64, data: Bytes) -> ClientResult<u32> {
+        let attempted = u32::try_from(data.len())
+            .expect("write chunks are bounded by the negotiated u32 msize");
         let resp = self
             .rpc(Message::Twrite(Twrite {
                 fid,
                 offset,
-                count: attempted as u32,
-                data: DekuBytes::from(data.to_vec()),
+                count: attempted,
+                data: DekuBytes::from(data),
             }))
             .await?;
         match resp {
-            Message::Rwrite(r) if r.count <= attempted as u32 => Ok((r.count, attempted as u32)),
+            Message::Rwrite(r) if r.count <= attempted => Ok(r.count),
             Message::Rwrite(_) => Err(ClientError::Unexpected("write count")),
             _ => Err(ClientError::Unexpected("write")),
         }
@@ -3463,6 +3487,34 @@ mod session_transition_tests {
         responder.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn read_bytes_retains_the_response_frame_allocation() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        let request_client = Arc::clone(&client);
+        let read = tokio::spawn(async move { request_client.read_bytes(7, 0, 7).await });
+
+        let request = recv_request(&mut requests, "read request").await;
+        assert!(matches!(request.body, Message::Tread(_)));
+        let frame = Bytes::from(
+            P9Message::new(
+                request.tag,
+                Message::Rread(Rread {
+                    count: 7,
+                    data: DekuBytes::from(Bytes::from_static(b"payload")),
+                }),
+            )
+            .to_bytes()
+            .unwrap(),
+        );
+        let expected_payload_ptr = frame.as_ptr() as usize + P9_IOHDRSZ as usize;
+        conn.deliver(frame);
+
+        let payload = read.await.unwrap().unwrap();
+        assert_eq!(payload.as_ref(), b"payload");
+        assert_eq!(payload.as_ptr() as usize, expected_payload_ptr);
+    }
+
     #[test]
     fn freeing_a_fid_clears_its_stale_tombstone() {
         let client = test_client(test_conn());
@@ -4028,24 +4080,43 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn write_once_chunks_remaining_data_at_pinned_msize() {
+    async fn write_bytes_chunks_at_the_msize_boundary() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
-        let expected = client.max_write_payload();
-        let remaining = vec![b'x'; expected as usize + 1];
+        let max = client.max_write_payload();
+        assert_eq!(
+            max,
+            client.msize() - P9_TWRITE_HDR - P9_OP_ENVELOPE_LEN as u32
+        );
+        let offset = 37;
+        let mut payload = vec![b'x'; max as usize + 1];
+        payload[max as usize] = b'y';
+        let payload = Bytes::from(payload);
 
         let request_client = Arc::clone(&client);
         let request =
-            tokio::spawn(async move { request_client.write_once(7, 0, &remaining).await });
-        let sent = recv_op_request(&mut requests, "write request").await;
-        let Message::Twrite(write) = sent.body else {
+            tokio::spawn(async move { request_client.write_bytes(7, offset, payload).await });
+
+        let first = recv_op_request(&mut requests, "first write request").await;
+        let Message::Twrite(first_write) = first.body else {
             panic!("expected Twrite");
         };
-        assert_eq!(write.count, expected);
-        assert_eq!(write.data.len(), expected as usize);
-        reply(&conn, sent.tag, Message::Rwrite(Rwrite { count: expected }));
+        assert_eq!(first_write.offset, offset);
+        assert_eq!(first_write.count, max);
+        assert_eq!(first_write.data.len(), max as usize);
+        assert!(first_write.data.iter().all(|byte| *byte == b'x'));
+        reply(&conn, first.tag, Message::Rwrite(Rwrite { count: max }));
 
-        assert_eq!(request.await.unwrap().unwrap(), (expected, expected));
+        let second = recv_op_request(&mut requests, "second write request").await;
+        let Message::Twrite(second_write) = second.body else {
+            panic!("expected Twrite");
+        };
+        assert_eq!(second_write.offset, offset + u64::from(max));
+        assert_eq!(second_write.count, 1);
+        assert_eq!(second_write.data.as_ref(), b"y");
+        reply(&conn, second.tag, Message::Rwrite(Rwrite { count: 1 }));
+
+        assert_eq!(request.await.unwrap().unwrap(), u64::from(max) + 1);
     }
 
     #[tokio::test]
@@ -4073,12 +4144,16 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn write_once_rejects_a_count_larger_than_attempted() {
+    async fn write_chunk_rejects_a_count_larger_than_attempted() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
 
         let request_client = Arc::clone(&client);
-        let request = tokio::spawn(async move { request_client.write_once(7, 0, b"x").await });
+        let request = tokio::spawn(async move {
+            request_client
+                .write_chunk(7, 0, Bytes::from_static(b"x"))
+                .await
+        });
         let sent = recv_op_request(&mut requests, "write request").await;
         assert!(matches!(
             sent.body,
