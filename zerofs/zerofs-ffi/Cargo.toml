@@ -1,6 +1,6 @@
 [package]
 name = "zerofs-ffi"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Foreign-language bindings (Python/TypeScript) for the ZeroFS client"
@@ -19,7 +19,7 @@ name = "zerofs_ffi"
 [dependencies]
 # The FFI layer needs only the FFI-shaped core surface, not the Rust-only sugar
 # (tokio-io cursor, Stream, serde), so it opts out of the default features.
-zerofs-client = { path = "../zerofs-client", version = "=0.1.4", default-features = false }
+zerofs-client = { path = "../zerofs-client", version = "=0.2.0", default-features = false }
 uniffi = { version = "0.31", features = ["tokio", "cli"] }
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
 thiserror = "2"

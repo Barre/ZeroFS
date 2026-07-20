@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "ninep-client"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "ninep-proto"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "deku",
@@ -6175,7 +6175,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-client"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -6227,7 +6227,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-ffi"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
