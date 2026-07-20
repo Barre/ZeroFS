@@ -867,7 +867,7 @@ impl Filesystem for Fuse9P {
         }
         let client = Arc::clone(&self.client);
         self.rt.spawn(async move {
-            match client.read(fid, offset, size).await {
+            match client.read_bytes(fid, offset, size).await {
                 Ok(data) => reply.data(&data),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -889,9 +889,11 @@ impl Filesystem for Fuse9P {
     ) {
         let client = Arc::clone(&self.client);
         let fid = fh.0 as u32;
-        let data = data.to_vec();
+        // The FUSE buffer expires with this callback. Own it once so chunking
+        // and retries need no additional staging copy before serialization.
+        let data = Bytes::copy_from_slice(data);
         self.rt.spawn(async move {
-            match client.write(fid, offset, &data).await {
+            match client.write_bytes(fid, offset, data).await {
                 // A single FUSE write is bounded by the kernel's max write, so it fits u32.
                 Ok(n) => reply.written(n as u32),
                 Err(e) => reply.error(errno(&e)),

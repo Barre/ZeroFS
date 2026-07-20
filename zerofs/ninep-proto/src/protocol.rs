@@ -1,6 +1,10 @@
 use crate::deku_bytes::DekuBytes;
+use bytes::{Buf, Bytes};
 use deku::ctx::Endian;
 use deku::prelude::*;
+use deku::reader::Reader;
+use deku::writer::Writer;
+use std::io::Cursor;
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 /// ZeroFS private dialect identifier. `.Z` distinguishes this wire generation
@@ -877,6 +881,12 @@ pub const T_SETATTRATTR: u8 = 248;
 pub const T_FALLOCATE: u8 = 228;
 pub const R_FALLOCATE: u8 = 229;
 
+// Response IDs used by the owned counted-payload decoder.
+const R_READ: u8 = 117;
+const R_READDIR: u8 = 41;
+const R_LOPENATREAD: u8 = 231;
+const R_READDIRATTR: u8 = 255;
+
 // Main message enum
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(ctx = "_type: u8", id = "_type")]
@@ -903,7 +913,7 @@ pub enum Message {
     Rlcreate(Rlcreate),
     #[deku(id = "116")]
     Tread(Tread),
-    #[deku(id = "117")]
+    #[deku(id = "R_READ")]
     Rread(Rread),
     #[deku(id = "T_WRITE")]
     Twrite(Twrite),
@@ -915,7 +925,7 @@ pub enum Message {
     Rclunk(Rclunk),
     #[deku(id = "40")]
     Treaddir(Treaddir),
-    #[deku(id = "41")]
+    #[deku(id = "R_READDIR")]
     Rreaddir(Rreaddir),
     #[deku(id = "24")]
     Tgetattr(Tgetattr),
@@ -1001,7 +1011,7 @@ pub enum Message {
     Rlopenat(Rlopenat),
     #[deku(id = "230")]
     Tlopenatread(Tlopenatread),
-    #[deku(id = "231")]
+    #[deku(id = "R_LOPENATREAD")]
     Rlopenatread(Rlopenatread),
     #[deku(id = "T_LCREATEATTR")]
     Tlcreateattr(Tlcreateattr),
@@ -1038,7 +1048,7 @@ pub enum Message {
     Rwalkgetattr(Rwalkgetattr),
     #[deku(id = "254")]
     Treaddirattr(Treaddirattr),
-    #[deku(id = "255")]
+    #[deku(id = "R_READDIRATTR")]
     Rreaddirattr(Rreaddirattr),
 }
 
@@ -1248,31 +1258,44 @@ impl Message {
 }
 
 /// Byte offset of the `type` field within a 9P frame (after the u32 size).
-pub const P9_TYPE_OFFSET: usize = 4;
-/// Length of the standard 9P frame header: size(u32) + type(u8) + tag(u16).
-pub const P9_FRAME_HEADER_LEN: usize = 7;
+const P9_TYPE_OFFSET: usize = P9_SIZE_FIELD_LEN;
 /// Length of the idempotency op-id in the ZeroFS request envelope.
 pub const P9_OP_ID_LEN: usize = 16;
 /// Length of the attempt flags in the ZeroFS request envelope.
 pub const P9_OP_FLAGS_LEN: usize = 1;
 /// Length of the originating writer epoch in the ZeroFS request envelope.
 pub const P9_OP_ORIGIN_EPOCH_LEN: usize = 8;
-/// Total bytes spliced after the tag for a mutation in the ZeroFS dialect.
+/// Total bytes encoded after the tag for a mutation in the ZeroFS dialect.
 pub const P9_OP_ENVELOPE_LEN: usize = P9_OP_ID_LEN + P9_OP_FLAGS_LEN + P9_OP_ORIGIN_EPOCH_LEN;
 
-// Deku retains standard framing; private mutation envelopes are spliced after tag.
+// The context controls whether ZeroFS mutation envelopes are present after the
+// standard header. Standard 9P remains the default for Deku's container APIs.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
+#[deku(ctx = "op_id_enabled: bool", ctx_default = "false")]
 pub struct P9Message {
     #[deku(endian = "little")]
     pub size: u32,
     pub type_: u8,
     #[deku(endian = "little")]
     pub tag: u16,
-    #[deku(skip, default = "[0u8; 16]")]
+    #[deku(
+        skip,
+        cond = "!op_id_enabled || !P9Message::carries_op_id(*type_)",
+        default = "[0u8; 16]"
+    )]
     pub op_id: [u8; 16],
-    #[deku(skip, default = "0")]
+    #[deku(
+        skip,
+        cond = "!op_id_enabled || !P9Message::carries_op_id(*type_)",
+        default = "0"
+    )]
     pub op_flags: u8,
-    #[deku(skip, default = "0")]
+    #[deku(
+        endian = "little",
+        skip,
+        cond = "!op_id_enabled || !P9Message::carries_op_id(*type_)",
+        default = "0"
+    )]
     pub op_origin_epoch: u64,
     #[deku(ctx = "*type_")]
     pub body: Message,
@@ -1285,56 +1308,100 @@ impl P9Message {
 
     /// Encodes covered mutations with a private envelope after the tag.
     pub fn to_bytes_ctx(&self, op_id_enabled: bool) -> Result<Vec<u8>, DekuError> {
-        // Deku produces the standard frame; op fields are skipped.
-        let mut bytes = DekuContainerWrite::to_bytes(self)?;
-        if op_id_enabled && Self::carries_op_id(self.type_) {
-            bytes.splice(
-                P9_FRAME_HEADER_LEN..P9_FRAME_HEADER_LEN,
-                self.op_id
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(self.op_flags))
-                    .chain(self.op_origin_epoch.to_le_bytes()),
-            );
-        }
+        let mut bytes = Vec::new();
+        let mut cursor = Cursor::new(&mut bytes);
+        let mut writer = Writer::new(&mut cursor);
+        DekuWriter::to_writer(self, &mut writer, op_id_enabled)?;
+        writer.finalize()?;
         let size = bytes.len() as u32;
-        bytes[0..4].copy_from_slice(&size.to_le_bytes());
+        bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
         Ok(bytes)
     }
 
     /// Decodes a standard frame with an optional private mutation envelope.
     pub fn from_bytes_ctx(input: &[u8], op_id_enabled: bool) -> Result<P9Message, DekuError> {
-        if op_id_enabled
-            && input.len() > P9_FRAME_HEADER_LEN
-            && Self::carries_op_id(input[P9_TYPE_OFFSET])
-        {
-            if input.len() < P9_FRAME_HEADER_LEN + P9_OP_ENVELOPE_LEN {
+        let mut cursor = Cursor::new(input);
+        let mut reader = Reader::new(&mut cursor);
+        P9Message::from_reader_with_ctx(&mut reader, op_id_enabled)
+    }
+
+    fn counted_payload_offset(type_: u8, op_id_enabled: bool) -> Option<usize> {
+        match type_ {
+            R_READ | R_READDIR | R_READDIRATTR => Some(P9_IOHDRSZ as usize),
+            R_LOPENATREAD => Some(P9_RLOPENATREAD_HDR as usize),
+            T_WRITE => {
+                Some(P9_TWRITE_HDR as usize + if op_id_enabled { P9_OP_ENVELOPE_LEN } else { 0 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Decodes a frame, retaining its allocation for counted payloads.
+    ///
+    /// Only the fixed prefix is copied into a small stack buffer for canonical
+    /// Deku decoding. The trailing payload remains a [`Bytes`] view of the
+    /// transport frame.
+    pub fn from_owned_bytes_ctx(
+        mut input: Bytes,
+        op_id_enabled: bool,
+    ) -> Result<P9Message, DekuError> {
+        let Some(type_) = input.get(P9_TYPE_OFFSET).copied() else {
+            return Self::from_bytes_ctx(&input, op_id_enabled);
+        };
+        let Some(payload_offset) = Self::counted_payload_offset(type_, op_id_enabled) else {
+            return Self::from_bytes_ctx(&input, op_id_enabled);
+        };
+
+        if input.len() < payload_offset {
+            return Self::from_bytes_ctx(&input, op_id_enabled);
+        }
+        let size = u32::from_le_bytes(
+            input[..P9_SIZE_FIELD_LEN]
+                .try_into()
+                .expect("the counted-payload prefix contains the frame header"),
+        );
+        let count_offset = payload_offset - P9_COUNT_FIELD_LEN;
+        let count = u32::from_le_bytes(
+            input[count_offset..payload_offset]
+                .try_into()
+                .expect("the counted-payload prefix length was checked"),
+        );
+        let payload_end = payload_offset
+            .checked_add(count as usize)
+            .ok_or_else(|| DekuError::Parse("9P payload length overflow".into()))?;
+        if input.len() < payload_end {
+            return Err(DekuError::Parse(
+                "9P count exceeds the available payload".into(),
+            ));
+        }
+
+        const MAX_COUNTED_PREFIX: usize = P9_TWRITE_HDR as usize + P9_OP_ENVELOPE_LEN;
+        let mut prefix = [0u8; MAX_COUNTED_PREFIX];
+        prefix[..payload_offset].copy_from_slice(&input[..payload_offset]);
+        prefix[..P9_SIZE_FIELD_LEN].copy_from_slice(&(payload_offset as u32).to_le_bytes());
+        prefix[count_offset..payload_offset].fill(0);
+
+        let mut message = Self::from_bytes_ctx(&prefix[..payload_offset], op_id_enabled)?;
+        message.size = size;
+
+        input.truncate(payload_end);
+        input.advance(payload_offset);
+        let (decoded_count, decoded_data) = match &mut message.body {
+            Message::Rread(message) => (&mut message.count, &mut message.data),
+            Message::Rreaddir(message) => (&mut message.count, &mut message.data),
+            Message::Rlopenatread(message) => (&mut message.count, &mut message.data),
+            Message::Twrite(message) => (&mut message.count, &mut message.data),
+            Message::Rreaddirattr(message) => (&mut message.count, &mut message.data),
+            _ => {
                 return Err(DekuError::Parse(
-                    "frame too short to contain an op envelope".into(),
+                    "counted-payload frame decoded as the wrong message type".into(),
                 ));
             }
-            let mut op_id = [0u8; 16];
-            op_id.copy_from_slice(&input[P9_FRAME_HEADER_LEN..P9_FRAME_HEADER_LEN + P9_OP_ID_LEN]);
-            let op_flags = input[P9_FRAME_HEADER_LEN + P9_OP_ID_LEN];
-            let origin_start = P9_FRAME_HEADER_LEN + P9_OP_ID_LEN + P9_OP_FLAGS_LEN;
-            let op_origin_epoch = u64::from_le_bytes(
-                input[origin_start..origin_start + P9_OP_ORIGIN_EPOCH_LEN]
-                    .try_into()
-                    .expect("the envelope length was checked"),
-            );
-            // Deku parses the body from standard framing.
-            let mut standard = Vec::with_capacity(input.len() - P9_OP_ENVELOPE_LEN);
-            standard.extend_from_slice(&input[..P9_FRAME_HEADER_LEN]);
-            standard.extend_from_slice(&input[P9_FRAME_HEADER_LEN + P9_OP_ENVELOPE_LEN..]);
-            let (_, mut msg) = P9Message::from_bytes((&standard, 0))?;
-            msg.op_id = op_id;
-            msg.op_flags = op_flags;
-            msg.op_origin_epoch = op_origin_epoch;
-            Ok(msg)
-        } else {
-            let (_, msg) = P9Message::from_bytes((input, 0))?;
-            Ok(msg)
-        }
+        };
+        *decoded_count = count;
+        *decoded_data = DekuBytes::from(input);
+
+        Ok(message)
     }
 
     /// Whether this request type carries the private mutation envelope.
@@ -1391,6 +1458,62 @@ impl P9Message {
 mod tests {
     use super::*;
     use deku::DekuContainerWrite;
+
+    /// Reference implementation of the former two-step encoder. Keeping this
+    /// in tests makes the contextual encoder's wire compatibility explicit.
+    fn legacy_enveloped_bytes(message: &P9Message) -> Vec<u8> {
+        let mut bytes = DekuContainerWrite::to_bytes(message).unwrap();
+        bytes.splice(
+            P9_HEADER_SIZE..P9_HEADER_SIZE,
+            message
+                .op_id
+                .iter()
+                .copied()
+                .chain(std::iter::once(message.op_flags))
+                .chain(message.op_origin_epoch.to_le_bytes()),
+        );
+        let size = bytes.len() as u32;
+        bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    fn counted_payload(message: &P9Message) -> (u32, &Bytes) {
+        match &message.body {
+            Message::Rread(message) => (message.count, &message.data),
+            Message::Rreaddir(message) => (message.count, &message.data),
+            Message::Rlopenatread(message) => (message.count, &message.data),
+            Message::Twrite(message) => (message.count, &message.data),
+            Message::Rreaddirattr(message) => (message.count, &message.data),
+            _ => panic!("expected a counted-payload message"),
+        }
+    }
+
+    fn assert_owned_payload_aliases(
+        message: P9Message,
+        op_id_enabled: bool,
+        payload_offset: usize,
+        expected_payload: &[u8],
+    ) {
+        let frame = Bytes::from(message.to_bytes_ctx(op_id_enabled).unwrap());
+        let expected_ptr = frame.as_ptr().wrapping_add(payload_offset);
+        let expected_frame = frame.clone();
+        let decoded = P9Message::from_owned_bytes_ctx(frame, op_id_enabled).unwrap();
+        let (decoded_count, decoded_payload) = counted_payload(&decoded);
+
+        assert_eq!(decoded.size, expected_frame.len() as u32);
+        assert_eq!(decoded_count, expected_payload.len() as u32);
+        assert_eq!(decoded_payload.as_ref(), expected_payload);
+        assert_eq!(
+            decoded_payload.as_ptr(),
+            expected_ptr,
+            "the decoded payload must be a slice of the owned frame"
+        );
+        assert_eq!(
+            decoded.to_bytes_ctx(op_id_enabled).unwrap(),
+            expected_frame,
+            "owned decoding must preserve every scalar field"
+        );
+    }
 
     fn tmkdir() -> Message {
         Message::Tmkdir(Tmkdir {
@@ -1526,6 +1649,201 @@ mod tests {
         assert_eq!(decoded.op_origin_epoch, 42);
         assert_eq!(decoded.tag, 5);
         assert!(matches!(decoded.body, Message::Tmkdir(_)));
+    }
+
+    #[test]
+    fn contextual_envelope_is_byte_for_byte_compatible_with_legacy_splicing() {
+        let payload = (0u8..=255).cycle().take(257).collect::<Vec<_>>();
+        let message = P9Message::new_with_op_id_flags_and_origin(
+            0x1234,
+            std::array::from_fn(|index| index as u8),
+            P9_OP_FLAG_RETRY,
+            0x0807_0605_0403_0201,
+            Message::Twrite(Twrite {
+                fid: 0x1122_3344,
+                offset: 0x0102_0304_0506_0708,
+                count: payload.len() as u32,
+                data: payload.into(),
+            }),
+        );
+
+        assert_eq!(
+            message.to_bytes_ctx(true).unwrap(),
+            legacy_enveloped_bytes(&message)
+        );
+    }
+
+    #[test]
+    fn owned_rread_payload_aliases_the_input_frame() {
+        let payload = b"rread payload retained from its frame";
+        let message = P9Message::new(
+            7,
+            Message::Rread(Rread {
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+        );
+
+        assert_owned_payload_aliases(message, false, P9_IOHDRSZ as usize, payload);
+    }
+
+    #[test]
+    fn owned_rlopenatread_payload_aliases_the_input_frame() {
+        let payload = b"prefetched bytes retained from their frame";
+        let message = P9Message::new(
+            11,
+            Message::Rlopenatread(Rlopenatread {
+                qid: qid(),
+                iounit: 64 * 1024,
+                eof: 1,
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+        );
+
+        assert_owned_payload_aliases(message, false, P9_RLOPENATREAD_HDR as usize, payload);
+    }
+
+    #[test]
+    fn owned_enveloped_twrite_payload_aliases_the_input_frame() {
+        let payload = b"write bytes retained from their enveloped frame";
+        let message = P9Message::new_with_op_id_flags_and_origin(
+            19,
+            [0xa5; P9_OP_ID_LEN],
+            P9_OP_FLAG_RETRY,
+            42,
+            Message::Twrite(Twrite {
+                fid: 23,
+                offset: 29,
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+        );
+
+        assert_owned_payload_aliases(
+            message,
+            true,
+            P9_TWRITE_HDR as usize + P9_OP_ENVELOPE_LEN,
+            payload,
+        );
+    }
+
+    #[test]
+    fn owned_standard_twrite_payload_aliases_the_input_frame() {
+        let payload = b"write bytes retained from a standard frame";
+        let message = P9Message::new(
+            21,
+            Message::Twrite(Twrite {
+                fid: 23,
+                offset: 29,
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+        );
+
+        assert_owned_payload_aliases(message, false, P9_TWRITE_HDR as usize, payload);
+    }
+
+    #[test]
+    fn owned_directory_payloads_alias_the_input_frame() {
+        let payload = b"encoded directory entries";
+        for body in [
+            Message::Rreaddir(Rreaddir {
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+            Message::Rreaddirattr(Rreaddirattr {
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+        ] {
+            assert_owned_payload_aliases(
+                P9Message::new(25, body),
+                false,
+                P9_IOHDRSZ as usize,
+                payload,
+            );
+        }
+    }
+
+    #[test]
+    fn owned_decoder_matches_borrowed_trailing_data_semantics() {
+        let mut frame = P9Message::new(
+            27,
+            Message::Rread(Rread {
+                count: 7,
+                data: b"payload".to_vec().into(),
+            }),
+        )
+        .to_bytes()
+        .unwrap();
+        frame[P9_HEADER_SIZE..P9_IOHDRSZ as usize].copy_from_slice(&3u32.to_le_bytes());
+
+        let borrowed = P9Message::from_bytes_ctx(&frame, false).unwrap();
+        let owned = P9Message::from_owned_bytes_ctx(Bytes::from(frame), false).unwrap();
+        let (count, data) = counted_payload(&owned);
+        assert_eq!(count, 3);
+        assert_eq!(data.as_ref(), b"pay");
+        assert_eq!(owned.to_bytes().unwrap(), borrowed.to_bytes().unwrap());
+    }
+
+    #[test]
+    fn owned_counted_decoder_rejects_truncated_payloads() {
+        let payload = b"payload";
+        let rread = P9Message::new(
+            31,
+            Message::Rread(Rread {
+                count: payload.len() as u32,
+                data: payload.to_vec().into(),
+            }),
+        );
+        let valid = rread.to_bytes().unwrap();
+
+        let count_cases = [
+            (rread, false, P9_IOHDRSZ as usize - P9_COUNT_FIELD_LEN),
+            (
+                P9Message::new(
+                    32,
+                    Message::Rlopenatread(Rlopenatread {
+                        qid: qid(),
+                        iounit: 4096,
+                        eof: 0,
+                        count: payload.len() as u32,
+                        data: payload.to_vec().into(),
+                    }),
+                ),
+                false,
+                P9_RLOPENATREAD_HDR as usize - P9_COUNT_FIELD_LEN,
+            ),
+            (
+                P9Message::new_with_op_id(
+                    33,
+                    [0x5a; P9_OP_ID_LEN],
+                    Message::Twrite(Twrite {
+                        fid: 1,
+                        offset: 2,
+                        count: payload.len() as u32,
+                        data: payload.to_vec().into(),
+                    }),
+                ),
+                true,
+                P9_TWRITE_HDR as usize + P9_OP_ENVELOPE_LEN - P9_COUNT_FIELD_LEN,
+            ),
+        ];
+
+        for (message, op_id_enabled, count_offset) in count_cases {
+            let mut truncated = message.to_bytes_ctx(op_id_enabled).unwrap();
+            truncated[count_offset..count_offset + P9_COUNT_FIELD_LEN]
+                .copy_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+            assert!(
+                P9Message::from_owned_bytes_ctx(Bytes::from(truncated), op_id_enabled).is_err()
+            );
+        }
+
+        let mut truncated_count = valid[..P9_HEADER_SIZE + P9_COUNT_FIELD_LEN - 1].to_vec();
+        let truncated_size = truncated_count.len() as u32;
+        truncated_count[..P9_SIZE_FIELD_LEN].copy_from_slice(&truncated_size.to_le_bytes());
+        assert!(P9Message::from_owned_bytes_ctx(Bytes::from(truncated_count), false).is_err());
     }
 
     #[test]

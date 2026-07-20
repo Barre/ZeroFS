@@ -12,6 +12,7 @@ use futures::stream::FuturesUnordered;
 use ninep_proto::{
     Message, P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE,
     P9_MIN_MESSAGE_SIZE, P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, Rlerror,
+    T_WRITE,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -732,8 +733,13 @@ pub(crate) fn dispatch_9p_frame(
     let tx = tx.clone();
 
     spawn_named("9p-request", async move {
-        // Decode large payloads after detachment from the connection reader.
-        let parsed = P9Message::from_bytes_ctx(&frame, zerofs_protocol);
+        // Only Twrite has an inbound bulk payload worth retaining. Other
+        // requests keep the regular decoder and the original error diagnostics.
+        let parsed = if type_byte == T_WRITE {
+            P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol)
+        } else {
+            P9Message::from_bytes_ctx(&frame, zerofs_protocol)
+        };
 
         // Barrier waiters were captured synchronously in receive order.
         for waiter in prior_waiters {
@@ -743,6 +749,7 @@ pub(crate) fn dispatch_9p_frame(
         // Parse failures stay registered until their `Rlerror` is enqueued.
         let response_bytes = match parsed {
             Ok(parsed) => {
+                drop(frame);
                 debug!(
                     "Received message type {} tag {}: {:?}",
                     parsed.type_, parsed.tag, parsed.body
@@ -778,7 +785,7 @@ pub(crate) fn dispatch_9p_frame(
                     "Message size: {}, buffer (first {} bytes): {:?}",
                     frame.len(),
                     P9_DEBUG_BUFFER_SIZE,
-                    &frame[0..std::cmp::min(P9_DEBUG_BUFFER_SIZE, frame.len())]
+                    &frame[..std::cmp::min(P9_DEBUG_BUFFER_SIZE, frame.len())]
                 );
                 P9Message::new(
                     tag,
