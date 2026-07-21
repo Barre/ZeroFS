@@ -29,9 +29,18 @@ type SegBase = (bytes::Bytes, (i64, i64), (u64, u64));
 
 type Reply = oneshot::Sender<Result<(), FsError>>;
 
+// `Barrier` is test-only; boxing `Commit` would add an allocation to the hot path.
+#[allow(clippy::large_enum_variant)]
+enum Request {
+    Commit(Transaction, Reply),
+    #[cfg(any(test, dst))]
+    #[allow(dead_code)]
+    Barrier(Reply),
+}
+
 #[derive(Clone)]
 pub struct WriteCoordinator {
-    sender: mpsc::UnboundedSender<(Transaction, Reply)>,
+    sender: mpsc::UnboundedSender<Request>,
 }
 
 /// Commit worker dependencies.
@@ -89,7 +98,19 @@ impl WriteCoordinator {
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
-            .send((txn, reply_tx))
+            .send(Request::Commit(txn, reply_tx))
+            .map_err(|_| FsError::IoError)?;
+        reply_rx.await.map_err(|_| FsError::IoError)?
+    }
+
+    /// Wait until every commit submitted before this call has finished,
+    /// including publication of its in-memory statistics.
+    #[cfg(any(test, dst))]
+    #[allow(dead_code)]
+    pub async fn barrier(&self) -> Result<(), FsError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(Request::Barrier(reply_tx))
             .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
@@ -102,13 +123,15 @@ impl WriteCoordinator {
 
 /// Weak commit handle held by `ExtentStore`; a strong sender would form a cycle.
 #[derive(Clone)]
-pub struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<(Transaction, Reply)>);
+pub struct WeakWriteCoordinator(mpsc::WeakUnboundedSender<Request>);
 
 impl WeakWriteCoordinator {
     pub async fn commit(&self, txn: Transaction) -> Result<(), FsError> {
         let sender = self.0.upgrade().ok_or(FsError::IoError)?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        sender.send((txn, reply_tx)).map_err(|_| FsError::IoError)?;
+        sender
+            .send(Request::Commit(txn, reply_tx))
+            .map_err(|_| FsError::IoError)?;
         reply_rx.await.map_err(|_| FsError::IoError)?
     }
 }
@@ -175,7 +198,7 @@ pub(crate) async fn stage_seg_deltas(
 
 async fn worker_loop(
     mut ctx: WorkerContext,
-    mut rx: mpsc::UnboundedReceiver<(Transaction, Reply)>,
+    mut rx: mpsc::UnboundedReceiver<Request>,
     initial_counter: u64,
 ) {
     let mut last_emitted_counter = initial_counter;
@@ -223,9 +246,26 @@ async fn worker_loop(
                 commit
             }
         };
-        let mut batch = vec![first];
+        let (txn, reply) = match first {
+            Request::Commit(txn, reply) => (txn, reply),
+            #[cfg(any(test, dst))]
+            Request::Barrier(reply) => {
+                let _ = reply.send(Ok(()));
+                continue;
+            }
+        };
+        let mut batch = vec![(txn, reply)];
+        #[cfg(any(test, dst))]
+        let mut barrier_reply = None;
         while let Ok(msg) = rx.try_recv() {
-            batch.push(msg);
+            match msg {
+                Request::Commit(txn, reply) => batch.push((txn, reply)),
+                #[cfg(any(test, dst))]
+                Request::Barrier(reply) => {
+                    barrier_reply = Some(reply);
+                    break;
+                }
+            }
         }
 
         let replicating = ctx.replicator.is_some();
@@ -317,6 +357,10 @@ async fn worker_loop(
                 for reply in replies {
                     let _ = reply.send(Err(e));
                 }
+                #[cfg(any(test, dst))]
+                if let Some(reply) = barrier_reply {
+                    let _ = reply.send(Err(e));
+                }
                 continue;
             }
         };
@@ -385,6 +429,10 @@ async fn worker_loop(
                 ctx.inode_store.allocate();
             }
             for reply in replies {
+                let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
+            }
+            #[cfg(any(test, dst))]
+            if let Some(reply) = barrier_reply {
                 let _ = reply.send(Err(FsError::LeaderRejectedBeforeApply));
             }
             continue;
@@ -498,6 +546,10 @@ async fn worker_loop(
         for reply in replies {
             let _ = reply.send(result);
         }
+        #[cfg(any(test, dst))]
+        if let Some(reply) = barrier_reply {
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -602,6 +654,41 @@ mod tests {
             .commit(txn)
             .await
             .expect("empty txn should commit as a no-op");
+    }
+
+    #[tokio::test]
+    async fn barrier_waits_for_prior_footprint_publication() {
+        let fs = make_fs().await;
+        let seg_key = codec().segcount_key(1, 1);
+        let mut txn = Transaction::new();
+        txn.add_seg_delta(&seg_key, 57_169, 57_169);
+
+        // Queue the commit without awaiting its own reply. The barrier must not
+        // complete until the worker has both applied it and published gauges.
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        fs.write_coordinator
+            .sender
+            .send(Request::Commit(txn, reply_tx))
+            .unwrap();
+        fs.write_coordinator.barrier().await.unwrap();
+
+        let stats = fs.extent_store.segment_gc_stats();
+        assert_eq!(
+            stats
+                .segment_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stats
+                .appended_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            57_169
+        );
+        assert_eq!(
+            stats.live_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            57_169
+        );
     }
 
     #[tokio::test]

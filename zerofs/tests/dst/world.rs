@@ -36,18 +36,29 @@ async fn wait_for_orphan_set_to_drain(fs: &ZeroFS) -> Result<(), tokio::time::er
     tokio::time::timeout(
         zerofs::dedup::OP_ID_RETENTION.saturating_add(ORPHAN_DRAIN_GRACE),
         async {
-            let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
-            if orphans.next().await.is_none() {
-                return;
-            }
-
-            tokio::time::sleep(zerofs::dedup::OP_ID_RETENTION).await;
+            let mut waited_for_replay_expiry = false;
             loop {
                 let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
                 if orphans.next().await.is_none() {
-                    return;
+                    // The reclaim commit removes the orphan key before the
+                    // commit worker publishes its footprint delta. Queue a
+                    // barrier behind that commit, then rescan in case an
+                    // earlier in-flight mutation created an orphan.
+                    fs.write_coordinator
+                        .barrier()
+                        .await
+                        .expect("commit barrier at quiesce");
+                    let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
+                    if orphans.next().await.is_none() {
+                        return;
+                    }
                 }
-                tokio::time::sleep(ORPHAN_DRAIN_POLL_INTERVAL).await;
+                if !waited_for_replay_expiry {
+                    tokio::time::sleep(zerofs::dedup::OP_ID_RETENTION).await;
+                    waited_for_replay_expiry = true;
+                } else {
+                    tokio::time::sleep(ORPHAN_DRAIN_POLL_INTERVAL).await;
+                }
             }
         },
     )
@@ -631,6 +642,13 @@ impl WorldHarness {
 
     async fn verify_quiescent(&self, round: usize, model: &WorldModel) {
         let fs = self.storage.fs();
+        wait_for_orphan_set_to_drain(fs).await.unwrap_or_else(|_| {
+            panic!(
+                "orphan set did not drain at quiesce (seed {}, round {round})",
+                self.config.seed
+            )
+        });
+
         for file in &model.files {
             assert_eq!(
                 file.ops.len(),
@@ -653,13 +671,6 @@ impl WorldHarness {
         Checks::new(fs.as_ref(), self.config.seed, round)
             .verify()
             .await;
-
-        wait_for_orphan_set_to_drain(fs).await.unwrap_or_else(|_| {
-            panic!(
-                "orphan set did not drain at quiesce (seed {}, round {round})",
-                self.config.seed
-            )
-        });
         let report = verify_consistency_sparse(fs)
             .await
             .expect("quiesced consistency scan");
@@ -877,6 +888,14 @@ pub(crate) fn run_graceful_close_case(seed: u64) {
 }
 
 pub(crate) fn run_seed_mode(seed: u64, failpoint_crashes: bool) -> (u64, Vec<String>) {
+    run_seed_mode_with_rounds(seed, failpoint_crashes, None)
+}
+
+fn run_seed_mode_with_rounds(
+    seed: u64,
+    failpoint_crashes: bool,
+    rounds: Option<usize>,
+) -> (u64, Vec<String>) {
     zerofs::fs::DST_FIXED_TIME.store(true, Relaxed);
     zerofs::db::DST_PANIC_ON_WRITE_ERROR.store(true, Relaxed);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -886,7 +905,10 @@ pub(crate) fn run_seed_mode(seed: u64, failpoint_crashes: bool) -> (u64, Vec<Str
         .build()
         .expect("runtime");
     runtime.block_on(async {
-        let (harness, model) = WorldHarness::new(seed, failpoint_crashes).await;
+        let (mut harness, model) = WorldHarness::new(seed, failpoint_crashes).await;
+        if let Some(rounds) = rounds {
+            harness.config.rounds = rounds;
+        }
         harness.run(model).await
     })
 }
@@ -894,6 +916,11 @@ pub(crate) fn run_seed_mode(seed: u64, failpoint_crashes: bool) -> (u64, Vec<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiescence_waits_for_deferred_reclaim_footprint_publication() {
+        run_seed_mode_with_rounds(3_763_214_793_977_829_566, false, Some(5));
+    }
 
     async fn orphan_ids(fs: &ZeroFS) -> Vec<InodeId> {
         let mut orphans = fs.orphan_store.list().await.expect("orphan-set scan");
