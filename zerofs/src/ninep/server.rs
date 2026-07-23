@@ -319,6 +319,8 @@ where
                 None => break,
             };
 
+            // Snapshot the ready batch before the first await. Continuing to
+            // drain across writes can indefinitely delay the final flush.
             let mut batch = vec![first];
             while let Ok(more) = rx.try_recv() {
                 batch.push(more);
@@ -754,26 +756,16 @@ pub(crate) fn dispatch_9p_frame(
                     "Received message type {} tag {}: {:?}",
                     parsed.type_, parsed.tag, parsed.body
                 );
-                let response = if let Some(received_guard) = received_guard {
-                    Box::pin(handler.handle_message_with_received_admission(
+                let response = handler
+                    .handle_message_with_received_admission(
                         tag,
                         parsed.op_id,
                         parsed.op_flags,
                         parsed.op_origin_epoch,
                         parsed.body,
-                        Some(received_guard),
-                    ))
-                    .await
-                } else {
-                    Box::pin(handler.handle_message_with_op_envelope_origin(
-                        tag,
-                        parsed.op_id,
-                        parsed.op_flags,
-                        parsed.op_origin_epoch,
-                        parsed.body,
-                    ))
-                    .await
-                };
+                        received_guard,
+                    )
+                    .await;
                 response.to_bytes().ok()
             }
             Err(e) => {

@@ -30,7 +30,7 @@ members = [
 # same release, so the version the driver reports (GetPluginInfo) must not
 # drift from zerofs's.
 [workspace.package]
-version = "2.1.0"
+version = "2.1.1"
 
 [profile.release]
 lto = true
