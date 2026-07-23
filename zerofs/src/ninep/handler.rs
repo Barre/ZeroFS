@@ -358,6 +358,16 @@ impl NinePHandler {
             .map(|s| s.fid.clone())
     }
 
+    /// Snapshot only the fid fields needed by attribute mutations. Unlike
+    /// `get_fid`, this does not allocate and clone the fid's path.
+    fn get_fid_inode_and_creds(&self, fid: u32) -> P9Result<(InodeId, Credentials)> {
+        self.session_state()
+            .fids
+            .get(&fid)
+            .ok_or(P9Error::BadFid)
+            .map(|slot| (slot.fid.inode_id, slot.fid.creds))
+    }
+
     fn clamp_count(&self, count: u32, header: u32) -> u32 {
         count.min(self.session_state().msize.saturating_sub(header))
     }
@@ -393,6 +403,7 @@ impl NinePHandler {
             .await
     }
 
+    #[cfg(test)]
     pub async fn handle_message_with_op_envelope_origin(
         &self,
         tag: u16,
@@ -902,12 +913,13 @@ impl NinePHandler {
     async fn walk(&self, tw: Twalk) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
-        let mut current_path = src_fid.path.clone();
+        let mut current_path = src_fid.path;
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
+        let has_wnames = !tw.wnames.is_empty();
 
-        for (i, wname) in tw.wnames.iter().enumerate() {
-            let name_bytes = Bytes::copy_from_slice(&wname.data);
+        for (i, wname) in tw.wnames.into_iter().enumerate() {
+            let name_bytes = Bytes::from(wname.data);
 
             let creds = src_fid.creds;
             let child_id = match self
@@ -948,7 +960,7 @@ impl NinePHandler {
         }
 
         // Only create newfid if the walk fully succeeded
-        if tw.newfid != tw.fid || !tw.wnames.is_empty() {
+        if tw.newfid != tw.fid || has_wnames {
             let new_fid = Fid {
                 path: current_path,
                 inode_id: current_id,
@@ -974,13 +986,13 @@ impl NinePHandler {
     async fn walk_getattr(&self, tw: Twalkgetattr) -> P9Result<Message> {
         let src_fid = self.get_fid(tw.fid)?;
 
-        let mut current_path = src_fid.path.clone();
+        let mut current_path = src_fid.path;
         let mut current_id = src_fid.inode_id;
         let mut wqids = Vec::new();
         let mut last_inode = None;
 
-        for wname in tw.wnames.iter() {
-            let name_bytes = Bytes::copy_from_slice(&wname.data);
+        for wname in tw.wnames {
+            let name_bytes = Bytes::from(wname.data);
             let child_id = self
                 .walk_component(&src_fid.creds, src_fid.root, current_id, &name_bytes)
                 .await?;
@@ -1384,7 +1396,7 @@ impl NinePHandler {
             .create_child(&parent_fid, &tc.name.data, tc.mode, tc.gid, op_id)
             .await?;
 
-        let mut path = parent_fid.path.clone();
+        let mut path = parent_fid.path;
         path.push(Bytes::from(tc.name.data));
         // The child lock orders fid publication against unlink.
         {
@@ -1481,11 +1493,11 @@ impl NinePHandler {
     }
 
     async fn setattr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let fid_entry = self.get_fid(ts.fid)?;
+        let (inode_id, creds) = self.get_fid_inode_and_creds(ts.fid)?;
         let attr = SetAttributes::from(&ts);
 
         self.filesystem
-            .setattr_idempotent(&fid_entry.creds, fid_entry.inode_id, &attr, op_id)
+            .setattr_idempotent(&creds, inode_id, &attr, op_id)
             .await?;
         Ok(Message::Rsetattr(Rsetattr))
     }
@@ -1521,15 +1533,15 @@ impl NinePHandler {
     // ZeroFS fast path: Tsetattr whose reply carries the post-op stat (which the
     // filesystem computes anyway), sparing the client its follow-up Tgetattr.
     async fn setattr_attr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let fid_entry = self.get_fid(ts.fid)?;
+        let (inode_id, creds) = self.get_fid_inode_and_creds(ts.fid)?;
         let attr = SetAttributes::from(&ts);
 
         let post_attr = self
             .filesystem
-            .setattr_idempotent(&fid_entry.creds, fid_entry.inode_id, &attr, op_id)
+            .setattr_idempotent(&creds, inode_id, &attr, op_id)
             .await?;
         Ok(Message::Rsetattrattr(Rsetattrattr {
-            stat: attrs_to_stat(&post_attr, fid_entry.inode_id),
+            stat: attrs_to_stat(&post_attr, inode_id),
         }))
     }
 
@@ -2096,6 +2108,14 @@ pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
     let rdev = attrs
         .rdev
         .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64));
+    // FileAttributes uses the NFS-facing conventional 4 KiB directory size,
+    // while the established 9P getattr representation reports directory size
+    // as zero. Keep compound/readdir stats identical to `inode_to_stat`.
+    let size = if attrs.file_type == FileType::Directory {
+        0
+    } else {
+        attrs.size
+    };
     Stat {
         qid: attrs_to_qid(attrs, fileid),
         mode: (attrs.mode & 0o7777) | type_bits,
@@ -2103,9 +2123,9 @@ pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
         gid: attrs.gid,
         nlink: attrs.nlink as u64,
         rdev,
-        size: attrs.size,
+        size,
         blksize: DEFAULT_BLKSIZE,
-        blocks: attrs.size.div_ceil(BLOCK_SIZE),
+        blocks: size.div_ceil(BLOCK_SIZE),
         atime_sec: attrs.atime.seconds,
         atime_nsec: attrs.atime.nanoseconds as u64,
         mtime_sec: attrs.mtime.seconds,
