@@ -3,10 +3,10 @@
 //!
 //! This bridges the kernel's FUSE protocol to 9P2000.L: each FUSE callback is
 //! translated into one or more 9P requests issued through [`NinePClient`].
-//! Because fuser's request dispatch loop is single-threaded but its `Reply`
-//! objects are `Send`, every callback simply hands the work (and the reply) off
-//! to a Tokio task and returns immediately, so many operations run concurrently
-//! over the multiplexed 9P connection.
+//! Because fuser invokes callbacks synchronously on a small pool of dispatcher
+//! threads but its `Reply` objects are `Send`, every callback simply hands the
+//! work (and the reply) off to a Tokio task and returns immediately, so many
+//! operations run concurrently over the multiplexed 9P connection.
 
 use crate::ninep::lock_manager::{FileLock, FileLockManager};
 use anyhow::{Context, Result, anyhow};
@@ -96,9 +96,11 @@ struct InodeEntry {
     /// One fid per uid that holds this inode. Every request acts as its caller
     /// (v9fs `access=user` semantics), so each user gets its own server-side fid.
     fids: HashMap<u32, u32>,
-    /// Open fids for this inode. Verified fsync checks every handle because
-    /// `fsync(fd)` persists writes issued through any handle to the file.
-    handles: std::collections::HashSet<u32>,
+    /// Open fids for this inode, mapped to the uid that opened them. Verified
+    /// fsync checks every handle because `fsync(fd)` persists writes issued
+    /// through any handle to the file. The owner lets setattr safely reuse an
+    /// existing handle without changing `access=user` credential semantics.
+    handles: HashMap<u32, u32>,
     /// The server inode id behind this FUSE ino when it differs from the
     /// default `ino - 1` bijection: only the mount root of an `--aname` mount,
     /// where FUSE ino 1 maps to the attach subtree's root inode.
@@ -363,9 +365,30 @@ fn node_name() -> Vec<u8> {
     b"zerofs-mount".to_vec()
 }
 
-/// Register a lookup without binding a fid. `user_fid` binds lazily on use.
-fn register_lookup(inodes: &Arc<DashMap<u64, InodeEntry>>, ino: u64) {
-    inodes.entry(ino).or_default().lookup += 1;
+fn tracked_handle_fid(
+    inodes: &Arc<DashMap<u64, InodeEntry>>,
+    ino: u64,
+    fh: Option<FileHandle>,
+) -> Option<(u32, u32)> {
+    let fid = fh?.0 as u32;
+    inodes
+        .get(&ino)
+        .and_then(|entry| entry.handles.get(&fid).copied())
+        .map(|owner_uid| (fid, owner_uid))
+}
+
+/// Return an open handle only when it belongs to the current request uid.
+/// File descriptors can be passed between users, while 9P fids retain the
+/// identity that opened them, so a mismatched handle must use `user_fid`.
+fn user_handle_fid(
+    inodes: &Arc<DashMap<u64, InodeEntry>>,
+    ino: u64,
+    uid: u32,
+    fh: Option<FileHandle>,
+) -> Option<u32> {
+    tracked_handle_fid(inodes, ino, fh)
+        .filter(|&(_, owner_uid)| owner_uid == uid)
+        .map(|(fid, _)| fid)
 }
 
 /// Walk `parent_fid` to `name`, getattr the result, and register (or reuse) the
@@ -376,7 +399,7 @@ async fn resolve_child(
     uid: u32,
     parent_fid: u32,
     name: &[u8],
-) -> Result<FileAttr, ClientError> {
+) -> Result<(FileAttr, Option<u32>), ClientError> {
     let nf = client.alloc_fid();
     let stat = match client.walk_getattr(parent_fid, nf, &[name]).await {
         Ok((_qids, stat)) => stat,
@@ -385,18 +408,18 @@ async fn resolve_child(
             return Err(e);
         }
     };
-    Ok(register_entry(client, inodes, uid, Some(nf), &stat).await)
+    Ok(register_entry(inodes, uid, Some(nf), &stat))
 }
 
 /// Register a lookup and retain at most one walked fid per user and inode.
-/// A missing fid is bound lazily by `user_fid`.
-async fn register_entry(
-    client: &Arc<NinePClient>,
+/// A missing fid is bound lazily by `user_fid`. A redundant walked fid is
+/// returned to the caller so it can reply to FUSE before clunking it.
+fn register_entry(
     inodes: &Arc<DashMap<u64, InodeEntry>>,
     uid: u32,
     walked: Option<u32>,
     stat: &Stat,
-) -> FileAttr {
+) -> (FileAttr, Option<u32>) {
     let ino = ino_of(stat.qid.path);
     let redundant = {
         use std::collections::hash_map::Entry;
@@ -413,12 +436,7 @@ async fn register_entry(
             None => None,
         }
     };
-    if let Some(fid) = redundant {
-        let _ = client.clunk(fid).await;
-        client.free_fid(fid);
-    }
-
-    stat_to_attr(stat)
+    (stat_to_attr(stat), redundant)
 }
 
 impl Filesystem for Fuse9P {
@@ -496,12 +514,23 @@ impl Filesystem for Fuse9P {
                 }
             };
             match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
-                Ok(attr) => reply.entry(&ttl, &attr, Generation(0)),
+                Ok((attr, redundant_fid)) => {
+                    reply.entry(&ttl, &attr, Generation(0));
+                    if let Some(fid) = redundant_fid {
+                        // The kernel has its answer; retire a duplicate walked fid
+                        // off the critical path. Do not release the number for reuse
+                        // until the stateful clunk has settled.
+                        let _ = client.clunk(fid).await;
+                        client.free_fid(fid);
+                    }
+                }
                 // Cache misses only in relaxed mode.
                 Err(e) if !ttl.is_zero() && e.to_errno() == libc::ENOENT => {
                     reply.entry(&ttl, &negative_attr(), Generation(0));
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => {
+                    reply.error(errno(&e));
+                }
             }
         });
     }
@@ -523,7 +552,7 @@ impl Filesystem for Fuse9P {
             let client = Arc::clone(&self.client);
             let prefetch = Arc::clone(&self.prefetch);
             self.rt.spawn(async move {
-                for fid in entry.fids.into_values().chain(entry.handles) {
+                for fid in entry.fids.into_values().chain(entry.handles.into_keys()) {
                     // Same leak-hygiene as the clunk: drop any prefetch buffer that
                     // outlived its release (keyed by the open-handle fid; a no-op for
                     // the inode fids, which never hold one).
@@ -535,23 +564,30 @@ impl Filesystem for Fuse9P {
         }
     }
 
-    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ttl = self.ttl;
+        let ino = ino.0;
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
-        let ttl = self.ttl;
         let uid = req.uid();
-        let ino = ino.0;
         self.rt.spawn(async move {
-            let fid = match user_fid(&client, &inodes, uid, ino).await {
-                Ok(f) => f,
-                Err(e) => {
-                    reply.error(errno(&e));
-                    return;
-                }
+            let fid = match tracked_handle_fid(&inodes, ino, fh) {
+                Some((fid, _)) => fid,
+                None => match user_fid(&client, &inodes, uid, ino).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        reply.error(errno(&e));
+                        return;
+                    }
+                },
             };
             match client.getattr(fid, GETATTR_ALL).await {
-                Ok(stat) => reply.attr(&ttl, &stat_to_attr(&stat)),
-                Err(e) => reply.error(errno(&e)),
+                Ok(stat) => {
+                    reply.attr(&ttl, &stat_to_attr(&stat));
+                }
+                Err(e) => {
+                    reply.error(errno(&e));
+                }
             }
         });
     }
@@ -568,7 +604,7 @@ impl Filesystem for Fuse9P {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<FileHandle>,
+        fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -581,12 +617,15 @@ impl Filesystem for Fuse9P {
         let caller_uid = req.uid();
         let ino = ino.0;
         self.rt.spawn(async move {
-            let fid = match user_fid(&client, &inodes, caller_uid, ino).await {
-                Ok(f) => f,
-                Err(e) => {
-                    reply.error(errno(&e));
-                    return;
-                }
+            let fid = match user_handle_fid(&inodes, ino, caller_uid, fh) {
+                Some(fid) => fid,
+                None => match user_fid(&client, &inodes, caller_uid, ino).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        reply.error(errno(&e));
+                        return;
+                    }
+                },
             };
             let ts = SetattrBuilder::new(fid)
                 .mode(mode)
@@ -597,8 +636,13 @@ impl Filesystem for Fuse9P {
                 .mtime(mtime.map(setattr_time))
                 .build();
             match client.setattr_attr(ts).await {
-                Ok(stat) => reply.attr(&ttl, &stat_to_attr(&stat)),
-                Err(e) => reply.error(errno(&e)),
+                Ok(stat) => {
+                    let attr = stat_to_attr(&stat);
+                    reply.attr(&ttl, &attr);
+                }
+                Err(e) => {
+                    reply.error(errno(&e));
+                }
             }
         });
     }
@@ -654,7 +698,8 @@ impl Filesystem for Fuse9P {
             };
             match client.mkdir_attr(parent_fid, &name, mode, gid).await {
                 Ok(stat) => {
-                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
+                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -703,7 +748,8 @@ impl Filesystem for Fuse9P {
                 .await
             {
                 Ok(stat) => {
-                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
+                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -741,7 +787,8 @@ impl Filesystem for Fuse9P {
             };
             match client.symlink_attr(parent_fid, &name, &target, gid).await {
                 Ok(stat) => {
-                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
+                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -827,7 +874,8 @@ impl Filesystem for Fuse9P {
             };
             match client.link_attr(dir_fid, file_fid, &newname).await {
                 Ok(stat) => {
-                    let attr = register_entry(&client, &inodes, uid, None, &stat).await;
+                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
                 Err(e) => reply.error(errno(&e)),
@@ -1168,13 +1216,14 @@ impl Filesystem for Fuse9P {
             {
                 Ok((stat, _iounit)) => {
                     let new_ino = ino_of(stat.qid.path);
-                    register_lookup(&inodes, new_ino);
-                    if let Some(mut e) = inodes.get_mut(&new_ino) {
-                        e.handles.insert(nf);
-                    }
+                    let mut entry = inodes.entry(new_ino).or_default();
+                    entry.lookup += 1;
+                    entry.handles.insert(nf, uid);
+                    drop(entry);
+                    let attr = stat_to_attr(&stat);
                     reply.created(
                         &ttl,
-                        &stat_to_attr(&stat),
+                        &attr,
                         Generation(0),
                         FileHandle(nf as u64),
                         open_flags,
@@ -1581,7 +1630,7 @@ impl Fuse9P {
                     // Track the open handle so a verified fsync of this inode (through
                     // ANY of its handles) presents this one's un-fsync'd writes too.
                     if let Some(mut e) = inodes.get_mut(&ino) {
-                        e.handles.insert(nf);
+                        e.handles.insert(nf, uid);
                     }
                     // Stash the folded-in bytes for `read` to serve, keyed by the
                     // handle, stamped now so a late first read can expire it.
@@ -1630,7 +1679,7 @@ impl Fuse9P {
                     entry
                         .fids
                         .values()
-                        .chain(entry.handles.iter())
+                        .chain(entry.handles.keys())
                         .copied()
                         .filter(|&fid| fid != primary),
                 );
@@ -1727,7 +1776,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         InodeEntry {
             lookup: u64::MAX,
             fids: HashMap::new(),
-            handles: std::collections::HashSet::new(),
+            handles: HashMap::new(),
             server_inode: Some(root_inode),
         },
     );
@@ -1895,6 +1944,63 @@ mod consistency_tests {
             validate_fallocate(0, 1, 0x80).unwrap_err().code(),
             libc::EOPNOTSUPP
         );
+    }
+
+    #[test]
+    fn setattr_reuses_only_same_user_handle_for_the_requested_inode() {
+        let inodes = Arc::new(DashMap::new());
+        let mut entry = InodeEntry::default();
+        entry.handles.insert(42, 1000);
+        inodes.insert(7, entry);
+
+        let handle = Some(FileHandle(42));
+        assert_eq!(tracked_handle_fid(&inodes, 7, handle), Some((42, 1000)));
+        assert_eq!(user_handle_fid(&inodes, 7, 1000, handle), Some(42));
+        assert_eq!(user_handle_fid(&inodes, 7, 1001, handle), None);
+        assert_eq!(user_handle_fid(&inodes, 8, 1000, handle), None);
+        assert_eq!(
+            user_handle_fid(&inodes, 7, 1000, Some(FileHandle(43))),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_lookup_returns_only_the_redundant_fid_for_deferred_clunk() {
+        let inodes = Arc::new(DashMap::new());
+        let stat = Stat {
+            qid: ninep_proto::Qid {
+                type_: 0,
+                version: 0,
+                path: 42,
+            },
+            mode: libc::S_IFREG | 0o644,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            rdev: 0,
+            size: 0,
+            blksize: 4096,
+            blocks: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            btime_sec: 0,
+            btime_nsec: 0,
+            r#gen: 0,
+            data_version: 0,
+        };
+
+        assert_eq!(register_entry(&inodes, 1000, Some(10), &stat).1, None);
+        assert_eq!(register_entry(&inodes, 1000, Some(11), &stat).1, Some(11));
+        assert_eq!(register_entry(&inodes, 1001, Some(12), &stat).1, None);
+
+        let entry = inodes.get(&ino_of(42)).unwrap();
+        assert_eq!(entry.lookup, 3);
+        assert_eq!(entry.fids.get(&1000), Some(&10));
+        assert_eq!(entry.fids.get(&1001), Some(&12));
     }
 }
 
