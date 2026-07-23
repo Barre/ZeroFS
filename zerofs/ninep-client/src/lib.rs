@@ -438,6 +438,7 @@ impl Conn {
     /// Stops both transport tasks.
     fn shutdown(&self) {
         self.dead.store(true, Ordering::Release);
+        self.pending.clear();
         self.reader_shutdown.notify_one();
         self.writer_shutdown.notify_one();
     }
@@ -483,9 +484,7 @@ impl Conn {
     }
 
     fn connection_lost(&self, reconnect: &Notify) {
-        self.dead.store(true, Ordering::Release);
-        self.pending.clear();
-        self.writer_shutdown.notify_one();
+        self.shutdown();
         reconnect.notify_waiters();
     }
 }
@@ -1228,6 +1227,13 @@ impl NinePClient {
 
     /// Block until the connection is live (i.e. not mid-reconnect).
     async fn wait_until_live(&self) -> ClientResult<()> {
+        let terminal_errno = self.terminal_errno.load(Ordering::Acquire);
+        if terminal_errno != 0 {
+            return Err(ClientError::Errno(terminal_errno));
+        }
+        if self.live.load(Ordering::Acquire) {
+            return Ok(());
+        }
         loop {
             let notified = self.live_notify.notified();
             tokio::pin!(notified);
@@ -1283,7 +1289,7 @@ impl NinePClient {
     async fn send_request_on_current(
         &self,
         op_id: [u8; 16],
-        body: Message,
+        body: &Message,
         attempt: &mut OpAttemptState,
         stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
     ) -> ClientResult<(Message, Arc<Conn>)> {
@@ -1352,10 +1358,10 @@ impl NinePClient {
 
                     // Registration-to-enqueue has no cancellation point.
                     pending.mark_dispatched();
-                    permit.send(bytes);
                     if let Some(dispatched_conn) = stateful_dispatched_conn {
                         *dispatched_conn.lock().unwrap() = Some(Arc::clone(&conn));
                     }
+                    permit.send(bytes);
                     Ok(())
                 })?;
             // Preserve the in-flight request while bounded liveness checks succeed.
@@ -1417,7 +1423,7 @@ impl NinePClient {
             [0u8; 16]
         };
         let mut attempt = OpAttemptState::default();
-        self.send_request_on_current(op_id, body, &mut attempt, None)
+        self.send_request_on_current(op_id, &body, &mut attempt, None)
             .await
             .map(|(response, _)| response)
     }
@@ -1459,7 +1465,7 @@ impl NinePClient {
         };
         let result = loop {
             let (response, response_conn) = match self
-                .send_request_on_current(op_id, body.clone(), &mut attempt, Some(&dispatched_conn))
+                .send_request_on_current(op_id, &body, &mut attempt, Some(&dispatched_conn))
                 .await
             {
                 Ok(response) => response,
@@ -2798,6 +2804,7 @@ fn spawn_writer(
                     conn.counters.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                     conn.counters.operations.fetch_add(1, Ordering::Relaxed);
                     if writer.write_all(&frame).await.is_err() {
+                        conn.shutdown();
                         break;
                     }
                     let mut failed = false;
@@ -2809,13 +2816,18 @@ fn spawn_writer(
                             break;
                         }
                     }
-                    if failed || writer.flush().await.is_err() {
+                    if failed {
+                        conn.shutdown();
+                        break;
+                    }
+                    if writer.flush().await.is_err() {
+                        conn.shutdown();
                         break;
                     }
                 }
             }
         }
-        conn.dead.store(true, Ordering::Release);
+        conn.shutdown();
         reconnect.notify_waiters();
     });
 }
