@@ -10,7 +10,7 @@ pub struct KeyedLockManager<K: Eq + Hash + Clone + Send + Sync + 'static> {
 }
 
 pub struct KeyedLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
-    _guard: OwnedMutexGuard<()>,
+    guard: Option<OwnedMutexGuard<()>>,
     key: K,
     locks: Arc<DashMap<K, Arc<Mutex<()>>>>,
 }
@@ -49,9 +49,9 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLockManager<K> {
         let lock = self.get_or_create_lock(&key);
         let guard = lock.lock_owned().await;
         KeyedLockGuard {
-            _guard: guard,
+            guard: Some(guard),
             key,
-            locks: self.locks.clone(),
+            locks: Arc::clone(&self.locks),
         }
     }
 }
@@ -69,9 +69,9 @@ impl<K: Eq + Hash + Clone + Ord + Send + Sync + 'static> KeyedLockManager<K> {
             let lock = self.get_or_create_lock(&key);
             let guard = lock.lock_owned().await;
             let lock_guard = KeyedLockGuard {
-                _guard: guard,
+                guard: Some(guard),
                 key,
-                locks: self.locks.clone(),
+                locks: Arc::clone(&self.locks),
             };
 
             guards.push(ShardLockGuard { _guard: lock_guard });
@@ -83,12 +83,12 @@ impl<K: Eq + Hash + Clone + Ord + Send + Sync + 'static> KeyedLockManager<K> {
 
 impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for KeyedLockGuard<K> {
     fn drop(&mut self) {
-        // Try to remove the lock if it's no longer in use
-        self.locks.remove_if(&self.key, |_, lock| {
-            // The guard holds one reference via OwnedMutexGuard
-            // DashMap holds another
-            Arc::strong_count(lock) <= 2
-        });
+        // Release the mutex before considering eviction. If a waiter already
+        // observed this exact lock, its Arc keeps the entry canonical.
+        drop(self.guard.take());
+
+        self.locks
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
     }
 }
 
