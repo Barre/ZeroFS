@@ -134,6 +134,15 @@ impl DirectoryStore {
         dir_id: InodeId,
         txn: &mut Transaction,
     ) -> Result<u64, FsError> {
+        let current = self.read_cookie(dir_id).await?;
+        self.stage_cookie_increment(dir_id, current, txn);
+        Ok(current)
+    }
+
+    /// Read the next directory cookie without staging a mutation. Callers that
+    /// overlap this point read with other validation must still hold the same
+    /// directory lock as `allocate_cookie` before staging the increment.
+    pub(crate) async fn read_cookie(&self, dir_id: InodeId) -> Result<u64, FsError> {
         let counter_key = self.key_codec.dir_cookie_counter_key(dir_id);
         let current = match self.db.get_bytes(&counter_key).await {
             Ok(Some(data)) => KeyCodec::decode_counter(&data)?,
@@ -143,8 +152,17 @@ impl DirectoryStore {
                 return Err(FsError::IoError);
             }
         };
-        txn.put_bytes(&counter_key, KeyCodec::encode_counter(current + 1));
         Ok(current)
+    }
+
+    pub(crate) fn stage_cookie_increment(
+        &self,
+        dir_id: InodeId,
+        current: u64,
+        txn: &mut Transaction,
+    ) {
+        let counter_key = self.key_codec.dir_cookie_counter_key(dir_id);
+        txn.put_bytes(&counter_key, KeyCodec::encode_counter(current + 1));
     }
 
     pub async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
