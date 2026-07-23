@@ -9,6 +9,8 @@ use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
 use crate::fs::inode::{DirectoryInode, FileInode, Inode, InodeId, SpecialInode};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
+#[cfg(test)]
+use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     AuthContext, FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetTime,
@@ -63,10 +65,20 @@ impl ZeroFS {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_create)? {
             return Ok(result);
         }
-        let (mut dir_inode, exists) = tokio::try_join!(
-            self.inode_store.get(dirid),
-            self.directory_store.exists(dirid, name)
-        )?;
+        // A cookie allocation is one point read followed by a transaction write.
+        // Overlap the read with the existing parent and child-name reads, but
+        // defer inspecting its result and staging the increment until their
+        // original positions below. That preserves error precedence and keeps
+        // the counter update atomic with the rest of the create transaction.
+        let cookie_read = self.directory_store.read_cookie(dirid);
+        let parent_and_name = async {
+            tokio::try_join!(
+                self.inode_store.get(dirid),
+                self.directory_store.exists(dirid, name)
+            )
+        };
+        let (parent_and_name, cookie) = tokio::join!(parent_and_name, cookie_read);
+        let (mut dir_inode, exists) = parent_and_name?;
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
@@ -94,7 +106,7 @@ impl ZeroFS {
                     SetMode::NoChange => 0o666,
                 };
 
-                let file_inode = FileInode {
+                let file_inode = Inode::File(FileInode {
                     size: 0,
                     mtime: now_sec,
                     mtime_nsec: now_nsec,
@@ -114,17 +126,15 @@ impl ZeroFS {
                     parent: Some(dirid),
                     name: Some(name.to_vec()),
                     nlink: 1,
-                };
+                });
 
                 let mut txn = self.db.new_transaction()?;
-                let cookie = self
-                    .directory_store
-                    .allocate_cookie(dirid, &mut txn)
-                    .await?;
+                let cookie = cookie?;
+                self.directory_store
+                    .stage_cookie_increment(dirid, cookie, &mut txn);
 
-                let file_inode_enum = Inode::File(file_inode.clone());
                 let file_attrs: FileAttributes = InodeWithId {
-                    inode: &file_inode_enum,
+                    inode: &file_inode,
                     id: file_id,
                 }
                 .into();
@@ -135,19 +145,13 @@ impl ZeroFS {
                         attrs: file_attrs.clone(),
                     },
                 );
-                self.inode_store.save(&mut txn, file_id, &file_inode_enum)?;
+                self.inode_store.save(&mut txn, file_id, &file_inode)?;
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_INODE);
 
-                self.directory_store.add(
-                    &mut txn,
-                    dirid,
-                    name,
-                    file_id,
-                    cookie,
-                    Some(&file_inode_enum),
-                );
+                self.directory_store
+                    .add(&mut txn, dirid, name, file_id, cookie, Some(&file_inode));
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::CREATE_AFTER_DIR_ENTRY);
@@ -185,9 +189,7 @@ impl ZeroFS {
                 self.tracer.emit(
                     &self.inode_store,
                     file_id,
-                    FileOperation::Create {
-                        mode: file_inode.mode,
-                    },
+                    FileOperation::Create { mode: final_mode },
                 );
 
                 Ok((file_id, file_attrs))
@@ -629,10 +631,27 @@ mod tests {
         // Check that the file was added to the directory
         let entry_key = KeyCodec::new().dir_entry_key(0, b"test.txt");
         let entry_data = fs.db.get_bytes(&entry_key).await.unwrap().unwrap();
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&entry_data[..8]);
-        let stored_id = u64::from_le_bytes(bytes);
+        let (stored_id, cookie) = KeyCodec::decode_dir_entry(&entry_data).unwrap();
         assert_eq!(stored_id, file_id);
+        assert_eq!(cookie, super::COOKIE_FIRST_ENTRY);
+
+        let (second_id, _) = fs
+            .create(&test_creds(), 0, b"second.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let second_entry_key = KeyCodec::new().dir_entry_key(0, b"second.txt");
+        let second_entry_data = fs.db.get_bytes(&second_entry_key).await.unwrap().unwrap();
+        let (stored_second_id, second_cookie) =
+            KeyCodec::decode_dir_entry(&second_entry_data).unwrap();
+        assert_eq!(stored_second_id, second_id);
+        assert_eq!(second_cookie, super::COOKIE_FIRST_ENTRY + 1);
+
+        let counter_key = KeyCodec::new().dir_cookie_counter_key(0);
+        let counter_data = fs.db.get_bytes(&counter_key).await.unwrap().unwrap();
+        assert_eq!(
+            KeyCodec::decode_counter(&counter_data).unwrap(),
+            super::COOKIE_FIRST_ENTRY + 2
+        );
     }
 
     #[tokio::test]
