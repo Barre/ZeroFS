@@ -9,14 +9,14 @@ use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::stats::FileSystemGlobalStats;
-use crate::fs::store::{ExtentStore, InodeStore};
+use crate::fs::store::{DirectoryStore, ExtentStore, InodeStore};
 use crate::replication::ShipOutcome;
 use crate::replication::types::SlateDbSeqno;
 use crate::task::spawn_named;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
 use slatedb::config::WriteOptions;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -47,6 +47,7 @@ pub struct WriteCoordinator {
 struct WorkerContext {
     db: Arc<Db>,
     inode_store: InodeStore,
+    directory_store: DirectoryStore,
     flush_coordinator: FlushCoordinator,
     key_codec: Arc<KeyCodec>,
     global_stats: Arc<FileSystemGlobalStats>,
@@ -66,6 +67,7 @@ impl WriteCoordinator {
     pub fn new(
         db: Arc<Db>,
         inode_store: InodeStore,
+        directory_store: DirectoryStore,
         flush_coordinator: FlushCoordinator,
         key_codec: Arc<KeyCodec>,
         global_stats: Arc<FileSystemGlobalStats>,
@@ -82,6 +84,7 @@ impl WriteCoordinator {
         let ctx = WorkerContext {
             db,
             inode_store,
+            directory_store,
             flush_coordinator,
             key_codec,
             global_stats,
@@ -163,12 +166,12 @@ pub(crate) async fn stage_seg_deltas(
     // undercounting live bytes can make GC delete referenced data.
     let bases: Vec<SegBase> = stream::iter(agg)
         .map(|(key, net)| async move {
-            match db.get_bytes(&key).await {
+            match db.get_bytes_internal(&key).await {
                 Ok(None) => Ok((key, net, (0, 0))),
                 Ok(Some(b)) => KeyCodec::decode_segcount(&b)
                     .map(|base| (key, net, base))
                     .ok_or(FsError::IoError),
-                Err(_) => Err(FsError::IoError),
+                Err(error) => Err(FsError::from_db_error(&error)),
             }
         })
         .buffer_unordered(PARALLEL_SEGCOUNT_READS)
@@ -275,6 +278,8 @@ async fn worker_loop(
         // Pin staged FrameLocs until the merged write resolves.
         let mut extent_ref_guards = Vec::new();
         let mut any_ops = false;
+        let mut inode_cache_invalidations: HashSet<u64> = HashSet::new();
+        let mut directory_entry_cache_invalidations: HashSet<(u64, bytes::Bytes)> = HashSet::new();
         let mut shard_deltas: HashMap<usize, (i64, i64)> = HashMap::new();
         let mut seg_map: HashMap<bytes::Bytes, (i64, i64)> = HashMap::new();
         let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
@@ -285,6 +290,12 @@ async fn worker_loop(
             any_ops |= !txn.is_empty();
             if let Some(entry) = txn.take_dedup_entry() {
                 batch_dedup_entries.push(entry);
+            }
+            for inode_id in txn.take_inode_cache_invalidations() {
+                inode_cache_invalidations.insert(inode_id);
+            }
+            for key in txn.take_directory_entry_cache_invalidations() {
+                directory_entry_cache_invalidations.insert(key);
             }
             for delta in txn.take_stats_deltas() {
                 let entry = shard_deltas
@@ -479,17 +490,36 @@ async fn worker_loop(
 
         let mut local_applied = false;
         if any_ops && result.is_ok() {
-            match ctx
-                .db
-                .write_with_options(
-                    merged,
-                    &WriteOptions {
-                        await_durable: false,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
+            // Complete lease and flush-barrier admission before evicting. The
+            // affected keys then stay uncacheable only across SlateDB's atomic
+            // apply, not while a suspended lease or seal+flush is awaited.
+            let write_result = match ctx.db.acquire_write_permit().await {
+                Ok(permit) => {
+                    let inode_cache_guard = ctx
+                        .inode_store
+                        .invalidate_cache(inode_cache_invalidations.iter().copied());
+                    let directory_cache_guard = ctx
+                        .directory_store
+                        .invalidate_cache(directory_entry_cache_invalidations.iter().cloned());
+
+                    let write_result = permit
+                        .write_with_options(
+                            merged,
+                            &WriteOptions {
+                                await_durable: false,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+
+                    drop(directory_cache_guard);
+                    drop(inode_cache_guard);
+                    write_result
+                }
+                Err(error) => Err(error),
+            };
+
+            match write_result {
                 Ok(slatedb_seq) => {
                     local_applied = true;
                     if let Some(permit) = apply_permit.take() {
@@ -557,6 +587,7 @@ async fn worker_loop(
 mod tests {
     use super::*;
     use crate::fs::ZeroFS;
+    use crate::fs::inode::{Inode, test_file_inode};
     use bytes::Bytes;
 
     /// `DST_PANIC_ON_WRITE_ERROR` is process-global, so fatal-path unit tests
@@ -575,8 +606,97 @@ mod tests {
         ZeroFS::new_in_memory().await.unwrap()
     }
 
+    fn file_size(inode: Option<Inode>) -> Option<u64> {
+        match inode {
+            Some(Inode::File(file)) => Some(file.size),
+            _ => None,
+        }
+    }
+
     fn codec() -> KeyCodec {
         KeyCodec::new()
+    }
+
+    #[tokio::test]
+    async fn inode_commits_invalidate_without_write_through_pollution() {
+        let fs = make_fs().await;
+        assert!(fs.inode_store.cache_enabled());
+        let inode_id = fs.inode_store.allocate();
+
+        let mut create = Transaction::new();
+        fs.inode_store
+            .save(&mut create, inode_id, &test_file_inode(10))
+            .unwrap();
+        fs.write_coordinator.commit(create).await.unwrap();
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), None);
+        assert_eq!(
+            file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
+            Some(10)
+        );
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), Some(10));
+
+        let mut update = Transaction::new();
+        fs.inode_store
+            .save(&mut update, inode_id, &test_file_inode(20))
+            .unwrap();
+        fs.inode_store
+            .save(&mut update, inode_id, &test_file_inode(30))
+            .unwrap();
+        fs.write_coordinator.commit(update).await.unwrap();
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), None);
+        assert_eq!(
+            file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
+            Some(30)
+        );
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), Some(30));
+
+        let mut delete = Transaction::new();
+        fs.inode_store.delete(&mut delete, inode_id);
+        fs.write_coordinator.commit(delete).await.unwrap();
+        assert!(fs.inode_store.cached_inode(inode_id).is_none());
+        assert!(matches!(
+            fs.inode_store.get(inode_id).await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_apply_failure_leaves_the_existing_inode_cache_untouched() {
+        let fs = make_fs().await;
+        let inode_id = fs.inode_store.allocate();
+
+        let mut create = Transaction::new();
+        fs.inode_store
+            .save(&mut create, inode_id, &test_file_inode(10))
+            .unwrap();
+        fs.write_coordinator.commit(create).await.unwrap();
+        assert_eq!(
+            file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
+            Some(10)
+        );
+
+        let seg_key = codec().segcount_key(9, 9);
+        fs.db
+            .put_with_options(
+                &seg_key,
+                b"bogus",
+                &slatedb::config::PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut update = Transaction::new();
+        fs.inode_store
+            .save(&mut update, inode_id, &test_file_inode(99))
+            .unwrap();
+        update.add_seg_delta(&seg_key, 1, 1);
+        fs.write_coordinator.commit(update).await.unwrap_err();
+
+        assert_eq!(file_size(fs.inode_store.cached_inode(inode_id)), Some(10));
+        assert_eq!(
+            file_size(Some(fs.inode_store.get(inode_id).await.unwrap())),
+            Some(10)
+        );
     }
 
     #[tokio::test]
@@ -1023,6 +1143,7 @@ mod tests {
         WriteCoordinator::new(
             fs.db.clone(),
             fs.inode_store.clone(),
+            fs.directory_store.clone(),
             fs.flush_coordinator.clone(),
             Arc::new(KeyCodec::new()),
             fs.global_stats.clone(),

@@ -127,6 +127,8 @@ pub struct StatsDelta {
 /// several transactions into a single merged `WriteBatch` via [`apply_to`].
 pub struct Transaction {
     ops: Vec<TxOp>,
+    inode_cache_invalidations: Vec<u64>,
+    directory_entry_cache_invalidations: Vec<(u64, Bytes)>,
     stats_deltas: Vec<StatsDelta>,
     /// Per-segment counter adjustments (segcount key, `(live_delta, total_delta)`),
     /// aggregated by the commit worker into one absolute `(live, total)` per
@@ -144,6 +146,8 @@ impl Transaction {
     pub fn new() -> Self {
         Self {
             ops: Vec::new(),
+            inode_cache_invalidations: Vec::new(),
+            directory_entry_cache_invalidations: Vec::new(),
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
             extent_ref_guard: None,
@@ -189,6 +193,23 @@ impl Transaction {
         self.ops.push(TxOp::Delete(key.clone()));
     }
 
+    pub(crate) fn invalidate_cached_inode(&mut self, inode_id: u64) {
+        self.inode_cache_invalidations.push(inode_id);
+    }
+
+    pub(crate) fn take_inode_cache_invalidations(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.inode_cache_invalidations)
+    }
+
+    pub(crate) fn invalidate_cached_directory_entry(&mut self, dir_id: u64, name: Bytes) {
+        self.directory_entry_cache_invalidations
+            .push((dir_id, name));
+    }
+
+    pub(crate) fn take_directory_entry_cache_invalidations(&mut self) -> Vec<(u64, Bytes)> {
+        std::mem::take(&mut self.directory_entry_cache_invalidations)
+    }
+
     /// Record a usage-stats adjustment for `inode_id`'s shard, materialized
     /// by the commit worker. No-op deltas are dropped so callers can pass
     /// computed differences unconditionally.
@@ -229,19 +250,9 @@ impl Transaction {
     /// already dedupes per key, so calling this on multiple transactions
     /// produces one merged batch with last-write-wins per key.
     ///
-    /// Only `ops` are applied — `seg_deltas` are the WriteCoordinator worker's job
-    /// (the sole segcount writer, which drains them first). The assert catches any
-    /// path that would commit a seg-delta-bearing txn directly and silently lose it.
+    /// Side channels must be drained by the write coordinator first.
     pub fn apply_to(self, target: &mut WriteBatch) {
-        debug_assert!(
-            self.seg_deltas.is_empty(),
-            "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
-             WriteCoordinator, not into_inner/apply_to"
-        );
-        debug_assert!(
-            self.extent_ref_guard.is_none(),
-            "extent reference guard would be dropped before commit"
-        );
+        self.assert_side_channels_drained();
         for op in self.ops {
             match op {
                 TxOp::Put(k, v) => target.put_bytes(k, v),
@@ -250,20 +261,44 @@ impl Transaction {
         }
     }
 
+    fn assert_side_channels_drained(&self) {
+        assert!(
+            self.inode_cache_invalidations.is_empty(),
+            "inode cache invalidations would be dropped: commit inode mutations through the \
+             WriteCoordinator"
+        );
+        assert!(
+            self.directory_entry_cache_invalidations.is_empty(),
+            "directory-entry cache invalidations would be dropped: commit namespace mutations \
+             through the WriteCoordinator"
+        );
+        assert!(
+            self.stats_deltas.is_empty(),
+            "stats deltas would be dropped: commit a stats-bearing transaction through the \
+             WriteCoordinator"
+        );
+        assert!(
+            self.seg_deltas.is_empty(),
+            "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
+             WriteCoordinator, not into_inner/apply_to"
+        );
+        assert!(
+            self.extent_ref_guard.is_none(),
+            "extent reference guard would be dropped before commit"
+        );
+        assert!(
+            self.dedup_entry.is_none(),
+            "dedup result would be dropped: commit a deduplicated transaction through the \
+             WriteCoordinator"
+        );
+    }
+
     /// Like [`apply_to`](Self::apply_to) but also returns the ops as `ReplOp`s
     /// for shipping. In apply order; replaying in seqno-then-op order on the
     /// standby reproduces the merged batch's last-write-wins result.
     pub fn apply_to_collecting(self, target: &mut WriteBatch) -> Vec<crate::replication::ReplOp> {
         use crate::replication::ReplOp;
-        debug_assert!(
-            self.seg_deltas.is_empty(),
-            "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
-             WriteCoordinator, not apply_to_collecting"
-        );
-        debug_assert!(
-            self.extent_ref_guard.is_none(),
-            "extent reference guard would be dropped before commit"
-        );
+        self.assert_side_channels_drained();
         let mut ops = Vec::with_capacity(self.ops.len());
         for op in self.ops {
             match op {
@@ -304,10 +339,8 @@ pub struct Db {
     /// while invalid so a deposed node never serves stale data. `None` (ungated)
     /// in single-node mode.
     lease: Option<Arc<crate::replication::Lease>>,
-    /// Data db status, read directly on the gate path (not a lagging watcher) so a
-    /// deposition is seen with no lag: SlateDB closes the db (`CloseReason::Fenced`)
-    /// the instant its manifest poll sees a newer writer, and a closed db must
-    /// reject ops with the "not leader" signal a failover client re-routes on.
+    /// Latest data-db status snapshot. A fenced SlateDB handle publishes its
+    /// close reason here; locally initiated close is gated earlier by `closing`.
     status: Option<tokio::sync::watch::Receiver<slatedb::DbStatus>>,
     /// Flush barrier. Every commit takes a read lock; the seal+flush durability
     /// sequence (flush coordinator, segment reclaim) takes the write lock. This
@@ -315,8 +348,31 @@ pub struct Db {
     /// the un-PUT open buffer: a commit that overlaps a flush lands *after* it, so
     /// its pointer is never in the flushed set referencing an un-sealed segment.
     flush_barrier: Arc<tokio::sync::RwLock<()>>,
-    /// Rejects writers released from the flush barrier after final close.
+    /// Rejects cache hits and writers once local close begins.
     closing: AtomicBool,
+}
+
+/// Admission to one database write while holding the flush barrier's read side.
+///
+/// Acquiring the permit performs all potentially blocking lease and flush-barrier
+/// waits. Callers can then establish short-lived cache invalidation windows
+/// immediately before the atomic SlateDB apply.
+#[must_use = "an admitted write must be applied or explicitly abandoned"]
+pub(crate) struct WritePermit<'a> {
+    db: &'a Db,
+    _flush_guard: tokio::sync::RwLockReadGuard<'a, ()>,
+}
+
+impl WritePermit<'_> {
+    pub(crate) async fn write_with_options(
+        self,
+        batch: WriteBatch,
+        options: &WriteOptions,
+    ) -> Result<u64> {
+        let result = self.db.write_admitted(batch, options).await;
+        drop(self);
+        result
+    }
 }
 
 impl Db {
@@ -362,10 +418,17 @@ impl Db {
     /// Check current serving authority.
     #[inline]
     fn check_lease(&self) -> Result<()> {
+        self.check_serving_authority().map_err(Into::into)
+    }
+
+    /// Enforce the HA gate for reads satisfied without touching SlateDB.
+    #[inline]
+    pub(crate) fn check_serving_authority(&self) -> Result<(), FsError> {
         if self.is_deposed() {
-            return Err(FsError::LeaderLeaseExpired.into());
+            Err(FsError::LeaderLeaseExpired)
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Wait through recoverable suspension for admitted or durability work.
@@ -387,7 +450,7 @@ impl Db {
 
     #[inline]
     fn check_closing(&self) -> Result<()> {
-        if self.closing.load(Ordering::Relaxed) {
+        if self.closing.load(Ordering::Acquire) {
             return Err(FsError::ShuttingDown.into());
         }
         Ok(())
@@ -395,7 +458,7 @@ impl Db {
 
     /// Called under the flush barrier's write lock immediately before close.
     pub fn mark_closing(&self) {
-        self.closing.store(true, Ordering::Relaxed);
+        self.closing.store(true, Ordering::Release);
     }
 
     /// Whether a protocol adapter may emit a successful response.
@@ -423,6 +486,9 @@ impl Db {
     /// db has been closed (fenced by a takeover).
     #[inline]
     fn is_deposed(&self) -> bool {
+        if self.closing.load(Ordering::Acquire) {
+            return true;
+        }
         if let Some(lease) = &self.lease
             && !lease.is_valid()
         {
@@ -444,6 +510,22 @@ impl Db {
         self.get_bytes_at(key, DurabilityLevel::Memory).await
     }
 
+    /// Point read for commit-worker internal work.
+    ///
+    /// Unlike a serving read, this waits through a recoverable lease
+    /// suspension. Commit preparation uses it before write admission so a
+    /// temporary authority gap does not turn a safe retry into an I/O error.
+    pub(crate) async fn get_bytes_internal(&self, key: &Bytes) -> Result<Option<Bytes>> {
+        self.check_internal_lease().await?;
+        self.check_closing()?;
+        let result = self
+            .get_bytes_at_unchecked(key, DurabilityLevel::Memory)
+            .await?;
+        self.check_internal_lease().await?;
+        self.check_closing()?;
+        Ok(result)
+    }
+
     /// Point read seeing only object-storage-durable data.
     pub async fn get_bytes_durable(&self, key: &Bytes) -> Result<Option<Bytes>> {
         self.get_bytes_at(key, DurabilityLevel::Remote).await
@@ -455,6 +537,19 @@ impl Db {
         durability_filter: DurabilityLevel,
     ) -> Result<Option<Bytes>> {
         self.check_lease()?;
+        let result = self.get_bytes_at_unchecked(key, durability_filter).await?;
+
+        // Do not publish a point-read result obtained across serving-authority
+        // loss. Cache loaders rely on this check before admitting the value.
+        self.check_lease()?;
+        Ok(result)
+    }
+
+    async fn get_bytes_at_unchecked(
+        &self,
+        key: &Bytes,
+        durability_filter: DurabilityLevel,
+    ) -> Result<Option<Bytes>> {
         let read_options = ReadOptions {
             durability_filter,
             cache_blocks: true,
@@ -468,7 +563,6 @@ impl Db {
                 reader.get_with_options(key, &read_options).await?
             }
         };
-
         Ok(result)
     }
 
@@ -585,17 +679,31 @@ impl Db {
         batch: WriteBatch,
         options: &WriteOptions,
     ) -> Result<u64> {
+        self.acquire_write_permit()
+            .await?
+            .write_with_options(batch, options)
+            .await
+    }
+
+    /// Complete the potentially blocking admission phase for a database write.
+    pub(crate) async fn acquire_write_permit(&self) -> Result<WritePermit<'_>> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
         self.check_internal_lease().await?;
         // Read side of the flush barrier: a commit overlapping a seal+flush waits
         // for it, so its pointer lands after the flush, never in the flushed set.
-        let _flush_guard = self.flush_barrier.read().await;
+        let flush_guard = self.flush_barrier.read().await;
         // Recheck authority after waiting on the flush barrier.
         self.check_internal_lease().await?;
         self.check_closing()?;
+        Ok(WritePermit {
+            db: self,
+            _flush_guard: flush_guard,
+        })
+    }
 
+    async fn write_admitted(&self, batch: WriteBatch, options: &WriteOptions) -> Result<u64> {
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => match db.write_with_options(batch, options).await {
                 Ok(handle) => Ok(handle.seqnum()),
@@ -829,6 +937,7 @@ impl Db {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.mark_closing();
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
                 if let Err(e) = db.close().await {
@@ -982,6 +1091,18 @@ mod lease_gate_tests {
             db.get_bytes(&key).await.unwrap(),
             Some(Bytes::from_static(b"v"))
         );
+
+        // Internal commit preparation waits through the same recoverable
+        // suspension instead of inheriting the fail-fast serving-read gate.
+        lease.suspend_for_tests();
+        let internal_read = db.get_bytes_internal(&key);
+        tokio::pin!(internal_read);
+        assert!(matches!(
+            futures::poll!(internal_read.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(lease.recover_for_tests(Duration::from_millis(500)));
+        assert_eq!(internal_read.await.unwrap(), Some(Bytes::from_static(b"v")));
 
         lease.suspend_for_tests();
         let flush = db.flush();

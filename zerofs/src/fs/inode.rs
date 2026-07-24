@@ -249,6 +249,25 @@ pub enum Inode {
     BlockDevice(SpecialInode),
 }
 
+#[cfg(test)]
+pub(crate) fn test_file_inode(size: u64) -> Inode {
+    Inode::File(FileInode {
+        size,
+        mtime: 1,
+        mtime_nsec: 0,
+        ctime: 1,
+        ctime_nsec: 0,
+        atime: 1,
+        atime_nsec: 0,
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        parent: Some(0),
+        name: Some(b"cached".to_vec()),
+        nlink: 1,
+    })
+}
+
 impl InodeAttrs for Inode {
     fn uid(&self) -> u32 {
         match self {

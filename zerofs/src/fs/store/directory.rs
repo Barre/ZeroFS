@@ -2,6 +2,7 @@ use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
+use crate::fs::store::read_cache::{InvalidationGuard, MetadataCache};
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
@@ -85,29 +86,31 @@ pub struct DirEntryInfo {
     pub inode: Option<Inode>,
 }
 
-const ENTRY_CACHE_CAPACITY: usize = 64 * 1024;
+const ENTRY_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+type EntryCacheKey = (InodeId, Bytes);
+type EntryCacheValue = (InodeId, u64);
+type DirectoryEntryCache = MetadataCache<EntryCacheKey, EntryCacheValue>;
+
+fn entry_cache_weight(key: &EntryCacheKey, _: &EntryCacheValue) -> usize {
+    std::mem::size_of::<EntryCacheKey>() + key.1.len() + std::mem::size_of::<EntryCacheValue>()
+}
 
 #[derive(Clone)]
 pub struct DirectoryStore {
     db: Arc<Db>,
     key_codec: Arc<KeyCodec>,
-    /// Cache of (dir_id, name) -> (entry inode id, cookie), sparing
-    /// `update_inode_in_entry` a database point-get on every file write. A
-    /// cookie is immutable for the life of its entry, so coherence only
-    /// requires that inserts and invalidations are ordered against entry
-    /// mutations; both happen exclusively under the entry inode's lock (see
-    /// `update_inode_in_entry`). Unlocked readers (the prelock lookups in
-    /// remove/rename) must never populate this cache: they can read
-    /// pre-commit state and would re-insert a value another task just
-    /// invalidated, defeating the under-lock re-verification.
-    entry_cache: foyer::Cache<(InodeId, Bytes), (InodeId, u64)>,
+    entry_cache: DirectoryEntryCache,
 }
 
 impl DirectoryStore {
     pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>) -> Self {
-        let entry_cache = foyer::CacheBuilder::new(ENTRY_CACHE_CAPACITY)
-            .with_name("zerofs-dir-entry-cache")
-            .build();
+        let entry_cache = DirectoryEntryCache::new(
+            db.clone(),
+            ENTRY_CACHE_BYTES,
+            "zerofs-dir-entry-cache",
+            entry_cache_weight,
+        );
         Self {
             db,
             key_codec,
@@ -116,17 +119,22 @@ impl DirectoryStore {
     }
 
     pub async fn get(&self, dir_id: InodeId, name: &[u8]) -> Result<InodeId, FsError> {
+        self.get_entry_with_cookie(dir_id, name)
+            .await
+            .map(|(inode_id, _)| inode_id)
+    }
+
+    async fn load_entry(&self, dir_id: InodeId, name: &[u8]) -> Result<EntryCacheValue, FsError> {
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
 
         let entry_data = self
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| FsError::IoError)?
+            .map_err(|error| FsError::from_db_error(&error))?
             .ok_or(FsError::NotFound)?;
 
-        let (inode_id, _cookie) = KeyCodec::decode_dir_entry(&entry_data)?;
-        Ok(inode_id)
+        KeyCodec::decode_dir_entry(&entry_data)
     }
 
     pub async fn allocate_cookie(
@@ -166,15 +174,21 @@ impl DirectoryStore {
     }
 
     pub async fn exists(&self, dir_id: InodeId, name: &[u8]) -> Result<bool, FsError> {
-        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
+        let cache_key = (dir_id, Bytes::copy_from_slice(name));
+        if self.entry_cache.get(&cache_key)?.is_some() {
+            return Ok(true);
+        }
 
-        let result = self
+        // Malformed values still represent existing keys.
+        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
+        let exists = self
             .db
             .get_bytes(&entry_key)
             .await
-            .map_err(|_| FsError::IoError)?;
-
-        Ok(result.is_some())
+            .map(|entry| entry.is_some())
+            .map_err(|error| FsError::from_db_error(&error))?;
+        self.db.check_serving_authority()?;
+        Ok(exists)
     }
 
     pub async fn list(
@@ -285,11 +299,9 @@ impl DirectoryStore {
         cookie: u64,
         inode: Option<&Inode>,
     ) {
-        self.entry_cache
-            .remove(&(dir_id, Bytes::copy_from_slice(name)));
-
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
+        txn.invalidate_cached_directory_entry(dir_id, Bytes::copy_from_slice(name));
 
         let scan_value = match inode {
             Some(inode) => DirScanValueRef::WithInode {
@@ -304,11 +316,9 @@ impl DirectoryStore {
     }
 
     pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
-        self.entry_cache
-            .remove(&(dir_id, Bytes::copy_from_slice(name)));
-
         let entry_key = self.key_codec.dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
+        txn.invalidate_cached_directory_entry(dir_id, Bytes::copy_from_slice(name));
 
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
         txn.delete_bytes(&scan_key);
@@ -324,28 +334,32 @@ impl DirectoryStore {
         dir_id: InodeId,
         name: &[u8],
     ) -> Result<(InodeId, u64), FsError> {
-        let entry_key = self.key_codec.dir_entry_key(dir_id, name);
-
-        let entry_data = self
-            .db
-            .get_bytes(&entry_key)
+        let key = (dir_id, Bytes::copy_from_slice(name));
+        self.entry_cache
+            .get_or_load(key, || self.load_entry(dir_id, name))
             .await
-            .map_err(|_| FsError::IoError)?
-            .ok_or(FsError::NotFound)?;
+    }
 
-        KeyCodec::decode_dir_entry(&entry_data)
+    pub(crate) fn invalidate_cache(
+        &self,
+        keys: impl IntoIterator<Item = EntryCacheKey>,
+    ) -> InvalidationGuard<EntryCacheKey, EntryCacheValue> {
+        self.entry_cache.invalidate(keys)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_entry(&self, dir_id: InodeId, name: &[u8]) -> Option<(InodeId, u64)> {
+        self.entry_cache
+            .peek(&(dir_id, Bytes::copy_from_slice(name)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_enabled(&self) -> bool {
+        self.entry_cache.is_enabled()
     }
 
     /// Update the embedded inode in a directory scan entry.
     /// Used when inode attributes change (write, setattr, etc.).
-    ///
-    /// Every caller holds `inode_id`'s lock, and so does every mutator of the
-    /// entry (remove and rename lock the entry's inode), which is what lets
-    /// the cookie be served from `entry_cache`: inserts here and the
-    /// invalidations in `add`/`unlink_entry` are serialized by that lock. The
-    /// cache is only trusted (and only populated) when the entry actually
-    /// points at `inode_id`; any mismatch falls back to the database read,
-    /// preserving the uncached behavior.
     pub async fn update_inode_in_entry(
         &self,
         txn: &mut Transaction,
@@ -354,24 +368,7 @@ impl DirectoryStore {
         inode_id: InodeId,
         inode: &Inode,
     ) -> Result<(), FsError> {
-        let cache_key = (dir_id, Bytes::copy_from_slice(name));
-        let cached_cookie = self
-            .entry_cache
-            .get(&cache_key)
-            .map(|entry| *entry.value())
-            .filter(|&(entry_id, _)| entry_id == inode_id)
-            .map(|(_, cookie)| cookie);
-
-        let cookie = match cached_cookie {
-            Some(cookie) => cookie,
-            None => {
-                let (entry_id, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
-                if entry_id == inode_id {
-                    self.entry_cache.insert(cache_key, (entry_id, cookie));
-                }
-                cookie
-            }
-        };
+        let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
 
         let scan_value = DirScanValueRef::WithInode { inode_id, inode };
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
@@ -395,5 +392,296 @@ impl DirectoryStore {
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::ZeroFS;
+    use crate::fs::inode::test_file_inode;
+    use crate::fs::store::InodeStore;
+    use crate::replication::Lease;
+    use futures::TryStreamExt;
+    use slatedb::config::{PutOptions, WriteOptions};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn commits_invalidate_entries_without_write_through_pollution() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        assert!(fs.directory_store.cache_enabled());
+
+        let mut create = Transaction::new();
+        fs.directory_store
+            .add(&mut create, 0, b"name", 10, COOKIE_FIRST_ENTRY, None);
+        fs.write_coordinator.commit(create).await.unwrap();
+        assert_eq!(fs.directory_store.cached_entry(0, b"name"), None);
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((10, COOKIE_FIRST_ENTRY))
+        );
+        assert_eq!(
+            fs.directory_store.cached_entry(0, b"name"),
+            Some((10, COOKIE_FIRST_ENTRY))
+        );
+
+        let mut replace = Transaction::new();
+        fs.directory_store
+            .unlink_entry(&mut replace, 0, b"name", COOKIE_FIRST_ENTRY);
+        fs.directory_store
+            .add(&mut replace, 0, b"name", 20, 7, None);
+        fs.write_coordinator.commit(replace).await.unwrap();
+        assert_eq!(fs.directory_store.cached_entry(0, b"name"), None);
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((20, 7))
+        );
+
+        let mut unlink = Transaction::new();
+        fs.directory_store.unlink_entry(&mut unlink, 0, b"name", 7);
+        fs.write_coordinator.commit(unlink).await.unwrap();
+        assert!(fs.directory_store.cached_entry(0, b"name").is_none());
+        assert_eq!(
+            fs.directory_store.get(0, b"name").await,
+            Err(FsError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_apply_failure_leaves_the_existing_entry_cache_untouched() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let mut create = Transaction::new();
+        fs.directory_store
+            .add(&mut create, 0, b"name", 10, COOKIE_FIRST_ENTRY, None);
+        fs.write_coordinator.commit(create).await.unwrap();
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((10, COOKIE_FIRST_ENTRY))
+        );
+
+        let codec = KeyCodec::new();
+        let seg_key = codec.segcount_key(13, 13);
+        fs.db
+            .put_with_options(
+                &seg_key,
+                b"bogus",
+                &PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut replace = Transaction::new();
+        fs.directory_store
+            .add(&mut replace, 0, b"name", 99, 9, None);
+        replace.add_seg_delta(&seg_key, 1, 1);
+        fs.write_coordinator.commit(replace).await.unwrap_err();
+
+        assert_eq!(
+            fs.directory_store.cached_entry(0, b"name"),
+            Some((10, COOKIE_FIRST_ENTRY))
+        );
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((10, COOKIE_FIRST_ENTRY))
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_and_readdir_agree_after_apply_before_invalidation_ends() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let mut create = Transaction::new();
+        fs.directory_store
+            .add(&mut create, 0, b"name", 10, COOKIE_FIRST_ENTRY, None);
+        fs.write_coordinator.commit(create).await.unwrap();
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((10, COOKIE_FIRST_ENTRY))
+        );
+
+        let cache_key = (0, Bytes::from_static(b"name"));
+        let cache_guard = fs.directory_store.invalidate_cache([cache_key]);
+
+        let codec = KeyCodec::new();
+        let mut batch = slatedb::WriteBatch::new();
+        batch.put_bytes(
+            codec.dir_entry_key(0, b"name"),
+            KeyCodec::encode_dir_entry(20, COOKIE_FIRST_ENTRY),
+        );
+        batch.put_bytes(
+            codec.dir_scan_key(0, COOKIE_FIRST_ENTRY),
+            encode_dir_scan_value(b"name", &DirScanValueRef::Reference { inode_id: 20 }),
+        );
+        fs.db
+            .write_with_options(batch, &WriteOptions::default())
+            .await
+            .unwrap();
+
+        let entries: Vec<_> = fs
+            .directory_store
+            .list(0)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inode_id, 20);
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((20, COOKIE_FIRST_ENTRY))
+        );
+        assert_eq!(
+            fs.directory_store.cached_entry(0, b"name"),
+            None,
+            "loads cannot refill while the database apply is being published"
+        );
+
+        drop(cache_guard);
+        assert_eq!(
+            fs.directory_store.get_entry_with_cookie(0, b"name").await,
+            Ok((20, COOKIE_FIRST_ENTRY))
+        );
+    }
+
+    #[tokio::test]
+    async fn exists_checks_raw_presence_without_decoding_the_entry() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let key = KeyCodec::new().dir_entry_key(0, b"corrupt");
+        fs.db
+            .put_with_options(&key, b"x", &PutOptions::default(), &WriteOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(fs.directory_store.exists(0, b"corrupt").await, Ok(true));
+        assert!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"corrupt")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_is_refused_after_serving_authority_is_lost() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let raw_db = Arc::new(
+            slatedb::DbBuilder::new(
+                slatedb::object_store::path::Path::from("cache-authority-test"),
+                object_store,
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let lease = Lease::new();
+        lease.renew(Duration::from_secs(60));
+        let db = Arc::new(Db::new(raw_db, None).with_lease(lease.clone()));
+        let codec = Arc::new(KeyCodec::new());
+        let inode_store = InodeStore::new(db.clone(), codec.clone(), 2);
+        let directory_store = DirectoryStore::new(db.clone(), codec.clone());
+        let inode_id = 1;
+        let inode = test_file_inode(10);
+
+        db.put_with_options(
+            &codec.inode_key(inode_id),
+            &bincode::serialize(&inode).unwrap(),
+            &PutOptions::default(),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            &codec.dir_entry_key(0, b"cached"),
+            &KeyCodec::encode_dir_entry(inode_id, COOKIE_FIRST_ENTRY),
+            &PutOptions::default(),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            inode_store.get(inode_id).await,
+            Ok(Inode::File(file)) if file.size == 10
+        ));
+        assert_eq!(
+            directory_store.get_entry_with_cookie(0, b"cached").await,
+            Ok((inode_id, COOKIE_FIRST_ENTRY))
+        );
+        assert_eq!(
+            directory_store.cached_entry(0, b"cached"),
+            Some((inode_id, COOKIE_FIRST_ENTRY))
+        );
+
+        lease.revoke();
+
+        assert!(matches!(
+            inode_store.get(inode_id).await,
+            Err(FsError::LeaderLeaseExpired)
+        ));
+        assert_eq!(
+            directory_store.get_entry_with_cookie(0, b"cached").await,
+            Err(FsError::LeaderLeaseExpired)
+        );
+        assert_eq!(
+            directory_store.exists(0, b"cached").await,
+            Err(FsError::LeaderLeaseExpired)
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_is_refused_after_database_close() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let raw_db = Arc::new(
+            slatedb::DbBuilder::new(
+                slatedb::object_store::path::Path::from("cache-close-test"),
+                object_store,
+            )
+            .build()
+            .await
+            .unwrap(),
+        );
+        let db = Arc::new(Db::new(raw_db, None));
+        let codec = Arc::new(KeyCodec::new());
+        let inode_store = InodeStore::new(db.clone(), codec.clone(), 2);
+        let directory_store = DirectoryStore::new(db.clone(), codec.clone());
+        let inode_id = 1;
+        let inode = test_file_inode(10);
+
+        db.put_with_options(
+            &codec.inode_key(inode_id),
+            &bincode::serialize(&inode).unwrap(),
+            &PutOptions::default(),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+        db.put_with_options(
+            &codec.dir_entry_key(0, b"cached"),
+            &KeyCodec::encode_dir_entry(inode_id, COOKIE_FIRST_ENTRY),
+            &PutOptions::default(),
+            &WriteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        inode_store.get(inode_id).await.unwrap();
+        directory_store
+            .get_entry_with_cookie(0, b"cached")
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        assert!(matches!(
+            inode_store.get(inode_id).await,
+            Err(FsError::LeaderLeaseExpired)
+        ));
+        assert_eq!(
+            directory_store.get_entry_with_cookie(0, b"cached").await,
+            Err(FsError::LeaderLeaseExpired)
+        );
     }
 }
