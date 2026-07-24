@@ -2,6 +2,7 @@ pub mod directory;
 pub mod extent;
 pub mod inode;
 pub mod orphan;
+mod read_cache;
 pub mod tombstone;
 
 pub use directory::DirectoryStore;

@@ -2,25 +2,51 @@ use crate::db::{Db, Transaction};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeAttrs, InodeId};
 use crate::fs::key_codec::KeyCodec;
+use crate::fs::store::read_cache::{InvalidationGuard, MetadataCache};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_HARDLINKS_PER_INODE: u32 = u32::MAX;
 
+const INODE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+type InodeCache = MetadataCache<InodeId, Inode>;
+
+fn inode_cache_weight(_: &InodeId, inode: &Inode) -> usize {
+    let allocated = match inode {
+        Inode::File(inode) => inode.name.as_ref().map_or(0, Vec::len),
+        Inode::Directory(inode) => inode.name.as_ref().map_or(0, Vec::len),
+        Inode::Symlink(inode) => inode.target.len() + inode.name.as_ref().map_or(0, Vec::len),
+        Inode::Fifo(inode)
+        | Inode::Socket(inode)
+        | Inode::CharDevice(inode)
+        | Inode::BlockDevice(inode) => inode.name.as_ref().map_or(0, Vec::len),
+    };
+    std::mem::size_of::<InodeId>() + std::mem::size_of::<Inode>() + allocated
+}
+
 #[derive(Clone)]
 pub struct InodeStore {
     db: Arc<Db>,
     key_codec: Arc<KeyCodec>,
     next_id: Arc<AtomicU64>,
+    cache: InodeCache,
 }
 
 impl InodeStore {
     pub fn new(db: Arc<Db>, key_codec: Arc<KeyCodec>, initial_next_id: u64) -> Self {
+        let cache = InodeCache::new(
+            db.clone(),
+            INODE_CACHE_BYTES,
+            "zerofs-inode-cache",
+            inode_cache_weight,
+        );
         Self {
             db,
             key_codec,
             next_id: Arc::new(AtomicU64::new(initial_next_id)),
+            cache,
         }
     }
 
@@ -33,6 +59,10 @@ impl InodeStore {
     }
 
     pub async fn get(&self, id: InodeId) -> Result<Inode, FsError> {
+        self.cache.get_or_load(id, || self.load(id)).await
+    }
+
+    async fn load(&self, id: InodeId) -> Result<Inode, FsError> {
         let key = self.key_codec.inode_key(id);
 
         let data = self
@@ -40,12 +70,17 @@ impl InodeStore {
             .get_bytes(&key)
             .await
             .map_err(|e| {
-                tracing::error!(
-                    "InodeStore::get({}): database get_bytes failed: {:?}",
-                    id,
-                    e
-                );
-                FsError::IoError
+                let error = FsError::from_db_error(&e);
+                if matches!(error, FsError::LeaderLeaseExpired | FsError::ShuttingDown) {
+                    tracing::debug!("InodeStore::get({id}): serving authority lost");
+                } else {
+                    tracing::error!(
+                        "InodeStore::get({}): database get_bytes failed: {:?}",
+                        id,
+                        e
+                    );
+                }
+                error
             })?
             .ok_or_else(|| {
                 // A missing inode is a normal ENOENT (a stat or deferred flush
@@ -69,6 +104,23 @@ impl InodeStore {
         })
     }
 
+    pub(crate) fn invalidate_cache(
+        &self,
+        inode_ids: impl IntoIterator<Item = InodeId>,
+    ) -> InvalidationGuard<InodeId, Inode> {
+        self.cache.invalidate(inode_ids)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_inode(&self, inode_id: InodeId) -> Option<Inode> {
+        self.cache.peek(&inode_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_enabled(&self) -> bool {
+        self.cache.is_enabled()
+    }
+
     pub fn save(
         &self,
         txn: &mut Transaction,
@@ -76,14 +128,16 @@ impl InodeStore {
         inode: &Inode,
     ) -> Result<(), Box<bincode::ErrorKind>> {
         let key = self.key_codec.inode_key(id);
-        let data = bincode::serialize(inode)?;
-        txn.put_bytes(&key, Bytes::from(data));
+        let data = Bytes::from(bincode::serialize(inode)?);
+        txn.put_bytes(&key, data);
+        txn.invalidate_cached_inode(id);
         Ok(())
     }
 
     pub fn delete(&self, txn: &mut Transaction, id: InodeId) {
         let key = self.key_codec.inode_key(id);
         txn.delete_bytes(&key);
+        txn.invalidate_cached_inode(id);
     }
 
     /// Resolve inode ID to full path components by walking parent chain.

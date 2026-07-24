@@ -210,6 +210,7 @@ impl ZeroFS {
         let write_coordinator = WriteCoordinator::new(
             db.clone(),
             inode_store.clone(),
+            directory_store.clone(),
             flush_coordinator.clone(),
             key_codec.clone(),
             global_stats.clone(),
@@ -519,6 +520,14 @@ mod tests {
         drop(fs_rw);
 
         let fs_ro = ZeroFS::new_in_memory_read_only(object_store).await.unwrap();
+        assert!(
+            !fs_ro.inode_store.cache_enabled(),
+            "read-only readers need manifest-refresh invalidation before inode caching is safe"
+        );
+        assert!(
+            !fs_ro.directory_store.cache_enabled(),
+            "read-only readers need manifest-refresh invalidation before entry caching is safe"
+        );
 
         let root_inode = fs_ro.inode_store.get(0).await.unwrap();
         assert!(matches!(root_inode, Inode::Directory(_)));
