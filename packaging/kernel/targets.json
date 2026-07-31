@@ -283,8 +283,8 @@
     {
       "id": "debian-13-backports-7.0.13",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "debian-13-backports-amd64-x86-64",
       "package_revision": "1",
       "kernel_release": "7.0.13+deb13-amd64",
@@ -301,8 +301,8 @@
     {
       "id": "debian-13-backports-7.0.13-aarch64",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "debian-13-backports-arm64-aarch64",
       "package_revision": "1",
       "kernel_release": "7.0.13+deb13-arm64",
@@ -319,8 +319,8 @@
     {
       "id": "fedora-43-7.1.5-100",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-43-kernel-core-x86-64",
       "package_revision": "1",
       "kernel_release": "7.1.5-100.fc43.x86_64",
@@ -348,8 +348,8 @@
     {
       "id": "fedora-43-7.1.5-100-aarch64",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-43-kernel-core-aarch64",
       "package_revision": "1",
       "kernel_release": "7.1.5-100.fc43.aarch64",
@@ -377,8 +377,8 @@
     {
       "id": "fedora-44-7.1.5-200",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-44-kernel-core-x86-64",
       "package_revision": "1",
       "kernel_release": "7.1.5-200.fc44.x86_64",
@@ -406,8 +406,8 @@
     {
       "id": "fedora-44-7.1.5-200-aarch64",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-44-kernel-core-aarch64",
       "package_revision": "1",
       "kernel_release": "7.1.5-200.fc44.aarch64",
@@ -435,8 +435,8 @@
     {
       "id": "tumbleweed-20260724-7.1.4-default",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "opensuse-tumbleweed-default-x86-64",
       "package_revision": "1",
       "kernel_release": "7.1.4-1-default",
@@ -448,6 +448,176 @@
         "kind": "opensuse-history",
         "identity": "kernel-default@7.1.4-1.1,kernel-default-devel@7.1.4-1.1,kernel-devel@7.1.4-1.1,kernel-source@7.1.4-1.1,kernel-syms@7.1.4-1.1",
         "snapshot": "20260724"
+      }
+    },
+    {
+      "id": "debian-13-backports-amd64-x86-64-7.1.3-deb13-amd64-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "debian-13-backports-amd64-x86-64",
+      "package_revision": "2",
+      "kernel_release": "7.1.3+deb13-amd64",
+      "kernel_package_name": "linux-image-7.1.3+deb13-amd64",
+      "kernel_package_version": "7.1.3-1~bpo13+1",
+      "kernel_selector_version": "7.1.3-1~bpo13+1",
+      "builder_image": "debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "debian:linux@7.1.3-1~bpo13+1:trixie-backports",
+        "snapshot": "20260731T193826Z"
+      }
+    },
+    {
+      "id": "debian-13-backports-arm64-aarch64-7.1.3-deb13-arm64-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "debian-13-backports-arm64-aarch64",
+      "package_revision": "2",
+      "kernel_release": "7.1.3+deb13-arm64",
+      "kernel_package_name": "linux-image-7.1.3+deb13-arm64",
+      "kernel_package_version": "7.1.3-1~bpo13+1",
+      "kernel_selector_version": "7.1.3-1~bpo13+1",
+      "builder_image": "debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "debian:linux@7.1.3-1~bpo13+1:trixie-backports",
+        "snapshot": "20260731T193826Z"
+      }
+    },
+    {
+      "id": "fedora-43-kernel-core-aarch64-7.1.5-101.fc43.aarch64-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-43-kernel-core-aarch64",
+      "package_revision": "2",
+      "kernel_release": "7.1.5-101.fc43.aarch64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-101.fc43.aarch64",
+      "kernel_selector_version": "7.1.5-101.fc43",
+      "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-101.fc43",
+        "snapshot": "koji-signed-build:c6e7f081cf80e13146676e88829b606631645531:aarch64,noarch,src",
+        "artifacts": {
+          "cargo-1.96.1-1.fc43.aarch64.rpm": "f827792193dd7a571b9dc1a425144cb4adfe06b147acc320cc02b65dd00370d7",
+          "kernel-7.1.5-101.fc43.src.rpm": "827e3478a9f8bcbc0a3c2c618e30ac4a4e26903e876d23ac8b776e00334a620f",
+          "kernel-core-7.1.5-101.fc43.aarch64.rpm": "8026208f7998f087105e4455f9f49d1ec0917c1c8c25d81601e16a4b916e0452",
+          "kernel-devel-7.1.5-101.fc43.aarch64.rpm": "1ccd137bc825c6d179ee3d9588fb2f8018b946e2f792b4c276faaa114c860bb1",
+          "kernel-modules-core-7.1.5-101.fc43.aarch64.rpm": "58290c26a9c4f6680dd4cf9b7fb03f611fa336f7dc6543019864cf733b2f8112",
+          "rust-1.96.1-1.fc43.aarch64.rpm": "3ea32a1be6fd2be2677465ba29601cc74ab54b7edad57362b720765268cc3899",
+          "rust-src-1.96.1-1.fc43.noarch.rpm": "f8adfae31928def18d06eee27fa23117eefcf180491e8b09b08a75283ed81ddb",
+          "rust-std-static-1.96.1-1.fc43.aarch64.rpm": "d770ca294c77558bce6afdd15478fd65e044801b3d28f862b1a4389f754455a6",
+          "rustfmt-1.96.1-1.fc43.aarch64.rpm": "6ae2c78437fbcf57d294d543419b753dad4d3965a29a505f5333244d4b269520"
+        }
+      }
+    },
+    {
+      "id": "fedora-43-kernel-core-x86-64-7.1.5-101.fc43.x86-64-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-43-kernel-core-x86-64",
+      "package_revision": "2",
+      "kernel_release": "7.1.5-101.fc43.x86_64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-101.fc43.x86_64",
+      "kernel_selector_version": "7.1.5-101.fc43",
+      "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-101.fc43",
+        "snapshot": "koji-signed-build:c6e7f081cf80e13146676e88829b606631645531:x86_64,noarch,src",
+        "artifacts": {
+          "cargo-1.96.1-1.fc43.x86_64.rpm": "9a2307c4a14672087ce8a931fe6751ff10784a793df2926ee1069021906acc94",
+          "kernel-7.1.5-101.fc43.src.rpm": "827e3478a9f8bcbc0a3c2c618e30ac4a4e26903e876d23ac8b776e00334a620f",
+          "kernel-core-7.1.5-101.fc43.x86_64.rpm": "6ac0a271d09d030c5dd5fd63683095cad1874d6d54aefdf3351b3ac2621c342a",
+          "kernel-devel-7.1.5-101.fc43.x86_64.rpm": "fae0273425fffb4a28b9fc150f6595ff2d6f61c1ed327f2be5a4734069a2a7d6",
+          "kernel-modules-core-7.1.5-101.fc43.x86_64.rpm": "b2a46ff397ea689e188cbaea413fd9ed93a2020d0ef9eddde9dd5c478d95e3fc",
+          "rust-1.96.1-1.fc43.x86_64.rpm": "c1a58a8493972ea6f32ddf1ebaa9f29508d6e08827ee0d863a656147e3045464",
+          "rust-src-1.96.1-1.fc43.noarch.rpm": "f8adfae31928def18d06eee27fa23117eefcf180491e8b09b08a75283ed81ddb",
+          "rust-std-static-1.96.1-1.fc43.x86_64.rpm": "f4baa44d4d0531a9cda934833722b61a738458448bdc338e864349a2f900876d",
+          "rustfmt-1.96.1-1.fc43.x86_64.rpm": "99a45838f14caf74be4d43435904d9845c6d181b166f524db81b88583c13d1f9"
+        }
+      }
+    },
+    {
+      "id": "fedora-44-kernel-core-aarch64-7.1.5-201.fc44.aarch64-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-44-kernel-core-aarch64",
+      "package_revision": "2",
+      "kernel_release": "7.1.5-201.fc44.aarch64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-201.fc44.aarch64",
+      "kernel_selector_version": "7.1.5-201.fc44",
+      "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-201.fc44",
+        "snapshot": "koji-signed-build:36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6:aarch64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc44.aarch64.rpm": "b9a5e2a583693fd5a1a9c78270d3dc40cf46326e7f92636e46b5c36b82ff3a5f",
+          "kernel-7.1.5-201.fc44.src.rpm": "797d5b83eeef488712a5303a993f689a3d4be7a407484bfdc15c06a145d50e61",
+          "kernel-core-7.1.5-201.fc44.aarch64.rpm": "1db5ee4eee608f228bf57b8bfd7190643a9d499ec4ed0fb4c174cd44ea3cbda1",
+          "kernel-devel-7.1.5-201.fc44.aarch64.rpm": "889274b2367d4c0dfd5f877cdd84c315809e08f4ee2434a1d03a31bda4c72e05",
+          "kernel-modules-core-7.1.5-201.fc44.aarch64.rpm": "a69f100a4a868948b124356df1d1f2b765d7f59214a89da16d9064adf4c26f1a",
+          "rust-1.97.1-1.fc44.aarch64.rpm": "c04ef4cf7e712aae73933c624eac33a2a54c0368d28af4467c6928557cf16350",
+          "rust-src-1.97.1-1.fc44.noarch.rpm": "e8730ab6cb13f46604929b1ce134431ac40d1446a95cef04edfbe3d97093554f",
+          "rust-std-static-1.97.1-1.fc44.aarch64.rpm": "5ea7fe6ad90d99ff45fedab6d37e510920d677f86b9998ea821678eb429e534e",
+          "rustfmt-1.97.1-1.fc44.aarch64.rpm": "313cfefe6f14d0e4d3836ff2916f6e75d5ff0c63e062bdf0e3f905d3f0a0d418"
+        }
+      }
+    },
+    {
+      "id": "fedora-44-kernel-core-x86-64-7.1.5-201.fc44.x86-64-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-44-kernel-core-x86-64",
+      "package_revision": "2",
+      "kernel_release": "7.1.5-201.fc44.x86_64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-201.fc44.x86_64",
+      "kernel_selector_version": "7.1.5-201.fc44",
+      "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-201.fc44",
+        "snapshot": "koji-signed-build:36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6:x86_64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc44.x86_64.rpm": "b9931f7a3c140fa9f33df4410a92724a5e9824808592967961e3cfcea19f56b7",
+          "kernel-7.1.5-201.fc44.src.rpm": "797d5b83eeef488712a5303a993f689a3d4be7a407484bfdc15c06a145d50e61",
+          "kernel-core-7.1.5-201.fc44.x86_64.rpm": "acda40f03f35671423d439c501ebec872f5a9b376a272d458619a5130259b251",
+          "kernel-devel-7.1.5-201.fc44.x86_64.rpm": "925d7d85c000f2e57352e903500b497c3814b5dd2660c414c2af80e78824c5e7",
+          "kernel-modules-core-7.1.5-201.fc44.x86_64.rpm": "7d4edf8d4505b67d2a041aabc5d78a5816bd56304dd78cb52131cf48cca45bd3",
+          "rust-1.97.1-1.fc44.x86_64.rpm": "79b49e6371de60a7bc4dcfbe179eda7be7007db0008fd6af1db5277919c75397",
+          "rust-src-1.97.1-1.fc44.noarch.rpm": "e8730ab6cb13f46604929b1ce134431ac40d1446a95cef04edfbe3d97093554f",
+          "rust-std-static-1.97.1-1.fc44.x86_64.rpm": "7ac4019f0a257142bbfeba2423a8420b92904354d624a5b0716e0cd5faa8ad08",
+          "rustfmt-1.97.1-1.fc44.x86_64.rpm": "9e0122684d937fe09f1a7f5bd1b0252a5988587a38731fb741847f5bb60554c6"
+        }
+      }
+    },
+    {
+      "id": "opensuse-tumbleweed-default-x86-64-7.1.4-1-default-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "opensuse-tumbleweed-default-x86-64",
+      "package_revision": "2",
+      "kernel_release": "7.1.4-1-default",
+      "kernel_package_name": "kernel-default",
+      "kernel_package_version": "7.1.4-1.2",
+      "kernel_selector_version": "7.1.4-1.2",
+      "builder_image": "registry.opensuse.org/opensuse/tumbleweed:20260724.37.69@sha256:2707c307c6a91a5562a400c54860372d7fdb1a3e6bc0c3203542564146637ed7",
+      "source": {
+        "kind": "opensuse-history",
+        "identity": "kernel-default@7.1.4-1.2,kernel-default-devel@7.1.4-1.2,kernel-devel@7.1.4-1.2,kernel-source@7.1.4-1.2,kernel-syms@7.1.4-1.1",
+        "snapshot": "20260729"
       }
     }
   ],
