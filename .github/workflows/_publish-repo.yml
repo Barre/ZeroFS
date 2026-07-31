@@ -72,7 +72,7 @@ on:
         required: true
 
 env:
-  DEB_S3_VERSION: "0.11.6"
+  DEB_S3_VERSION: "0.11.8"
   LC_ALL: C
 
 jobs:
