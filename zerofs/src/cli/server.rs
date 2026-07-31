@@ -21,7 +21,7 @@ use slatedb::config::GarbageCollectorDirectoryOptions;
 use slatedb::config::GarbageCollectorOptions;
 use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::path::Path;
-use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader};
+use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader, DbReaderMode};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -773,7 +773,7 @@ pub async fn build_slatedb(
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
-                .with_checkpoint_id(checkpoint_id)
+                .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
