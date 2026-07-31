@@ -57,10 +57,6 @@ on:
         required: false
         default: ZeroFS
         type: string
-      release-tag:
-        description: GitHub release receiving the package files
-        required: true
-        type: string
     secrets:
       R2_ACCOUNT_ID:
         required: true
@@ -80,7 +76,7 @@ jobs:
     name: Publish ${{ inputs.prefix }}
     runs-on: ubuntu-26.04
     permissions:
-      contents: write
+      contents: read
     env:
       APT_CODENAME: ${{ inputs.codename }}
       APT_COMPONENT: ${{ inputs.component }}
@@ -138,7 +134,6 @@ jobs:
           DESCRIPTOR_ID: ${{ inputs.descriptor-id }}
           DESCRIPTOR_KEY: ${{ inputs.descriptor-key }}
           DESCRIPTOR_NAME: ${{ inputs.descriptor-name }}
-          RELEASE_TAG: ${{ inputs.release-tag }}
         run: |
           [[ "$FAMILY" == deb || "$FAMILY" == rpm ]]
           validate_object_key() {
@@ -167,7 +162,6 @@ jobs:
           [[ "$CONFIG_REPO_BASE_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%+/-]*)?$ ]]
           repo_path=${CONFIG_REPO_BASE_URL#https://}
           [[ "$repo_path" != *//* ]]
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           if [[ "$FAMILY" == rpm && -n "$DESCRIPTOR_KEY" ]]; then
             [[ "$DESCRIPTOR_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
             [[ "$DESCRIPTOR_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._\ \(\)/-]*$ ]]
@@ -437,34 +431,3 @@ jobs:
           EOF
           fi
           rclone copyto "$descriptor" "r2:$R2_BUCKET/$DESCRIPTOR_KEY"
-
-      - name: Attach packages to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release-tag }}
-        run: |
-          existing="$RUNNER_TEMP/existing-release-assets"
-          install -d -m 0755 "$existing"
-          gh release view "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name' > "$existing/names"
-
-          uploads=()
-          for package in out/*."$FAMILY"; do
-            name=${package##*/}
-            if grep -Fxq "$name" "$existing/names"; then
-              gh release download "$RELEASE_TAG" \
-                --repo "$GITHUB_REPOSITORY" \
-                --pattern "$name" --dir "$existing"
-              cmp -s "$package" "$existing/$name" || {
-                echo "existing release asset changed: $name" >&2
-                exit 1
-              }
-            else
-              uploads+=("$package")
-            fi
-          done
-          if ((${#uploads[@]})); then
-            gh release upload "$RELEASE_TAG" "${uploads[@]}" \
-              --repo "$GITHUB_REPOSITORY"
-          fi

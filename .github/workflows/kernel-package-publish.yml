@@ -393,60 +393,11 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  signing-material:
-    name: Attach module signing material
-    needs: [resolve, stage]
-    runs-on: ubuntu-26.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: zerofs-kernel-staged-${{ github.run_id }}
-          path: staged
-
-      - name: Preflight and attach certificate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          existing="$RUNNER_TEMP/existing-assets"
-          install -d -m 0755 "$existing"
-          release_id=$(
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-              --jq .id
-          )
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          gh api --paginate \
-            "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
-            --jq '.[].name' >"$existing/names"
-
-          uploads=()
-          for name in zerofs-module-signing-cert.der \
-                      zerofs-module-signing-cert.fingerprint; do
-            if grep -Fxq "$name" "$existing/names"; then
-              gh release download "$RELEASE_TAG" \
-                --repo "$GITHUB_REPOSITORY" \
-                --pattern "$name" \
-                --dir "$existing"
-              cmp -s "staged/$name" "$existing/$name" || {
-                echo "existing release asset changed: $name" >&2
-                exit 1
-              }
-            else
-              uploads+=("staged/$name")
-            fi
-          done
-          if ((${#uploads[@]})); then
-            gh release upload "$RELEASE_TAG" "${uploads[@]}" \
-              --repo "$GITHUB_REPOSITORY"
-          fi
-
   publish:
     name: Publish ${{ matrix.id }}
-    needs: [resolve, stage, signing-material]
+    needs: [resolve, stage]
     permissions:
-      contents: write
+      contents: read
     strategy:
       max-parallel: 1
       matrix: ${{ fromJSON(needs.stage.outputs.matrix) }}
@@ -464,7 +415,6 @@ jobs:
       descriptor-key: ${{ matrix.descriptor_key }}
       descriptor-id: ${{ matrix.descriptor_id }}
       descriptor-name: ${{ matrix.descriptor_name }}
-      release-tag: ${{ needs.resolve.outputs.tag }}
     secrets:
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
