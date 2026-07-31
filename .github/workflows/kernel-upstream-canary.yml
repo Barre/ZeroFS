@@ -1,0 +1,40 @@
+name: kernel-upstream-canary
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-upstream-canary
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve upstream Linux tags
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.releases.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Resolve release tags
+        id: releases
+        run: |
+          matrix=$(python3 kernel/ci/upstream_kernels.py)
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+
+  build:
+    name: Build ZeroFS server
+    uses: ./.github/workflows/_build-ci-bin.yml
+
+  canary:
+    name: Upstream Linux compatibility
+    needs: [resolve, build]
+    uses: ./.github/workflows/kernel-compile-9p.yml
+    with:
+      test_matrix: ${{ needs.resolve.outputs.matrix }}

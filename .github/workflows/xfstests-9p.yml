@@ -8,19 +8,61 @@ permissions:
 
 jobs:
   xfstests:
-    name: Run xfstests 9P Test Suite
-    runs-on: ubuntu-latest
+    name: Run xfstests (${{ matrix.client }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - client: v9fs
+            guest: "0"
+            os: ubuntu-latest
+          - client: native
+            guest: "1"
+            os: ubuntu-26.04
+    env:
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+      ZEROFS_QEMU_MEMORY_MB: 8192
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
+      - uses: actions/checkout@v4
+
       - run: df -h
+        shell: bash
+
       - name: "Disk space cleanup"
+        shell: bash
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           sudo docker builder prune -a
 
       - run: df -h
-      - uses: actions/checkout@v4
+        shell: bash
+
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start the native-client guest
+        if: matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
+      - run: chmod +x zerofs/target/ci/zerofs
 
       - name: Install dependencies
         run: |
@@ -34,31 +76,41 @@ jobs:
             xfslibs-dev || true
           sudo apt-get install -y systemd-coredump systemd jq pkg-config
 
-          # Load 9p kernel modules
+      - name: Load v9fs
+        if: matrix.client == 'v9fs'
+        run: |
           sudo modprobe 9p
           sudo modprobe 9pnet
           sudo modprobe 9pnet_virtio || true
 
+      - name: Build and load the native client
+        if: matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
       - name: Clone xfstests
         run: |
           git clone https://github.com/Barre/xfstests.git /tmp/xfstests
+          git -C /tmp/xfstests checkout 1ae822c1c2e2364e966085cee3ce4a97b2500241
+          if [[ "${{ matrix.client }}" == native ]]; then
+            for tool in ln ls mkdir mknod od touch; do
+              gnu_tool="/usr/bin/gnu${tool}"
+              if [[ ! -x "$gnu_tool" ]]; then
+                echo "Required GNU coreutils executable is missing: $gnu_tool" >&2
+                exit 1
+              fi
+              ln -s -- "$gnu_tool" "/tmp/xfstests/$tool"
+            done
+          fi
 
       - name: Build xfstests
-        working-directory: /tmp/xfstests
         run: |
+          cd /tmp/xfstests
           make
           sudo make install
 
-      - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci
-      - run: chmod +x zerofs/target/ci/zerofs
-
       - name: Start MinIO
         run: |
-          docker run -d \
+          sudo docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
@@ -84,18 +136,24 @@ jobs:
           mkdir -p /tmp/zerofs-cache-scratch
 
       - name: Start ZeroFS (TEST instance)
-        working-directory: zerofs
         run: |
+          cd zerofs
+
           # Create ZeroFS configuration for TEST
           cat > zerofs-test.toml << EOF
           [cache]
           dir = "/tmp/zerofs-cache-test"
           disk_size_gb = 1.0
-          memory_size_gb = 1.0
+          memory_size_gb = 0.25
 
           [storage]
           url = "s3://zerofs-test/test"
           encryption_password = "test-password-123"
+
+          [filesystem]
+          # Keep statfs finite so generic/213 can exercise fallocate's ENOSPC
+          # path, while allowing generic/490's roughly 34 GB sparse file.
+          max_size_gb = 64.0
 
           [aws]
           access_key_id = "minioadmin"
@@ -111,7 +169,8 @@ jobs:
           EOF
 
           # Start ZeroFS in the background
-          ./target/ci/zerofs run -c zerofs-test.toml &
+          ./target/ci/zerofs run -c zerofs-test.toml \
+            > /tmp/zerofs-test.log 2>&1 &
           echo $! > /tmp/zerofs-test.pid
 
           # Wait for ZeroFS to start
@@ -126,22 +185,27 @@ jobs:
 
           if [ ! -S /tmp/zerofs-test.9p.sock ]; then
             echo "ZeroFS TEST instance failed to start"
+            cat /tmp/zerofs-test.log || true
             exit 1
           fi
 
       - name: Start ZeroFS (SCRATCH instance)
-        working-directory: zerofs
         run: |
+          cd zerofs
+
           # Create ZeroFS configuration for SCRATCH
           cat > zerofs-scratch.toml << EOF
           [cache]
           dir = "/tmp/zerofs-cache-scratch"
           disk_size_gb = 1.0
-          memory_size_gb = 1.0
+          memory_size_gb = 0.25
 
           [storage]
           url = "s3://zerofs-test/scratch"
           encryption_password = "test-password-123"
+
+          [filesystem]
+          max_size_gb = 64.0
 
           [aws]
           access_key_id = "minioadmin"
@@ -157,7 +221,8 @@ jobs:
           EOF
 
           # Start ZeroFS in the background
-          ./target/ci/zerofs run -c zerofs-scratch.toml &
+          ./target/ci/zerofs run -c zerofs-scratch.toml \
+            > /tmp/zerofs-scratch.log 2>&1 &
           echo $! > /tmp/zerofs-scratch.pid
 
           # Wait for ZeroFS to start
@@ -172,6 +237,7 @@ jobs:
 
           if [ ! -S /tmp/zerofs-scratch.9p.sock ]; then
             echo "ZeroFS SCRATCH instance failed to start"
+            cat /tmp/zerofs-scratch.log || true
             exit 1
           fi
 
@@ -180,31 +246,56 @@ jobs:
           sudo mkdir -p /mnt/test
           sudo mkdir -p /mnt/scratch
 
-      - name: Mount 9P filesystems
+      - name: Mount filesystems
         run: |
-          # Mount TEST filesystem
-          sudo mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs-test.9p.sock /mnt/test
+          if [[ "${{ matrix.client }}" == v9fs ]]; then
+            sudo mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user \
+              /tmp/zerofs-test.9p.sock /mnt/test
+            sudo mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user \
+              /tmp/zerofs-scratch.9p.sock /mnt/scratch
+            expected_type=9p
+          else
+            sudo mount -t zerofs -o consistency=relaxed,msize=10485760 \
+              /tmp/zerofs-test.9p.sock /mnt/test
+            sudo mount -t zerofs -o consistency=relaxed,msize=10485760 \
+              /tmp/zerofs-scratch.9p.sock /mnt/scratch
+            expected_type=zerofs
+          fi
 
-          # Mount SCRATCH filesystem
-          sudo mount -t 9p -o trans=unix,version=9p2000.L,cache=mmap,access=user /tmp/zerofs-scratch.9p.sock /mnt/scratch
-
-          # Verify mounts
-          mount | grep 9p
+          [[ $(findmnt -nr -o FSTYPE /mnt/test) == "$expected_type" ]]
+          [[ $(findmnt -nr -o FSTYPE /mnt/scratch) == "$expected_type" ]]
 
       - name: Configure xfstests
-        working-directory: /tmp/xfstests
+        id: configure_xfstests
         run: |
-          cat > local.config << 'EOF'
+          cd /tmp/xfstests
+          if [[ "${{ matrix.client }}" == v9fs ]]; then
+            cat > local.config << 'EOF'
           export FSTYP=9p
-
           export TEST_DIR=/mnt/test
           export SCRATCH_MNT=/mnt/scratch
-
           export TEST_DEV=/tmp/zerofs-test.9p.sock
           export SCRATCH_DEV=/tmp/zerofs-scratch.9p.sock
-
           export PLAN9_MOUNT_OPTIONS="-o trans=unix,version=9p2000.L,cache=mmap,access=user"
           EOF
+          else
+            cat > local.config << 'EOF'
+          export FSTYP=zerofs
+          export TEST_DIR=/mnt/test
+          export SCRATCH_MNT=/mnt/scratch
+          export TEST_DEV=/tmp/zerofs-test.9p.sock
+          export SCRATCH_DEV=/tmp/zerofs-scratch.9p.sock
+          export ZEROFS_MOUNT_OPTIONS="-o consistency=relaxed,msize=10485760"
+          EOF
+            cat > local.strict.config << 'EOF'
+          export FSTYP=zerofs
+          export TEST_DIR=/mnt/test
+          export SCRATCH_MNT=/mnt/scratch
+          export TEST_DEV=/tmp/zerofs-test.9p.sock
+          export SCRATCH_DEV=/tmp/zerofs-scratch.9p.sock
+          export ZEROFS_MOUNT_OPTIONS="-o consistency=strict,msize=10485760"
+          EOF
+          fi
 
           cat > excludes << 'EOF'
           generic/035
@@ -229,11 +320,106 @@ jobs:
           generic/676
           generic/465
           EOF
+          if [[ "${{ matrix.client }}" == native ]]; then
+            echo generic/732 >> excludes
+          fi
 
       - name: Run xfstests
-        working-directory: /tmp/xfstests
+        timeout-minutes: 90
         run: |
+          cd /tmp/xfstests
           sudo ./check -g quick -E excludes
+
+      - name: Run strict-consistency xfstest
+        if: ${{ !cancelled() && matrix.client == 'native' && steps.configure_xfstests.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          cd /tmp/xfstests
+          sudo env \
+            HOST_OPTIONS=/tmp/xfstests/local.strict.config \
+            RESULT_BASE=/tmp/xfstests/results-strict \
+            ./check generic/732
+
+      - name: Collect xfstests diagnostics
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+          artifact_dir="$RUNNER_TEMP/zerofs-xfstests-${{ matrix.client }}"
+          mkdir -p "$artifact_dir"
+
+          if [[ -d /tmp/xfstests/results ]]; then
+            sudo cp -a /tmp/xfstests/results "$artifact_dir/xfstests-results"
+          fi
+          if [[ -d /tmp/xfstests/results-strict ]]; then
+            sudo cp -a /tmp/xfstests/results-strict \
+              "$artifact_dir/xfstests-results-strict"
+          fi
+          if [[ -d /tmp/zerofs-ci-step-logs ]]; then
+            sudo cp -a /tmp/zerofs-ci-step-logs "$artifact_dir/ci-step-logs"
+          fi
+          for log in /tmp/zerofs-test.log /tmp/zerofs-scratch.log; do
+            if [[ -f "$log" ]]; then
+              sudo cp -a "$log" "$artifact_dir/"
+            fi
+          done
+
+          sudo dmesg --ctime > "$artifact_dir/dmesg.log" 2>&1 || true
+          grep -Eai \
+            'oom|out of memory|killed process|memory cgroup out of memory' \
+            "$artifact_dir/dmesg.log" > "$artifact_dir/oom.log" || true
+          sudo journalctl -u systemd-oomd --no-pager \
+            > "$artifact_dir/systemd-oomd.log" 2>&1 || true
+
+          {
+            date --iso-8601=seconds
+            echo
+            free -h
+            echo
+            cat /proc/meminfo
+            echo
+            ps auxww
+            echo
+            findmnt
+            for server in test scratch; do
+              pid_file="/tmp/zerofs-${server}.pid"
+              echo
+              echo "ZeroFS $server server:"
+              if [[ ! -r "$pid_file" ]]; then
+                echo "PID file is missing"
+                continue
+              fi
+              pid=$(<"$pid_file")
+              echo "PID: $pid"
+              if kill -0 "$pid" 2>/dev/null; then
+                ps -p "$pid" -o pid,ppid,state,etimes,%cpu,%mem,rss,vsz,cmd
+                cat "/proc/$pid/status"
+              else
+                echo "Process is not running"
+              fi
+            done
+          } > "$artifact_dir/system-state.log" 2>&1 || true
+
+          sudo docker inspect minio > "$artifact_dir/minio-inspect.log" 2>&1 || true
+          sudo docker logs minio > "$artifact_dir/minio.log" 2>&1 || true
+          sudo chown -R "$(id -u):$(id -g)" "$artifact_dir"
+
+      - name: Pull native xfstests diagnostics from the guest
+        if: always() && matrix.client == 'native'
+        continue-on-error: true
+        shell: bash
+        run: |
+          ./kernel/ci/qemu-vm.sh pull \
+            "$RUNNER_TEMP/zerofs-xfstests-native" \
+            "$RUNNER_TEMP/zerofs-xfstests-native"
+
+      - name: Upload xfstests diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-xfstests-${{ matrix.client }}
+          path: ${{ runner.temp }}/zerofs-xfstests-${{ matrix.client }}
+          if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
@@ -251,3 +437,31 @@ jobs:
           fi
           pkill -f "zerofs-test.toml" || true
           pkill -f "zerofs-scratch.toml" || true
+
+          if [[ "${{ matrix.client }}" == native ]]; then
+            "$GITHUB_WORKSPACE/kernel/ci/native-kmod.sh" unload
+          fi
+
+      - name: Stop the native-client guest
+        if: always() && matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
+
+      - name: Collect the native guest serial log
+        if: always() && matrix.client == 'native'
+        shell: bash
+        run: |
+          artifact_dir="$RUNNER_TEMP/zerofs-xfstests-native"
+          mkdir -p "$artifact_dir"
+          if [[ -f "$RUNNER_TEMP/zerofs-qemu-serial.log" ]]; then
+            cp "$RUNNER_TEMP/zerofs-qemu-serial.log" \
+              "$artifact_dir/qemu-serial.log"
+          fi
+
+      - name: Upload the native guest serial log
+        if: always() && matrix.client == 'native'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-xfstests-native-serial
+          path: ${{ runner.temp }}/zerofs-xfstests-native/qemu-serial.log
+          if-no-files-found: ignore

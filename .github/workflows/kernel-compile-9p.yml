@@ -2,21 +2,68 @@ name: kernel-compile-9p
 
 on:
   workflow_call:
+    inputs:
+      test_matrix:
+        description: Linux build and client matrix
+        required: false
+        type: string
+        default: >-
+          {"include":[
+            {"name":"v9fs","client":"v9fs","guest":0,"arch":"x86_64","kernel":"6.18"},
+            {"name":"native","client":"native","guest":1,"arch":"x86_64","kernel":"6.18"}
+          ]}
 
 permissions:
   contents: read
 
 jobs:
   kernel-compile-9p:
-    name: Compile Linux Kernel on 9P
-    runs-on: ubuntu-latest
+    name: Compile Linux Kernel (${{ matrix.name }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.test_matrix) }}
+    env:
+      ZEROFS_CI_ARCH: ${{ matrix.arch }}
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+      ZEROFS_CI_KERNEL: ${{ matrix.kernel }}
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Make the ZeroFS binary executable
+        shell: bash
+        run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start native-client guest
+        if: matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
+      - name: Load native kernel client
+        if: matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
       - name: Start MinIO
         run: |
-          docker run -d \
+          sudo docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
@@ -24,19 +71,31 @@ jobs:
             minio/minio server /data
 
           # Wait for MinIO to be ready
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if curl -f http://localhost:9000/minio/health/live; then
               echo "MinIO is ready"
               break
             fi
             sleep 1
           done
+          curl -fsS http://localhost:9000/minio/health/live >/dev/null
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+          sudo apt-get install -y \
+            bc bison build-essential clang flex libelf-dev libncurses-dev \
+            libssl-dev lld llvm xz-utils
 
+      - name: Install native module toolchain
+        if: matrix.client == 'native'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            bindgen busybox-static rustc rust-src
+
+      - name: Load v9fs kernel modules
+        if: matrix.client == 'v9fs'
+        run: |
           # Load 9p kernel modules
           sudo modprobe 9p
           sudo modprobe 9pnet
@@ -53,16 +112,10 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true
 
-      - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci
-      - run: chmod +x zerofs/target/ci/zerofs
-
       - name: Start ZeroFS with 9P support
-        working-directory: zerofs
         run: |
+          cd zerofs
+
           # Create cache directory
           mkdir -p /tmp/zerofs-cache
 
@@ -98,7 +151,7 @@ jobs:
 
           # Wait for ZeroFS 9P server to start
           echo "Waiting for ZeroFS 9P server to start..."
-          for i in {1..30}; do
+          for _ in {1..30}; do
             if nc -z 127.0.0.1 5564 2>/dev/null; then
               echo "ZeroFS 9P server is ready"
               break
@@ -112,7 +165,8 @@ jobs:
             exit 1
           fi
 
-      - name: Mount 9P filesystem
+      - name: Mount filesystem with v9fs
+        if: matrix.client == 'v9fs'
         run: |
           # Create mount point
           sudo mkdir -p /mnt/zerofs
@@ -126,38 +180,305 @@ jobs:
           # Test write access
           touch /mnt/zerofs/test_file && rm /mnt/zerofs/test_file
 
+      - name: Mount filesystem with the native client
+        if: matrix.client == 'native'
+        run: |
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t zerofs -o consistency=relaxed,msize=10485760 \
+            127.0.0.1:5564 /mnt/zerofs
+          [[ $(findmnt -nr -o FSTYPE /mnt/zerofs) == zerofs ]]
+          touch /mnt/zerofs/test_file && rm /mnt/zerofs/test_file
+
       - name: Check disk space
         run: df -h
 
       - name: Download Linux kernel
         run: |
           cd /mnt/zerofs
-          wget -q https://git.kernel.org/torvalds/t/linux-7.2-rc1.tar.gz
-          tar -xf linux-7.2-rc1.tar.gz
-          rm linux-7.2-rc1.tar.gz
+          kernel_pattern='^[1-9][0-9]*\.[0-9]+(\.[0-9]+)?(-rc[1-9][0-9]*)?$'
+          [[ "$ZEROFS_CI_KERNEL" =~ $kernel_pattern ]]
+          kernel_major=${ZEROFS_CI_KERNEL%%.*}
+          if [[ "$ZEROFS_CI_KERNEL" == *-rc* ]]; then
+            archive="linux-${ZEROFS_CI_KERNEL}.tar.gz"
+            source_url="https://git.kernel.org/pub/scm/linux/kernel/git"
+            source_url+="/torvalds/linux.git/snapshot/$archive"
+          else
+            archive="linux-${ZEROFS_CI_KERNEL}.tar.xz"
+            source_url="https://cdn.kernel.org/pub/linux/kernel"
+            source_url+="/v${kernel_major}.x/$archive"
+          fi
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$archive" "$source_url"
+          tar -xf "$archive"
+          rm "$archive"
+          [[ -d "linux-${ZEROFS_CI_KERNEL}" ]]
 
       - name: Compile kernel
         run: |
-          cd /mnt/zerofs/linux-7.2-rc1
+          kernel_source="/mnt/zerofs/linux-${ZEROFS_CI_KERNEL}"
+          kernel_build="/mnt/zerofs/linux-${ZEROFS_CI_KERNEL}-build"
+          config_arguments=(
+            --enable 64BIT
+            --enable MODULES
+            --enable MODULE_UNLOAD
+            --enable FTRACE
+            --enable FUNCTION_TRACER
+            --enable DYNAMIC_FTRACE
+            --enable DYNAMIC_FTRACE_WITH_REGS
+            --enable NET
+            --enable INET
+            --enable NETDEVICES
+            --enable NETFS_SUPPORT
+            --enable NET_9P
+            --enable 9P_FS
+            --enable UNIX
+            --enable FILE_LOCKING
+            --enable VIRTIO_MENU
+            --enable VIRTIO_NET
+            --enable BLK_DEV_INITRD
+            --enable BINFMT_ELF
+            --enable BINFMT_SCRIPT
+            --enable PRINTK
+            --enable TTY
+            --enable PROC_FS
+            --enable SYSFS
+            --enable DEVTMPFS
+            --disable MODULE_SIG_FORCE
+          )
+          case "$ZEROFS_CI_ARCH" in
+            x86_64)
+              make_arch=x86
+              config_arguments+=(
+                --disable X86_32
+                --enable PCI
+                --enable VIRTIO_PCI
+                --enable SERIAL_8250
+                --enable SERIAL_8250_CONSOLE
+                --enable MODVERSIONS
+                --disable EXTENDED_MODVERSIONS
+                --disable GENDWARFKSYMS
+                --disable RUST
+              )
+              required_arch_options=(
+                X86_64 PCI VIRTIO_PCI
+                SERIAL_8250 SERIAL_8250_CONSOLE
+                MODVERSIONS GENKSYMS
+              )
+              ftrace_backend='^CONFIG_FTRACE_MCOUNT_USE_(CC|OBJTOOL)=y$'
+              ;;
+            aarch64)
+              make_arch=arm64
+              config_arguments+=(
+                --enable ARM64
+                --enable VIRTIO_MMIO
+                --enable SERIAL_AMBA_PL011
+                --enable SERIAL_AMBA_PL011_CONSOLE
+                --enable RUST
+                --disable EXTENDED_MODVERSIONS
+                --disable GENDWARFKSYMS
+                --disable MODVERSIONS
+              )
+              required_arch_options=(
+                ARM64 VIRTIO_MMIO
+                SERIAL_AMBA_PL011 SERIAL_AMBA_PL011_CONSOLE
+                RUST
+              )
+              ftrace_backend='^CONFIG_FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY=y$'
+              ;;
+            *)
+              echo "unsupported kernel architecture: $ZEROFS_CI_ARCH" >&2
+              exit 1
+              ;;
+          esac
+          kernel_make=(
+            -C "$kernel_source"
+            O="$kernel_build"
+            LLVM=1
+            ARCH="$make_arch"
+          )
+          make "${kernel_make[@]}" tinyconfig
+          "$kernel_source/scripts/config" \
+            --file "$kernel_build/.config" "${config_arguments[@]}"
+          make "${kernel_make[@]}" olddefconfig
 
-          # Configure with tinyconfig for minimal build
-          make tinyconfig
+          required_options=(
+            MODULE_UNLOAD
+            FUNCTION_TRACER
+            DYNAMIC_FTRACE
+            NETFS_SUPPORT
+            INET
+            NETDEVICES
+            VIRTIO
+            VIRTIO_MENU
+            VIRTIO_NET
+            CC_IS_CLANG
+            BLK_DEV_INITRD
+            BINFMT_ELF
+            BINFMT_SCRIPT
+            PRINTK
+            TTY
+            PROC_FS
+            SYSFS
+            DEVTMPFS
+            SLUB_TINY
+            "${required_arch_options[@]}"
+          )
+          for option in "${required_options[@]}"; do
+            if ! grep -qx "CONFIG_${option}=y" "$kernel_build/.config"; then
+              echo "CONFIG_${option} must be enabled" >&2
+              exit 1
+            fi
+          done
+          disabled_options=(
+            USER_NS
+            MEMCG
+            MIGRATION
+            MODULE_SIG_FORCE
+          )
+          if [[ "$ZEROFS_CI_ARCH" == x86_64 ]]; then
+            disabled_options+=(
+              RUST
+              EXTENDED_MODVERSIONS
+              GENDWARFKSYMS
+            )
+          else
+            disabled_options+=(
+              MODVERSIONS
+              EXTENDED_MODVERSIONS
+              GENDWARFKSYMS
+            )
+          fi
+          for option in "${disabled_options[@]}"; do
+            if grep -qx "CONFIG_${option}=y" "$kernel_build/.config"; then
+              echo "CONFIG_${option} must be disabled" >&2
+              exit 1
+            fi
+          done
 
-          # Show config size
-          echo "Config size: $(wc -l < .config) lines"
+          if ! grep -Eq "$ftrace_backend" "$kernel_build/.config"; then
+            echo "kernel did not select a supported ftrace mcount backend" >&2
+            grep '^CONFIG_FTRACE_MCOUNT_USE_' \
+              "$kernel_build/.config" >&2 || true
+            exit 1
+          fi
+          if [[ "$ZEROFS_CI_ARCH" == x86_64 ]] &&
+             ! grep -qx '# CONFIG_EXTENDED_MODVERSIONS is not set' \
+               "$kernel_build/.config"; then
+            echo "CONFIG_EXTENDED_MODVERSIONS must be disabled" >&2
+            exit 1
+          fi
 
-          # Time the compilation
+          echo "Config size: $(wc -l < "$kernel_build/.config") lines"
           echo "Starting kernel compilation with $(nproc) cores..."
-          time make -j$(nproc) 2>&1 | tee /tmp/kernel-build.log
+          time make "${kernel_make[@]}" -j"$(nproc)" 2>&1 |
+            tee /tmp/kernel-build.log
 
-          # Check if vmlinux was created
-          if [ -f vmlinux ]; then
+          if [[ -f "$kernel_build/vmlinux" ]]; then
             echo "Kernel compilation successful!"
-            ls -lh vmlinux
+            ls -lh "$kernel_build/vmlinux"
           else
             echo "Kernel compilation failed!"
             exit 1
           fi
+
+      - name: Select target BusyBox
+        if: matrix.client == 'native'
+        run: |
+          if [[ "$ZEROFS_CI_ARCH" == x86_64 ]]; then
+            echo "ZEROFS_CI_BUSYBOX=$(command -v busybox)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          apt_root="$RUNNER_TEMP/arm64-apt"
+          install -d \
+            "$apt_root/cache/archives/partial" \
+            "$apt_root/download" \
+            "$apt_root/sourceparts" \
+            "$apt_root/state/lists/partial"
+          codename=$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")
+          sources_file="$apt_root/ubuntu.sources"
+          cat >"$sources_file" <<EOF
+          Types: deb
+          URIs: https://ports.ubuntu.com/ubuntu-ports
+          Suites: $codename $codename-updates $codename-security
+          Components: main universe
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          apt_options=(
+            -o Debug::NoLocking=true
+            -o "APT::Architecture=arm64"
+            -o "Dir::Cache=$apt_root/cache"
+            -o "Dir::Etc::sourcelist=$sources_file"
+            -o "Dir::Etc::sourceparts=$apt_root/sourceparts"
+            -o "Dir::State=$apt_root/state"
+            -o "Dir::State::status=/dev/null"
+            -o APT::Get::List-Cleanup=0
+            -o Acquire::Languages=none
+          )
+          apt-get "${apt_options[@]}" update
+          (
+            cd "$apt_root/download"
+            apt-get "${apt_options[@]}" download busybox-static
+          )
+          busybox_deb=$(find "$apt_root/download" -maxdepth 1 \
+            -type f -name 'busybox-static_*_arm64.deb' -print -quit)
+          [[ -n "$busybox_deb" ]]
+          dpkg-deb -x "$busybox_deb" "$apt_root/root"
+          busybox=
+          for candidate in \
+            "$apt_root/root/usr/bin/busybox" \
+            "$apt_root/root/bin/busybox"; do
+            if [[ -x "$candidate" ]]; then
+              busybox=$candidate
+              break
+            fi
+          done
+          [[ -n "$busybox" ]]
+          echo "ZEROFS_CI_BUSYBOX=$busybox" >> "$GITHUB_ENV"
+
+      - name: Build native kernel client
+        if: matrix.client == 'native'
+        run: |
+          kernel_source="/mnt/zerofs/linux-${ZEROFS_CI_KERNEL}"
+          kernel_build="/mnt/zerofs/linux-${ZEROFS_CI_KERNEL}-build"
+          case "$ZEROFS_CI_ARCH" in
+            x86_64) make_arch=x86 ;;
+            aarch64) make_arch=arm64 ;;
+          esac
+          if [[ "$ZEROFS_CI_ARCH" == x86_64 ]]; then
+            [[ ! -e "$kernel_build/rust/libkernel.rmeta" ]]
+            make -C kernel self-contained LLVM=1 ARCH="$make_arch" \
+              "KERNEL_SRC=$kernel_source" \
+              "KDIR=$kernel_build"
+          else
+            [[ -s "$kernel_build/rust/libkernel.rmeta" ]]
+            make -C kernel LLVM=1 ARCH="$make_arch" \
+              "KDIR=$kernel_build"
+          fi
+
+          module_path=$(make --no-print-directory -s -C kernel \
+            ARCH="$make_arch" "KDIR=$kernel_build" module-path)
+          [[ -s "$module_path" ]]
+          if [[ "$ZEROFS_CI_ARCH" == x86_64 ]] &&
+             nm -u "$module_path" |
+              grep -E '[[:space:]](_R|__rust|rust_)' >/dev/null; then
+            echo "self-contained module still imports Rust support symbols" >&2
+            exit 1
+          fi
+          if [[ "$ZEROFS_CI_ARCH" == x86_64 ]]; then
+            readelf -W -S "$module_path" | grep '__versions' >/dev/null
+          else
+            nm -u "$module_path" |
+              grep -E '[[:space:]]_R' >/dev/null
+          fi
+          modinfo "$module_path" | grep -E '^(name|vermagic):'
+
+          ./kernel/ci/module-smoke.sh prepare \
+            "$kernel_build" \
+            "$module_path" \
+            "$RUNNER_TEMP/zerofs-upstream-smoke" \
+            "$ZEROFS_CI_BUSYBOX"
 
       - name: Cleanup
         if: always()
@@ -167,6 +488,38 @@ jobs:
 
           # Kill ZeroFS
           if [ -f /tmp/zerofs.pid ]; then
-            kill $(cat /tmp/zerofs.pid) || true
+            kill "$(< /tmp/zerofs.pid)" || true
           fi
           pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+      - name: Unload native kernel client
+        if: always() && matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh unload
+
+      - name: Pull module smoke bundle
+        if: matrix.client == 'native'
+        shell: bash
+        run: |
+          ./kernel/ci/qemu-vm.sh pull \
+            "$RUNNER_TEMP/zerofs-upstream-smoke" \
+            "$RUNNER_TEMP/zerofs-upstream-smoke"
+
+      - name: Stop native-client guest
+        if: always() && matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
+
+      - name: Install arm64 QEMU
+        if: matrix.client == 'native' && matrix.arch == 'aarch64'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm
+
+      - name: Mount ZeroFS with the target module
+        if: matrix.client == 'native'
+        shell: bash
+        run: |
+          ./kernel/ci/module-smoke.sh bundle \
+            "$RUNNER_TEMP/zerofs-upstream-smoke" \
+            zerofs/target/ci/zerofs

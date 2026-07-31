@@ -8,18 +8,56 @@ permissions:
 
 jobs:
   pjdfstest-9p:
-    name: Run pjdfstest 9P Test Suite
+    name: Run pjdfstest (${{ matrix.client }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        include:
+          - client: v9fs
+            os: ubuntu-latest
+            guest: 0
+          - client: native
+            os: ubuntu-26.04
+            guest: 1
+    env:
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Make the ZeroFS binary executable
+        shell: bash
+        run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start native-client guest
+        if: matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
+      - name: Load native kernel client
+        if: matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
       - name: Start MinIO
         run: |
-          docker run -d \
+          sudo docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
@@ -40,6 +78,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool git perl
 
+      - name: Load v9fs kernel modules
+        if: matrix.client == 'v9fs'
+        run: |
           # Check if 9p kernel module is available
           sudo modprobe 9p
           sudo modprobe 9pnet
@@ -57,8 +98,8 @@ jobs:
           git clone https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
 
       - name: Build pjdfstest
-        working-directory: /tmp/pjdfstest
         run: |
+          cd /tmp/pjdfstest
           autoreconf -fvi
           ./configure
           make
@@ -71,16 +112,10 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-test || true
 
-      - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci
-      - run: chmod +x zerofs/target/ci/zerofs
-
       - name: Start ZeroFS with 9P support
-        working-directory: zerofs
         run: |
+          cd zerofs
+
           # Create cache directory
           mkdir -p /tmp/zerofs-cache
 
@@ -127,7 +162,8 @@ jobs:
             exit 1
           fi
 
-      - name: Mount 9P filesystem
+      - name: Mount filesystem with v9fs
+        if: matrix.client == 'v9fs'
         run: |
           # Create mount point
           sudo mkdir -p /mnt/zerofs-9p
@@ -138,9 +174,18 @@ jobs:
           # Verify mount
           mount | grep zerofs-9p
 
-      - name: Run pjdfstest
-        working-directory: /mnt/zerofs-9p
+      - name: Mount filesystem with the native client
+        if: matrix.client == 'native'
         run: |
+          sudo mkdir -p /mnt/zerofs-9p
+          sudo mount -t zerofs -o consistency=relaxed,msize=10485760 \
+            127.0.0.1:5564 /mnt/zerofs-9p
+          [[ $(findmnt -nr -o FSTYPE /mnt/zerofs-9p) == zerofs ]]
+
+      - name: Run pjdfstest
+        run: |
+          cd /mnt/zerofs-9p
+
           # Create test directory
           mkdir -p pjdfstest_test
           cd pjdfstest_test
@@ -148,8 +193,14 @@ jobs:
           # Get list of all test files
           find /tmp/pjdfstest/tests -name "*.t" -type f > /tmp/all_tests.txt
 
-          # Filter out excluded tests
-          grep -v -f ${{ github.workspace }}/.github/.pjdfstest-9p-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
+          exclude_file="$GITHUB_WORKSPACE/.github/.pjdfstest-9p-exclude"
+          if [[ "${{ matrix.client }}" == native ]]; then
+            # The native client implements opened-descriptor truncation; keep its
+            # regression test even though Linux v9fs still excludes it.
+            grep -v '^tests/ftruncate/00\.t$' "$exclude_file" > /tmp/pjdfstest-excludes
+            exclude_file=/tmp/pjdfstest-excludes
+          fi
+          grep -v -f "$exclude_file" /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
 
           # Run the filtered test suite
           sudo prove -rv $(cat /tmp/tests_to_run.txt)
@@ -157,8 +208,8 @@ jobs:
       - name: Test Summary
         if: always()
         run: |
-          echo "pjdfstest suite completed for 9P filesystem"
-          echo "Excluded tests listed in .pjdfstest-9p-exclude due to 9P protocol limitations"
+          echo "pjdfstest suite completed for the ${{ matrix.client }} client"
+          echo "Shared exclusions are listed in .pjdfstest-9p-exclude"
 
       - name: Cleanup
         if: always()
@@ -168,3 +219,12 @@ jobs:
 
           # Kill ZeroFS
           pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+      - name: Unload native kernel client
+        if: always() && matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh unload
+
+      - name: Stop native-client guest
+        if: always() && matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
