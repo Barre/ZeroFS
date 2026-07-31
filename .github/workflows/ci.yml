@@ -4,7 +4,7 @@ name: ci
 # binary. The binary is built once (build job) and every suite downloads it as the
 # zerofs-ci-bin artifact instead of recompiling ZeroFS on its own runner. The suites
 # are reusable workflows (on: workflow_call) invoked here, so they share this run and
-# can see the artifact.
+# can see the artifact. Exact-kernel package smoke tests reuse the same server binary.
 #
 # Suites that need a different binary keep their own push/PR workflows and are NOT
 # wired in here: cross-compile (other targets + webui), release-pgo (release/PGO),
@@ -44,6 +44,9 @@ jobs:
   kernel-compile-nfs:
     needs: build
     uses: ./.github/workflows/kernel-compile-nfs.yml
+  kernel-packages:
+    needs: build
+    uses: ./.github/workflows/kernel-packages.yml
 
   pjdfstest:
     needs: build

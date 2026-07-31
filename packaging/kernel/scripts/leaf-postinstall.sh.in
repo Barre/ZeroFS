@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+kernel_release='@KERNEL_RELEASE@'
+
+if ! command -v depmod >/dev/null 2>&1; then
+    printf 'zerofs: depmod is required to register the kernel module\n' >&2
+    exit 1
+fi
+depmod -a "$kernel_release"
+
+exit 0

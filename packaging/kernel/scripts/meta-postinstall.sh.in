@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+kernel_release='@KERNEL_RELEASE@'
+certificate=/usr/share/zerofs/zerofs-module-signing-cert.der
+
+if [ "$(uname -r)" != "$kernel_release" ]; then
+    exit 0
+fi
+
+if ! command -v modprobe >/dev/null 2>&1; then
+    printf 'zerofs: warning: modprobe is unavailable; module was not loaded\n' >&2
+    exit 0
+fi
+
+if load_error=$(modprobe zerofs 2>&1); then
+    exit 0
+fi
+
+printf 'zerofs: warning: could not load the kernel module:\n%s\n' \
+    "$load_error" >&2
+if [ -r "$certificate" ]; then
+    printf '%s\n' \
+        'zerofs: if Secure Boot rejected the signing key, enroll it with:' \
+        "  sudo mokutil --import $certificate" \
+        'zerofs: set a one-time password, reboot, and select Enroll MOK.' >&2
+fi
+
+# Keep the package configured so the user can enroll the key. The
+# modules-load.d entry retries on the next boot.
+exit 0
