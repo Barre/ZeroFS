@@ -17,11 +17,11 @@ export const sections = [
 
 # 9P Protocol Extensions
 
-ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own client selects one private dialect, `9P2000.L.Z`, which includes fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, durability-aware fsync, and atomic fallocate operations. This page documents what that dialect does and how it is framed on the wire. {{ className: 'lead' }}
+ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own clients select one private dialect, `9P2000.L.Z`, which includes fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, durability-aware fsync, and atomic fallocate operations. This page documents what that dialect does and how it is framed on the wire. {{ className: 'lead' }}
 
 ## Overview {{ id: 'overview' }}
 
-The private dialect is separate from plain 9P2000.L. A stock kernel 9P client proposes `9P2000.L` and receives the standard protocol. ZeroFS's own clients propose `9P2000.L.Z`: [`zerofs mount`](/9p-access#mounting-with-zerofs-mount), the [client libraries](/client-libraries), and the [Web UI file manager](/web-ui#9p-on-the-web) all use the same `zerofs-client` core (compiled to WebAssembly in the browser), so they share one wire format and one negotiation path.
+The private dialect is separate from plain 9P2000.L. Stock Linux v9fs proposes `9P2000.L` and receives the standard protocol. The [native kernel client](/kernel-client), [`zerofs mount`](/9p-access#mounting-with-zerofs-mount), the [client libraries](/client-libraries), and the [Web UI file manager](/web-ui#9p-on-the-web) propose `9P2000.L.Z`. The userspace clients share the `zerofs-client` core; the kernel module implements the same wire format directly.
 
 Every extension was added to remove a specific cost in the standard protocol:
 
@@ -37,10 +37,10 @@ Dialect selection happens in the standard `Tversion`/`Rversion` exchange. There 
 
 | Version string | Protocol |
 | --- | --- |
-| `9P2000.L` | Standard Linux 9P, used by stock kernel clients. |
+| `9P2000.L` | Standard Linux 9P, used by stock v9fs. |
 | `9P2000.L.Z` | The complete current ZeroFS-private dialect, including every feature on this page. |
 
-The bundled client proposes exactly `9P2000.L.Z` and requires the server to echo that exact string. The name is indivisible: `.Z` identifies the current ZeroFS wire generation layered on the Linux dialect; it is not a capability list, and there is no substring matching or downgrade to a partial private protocol. A released server that recognizes only an older `.zerofs*` layout will answer with a different token, so negotiation fails cleanly before either side decodes an incompatible frame. A future incompatible generation will use a new token such as `.Z2`. This remains a private interface; upgrade the client, server, Web UI, and HA peers as one release set.
+ZeroFS clients propose exactly `9P2000.L.Z` and require the server to echo that exact string. The name is indivisible: `.Z` identifies the current ZeroFS wire generation layered on the Linux dialect; it is not a capability list, and there is no substring matching or downgrade to a partial private protocol. A released server that recognizes only an older `.zerofs*` layout will answer with a different token, so negotiation fails cleanly before either side decodes an incompatible frame. A future incompatible generation will use a new token such as `.Z2`. This remains a private interface; upgrade the client, server, Web UI, and HA peers as one release set.
 
 <Note>
 `ignore_fsync` does not select a different dialect. It is an explicit administrator opt-out that makes both `Tfsync` and `Tfsyncdur` return without forcing stable storage.
@@ -98,7 +98,7 @@ Rlopenatread  qid[13] iounit[4] eof[1] count[4] data[count]
 
 ## Idempotent retries {{ id: 'idempotent-retries' }}
 
-Standard 9P has no safe way to retry a mutating request. If a `Tmkdir` is sent and the connection drops before its reply arrives, the client cannot know whether the server applied it. Re-sending risks a double-apply (a second `mkdir` that fails with `EEXIST`, or worse, a second `rename` or `unlink` that acts on the wrong state). This matters most for the bundled client, which [reconnects on its own](/9p-access#mounting-with-zerofs-mount) and would otherwise have to surface an error for every in-flight mutation at the moment a server restarts.
+Standard 9P has no safe way to retry a mutating request. If a `Tmkdir` is sent and the connection drops before its reply arrives, the client cannot know whether the server applied it. Re-sending risks a double-apply (a second `mkdir` that fails with `EEXIST`, or worse, a second `rename` or `unlink` that acts on the wrong state). This matters for reconnecting ZeroFS clients, which would otherwise have to surface an error for every in-flight mutation at the moment a server restarts.
 
 The private dialect attaches a 25-byte operation envelope to every reorder-sensitive mutation. The envelope is outside the message body: it appears immediately after the tag, and the frame's `size` includes it.
 
@@ -113,26 +113,28 @@ covered mutation   size[4] type[1] tag[2] op_id[16] flags[1] origin_epoch[8] bod
 
 The server keeps a time-bounded ledger keyed by op-id. It serializes concurrent copies through a single-flight gate and retains each completed operation's exact result, including errors, so a known retry receives the original outcome without applying again. An unseen `RETRY` fails closed with `ESTALE` rather than being reinterpreted as new work, except during the narrowly scoped promotion window for the named predecessor epoch. An all-zero envelope opts out of deduplication.
 
-Automatic retry is bounded: the bundled client retries one ambiguous op-id for up to 120 seconds, while the server keeps its completed result for an additional 30-second margin. Both values come from the same static timing policy as client recovery and HA handoff, which checks that the retry horizon covers their conservative 108-second recovery budget. If the result is still unknown at the horizon, the client reports an ambiguous disconnect instead of starting a fresh attempt that might apply twice.
+Automatic retry is bounded: a ZeroFS client retries one ambiguous op-id for up to 120 seconds, while the server keeps its completed result for an additional 30-second margin. Both values come from the same static timing policy as client recovery and HA handoff, which checks that the retry horizon covers their conservative 108-second recovery budget. If the result is still unknown at the horizon, the client reports an ambiguous disconnect instead of starting a fresh attempt that might apply twice.
 
 The covered requests are the create family (`Tlcreate`, `Tsymlink`, `Tmknod`, `Tmkdir`, and `Tlink`), `Trename`, `Trenameat`, `Tunlinkat`, `Twrite`, `Tsetattr`, `Tfallocate`, and the stat-carrying create and setattr variants. Writes, setattr, and fallocate are included even where repeating the operation would produce the same immediate state: a delayed copy could otherwise execute after a later mutation and roll state backward. Reads, walks, attach, clunk, and the open-only fast paths carry no envelope.
 
-The envelope is what makes `zerofs mount` reconnect cleanly. On a dropped connection the client re-sends in-flight mutations with their original attempt state, and the [client-side failover path](/high-availability) preserves it across a re-route so a retried write, create, or rename has one authoritative outcome even when it reaches a successor after failover.
+The envelope lets ZeroFS clients reconnect cleanly. On a dropped connection the client re-sends in-flight mutations with their original attempt state, and the [client-side failover path](/high-availability) preserves it across a re-route so a retried write, create, or rename has one authoritative outcome even when it reaches a successor after failover.
 
 ## Reconnect by inode id {{ id: 'reconnect' }}
 
-When the bundled client reconnects, it has to rebuild its open fids on the new session. Re-walking the original path does not work if a still-linked file was renamed. `Trebind` binds a fresh fid directly to an inode by its server-assigned id rather than by a path, so linked open handles survive a rename or hardlink shuffle across the outage.
+When a ZeroFS client reconnects, it has to rebuild its open fids on the new session. Re-walking the original path does not work if a still-linked file was renamed. `Trebind` binds a fresh fid directly to an inode by its server-assigned id rather than by a path, so linked open handles can survive a rename within their attach root.
 
 ```text {{ title: 'Trebind / Rrebind' }}
 Trebind  fid[4] inode_id[8] root_inode[8] flags[1] uname[s] n_uname[4]
 Rrebind  qid[13]
 ```
 
-`root_inode` preserves the immutable attach root that governed the old fid, while `uname` and `n_uname` reconstruct its credentials. A root-self request first re-establishes an attach root by stable inode id, so renaming that directory during the outage does not strand the session. The `REPLAY` flag marks automatic session recovery. `OPENED` is valid only together with `REPLAY`; it marks a fid whose open state the client will restore after rebinding it.
+`root_inode` preserves the immutable attach root that governed the old fid, while `uname` and `n_uname` reconstruct its credentials. A root-self request first re-establishes an attach root by stable inode id, so renaming that directory during the outage does not strand the session as long as its current path remains searchable. The `REPLAY` flag marks automatic session recovery but grants no authorization. `OPENED` is valid only together with `REPLAY`; it marks a fid whose open state the client will attempt to restore after rebinding it.
 
-The server verifies that a rebound inode is still available to the session governed by its declared attach root. Reconnect does not resurrect an inode whose final namespace link has been removed.
+The server verifies that the declared attach root is currently reachable from inode 0. For an inode with a recorded parent, it also verifies a searchable parent chain to that root. Replay performs the same checks as a manual bind; a failed replay check returns `ESTALE` so reconnect retires the stale fid. `OPENED` only marks the expected in-place reopen: it grants no access and pins no inode until that reopen passes the current DAC checks. If final unlink wins between rebind and reopen, the descriptor becomes stale rather than repinning the orphan.
 
-An open-unlinked handle therefore belongs to its current connection. It continues to work after the unlink, as POSIX requires, but a later disconnect or failover makes it unrecoverable. Replay is an indivisible session transition: if any recorded open handle can no longer be rebound, the client permanently fails the entire logical session with `ESTALE` instead of publishing a partial recovery. This is session-wide, not a per-fid error; the caller must establish a new client or mount.
+A hardlinked non-directory records no single parent, including the lazy representation that remains after its link count falls back to one. After checking search access at inode 0, a global-root bind accepts that still-linked representation because it has no subtree membership to prove. The server deliberately does not scan the namespace for an alias, so knowledge of a still-linked inode id is sufficient on a global-root endpoint. A subtree bind refuses it because no single parent chain proves that an alias remains inside the subtree.
+
+An open-unlinked handle therefore belongs to its current connection. It continues to work after the unlink, as POSIX requires, but a later disconnect or failover makes that descriptor stale. Other fids can still recover; losing a fid that held a byte-range lock instead terminates the logical session because the client can no longer preserve the lock guarantee.
 
 ## Durability-verified fsync {{ id: 'durable-fsync' }}
 
@@ -149,7 +151,7 @@ Tfsyncdur    fid[4] datasync[4] token[8]
              -> Rlerror(ESTALE)   otherwise
 ```
 
-This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it is what lets the bundled client verify fsync durability through a [high-availability](/high-availability) failover. With `ignore_fsync`, the administrator deliberately disables the barrier: `Tfsyncdur` returns success without flushing or checking lineage.
+This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it lets ZeroFS clients verify fsync durability through a [high-availability](/high-availability) failover. With `ignore_fsync`, the administrator deliberately disables the barrier: `Tfsyncdur` returns success without flushing or checking lineage.
 
 ## Atomic fallocate {{ id: 'fallocate' }}
 

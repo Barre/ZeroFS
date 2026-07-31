@@ -249,21 +249,22 @@ Upgrade the two HA peers together. New releases understand the legacy leader mar
 
 ## Clients and bindings {{ id: 'clients' }}
 
-Pass both 9P addresses as one target set. The bundled mount and foreign-language bindings use a comma-separated string; Rust also exposes `connect_multi`. Targets are probed concurrently, and the first node that proves it is serving becomes the connection.
+Pass both 9P addresses as one target set. The bundled mount and foreign-language bindings use a comma-separated string; Rust also exposes `connect_multi`. These userspace clients probe targets concurrently. The native kernel client tries its configured targets sequentially.
 
 | Client | HA connection |
 | --- | --- |
+| Native kernel client | `sudo mount -t zerofs 10.0.0.10:5564,10.0.0.11:5564 /mnt/zerofs` |
 | `zerofs mount` | `zerofs mount node-a:5564,node-b:5564 /mnt/zerofs` |
 | Rust | `Client::connect_multi(&["node-a:5564".into(), "node-b:5564".into()]).await?` |
 | Python | `await zerofs_client.Client.connect("node-a:5564,node-b:5564")` |
 | TypeScript | `await Client.connect("node-a:5564,node-b:5564")` |
 | Go | `zerofs.ClientConnect("node-a:5564,node-b:5564")` |
 
-The client tries the targets until it finds the serving leader. During an outage, undispatched calls block while the session reconnects. After takeover it replays fids by stable inode id, reopens linked handles, and attempts to reacquire recorded byte-range locks. Replay is published only if the whole session succeeds.
+The client tries the targets until it finds the serving leader. Userspace clients keep undispatched calls blocked while reconnecting. The native client limits each request's reconnect wait with `reconnect_grace_ms`, which defaults to 120 seconds. After takeover, the client rebinds linked open files by inode ID and reacquires recorded byte-range locks before resuming I/O. Open files that cannot be rebound become stale.
 
-An open file whose final directory link has been removed cannot be recovered on a new connection. If such a handle exists during reconnect, the logical client or mount becomes terminal with `ESTALE`; establish a new session and reopen the remaining paths. Server lock state is not replicated, so reacquisition is not an uninterrupted distributed lock guarantee and a competing session may acquire a lock during the gap.
+An open file whose final directory link has been removed cannot be recovered on a new connection. That handle becomes stale, while unrelated handles remain usable. Server lock state is not replicated, so a competing session may acquire a lock during the gap. If the stale handle held a recorded lock, the client stops reconnecting and subsequent operations fail.
 
-The Linux kernel 9P client takes one endpoint and does not use the private reconnect protocol. NFS and NBD connections also do not reroute between the two nodes. Use `zerofs mount`, a client library, CSI, or an external connection-routing layer when transparent client failover is required.
+The [native kernel client](/kernel-client) accepts the two leader/standby addresses as IP literals or Unix sockets and uses the private reconnect protocol. Stock Linux v9fs takes one endpoint and does not reconnect. NFS and NBD connections also do not reroute between the two nodes. Use the native client, `zerofs mount`, a client library, CSI, or an external connection-routing layer when transparent client failover is required.
 
 ## Kubernetes (CSI) {{ id: 'kubernetes' }}
 

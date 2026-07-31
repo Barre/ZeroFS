@@ -28,7 +28,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 
 | | |
 |---|---|
-| **File access** | NFS and 9P servers. `zerofs mount`, the bundled FUSE client, is the recommended Linux mount. |
+| **File access** | NFS and 9P servers. Use the native kernel client when an exact package is available or `zerofs mount` as a fallback. |
 | **Block access** | NBD devices with TRIM. FLUSH and FUA replies return only after data is durable. |
 | **Encryption** | Extents are encrypted with XChaCha20-Poly1305. Data key wrapped via Argon2id. |
 | **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
@@ -88,6 +88,12 @@ $EDITOR zerofs.toml    # Set S3 credentials
 zerofs run -c zerofs.toml
 ```
 
+## Native Linux kernel client
+
+[`kernel/`](kernel/) contains an out-of-tree VFS module that speaks the private
+`9P2000.L.Z` dialect over TCP or AF_UNIX, without FUSE or Linux v9fs. It
+supports x86-64 and little-endian arm64. See the
+[native kernel client guide](https://www.zerofs.net/kernel-client).
 
 ## Testing
 
@@ -245,15 +251,25 @@ An optional `storage_class` under `[storage]` is passed verbatim to the backend 
 
 Over 9P, fsync returns only after data reaches stable storage; NFS COMMIT semantics let fsync return before that. If you depend on fsync durability, use a 9P-based mount.
 
-### `zerofs mount` (recommended on Linux)
+### Native kernel client
+
+```bash
+sudo mount -t zerofs 127.0.0.1:5564 /mnt/zerofs
+# Unix socket
+sudo mount -t zerofs /tmp/zerofs.9p.sock /mnt/zerofs
+```
+
+Exact-kernel packages, compatibility, and mount options:
+[native kernel client](https://www.zerofs.net/kernel-client).
+
+### `zerofs mount` (FUSE fallback)
 
 ```bash
 zerofs mount 127.0.0.1:5564 /mnt/zerofs        # TCP
 zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs   # Unix socket
 ```
 
-### Kernel 9P client
-
+### Stock Linux v9fs
 
 ```bash
 mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p

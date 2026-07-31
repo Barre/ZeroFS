@@ -264,7 +264,7 @@ A pull-based listing cursor plus `openat`-style child operations. **Child names 
 
 **`FileType`**: `File`, `Dir`, `Symlink`, `Fifo`, `Socket`, `CharDevice`, `BlockDevice`, `Unknown`.
 
-**`Metadata`**: `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, and `atime`/`mtime`/`ctime` timestamps. `btime` and `data_version` are reserved (servers currently report 0).
+**`Metadata`**: `ino`, `file_type`, `mode` (full st_mode), `nlink`, `uid`, `gid`, `size`, `block_size`, `blocks` (512-byte units), `rdev`, `data_version`, and `atime`/`mtime`/`ctime`/`btime` timestamps. `btime` and `data_version` are reserved and currently reported as zero.
 
 **`DirEntry`**: `name` (UTF-8, lossy: invalid bytes become U+FFFD), `name_bytes` (exact on-wire bytes for the `*_at` methods), `name_is_utf8`, `file_type`, `ino`, and `metadata` (always returned inline by the private dialect's directory read).
 
@@ -286,7 +286,7 @@ uniffi generates a faithful but mechanical surface (async methods, raw handle ob
 
 **Reconnection.** The session retries indefinitely with backoff. Undispatched calls block while no server is available. Session replay rebinds linked open handles by stable inode id and re-acquires recorded byte-range locks before publishing the connection.
 
-An open handle with no remaining namespace link is connection-local. Disconnecting with such a handle makes the logical client terminal with `Stale`/`ESTALE`; recovery requires a new client and reopened paths. In-flight mutations retain their operation envelope across retries. Automatic retry ends at the 120-second protocol horizon, after which an unresolved result is reported as an ambiguous connection failure.
+An open handle with no remaining namespace link is connection-local and becomes stale after reconnect; unrelated fids remain usable. If the stale fid held a recorded byte-range lock, the logical client becomes terminal because it cannot preserve the lock guarantee. In-flight mutations retain their operation envelope across retries. Automatic retry ends at the 120-second protocol horizon, after which an unresolved result is reported as an ambiguous connection failure.
 
 **Cancellation.** Host-language cancellation does not cancel Rust or server-side work. Caller waits can be bounded with `asyncio.wait_for` (Python), `Promise.race` (TypeScript), or the `Call(ctx, fn)`/`Do(ctx, fn)` context wrappers (Go). A timeout abandons the caller wait; the operation continues until it resolves or reaches the protocol horizon, and its result is discarded. The deadline bounds caller latency, not server execution.
 

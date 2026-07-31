@@ -17,7 +17,7 @@ export const sections = [
 
 # ZeroFS Documentation
 
-ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as block devices over NBD. NFS and 9P need nothing installed on the client because the OS already ships support; a bundled FUSE client mounts without root. The server runs in userspace, with no kernel modules. CI compiles the Linux kernel on ZeroFS mounts on every change.
+ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as block devices over NBD. Stock NFS and 9P clients need no installation. On supported Linux kernels, the [native kernel client](/kernel-client) is the fastest mount option; the bundled FUSE client works across a wider range and mounts without root. The server itself runs in userspace.
 
 <div className="not-prose mt-6 mb-16 flex gap-3">
   <Button href="/quickstart" arrow="right">

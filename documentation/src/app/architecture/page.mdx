@@ -112,11 +112,12 @@ Because the servers share one filesystem layer, protocols mix on a single instan
 | Mount | Client | Use case |
 |-------|--------|----------|
 | [NFS](/nfs-access) | NFS client that ships with macOS, Linux, and Windows | Mounting from any operating system without installing software |
-| [9P](/9p-access) | Linux kernel `9p` module | fsync-dependent workloads (databases, transactional systems); closer POSIX adherence than NFS |
-| [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) | FUSE client bundled in the `zerofs` binary; speaks 9P to the same server | Linux mounts without root; reconnects on its own after server restarts and network interruptions |
+| [Native kernel client](/kernel-client) | Exact-kernel `zerofs` module; speaks private 9P directly through VFS and netfslib | Fast Linux mounts with reconnect and HA failover |
+| [Stock 9P](/9p-access) | Linux v9fs module | No ZeroFS client installation; fsync-dependent workloads |
+| [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) | FUSE client bundled in the `zerofs` binary; speaks private 9P | Linux mounts without root; reconnect and HA failover across a wider kernel range |
 | [NBD](/nbd-devices) | `nbd-client` | Raw block devices for ext4, XFS, ZFS pools, and VM disks |
 
-The fsync difference is the deciding factor for databases. NFS COMMIT semantics allow fsync to return before data reaches stable storage. Over 9P (kernel client or `zerofs mount`) fsync returns only after data is durable.
+The fsync difference is the deciding factor for databases. NFS COMMIT semantics allow fsync to return before data reaches stable storage. Over 9P, fsync returns only after data is durable.
 
 ## Filesystem Limits {{ id: 'filesystem-limits' }}
 
