@@ -1,0 +1,470 @@
+name: _publish-repo
+
+on:
+  workflow_call:
+    inputs:
+      family:
+        description: deb or rpm
+        required: true
+        type: string
+      prefix:
+        description: Repository prefix in the package bucket
+        required: true
+        type: string
+      artifact-name:
+        description: Actions artifact containing the packages
+        required: true
+        type: string
+      package-directory:
+        description: Directory inside the artifact containing the packages
+        required: false
+        default: "."
+        type: string
+      codename:
+        description: APT codename and suite
+        required: false
+        default: stable
+        type: string
+      component:
+        description: APT component
+        required: false
+        default: main
+        type: string
+      architectures:
+        description: Space-separated package architectures
+        required: true
+        type: string
+      probe-package:
+        description: Package name required in the artifact
+        required: true
+        type: string
+      probe-version:
+        description: Full package version required in the artifact
+        required: true
+        type: string
+      descriptor-key:
+        description: Object key for the .list or .repo descriptor
+        required: false
+        default: ""
+        type: string
+      descriptor-id:
+        description: Section ID for an RPM repository descriptor
+        required: false
+        default: zerofs
+        type: string
+      descriptor-name:
+        description: Display name for an RPM repository descriptor
+        required: false
+        default: ZeroFS
+        type: string
+      release-tag:
+        description: GitHub release receiving the package files
+        required: true
+        type: string
+    secrets:
+      R2_ACCOUNT_ID:
+        required: true
+      R2_ACCESS_KEY_ID:
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        required: true
+      GPG_PRIVATE_KEY:
+        required: true
+
+env:
+  DEB_S3_VERSION: "0.11.6"
+  LC_ALL: C
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.prefix }}
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    env:
+      APT_CODENAME: ${{ inputs.codename }}
+      APT_COMPONENT: ${{ inputs.component }}
+      ARCHITECTURES: ${{ inputs.architectures }}
+      FAMILY: ${{ inputs.family }}
+      PREFIX: ${{ inputs.prefix }}
+      PROBE_PACKAGE: ${{ inputs.probe-package }}
+      PROBE_VERSION: ${{ inputs.probe-version }}
+    steps:
+      - name: Install publishing tools
+        run: |
+          sudo apt-get update
+          packages=(rclone)
+          if [[ "$FAMILY" == deb ]]; then
+            packages+=(dpkg ruby ruby-dev)
+          else
+            packages+=(createrepo-c rpm)
+          fi
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          if [[ "$FAMILY" == deb ]]; then
+            sudo gem install --no-document \
+              --version "$DEB_S3_VERSION" deb-s3
+          fi
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: download
+
+      - name: Select packages
+        env:
+          PACKAGE_DIRECTORY: ${{ inputs.package-directory }}
+        run: |
+          [[ "$PACKAGE_DIRECTORY" == "." ||
+             "$PACKAGE_DIRECTORY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+            echo "package directory must be a plain artifact subdirectory" >&2
+            exit 1
+          }
+          if [[ "$PACKAGE_DIRECTORY" == "." ]]; then
+            mv download out
+          else
+            [[ -d "download/$PACKAGE_DIRECTORY" &&
+               ! -L "download/$PACKAGE_DIRECTORY" ]]
+            mv "download/$PACKAGE_DIRECTORY" out
+          fi
+
+      - name: Validate configuration
+        env:
+          CONFIG_GPG_FINGERPRINT: ${{ vars.GPG_KEY_ID }}
+          CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          CONFIG_R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          CONFIG_R2_BUCKET: ${{ vars.R2_BUCKET }}
+          CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CONFIG_REPO_BASE_URL: ${{ vars.REPO_BASE_URL }}
+          DESCRIPTOR_ID: ${{ inputs.descriptor-id }}
+          DESCRIPTOR_KEY: ${{ inputs.descriptor-key }}
+          DESCRIPTOR_NAME: ${{ inputs.descriptor-name }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          [[ "$FAMILY" == deb || "$FAMILY" == rpm ]]
+          validate_object_key() {
+            [[ "$1" =~ ^[a-z0-9][a-z0-9._/-]*$ &&
+               "$1" != *//* && "$1" != */ ]]
+            local part
+            local -a parts
+            IFS=/ read -r -a parts <<< "$1"
+            for part in "${parts[@]}"; do
+              [[ -n "$part" && "$part" != . && "$part" != .. ]]
+            done
+          }
+          validate_object_key "$PREFIX"
+          [[ -z "$DESCRIPTOR_KEY" ]] ||
+            validate_object_key "$DESCRIPTOR_KEY"
+          [[ "$APT_CODENAME" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+          [[ "$APT_COMPONENT" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+          [[ "$ARCHITECTURES" =~ ^[A-Za-z0-9_]+([[:space:]][A-Za-z0-9_]+)*$ ]]
+          [[ "$CONFIG_GPG_FINGERPRINT" =~ ^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$ ]]
+          [[ "$CONFIG_R2_ACCOUNT_ID" =~ ^[A-Fa-f0-9]{32}$ ]]
+          [[ "$CONFIG_R2_ACCESS_KEY_ID" =~ ^[A-Za-z0-9]{16,128}$ ]]
+          [[ ${#CONFIG_R2_SECRET_ACCESS_KEY} -ge 32 &&
+             ${#CONFIG_R2_SECRET_ACCESS_KEY} -le 256 &&
+             "$CONFIG_R2_SECRET_ACCESS_KEY" != *[$'\r\n']* ]]
+          [[ "$CONFIG_R2_BUCKET" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]
+          [[ "$CONFIG_REPO_BASE_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%+/-]*)?$ ]]
+          repo_path=${CONFIG_REPO_BASE_URL#https://}
+          [[ "$repo_path" != *//* ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$FAMILY" == rpm && -n "$DESCRIPTOR_KEY" ]]; then
+            [[ "$DESCRIPTOR_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+            [[ "$DESCRIPTOR_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._\ \(\)/-]*$ ]]
+          fi
+
+          {
+            echo "GPG_FINGERPRINT=${CONFIG_GPG_FINGERPRINT^^}"
+            echo "R2_BUCKET=$CONFIG_R2_BUCKET"
+            echo "R2_ENDPOINT=https://${CONFIG_R2_ACCOUNT_ID,,}.r2.cloudflarestorage.com"
+            echo "REPO_BASE_URL=${CONFIG_REPO_BASE_URL%/}"
+          } >> "$GITHUB_ENV"
+
+      - name: Import repository signing key
+        env:
+          REPOSITORY_SIGNING_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          gnupg_home="$RUNNER_TEMP/zerofs-publish-gnupg"
+          install -d -m 0700 "$gnupg_home"
+          export GNUPGHOME=$gnupg_home
+          printf '%s\n' "$REPOSITORY_SIGNING_KEY" |
+            gpg --batch --import
+          actual_fingerprint=$(
+            gpg --batch --with-colons --fingerprint \
+              --list-secret-keys "$GPG_FINGERPRINT" |
+              awk -F: '$1 == "fpr" { print toupper($10); exit }'
+          )
+          [[ "$actual_fingerprint" == "$GPG_FINGERPRINT" ]]
+
+          printf 'ZeroFS repository signing test\n' > "$RUNNER_TEMP/signing-test"
+          gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+            --local-user "$GPG_FINGERPRINT" \
+            --detach-sign "$RUNNER_TEMP/signing-test"
+          gpg --batch --verify \
+            "$RUNNER_TEMP/signing-test.sig" \
+            "$RUNNER_TEMP/signing-test"
+          gpg --batch --armor --export "$GPG_FINGERPRINT" > zerofs.gpg
+          [[ -s zerofs.gpg ]]
+          echo "GNUPGHOME=$gnupg_home" >> "$GITHUB_ENV"
+
+      - name: Configure R2
+        env:
+          CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          install -d -m 0700 "$HOME/.config/rclone"
+          umask 077
+          cat > "$HOME/.config/rclone/rclone.conf" <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $CONFIG_R2_ACCESS_KEY_ID
+          secret_access_key = $CONFIG_R2_SECRET_ACCESS_KEY
+          endpoint = $R2_ENDPOINT
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Audit packages
+        run: |
+          if find out -type l -print -quit | grep -q .; then
+            echo "package artifact contains a symbolic link" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          packages=(out/*."$FAMILY")
+          ((${#packages[@]})) || {
+            echo "artifact contains no $FAMILY packages" >&2
+            exit 1
+          }
+          read -r -a expected_architectures <<< "$ARCHITECTURES"
+          declare -A found_architectures=()
+          for package in "${packages[@]}"; do
+            if [[ "$FAMILY" == deb ]]; then
+              dpkg-deb --info "$package" >/dev/null
+              name=$(dpkg-deb -f "$package" Package)
+              version=$(dpkg-deb -f "$package" Version)
+              architecture=$(dpkg-deb -f "$package" Architecture)
+            else
+              rpm -qp "$package" >/dev/null
+              name=$(rpm -qp --qf '%{NAME}' "$package")
+              version=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$package")
+              architecture=$(rpm -qp --qf '%{ARCH}' "$package")
+            fi
+            architecture_expected=false
+            for expected in "${expected_architectures[@]}"; do
+              [[ "$architecture" == "$expected" ]] &&
+                architecture_expected=true
+            done
+            [[ "$architecture_expected" == true ]] || {
+              echo "$package: unexpected architecture $architecture" >&2
+              exit 1
+            }
+            if [[ "$name" == "$PROBE_PACKAGE" ]]; then
+              [[ "$version" == "$PROBE_VERSION" ]] || {
+                echo "$package: $name is $version, expected $PROBE_VERSION" >&2
+                exit 1
+              }
+              found_architectures["$architecture"]=1
+            fi
+          done
+          for architecture in "${expected_architectures[@]}"; do
+            [[ -n "${found_architectures[$architecture]:-}" ]] || {
+              echo "artifact contains no $PROBE_PACKAGE for $architecture" >&2
+              exit 1
+            }
+          done
+          sha256sum "${packages[@]}"
+
+      - name: Publish repository key
+        run: |
+          key_dir="$RUNNER_TEMP/zerofs-repository-key"
+          install -d -m 0755 "$key_dir"
+          rclone lsf "r2:$R2_BUCKET" \
+            --files-only --max-depth 1 --include zerofs.gpg > "$key_dir/files"
+          if grep -Fxq zerofs.gpg "$key_dir/files"; then
+            rclone copyto \
+              "r2:$R2_BUCKET/zerofs.gpg" "$key_dir/zerofs.gpg"
+            cmp -s zerofs.gpg "$key_dir/zerofs.gpg" || {
+              echo "repository signing key differs from the published key" >&2
+              exit 1
+            }
+          else
+            rclone copyto zerofs.gpg "r2:$R2_BUCKET/zerofs.gpg"
+          fi
+
+      - name: Prepare RPM repository
+        if: inputs.family == 'rpm'
+        run: |
+          install -d -m 0755 rpmrepo rpm-new
+          rclone lsf "r2:$R2_BUCKET" \
+            --recursive --files-only --include "$PREFIX/**" \
+            > "$RUNNER_TEMP/rpm-existing-files"
+          if [[ -s "$RUNNER_TEMP/rpm-existing-files" ]]; then
+            rclone copy "r2:$R2_BUCKET/$PREFIX" rpmrepo
+          fi
+          if find rpmrepo -type l -print -quit | grep -q .; then
+            echo "existing RPM repository contains a symbolic link" >&2
+            exit 1
+          fi
+
+          rpm_db="$RUNNER_TEMP/zerofs-publish-rpmdb"
+          install -d -m 0700 "$rpm_db"
+          rpm --dbpath "$rpm_db" --initdb
+          rpm --dbpath "$rpm_db" --import zerofs.gpg
+
+          rpm_identity() {
+            local identity
+            local header_digest
+            identity=$(rpm -qp \
+              --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}|%{SHA256HEADER}\n' \
+              "$1")
+            header_digest=${identity##*|}
+            [[ "$header_digest" =~ ^[A-Fa-f0-9]{64}$ ]]
+            printf '%s\n' "$identity"
+          }
+          verify_signed_rpm() {
+            local verification
+            verification=$(rpm --dbpath "$rpm_db" --checksig "$1")
+            printf '%s\n' "$verification"
+            [[ "$verification" == *"signatures OK"* ]]
+          }
+
+          shopt -s nullglob
+          mapfile -d '' historical_packages < <(
+            find rpmrepo -type f -name '*.rpm' -print0 | sort -z
+          )
+          for package in "${historical_packages[@]}"; do
+            verify_signed_rpm "$package"
+          done
+          new_packages=(out/*.rpm)
+          for package in "${new_packages[@]}"; do
+            filename=${package##*/}
+            existing="rpmrepo/$filename"
+            if [[ -e "$existing" ]]; then
+              [[ -f "$existing" && ! -L "$existing" ]]
+              [[ "$(rpm_identity "$package")" == \
+                 "$(rpm_identity "$existing")" ]] || {
+                echo "published RPM changed without a version bump: $filename" >&2
+                exit 1
+              }
+              cp "$existing" "$package"
+              continue
+            fi
+            rpmsign --addsign \
+              --define "_openpgp_sign_id $GPG_FINGERPRINT" \
+              --define "_gpg_name $GPG_FINGERPRINT" \
+              "$package"
+            verify_signed_rpm "$package"
+            cp "$package" "rpm-new/$filename"
+            cp "$package" "$existing"
+          done
+
+          createrepo_c --update rpmrepo
+          repomd=rpmrepo/repodata/repomd.xml
+          [[ -s "$repomd" ]]
+          gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+            --local-user "$GPG_FINGERPRINT" \
+            --detach-sign --armor \
+            --output "$repomd.asc" "$repomd"
+          gpg --batch --verify "$repomd.asc" "$repomd"
+
+      - name: Publish APT repository
+        if: inputs.family == 'deb'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          deb-s3 upload \
+            --bucket "$R2_BUCKET" \
+            --endpoint "$R2_ENDPOINT" \
+            --s3-region auto \
+            --force-path-style \
+            --prefix "$PREFIX" \
+            --codename "$APT_CODENAME" \
+            --suite "$APT_CODENAME" \
+            --component "$APT_COMPONENT" \
+            --visibility private \
+            --sign "$GPG_FINGERPRINT" \
+            --gpg-options="--pinentry-mode=loopback --batch --yes" \
+            --fail-if-exists \
+            --preserve-versions \
+            out/*.deb
+          deb-s3 verify \
+            --bucket "$R2_BUCKET" \
+            --endpoint "$R2_ENDPOINT" \
+            --s3-region auto \
+            --force-path-style \
+            --prefix "$PREFIX" \
+            --codename "$APT_CODENAME" \
+            --suite "$APT_CODENAME" \
+            --component "$APT_COMPONENT"
+
+      - name: Publish RPM repository
+        if: inputs.family == 'rpm'
+        run: |
+          rclone copy rpm-new "r2:$R2_BUCKET/$PREFIX"
+          rclone copy rpmrepo/repodata \
+            "r2:$R2_BUCKET/$PREFIX/repodata" \
+            --exclude repomd.xml \
+            --exclude repomd.xml.asc
+          rclone copyto rpmrepo/repodata/repomd.xml.asc \
+            "r2:$R2_BUCKET/$PREFIX/repodata/repomd.xml.asc"
+          rclone copyto rpmrepo/repodata/repomd.xml \
+            "r2:$R2_BUCKET/$PREFIX/repodata/repomd.xml"
+
+      - name: Publish repository descriptor
+        if: inputs.descriptor-key != ''
+        env:
+          DESCRIPTOR_ID: ${{ inputs.descriptor-id }}
+          DESCRIPTOR_KEY: ${{ inputs.descriptor-key }}
+          DESCRIPTOR_NAME: ${{ inputs.descriptor-name }}
+        run: |
+          descriptor="$RUNNER_TEMP/${DESCRIPTOR_KEY##*/}"
+          if [[ "$FAMILY" == deb ]]; then
+            cat > "$descriptor" <<EOF
+          deb [signed-by=/usr/share/keyrings/zerofs.gpg] $REPO_BASE_URL/$PREFIX $APT_CODENAME $APT_COMPONENT
+          EOF
+          else
+            cat > "$descriptor" <<EOF
+          [$DESCRIPTOR_ID]
+          name=$DESCRIPTOR_NAME
+          baseurl=$REPO_BASE_URL/$PREFIX
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=$REPO_BASE_URL/zerofs.gpg
+          EOF
+          fi
+          rclone copyto "$descriptor" "r2:$R2_BUCKET/$DESCRIPTOR_KEY"
+
+      - name: Attach packages to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          existing="$RUNNER_TEMP/existing-release-assets"
+          install -d -m 0755 "$existing"
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' > "$existing/names"
+
+          uploads=()
+          for package in out/*."$FAMILY"; do
+            name=${package##*/}
+            if grep -Fxq "$name" "$existing/names"; then
+              gh release download "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern "$name" --dir "$existing"
+              cmp -s "$package" "$existing/$name" || {
+                echo "existing release asset changed: $name" >&2
+                exit 1
+              }
+            else
+              uploads+=("$package")
+            fi
+          done
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
