@@ -151,6 +151,13 @@ impl RefTree {
                 }
             }
             NsOp::Rename { from, to } => {
+                // rename(2) is a no-op when source and destination are two
+                // hard links to the same inode; both names remain present.
+                if let Some(source_group) = self.paths.get(from)
+                    && self.paths.get(to) == Some(source_group)
+                {
+                    return change;
+                }
                 change.retired = self.remove(to);
                 let moved: Vec<(NsPath, u64)> = self
                     .paths
@@ -586,5 +593,46 @@ impl NsModel {
             self.oplog.len(),
             self.acked,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(name: &[u8]) -> NsPath {
+        vec![name.to_vec()]
+    }
+
+    #[test]
+    fn rename_between_hardlinks_is_a_noop() {
+        let from = path(b"from");
+        let to = path(b"to");
+        let mut tree = RefTree::default();
+        let mut next_group = 1;
+
+        tree.apply(&NsOp::Create(from.clone()), &mut next_group);
+        tree.apply(
+            &NsOp::Link {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            &mut next_group,
+        );
+        let group = tree.paths[&from];
+
+        let change = tree.apply(
+            &NsOp::Rename {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            &mut next_group,
+        );
+
+        assert_eq!(tree.paths.get(&from), Some(&group));
+        assert_eq!(tree.paths.get(&to), Some(&group));
+        assert!(tree.groups.contains_key(&group));
+        assert!(change.added.is_none());
+        assert!(change.retired.is_none());
     }
 }
