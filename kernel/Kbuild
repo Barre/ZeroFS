@@ -1,0 +1,241 @@
+obj-m := zerofs.o
+ifeq ($(ZEROFS_SELF_CONTAINED),1)
+zerofs-y := self_contained/zerofs_main.o
+else
+zerofs-y := zerofs_main.o
+endif
+zerofs-y += netfs/compat_helpers.o vfs/compat_helpers.o
+
+# Rust's include! paths must follow the module object directory selected by
+# Kbuild.
+override ZEROFS_KBUILD_OUTPUT := $(abspath $(obj))
+export ZEROFS_KBUILD_OUTPUT
+
+RUSTFLAGS_MODULE += -Copt-level=3 -Cembed-bitcode=y
+
+# Implementation-facing C APIs omitted from the canonical Rust bindings or
+# exposed there only as opaque types.
+zerofs_bindgen_common_flags := \
+	--rust-target 1.68 \
+	--use-core \
+	--ctypes-prefix kernel::ffi \
+	--no-layout-tests \
+	--no-debug '.*' \
+	--no-doc-comments \
+	--enable-function-attribute-detection \
+	--no-recursive-allowlist
+
+# Keep bindgen's C ABI aligned with the architecture selected by Kbuild. These
+# are the same target triples used by the kernel's own Rust binding generator.
+zerofs_bindgen_target_x86 := x86_64-linux-gnu
+zerofs_bindgen_target_arm64 := aarch64-linux-gnu
+zerofs_bindgen_target := $(zerofs_bindgen_target_$(SRCARCH))
+
+zerofs_bindgen_arch_flags_x86 := -m64 -march=x86-64
+zerofs_bindgen_arch_flags_arm64 := -mlittle-endian
+zerofs_bindgen_arch_flags := $(zerofs_bindgen_arch_flags_$(SRCARCH))
+zerofs_bindgen_compiler_flags := $(filter -DCC_USING_%,$(KBUILD_CFLAGS))
+
+ifeq ($(zerofs_bindgen_target),)
+$(error ZeroFS does not support Kbuild architecture $(SRCARCH))
+endif
+
+ifeq ($(CONFIG_CC_IS_GCC),y)
+# The target kernel's C objects must stay on its GCC toolchain. Only the two
+# LLVM bitcode boundaries below use Clang, with GCC-only driver flags removed
+# or translated to their x86 Clang equivalents.
+zerofs_bc_gcc_only_flags := \
+	--param=% \
+	-fconserve-stack \
+	-fdiagnostics-show-context \
+	-fdiagnostics-show-context=% \
+	-fdiagnostics-show-inlining-chain \
+	-femit-struct-debug-baseonly \
+	-falign-jumps=% \
+	-fmin-function-alignment=% \
+	-fno-allow-store-data-races \
+	-fno-inline-functions-called-once \
+	-fno-ipa-cp-clone \
+	-fno-ipa-sra \
+	-fno-isolate-erroneous-paths-dereference \
+	-fno-partial-inlining \
+	-fno-reorder-blocks \
+	-fplugin=% \
+	-fplugin-arg-% \
+	-pg \
+	-fsanitize=bounds-strict \
+	-fzero-init-padding-bits=% \
+	-mindirect-branch=% \
+	-mindirect-branch-register \
+	-mfentry \
+	-mnop-mcount \
+	-mpreferred-stack-boundary=% \
+	-mrecord-mcount \
+	-Wno-tsan
+
+zerofs_bc_clang_flags = \
+	--target=$(zerofs_bindgen_target) \
+	-fintegrated-as \
+	$(filter-out $(zerofs_bc_gcc_only_flags),$(1)) \
+	-mstack-alignment=8 \
+	$(if $(CONFIG_MITIGATION_RETPOLINE),-mretpoline-external-thunk) \
+	$(if $(filter-out 0,$(CONFIG_FUNCTION_ALIGNMENT)),\
+		-falign-functions=$(CONFIG_FUNCTION_ALIGNMENT)) \
+	$(if $(CONFIG_UBSAN_BOUNDS_STRICT),-fsanitize=bounds) \
+	-Wno-duplicate-decl-specifier \
+	-Wno-enum-enum-conversion \
+	-Wno-ignored-optimization-argument \
+	-Wno-microsoft-anon-tag \
+	-Wno-unknown-warning-option \
+	-Wno-unused-command-line-argument
+else
+zerofs_bc_clang_flags = $(CLANG_FLAGS) $(1)
+endif
+
+zerofs_netfs_bindgen_flags := \
+	$(zerofs_bindgen_common_flags) \
+	--allowlist-type 'netfs_.*' \
+	--allowlist-type 'rolling_buffer' \
+	--allowlist-function 'netfs_.*' \
+	--allowlist-var 'NETFS_.*'
+
+zerofs_fs_context_bindgen_flags := \
+	$(zerofs_bindgen_common_flags) \
+	--opaque-type 'p_log' \
+	--allowlist-type 'constant_table' \
+	--allowlist-type 'p_log' \
+	--allowlist-type 'fs_context' \
+	--allowlist-type 'fs_context_operations' \
+	--allowlist-type 'fs_context_purpose' \
+	--allowlist-type 'fs_context_phase' \
+	--allowlist-type 'fs_parameter' \
+	--allowlist-type 'fs_parameter_spec' \
+	--allowlist-type 'fs_param_type' \
+	--allowlist-type 'fs_parse_result' \
+	--allowlist-type 'fs_value_type' \
+	--allowlist-function '__fs_parse' \
+	--allowlist-function 'fs_param_is_enum' \
+	--allowlist-function 'fs_param_is_u32' \
+	--allowlist-function 'get_tree_nodev'
+
+zerofs_vfs_layout_bindgen_flags := \
+	$(zerofs_bindgen_common_flags) \
+	--allowlist-var 'ZEROFS_.*'
+
+quiet_cmd_zerofs_netfs_bindgen = BINDGEN $@
+      cmd_zerofs_netfs_bindgen = \
+	$(BINDGEN) $(srctree)/include/linux/netfs.h \
+		$(zerofs_netfs_bindgen_flags) -o $@ -- \
+		$(NOSTDINC_FLAGS) $(LINUXINCLUDE) \
+		-include $(srctree)/include/linux/compiler_types.h \
+		-D__KERNEL__ -DMODULE -D__BINDGEN__ \
+		$(zerofs_bindgen_compiler_flags) \
+		-fno-builtin -fms-extensions -fshort-wchar -funsigned-char \
+		$(zerofs_bindgen_arch_flags) -w \
+		--target=$(zerofs_bindgen_target)
+
+quiet_cmd_zerofs_vfs_layout_bindgen = BINDGEN $@
+      cmd_zerofs_vfs_layout_bindgen = \
+	$(BINDGEN) $(src)/vfs/layout.h \
+		$(zerofs_vfs_layout_bindgen_flags) -o $@ -- \
+		$(NOSTDINC_FLAGS) $(LINUXINCLUDE) \
+		-include $(srctree)/include/linux/compiler_types.h \
+		-D__KERNEL__ -DMODULE -D__BINDGEN__ \
+		$(zerofs_bindgen_compiler_flags) \
+		-fno-builtin -fms-extensions -fshort-wchar -funsigned-char \
+		$(zerofs_bindgen_arch_flags) -w \
+		--target=$(zerofs_bindgen_target)
+
+quiet_cmd_zerofs_fs_context_bindgen = BINDGEN $@
+      cmd_zerofs_fs_context_bindgen = \
+	$(BINDGEN) $(srctree)/include/linux/fs_parser.h \
+		$(zerofs_fs_context_bindgen_flags) -o $@ -- \
+		$(NOSTDINC_FLAGS) $(LINUXINCLUDE) \
+		-include $(srctree)/include/linux/compiler_types.h \
+		-D__KERNEL__ -DMODULE -D__BINDGEN__ \
+		$(zerofs_bindgen_compiler_flags) \
+		-fno-builtin -fms-extensions -fshort-wchar -funsigned-char \
+		$(zerofs_bindgen_arch_flags) -w \
+		--target=$(zerofs_bindgen_target)
+
+targets += netfs/bindings.rs fs_context_bindings.rs vfs/layout_bindings.rs
+targets += self_contained/kernel_helpers.bc self_contained/zerofs_main.bc
+targets += self_contained/bitcode.o self_contained/zerofs_main.o
+
+$(obj)/netfs/bindings.rs: $(srctree)/include/linux/netfs.h \
+			 $(objtree)/include/config/auto.conf FORCE
+	$(call if_changed,zerofs_netfs_bindgen)
+
+$(obj)/fs_context_bindings.rs: $(srctree)/include/linux/fs_context.h \
+			     $(srctree)/include/linux/fs_parser.h \
+			     $(objtree)/include/config/auto.conf FORCE
+	$(call if_changed,zerofs_fs_context_bindgen)
+
+$(obj)/vfs/layout_bindings.rs: $(src)/vfs/layout.h \
+			      $(srctree)/include/linux/filelock.h \
+			      $(srctree)/include/linux/fs.h \
+			      $(srctree)/include/linux/statfs.h \
+			      $(objtree)/include/config/auto.conf FORCE
+	$(call if_changed,zerofs_vfs_layout_bindgen)
+
+$(obj)/zerofs_main.o: $(obj)/netfs/bindings.rs $(obj)/fs_context_bindings.rs
+$(obj)/zerofs_main.o: $(obj)/vfs/layout_bindings.rs
+
+quiet_cmd_zerofs_main_bc = RUSTC-BC $@
+      cmd_zerofs_main_bc = \
+	$(rust_common_cmd) --emit=llvm-bc=$@ $(src)/zerofs_main.rs
+
+define rule_zerofs_main_bc
+	$(call cmd_and_fixdep,zerofs_main_bc)
+endef
+
+$(obj)/self_contained/zerofs_main.bc: $(src)/zerofs_main.rs
+$(obj)/self_contained/zerofs_main.bc: $(obj)/netfs/bindings.rs
+$(obj)/self_contained/zerofs_main.bc: $(obj)/fs_context_bindings.rs
+$(obj)/self_contained/zerofs_main.bc: $(obj)/vfs/layout_bindings.rs FORCE
+	+$(call if_changed_rule,zerofs_main_bc)
+$(obj)/self_contained/zerofs_main.bc: private part-of-module := y
+
+quiet_cmd_zerofs_kernel_helpers_bc = LLVM-BC $@
+      cmd_zerofs_kernel_helpers_bc = \
+	$(ZEROFS_BC_CLANG) \
+		$(call zerofs_bc_clang_flags,$(filter-out \
+			-g% -Wmissing-prototypes -Wmissing-declarations,\
+			$(c_flags))) \
+		-g0 -Wno-gnu-variable-sized-type-not-at-end \
+		-emit-llvm -c $< -o $@
+
+$(obj)/self_contained/kernel_helpers.bc: \
+		$(ZEROFS_KERNEL_RUST_SOURCE)/helpers/helpers.c FORCE
+	$(call if_changed_dep,zerofs_kernel_helpers_bc)
+$(obj)/self_contained/kernel_helpers.bc: private part-of-module := y
+
+quiet_cmd_zerofs_bitcode = CC      $@
+      cmd_zerofs_bitcode = $(CC) $(c_flags) -x c -c /dev/null -o $@
+
+$(obj)/self_contained/bitcode.o: $(obj)/self_contained/zerofs_main.bc
+$(obj)/self_contained/bitcode.o: $(obj)/self_contained/kernel_helpers.bc FORCE
+	$(call if_changed,zerofs_bitcode)
+
+quiet_cmd_zerofs_self_contained_o = LLVM-CC $@
+      cmd_zerofs_self_contained_o = \
+	$(ZEROFS_BC_CLANG) \
+		$(call zerofs_bc_clang_flags,$(KBUILD_CFLAGS)) \
+		-Wno-override-module \
+		-c $< -o $@ \
+		$(cmd_ld_single) $(cmd_objtool)
+
+define rule_zerofs_self_contained_o
+	$(call cmd_and_savecmd,zerofs_self_contained_o)
+	$(call cmd,gen_objtooldep)
+endef
+
+$(obj)/self_contained/zerofs_main.o: \
+		$(obj)/self_contained/zerofs_main.internal.bc FORCE
+	+$(call if_changed_rule,zerofs_self_contained_o)
+
+clean-files += netfs/bindings.rs fs_context_bindings.rs vfs/layout_bindings.rs
+clean-files += self_contained/kernel_helpers.bc self_contained/zerofs_main.bc
+clean-files += self_contained/bitcode.o
+clean-files += self_contained/zerofs_main.linked.bc
+clean-files += self_contained/zerofs_main.internal.bc self_contained/zerofs_main.o
