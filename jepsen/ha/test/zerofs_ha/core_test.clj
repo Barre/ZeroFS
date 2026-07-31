@@ -13,6 +13,82 @@
 (defn- check [history]
   (checker/check (core/set-checker) {} history {}))
 
+(deftest mount-client-config-defaults-to-fuse
+  (is (= "fuse" (:mount-client (core/cfg {:work-dir "/tmp/zerofs-ha"}))))
+  (is (= "native" (:mount-client
+                    (core/cfg {:work-dir "/tmp/zerofs-ha"
+                               :mount-client "native"})))))
+
+(deftest mount-dispatches-to-the-selected-client
+  (let [events (atom [])
+        awaits (atom 0)
+        base   {:work "/tmp/zerofs-ha"
+                :zerofs "/tmp/zerofs"
+                :mount "/tmp/zerofs-ha/mnt"
+                :nodes {:a {:ninep "/tmp/a.sock"}
+                        :b {:ninep "/tmp/b.sock"}}}]
+    (with-redefs [core/daemon-start!
+                  (fn [& args] (swap! events conj [:daemon args]))
+                  core/sh-ok!
+                  (fn [& args] (swap! events conj [:shell args]) {:exit 0})
+                  core/mounted? (constantly true)
+                  util/await-fn
+                  (fn [ready? _]
+                    (swap! awaits inc)
+                    (is (true? (ready?))))]
+      (core/mount! (assoc base :mount-client "fuse"))
+      (core/mount! (assoc base :mount-client "native")))
+    (is (= 2 @awaits))
+    (is (= [[:daemon
+             ["/tmp/zerofs-ha/mount.pid"
+              "/tmp/zerofs-ha/mount.log"
+              {}
+              "/tmp/zerofs"
+              ["mount"
+               "unix:/tmp/a.sock,unix:/tmp/b.sock"
+               "/tmp/zerofs-ha/mnt"
+               "--writeback"
+               "false"]]]
+            [:shell
+             [:sudo
+              :mount
+              :-t
+              :zerofs
+              :-o
+              "consistency=strict,msize=10485760"
+              "unix:/tmp/a.sock,unix:/tmp/b.sock"
+              "/tmp/zerofs-ha/mnt"]]]
+           @events))))
+
+(deftest durability-handles-close-once
+  (let [closed  (atom [])
+        resource (fn [name]
+                   (proxy [java.io.Closeable] []
+                     (close [] (swap! closed conj name))))
+        handles (atom {"file" {:raf (resource :file)}
+                       "dir"  {:dirchan (resource :dir)}})]
+    (core/close-durability-handles! handles)
+    (core/close-durability-handles! handles)
+    (is (= {} @handles))
+    (is (= #{:file :dir} (set @closed)))
+    (is (= 2 (count @closed)))))
+
+(deftest unmount-dispatches-to-the-selected-client
+  (let [commands (atom [])
+        base     {:mount "/tmp/zerofs-ha/mnt"}]
+    (with-redefs [core/mounted? (constantly true)
+                  core/sh! (fn [& args]
+                             (swap! commands conj args)
+                             {:exit 0})
+                  core/sh-ok! (fn [& args]
+                                (swap! commands conj args)
+                                {:exit 0})]
+      (core/unmount! (assoc base :mount-client "fuse"))
+      (core/unmount! (assoc base :mount-client "native")))
+    (is (= [[:fusermount3 :-uz "/tmp/zerofs-ha/mnt"]
+            [:sudo :umount "/tmp/zerofs-ha/mnt"]]
+           @commands))))
+
 (deftest node-9p-up-requires-a-listener
   (let [dir         (.toFile (Files/createTempDirectory
                               "zerofs-ha-test"

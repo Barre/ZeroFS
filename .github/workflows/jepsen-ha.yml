@@ -8,20 +8,57 @@ permissions:
 
 jobs:
   jepsen-ha:
-    name: Run jepsen HA suite (leader/standby over MinIO)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: HA suite (${{ matrix.mount-client }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mount-client: fuse
+            os: ubuntu-latest
+            guest: "0"
+            timeout: 30
+          - mount-client: native
+            os: ubuntu-26.04
+            guest: "1"
+            timeout: 45
+    env:
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.mount-client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start the Rust-enabled QEMU guest
+        if: matrix.mount-client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
       - name: Set up JDK 17
+        if: matrix.mount-client == 'fuse'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Install Leiningen + FUSE + gnuplot
+        if: matrix.mount-client == 'fuse'
         run: |
           sudo apt-get update
           # fuse3: the test runs the multi-target FUSE mount. gnuplot: jepsen's
@@ -29,6 +66,17 @@ jobs:
           # to :unknown.
           sudo apt-get install -y fuse3 gnuplot
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
+            -o /usr/local/bin/lein
+          sudo chmod +x /usr/local/bin/lein
+          lein version
+
+      - name: Install guest JDK, Leiningen, and gnuplot
+        if: matrix.mount-client == 'native'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gnuplot openjdk-17-jdk-headless
+          sudo curl -fsSL \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
           lein version
@@ -42,60 +90,118 @@ jobs:
             -o "$RUNNER_TEMP/minio-bin/mc"
           chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
 
-      - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
+      - name: Build and load the native kernel module
+        if: matrix.mount-client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
       # The test self-manages MinIO (starts the server, creates the bucket) and the
-      # FUSE mount, so only the binaries are needed here. lein exits non-zero on a
-      # failed analysis; the grep is a backup against a 0-exit on an invalid result.
+      # selected mount, so only the binaries are needed here. lein exits non-zero
+      # on a failed analysis; the grep backs up a 0-exit on an invalid result.
       - name: HA test (fsync, kill/heal nemesis)
-        working-directory: jepsen/ha
         run: |
-          lein run test \
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          lein=(lein)
+          if [[ "${{ matrix.mount-client }}" == fuse ]]; then
+            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
+              /usr/local/bin/lein)
+          fi
+          "${lein[@]}" run test \
             --time-limit 300 \
             --concurrency 10 \
+            --mount-client "${{ matrix.mount-client }}" \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
             --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
-            --work-dir "$RUNNER_TEMP/zerofs-ha-fsync" 2>&1 | tee fsync.log
+            --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-fsync" 2>&1 | tee fsync.log
           grep -q "Everything looks good" fsync.log
 
       - name: HA test (--no-fsync, semi-sync of un-fsynced writes)
-        working-directory: jepsen/ha
         run: |
-          lein run test \
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          lein=(lein)
+          if [[ "${{ matrix.mount-client }}" == fuse ]]; then
+            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
+              /usr/local/bin/lein)
+          fi
+          "${lein[@]}" run test \
             --time-limit 90 \
             --concurrency 10 \
             --no-fsync \
+            --mount-client "${{ matrix.mount-client }}" \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
             --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
-            --work-dir "$RUNNER_TEMP/zerofs-ha-nofsync" 2>&1 | tee nofsync.log
+            --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-nofsync" 2>&1 | tee nofsync.log
           grep -q "Everything looks good" nofsync.log
+
+      - name: Clean up the native guest
+        if: always() && matrix.mount-client == 'native'
+        run: |
+          for work_dir in \
+            "$RUNNER_TEMP/zerofs-ha-native-fsync" \
+            "$RUNNER_TEMP/zerofs-ha-native-nofsync"; do
+            if findmnt -rn -M "$work_dir/mnt" >/dev/null; then
+              sudo umount "$work_dir/mnt" || sudo umount -l "$work_dir/mnt"
+            fi
+          done
+          ./kernel/ci/native-kmod.sh unload
 
       # Node logs (a.log/b.log/minio.log/mount.log) live in the work-dir, not the
       # jepsen store; copy them in so the uploaded artifact captures them.
       - name: Collect node logs on failure
         if: failure()
         run: |
+          if [[ "${{ matrix.mount-client }}" == fuse &&
+                -e jepsen/ha/store ]]; then
+            sudo chown -R "$(id -u):$(id -g)" -- jepsen/ha/store
+          fi
           mkdir -p jepsen/ha/store/node-logs
-          for wd in zerofs-ha-fsync zerofs-ha-nofsync; do
+          for wd in \
+            "zerofs-ha-${{ matrix.mount-client }}-fsync" \
+            "zerofs-ha-${{ matrix.mount-client }}-nofsync"; do
             for f in "$RUNNER_TEMP/$wd"/*.log; do
               [ -e "$f" ] || continue
               cp "$f" "jepsen/ha/store/node-logs/$wd.$(basename "$f")"
             done
           done
+          if [ "${{ matrix.mount-client }}" = native ]; then
+            sudo dmesg > jepsen/ha/store/node-logs/kernel.log || true
+            findmnt -rn -t zerofs > jepsen/ha/store/node-logs/mounts.log || true
+          fi
+
+      - name: Pull native failure logs from the guest
+        if: failure() && matrix.mount-client == 'native'
+        shell: bash
+        run: |
+          ./kernel/ci/qemu-vm.sh pull \
+            "$GITHUB_WORKSPACE/jepsen/ha/store" \
+            "$GITHUB_WORKSPACE/jepsen/ha/guest-store"
+
+      - name: Stop the native QEMU guest
+        if: always() && matrix.mount-client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
+
+      - name: Collect the native guest serial log
+        if: failure() && matrix.mount-client == 'native'
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/zerofs-qemu-serial.log" ]; then
+            mkdir -p jepsen/ha/guest-store/node-logs
+            cp "$RUNNER_TEMP/zerofs-qemu-serial.log" \
+              jepsen/ha/guest-store/node-logs/qemu-serial.log
+          fi
 
       - name: Upload jepsen store on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: jepsen-ha-store
-          path: jepsen/ha/store
+          name: jepsen-ha-store-${{ matrix.mount-client }}
+          path: |
+            jepsen/ha/store
+            jepsen/ha/guest-store
           if-no-files-found: ignore
 
   # The fsync-honesty / durability scenarios. Each is a dedicated deterministic
@@ -103,12 +209,15 @@ jobs:
   # one --fsync-* flag per leg. Each asserts that a successful fsync never reports a
   # durability it cannot provide (ESTALE over a lost write, never a false success).
   durability:
-    name: Durability (${{ matrix.scenario }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Durability (${{ matrix.mount-client }}, ${{ matrix.scenario }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
+        mount-client:
+          - fuse
+          - native
         scenario:
           - fsync-honesty                # cold double-restart: lost un-fsync'd write -> fsync fails
           - fsync-honesty-partition      # Solo at takeover: unshipped write -> fsync fails
@@ -120,23 +229,68 @@ jobs:
           - fsync-rename                 # cross-dir rename -> fsyncdir(source) fails
           - fsync-metadata-transparency  # setattr replayed across a clean failover -> fsync ok
           - fsync-multifailover          # kept token still invalidated by a later cold restart
+        include:
+          - mount-client: fuse
+            os: ubuntu-latest
+            guest: "0"
+            timeout: 20
+          - mount-client: native
+            os: ubuntu-26.04
+            guest: "1"
+            timeout: 35
+    env:
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.mount-client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start the Rust-enabled QEMU guest
+        if: matrix.mount-client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
       - name: Set up JDK 17
+        if: matrix.mount-client == 'fuse'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Install Leiningen + FUSE + gnuplot
+        if: matrix.mount-client == 'fuse'
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 gnuplot
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
+
+      - name: Install guest JDK, Leiningen, and gnuplot
+        if: matrix.mount-client == 'native'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl gnuplot openjdk-17-jdk-headless
+          sudo curl -fsSL \
+            https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
+            -o /usr/local/bin/lein
+          sudo chmod +x /usr/local/bin/lein
+          lein version
 
       - name: Download MinIO + mc
         run: |
@@ -147,38 +301,85 @@ jobs:
             -o "$RUNNER_TEMP/minio-bin/mc"
           chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
 
-      - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
+      - name: Build and load the native kernel module
+        if: matrix.mount-client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
       - name: Run --${{ matrix.scenario }}
-        working-directory: jepsen/ha
         run: |
-          lein run test \
+          cd "$GITHUB_WORKSPACE/jepsen/ha"
+          lein=(lein)
+          if [[ "${{ matrix.mount-client }}" == fuse ]]; then
+            lein=(sudo env HOME=/root LEIN_ROOT=1 JAVA_HOME="$JAVA_HOME"
+              /usr/local/bin/lein)
+          fi
+          "${lein[@]}" run test \
             --${{ matrix.scenario }} \
             --time-limit 120 \
+            --mount-client "${{ matrix.mount-client }}" \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
             --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
             --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
-            --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.scenario }}" 2>&1 | tee scenario.log
+            --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-${{ matrix.scenario }}" 2>&1 | tee scenario.log
           grep -q "Everything looks good" scenario.log
+
+      - name: Clean up the native guest
+        if: always() && matrix.mount-client == 'native'
+        run: |
+          work_dir="$RUNNER_TEMP/zerofs-ha-native-${{ matrix.scenario }}"
+          if findmnt -rn -M "$work_dir/mnt" >/dev/null; then
+            sudo umount "$work_dir/mnt" || sudo umount -l "$work_dir/mnt"
+          fi
+          ./kernel/ci/native-kmod.sh unload
 
       - name: Collect node logs on failure
         if: failure()
         run: |
+          if [[ "${{ matrix.mount-client }}" == fuse &&
+                -e jepsen/ha/store ]]; then
+            sudo chown -R "$(id -u):$(id -g)" -- jepsen/ha/store
+          fi
           mkdir -p jepsen/ha/store/node-logs
-          for f in "$RUNNER_TEMP/zerofs-ha-${{ matrix.scenario }}"/*.log; do
+          for f in "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-${{ matrix.scenario }}"/*.log; do
             [ -e "$f" ] || continue
             cp "$f" "jepsen/ha/store/node-logs/$(basename "$f")"
           done
+          if [ "${{ matrix.mount-client }}" = native ]; then
+            sudo dmesg > jepsen/ha/store/node-logs/kernel.log || true
+            findmnt -rn -t zerofs > jepsen/ha/store/node-logs/mounts.log || true
+          fi
+
+      - name: Pull native failure logs from the guest
+        if: failure() && matrix.mount-client == 'native'
+        shell: bash
+        run: |
+          ./kernel/ci/qemu-vm.sh pull \
+            "$GITHUB_WORKSPACE/jepsen/ha/store" \
+            "$GITHUB_WORKSPACE/jepsen/ha/guest-store"
+
+      - name: Stop the native QEMU guest
+        if: always() && matrix.mount-client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
+
+      - name: Collect the native guest serial log
+        if: failure() && matrix.mount-client == 'native'
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/zerofs-qemu-serial.log" ]; then
+            mkdir -p jepsen/ha/guest-store/node-logs
+            cp "$RUNNER_TEMP/zerofs-qemu-serial.log" \
+              jepsen/ha/guest-store/node-logs/qemu-serial.log
+          fi
 
       - name: Upload jepsen store on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: jepsen-ha-store-${{ matrix.scenario }}
-          path: jepsen/ha/store
+          name: jepsen-ha-store-${{ matrix.mount-client }}-${{ matrix.scenario }}
+          path: |
+            jepsen/ha/store
+            jepsen/ha/guest-store
           if-no-files-found: ignore

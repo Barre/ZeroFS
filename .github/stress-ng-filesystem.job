@@ -1,0 +1,58 @@
+run sequential
+metrics-brief
+timeout 0
+
+access 1
+access-ops 4
+
+chdir 1
+chdir-dirs 64
+chdir-ops 1
+
+chmod 1
+chmod-ops 4
+
+chown 1
+chown-ops 32
+
+dentry 1
+dentries 64
+dentry-ops 65
+
+dir 1
+dir-dirs 64
+dir-ops 65
+
+dirdeep 1
+dirdeep-ops 128
+
+dirmany 1
+dirmany-ops 128
+
+dup 1
+dup-ops 16
+
+filename 1
+filename-opts posix
+filename-ops 4
+
+link 1
+link-ops 1
+
+metamix 1
+metamix-ops 1
+
+open 1
+open-ops 256
+
+rename 1
+rename-ops 128
+
+symlink 1
+symlink-ops 1
+
+touch 1
+touch-ops 256
+
+utime 1
+utime-ops 8

@@ -1,6 +1,7 @@
 (ns zerofs-ha.core
   "Jepsen HA test for ZeroFS: local MinIO + a ZeroFS leader/standby pair over it +
-  a multi-target FUSE mount. Nemesis kills leader/standby/both/MinIO then heals.
+  a multi-target FUSE or native-kernel mount. Nemesis kills
+  leader/standby/both/MinIO then heals.
   Workload is a grow-only set (add = create+fsync a uniquely-named file, fsync
   being a global durability barrier; read = ls); set-full checker asserts no
   acked add is lost. All-local: one logical node, dummy SSH, process management
@@ -52,6 +53,7 @@
      :minio       (:minio-bin opts)
      :mc          (:mc-bin opts)
      :mount       (str work "/mnt")
+     :mount-client (or (:mount-client opts) "fuse")
      :minio-data  (str work "/minio-data")
      :minio-addr  "127.0.0.1:9000"
      :minio-log   (str work "/minio.log")
@@ -272,17 +274,32 @@
   (str "unix:" (get-in c [:nodes :a :ninep]) ",unix:" (get-in c [:nodes :b :ninep])))
 
 (defn mount! [c]
-  (info "Mounting at" (:mount c))
-  (daemon-start! (str (:work c) "/mount.pid") (str (:work c) "/mount.log") {}
-                 (:zerofs c)
-                 ["mount" (mount-targets c) (:mount c) "--writeback" "false"])
+  (info "Mounting with" (:mount-client c) "at" (:mount c))
+  (case (:mount-client c)
+    "fuse"
+    (daemon-start! (str (:work c) "/mount.pid") (str (:work c) "/mount.log") {}
+                   (:zerofs c)
+                   ["mount" (mount-targets c) (:mount c) "--writeback" "false"])
+
+    "native"
+    (sh-ok! :sudo :mount :-t :zerofs :-o "consistency=strict,msize=10485760"
+            (mount-targets c) (:mount c))
+
+    (throw+ {:type ::unknown-mount-client :mount-client (:mount-client c)}))
   (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
             {:retry-interval 200 :log-interval 5000 :log-message "Waiting for mount"}))
 
 (defn unmount! [c]
   (when (mounted? c)
-    (or (zero? (:exit (sh! :fusermount3 :-uz (:mount c))))
-        (sh! :fusermount :-uz (:mount c)))))
+    (case (:mount-client c)
+      "fuse"
+      (or (zero? (:exit (sh! :fusermount3 :-uz (:mount c))))
+          (sh! :fusermount :-uz (:mount c)))
+
+      "native"
+      (sh-ok! :sudo :umount (:mount c))
+
+      (throw+ {:type ::unknown-mount-client :mount-client (:mount-client c)}))))
 
 (defn cluster-down! [c]
   (unmount! c)
@@ -623,6 +640,23 @@
 
 (defn dc-file [dir f] (io/file dir f))
 
+(defn close-durability-handles!
+  "Atomically detach and close every file or directory handle held by a
+  durability client. Multiple Jepsen worker teardowns may share the same atom."
+  [handles]
+  (let [entries   (vals (first (swap-vals! handles (constantly {}))))
+        resources (keep identity (mapcat (juxt :raf :dirchan) entries))
+        error     (reduce (fn [first-error resource]
+                            (try
+                              (.close ^java.io.Closeable resource)
+                              first-error
+                              (catch java.io.IOException e
+                                (or first-error e))))
+                          nil
+                          resources)]
+    (when error
+      (throw error))))
+
 (defrecord DurabilityClient [dir handles counter]
   client/Client
   (open! [this _test _node] this)
@@ -717,8 +751,8 @@
                                                         (map #(.getName %)
                                                              (or (.listFiles (dc-file dir dirname))
                                                                  (into-array java.io.File []))))])))))))
-  (teardown! [_ _test])
-  (close! [_ _test]))
+  (teardown! [_ _test] (close-durability-handles! handles))
+  (close! [_ _test] (close-durability-handles! handles)))
 
 ;; Nemesis: process loss, object-store pauses, replication partitions, blocked
 ;; survivor restart, forced recovery, and cluster repair.
@@ -1537,6 +1571,9 @@
   build, and minio/mc resolved on PATH."
   [[nil "--work-dir DIR" "Working directory for the cluster + mount"
     :default (or (System/getenv "ZEROFS_JEPSEN_WORK") "/tmp/zerofs-jepsen-ha")]
+   [nil "--mount-client CLIENT" "Mount client to exercise: fuse or native"
+    :default "fuse"
+    :validate [#{"fuse" "native"} "Must be either fuse or native"]]
    [nil "--zerofs-bin PATH" "Path to the zerofs binary"
     :default (or (System/getenv "ZEROFS_BIN") "../../zerofs/target/ci/zerofs")]
    [nil "--minio-bin PATH" "Path to the minio binary"
@@ -1553,7 +1590,7 @@
     :default false]
    [nil "--fsync-crossfid" "Cross-fid (per-fd POSIX): two open files written un-fsync'd, a cold double-restart loses both, fsync(a) fails, the app redoes ONLY a and fsync(a) succeeds, then fsync(b) MUST STILL fail. The fsync obligation is per-fid, so a's redo does not discharge b's lost write."
     :default false]
-   [nil "--fsync-metadata" "Metadata honesty (FUSE fid-mapping): ftruncate(fd) un-fsync'd is a setattr the mount lands on the per-inode fid, not the open handle the app fsyncs. A cold double-restart loses the truncate; fsync(fd) MUST fail. A verified fsync aggregates every fid bound to the inode and returns ESTALE rather than reporting success over the lost truncate."
+   [nil "--fsync-metadata" "Metadata honesty: ftruncate(fd) un-fsync'd, then a cold double-restart loses the truncate; fsync(fd) MUST fail. A verified fsync aggregates every fid bound to the inode and returns ESTALE rather than reporting success over the lost truncate."
     :default false]
    [nil "--fsync-multihandle" "Multiple-open-handle honesty: open the same file twice, write un-fsync'd through one handle, cold double-restart loses it, fsync through the OTHER handle MUST fail (POSIX fsync(fd) persists the whole file). A verified fsync aggregates every open handle of the inode and returns ESTALE rather than reporting success over the sibling handle's lost write."
     :default false]

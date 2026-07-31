@@ -115,15 +115,11 @@ jobs:
           # Verify mount
           mount | grep zerofs
 
-      - name: Run stress-ng test
+      - name: Run filesystem metadata stress test
+        timeout-minutes: 10
         run: |
           cd /mnt/zerofs-nfs
-          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
-          --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
-          --fd-fork 1 --filename 1 --fstat 1 \
-          --getdent 1 --link 1  \
-          --metamix 1 --open 1 --rename 1 --symlink 1  \
-          --touch 1 --utime 1 --timeout 60s
+          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
@@ -135,18 +131,56 @@ jobs:
           pkill -f "zerofs run -c zerofs-ci.toml" || true
 
   stress-ng-9p:
-    name: Run stress-ng fstat test on 9P
+    name: Run filesystem metadata stress test (${{ matrix.client }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        include:
+          - client: v9fs
+            os: ubuntu-latest
+            guest: 0
+          - client: native
+            os: ubuntu-26.04
+            guest: 1
+    env:
+      ZEROFS_CI_GUEST: ${{ matrix.guest }}
+    defaults:
+      run:
+        shell: bash kernel/ci/ci-shell.sh {0}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch the prebuilt ZeroFS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zerofs-ci-bin
+          path: zerofs/target/ci
+
+      - name: Make the ZeroFS binary executable
+        shell: bash
+        run: chmod +x zerofs/target/ci/zerofs
+
+      - name: Cache the Ubuntu guest image
+        if: matrix.client == 'native'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/zerofs-qemu/ubuntu-26.04-server-cloudimg-amd64-20260720.img
+          key: zerofs-qemu-ubuntu-26.04-amd64-20260720
+
+      - name: Start native-client guest
+        if: matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh start
+
+      - name: Load native kernel client
+        if: matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh load
+
       - name: Start MinIO
         run: |
-          docker run -d \
+          sudo docker run -d \
             --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
@@ -167,6 +201,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y stress-ng
 
+      - name: Load v9fs kernel modules
+        if: matrix.client == 'v9fs'
+        run: |
           # Check if 9p kernel module is available
           sudo modprobe 9p
           sudo modprobe 9pnet
@@ -183,16 +220,10 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/zerofs-stress-test || true
 
-      - name: Fetch the prebuilt ZeroFS binary
-        uses: actions/download-artifact@v4
-        with:
-          name: zerofs-ci-bin
-          path: zerofs/target/ci
-      - run: chmod +x zerofs/target/ci/zerofs
-
       - name: Start ZeroFS with 9P support
-        working-directory: zerofs
         run: |
+          cd zerofs
+
           # Create cache directory
           mkdir -p /tmp/zerofs-cache
 
@@ -239,7 +270,8 @@ jobs:
             exit 1
           fi
 
-      - name: Mount 9P filesystem
+      - name: Mount filesystem with v9fs
+        if: matrix.client == 'v9fs'
         run: |
           # Create mount point
           sudo mkdir -p /mnt/zerofs-9p
@@ -250,15 +282,19 @@ jobs:
           # Verify mount
           mount | grep zerofs-9p
 
-      - name: Run stress-ng fstat test
+      - name: Mount filesystem with the native client
+        if: matrix.client == 'native'
+        run: |
+          sudo mkdir -p /mnt/zerofs-9p
+          sudo mount -t zerofs -o consistency=relaxed,msize=10485760 \
+            127.0.0.1:5564 /mnt/zerofs-9p
+          [[ $(findmnt -nr -o FSTYPE /mnt/zerofs-9p) == zerofs ]]
+
+      - name: Run filesystem metadata stress test
+        timeout-minutes: 10
         run: |
           cd /mnt/zerofs-9p
-          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
-            --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
-            --fd-fork 1 --filename 1 --fstat 1 \
-            --getdent 1 --link 1  \
-            --metamix 1 --open 1 --rename 1 --symlink 1  \
-            --touch 1 --utime 1 --timeout 60s
+          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
@@ -268,6 +304,15 @@ jobs:
 
           # Kill ZeroFS
           pkill -f "zerofs run -c zerofs-ci.toml" || true
+
+      - name: Unload native kernel client
+        if: always() && matrix.client == 'native'
+        run: ./kernel/ci/native-kmod.sh unload
+
+      - name: Stop native-client guest
+        if: always() && matrix.client == 'native'
+        shell: bash
+        run: ./kernel/ci/qemu-vm.sh stop
 
   stress-ng-fuse:
     name: Run stress-ng test on zerofs mount (FUSE)
@@ -382,15 +427,11 @@ jobs:
           mountpoint -q /mnt/zerofs-fuse || { echo "FUSE mount failed"; exit 1; }
           mount | grep zerofs-fuse
 
-      - name: Run stress-ng fstat test
+      - name: Run filesystem metadata stress test
+        timeout-minutes: 10
         run: |
           cd /mnt/zerofs-fuse
-          sudo stress-ng --access 1 --chdir 1 --chmod 1 --chown 1  \
-            --dentry 1 --dir 1 --dirdeep 1 --dirmany 1 --dup 1 --eventfd 1 \
-            --fd-fork 1 --filename 1 --fstat 1 \
-            --getdent 1 --link 1  \
-            --metamix 1 --open 1 --rename 1 --symlink 1  \
-            --touch 1 --utime 1 --timeout 60s
+          sudo stress-ng --job "$GITHUB_WORKSPACE/.github/stress-ng-filesystem.job"
 
       - name: Cleanup
         if: always()
