@@ -1,0 +1,42 @@
+name: "@META_PACKAGE@"
+arch: "@NFPM_ARCH@"
+platform: linux
+version: "@ZEROFS_VERSION@"
+release: "@PACKAGE_REVISION@"
+section: kernel
+priority: optional
+maintainer: Pierre Barre <pierre@zerofs.net>
+description: |
+  ZeroFS native kernel client.
+  This selector installs the module for @TARGET_ID@, kernel @KERNEL_RELEASE@,
+  and configures it to load during boot.
+vendor: ZeroFS
+homepage: https://www.zerofs.net
+license: "@PACKAGE_LICENSE@"
+
+depends:
+  - "@LEAF_DEPENDENCY@"
+
+# @KERNEL_UPGRADE_CONFLICT@
+
+contents:
+  - src: ./content/zerofs.conf
+    dst: /usr/lib/modules-load.d/zerofs.conf
+    file_info:
+      mode: 0644
+
+  - src: ./content/meta-provenance.json
+    dst: /usr/share/doc/@META_PACKAGE@/provenance.json
+    file_info:
+      mode: 0644
+
+  # @SIGNING_CERT_CONTENT@
+
+deb:
+  compression: zstd
+
+rpm:
+  compression: zstd
+
+scripts:
+  postinstall: ./scripts/meta-postinstall.sh

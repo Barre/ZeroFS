@@ -1,0 +1,42 @@
+name: "@LEAF_PACKAGE@"
+arch: "@NFPM_ARCH@"
+platform: linux
+version: "@ZEROFS_VERSION@"
+release: "@PACKAGE_REVISION@"
+section: kernel
+priority: optional
+maintainer: Pierre Barre <pierre@zerofs.net>
+description: |
+  ZeroFS native kernel client for one exact kernel.
+  This co-installable package targets @TARGET_ID@, kernel @KERNEL_RELEASE@.
+vendor: ZeroFS
+homepage: https://www.zerofs.net
+license: "@PACKAGE_LICENSE@"
+
+depends:
+  - kmod
+  - "@KERNEL_PACKAGE_DEPENDENCY@"
+
+provides:
+  - "@LEAF_PROVIDES@"
+
+contents:
+  - src: ./content/zerofs.ko
+    dst: /lib/modules/@KERNEL_RELEASE@/updates/zerofs/zerofs.ko
+    file_info:
+      mode: 0644
+
+  - src: ./content/leaf-provenance.json
+    dst: /usr/share/doc/@LEAF_PACKAGE@/provenance.json
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: ./scripts/leaf-postinstall.sh
+  postremove: ./scripts/leaf-postremove.sh
+
+deb:
+  compression: zstd
+
+rpm:
+  compression: zstd

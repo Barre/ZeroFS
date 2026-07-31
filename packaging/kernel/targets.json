@@ -1,0 +1,501 @@
+{
+  "schema_version": 1,
+  "channels": [
+    {
+      "id": "ubuntu-26.04-generic-x86-64",
+      "distro": "ubuntu",
+      "release": "26.04",
+      "family": "deb",
+      "arch": "x86_64",
+      "flavor": "generic",
+      "apt": {
+        "codename": "stable",
+        "suite": "stable",
+        "component": "main"
+      },
+      "discovery": {
+        "kind": "ubuntu-snapshot",
+        "builder_image": "ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+        "selector": "linux-image-generic",
+        "suite": "resolute"
+      }
+    },
+    {
+      "id": "ubuntu-26.04-generic-aarch64",
+      "distro": "ubuntu",
+      "release": "26.04",
+      "family": "deb",
+      "arch": "aarch64",
+      "flavor": "generic",
+      "apt": {
+        "codename": "stable",
+        "suite": "stable",
+        "component": "main"
+      },
+      "discovery": {
+        "kind": "ubuntu-snapshot",
+        "builder_image": "ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+        "selector": "linux-image-generic",
+        "suite": "resolute"
+      }
+    },
+    {
+      "id": "ubuntu-24.04-generic-hwe-x86-64",
+      "distro": "ubuntu",
+      "release": "24.04",
+      "family": "deb",
+      "arch": "x86_64",
+      "flavor": "generic-hwe",
+      "apt": {
+        "codename": "stable",
+        "suite": "stable",
+        "component": "main"
+      },
+      "discovery": {
+        "kind": "ubuntu-snapshot",
+        "builder_image": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90",
+        "selector": "linux-image-generic-hwe-24.04",
+        "suite": "noble"
+      }
+    },
+    {
+      "id": "ubuntu-24.04-generic-hwe-aarch64",
+      "distro": "ubuntu",
+      "release": "24.04",
+      "family": "deb",
+      "arch": "aarch64",
+      "flavor": "generic-hwe",
+      "apt": {
+        "codename": "stable",
+        "suite": "stable",
+        "component": "main"
+      },
+      "discovery": {
+        "kind": "ubuntu-snapshot",
+        "builder_image": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90",
+        "selector": "linux-image-generic-hwe-24.04",
+        "suite": "noble"
+      }
+    },
+    {
+      "id": "debian-13-backports-amd64-x86-64",
+      "distro": "debian",
+      "release": "13-backports",
+      "family": "deb",
+      "arch": "x86_64",
+      "flavor": "amd64",
+      "apt": {
+        "codename": "stable",
+        "suite": "stable",
+        "component": "main"
+      },
+      "discovery": {
+        "kind": "debian-snapshot",
+        "builder_image": "debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+        "selector": "linux-image-amd64",
+        "suite": "trixie-backports"
+      }
+    },
+    {
+      "id": "debian-13-backports-arm64-aarch64",
+      "distro": "debian",
+      "release": "13-backports",
+      "family": "deb",
+      "arch": "aarch64",
+      "flavor": "arm64",
+      "apt": {
+        "codename": "stable",
+        "suite": "stable",
+        "component": "main"
+      },
+      "discovery": {
+        "kind": "debian-snapshot",
+        "builder_image": "debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+        "selector": "linux-image-arm64",
+        "suite": "trixie-backports"
+      }
+    },
+    {
+      "id": "fedora-43-kernel-core-x86-64",
+      "distro": "fedora",
+      "release": "43",
+      "family": "rpm",
+      "arch": "x86_64",
+      "flavor": "kernel-core",
+      "rpm": {
+        "repo_id": "zerofs-fedora-43-kernel-core-x86-64"
+      },
+      "discovery": {
+        "kind": "fedora-koji",
+        "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+        "selector": "kernel-core",
+        "signing_fingerprint": "c6e7f081cf80e13146676e88829b606631645531"
+      }
+    },
+    {
+      "id": "fedora-43-kernel-core-aarch64",
+      "distro": "fedora",
+      "release": "43",
+      "family": "rpm",
+      "arch": "aarch64",
+      "flavor": "kernel-core",
+      "rpm": {
+        "repo_id": "zerofs-fedora-43-kernel-core-aarch64"
+      },
+      "discovery": {
+        "kind": "fedora-koji",
+        "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+        "selector": "kernel-core",
+        "signing_fingerprint": "c6e7f081cf80e13146676e88829b606631645531"
+      }
+    },
+    {
+      "id": "fedora-44-kernel-core-x86-64",
+      "distro": "fedora",
+      "release": "44",
+      "family": "rpm",
+      "arch": "x86_64",
+      "flavor": "kernel-core",
+      "rpm": {
+        "repo_id": "zerofs-fedora-44-kernel-core-x86-64"
+      },
+      "discovery": {
+        "kind": "fedora-koji",
+        "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+        "selector": "kernel-core",
+        "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6"
+      }
+    },
+    {
+      "id": "fedora-44-kernel-core-aarch64",
+      "distro": "fedora",
+      "release": "44",
+      "family": "rpm",
+      "arch": "aarch64",
+      "flavor": "kernel-core",
+      "rpm": {
+        "repo_id": "zerofs-fedora-44-kernel-core-aarch64"
+      },
+      "discovery": {
+        "kind": "fedora-koji",
+        "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+        "selector": "kernel-core",
+        "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6"
+      }
+    },
+    {
+      "id": "opensuse-tumbleweed-default-x86-64",
+      "distro": "opensuse",
+      "release": "tumbleweed",
+      "family": "rpm",
+      "arch": "x86_64",
+      "flavor": "default",
+      "rpm": {
+        "repo_id": "zerofs-opensuse-tumbleweed-default-x86-64"
+      },
+      "discovery": {
+        "kind": "opensuse-history",
+        "builder_image": "registry.opensuse.org/opensuse/tumbleweed:20260724.37.69@sha256:2707c307c6a91a5562a400c54860372d7fdb1a3e6bc0c3203542564146637ed7",
+        "selector": "kernel-default",
+        "packages": [
+          "kernel-default",
+          "kernel-default-devel",
+          "kernel-devel",
+          "kernel-source",
+          "kernel-syms"
+        ]
+      }
+    }
+  ],
+  "targets": [
+    {
+      "id": "ubuntu-26.04-generic-7.0.0-28",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "ubuntu-26.04-generic-x86-64",
+      "package_revision": "1",
+      "kernel_release": "7.0.0-28-generic",
+      "kernel_package_name": "linux-image-7.0.0-28-generic",
+      "kernel_package_version": "7.0.0-28.28",
+      "kernel_selector_version": "7.0.0-28.28",
+      "builder_image": "ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "ubuntu:linux@7.0.0-28.28",
+        "snapshot": "20260727T000000Z"
+      }
+    },
+    {
+      "id": "ubuntu-26.04-generic-7.0.0-28-aarch64",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "ubuntu-26.04-generic-aarch64",
+      "package_revision": "1",
+      "kernel_release": "7.0.0-28-generic",
+      "kernel_package_name": "linux-image-7.0.0-28-generic",
+      "kernel_package_version": "7.0.0-28.28",
+      "kernel_selector_version": "7.0.0-28.28",
+      "builder_image": "ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "ubuntu:linux@7.0.0-28.28",
+        "snapshot": "20260727T000000Z"
+      }
+    },
+    {
+      "id": "ubuntu-24.04-hwe-7.0.0-28",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "ubuntu-24.04-generic-hwe-x86-64",
+      "package_revision": "1",
+      "kernel_release": "7.0.0-28-generic",
+      "kernel_package_name": "linux-image-7.0.0-28-generic",
+      "kernel_package_version": "7.0.0-28.28~24.04.1",
+      "kernel_selector_version": "7.0.0-28.28~24.04.1",
+      "builder_image": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "ubuntu:linux-hwe-7.0@7.0.0-28.28~24.04.1",
+        "snapshot": "20260727T000000Z"
+      }
+    },
+    {
+      "id": "ubuntu-24.04-hwe-7.0.0-28-aarch64",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "ubuntu-24.04-generic-hwe-aarch64",
+      "package_revision": "1",
+      "kernel_release": "7.0.0-28-generic",
+      "kernel_package_name": "linux-image-7.0.0-28-generic",
+      "kernel_package_version": "7.0.0-28.28~24.04.1",
+      "kernel_selector_version": "7.0.0-28.28~24.04.1",
+      "builder_image": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "ubuntu:linux-hwe-7.0@7.0.0-28.28~24.04.1",
+        "snapshot": "20260727T000000Z"
+      }
+    },
+    {
+      "id": "debian-13-backports-7.0.13",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "debian-13-backports-amd64-x86-64",
+      "package_revision": "1",
+      "kernel_release": "7.0.13+deb13-amd64",
+      "kernel_package_name": "linux-image-7.0.13+deb13-amd64",
+      "kernel_package_version": "7.0.13-1~bpo13+1",
+      "kernel_selector_version": "7.0.13-1~bpo13+1",
+      "builder_image": "debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "debian:linux@7.0.13-1~bpo13+1:trixie-backports",
+        "snapshot": "20260727T000000Z"
+      }
+    },
+    {
+      "id": "debian-13-backports-7.0.13-aarch64",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "debian-13-backports-arm64-aarch64",
+      "package_revision": "1",
+      "kernel_release": "7.0.13+deb13-arm64",
+      "kernel_package_name": "linux-image-7.0.13+deb13-arm64",
+      "kernel_package_version": "7.0.13-1~bpo13+1",
+      "kernel_selector_version": "7.0.13-1~bpo13+1",
+      "builder_image": "debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "debian:linux@7.0.13-1~bpo13+1:trixie-backports",
+        "snapshot": "20260727T000000Z"
+      }
+    },
+    {
+      "id": "fedora-43-7.1.5-100",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-43-kernel-core-x86-64",
+      "package_revision": "1",
+      "kernel_release": "7.1.5-100.fc43.x86_64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-100.fc43.x86_64",
+      "kernel_selector_version": "7.1.5-100.fc43",
+      "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-100.fc43",
+        "snapshot": "koji-download-build:x86_64,noarch,src",
+        "artifacts": {
+          "cargo-1.96.1-1.fc43.x86_64.rpm": "91c098b91ad70e3aa1470f9bb6c0b8c5b8475dcc84526a5ec909873f550263ff",
+          "kernel-7.1.5-100.fc43.src.rpm": "ea8396cf05119e3d9af404988bfd4e5aa88001922a5469174c1a69431757cdaf",
+          "kernel-core-7.1.5-100.fc43.x86_64.rpm": "22269045a9b14ee1e4846c6a420c599e8114ddb44c6c76a9543eaae0a2b24434",
+          "kernel-devel-7.1.5-100.fc43.x86_64.rpm": "058d0484f513ff451ee1c4e6ccb3d4509619007a69c2e6426d44c840a65a4fff",
+          "kernel-modules-core-7.1.5-100.fc43.x86_64.rpm": "85a1365f07c3f452178ef645d9d085a09a26ca5eab95eb0731d4fc2fadf2dc6f",
+          "rust-1.96.1-1.fc43.x86_64.rpm": "d008ed30fa93406d30a044bbcb360f1d744796e428921b78140982be232d2b9b",
+          "rust-src-1.96.1-1.fc43.noarch.rpm": "ee3e88c3f3ed225278edb2b9dcb7076082ea2a4cbfa7e66ec782dd3547e24e50",
+          "rust-std-static-1.96.1-1.fc43.x86_64.rpm": "fd28b8fd1266dab0df34cdc058257a71ea00b7b102b92d3da66468d41108600a",
+          "rustfmt-1.96.1-1.fc43.x86_64.rpm": "23ddfae74e2b9ffa6c2833c0dd2ecb8b39392795a10c5b977de805d26a2590c6"
+        }
+      }
+    },
+    {
+      "id": "fedora-43-7.1.5-100-aarch64",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-43-kernel-core-aarch64",
+      "package_revision": "1",
+      "kernel_release": "7.1.5-100.fc43.aarch64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-100.fc43.aarch64",
+      "kernel_selector_version": "7.1.5-100.fc43",
+      "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-100.fc43",
+        "snapshot": "koji-signed-build:c6e7f081cf80e13146676e88829b606631645531:aarch64,noarch,src",
+        "artifacts": {
+          "cargo-1.96.1-1.fc43.aarch64.rpm": "f827792193dd7a571b9dc1a425144cb4adfe06b147acc320cc02b65dd00370d7",
+          "kernel-7.1.5-100.fc43.src.rpm": "8f0d6377478f29083631bbb6711b68c728c03cc21735de406d5676f485b91ea9",
+          "kernel-core-7.1.5-100.fc43.aarch64.rpm": "8a197752fbe5fb9c770c1462924f81af24aa6ab7044accf5404f500806f7cc02",
+          "kernel-devel-7.1.5-100.fc43.aarch64.rpm": "a567e71ce8fb5e930d85d5253544f287d4ca92152fa3d1597453f62818f60271",
+          "kernel-modules-core-7.1.5-100.fc43.aarch64.rpm": "cdf9a79b486279d027e0a0c6f2ab079f2417d027b9d8582fd609bac5b1271a53",
+          "rust-1.96.1-1.fc43.aarch64.rpm": "3ea32a1be6fd2be2677465ba29601cc74ab54b7edad57362b720765268cc3899",
+          "rust-src-1.96.1-1.fc43.noarch.rpm": "f8adfae31928def18d06eee27fa23117eefcf180491e8b09b08a75283ed81ddb",
+          "rust-std-static-1.96.1-1.fc43.aarch64.rpm": "d770ca294c77558bce6afdd15478fd65e044801b3d28f862b1a4389f754455a6",
+          "rustfmt-1.96.1-1.fc43.aarch64.rpm": "6ae2c78437fbcf57d294d543419b753dad4d3965a29a505f5333244d4b269520"
+        }
+      }
+    },
+    {
+      "id": "fedora-44-7.1.5-200",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-44-kernel-core-x86-64",
+      "package_revision": "1",
+      "kernel_release": "7.1.5-200.fc44.x86_64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-200.fc44.x86_64",
+      "kernel_selector_version": "7.1.5-200.fc44",
+      "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-200.fc44",
+        "snapshot": "koji-download-build:x86_64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc44.x86_64.rpm": "0b69aa6aae0e2d42892131f21cd0caa446ba69734aec0624abbab4be2601686f",
+          "kernel-7.1.5-200.fc44.src.rpm": "90d86aafacd24cb5b54d2e4104e8f5c0d49641590b73c25ebcfc180942394b30",
+          "kernel-core-7.1.5-200.fc44.x86_64.rpm": "ddabf1c233818fbea094622daf1112c843b60456626f75daf4ead4c94b3d953d",
+          "kernel-devel-7.1.5-200.fc44.x86_64.rpm": "d2de3a7e857594b7f918186265ec947670c8e50b0682a649eaf62ad9ea34de68",
+          "kernel-modules-core-7.1.5-200.fc44.x86_64.rpm": "be3d0dd57ac6d2b19777edcbdabd0e0a609d0327bb9701d20156f1b85d491d21",
+          "rust-1.97.1-1.fc44.x86_64.rpm": "22200a3e47ffd91c10ef2656936e5445834780f8d7dec3e710fbc5672a46fef4",
+          "rust-src-1.97.1-1.fc44.noarch.rpm": "a5a6680822a91be40d4f627896ca61a3ad821b91fc579ecdb59487aefe052713",
+          "rust-std-static-1.97.1-1.fc44.x86_64.rpm": "24b678288de70002eb87393c5dfa7cc7315628fc3051a76ddf76d1dcb1b3b0b0",
+          "rustfmt-1.97.1-1.fc44.x86_64.rpm": "e16e084b6c9fe82292f3649fbbda703e20066dcbba6b735d6d39f9d1b2b8ea57"
+        }
+      }
+    },
+    {
+      "id": "fedora-44-7.1.5-200-aarch64",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-44-kernel-core-aarch64",
+      "package_revision": "1",
+      "kernel_release": "7.1.5-200.fc44.aarch64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.5-200.fc44.aarch64",
+      "kernel_selector_version": "7.1.5-200.fc44",
+      "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.5-200.fc44",
+        "snapshot": "koji-signed-build:36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6:aarch64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc44.aarch64.rpm": "b9a5e2a583693fd5a1a9c78270d3dc40cf46326e7f92636e46b5c36b82ff3a5f",
+          "kernel-7.1.5-200.fc44.src.rpm": "21c5141ddb77fce0f77c00bf7804690719b36023d75e7e0688b5e39b2f5a9b99",
+          "kernel-core-7.1.5-200.fc44.aarch64.rpm": "37766c8f9c3847da7dc557a18adff7119a7adb54efb64c4ed6e81b7baa2412e6",
+          "kernel-devel-7.1.5-200.fc44.aarch64.rpm": "a2597e88c4f5711bd5aab8aa092ee0f26928680fbf34c1c5cef3adc52a6ea224",
+          "kernel-modules-core-7.1.5-200.fc44.aarch64.rpm": "cd7c601339fd8fc8acaac974085babc3cf04d4de93fe61efd2e67d318623cf57",
+          "rust-1.97.1-1.fc44.aarch64.rpm": "c04ef4cf7e712aae73933c624eac33a2a54c0368d28af4467c6928557cf16350",
+          "rust-src-1.97.1-1.fc44.noarch.rpm": "e8730ab6cb13f46604929b1ce134431ac40d1446a95cef04edfbe3d97093554f",
+          "rust-std-static-1.97.1-1.fc44.aarch64.rpm": "5ea7fe6ad90d99ff45fedab6d37e510920d677f86b9998ea821678eb429e534e",
+          "rustfmt-1.97.1-1.fc44.aarch64.rpm": "313cfefe6f14d0e4d3836ff2916f6e75d5ff0c63e062bdf0e3f905d3f0a0d418"
+        }
+      }
+    },
+    {
+      "id": "tumbleweed-20260724-7.1.4-default",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "opensuse-tumbleweed-default-x86-64",
+      "package_revision": "1",
+      "kernel_release": "7.1.4-1-default",
+      "kernel_package_name": "kernel-default",
+      "kernel_package_version": "7.1.4-1.1",
+      "kernel_selector_version": "7.1.4-1.1",
+      "builder_image": "registry.opensuse.org/opensuse/tumbleweed:20260724.37.69@sha256:2707c307c6a91a5562a400c54860372d7fdb1a3e6bc0c3203542564146637ed7",
+      "source": {
+        "kind": "opensuse-history",
+        "identity": "kernel-default@7.1.4-1.1,kernel-default-devel@7.1.4-1.1,kernel-devel@7.1.4-1.1,kernel-source@7.1.4-1.1,kernel-syms@7.1.4-1.1",
+        "snapshot": "20260724"
+      }
+    }
+  ],
+  "unsupported_targets": [
+    {
+      "id": "ubuntu-24.04-ga",
+      "distro": "ubuntu",
+      "release": "24.04",
+      "arch": "x86_64",
+      "flavor": "generic",
+      "kernel_release": "6.8-series",
+      "reason": "Linux 6.8 predates the minimum compatible netfs API."
+    },
+    {
+      "id": "debian-13-ga",
+      "distro": "debian",
+      "release": "13",
+      "arch": "x86_64",
+      "flavor": "amd64",
+      "kernel_release": "6.12-series",
+      "reason": "Linux 6.12 predates the minimum compatible netfs API."
+    },
+    {
+      "id": "rocky-9",
+      "distro": "rocky",
+      "release": "9",
+      "arch": "x86_64",
+      "flavor": "kernel-core",
+      "kernel_release": "5.14-series",
+      "reason": "Rocky Linux 9's kernel predates the minimum compatible netfs API."
+    },
+    {
+      "id": "rocky-10",
+      "distro": "rocky",
+      "release": "10",
+      "arch": "x86_64",
+      "flavor": "kernel-core",
+      "kernel_release": "6.12-series",
+      "reason": "Rocky Linux 10's kernel predates the minimum compatible netfs API."
+    },
+    {
+      "id": "opensuse-leap-16",
+      "distro": "opensuse",
+      "release": "leap-16",
+      "arch": "x86_64",
+      "flavor": "default",
+      "kernel_release": "6.12-series",
+      "reason": "Leap 16's kernel predates the minimum compatible netfs API."
+    }
+  ]
+}
