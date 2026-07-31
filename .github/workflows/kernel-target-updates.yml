@@ -1,0 +1,221 @@
+name: kernel-target-updates
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      as_of:
+        description: UTC discovery time (YYYY-MM-DDTHH:MM:SSZ)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: kernel-target-updates
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve discovery channels
+    if: >-
+      github.ref ==
+      format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-26.04
+    outputs:
+      as_of: ${{ steps.resolve.outputs.as_of }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Ensure update label
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const name = "kernel-update";
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name,
+                color: "1d76db",
+                description: "A newer distribution kernel is available",
+              });
+            }
+
+      - name: Resolve discovery inputs
+        id: resolve
+        env:
+          REQUESTED_AS_OF: ${{ inputs.as_of }}
+        run: |
+          matrix=$(packaging/kernel/kernel-targets.py \
+            --manifest packaging/kernel/targets.json \
+            matrix --scope discover)
+          count=$(python3 -c \
+            'import json,sys; print(len(json.load(sys.stdin)["include"]))' \
+            <<<"$matrix")
+          ((count > 0))
+
+          if [[ -n "$REQUESTED_AS_OF" ]]; then
+            as_of=$REQUESTED_AS_OF
+          else
+            as_of=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          fi
+          timestamp_pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+          timestamp_pattern+='[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+          [[ "$as_of" =~ $timestamp_pattern ]]
+
+          {
+            echo "as_of=$as_of"
+            echo "base_sha=$(git rev-parse HEAD)"
+            echo "matrix=$matrix"
+          } >>"$GITHUB_OUTPUT"
+
+  check:
+    name: Check ${{ matrix.id }}
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.resolve.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Install Python
+        run: |
+          if command -v python3 >/dev/null 2>&1; then
+            python3 --version
+            exit 0
+          fi
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              --no-install-recommends python3
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y python3
+          elif command -v zypper >/dev/null 2>&1; then
+            zypper --non-interactive install python3
+          else
+            echo "cannot install Python in the discovery container" >&2
+            exit 1
+          fi
+
+      - name: Check latest kernel
+        id: check
+        env:
+          AS_OF: ${{ needs.resolve.outputs.as_of }}
+          CHANNEL_ID: ${{ matrix.id }}
+        run: |
+          entry=$(python3 packaging/kernel/kernel-targets.py \
+            --manifest packaging/kernel/targets.json \
+            check "$CHANNEL_ID" \
+            --as-of "$AS_OF")
+          echo "entry=$entry" >>"$GITHUB_OUTPUT"
+
+      - name: Reconcile update issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          ENTRY: ${{ steps.check.outputs.entry }}
+        with:
+          script: |
+            const entry = JSON.parse(process.env.ENTRY);
+            const label = "kernel-update";
+            const marker =
+              `<!-- zerofs-kernel-channel: ${entry.channel_id} -->`;
+            const title = `Kernel update: ${entry.channel_id}`;
+            const body = [
+              marker,
+              "",
+              `Current target: \`${entry.current_target_id}\``,
+              `Current kernel: \`${entry.current_kernel_release}\``,
+              `Current package: \`${entry.current_kernel_package_version}\``,
+              `Current source: \`${entry.current_source_identity}\``,
+              `Current snapshot: \`${entry.current_source_snapshot}\``,
+              `Available kernel: \`${entry.candidate_kernel_release}\``,
+              `Available package: \`${entry.candidate_kernel_package_version}\``,
+              `Available source: \`${entry.candidate_source_identity}\``,
+              `Available snapshot: \`${entry.candidate_source_snapshot}\``,
+              "",
+              "Prepare the manifest update:",
+              "",
+              "```sh",
+              "as_of=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "candidate=$(mktemp)",
+              "packaging/kernel/kernel-targets.py \\",
+              "  --manifest packaging/kernel/targets.json \\",
+              `  discover ${entry.channel_id} --as-of "$as_of" \\`,
+              '  --output "$candidate"',
+              "packaging/kernel/kernel-targets.py \\",
+              "  --manifest packaging/kernel/targets.json \\",
+              '  apply "$candidate"',
+              'rm "$candidate"',
+              "```",
+            ].join("\n");
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner, repo, state: "all", labels: label, per_page: 100 },
+            );
+            const matches = issues.filter(
+              issue =>
+                !issue.pull_request &&
+                (issue.body || "").split(/\r?\n/).includes(marker),
+            );
+            if (matches.length > 1) {
+              throw new Error(
+                `multiple kernel update issues exist for ${entry.channel_id}`,
+              );
+            }
+            const issue = matches[0];
+
+            if (entry.update_available) {
+              if (!issue) {
+                await github.rest.issues.create({
+                  owner,
+                  repo,
+                  title,
+                  body,
+                  labels: [label],
+                });
+              } else if (
+                issue.state !== "open" ||
+                issue.title !== title ||
+                issue.body !== body
+              ) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  state: "open",
+                  title,
+                  body,
+                });
+              }
+            } else if (issue && issue.state === "open") {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                state: "closed",
+                state_reason: "completed",
+              });
+            }
