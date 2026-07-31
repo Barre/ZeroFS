@@ -1,41 +1,12 @@
 use crate::deku_bytes::DekuBytes;
+use crate::wire_types::*;
+use alloc::vec::Vec;
 use bytes::{Buf, Bytes};
-use deku::ctx::Endian;
+use deku::ctx::{Endian, Order};
+use deku::no_std_io::Cursor;
 use deku::prelude::*;
 use deku::reader::Reader;
 use deku::writer::Writer;
-use std::io::Cursor;
-
-pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
-/// ZeroFS private dialect identifier. `.Z` distinguishes this wire generation
-/// from legacy `.zerofs*` layouts. The dialect includes compound operations,
-/// stat-bearing replies, replay, mutation envelopes, durability lineage,
-/// open-prefetch, and atomic fallocate.
-pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.Z";
-/// The 9P sentinel for an absent fid, including an unauthenticated `Tattach.afid`.
-pub const NOFID: u32 = u32::MAX;
-
-// QID type constants
-pub const QID_TYPE_DIR: u8 = 0x80;
-pub const QID_TYPE_SYMLINK: u8 = 0x02;
-pub const QID_TYPE_FILE: u8 = 0x00;
-
-pub const GETATTR_ALL: u64 = 0x00003fff;
-
-// Setattr valid bits
-pub const SETATTR_MODE: u32 = 0x00000001;
-pub const SETATTR_UID: u32 = 0x00000002;
-pub const SETATTR_GID: u32 = 0x00000004;
-pub const SETATTR_SIZE: u32 = 0x00000008;
-pub const SETATTR_ATIME: u32 = 0x00000010;
-pub const SETATTR_MTIME: u32 = 0x00000020;
-pub const SETATTR_ATIME_SET: u32 = 0x00000080;
-pub const SETATTR_MTIME_SET: u32 = 0x00000100;
-
-// Linux fallocate mode bits carried verbatim by Tfallocate.
-pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
-pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
-pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 
 /// Supported semantic operation encoded by the Linux fallocate mode bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,139 +48,76 @@ pub enum LockType {
 
 pub const P9_LOCK_FLAGS_BLOCK: u32 = 1; // blocking request
 
-/// `Rlerror` code for leadership loss with a potentially dispatched request.
-/// Resends retain `P9_OP_FLAG_RETRY`. Numeric value: Linux `ESHUTDOWN`.
-pub const P9_ENOTLEADER: u32 = 108;
-
-/// `Rlerror` code proving no logical effect. A CLEAN response to FIRST permits
-/// another FIRST; CLEAN on RETRY does not clear earlier ambiguity. Numeric
-/// value: Linux `ENOTCONN`.
-pub const P9_ENOTLEADER_CLEAN: u32 = 107;
-
-/// `Rlerror` code for a RETRY absent from the in-flight and completed ledgers.
-/// The request must not be dispatched. Numeric value: Linux `ESTALE`.
-pub const P9_EOPIDSTALE: u32 = 116;
-
-/// The frame is an ambiguous resend of an op-id, not its sole initial attempt.
-/// An unseen request carrying this flag is invalid and must not be dispatched.
-pub const P9_OP_FLAG_RETRY: u8 = 1 << 0;
-/// All currently defined op-envelope flag bits. Unknown bits fail closed.
-pub const P9_OP_KNOWN_FLAGS: u8 = P9_OP_FLAG_RETRY;
-
-/// Maximum negotiated message size and codec frame size.
-pub const P9_MAX_MSIZE: u32 = 10 * 1024 * 1024;
-
 pub const P9_CHANNEL_SIZE: usize = 1000;
-pub const P9_SIZE_FIELD_LEN: usize = std::mem::size_of::<u32>();
-pub const P9_TYPE_FIELD_LEN: usize = std::mem::size_of::<u8>();
-pub const P9_TAG_FIELD_LEN: usize = std::mem::size_of::<u16>();
-pub const P9_COUNT_FIELD_LEN: usize = std::mem::size_of::<u32>();
-/// Header size: size[4] + type[1] + tag[2]
-pub const P9_HEADER_SIZE: usize = P9_SIZE_FIELD_LEN + P9_TYPE_FIELD_LEN + P9_TAG_FIELD_LEN;
-pub const P9_MIN_MESSAGE_SIZE: u32 = P9_HEADER_SIZE as u32;
-/// IO header overhead for Rread/Rreaddir: header + count[4]
-pub const P9_IOHDRSZ: u32 = (P9_HEADER_SIZE + P9_COUNT_FIELD_LEN) as u32;
-/// Wire overhead of a Twrite request preceding its data payload:
-/// header + fid[4] + offset[8] + count[4]. A Twrite carrying `count` bytes is
-/// `P9_TWRITE_HDR + count` bytes on the wire and must not exceed the msize.
-pub const P9_TWRITE_HDR: u32 = (P9_HEADER_SIZE + 4 + 8 + P9_COUNT_FIELD_LEN) as u32;
-/// `Rlopenatread` overhead before data: header + qid[13] + iounit[4] + eof[1]
-/// + count[4]. Prefetch limits use this value.
-pub const P9_RLOPENATREAD_HDR: u32 = (P9_HEADER_SIZE + 13 + 4 + 1 + P9_COUNT_FIELD_LEN) as u32;
 pub const P9_DEBUG_BUFFER_SIZE: usize = 40;
 pub const P9_READDIR_BATCH_SIZE: usize = 1000;
-pub const P9_MAX_GROUPS: usize = 16;
 pub const P9_NOBODY_UID: u32 = 65534;
-pub const P9_MAX_NAME_LEN: u32 = 255;
 
-#[derive(Debug, Clone, Copy, DekuRead, DekuWrite)]
-#[deku(id_type = "u8")]
-pub enum LockStatus {
-    #[deku(id = "0")]
-    Success,
-    #[deku(id = "1")]
-    Blocked,
-    #[deku(id = "2")]
-    LockError,
-    #[deku(id = "3")]
-    Grace,
-}
+/// Userspace 9P string. The shared [`WireString`] accepts other storage.
+pub type P9String = WireString<Vec<u8>>;
 
-// Basic structures
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(
-    endian = "endian",
-    ctx = "endian: Endian",
-    ctx_default = "Endian::Little"
-)]
-pub struct Qid {
-    pub type_: u8,
-    pub version: u32,
-    pub path: u64,
-}
-
-impl Qid {
-    /// Serialized size on the wire: type u8 + version u32 + path u64.
-    pub const WIRE_SIZE: usize = 1 + 4 + 8;
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
-pub struct Stat {
-    pub qid: Qid,
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub nlink: u64,
-    pub rdev: u64,
-    pub size: u64,
-    pub blksize: u64,
-    pub blocks: u64,
-    pub atime_sec: u64,
-    pub atime_nsec: u64,
-    pub mtime_sec: u64,
-    pub mtime_nsec: u64,
-    pub ctime_sec: u64,
-    pub ctime_nsec: u64,
-    pub btime_sec: u64,
-    pub btime_nsec: u64,
-    pub r#gen: u64,
-    pub data_version: u64,
-}
-
-impl Stat {
-    /// Serialized size on the wire: qid + three u32s + fifteen u64s.
-    pub const WIRE_SIZE: usize = Qid::WIRE_SIZE + 3 * 4 + 15 * 8;
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(
-    endian = "endian",
-    ctx = "endian: Endian",
-    ctx_default = "Endian::Little"
-)]
-pub struct P9String {
-    #[deku(update = "self.data.len()")]
-    pub len: u16,
-    #[deku(count = "len")]
-    pub data: Vec<u8>,
-}
-
-impl P9String {
+impl WireString<Vec<u8>> {
     pub fn new(data: Vec<u8>) -> Self {
-        Self {
-            len: data.len() as u16,
-            data,
-        }
+        Self::from_storage(data)
     }
+}
 
-    pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.data)
+impl<'a, B> DekuReader<'a, Endian> for WireString<B>
+where
+    B: ByteStorage + From<Vec<u8>>,
+{
+    fn from_reader_with_ctx<R: deku::no_std_io::Read + deku::no_std_io::Seek>(
+        reader: &mut Reader<R>,
+        endian: Endian,
+    ) -> Result<Self, DekuError> {
+        let len = u16::from_reader_with_ctx(reader, endian)?;
+        let mut data = alloc::vec![0; len as usize];
+        reader.read_bytes(len as usize, &mut data, Order::Lsb0)?;
+        Ok(Self {
+            len,
+            data: B::from(data),
+        })
     }
+}
 
-    /// Serialized size on the wire: u16 length prefix + bytes.
-    pub fn wire_size(&self) -> usize {
-        2 + self.data.len()
+impl<'a, B> DekuReader<'a> for WireString<B>
+where
+    B: ByteStorage + From<Vec<u8>>,
+{
+    fn from_reader_with_ctx<R: deku::no_std_io::Read + deku::no_std_io::Seek>(
+        reader: &mut Reader<R>,
+        (): (),
+    ) -> Result<Self, DekuError> {
+        Self::from_reader_with_ctx(reader, Endian::Little)
+    }
+}
+
+impl<B: ByteStorage> DekuWriter<Endian> for WireString<B> {
+    fn to_writer<W: deku::no_std_io::Write + deku::no_std_io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+        endian: Endian,
+    ) -> Result<(), DekuError> {
+        self.len.to_writer(writer, endian)?;
+        writer.write_bytes(self.data.as_ref())?;
+        Ok(())
+    }
+}
+
+impl<B: ByteStorage> DekuWriter for WireString<B> {
+    fn to_writer<W: deku::no_std_io::Write + deku::no_std_io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+        (): (),
+    ) -> Result<(), DekuError> {
+        self.to_writer(writer, Endian::Little)
+    }
+}
+
+impl<B: ByteStorage> DekuUpdate for WireString<B> {
+    fn update(&mut self) -> Result<(), DekuError> {
+        self.len = self.data.as_ref().len().try_into()?;
+        Ok(())
     }
 }
 
@@ -473,11 +381,6 @@ pub struct Rxattrwalk {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rlock {
-    pub status: LockStatus,
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(endian = "little")]
 pub struct Rgetlock {
     pub lock_type: LockType,
@@ -502,11 +405,6 @@ pub struct Rattach {
 
 // ZeroFS-private reconnect extension: binds a fresh fid to an existing inode by
 // id (not by re-walking a path), so reconnection survives renames/hardlinks.
-// Only our own client sends it.
-pub const P9_REBIND_REPLAY: u8 = 1 << 0;
-pub const P9_REBIND_OPENED: u8 = 1 << 1;
-pub const P9_REBIND_KNOWN_FLAGS: u8 = P9_REBIND_REPLAY | P9_REBIND_OPENED;
-
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(endian = "little")]
 pub struct Trebind {
@@ -514,17 +412,15 @@ pub struct Trebind {
     pub inode_id: u64,
     /// Attach-root inode. A root-self request has `inode_id == root_inode`.
     pub root_inode: u64,
-    /// Replay flags. `P9_REBIND_OPENED` requires `P9_REBIND_REPLAY` and applies
-    /// only to still-linked inodes.
+    /// Replay flags. `P9_REBIND_OPENED` requires `P9_REBIND_REPLAY`, marks an
+    /// expected in-place reopen, and grants neither access nor an inode pin.
     pub flags: u8,
-    /// Original `Tattach` username for `n_uname == -1` credential lookup.
+    /// Original `Tattach` username for legacy clients, or a binary credential
+    /// payload beginning with `P9_REBIND_CREDENTIAL_SENTINEL`. The group-count
+    /// byte may carry `P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE`.
     pub uname: P9String,
+    /// Numeric uid; kernel credential payloads carry fsuid here.
     pub n_uname: u32,
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rrebind {
-    pub qid: Qid,
 }
 
 // Private compound requests require the ZeroFS dialect.
@@ -636,13 +532,6 @@ pub struct Tlcreateattr {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rlcreateattr {
-    #[deku(endian = "little")]
-    pub iounit: u32,
-    pub stat: Stat,
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rmkdirattr {
     pub stat: Stat,
 }
@@ -702,13 +591,6 @@ pub struct Rwalk {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rlopen {
-    pub qid: Qid,
-    #[deku(endian = "little")]
-    pub iounit: u32,
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rlcreate {
     pub qid: Qid,
     #[deku(endian = "little")]
@@ -721,12 +603,6 @@ pub struct Rread {
     pub count: u32,
     #[deku(ctx = "count")]
     pub data: DekuBytes,
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rwrite {
-    #[deku(endian = "little")]
-    pub count: u32,
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -769,13 +645,6 @@ impl Rreaddir {
 }
 
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rgetattr {
-    #[deku(endian = "little")]
-    pub valid: u64,
-    pub stat: Stat,
-}
-
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rmkdir {
     pub qid: Qid,
 }
@@ -793,13 +662,6 @@ pub struct Rmknod {
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Rreadlink {
     pub target: P9String,
-}
-
-// Error response
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-pub struct Rlerror {
-    #[deku(endian = "little")]
-    pub ecode: u32,
 }
 
 // Empty responses
@@ -828,14 +690,6 @@ pub struct Rfsync;
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Tgetlineage;
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
-pub struct Rgetlineage {
-    pub token: u64,
-    /// HA writer epoch used as mutation-envelope origin; zero when standalone.
-    pub writer_epoch: u64,
-}
-
 /// Durability-verified fsync carrying the oldest unsynced lineage token.
 /// Token zero denotes no pending write. A lineage mismatch returns `ESTALE`.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -846,209 +700,195 @@ pub struct Tfsyncdur {
     pub token: u64,
 }
 
-#[derive(Debug, Clone, DekuRead, DekuWrite)]
-#[deku(endian = "little")]
-pub struct Rstatfs {
-    pub r#type: u32,  // filesystem type
-    pub bsize: u32,   // optimal transfer block size
-    pub blocks: u64,  // total data blocks in filesystem
-    pub bfree: u64,   // free blocks in filesystem
-    pub bavail: u64,  // free blocks available to non-superuser
-    pub files: u64,   // total file nodes in filesystem
-    pub ffree: u64,   // free file nodes in filesystem
-    pub fsid: u64,    // filesystem id
-    pub namelen: u32, // maximum length of filenames
-}
-
 // These IDs define mutation-envelope coverage and must match the enum layout.
-pub const T_LCREATE: u8 = 14;
-pub const T_SYMLINK: u8 = 16;
-pub const T_MKNOD: u8 = 18;
-pub const T_RENAME: u8 = 20;
-pub const T_SETATTR: u8 = 26;
-pub const T_WRITE: u8 = 118;
-pub const T_LINK: u8 = 70;
-pub const T_MKDIR: u8 = 72;
-pub const T_RENAMEAT: u8 = 74;
-pub const T_UNLINKAT: u8 = 76;
-pub const T_LCREATEATTR: u8 = 238;
-pub const T_MKDIRATTR: u8 = 240;
-pub const T_SYMLINKATTR: u8 = 242;
-pub const T_MKNODATTR: u8 = 244;
-pub const T_LINKATTR: u8 = 246;
-pub const T_SETATTRATTR: u8 = 248;
+pub const T_LCREATE: u8 = message_type::TLCREATE;
+pub const T_SYMLINK: u8 = message_type::TSYMLINK;
+pub const T_MKNOD: u8 = message_type::TMKNOD;
+pub const T_RENAME: u8 = message_type::TRENAME;
+pub const T_SETATTR: u8 = message_type::TSETATTR;
+pub const T_WRITE: u8 = message_type::TWRITE;
+pub const T_LINK: u8 = message_type::TLINK;
+pub const T_MKDIR: u8 = message_type::TMKDIR;
+pub const T_RENAMEAT: u8 = message_type::TRENAMEAT;
+pub const T_UNLINKAT: u8 = message_type::TUNLINKAT;
+pub const T_LCREATEATTR: u8 = message_type::TLCREATEATTR;
+pub const T_MKDIRATTR: u8 = message_type::TMKDIRATTR;
+pub const T_SYMLINKATTR: u8 = message_type::TSYMLINKATTR;
+pub const T_MKNODATTR: u8 = message_type::TMKNODATTR;
+pub const T_LINKATTR: u8 = message_type::TLINKATTR;
+pub const T_SETATTRATTR: u8 = message_type::TSETATTRATTR;
 // Delayed fallocate retries can reorder with writes and therefore carry op-ids.
-pub const T_FALLOCATE: u8 = 228;
-pub const R_FALLOCATE: u8 = 229;
+pub const T_FALLOCATE: u8 = message_type::TFALLOCATE;
+pub const R_FALLOCATE: u8 = message_type::RFALLOCATE;
 
 // Response IDs used by the owned counted-payload decoder.
-const R_READ: u8 = 117;
-const R_READDIR: u8 = 41;
-const R_LOPENATREAD: u8 = 231;
-const R_READDIRATTR: u8 = 255;
+const R_READ: u8 = message_type::RREAD;
+const R_READDIR: u8 = message_type::RREADDIR;
+const R_LOPENATREAD: u8 = message_type::RLOPENATREAD;
+const R_READDIRATTR: u8 = message_type::RREADDIRATTR;
 
 // Main message enum
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(ctx = "_type: u8", id = "_type")]
 pub enum Message {
-    #[deku(id = "100")]
+    #[deku(id = "message_type::TVERSION")]
     Tversion(Tversion),
-    #[deku(id = "101")]
+    #[deku(id = "message_type::RVERSION")]
     Rversion(Rversion),
-    #[deku(id = "104")]
+    #[deku(id = "message_type::TATTACH")]
     Tattach(Tattach),
-    #[deku(id = "105")]
+    #[deku(id = "message_type::RATTACH")]
     Rattach(Rattach),
-    #[deku(id = "110")]
+    #[deku(id = "message_type::TWALK")]
     Twalk(Twalk),
-    #[deku(id = "111")]
+    #[deku(id = "message_type::RWALK")]
     Rwalk(Rwalk),
-    #[deku(id = "12")]
+    #[deku(id = "message_type::TLOPEN")]
     Tlopen(Tlopen),
-    #[deku(id = "13")]
+    #[deku(id = "message_type::RLOPEN")]
     Rlopen(Rlopen),
-    #[deku(id = "T_LCREATE")]
+    #[deku(id = "message_type::TLCREATE")]
     Tlcreate(Tlcreate),
-    #[deku(id = "15")]
+    #[deku(id = "message_type::RLCREATE")]
     Rlcreate(Rlcreate),
-    #[deku(id = "116")]
+    #[deku(id = "message_type::TREAD")]
     Tread(Tread),
-    #[deku(id = "R_READ")]
+    #[deku(id = "message_type::RREAD")]
     Rread(Rread),
-    #[deku(id = "T_WRITE")]
+    #[deku(id = "message_type::TWRITE")]
     Twrite(Twrite),
-    #[deku(id = "119")]
+    #[deku(id = "message_type::RWRITE")]
     Rwrite(Rwrite),
-    #[deku(id = "120")]
+    #[deku(id = "message_type::TCLUNK")]
     Tclunk(Tclunk),
-    #[deku(id = "121")]
+    #[deku(id = "message_type::RCLUNK")]
     Rclunk(Rclunk),
-    #[deku(id = "40")]
+    #[deku(id = "message_type::TREADDIR")]
     Treaddir(Treaddir),
-    #[deku(id = "R_READDIR")]
+    #[deku(id = "message_type::RREADDIR")]
     Rreaddir(Rreaddir),
-    #[deku(id = "24")]
+    #[deku(id = "message_type::TGETATTR")]
     Tgetattr(Tgetattr),
-    #[deku(id = "25")]
+    #[deku(id = "message_type::RGETATTR")]
     Rgetattr(Rgetattr),
-    #[deku(id = "T_SETATTR")]
+    #[deku(id = "message_type::TSETATTR")]
     Tsetattr(Tsetattr),
-    #[deku(id = "27")]
+    #[deku(id = "message_type::RSETATTR")]
     Rsetattr(Rsetattr),
-    #[deku(id = "T_FALLOCATE")]
+    #[deku(id = "message_type::TFALLOCATE")]
     Tfallocate(Tfallocate),
-    #[deku(id = "R_FALLOCATE")]
+    #[deku(id = "message_type::RFALLOCATE")]
     Rfallocate(Rfallocate),
-    #[deku(id = "T_MKDIR")]
+    #[deku(id = "message_type::TMKDIR")]
     Tmkdir(Tmkdir),
-    #[deku(id = "73")]
+    #[deku(id = "message_type::RMKDIR")]
     Rmkdir(Rmkdir),
-    #[deku(id = "T_SYMLINK")]
+    #[deku(id = "message_type::TSYMLINK")]
     Tsymlink(Tsymlink),
-    #[deku(id = "17")]
+    #[deku(id = "message_type::RSYMLINK")]
     Rsymlink(Rsymlink),
-    #[deku(id = "T_MKNOD")]
+    #[deku(id = "message_type::TMKNOD")]
     Tmknod(Tmknod),
-    #[deku(id = "19")]
+    #[deku(id = "message_type::RMKNOD")]
     Rmknod(Rmknod),
-    #[deku(id = "22")]
+    #[deku(id = "message_type::TREADLINK")]
     Treadlink(Treadlink),
-    #[deku(id = "23")]
+    #[deku(id = "message_type::RREADLINK")]
     Rreadlink(Rreadlink),
-    #[deku(id = "T_LINK")]
+    #[deku(id = "message_type::TLINK")]
     Tlink(Tlink),
-    #[deku(id = "71")]
+    #[deku(id = "message_type::RLINK")]
     Rlink(Rlink),
-    #[deku(id = "T_RENAME")]
+    #[deku(id = "message_type::TRENAME")]
     Trename(Trename),
-    #[deku(id = "21")]
+    #[deku(id = "message_type::RRENAME")]
     Rrename(Rrename),
-    #[deku(id = "T_RENAMEAT")]
+    #[deku(id = "message_type::TRENAMEAT")]
     Trenameat(Trenameat),
-    #[deku(id = "75")]
+    #[deku(id = "message_type::RRENAMEAT")]
     Rrenameat(Rrenameat),
-    #[deku(id = "T_UNLINKAT")]
+    #[deku(id = "message_type::TUNLINKAT")]
     Tunlinkat(Tunlinkat),
-    #[deku(id = "77")]
+    #[deku(id = "message_type::RUNLINKAT")]
     Runlinkat(Runlinkat),
-    #[deku(id = "50")]
+    #[deku(id = "message_type::TFSYNC")]
     Tfsync(Tfsync),
-    #[deku(id = "51")]
+    #[deku(id = "message_type::RFSYNC")]
     Rfsync(Rfsync),
-    #[deku(id = "232")]
+    #[deku(id = "message_type::TFSYNCDUR")]
     Tfsyncdur(Tfsyncdur),
-    #[deku(id = "233")]
+    #[deku(id = "message_type::TGETLINEAGE")]
     Tgetlineage(Tgetlineage),
-    #[deku(id = "234")]
+    #[deku(id = "message_type::RGETLINEAGE")]
     Rgetlineage(Rgetlineage),
-    #[deku(id = "52")]
+    #[deku(id = "message_type::TLOCK")]
     Tlock(Tlock),
-    #[deku(id = "53")]
+    #[deku(id = "message_type::RLOCK")]
     Rlock(Rlock),
-    #[deku(id = "54")]
+    #[deku(id = "message_type::TGETLOCK")]
     Tgetlock(Tgetlock),
-    #[deku(id = "55")]
+    #[deku(id = "message_type::RGETLOCK")]
     Rgetlock(Rgetlock),
-    #[deku(id = "7")]
+    #[deku(id = "message_type::RLERROR")]
     Rlerror(Rlerror),
-    #[deku(id = "108")]
+    #[deku(id = "message_type::TFLUSH")]
     Tflush(Tflush),
-    #[deku(id = "109")]
+    #[deku(id = "message_type::RFLUSH")]
     Rflush(Rflush),
-    #[deku(id = "30")]
+    #[deku(id = "message_type::TXATTRWALK")]
     Txattrwalk(Txattrwalk),
-    #[deku(id = "31")]
+    #[deku(id = "message_type::RXATTRWALK")]
     Rxattrwalk(Rxattrwalk),
-    #[deku(id = "8")]
+    #[deku(id = "message_type::TSTATFS")]
     Tstatfs(Tstatfs),
-    #[deku(id = "9")]
+    #[deku(id = "message_type::RSTATFS")]
     Rstatfs(Rstatfs),
     // Private compound extensions use IDs outside the standard 9P range. The
     // *attr requests keep the standard request layout and return a richer reply.
-    #[deku(id = "236")]
+    #[deku(id = "message_type::TLOPENAT")]
     Tlopenat(Tlopenat),
-    #[deku(id = "237")]
+    #[deku(id = "message_type::RLOPENAT")]
     Rlopenat(Rlopenat),
-    #[deku(id = "230")]
+    #[deku(id = "message_type::TLOPENATREAD")]
     Tlopenatread(Tlopenatread),
-    #[deku(id = "R_LOPENATREAD")]
+    #[deku(id = "message_type::RLOPENATREAD")]
     Rlopenatread(Rlopenatread),
-    #[deku(id = "T_LCREATEATTR")]
+    #[deku(id = "message_type::TLCREATEATTR")]
     Tlcreateattr(Tlcreateattr),
-    #[deku(id = "239")]
+    #[deku(id = "message_type::RLCREATEATTR")]
     Rlcreateattr(Rlcreateattr),
-    #[deku(id = "T_MKDIRATTR")]
+    #[deku(id = "message_type::TMKDIRATTR")]
     Tmkdirattr(Tmkdir),
-    #[deku(id = "241")]
+    #[deku(id = "message_type::RMKDIRATTR")]
     Rmkdirattr(Rmkdirattr),
-    #[deku(id = "T_SYMLINKATTR")]
+    #[deku(id = "message_type::TSYMLINKATTR")]
     Tsymlinkattr(Tsymlink),
-    #[deku(id = "243")]
+    #[deku(id = "message_type::RSYMLINKATTR")]
     Rsymlinkattr(Rsymlinkattr),
-    #[deku(id = "T_MKNODATTR")]
+    #[deku(id = "message_type::TMKNODATTR")]
     Tmknodattr(Tmknod),
-    #[deku(id = "245")]
+    #[deku(id = "message_type::RMKNODATTR")]
     Rmknodattr(Rmknodattr),
-    #[deku(id = "T_LINKATTR")]
+    #[deku(id = "message_type::TLINKATTR")]
     Tlinkattr(Tlink),
-    #[deku(id = "247")]
+    #[deku(id = "message_type::RLINKATTR")]
     Rlinkattr(Rlinkattr),
-    #[deku(id = "T_SETATTRATTR")]
+    #[deku(id = "message_type::TSETATTRATTR")]
     Tsetattrattr(Tsetattr),
-    #[deku(id = "249")]
+    #[deku(id = "message_type::RSETATTRATTR")]
     Rsetattrattr(Rsetattrattr),
     // ZeroFS-private reconnect extension (ids outside the standard 9P range).
-    #[deku(id = "250")]
+    #[deku(id = "message_type::TREBIND")]
     Trebind(Trebind),
-    #[deku(id = "251")]
+    #[deku(id = "message_type::RREBIND")]
     Rrebind(Rrebind),
-    #[deku(id = "252")]
+    #[deku(id = "message_type::TWALKGETATTR")]
     Twalkgetattr(Twalkgetattr),
-    #[deku(id = "253")]
+    #[deku(id = "message_type::RWALKGETATTR")]
     Rwalkgetattr(Rwalkgetattr),
-    #[deku(id = "254")]
+    #[deku(id = "message_type::TREADDIRATTR")]
     Treaddirattr(Treaddirattr),
-    #[deku(id = "R_READDIRATTR")]
+    #[deku(id = "message_type::RREADDIRATTR")]
     Rreaddirattr(Rreaddirattr),
 }
 
@@ -1259,15 +1099,6 @@ impl Message {
 
 /// Byte offset of the `type` field within a 9P frame (after the u32 size).
 const P9_TYPE_OFFSET: usize = P9_SIZE_FIELD_LEN;
-/// Length of the idempotency op-id in the ZeroFS request envelope.
-pub const P9_OP_ID_LEN: usize = 16;
-/// Length of the attempt flags in the ZeroFS request envelope.
-pub const P9_OP_FLAGS_LEN: usize = 1;
-/// Length of the originating writer epoch in the ZeroFS request envelope.
-pub const P9_OP_ORIGIN_EPOCH_LEN: usize = 8;
-/// Total bytes encoded after the tag for a mutation in the ZeroFS dialect.
-pub const P9_OP_ENVELOPE_LEN: usize = P9_OP_ID_LEN + P9_OP_FLAGS_LEN + P9_OP_ORIGIN_EPOCH_LEN;
-
 // The context controls whether ZeroFS mutation envelopes are present after the
 // standard header. Standard 9P remains the default for Deku's container APIs.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
@@ -1306,6 +1137,25 @@ impl P9Message {
         self.to_bytes_ctx(false)
     }
 
+    /// Encode into caller-owned storage without allocating.
+    pub fn to_slice_ctx(&self, output: &mut [u8], op_id_enabled: bool) -> Result<usize, DekuError> {
+        let written = {
+            let mut cursor = Cursor::new(&mut *output);
+            let mut writer = Writer::new(&mut cursor);
+            DekuWriter::to_writer(self, &mut writer, op_id_enabled)?;
+            writer.finalize()?;
+            writer.bits_written / 8
+        };
+        let size: u32 = written.try_into()?;
+        let size_field = output
+            .get_mut(..P9_SIZE_FIELD_LEN)
+            .ok_or(DekuError::Incomplete(NeedSize::new(
+                P9_SIZE_FIELD_LEN * u8::BITS as usize,
+            )))?;
+        size_field.copy_from_slice(&size.to_le_bytes());
+        Ok(written)
+    }
+
     /// Encodes covered mutations with a private envelope after the tag.
     pub fn to_bytes_ctx(&self, op_id_enabled: bool) -> Result<Vec<u8>, DekuError> {
         let mut bytes = Vec::new();
@@ -1318,11 +1168,22 @@ impl P9Message {
         Ok(bytes)
     }
 
+    /// Decode from any no-std I/O source supported by Deku.
+    pub fn from_reader_ctx<R>(
+        reader: &mut Reader<R>,
+        op_id_enabled: bool,
+    ) -> Result<P9Message, DekuError>
+    where
+        R: deku::no_std_io::Read + deku::no_std_io::Seek,
+    {
+        P9Message::from_reader_with_ctx(reader, op_id_enabled)
+    }
+
     /// Decodes a standard frame with an optional private mutation envelope.
     pub fn from_bytes_ctx(input: &[u8], op_id_enabled: bool) -> Result<P9Message, DekuError> {
         let mut cursor = Cursor::new(input);
         let mut reader = Reader::new(&mut cursor);
-        P9Message::from_reader_with_ctx(&mut reader, op_id_enabled)
+        Self::from_reader_ctx(&mut reader, op_id_enabled)
     }
 
     fn counted_payload_offset(type_: u8, op_id_enabled: bool) -> Option<usize> {
@@ -1368,10 +1229,14 @@ impl P9Message {
         );
         let payload_end = payload_offset
             .checked_add(count as usize)
-            .ok_or_else(|| DekuError::Parse("9P payload length overflow".into()))?;
+            .ok_or(deku::deku_error!(
+                DekuError::Parse,
+                "9P payload length overflow"
+            ))?;
         if input.len() < payload_end {
-            return Err(DekuError::Parse(
-                "9P count exceeds the available payload".into(),
+            return Err(deku::deku_error!(
+                DekuError::Parse,
+                "9P count exceeds the available payload"
             ));
         }
 
@@ -1393,8 +1258,9 @@ impl P9Message {
             Message::Twrite(message) => (&mut message.count, &mut message.data),
             Message::Rreaddirattr(message) => (&mut message.count, &mut message.data),
             _ => {
-                return Err(DekuError::Parse(
-                    "counted-payload frame decoded as the wrong message type".into(),
+                return Err(deku::deku_error!(
+                    DekuError::Parse,
+                    "counted-payload frame decoded as the wrong message type"
                 ));
             }
         };
@@ -1457,7 +1323,13 @@ impl P9Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use deku::DekuContainerWrite;
+
+    #[derive(DekuWrite)]
+    struct BorrowedStringMessage<'a> {
+        value: WireString<&'a [u8]>,
+    }
 
     /// Reference implementation of the former two-step encoder. Keeping this
     /// in tests makes the contextual encoder's wire compatibility explicit.
@@ -1475,6 +1347,32 @@ mod tests {
         let size = bytes.len() as u32;
         bytes[..P9_SIZE_FIELD_LEN].copy_from_slice(&size.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn borrowed_string_storage_encodes_without_ownership_conversion() {
+        let message = BorrowedStringMessage {
+            value: WireString::from_storage(b"kernel-name".as_slice()),
+        };
+
+        assert_eq!(message.to_bytes().unwrap(), b"\x0b\0kernel-name".as_slice());
+    }
+
+    #[test]
+    fn caller_owned_output_matches_allocating_encoder() {
+        let message = P9Message::new(
+            42,
+            Message::Tgetattr(Tgetattr {
+                fid: 7,
+                request_mask: GETATTR_ALL,
+            }),
+        );
+        let expected = message.to_bytes_ctx(false).unwrap();
+        let mut output = [0u8; 64];
+
+        let written = message.to_slice_ctx(&mut output, false).unwrap();
+
+        assert_eq!(&output[..written], expected);
     }
 
     fn counted_payload(message: &P9Message) -> (u32, &Bytes) {
@@ -1921,6 +1819,43 @@ mod tests {
                 assert_eq!(rebind.flags, P9_REBIND_REPLAY | P9_REBIND_OPENED);
                 assert_eq!(rebind.uname.as_str().unwrap(), "root");
                 assert_eq!(rebind.n_uname, 1000);
+            }
+            _ => panic!("expected Trebind"),
+        }
+    }
+
+    #[test]
+    fn rebind_round_trips_binary_credentials() {
+        let credentials = vec![
+            P9_REBIND_CREDENTIAL_SENTINEL,
+            P9_REBIND_CREDENTIAL_VERSION,
+            0xd2,
+            0x04,
+            0,
+            0,
+            1,
+            0x2e,
+            0x16,
+            0,
+            0,
+        ];
+        let msg = P9Message::new(
+            18,
+            Message::Trebind(Trebind {
+                fid: 10,
+                inode_id: 43,
+                root_inode: 0,
+                flags: 0,
+                uname: P9String::new(credentials.clone()),
+                n_uname: 1001,
+            }),
+        );
+        let bytes = msg.to_bytes().unwrap();
+        let (_, decoded) = P9Message::from_bytes((&bytes, 0)).unwrap();
+        match decoded.body {
+            Message::Trebind(rebind) => {
+                assert_eq!(rebind.uname.data, credentials);
+                assert_eq!(rebind.n_uname, 1001);
             }
             _ => panic!("expected Trebind"),
         }

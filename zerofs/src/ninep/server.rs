@@ -319,9 +319,61 @@ where
                 None => break,
             };
 
-            // Snapshot the ready batch before the first await. Continuing to
-            // drain across writes can indefinitely delay the final flush.
-            let mut batch = vec![first];
+            // Avoid allocating a batch for the uncontended case. Adaptive
+            // kernel lanes normally carry one direct request; a Vec is useful
+            // only after a second response is already waiting.
+            let second = match rx.try_recv() {
+                Ok(more) => more,
+                Err(_) => {
+                    let (tag, response_bytes) = first;
+                    let requires_authority = response_requires_serving_authority(&response_bytes);
+                    if requires_authority && !authority.may_emit(&response_bytes) {
+                        warn!(
+                            "Dropping successful 9P response for tag {tag} after serving authority \
+                             was lost; closing the connection"
+                        );
+                        return;
+                    }
+                    // Keep the final authority check adjacent to the actual
+                    // transport write, just as on the buffered batch path.
+                    if requires_authority && !authority.permits_successful_response() {
+                        warn!(
+                            "Dropping successful 9P response for tag {tag} immediately before \
+                             write after serving authority was lost; closing the connection"
+                        );
+                        return;
+                    }
+                    // The outer BufWriter is empty after every batch. Bypass
+                    // its copy for this latency-critical case, but still flush
+                    // the underlying AsyncWrite: write_all only guarantees
+                    // acceptance, and the transport itself may be buffered.
+                    if let Err(e) = writer.get_mut().write_all(&response_bytes).await {
+                        error!("Failed to write response for tag {}: {}", tag, e);
+                        return;
+                    }
+                    // Mirror the buffered batch path's final authority check.
+                    // If the underlying writer retained the bytes, authority
+                    // loss must prevent its flush.
+                    if requires_authority && !authority.permits_successful_response() {
+                        warn!(
+                            "Dropping buffered successful 9P response for tag {tag} before flush \
+                             after serving authority was lost; closing the connection"
+                        );
+                        return;
+                    }
+                    if let Err(e) = writer.get_mut().flush().await {
+                        error!("Failed to flush response for tag {}: {}", tag, e);
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            // Form one bounded batch before any transport write. Continuing
+            // to drain across writes can indefinitely delay the final flush.
+            let mut batch = vec![first, second];
+            // Consolidate responses that are already queued without delaying
+            // an uncontended RPC by a scheduler turn.
             while let Ok(more) = rx.try_recv() {
                 batch.push(more);
             }
@@ -871,6 +923,7 @@ mod tests {
         DekuBytes, GETATTR_ALL, LockType, P9String, Rclunk, Rflush, Rlopenat, Rread, Tattach,
         Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite, VERSION_9P2000L_ZEROFS,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
@@ -1130,6 +1183,44 @@ mod tests {
         }
     }
 
+    struct CountWrites<W> {
+        inner: W,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for CountWrites<W> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            match std::pin::Pin::new(&mut this.inner).poll_write(cx, buf) {
+                std::task::Poll::Ready(Ok(written)) => {
+                    if written != 0 {
+                        this.writes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::task::Poll::Ready(Ok(written))
+                }
+                result => result,
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn accepted_tcp_stream_has_bounded_liveness_options() {
@@ -1186,14 +1277,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_response_is_flushed_before_writer_drain_returns() {
-        let filesystem = ZeroFS::new_in_memory().await.unwrap();
+    async fn single_response_flushes_buffered_transport_before_writer_drain_returns() {
         let (mut client, server) = tokio::io::duplex(4096);
+        // Exercise the single-response fast path with an underlying writer
+        // whose write_all only fills its own buffer. Dropping it without an
+        // explicit flush would discard the response.
+        let buffered_server = tokio::io::BufWriter::with_capacity(4096, server);
         let response = frame(21, Message::Rflush(Rflush)).to_vec();
         let writer = spawn_response_writer(
-            server,
+            buffered_server,
             response_queue([(21, response.clone())]),
-            ResponseAuthority::from_database(Arc::clone(&filesystem.db)),
+            ResponseAuthority::always(),
             CancellationToken::new(),
         );
 
@@ -1211,6 +1305,34 @@ mod tests {
             client.read(&mut trailing).await.expect("writer EOF"),
             0,
             "a completed drain must drop the write half before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_queued_responses_share_one_transport_write() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counted_server = CountWrites {
+            inner: server,
+            writes: Arc::clone(&writes),
+        };
+        let first = not_leader(31);
+        let second = not_leader(32);
+        let writer = spawn_response_writer(
+            counted_server,
+            response_queue([(31, first.clone()), (32, second.clone())]),
+            ResponseAuthority::always(),
+            CancellationToken::new(),
+        );
+
+        drain_writer(writer, "coalesced response writer must drain").await;
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, [first, second].concat());
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "both small responses should occupy one BufWriter flush"
         );
     }
 
@@ -1364,8 +1486,10 @@ mod tests {
         let creds = Credentials {
             uid: 0,
             gid: 0,
+            gid_known: true,
             groups: [0; 16],
             groups_count: 0,
+            groups_complete: true,
         };
         assert_eq!(
             filesystem

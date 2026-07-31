@@ -190,10 +190,10 @@ impl ZeroFS {
         Ok((new_id, attrs))
     }
 
-    /// Hard-link `fileid` as `linkdirid/linkname`. Directories and symlinks
-    /// are EINVAL; nlink caps at [`MAX_HARDLINKS_PER_INODE`]. Linking an
-    /// open-unlinked inode (nlink 0) resurrects it and clears its orphan
-    /// record.
+    /// Hard-link `fileid` as `linkdirid/linkname`. Directories are EINVAL;
+    /// regular files, symlinks, and special files cap nlink at
+    /// [`MAX_HARDLINKS_PER_INODE`]. Linking an open-unlinked inode (nlink 0)
+    /// resurrects it and clears its orphan record.
     pub async fn link(
         &self,
         auth: &AuthContext,
@@ -259,10 +259,6 @@ impl ZeroFS {
             return Err(FsError::InvalidArgument);
         }
 
-        if matches!(file_inode, Inode::Symlink(_)) {
-            return Err(FsError::InvalidArgument);
-        }
-
         if exists {
             return Err(FsError::Exists);
         }
@@ -305,6 +301,22 @@ impl ZeroFS {
                 }
                 file.ctime = now_sec;
                 file.ctime_nsec = now_nsec;
+            }
+            Inode::Symlink(symlink) => {
+                if symlink.nlink == MAX_HARDLINKS_PER_INODE {
+                    return Err(FsError::TooManyLinks);
+                }
+                resurrected = symlink.nlink == 0;
+                symlink.nlink += 1;
+                if resurrected {
+                    symlink.parent = Some(linkdirid);
+                    symlink.name = Some(linkname.to_vec());
+                } else if symlink.nlink > 1 {
+                    symlink.parent = None;
+                    symlink.name = None;
+                }
+                symlink.ctime = now_sec;
+                symlink.ctime_nsec = now_nsec;
             }
             Inode::Fifo(special)
             | Inode::Socket(special)
@@ -419,6 +431,26 @@ mod tests {
 
     use crate::fs::store::inode::MAX_HARDLINKS_PER_INODE;
     use crate::fs::types::{FileType, SetAttributes};
+    use futures::StreamExt;
+
+    async fn readlink_at(fs: &ZeroFS, dirid: InodeId, name: &[u8]) -> Vec<u8> {
+        let inode_id = fs.lookup(&test_creds(), dirid, name).await.unwrap();
+        match fs.inode_store.get(inode_id).await.unwrap() {
+            Inode::Symlink(symlink) => symlink.target,
+            _ => panic!("expected symlink"),
+        }
+    }
+
+    async fn scan_entry_is_reference(fs: &ZeroFS, dirid: InodeId, name: &[u8]) -> bool {
+        let mut entries = fs.directory_store.list(dirid).await.unwrap();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.unwrap();
+            if entry.name == name {
+                return entry.inode.is_none();
+            }
+        }
+        panic!("missing directory scan entry");
+    }
 
     #[tokio::test]
     async fn test_process_symlink() {
@@ -535,6 +567,212 @@ mod tests {
             1,
             "the retry must not recreate the removed hardlink"
         );
+    }
+
+    #[tokio::test]
+    async fn hardlinked_symlink_reads_through_both_names_and_unlinks_one_at_a_time() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let target = b"../opaque-\xff-target";
+        let (symlink_id, _) = fs
+            .symlink(
+                &test_creds(),
+                0,
+                b"original",
+                target,
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+
+        fs.link(&auth, symlink_id, 0, b"alias").await.unwrap();
+
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"original").await.unwrap(),
+            symlink_id
+        );
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"alias").await.unwrap(),
+            symlink_id
+        );
+        assert_eq!(readlink_at(&fs, 0, b"original").await, target);
+        assert_eq!(readlink_at(&fs, 0, b"alias").await, target);
+        match fs.inode_store.get(symlink_id).await.unwrap() {
+            Inode::Symlink(symlink) => {
+                assert_eq!(symlink.nlink, 2);
+                assert_eq!(symlink.parent, None);
+                assert_eq!(symlink.name, None);
+            }
+            _ => panic!("expected symlink"),
+        }
+        assert!(scan_entry_is_reference(&fs, 0, b"original").await);
+        assert!(scan_entry_is_reference(&fs, 0, b"alias").await);
+        assert_eq!(fs.global_stats.get_totals(), (0, 1));
+
+        fs.remove(&auth, 0, b"original").await.unwrap();
+
+        assert!(matches!(
+            fs.lookup(&test_creds(), 0, b"original").await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(readlink_at(&fs, 0, b"alias").await, target);
+        match fs.inode_store.get(symlink_id).await.unwrap() {
+            Inode::Symlink(symlink) => {
+                assert_eq!(symlink.nlink, 1);
+                assert_eq!(symlink.parent, None);
+                assert_eq!(symlink.name, None);
+            }
+            _ => panic!("expected symlink"),
+        }
+        assert!(
+            scan_entry_is_reference(&fs, 0, b"alias").await,
+            "the surviving lazy nlink==1 entry remains a reference"
+        );
+        assert_eq!(fs.global_stats.get_totals(), (0, 1));
+
+        fs.remove(&auth, 0, b"alias").await.unwrap();
+        assert!(matches!(
+            fs.inode_store.get(symlink_id).await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(fs.global_stats.get_totals(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn hardlinked_open_symlink_orphans_only_after_its_final_unlink() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let (symlink_id, _) = fs
+            .symlink(
+                &test_creds(),
+                0,
+                b"first",
+                b"still-readable",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.link(&auth, symlink_id, 0, b"last").await.unwrap();
+        fs.open_handle_inc(symlink_id);
+
+        fs.remove(&auth, 0, b"first").await.unwrap();
+        assert!(!fs.orphan_store.contains(symlink_id).await.unwrap());
+        assert_eq!(readlink_at(&fs, 0, b"last").await, b"still-readable");
+        assert_eq!(fs.global_stats.get_totals(), (0, 1));
+
+        fs.remove(&auth, 0, b"last").await.unwrap();
+        assert!(fs.orphan_store.contains(symlink_id).await.unwrap());
+        match fs.inode_store.get(symlink_id).await.unwrap() {
+            Inode::Symlink(symlink) => {
+                assert_eq!(symlink.nlink, 0);
+                assert_eq!(symlink.target, b"still-readable");
+            }
+            _ => panic!("expected symlink"),
+        }
+        assert_eq!(fs.global_stats.get_totals(), (0, 1));
+
+        fs.handle_closed(symlink_id).await;
+        assert!(matches!(
+            fs.inode_store.get(symlink_id).await,
+            Err(FsError::NotFound)
+        ));
+        assert!(!fs.orphan_store.contains(symlink_id).await.unwrap());
+        assert_eq!(fs.global_stats.get_totals(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn rename_clobber_of_one_symlink_alias_preserves_the_other() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let (symlink_id, _) = fs
+            .symlink(
+                &test_creds(),
+                0,
+                b"replace-me",
+                b"shared-target",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.link(&auth, symlink_id, 0, b"survivor").await.unwrap();
+        let (source_id, _) = fs
+            .create(&test_creds(), 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.open_handle_inc(symlink_id);
+
+        fs.rename(&auth, 0, b"source", 0, b"replace-me")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"replace-me").await.unwrap(),
+            source_id
+        );
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"survivor").await.unwrap(),
+            symlink_id
+        );
+        assert_eq!(readlink_at(&fs, 0, b"survivor").await, b"shared-target");
+        match fs.inode_store.get(symlink_id).await.unwrap() {
+            Inode::Symlink(symlink) => {
+                assert_eq!(symlink.nlink, 1);
+                assert_eq!(symlink.parent, None);
+                assert_eq!(symlink.name, None);
+            }
+            _ => panic!("expected symlink"),
+        }
+        assert!(scan_entry_is_reference(&fs, 0, b"survivor").await);
+        assert!(
+            !fs.orphan_store.contains(symlink_id).await.unwrap(),
+            "clobbering a non-final alias must not orphan the inode"
+        );
+        assert_eq!(fs.global_stats.get_totals(), (0, 2));
+
+        fs.handle_closed(symlink_id).await;
+        assert!(fs.inode_store.get(symlink_id).await.is_ok());
+        fs.remove(&auth, 0, b"survivor").await.unwrap();
+        assert!(matches!(
+            fs.inode_store.get(symlink_id).await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(fs.global_stats.get_totals(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn symlink_hardlink_retry_does_not_increment_nlink_twice() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let (symlink_id, _) = fs
+            .symlink(
+                &test_creds(),
+                0,
+                b"original",
+                b"target",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let op_id = [0x5a; 16];
+
+        let first = fs
+            .link_idempotent(&auth, symlink_id, 0, b"alias", op_id)
+            .await
+            .unwrap();
+        let replay = fs
+            .link_idempotent(&auth, symlink_id, 0, b"alias", op_id)
+            .await
+            .unwrap();
+
+        assert_eq!(first.0, symlink_id);
+        assert_eq!(replay.0, symlink_id);
+        assert_eq!(first.1.nlink, 2);
+        assert_eq!(replay.1.nlink, 2);
+        match fs.inode_store.get(symlink_id).await.unwrap() {
+            Inode::Symlink(symlink) => assert_eq!(symlink.nlink, 2),
+            _ => panic!("expected symlink"),
+        }
+        assert_eq!(fs.global_stats.get_totals(), (0, 1));
     }
 
     #[tokio::test]

@@ -161,8 +161,10 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
     let creds = Credentials {
         uid: 0,
         gid: 0,
+        gid_known: true,
         groups: [0; 16],
         groups_count: 1,
+        groups_complete: true,
     };
     let nbd_name = b".nbd";
 

@@ -40,6 +40,34 @@ impl ZeroFS {
         name: &[u8],
         op_id: crate::dedup::OpId,
     ) -> Result<(), FsError> {
+        self.remove_idempotent_inner(auth, dirid, name, op_id, None)
+            .await
+    }
+
+    /// Remove with `unlinkat(2)`'s expected target kind enforced after the
+    /// directory entry and target inode have been revalidated under their
+    /// mutation locks.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn remove_idempotent_checked(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        name: &[u8],
+        op_id: crate::dedup::OpId,
+        remove_directory: bool,
+    ) -> Result<(), FsError> {
+        self.remove_idempotent_inner(auth, dirid, name, op_id, Some(remove_directory))
+            .await
+    }
+
+    async fn remove_idempotent_inner(
+        &self,
+        auth: &AuthContext,
+        dirid: InodeId,
+        name: &[u8],
+        op_id: crate::dedup::OpId,
+        expected_directory: Option<bool>,
+    ) -> Result<(), FsError> {
         validate_filename(name)?;
 
         // Replay a completed remove before resolving the missing entry.
@@ -51,6 +79,22 @@ impl ZeroFS {
         }
 
         let creds = Credentials::from_auth_context(auth);
+
+        // Search permission is required before resolving a name. In
+        // particular, do not let ENOENT for a missing entry reveal that the
+        // name is absent from a directory the caller cannot search. The
+        // mutation-lock section below rechecks both search and write access so
+        // a concurrent chmod cannot authorize the removal.
+        {
+            let dir_inode = self.inode_store.get(dirid).await?;
+            if !matches!(&dir_inode, Inode::Directory(_)) {
+                return Err(FsError::NotDirectory);
+            }
+            check_access(&dir_inode, &creds, AccessMode::Execute)?;
+            if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
+                return Err(FsError::StaleHandle);
+            }
+        }
 
         let (file_id, cookie) = match self
             .directory_store
@@ -83,8 +127,7 @@ impl ZeroFS {
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
-        let is_dir = matches!(dir_inode, Inode::Directory(_));
-        if !is_dir {
+        if !matches!(&dir_inode, Inode::Directory(_)) {
             return Err(FsError::NotDirectory);
         }
         if matches!(&dir_inode, Inode::Directory(dir) if dir.nlink == 0) {
@@ -101,10 +144,19 @@ impl ZeroFS {
         }
 
         let mut file_inode = self.inode_store.get(file_id).await?;
+        match (
+            expected_directory,
+            matches!(file_inode, Inode::Directory(_)),
+        ) {
+            (Some(true), false) => return Err(FsError::NotDirectory),
+            (Some(false), true) => return Err(FsError::IsDirectory),
+            _ => {}
+        }
         let defer_unlinked = self.should_defer_unlinked_inode(file_id);
 
         let original_nlink = match &file_inode {
             Inode::File(f) => f.nlink,
+            Inode::Symlink(s) => s.nlink,
             Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
                 s.nlink
             }
@@ -219,7 +271,16 @@ impl ZeroFS {
                         dir.nlink = dir.nlink.saturating_sub(1);
                     }
                     Inode::Symlink(symlink) => {
-                        if defer_unlinked {
+                        if symlink.nlink > 1 {
+                            symlink.nlink -= 1;
+                            symlink.ctime = now_sec;
+                            symlink.ctime_nsec = now_nsec;
+
+                            // Both namespace entries remain reference entries.
+                            // Keeping the surviving nlink==1 entry as a
+                            // reference avoids an inode-to-name reverse scan.
+                            self.inode_store.save(&mut txn, file_id, &file_inode)?;
+                        } else if defer_unlinked {
                             // POSIX open-unlink: defer reclaim until last clunk.
                             symlink.nlink = 0;
                             symlink.ctime = now_sec;
@@ -289,11 +350,11 @@ impl ZeroFS {
                         .ok();
                 }
 
-                // For directories and symlinks: always remove from stats
-                // For files and special files: only remove if this is the last link
+                // Directories are never hardlinked. All other inode kinds are
+                // removed from stats only when their last namespace link goes.
                 let (file_size, should_always_remove_stats) = match &file_inode {
                     Inode::File(f) => (Some(f.size), false),
-                    Inode::Directory(_) | Inode::Symlink(_) => (None, true),
+                    Inode::Directory(_) => (None, true),
                     _ => (None, false),
                 };
 
@@ -336,7 +397,7 @@ mod tests {
 
     use crate::fs::key_codec::KeyCodec;
 
-    use crate::fs::types::SetAttributes;
+    use crate::fs::types::{SetAttributes, SetMode};
     use bytes::Bytes;
 
     #[tokio::test]
@@ -410,6 +471,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_remove_enforces_target_kind_under_the_mutation_lock() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        fs.create(&test_creds(), 0, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.mkdir(&test_creds(), 0, b"directory", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = (&test_auth()).into();
+
+        let file_as_directory = fs
+            .remove_idempotent_checked(&auth, 0, b"file", [0; 16], true)
+            .await;
+        assert!(matches!(file_as_directory, Err(FsError::NotDirectory)));
+        assert!(fs.lookup(&test_creds(), 0, b"file").await.is_ok());
+
+        let directory_as_file = fs
+            .remove_idempotent_checked(&auth, 0, b"directory", [0; 16], false)
+            .await;
+        assert!(matches!(directory_as_file, Err(FsError::IsDirectory)));
+        assert!(fs.lookup(&test_creds(), 0, b"directory").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_checks_parent_search_before_resolving_a_missing_name() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (dir_id, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"unsearchable",
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = fs.remove(&(&test_auth()).into(), dir_id, b"missing").await;
+        assert!(matches!(result, Err(FsError::PermissionDenied)));
+    }
+
+    #[tokio::test]
     async fn remove_retry_requires_a_remove_result() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let op_id = [0x31; 16];
@@ -428,14 +533,37 @@ mod tests {
     async fn remove_retry_replays_success_after_entry_is_gone() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let op_id = [0x32; 16];
-        fs.create(&test_creds(), 0, b"file", &SetAttributes::default())
+        let (dir_id, _) = fs
+            .mkdir(
+                &test_creds(),
+                0,
+                b"parent",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.create(&test_creds(), dir_id, b"file", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.remove_idempotent(&(&test_auth()).into(), 0, b"file", op_id)
+        fs.remove_idempotent(&(&test_auth()).into(), dir_id, b"file", op_id)
             .await
             .unwrap();
-        fs.remove_idempotent(&(&test_auth()).into(), 0, b"file", op_id)
+        fs.setattr(
+            &test_creds(),
+            dir_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        fs.remove_idempotent(&(&test_auth()).into(), dir_id, b"file", op_id)
             .await
             .unwrap();
         assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Remove)));

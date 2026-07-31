@@ -62,8 +62,9 @@ fn encode_dir_scan_value(name: &[u8], value: &DirScanValueRef) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Decode directory scan entry value: returns (name, DirScanValue)
-fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
+/// Decode the current on-disk directory scan record for consistency tooling.
+#[doc(hidden)]
+pub fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
     if data.len() < 4 {
         return Err(FsError::InvalidData);
     }

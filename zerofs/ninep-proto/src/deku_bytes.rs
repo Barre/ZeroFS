@@ -1,62 +1,34 @@
+use alloc::vec::Vec;
 use bytes::Bytes;
 use deku::ctx::Order;
+use deku::no_std_io::{Read, Seek, Write};
 use deku::prelude::*;
 use deku::reader::Reader;
 use deku::writer::Writer;
-use std::io::{Read, Seek, Write};
 
-#[derive(Debug, Clone, Default)]
-pub struct DekuBytes(pub Bytes);
+use crate::{ByteStorage, WireBytes};
 
-impl DekuBytes {
-    pub fn new(bytes: Bytes) -> Self {
-        Self(bytes)
-    }
+/// Userspace counted payload. Other environments use [`WireBytes`] directly.
+pub type DekuBytes<B = Bytes> = WireBytes<B>;
 
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl From<Bytes> for DekuBytes {
-    fn from(bytes: Bytes) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<Vec<u8>> for DekuBytes {
+impl From<Vec<u8>> for WireBytes<Bytes> {
     fn from(vec: Vec<u8>) -> Self {
         Self(Bytes::from(vec))
     }
 }
 
-impl From<DekuBytes> for Bytes {
-    fn from(deku_bytes: DekuBytes) -> Self {
+impl From<WireBytes<Bytes>> for Bytes {
+    fn from(deku_bytes: WireBytes<Bytes>) -> Self {
         deku_bytes.0
-    }
-}
-
-impl AsRef<[u8]> for DekuBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for DekuBytes {
-    type Target = Bytes;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
 const READ_CHUNK_SIZE: usize = 64 * 1024;
 
-impl<'a> DekuReader<'a, &u32> for DekuBytes {
+impl<'a, B> DekuReader<'a, &u32> for WireBytes<B>
+where
+    B: ByteStorage + From<Vec<u8>>,
+{
     fn from_reader_with_ctx<R: Read + Seek>(
         reader: &mut Reader<R>,
         count: &u32,
@@ -72,17 +44,17 @@ impl<'a> DekuReader<'a, &u32> for DekuBytes {
             reader.read_bytes(chunk, &mut buf[start..], Order::Lsb0)?;
             remaining -= chunk;
         }
-        Ok(Self(Bytes::from(buf)))
+        Ok(Self(B::from(buf)))
     }
 }
 
-impl DekuWriter<&u32> for DekuBytes {
+impl<B: ByteStorage> DekuWriter<&u32> for WireBytes<B> {
     fn to_writer<W: Write + Seek>(
         &self,
         writer: &mut Writer<W>,
         _count: &u32,
     ) -> Result<(), DekuError> {
-        writer.write_bytes(&self.0)?;
+        writer.write_bytes(self.0.as_ref())?;
         Ok(())
     }
 }

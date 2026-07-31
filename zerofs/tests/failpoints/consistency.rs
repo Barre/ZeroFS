@@ -5,7 +5,7 @@ use zerofs::fs::ZeroFS;
 use zerofs::fs::errors::FsError;
 use zerofs::fs::inode::{Inode, InodeAttrs, InodeId};
 use zerofs::fs::key_codec::{EXTENT_DOMAIN, KeyCodec, KeyPrefix, META_DOMAIN, ParsedKey};
-use zerofs::fs::store::directory::DirScanValue;
+use zerofs::fs::store::directory::{DirScanValue, decode_dir_scan_value};
 
 const ROOT_INODE_ID: InodeId = 0;
 const DIR_BASE_NLINK: u32 = 2;
@@ -883,7 +883,7 @@ impl<'a> ConsistencyChecker<'a> {
                     if let Ok(inode) = self.fs.inode_store.get(inode_id).await {
                         let scan_key = codec.dir_scan_key(dir_id, cookie);
                         if let Ok(Some(scan_value)) = self.fs.db.get_bytes(&scan_key).await
-                            && let Ok((_, dsv)) = Self::decode_dir_scan_value(&scan_value)
+                            && let Ok((_, dsv)) = decode_dir_scan_value(&scan_value)
                             && let DirScanValue::WithInode {
                                 inode: embedded, ..
                             } = dsv
@@ -918,7 +918,7 @@ impl<'a> ConsistencyChecker<'a> {
                 };
                 if let ParsedKey::DirScan { cookie } = codec.parse_key(&key) {
                     max_cookie = max_cookie.max(cookie);
-                    if let Ok((name, _)) = Self::decode_dir_scan_value(&value) {
+                    if let Ok((name, _)) = decode_dir_scan_value(&value) {
                         dir_scans.insert(cookie, name);
                     }
                 }
@@ -978,20 +978,6 @@ impl<'a> ConsistencyChecker<'a> {
         }
 
         Ok(())
-    }
-
-    fn decode_dir_scan_value(data: &[u8]) -> Result<(Vec<u8>, DirScanValue), FsError> {
-        if data.len() < 4 {
-            return Err(FsError::InvalidData);
-        }
-        let name_len = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-        if data.len() < 4 + name_len {
-            return Err(FsError::InvalidData);
-        }
-        let name = data[4..4 + name_len].to_vec();
-        let value: DirScanValue =
-            bincode::deserialize(&data[4 + name_len..]).map_err(|_| FsError::InvalidData)?;
-        Ok((name, value))
     }
 
     async fn verify_orphaned_directory_metadata(&mut self) -> Result<(), FsError> {

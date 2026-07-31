@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub type InodeId = u64;
 
+/// Device-number limits of Linux's 12/20-bit `new_encode_dev` split, which both
+/// the 9P `Stat.rdev` field and NFS `specdata` are read back through.
+pub const MAX_DEVICE_MAJOR: u32 = (1 << 12) - 1;
+pub const MAX_DEVICE_MINOR: u32 = (1 << 20) - 1;
+
 pub trait InodeAttrs {
     fn uid(&self) -> u32;
     fn gid(&self) -> u32;

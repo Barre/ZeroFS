@@ -459,3 +459,17 @@ impl DirEntry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_preserves_the_wire_data_version() {
+        let stat = Stat {
+            data_version: 42,
+            ..Default::default()
+        };
+        assert_eq!(Metadata::from_stat(&stat).data_version, 42);
+    }
+}

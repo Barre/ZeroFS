@@ -40,6 +40,37 @@ impl ZeroFS {
         data: &Bytes,
         op_id: crate::dedup::OpId,
     ) -> Result<FileAttributes, FsError> {
+        self.write_idempotent_inner(auth, id, offset, data, op_id, true)
+            .await
+    }
+
+    /// Write through a fid whose access mode was already authorized at open.
+    ///
+    /// The original credentials are still used for ownership-sensitive
+    /// metadata such as clearing SUID/SGID; only the mutable mode-bit access
+    /// check is skipped so an open descriptor remains a stable capability.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn write_opened_idempotent(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+        offset: u64,
+        data: &Bytes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        self.write_idempotent_inner(auth, id, offset, data, op_id, false)
+            .await
+    }
+
+    async fn write_idempotent_inner(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+        offset: u64,
+        data: &Bytes,
+        op_id: crate::dedup::OpId,
+        check_permissions: bool,
+    ) -> Result<FileAttributes, FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_write)? {
             return Ok(result);
         }
@@ -63,10 +94,32 @@ impl ZeroFS {
 
         // NFS RFC 1813 section 4.4: Allow owners to write to their files regardless of permission bits
         match &inode {
-            Inode::File(file) if creds.uid != file.uid => {
-                check_access(&inode, &creds, AccessMode::Write)?;
+            Inode::File(file) => {
+                if check_permissions && creds.uid != file.uid {
+                    check_access(&inode, &creds, AccessMode::Write)?;
+                }
             }
-            _ => {}
+            _ => return Err(FsError::IsDirectory),
+        }
+
+        // POSIX zero-length writes do not extend a sparse file or update its
+        // timestamps. In particular, an offset beyond EOF must not change
+        // size. A tagged write still needs its typed result in the mutation
+        // ledger; otherwise 9P dispatch records the generic `Applied` fallback
+        // and a retry cannot reconstruct the write result.
+        if data.is_empty() {
+            let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+            if crate::dedup::has_op_id(&op_id) {
+                let mut txn = self.db.new_transaction()?;
+                txn.set_dedup_result(
+                    op_id,
+                    DedupResult::Write {
+                        attrs: post_attrs.clone(),
+                    },
+                );
+                self.write_coordinator.commit(txn).await?;
+            }
+            return Ok(post_attrs);
         }
 
         match &mut inode {
@@ -181,13 +234,35 @@ impl ZeroFS {
         offset: u64,
         count: u32,
     ) -> Result<(Bytes, bool), FsError> {
+        self.read_file_inner(Some(auth), id, offset, count).await
+    }
+
+    /// Read through a fid whose read access was already authorized at open.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn read_file_opened(
+        &self,
+        id: InodeId,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Bytes, bool), FsError> {
+        self.read_file_inner(None, id, offset, count).await
+    }
+
+    async fn read_file_inner(
+        &self,
+        auth: Option<&AuthContext>,
+        id: InodeId,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Bytes, bool), FsError> {
         debug!("read_file: id={}, offset={}, count={}", id, offset, count);
 
         let inode = self.inode_store.get(id).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-
-        check_access(&inode, &creds, AccessMode::Read)?;
+        if let Some(auth) = auth {
+            let creds = Credentials::from_auth_context(auth);
+            check_access(&inode, &creds, AccessMode::Read)?;
+        }
 
         match &inode {
             Inode::File(file) => {
@@ -280,12 +355,14 @@ impl ZeroFS {
         Ok(())
     }
 
-    /// Atomically allocate, punch, or zero a file range.
+    /// Atomically allocate, punch, or zero a file range through a fid whose
+    /// write access was authorized at open.
     ///
     /// ZeroFS represents zero-filled ranges as sparse holes. Its allocation
     /// guarantee comes from charging logical growth against quota, so a later
     /// write inside the file does not consume additional quota.
-    pub async fn fallocate(
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn fallocate_opened(
         &self,
         auth: &AuthContext,
         id: InodeId,
@@ -293,13 +370,26 @@ impl ZeroFS {
         length: u64,
         mode: FallocateMode,
     ) -> Result<FileAttributes, FsError> {
-        self.fallocate_idempotent(auth, id, offset, length, mode, [0u8; 16])
+        self.fallocate_idempotent_inner(auth, id, offset, length, mode, [0u8; 16])
             .await
     }
 
-    /// Idempotent fallocate. Delayed punch-hole and zero-range retries do not
-    /// apply after newer writes.
-    pub async fn fallocate_idempotent(
+    /// Idempotent fallocate through an already-authorized opened fid.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn fallocate_opened_idempotent(
+        &self,
+        auth: &AuthContext,
+        id: InodeId,
+        offset: u64,
+        length: u64,
+        mode: FallocateMode,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        self.fallocate_idempotent_inner(auth, id, offset, length, mode, op_id)
+            .await
+    }
+
+    async fn fallocate_idempotent_inner(
         &self,
         auth: &AuthContext,
         id: InodeId,
@@ -330,12 +420,8 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        match &inode {
-            Inode::File(file) if creds.uid != file.uid => {
-                check_access(&inode, &creds, AccessMode::Write)?;
-            }
-            Inode::File(_) => {}
-            _ => return Err(FsError::IsDirectory),
+        if !matches!(&inode, Inode::File(_)) {
+            return Err(FsError::IsDirectory);
         }
 
         let (old_size, parent_name_for_update) = match &inode {
@@ -350,7 +436,6 @@ impl ZeroFS {
             FallocateMode::PunchHole | FallocateMode::ZeroRange { keep_size: true } => old_size,
         };
         let zeroes_range = !matches!(mode, FallocateMode::Allocate);
-
         if new_size > old_size {
             let increase = new_size - old_size;
             let (used_bytes, _) = self.global_stats.get_totals();
@@ -471,6 +556,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(fattr.size, data.len() as u64);
+        let empty = fs
+            .write(&(&test_auth()).into(), file_id, 1_000_000, &Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            empty.size, fattr.size,
+            "an empty write beyond EOF must not grow the file"
+        );
+        assert_eq!(
+            empty.mtime, fattr.mtime,
+            "an empty write must not update timestamps"
+        );
 
         let (read_data, eof) = fs
             .read_file(&(&test_auth()).into(), file_id, 0, data.len() as u32)
@@ -510,6 +607,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_write_retry_replays_typed_result_without_overwriting_a_later_write() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"empty-retry.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let op_id = [0x42; 16];
+        let auth: AuthContext = (&test_auth()).into();
+
+        let original = fs
+            .write_idempotent(&auth, file_id, 1_000_000, &Bytes::new(), op_id)
+            .await
+            .unwrap();
+        assert_eq!(original.size, 0);
+        assert!(matches!(
+            fs.dedup.get(&op_id),
+            Some(crate::dedup::DedupResult::Write { ref attrs })
+                if attrs.size == original.size && attrs.mtime == original.mtime
+        ));
+
+        fs.write(&auth, file_id, 0, &Bytes::from_static(b"later"))
+            .await
+            .unwrap();
+
+        let replayed = fs
+            .write_idempotent(&auth, file_id, 1_000_000, &Bytes::new(), op_id)
+            .await
+            .unwrap();
+        assert_eq!(replayed.size, original.size);
+        assert_eq!(replayed.mtime, original.mtime);
+        let (data, _) = fs.read_file(&auth, file_id, 0, 5).await.unwrap();
+        assert_eq!(data.as_ref(), b"later");
+    }
+
+    #[tokio::test]
     async fn fallocate_retry_does_not_zero_a_later_write() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (file_id, _) = fs
@@ -529,7 +666,7 @@ mod tests {
         let mode = FallocateMode::ZeroRange { keep_size: true };
 
         let original = fs
-            .fallocate_idempotent(&auth, file_id, 0, 5, mode, op_id)
+            .fallocate_opened_idempotent(&auth, file_id, 0, 5, mode, op_id)
             .await
             .unwrap();
         fs.write(&auth, file_id, 0, &Bytes::from_static(b"later"))
@@ -537,7 +674,7 @@ mod tests {
             .unwrap();
 
         let replayed = fs
-            .fallocate_idempotent(&auth, file_id, 0, 5, mode, op_id)
+            .fallocate_opened_idempotent(&auth, file_id, 0, 5, mode, op_id)
             .await
             .unwrap();
         assert_eq!(replayed.mtime, original.mtime);
@@ -597,7 +734,7 @@ mod tests {
             .unwrap();
 
         let attrs = fs
-            .fallocate(&auth, file_id, 8, 8, FallocateMode::Allocate)
+            .fallocate_opened(&auth, file_id, 8, 8, FallocateMode::Allocate)
             .await
             .unwrap();
         assert_eq!(attrs.size, 16);
@@ -606,7 +743,7 @@ mod tests {
         assert!(data[4..].iter().all(|&b| b == 0));
 
         let attrs = fs
-            .fallocate(&auth, file_id, 1, 2, FallocateMode::Allocate)
+            .fallocate_opened(&auth, file_id, 1, 2, FallocateMode::Allocate)
             .await
             .unwrap();
         assert_eq!(attrs.size, 16, "allocation inside EOF must not shrink");
@@ -622,14 +759,14 @@ mod tests {
             .unwrap();
         let auth = (&test_auth()).into();
 
-        fs.fallocate(&auth, file_id, 0, 8, FallocateMode::Allocate)
+        fs.fallocate_opened(&auth, file_id, 0, 8, FallocateMode::Allocate)
             .await
             .unwrap();
         fs.write(&auth, file_id, 0, &Bytes::from_static(b"12345678"))
             .await
             .expect("an overwrite inside the reservation consumes no new quota");
         let result = fs
-            .fallocate(&auth, file_id, 8, 1, FallocateMode::Allocate)
+            .fallocate_opened(&auth, file_id, 8, 1, FallocateMode::Allocate)
             .await;
         assert!(matches!(result, Err(FsError::NoSpace)));
     }
@@ -647,7 +784,7 @@ mod tests {
             .unwrap();
 
         let attrs = fs
-            .fallocate(&auth, file_id, 2, 3, FallocateMode::PunchHole)
+            .fallocate_opened(&auth, file_id, 2, 3, FallocateMode::PunchHole)
             .await
             .unwrap();
         assert_eq!(attrs.size, 12);
@@ -657,7 +794,7 @@ mod tests {
         assert_eq!(&data[5..], b"fghijkl");
 
         let attrs = fs
-            .fallocate(
+            .fallocate_opened(
                 &auth,
                 file_id,
                 8,
@@ -669,7 +806,7 @@ mod tests {
         assert_eq!(attrs.size, 12, "KEEP_SIZE must not cross EOF");
 
         let attrs = fs
-            .fallocate(
+            .fallocate_opened(
                 &auth,
                 file_id,
                 8,
@@ -708,7 +845,7 @@ mod tests {
             .await
             .unwrap();
         let attrs = fs
-            .fallocate(&auth, file_id, 0, 1, FallocateMode::Allocate)
+            .fallocate_opened(&auth, file_id, 0, 1, FallocateMode::Allocate)
             .await
             .unwrap();
         assert_ne!(
@@ -720,7 +857,7 @@ mod tests {
             .await
             .unwrap();
         let attrs = fs
-            .fallocate(&auth, file_id, 100, 1, FallocateMode::PunchHole)
+            .fallocate_opened(&auth, file_id, 100, 1, FallocateMode::PunchHole)
             .await
             .unwrap();
         assert_ne!(
@@ -753,10 +890,12 @@ mod tests {
         let non_owner = AuthContext {
             uid: 2000,
             gid: 2000,
+            gid_known: true,
             gids: Vec::new(),
+            groups_complete: true,
         };
         let attrs = fs
-            .fallocate(&non_owner, file_id, 0, 1, FallocateMode::PunchHole)
+            .fallocate_opened(&non_owner, file_id, 0, 1, FallocateMode::PunchHole)
             .await
             .unwrap();
         assert_eq!(attrs.mode & 0o6000, 0);
@@ -789,7 +928,7 @@ mod tests {
             let auth_clone = auth.clone();
             let result = tokio::spawn(async move {
                 fs_clone
-                    .fallocate(&auth_clone, file_id, offset, 2, FallocateMode::PunchHole)
+                    .fallocate_opened(&auth_clone, file_id, offset, 2, FallocateMode::PunchHole)
                     .await
             })
             .await;
@@ -808,7 +947,7 @@ mod tests {
         let auth_clone = auth.clone();
         let result = tokio::spawn(async move {
             fs_clone
-                .fallocate(&auth_clone, file_id, 8, 2, FallocateMode::PunchHole)
+                .fallocate_opened(&auth_clone, file_id, 8, 2, FallocateMode::PunchHole)
                 .await
         })
         .await;
@@ -825,7 +964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trim_remains_extent_only_while_fallocate_has_its_own_trace() {
+    async fn trim_preserves_timestamps_and_zeroes_the_requested_range() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (file_id, _) = fs
             .create(&test_creds(), 0, b"trim.bin", &SetAttributes::default())
@@ -866,7 +1005,7 @@ mod tests {
         assert_eq!(&data[..], b"a\0\0defgh");
 
         let mut events = fs.tracer.subscribe();
-        fs.fallocate(&auth, file_id, 0, 1, FallocateMode::Allocate)
+        fs.fallocate_opened(&auth, file_id, 0, 1, FallocateMode::Allocate)
             .await
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())

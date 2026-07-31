@@ -17,8 +17,13 @@ const S_ISVTX: u32 = 0o1000;
 pub struct Credentials {
     pub uid: u32,
     pub gid: u32,
+    /// Whether `gid` came from the caller rather than a protocol fallback.
+    pub gid_known: bool,
     pub groups: [u32; 16],
     pub groups_count: usize,
+    /// False when an upstream kernel already performed group DAC but could not
+    /// provide the complete supplementary-group list.
+    pub groups_complete: bool,
 }
 
 impl Credentials {
@@ -26,8 +31,10 @@ impl Credentials {
         let mut creds = Self {
             uid: auth.uid,
             gid: auth.gid,
+            gid_known: auth.gid_known,
             groups: [0; 16],
             groups_count: auth.gids.len().min(16),
+            groups_complete: auth.groups_complete,
         };
 
         for (i, gid) in auth.gids.iter().take(16).enumerate() {
@@ -42,7 +49,11 @@ impl Credentials {
     }
 
     pub fn is_member_of_group(&self, gid: u32) -> bool {
-        if self.gid == gid {
+        self.is_known_member_of_group(gid) || !self.groups_complete
+    }
+
+    fn is_known_member_of_group(&self, gid: u32) -> bool {
+        if self.gid_known && self.gid == gid {
             return true;
         }
         for i in 0..self.groups_count {
@@ -83,8 +94,12 @@ pub fn check_access(inode: &Inode, creds: &Credentials, mode: AccessMode) -> Res
         if file_mode & permission_bits.0 != 0 {
             return Ok(());
         }
-    } else if creds.is_member_of_group(gid) {
+    } else if creds.is_known_member_of_group(gid) {
         if file_mode & permission_bits.1 != 0 {
+            return Ok(());
+        }
+    } else if !creds.groups_complete {
+        if file_mode & (permission_bits.1 | permission_bits.2) != 0 {
             return Ok(());
         }
     } else if file_mode & permission_bits.2 != 0 {

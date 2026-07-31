@@ -32,6 +32,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 pub use ninep_proto::NOFID;
 use ninep_proto::retry::MUTATION_RETRY_HORIZON;
+use ninep_proto::slice_codec::{LOCK_BLOCKED, LOCK_SUCCESS};
 use ninep_proto::*;
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
@@ -992,11 +993,11 @@ impl NinePClient {
                     client_id: P9String::new(lk.client_id.clone()),
                 });
                 match Self::send_raw_rpc(conn, body).await {
-                    Ok(Message::Rlock(r)) if matches!(r.status, LockStatus::Success) => {
+                    Ok(Message::Rlock(r)) if r.status == LockStatus::Success.as_wire() => {
                         acquired.push(lk);
                     }
                     Ok(Message::Rlock(Rlock {
-                        status: LockStatus::Blocked,
+                        status: LOCK_BLOCKED,
                     }))
                     | Err(ClientError::Errno(linux::EAGAIN)) => {
                         let rolled_back = Self::rollback_replayed_locks(conn, &acquired).await;
@@ -1070,7 +1071,7 @@ impl NinePClient {
                 if !matches!(
                     result,
                     Ok(Message::Rlock(Rlock {
-                        status: LockStatus::Success
+                        status: LOCK_SUCCESS
                     }))
                 ) {
                     debug!("9P lock replay rollback was not acknowledged");
@@ -1642,8 +1643,84 @@ impl NinePClient {
     }
 
     /// Bind `fid` to an inode by id (no path walk), acting as `n_uname`. Used for
-    /// per-user fids and reconnect replay.
+    /// legacy per-user fids. Because this form cannot carry a gid, callers that
+    /// enforce server-side permissions should use [`Self::rebind_with_credentials`].
     pub async fn rebind(&self, fid: u32, inode_id: u64, n_uname: u32) -> ClientResult<Qid> {
+        self.rebind_inner(fid, inode_id, n_uname, Vec::new()).await
+    }
+
+    /// Bind `fid` to an inode by id with an authoritative filesystem identity.
+    ///
+    /// `groups` contains supplementary gids. Lists longer than
+    /// [`P9_MAX_GROUPS`] are rejected with `E2BIG`; the exact encoded identity
+    /// is retained for reconnect replay.
+    pub async fn rebind_with_credentials(
+        &self,
+        fid: u32,
+        inode_id: u64,
+        uid: u32,
+        gid: u32,
+        groups: &[u32],
+    ) -> ClientResult<Qid> {
+        if groups.len() > P9_MAX_GROUPS {
+            return Err(ClientError::Errno(linux::E2BIG));
+        }
+        self.rebind_with_credentials_inner(fid, inode_id, uid, gid, groups, true)
+            .await
+    }
+
+    /// Bind `fid` with a uid and primary gid when the caller cannot observe
+    /// supplementary groups. The server still enforces owner permissions and
+    /// accepts group access that an authoritative local permission check has
+    /// already allowed.
+    pub async fn rebind_with_primary_group(
+        &self,
+        fid: u32,
+        inode_id: u64,
+        uid: u32,
+        gid: u32,
+    ) -> ClientResult<Qid> {
+        self.rebind_with_credentials_inner(fid, inode_id, uid, gid, &[], false)
+            .await
+    }
+
+    async fn rebind_with_credentials_inner(
+        &self,
+        fid: u32,
+        inode_id: u64,
+        uid: u32,
+        gid: u32,
+        groups: &[u32],
+        groups_complete: bool,
+    ) -> ClientResult<Qid> {
+        let group_count = groups.len().min(P9_MAX_GROUPS);
+        let mut payload = Vec::with_capacity(
+            P9_REBIND_CREDENTIAL_HEADER_SIZE + group_count * std::mem::size_of::<u32>(),
+        );
+        payload.push(P9_REBIND_CREDENTIAL_SENTINEL);
+        payload.push(P9_REBIND_CREDENTIAL_VERSION);
+        payload.extend_from_slice(&gid.to_le_bytes());
+        payload.push(
+            group_count as u8
+                | if groups_complete {
+                    0
+                } else {
+                    P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE
+                },
+        );
+        for group in &groups[..group_count] {
+            payload.extend_from_slice(&group.to_le_bytes());
+        }
+        self.rebind_inner(fid, inode_id, uid, payload).await
+    }
+
+    async fn rebind_inner(
+        &self,
+        fid: u32,
+        inode_id: u64,
+        n_uname: u32,
+        uname: Vec<u8>,
+    ) -> ClientResult<Qid> {
         let root_inode = self.state.lock().unwrap().default_root.unwrap_or(0);
         let (resp, _transition) = self
             .rpc_stateful(Message::Trebind(Trebind {
@@ -1651,7 +1728,7 @@ impl NinePClient {
                 inode_id,
                 root_inode,
                 flags: 0,
-                uname: P9String::new(Vec::new()),
+                uname: P9String::new(uname.clone()),
                 n_uname,
             }))
             .await?;
@@ -1663,7 +1740,7 @@ impl NinePClient {
                         inode_id,
                         root_inode,
                         n_uname,
-                        uname: Vec::new(),
+                        uname,
                         opened: None,
                     },
                 );
@@ -2463,12 +2540,14 @@ impl NinePClient {
             .await?;
         match resp {
             Message::Rlock(r) => {
+                let status = LockStatus::from_wire(r.status)
+                    .ok_or(ClientError::Unexpected("lock status"))?;
                 let mut st = self.state.lock().unwrap();
                 match lock_type {
-                    LockType::Unlock if matches!(r.status, LockStatus::Success) => {
+                    LockType::Unlock if status == LockStatus::Success => {
                         unlock_recorded_range(&mut st.locks, fid, start, length);
                     }
-                    _ if matches!(r.status, LockStatus::Success) => {
+                    _ if status == LockStatus::Success => {
                         replace_recorded_lock(
                             &mut st.locks,
                             LockRecord {
@@ -2483,7 +2562,7 @@ impl NinePClient {
                     }
                     _ => {}
                 }
-                Ok(r.status)
+                Ok(status)
             }
             _ => Err(ClientError::Unexpected("lock")),
         }
@@ -3403,6 +3482,143 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
+    async fn binary_rebind_credentials_survive_replay_exactly() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&old_conn));
+        let expected = vec![
+            P9_REBIND_CREDENTIAL_SENTINEL,
+            P9_REBIND_CREDENTIAL_VERSION,
+            0xd0,
+            0x07,
+            0,
+            0,
+            2,
+            0xd1,
+            0x07,
+            0,
+            0,
+            0xd2,
+            0x07,
+            0,
+            0,
+        ];
+
+        let responder_conn = Arc::clone(&old_conn);
+        let expected_initial = expected.clone();
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut old_requests, "credential rebind").await;
+            let Message::Trebind(rebind) = request.body else {
+                panic!("expected Trebind");
+            };
+            assert_eq!((rebind.fid, rebind.inode_id, rebind.n_uname), (7, 70, 1000));
+            assert_eq!(rebind.flags, 0);
+            assert_eq!(rebind.uname.data, expected_initial);
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rrebind(Rrebind { qid: qid(70) }),
+            );
+        });
+
+        client
+            .rebind_with_credentials(7, 70, 1000, 2000, &[2001, 2002])
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        let (replay_conn, mut replay_requests) = test_conn_with_receiver();
+        let responder_conn = Arc::clone(&replay_conn);
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut replay_requests, "credential replay").await;
+            let Message::Trebind(rebind) = request.body else {
+                panic!("expected Trebind");
+            };
+            assert_eq!((rebind.fid, rebind.inode_id, rebind.n_uname), (7, 70, 1000));
+            assert_eq!(rebind.flags, P9_REBIND_REPLAY);
+            assert_eq!(rebind.uname.data, expected);
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rrebind(Rrebind { qid: qid(70) }),
+            );
+        });
+
+        client.replay(&replay_conn).await.unwrap();
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn primary_group_rebind_marks_incomplete_groups_through_replay() {
+        let (old_conn, mut old_requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&old_conn));
+        let expected = vec![
+            P9_REBIND_CREDENTIAL_SENTINEL,
+            P9_REBIND_CREDENTIAL_VERSION,
+            0xd0,
+            0x07,
+            0,
+            0,
+            P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE,
+        ];
+
+        let responder_conn = Arc::clone(&old_conn);
+        let expected_initial = expected.clone();
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut old_requests, "primary-group rebind").await;
+            let Message::Trebind(rebind) = request.body else {
+                panic!("expected Trebind");
+            };
+            assert_eq!((rebind.fid, rebind.inode_id, rebind.n_uname), (7, 70, 1000));
+            assert_eq!(rebind.flags, 0);
+            assert_eq!(rebind.uname.data, expected_initial);
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rrebind(Rrebind { qid: qid(70) }),
+            );
+        });
+
+        client
+            .rebind_with_primary_group(7, 70, 1000, 2000)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        let (replay_conn, mut replay_requests) = test_conn_with_receiver();
+        let responder_conn = Arc::clone(&replay_conn);
+        let responder = tokio::spawn(async move {
+            let request = recv_request(&mut replay_requests, "primary-group replay").await;
+            let Message::Trebind(rebind) = request.body else {
+                panic!("expected Trebind");
+            };
+            assert_eq!(rebind.flags, P9_REBIND_REPLAY);
+            assert_eq!(rebind.uname.data, expected);
+            reply(
+                &responder_conn,
+                request.tag,
+                Message::Rrebind(Rrebind { qid: qid(70) }),
+            );
+        });
+
+        client.replay(&replay_conn).await.unwrap();
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_rebind_rejects_unrepresentable_group_lists() {
+        let (conn, _requests) = test_conn_with_receiver();
+        let client = test_client(conn);
+        let groups = [2000; P9_MAX_GROUPS + 1];
+
+        assert!(matches!(
+            client
+                .rebind_with_credentials(7, 70, 1000, 2000, &groups)
+                .await,
+            Err(ClientError::Errno(code)) if code == linux::E2BIG
+        ));
+    }
+
+    #[tokio::test]
     async fn rooted_descendant_replays_after_its_attach_fid_was_clunked() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
@@ -3587,7 +3803,7 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn failed_reopen_clunks_the_provisional_rebind() {
+    async fn failed_reopen_clunks_the_pending_rebind_fid() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
         client
@@ -3623,7 +3839,7 @@ mod session_transition_tests {
                 }),
             );
 
-            let request = recv_request(&mut requests, "provisional fid clunk").await;
+            let request = recv_request(&mut requests, "pending rebind fid clunk").await;
             assert!(matches!(request.body, Message::Tclunk(Tclunk { fid: 7 })));
             reply(&responder_conn, request.tag, Message::Rclunk(Rclunk));
         });
@@ -3808,7 +4024,7 @@ mod session_transition_tests {
                     &responder_conn,
                     request.tag,
                     Message::Rlock(Rlock {
-                        status: LockStatus::Blocked,
+                        status: LockStatus::Blocked.as_wire(),
                     }),
                 );
             }
@@ -3839,7 +4055,7 @@ mod session_transition_tests {
                 &responder_conn,
                 request.tag,
                 Message::Rlock(Rlock {
-                    status: LockStatus::LockError,
+                    status: LockStatus::LockError.as_wire(),
                 }),
             );
         });
@@ -3866,7 +4082,7 @@ mod session_transition_tests {
                 &responder_conn,
                 request.tag,
                 Message::Rlock(Rlock {
-                    status: LockStatus::Blocked,
+                    status: LockStatus::Blocked.as_wire(),
                 }),
             );
 
@@ -3882,7 +4098,7 @@ mod session_transition_tests {
                 &responder_conn,
                 request.tag,
                 Message::Rlock(Rlock {
-                    status: LockStatus::Success,
+                    status: LockStatus::Success.as_wire(),
                 }),
             );
         });
@@ -3918,7 +4134,7 @@ mod session_transition_tests {
                 &responder_conn,
                 request.tag,
                 Message::Rlock(Rlock {
-                    status: LockStatus::Success,
+                    status: LockStatus::Success.as_wire(),
                 }),
             );
 
@@ -3952,7 +4168,7 @@ mod session_transition_tests {
                 &responder_conn,
                 request.tag,
                 Message::Rlock(Rlock {
-                    status: LockStatus::Success,
+                    status: LockStatus::Success.as_wire(),
                 }),
             );
 
@@ -3967,7 +4183,7 @@ mod session_transition_tests {
                     &responder_conn,
                     request.tag,
                     Message::Rlock(Rlock {
-                        status: LockStatus::Success,
+                        status: LockStatus::Success.as_wire(),
                     }),
                 );
             }

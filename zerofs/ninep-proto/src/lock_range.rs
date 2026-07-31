@@ -1,13 +1,12 @@
-//! Shared byte-range arithmetic for 9P locks.
+//! Allocating view of the shared byte-range arithmetic for 9P locks.
+//!
+//! The arithmetic lives in the allocation-free codec entry point included by
+//! the kernel client. This module gives the server the surviving fragments as a
+//! `Vec`.
 
-/// Exclusive end of a 9P lock range. A zero length extends to EOF.
-pub fn lock_range_end(start: u64, length: u64) -> u64 {
-    if length == 0 {
-        u64::MAX
-    } else {
-        start.saturating_add(length)
-    }
-}
+use alloc::vec::Vec;
+
+pub use crate::slice_codec::lock_range_end;
 
 /// Remove one range from another, returning the surviving left and right
 /// fragments as `(start, length)` pairs. A zero length extends to EOF.
@@ -17,39 +16,16 @@ pub fn subtract_lock_range(
     remove_start: u64,
     remove_length: u64,
 ) -> Vec<(u64, u64)> {
-    let held_end = lock_range_end(held_start, held_length);
-    let remove_end = lock_range_end(remove_start, remove_length);
-    if held_start >= remove_end || remove_start >= held_end {
-        return vec![(held_start, held_length)];
-    }
-
-    let mut survivors = Vec::with_capacity(2);
-
-    if held_start < remove_start {
-        let left_end = remove_start.min(held_end);
-        if held_start < left_end {
-            survivors.push((held_start, left_end - held_start));
-        }
-    }
-
-    if remove_end < held_end {
-        let right_start = remove_end.max(held_start);
-        if right_start < held_end {
-            let right_length = if held_end == u64::MAX {
-                0
-            } else {
-                held_end - right_start
-            };
-            survivors.push((right_start, right_length));
-        }
-    }
-
-    survivors
+    crate::slice_codec::subtract_lock_range(held_start, held_length, remove_start, remove_length)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn range_end_handles_eof_and_overflow() {
