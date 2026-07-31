@@ -7,7 +7,9 @@ use fp::fail_point;
 
 use crate::dedup::DedupResult;
 use crate::fs::errors::FsError;
-use crate::fs::inode::{DirectoryInode, FileInode, Inode, InodeId, SpecialInode};
+use crate::fs::inode::{
+    DirectoryInode, FileInode, Inode, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR, SpecialInode,
+};
 use crate::fs::permissions::{AccessMode, Credentials, check_access, validate_mode};
 #[cfg(test)]
 use crate::fs::store::directory::COOKIE_FIRST_ENTRY;
@@ -446,6 +448,13 @@ impl ZeroFS {
             return Ok(result);
         }
         validate_filename(name)?;
+        // Storing a device number the client-facing 32-bit encoding cannot
+        // represent would make two distinct devices alias when read back.
+        if let Some((major, minor)) = rdev
+            && (major > MAX_DEVICE_MAJOR || minor > MAX_DEVICE_MINOR)
+        {
+            return Err(FsError::InvalidArgument);
+        }
 
         debug!(
             "mknod: dirid={}, filename={}, ftype={:?}",

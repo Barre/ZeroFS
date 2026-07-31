@@ -24,8 +24,10 @@ fn test_creds() -> Credentials {
     Credentials {
         uid: 1000,
         gid: 1000,
+        gid_known: true,
         groups: [1000; 16],
         groups_count: 1,
+        groups_complete: true,
     }
 }
 
@@ -137,17 +139,8 @@ impl TestSetup {
         let scenario = fail::FailScenario::setup();
         let ctx = CrashTestContext::new();
         let fs = ctx.create_fs().await;
-        let creds = Credentials {
-            uid: 1000,
-            gid: 1000,
-            groups: [1000; 16],
-            groups_count: 1,
-        };
-        let auth = AuthContext {
-            uid: 1000,
-            gid: 1000,
-            gids: vec![1000],
-        };
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
         (
             scenario,
             Self {
@@ -165,17 +158,8 @@ async fn test_basic_consistency_after_clean_restart() {
     let _scenario = fail::FailScenario::setup();
     let ctx = CrashTestContext::new();
     let fs = ctx.create_fs().await;
-    let creds = Credentials {
-        uid: 1000,
-        gid: 1000,
-        groups: [1000; 16],
-        groups_count: 1,
-    };
-    let auth = AuthContext {
-        uid: 1000,
-        gid: 1000,
-        gids: vec![1000],
-    };
+    let creds = test_creds();
+    let auth = AuthContext::from(&creds);
 
     let (file_id, _) = fs
         .create(&creds, 0, b"test.txt", &SetAttributes::default())

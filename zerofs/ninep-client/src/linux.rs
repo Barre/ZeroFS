@@ -1,6 +1,7 @@
 // 9P2000.L carries Linux ABI values on every host, so these constants must not
 // come from the compilation target's libc (notably, browsers have no libc).
 pub(crate) const EIO: i32 = 5;
+pub(crate) const E2BIG: u32 = 7;
 pub(crate) const EAGAIN: u32 = 11;
 pub(crate) const ENOENT: u32 = 2;
 pub(crate) const ESTALE: u32 = 116;

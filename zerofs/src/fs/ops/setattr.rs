@@ -20,7 +20,63 @@ use crate::fs::{ZeroFS, get_current_time};
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
 
+enum SizeAuthorization {
+    CurrentMode,
+    OpenedWritableFid,
+}
+
 impl ZeroFS {
+    /// Persist an automatic access-time update without changing ctime or
+    /// requiring the reader to own the file.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn record_access_time_idempotent(
+        &self,
+        id: InodeId,
+        atime: crate::fs::types::Timestamp,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
+        let _guard = self.lock_manager.acquire(id).await;
+        if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
+            return Ok(result);
+        }
+
+        let mut inode = self.inode_store.get(id).await?;
+        let file = match &mut inode {
+            Inode::File(file) => file,
+            _ => return Err(FsError::InvalidArgument),
+        };
+        let changed = (file.atime, file.atime_nsec) < (atime.seconds, atime.nanoseconds);
+        if changed {
+            file.atime = atime.seconds;
+            file.atime_nsec = atime.nanoseconds;
+        }
+
+        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+        let mut txn = self.db.new_transaction()?;
+        if changed {
+            self.inode_store.save(&mut txn, id, &inode)?;
+            if let Some(parent_id) = inode.parent()
+                && let Some(name) = inode.name()
+            {
+                self.directory_store
+                    .update_inode_in_entry(&mut txn, parent_id, name, id, &inode)
+                    .await?;
+            }
+        }
+        txn.set_dedup_result(
+            op_id,
+            DedupResult::Setattr {
+                attrs: post_attrs.clone(),
+            },
+        );
+        self.write_coordinator.commit(txn).await?;
+        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+        Ok(post_attrs)
+    }
+
     /// Attribute update behind POSIX gates: chmod needs ownership; chown needs
     /// root (an owner may chgrp within their groups); explicit timestamps need
     /// `can_set_times`. A size change goes through the extent store: shrink
@@ -42,6 +98,39 @@ impl ZeroFS {
         id: InodeId,
         setattr: &SetAttributes,
         op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        self.setattr_idempotent_inner(creds, id, setattr, op_id, SizeAuthorization::CurrentMode)
+            .await
+    }
+
+    /// Idempotent setattr through a fid whose write access was authorized at
+    /// open. Only the mutable mode-bit check for a size change is skipped;
+    /// ownership and timestamp authorization remain enforced.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn setattr_opened_idempotent(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+    ) -> Result<FileAttributes, FsError> {
+        self.setattr_idempotent_inner(
+            creds,
+            id,
+            setattr,
+            op_id,
+            SizeAuthorization::OpenedWritableFid,
+        )
+        .await
+    }
+
+    async fn setattr_idempotent_inner(
+        &self,
+        creds: &Credentials,
+        id: InodeId,
+        setattr: &SetAttributes,
+        op_id: crate::dedup::OpId,
+        size_authorization: SizeAuthorization,
     ) -> Result<FileAttributes, FsError> {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
@@ -126,13 +215,15 @@ impl ZeroFS {
             SetTime::NoChange => {}
         }
 
-        if matches!(setattr.size, SetSize::Set(_)) {
+        if matches!(size_authorization, SizeAuthorization::CurrentMode)
+            && matches!(setattr.size, SetSize::Set(_))
+        {
             check_access(&inode, creds, AccessMode::Write)?;
         }
 
         match &mut inode {
             Inode::File(file) => {
-                if let SetSize::Set(new_size) = setattr.size {
+                let size_change = if let SetSize::Set(new_size) = setattr.size {
                     let old_size = file.size;
                     if new_size != old_size {
                         if new_size > old_size {
@@ -153,61 +244,13 @@ impl ZeroFS {
                         file.mtime_nsec = now_nsec;
                         file.ctime = now_sec;
                         file.ctime_nsec = now_nsec;
-
-                        let mut txn = self.db.new_transaction()?;
-
-                        self.extent_store
-                            .truncate(&mut txn, id, old_size, new_size)
-                            .await?;
-
-                        #[cfg(feature = "failpoints")]
-                        fail_point!(fp::TRUNCATE_AFTER_EXTENTS);
-
-                        let parent_name_for_update = file.parent.zip(file.name.clone());
-
-                        self.inode_store.save(&mut txn, id, &inode)?;
-
-                        #[cfg(feature = "failpoints")]
-                        fail_point!(fp::TRUNCATE_AFTER_INODE);
-
-                        if let Some((parent_id, name)) = parent_name_for_update {
-                            self.directory_store
-                                .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
-                                .await?;
-                        }
-
-                        let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
-                        txn.set_dedup_result(
-                            op_id,
-                            crate::dedup::DedupResult::Setattr {
-                                attrs: post_attrs.clone(),
-                            },
-                        );
-
-                        txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
-
-                        self.write_coordinator.commit(txn).await?;
-
-                        #[cfg(feature = "failpoints")]
-                        fail_point!(fp::TRUNCATE_AFTER_COMMIT);
-
-                        self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
-                        self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
-
-                        self.tracer.emit(
-                            &self.inode_store,
-                            id,
-                            FileOperation::Setattr {
-                                mode: match setattr.mode {
-                                    SetMode::Set(m) => Some(m),
-                                    SetMode::NoChange => None,
-                                },
-                            },
-                        );
-
-                        return Ok(post_attrs);
+                        Some((old_size, new_size))
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
 
                 if let SetMode::Set(mode) = setattr.mode {
                     debug!("Setting file mode from {} to {:#o}", file.mode, mode);
@@ -276,6 +319,64 @@ impl ZeroFS {
                     let (now_sec, now_nsec) = get_current_time();
                     file.ctime = now_sec;
                     file.ctime_nsec = now_nsec;
+                }
+
+                // A size change must commit the extent update, every other
+                // requested attribute, the directory-entry snapshot, and the
+                // idempotency result in one transaction. In particular, do
+                // not return through the truncate path before applying
+                // mode/owner/timestamp fields.
+                if let Some((old_size, new_size)) = size_change {
+                    let parent_name_for_update = file.parent.zip(file.name.clone());
+                    let mut txn = self.db.new_transaction()?;
+
+                    self.extent_store
+                        .truncate(&mut txn, id, old_size, new_size)
+                        .await?;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::TRUNCATE_AFTER_EXTENTS);
+
+                    self.inode_store.save(&mut txn, id, &inode)?;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::TRUNCATE_AFTER_INODE);
+
+                    if let Some((parent_id, name)) = parent_name_for_update {
+                        self.directory_store
+                            .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
+                            .await?;
+                    }
+
+                    let post_attrs: FileAttributes = InodeWithId { inode: &inode, id }.into();
+                    txn.set_dedup_result(
+                        op_id,
+                        crate::dedup::DedupResult::Setattr {
+                            attrs: post_attrs.clone(),
+                        },
+                    );
+                    txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
+
+                    self.write_coordinator.commit(txn).await?;
+
+                    #[cfg(feature = "failpoints")]
+                    fail_point!(fp::TRUNCATE_AFTER_COMMIT);
+
+                    self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
+                    self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
+
+                    self.tracer.emit(
+                        &self.inode_store,
+                        id,
+                        FileOperation::Setattr {
+                            mode: match setattr.mode {
+                                SetMode::Set(m) => Some(m),
+                                SetMode::NoChange => None,
+                            },
+                        },
+                    );
+
+                    return Ok(post_attrs);
                 }
             }
             Inode::Directory(dir) => {
@@ -511,11 +612,16 @@ impl ZeroFS {
 #[cfg(test)]
 mod tests {
 
+    use crate::fs::errors::FsError;
+    use crate::fs::permissions::Credentials;
     use crate::fs::test_util::test_creds;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
-    use crate::fs::types::{SetAttributes, SetSize};
+    use crate::fs::types::{
+        AuthContext, FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime,
+        SetUid, Timestamp,
+    };
     use bytes::Bytes;
 
     #[tokio::test]
@@ -543,12 +649,174 @@ mod tests {
 
         let fattr = fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
         assert_eq!(fattr.size, 500);
+        let same_size = fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
+        assert_eq!(same_size.size, fattr.size);
 
         let (read_data, _) = fs
             .read_file(&(&test_auth()).into(), file_id, 0, 1000)
             .await
             .unwrap();
         assert_eq!(read_data.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn access_time_update_is_monotonic_and_replayable_without_ctime_change() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, created) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"access-time.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let first = Timestamp {
+            seconds: created.atime.seconds + 10,
+            nanoseconds: 100,
+        };
+        let second = Timestamp {
+            seconds: first.seconds + 10,
+            nanoseconds: 200,
+        };
+        let first_op = [0x81; 16];
+
+        let original = fs
+            .record_access_time_idempotent(file_id, first, first_op)
+            .await
+            .unwrap();
+        assert_eq!(original.atime, first);
+        assert_eq!(original.ctime, created.ctime);
+
+        let newer = fs
+            .record_access_time_idempotent(file_id, second, [0x82; 16])
+            .await
+            .unwrap();
+        assert_eq!(newer.atime, second);
+        assert_eq!(newer.ctime, created.ctime);
+
+        let stale = fs
+            .record_access_time_idempotent(file_id, first, [0x83; 16])
+            .await
+            .unwrap();
+        assert_eq!(stale.atime, second);
+        assert_eq!(stale.ctime, created.ctime);
+
+        let replayed = fs
+            .record_access_time_idempotent(file_id, first, first_op)
+            .await
+            .unwrap();
+        assert_eq!(replayed.atime, original.atime);
+        assert_eq!(replayed.ctime, original.ctime);
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        let persisted: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(persisted.atime, second);
+        assert_eq!(persisted.ctime, created.ctime);
+    }
+
+    #[tokio::test]
+    async fn opened_truncate_remains_authorized_after_chmod() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"opened-truncate.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = AuthContext::from(&creds);
+        fs.write(&auth, file_id, 0, &Bytes::from(vec![b'A'; 1000]))
+            .await
+            .unwrap();
+
+        fs.setattr(
+            &creds,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let truncate = SetAttributes {
+            size: SetSize::Set(500),
+            ..Default::default()
+        };
+        let error = fs.setattr(&creds, file_id, &truncate).await.unwrap_err();
+        assert_eq!(
+            error,
+            FsError::PermissionDenied,
+            "ordinary setattr must still use the inode's current mode"
+        );
+
+        let attrs = fs
+            .setattr_opened_idempotent(&creds, file_id, &truncate, [0; 16])
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 500);
+        let (data, _) = fs.read_file_opened(file_id, 0, 1000).await.unwrap();
+        assert_eq!(data.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn opened_setattr_still_enforces_ownership_atomically() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let owner = test_creds();
+        let (file_id, _) = fs
+            .create(
+                &owner,
+                0,
+                b"opened-size-only.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.setattr(
+            &owner,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let non_owner = Credentials {
+            uid: owner.uid + 1,
+            gid: owner.gid + 1,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 0,
+            groups_complete: true,
+        };
+        let result = fs
+            .setattr_opened_idempotent(
+                &non_owner,
+                file_id,
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    size: SetSize::Set(100),
+                    ..Default::default()
+                },
+                [0; 16],
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), FsError::OperationNotPermitted);
+
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        let attrs: FileAttributes = InodeWithId {
+            inode: &inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(attrs.mode, 0);
+        assert_eq!(attrs.size, 0);
     }
 
     #[tokio::test]
@@ -584,5 +852,119 @@ mod tests {
         assert_eq!(replayed.size, 0, "retry returns the original exact stat");
         let (data, _) = fs.read_file(&auth, file_id, 0, 3).await.unwrap();
         assert_eq!(data.as_ref(), b"new", "retry must not truncate again");
+    }
+
+    #[tokio::test]
+    async fn combined_truncate_and_metadata_commit_and_replay_together() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"combined.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        let auth = (&test_auth()).into();
+        fs.write(&auth, file_id, 0, &Bytes::from(vec![b'A'; 1000]))
+            .await
+            .unwrap();
+
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; 16],
+            groups_count: 0,
+            groups_complete: true,
+        };
+        let atime = Timestamp {
+            seconds: 1_234_567_890,
+            nanoseconds: 123_456_789,
+        };
+        let mtime = Timestamp {
+            seconds: 1_345_678_901,
+            nanoseconds: 234_567_890,
+        };
+        let combined = SetAttributes {
+            mode: SetMode::Set(0o6754),
+            uid: SetUid::Set(2001),
+            gid: SetGid::Set(2002),
+            size: SetSize::Set(500),
+            atime: SetTime::SetToClientTime(atime),
+            mtime: SetTime::SetToClientTime(mtime),
+        };
+        let op_id = [0x71; 16];
+
+        let original = fs
+            .setattr_idempotent(&root, file_id, &combined, op_id)
+            .await
+            .unwrap();
+        assert_eq!(original.size, 500);
+        assert_eq!(original.mode, 0o6754);
+        assert_eq!(original.uid, 2001);
+        assert_eq!(original.gid, 2002);
+        assert_eq!(original.atime, atime);
+        assert_eq!(original.mtime, mtime);
+
+        let persisted_inode = fs.inode_store.get(file_id).await.unwrap();
+        let persisted: FileAttributes = InodeWithId {
+            inode: &persisted_inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(persisted.size, original.size);
+        assert_eq!(persisted.mode, original.mode);
+        assert_eq!(persisted.uid, original.uid);
+        assert_eq!(persisted.gid, original.gid);
+        assert_eq!(persisted.atime, original.atime);
+        assert_eq!(persisted.mtime, original.mtime);
+        let (data, eof) = fs
+            .read_file(&AuthContext::from(&root), file_id, 0, 1000)
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 500);
+        assert!(eof);
+
+        // Move every field away from the original result. Replaying the
+        // combined operation must return its retained post-op stat without
+        // truncating or restoring metadata over these later changes.
+        let later_atime = Timestamp {
+            seconds: 2_000_000_000,
+            nanoseconds: 1,
+        };
+        let later_mtime = Timestamp {
+            seconds: 2_000_000_001,
+            nanoseconds: 2,
+        };
+        let later = SetAttributes {
+            mode: SetMode::Set(0o600),
+            uid: SetUid::Set(3001),
+            gid: SetGid::Set(3002),
+            size: SetSize::Set(750),
+            atime: SetTime::SetToClientTime(later_atime),
+            mtime: SetTime::SetToClientTime(later_mtime),
+        };
+        fs.setattr(&root, file_id, &later).await.unwrap();
+
+        let replayed = fs
+            .setattr_idempotent(&root, file_id, &combined, op_id)
+            .await
+            .unwrap();
+        assert_eq!(replayed.size, original.size);
+        assert_eq!(replayed.mode, original.mode);
+        assert_eq!(replayed.uid, original.uid);
+        assert_eq!(replayed.gid, original.gid);
+        assert_eq!(replayed.atime, original.atime);
+        assert_eq!(replayed.mtime, original.mtime);
+
+        let current_inode = fs.inode_store.get(file_id).await.unwrap();
+        let current: FileAttributes = InodeWithId {
+            inode: &current_inode,
+            id: file_id,
+        }
+        .into();
+        assert_eq!(current.size, 750);
+        assert_eq!(current.mode, 0o600);
+        assert_eq!(current.uid, 3001);
+        assert_eq!(current.gid, 3002);
+        assert_eq!(current.atime, later_atime);
+        assert_eq!(current.mtime, later_mtime);
     }
 }

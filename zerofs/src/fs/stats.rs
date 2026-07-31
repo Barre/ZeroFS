@@ -132,8 +132,10 @@ mod tests {
         Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         }
     }
 
@@ -141,7 +143,9 @@ mod tests {
         AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         }
     }
 

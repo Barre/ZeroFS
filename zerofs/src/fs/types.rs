@@ -364,11 +364,27 @@ pub struct ReadDirResult {
 }
 
 /// Protocol-agnostic authentication context
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AuthContext {
     pub uid: u32,
     pub gid: u32,
+    pub gid_known: bool,
     pub gids: Vec<u32>,
+    /// False only when group DAC was already checked before this context was
+    /// created and the complete supplementary-group list was unavailable.
+    pub groups_complete: bool,
+}
+
+impl Default for AuthContext {
+    fn default() -> Self {
+        Self {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            gids: Vec::new(),
+            groups_complete: true,
+        }
+    }
 }
 
 impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
@@ -376,7 +392,9 @@ impl From<&zerofs_nfsserve::vfs::AuthContext> for AuthContext {
         Self {
             uid: auth.uid,
             gid: auth.gid,
+            gid_known: true,
             gids: auth.gids.clone(),
+            groups_complete: true,
         }
     }
 }
@@ -386,7 +404,9 @@ impl From<&super::permissions::Credentials> for AuthContext {
         Self {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: creds.gid_known,
             gids: creds.groups[..creds.groups_count].to_vec(),
+            groups_complete: creds.groups_complete,
         }
     }
 }

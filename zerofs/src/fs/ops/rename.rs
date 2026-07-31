@@ -224,13 +224,6 @@ impl ZeroFS {
 
         check_sticky_bit_delete(&from_dir, &source_inode, &creds)?;
 
-        // Capture old path before rename for tracing (name will change after)
-        let trace_old_path = if self.tracer.has_subscribers() {
-            Some(self.inode_store.resolve_path_lossy(source_inode_id).await)
-        } else {
-            None
-        };
-
         // POSIX: Moving directories in sticky directories requires ownership of the moved directory
         if from_dirid != to_dirid
             && matches!(source_inode, Inode::Directory(_))
@@ -246,27 +239,53 @@ impl ZeroFS {
             }
         }
 
-        let same_inode = target_inode_id == Some(source_inode_id);
+        // POSIX specifies that renaming one hard link over another link to the
+        // same inode succeeds without changing either directory entry. Keep
+        // the normal directory permission and sticky-bit checks above (and
+        // check the target directory's sticky policy for a cross-directory
+        // rename), then publish only the replay result.
+        if target_inode_id == Some(source_inode_id) {
+            if let Some(ref target_dir) = to_dir {
+                check_sticky_bit_delete(target_dir, &source_inode, &creds)?;
+            }
+            if crate::dedup::has_op_id(&op_id) {
+                let mut txn = self.db.new_transaction()?;
+                txn.set_dedup_result(op_id, DedupResult::Rename);
+                self.write_coordinator.commit(txn).await?;
+            }
+            return Ok(());
+        }
+
+        // Capture old path before rename for tracing (name will change after)
+        let trace_old_path = if self.tracer.has_subscribers() {
+            Some(self.inode_store.resolve_path_lossy(source_inode_id).await)
+        } else {
+            None
+        };
 
         let target = if let Some(target_id) = target_inode_id {
-            if same_inode {
-                None
-            } else {
-                let inode = self.inode_store.get(target_id).await?;
-                if let Inode::Directory(dir) = &inode
-                    && dir.entry_count > 0
-                {
-                    return Err(FsError::NotEmpty);
-                }
-
-                let target_dir = if let Some(ref to_dir) = to_dir {
-                    to_dir
-                } else {
-                    &from_dir
-                };
-                check_sticky_bit_delete(target_dir, &inode, &creds)?;
-                Some((target_id, inode))
+            let inode = self.inode_store.get(target_id).await?;
+            match (
+                matches!(source_inode, Inode::Directory(_)),
+                matches!(inode, Inode::Directory(_)),
+            ) {
+                (true, false) => return Err(FsError::NotDirectory),
+                (false, true) => return Err(FsError::IsDirectory),
+                _ => {}
             }
+            if let Inode::Directory(dir) = &inode
+                && dir.entry_count > 0
+            {
+                return Err(FsError::NotEmpty);
+            }
+
+            let target_dir = if let Some(ref to_dir) = to_dir {
+                to_dir
+            } else {
+                &from_dir
+            };
+            check_sticky_bit_delete(target_dir, &inode, &creds)?;
+            Some((target_id, inode))
         } else {
             None
         };
@@ -286,7 +305,8 @@ impl ZeroFS {
             let (original_nlink, original_file_size, should_always_remove_stats) =
                 match &existing_inode {
                     Inode::File(f) => (f.nlink, Some(f.size), false),
-                    Inode::Directory(_) | Inode::Symlink(_) => (1, None, true),
+                    Inode::Directory(_) => (1, None, true),
+                    Inode::Symlink(s) => (s.nlink, None, false),
                     Inode::Fifo(s)
                     | Inode::Socket(s)
                     | Inode::CharDevice(s)
@@ -394,7 +414,17 @@ impl ZeroFS {
                     }
                 }
                 Inode::Symlink(mut symlink) => {
-                    if target_should_defer {
+                    if symlink.nlink > 1 {
+                        symlink.nlink -= 1;
+                        let (now_sec, now_nsec) = get_current_time();
+                        symlink.ctime = now_sec;
+                        symlink.ctime_nsec = now_nsec;
+
+                        // As in remove(), the surviving link remains a
+                        // reference entry and resolves through the inode store.
+                        self.inode_store
+                            .save(&mut txn, target_id, &Inode::Symlink(symlink))?;
+                    } else if target_should_defer {
                         // POSIX open-unlink on a rename-clobbered symlink.
                         symlink.nlink = 0;
                         let (now_sec, now_nsec) = get_current_time();
@@ -427,8 +457,8 @@ impl ZeroFS {
             #[cfg(feature = "failpoints")]
             fail_point!(fp::RENAME_AFTER_TARGET_DELETE);
 
-            // For directories and symlinks: always remove from stats
-            // For files and special files: only remove if this is the last link.
+            // Directories are never hardlinked. All other inode kinds are
+            // removed from stats only when their last namespace link goes.
             // When deferred, the target's storage is still live; its stats are
             // subtracted at reclaim (last clunk / startup drain).
             if !target_deferred && (should_always_remove_stats || original_nlink <= 1) {
@@ -443,9 +473,6 @@ impl ZeroFS {
                 deferred_target_id = Some(target_id);
             }
 
-            self.directory_store
-                .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
-        } else if same_inode {
             self.directory_store
                 .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         }
@@ -466,11 +493,6 @@ impl ZeroFS {
                 d.name = Some(to_name.to_vec());
             }
             Inode::File(f) => {
-                if same_inode {
-                    f.nlink = f.nlink.saturating_sub(1);
-                    f.ctime = now_sec;
-                    f.ctime_nsec = now_nsec;
-                }
                 if f.nlink == 1 {
                     f.parent = Some(to_dirid);
                     f.name = Some(to_name.to_vec());
@@ -478,18 +500,15 @@ impl ZeroFS {
             }
             Inode::Symlink(s) => {
                 if s.nlink == 1 {
-                    if dir_changed {
-                        s.parent = Some(to_dirid);
-                    }
+                    // A symlink that fell from two links to one can still be
+                    // parentless with a reference entry. Renaming that final
+                    // alias embeds it again, even within the same directory,
+                    // so restore both halves of its namespace identity.
+                    s.parent = Some(to_dirid);
                     s.name = Some(to_name.to_vec());
                 }
             }
             Inode::Fifo(s) | Inode::Socket(s) | Inode::CharDevice(s) | Inode::BlockDevice(s) => {
-                if same_inode {
-                    s.nlink = s.nlink.saturating_sub(1);
-                    s.ctime = now_sec;
-                    s.ctime_nsec = now_nsec;
-                }
                 if s.nlink == 1 {
                     s.parent = Some(to_dirid);
                     s.name = Some(to_name.to_vec());
@@ -537,6 +556,11 @@ impl ZeroFS {
             } else if target_inode_id.is_some() {
                 // Same directory with target: only target was removed (source renamed in place)
                 d.entry_count = d.entry_count.saturating_sub(1);
+                if target_was_directory {
+                    // Both source and target were subdirectories before the
+                    // replacement; only the source remains afterwards.
+                    d.nlink = d.nlink.saturating_sub(1);
+                }
             }
             // If same dir without target: entry_count unchanged (rename only)
             d.mtime = now_sec;
@@ -645,7 +669,7 @@ mod tests {
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
 
-    use crate::fs::types::SetAttributes;
+    use crate::fs::types::{SetAttributes, SetMode};
     use bytes::Bytes;
 
     #[tokio::test]
@@ -772,6 +796,116 @@ mod tests {
         // Check that the original file2 inode is gone
         let result = fs.inode_store.get(file2_id).await;
         assert!(matches!(result, Err(FsError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_directory_non_directory_replacements_without_mutation() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let (source_dir_id, _) = fs
+            .mkdir(&test_creds(), 0, b"source-dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (target_file_id, _) = fs
+            .create(&test_creds(), 0, b"target-file", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (source_file_id, _) = fs
+            .create(&test_creds(), 0, b"source-file", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (target_dir_id, _) = fs
+            .mkdir(&test_creds(), 0, b"target-dir", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let source_dir_entry = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"source-dir")
+            .await
+            .unwrap();
+        let target_file_entry = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"target-file")
+            .await
+            .unwrap();
+        let source_file_entry = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"source-file")
+            .await
+            .unwrap();
+        let target_dir_entry = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"target-dir")
+            .await
+            .unwrap();
+        let root_before = fs.inode_store.get(0).await.unwrap();
+        let stats_before = fs.global_stats.get_totals();
+
+        assert!(matches!(
+            fs.rename(&auth, 0, b"source-dir", 0, b"target-file").await,
+            Err(FsError::NotDirectory)
+        ));
+        assert!(matches!(
+            fs.rename(&auth, 0, b"source-file", 0, b"target-dir").await,
+            Err(FsError::IsDirectory)
+        ));
+
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"source-dir")
+                .await
+                .unwrap(),
+            source_dir_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"target-file")
+                .await
+                .unwrap(),
+            target_file_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"source-file")
+                .await
+                .unwrap(),
+            source_file_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"target-dir")
+                .await
+                .unwrap(),
+            target_dir_entry
+        );
+        assert!(matches!(
+            fs.inode_store.get(source_dir_id).await,
+            Ok(Inode::Directory(_))
+        ));
+        assert!(matches!(
+            fs.inode_store.get(target_file_id).await,
+            Ok(Inode::File(_))
+        ));
+        assert!(matches!(
+            fs.inode_store.get(source_file_id).await,
+            Ok(Inode::File(_))
+        ));
+        assert!(matches!(
+            fs.inode_store.get(target_dir_id).await,
+            Ok(Inode::Directory(_))
+        ));
+        assert_eq!(
+            match fs.inode_store.get(0).await.unwrap() {
+                Inode::Directory(dir) => dir.entry_count,
+                _ => panic!("expected root directory"),
+            },
+            match root_before {
+                Inode::Directory(dir) => dir.entry_count,
+                _ => panic!("expected root directory"),
+            }
+        );
+        assert_eq!(fs.global_stats.get_totals(), stats_before);
     }
 
     #[tokio::test]
@@ -905,6 +1039,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_directory_over_empty_directory_updates_parent_nlink() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (source_id, _) = fs
+            .mkdir(&test_creds(), 0, b"source", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (replaced_id, _) = fs
+            .mkdir(&test_creds(), 0, b"target", &SetAttributes::default())
+            .await
+            .unwrap();
+        let before = directory_mutation_state(&fs.inode_store.get(0).await.unwrap());
+        assert_eq!(before.0, 2);
+
+        fs.rename(&(&test_auth()).into(), 0, b"source", 0, b"target")
+            .await
+            .unwrap();
+
+        let after = directory_mutation_state(&fs.inode_store.get(0).await.unwrap());
+        assert_eq!(after.0, 1);
+        assert_eq!(after.1, before.1 - 1);
+        assert!(fs.lookup(&test_creds(), 0, b"source").await.is_err());
+        assert_eq!(
+            fs.lookup(&test_creds(), 0, b"target").await.unwrap(),
+            source_id
+        );
+        assert!(matches!(
+            fs.inode_store.get(replaced_id).await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_last_symlink_alias_restores_embedded_metadata_updates() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let auth = (&test_auth()).into();
+        let (symlink_id, _) = fs
+            .symlink(
+                &test_creds(),
+                0,
+                b"first",
+                b"target",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.link(&auth, symlink_id, 0, b"survivor").await.unwrap();
+        fs.remove(&auth, 0, b"first").await.unwrap();
+
+        fs.rename(&auth, 0, b"survivor", 0, b"renamed")
+            .await
+            .unwrap();
+
+        match fs.inode_store.get(symlink_id).await.unwrap() {
+            Inode::Symlink(symlink) => {
+                assert_eq!(symlink.nlink, 1);
+                assert_eq!(symlink.parent, Some(0));
+                assert_eq!(symlink.name.as_deref(), Some(b"renamed".as_slice()));
+            }
+            _ => panic!("expected symlink"),
+        }
+
+        fs.setattr(
+            &test_creds(),
+            symlink_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o701),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let entries = fs.readdir(&auth, 0, 0, 16).await.unwrap();
+        let renamed = entries
+            .entries
+            .iter()
+            .find(|entry| entry.name == b"renamed")
+            .expect("renamed symlink must be present");
+        assert_eq!(renamed.fileid, symlink_id);
+        assert_eq!(renamed.attr.mode & 0o777, 0o701);
+    }
+
+    #[tokio::test]
     async fn test_process_rename_prevent_directory_cycles() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
 
@@ -1013,96 +1231,258 @@ mod tests {
         assert!(fs.is_ancestor_of(b_id, b_id).await.unwrap());
     }
 
+    fn hardlinked_file_state(inode: &Inode) -> (u32, Option<InodeId>, Option<Vec<u8>>, u64, u32) {
+        match inode {
+            Inode::File(file) => (
+                file.nlink,
+                file.parent,
+                file.name.clone(),
+                file.ctime,
+                file.ctime_nsec,
+            ),
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    fn directory_mutation_state(inode: &Inode) -> (u64, u32, u64, u32, u64, u32) {
+        match inode {
+            Inode::Directory(dir) => (
+                dir.entry_count,
+                dir.nlink,
+                dir.mtime,
+                dir.mtime_nsec,
+                dir.ctime,
+                dir.ctime_nsec,
+            ),
+            _ => panic!("Expected directory inode"),
+        }
+    }
+
     #[tokio::test]
-    async fn test_rename_hardlink_over_same_inode() {
+    async fn rename_same_directory_hardlinks_is_idempotent_noop() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [0x51; 16];
 
         let (file_id, _) = fs
             .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
-
-        fs.write(
-            &(&test_auth()).into(),
-            file_id,
-            0,
-            &Bytes::from(b"test content".to_vec()),
-        )
-        .await
-        .unwrap();
-
-        let inode = fs.inode_store.get(file_id).await.unwrap();
-        match &inode {
-            Inode::File(f) => assert_eq!(f.nlink, 1, "Initial nlink should be 1"),
-            _ => panic!("Expected file inode"),
-        }
-
         fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
             .await
             .unwrap();
 
-        let inode = fs.inode_store.get(file_id).await.unwrap();
-        match &inode {
-            Inode::File(f) => assert_eq!(f.nlink, 2, "After link, nlink should be 2"),
-            _ => panic!("Expected file inode"),
-        }
+        let original_entry = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"original.txt")
+            .await
+            .unwrap();
+        let hardlink_entry = fs
+            .directory_store
+            .get_entry_with_cookie(0, b"hardlink.txt")
+            .await
+            .unwrap();
+        assert_eq!(original_entry.0, file_id);
+        assert_eq!(hardlink_entry.0, file_id);
 
-        let root_inode = fs.inode_store.get(0).await.unwrap();
-        match &root_inode {
-            Inode::Directory(d) => assert_eq!(d.entry_count, 2, "Directory should have 2 entries"),
-            _ => panic!("Expected directory inode"),
-        }
+        let file_state = hardlinked_file_state(&fs.inode_store.get(file_id).await.unwrap());
+        let root_state = directory_mutation_state(&fs.inode_store.get(0).await.unwrap());
+        assert_eq!(file_state.0, 2);
+        assert_eq!(root_state.0, 2);
 
-        fs.rename(
+        fs.rename_idempotent(
             &(&test_auth()).into(),
             0,
             b"hardlink.txt",
             0,
             b"original.txt",
+            op_id,
         )
         .await
         .unwrap();
 
-        let inode = fs.inode_store.get(file_id).await.unwrap();
-        match &inode {
-            Inode::File(f) => {
-                assert_eq!(f.nlink, 1, "After rename, nlink should be 1");
-                // Since nlink is 1, parent and name should be set
-                assert_eq!(f.parent, Some(0), "Parent should be set to root");
-                assert_eq!(f.name, Some(b"original.txt".to_vec()), "Name should be set");
-            }
-            _ => panic!("Expected file inode"),
-        }
+        assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Rename)));
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"original.txt")
+                .await
+                .unwrap(),
+            original_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"hardlink.txt")
+                .await
+                .unwrap(),
+            hardlink_entry
+        );
+        assert_eq!(
+            hardlinked_file_state(&fs.inode_store.get(file_id).await.unwrap()),
+            file_state
+        );
+        assert_eq!(
+            directory_mutation_state(&fs.inode_store.get(0).await.unwrap()),
+            root_state
+        );
 
-        let root_inode = fs.inode_store.get(0).await.unwrap();
-        match &root_inode {
-            Inode::Directory(d) => assert_eq!(d.entry_count, 1, "Directory should have 1 entry"),
-            _ => panic!("Expected directory inode"),
-        }
+        // A replay must return the recorded success without touching either
+        // link or any inode/directory metadata.
+        fs.rename_idempotent(
+            &(&test_auth()).into(),
+            0,
+            b"hardlink.txt",
+            0,
+            b"original.txt",
+            op_id,
+        )
+        .await
+        .unwrap();
 
-        let result = fs.directory_store.get(0, b"hardlink.txt").await;
-        assert!(matches!(result, Err(FsError::NotFound)));
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"original.txt")
+                .await
+                .unwrap(),
+            original_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(0, b"hardlink.txt")
+                .await
+                .unwrap(),
+            hardlink_entry
+        );
+        assert_eq!(
+            hardlinked_file_state(&fs.inode_store.get(file_id).await.unwrap()),
+            file_state
+        );
+        assert_eq!(
+            directory_mutation_state(&fs.inode_store.get(0).await.unwrap()),
+            root_state
+        );
+    }
 
-        let stored_id = fs.directory_store.get(0, b"original.txt").await.unwrap();
-        assert_eq!(stored_id, file_id, "original.txt should point to the file");
+    #[tokio::test]
+    async fn rename_cross_directory_hardlinks_is_idempotent_noop() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let op_id = [0x52; 16];
 
-        let (read_data, _) = fs
-            .read_file(&(&test_auth()).into(), file_id, 0, 100)
+        let (from_dirid, _) = fs
+            .mkdir(&test_creds(), 0, b"from", &SetAttributes::default())
             .await
             .unwrap();
-        assert_eq!(read_data.as_ref(), b"test content");
-
-        fs.remove(&(&test_auth()).into(), 0, b"original.txt")
+        let (to_dirid, _) = fs
+            .mkdir(&test_creds(), 0, b"to", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                from_dirid,
+                b"source.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        fs.link(&(&test_auth()).into(), file_id, to_dirid, b"target.txt")
             .await
             .unwrap();
 
-        let root_inode = fs.inode_store.get(0).await.unwrap();
-        match &root_inode {
-            Inode::Directory(d) => assert_eq!(d.entry_count, 0, "Directory should be empty"),
-            _ => panic!("Expected directory inode"),
-        }
+        let source_entry = fs
+            .directory_store
+            .get_entry_with_cookie(from_dirid, b"source.txt")
+            .await
+            .unwrap();
+        let target_entry = fs
+            .directory_store
+            .get_entry_with_cookie(to_dirid, b"target.txt")
+            .await
+            .unwrap();
+        assert_eq!(source_entry.0, file_id);
+        assert_eq!(target_entry.0, file_id);
 
-        let result = fs.inode_store.get(file_id).await;
-        assert!(matches!(result, Err(FsError::NotFound)));
+        let file_state = hardlinked_file_state(&fs.inode_store.get(file_id).await.unwrap());
+        let from_dir_state =
+            directory_mutation_state(&fs.inode_store.get(from_dirid).await.unwrap());
+        let to_dir_state = directory_mutation_state(&fs.inode_store.get(to_dirid).await.unwrap());
+        assert_eq!(file_state.0, 2);
+        assert_eq!(from_dir_state.0, 1);
+        assert_eq!(to_dir_state.0, 1);
+
+        fs.rename_idempotent(
+            &(&test_auth()).into(),
+            from_dirid,
+            b"source.txt",
+            to_dirid,
+            b"target.txt",
+            op_id,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(fs.dedup.get(&op_id), Some(DedupResult::Rename)));
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(from_dirid, b"source.txt")
+                .await
+                .unwrap(),
+            source_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(to_dirid, b"target.txt")
+                .await
+                .unwrap(),
+            target_entry
+        );
+        assert_eq!(
+            hardlinked_file_state(&fs.inode_store.get(file_id).await.unwrap()),
+            file_state
+        );
+        assert_eq!(
+            directory_mutation_state(&fs.inode_store.get(from_dirid).await.unwrap()),
+            from_dir_state
+        );
+        assert_eq!(
+            directory_mutation_state(&fs.inode_store.get(to_dirid).await.unwrap()),
+            to_dir_state
+        );
+
+        fs.rename_idempotent(
+            &(&test_auth()).into(),
+            from_dirid,
+            b"source.txt",
+            to_dirid,
+            b"target.txt",
+            op_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(from_dirid, b"source.txt")
+                .await
+                .unwrap(),
+            source_entry
+        );
+        assert_eq!(
+            fs.directory_store
+                .get_entry_with_cookie(to_dirid, b"target.txt")
+                .await
+                .unwrap(),
+            target_entry
+        );
+        assert_eq!(
+            hardlinked_file_state(&fs.inode_store.get(file_id).await.unwrap()),
+            file_state
+        );
+        assert_eq!(
+            directory_mutation_state(&fs.inode_store.get(from_dirid).await.unwrap()),
+            from_dir_state
+        );
+        assert_eq!(
+            directory_mutation_state(&fs.inode_store.get(to_dirid).await.unwrap()),
+            to_dir_state
+        );
     }
 }

@@ -83,10 +83,37 @@ impl ZeroFS {
         start_after: InodeId,
         max_entries: usize,
     ) -> Result<ReadDirResult, FsError> {
+        self.readdir_inner(Some(auth), dirid, start_after, max_entries)
+            .await
+    }
+
+    /// Page through a directory fid whose read access was already authorized at
+    /// open, so that a paged listing cannot fail halfway through on a chmod the
+    /// same open descriptor would survive.
+    #[allow(dead_code)] // Used by the binary-only 9P handler.
+    pub(crate) async fn readdir_opened(
+        &self,
+        dirid: InodeId,
+        start_after: InodeId,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, FsError> {
+        self.readdir_inner(None, dirid, start_after, max_entries)
+            .await
+    }
+
+    async fn readdir_inner(
+        &self,
+        auth: Option<&AuthContext>,
+        dirid: InodeId,
+        start_after: InodeId,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, FsError> {
         let dir_inode = self.inode_store.get(dirid).await?;
 
-        let creds = Credentials::from_auth_context(auth);
-        check_access(&dir_inode, &creds, AccessMode::Read)?;
+        if let Some(auth) = auth {
+            let creds = Credentials::from_auth_context(auth);
+            check_access(&dir_inode, &creds, AccessMode::Read)?;
+        }
 
         use crate::fs::store::directory::{COOKIE_DOT, COOKIE_DOTDOT};
 
@@ -496,7 +523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dir_scan_entry_restored_on_rename_over_same_inode() {
+    async fn test_dir_scan_entries_unchanged_on_rename_over_same_inode() {
         use futures::StreamExt;
 
         let fs = ZeroFS::new_in_memory().await.unwrap();
@@ -531,21 +558,26 @@ mod tests {
         .unwrap();
 
         let mut entries = fs.directory_store.list(0).await.unwrap();
-        let entry = entries.next().await.unwrap().unwrap();
-
-        assert_eq!(entry.name, b"original.txt");
-        assert!(
-            entry.inode.is_some(),
-            "After rename-over-same-inode (nlink=1), should have embedded inode"
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.unwrap();
+            names.push(entry.name);
+            assert!(
+                entry.inode.is_none(),
+                "Both entries should remain references with nlink=2"
+            );
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec![b"hardlink.txt".to_vec(), b"original.txt".to_vec()]
         );
 
-        // Verify nlink is 1
-        let embedded = entry.inode.unwrap();
-        match embedded {
-            Inode::File(f) => {
-                assert_eq!(f.nlink, 1);
-                assert!(f.parent.is_some(), "parent should be restored");
-                assert!(f.name.is_some(), "name should be restored");
+        match fs.inode_store.get(file_id).await.unwrap() {
+            Inode::File(file) => {
+                assert_eq!(file.nlink, 2);
+                assert!(file.parent.is_none());
+                assert!(file.name.is_none());
             }
             _ => panic!("Expected file inode"),
         }

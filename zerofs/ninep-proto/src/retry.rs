@@ -1,6 +1,6 @@
 //! Mutation retry timings shared by 9P clients and servers.
 
-use std::time::Duration;
+use core::time::Duration;
 
 /// Maximum elapsed time from the first dispatched mutation to a resend using
 /// the same operation ID.

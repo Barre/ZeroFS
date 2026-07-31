@@ -9,6 +9,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::Duration;
 use zerofs::fs::EXTENT_SIZE;
+use zerofs::fs::inode::{MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR};
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::types::{AuthContext, FileType, SetAttributes, SetSize};
 
@@ -486,11 +487,17 @@ impl NamespaceActor {
             1 => (FileType::Socket, None),
             2 => (
                 FileType::CharDevice,
-                Some((self.rng.r#gen::<u32>(), self.rng.r#gen::<u32>())),
+                Some((
+                    self.rng.r#gen::<u32>() & MAX_DEVICE_MAJOR,
+                    self.rng.r#gen::<u32>() & MAX_DEVICE_MINOR,
+                )),
             ),
             _ => (
                 FileType::BlockDevice,
-                Some((self.rng.r#gen::<u32>(), self.rng.r#gen::<u32>())),
+                Some((
+                    self.rng.r#gen::<u32>() & MAX_DEVICE_MAJOR,
+                    self.rng.r#gen::<u32>() & MAX_DEVICE_MINOR,
+                )),
             ),
         };
         let directory_inode = self.model.inode_of(&directory);

@@ -17,8 +17,10 @@ mod tests {
         Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         }
     }
 
@@ -113,7 +115,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (a_id, _) = fs
@@ -146,7 +150,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file1_id, _) = fs
@@ -197,7 +203,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (parent_id, _) = fs
@@ -229,7 +237,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (dir_id, _) = fs
@@ -278,7 +288,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -333,7 +345,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (tmp_id, _) = fs
@@ -407,7 +421,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let file_id = fs
@@ -428,7 +444,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (dir_id, _) = fs
@@ -476,7 +494,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (dir1_id, _) = fs
@@ -526,7 +546,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -589,7 +611,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -675,7 +699,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -706,7 +732,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -741,7 +769,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (src_id, _) = fs
@@ -816,7 +846,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -859,7 +891,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         let (a_id, _) = fs
@@ -953,7 +987,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
 
         // Create file 'a'
@@ -1057,7 +1093,9 @@ mod tests {
         let auth = AuthContext {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             gids: vec![1000],
+            groups_complete: true,
         };
         fs.rename(&auth, dir2_id, b"dir3", 0, b"moved_dir3")
             .await
@@ -1094,7 +1132,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1129,7 +1169,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1142,7 +1184,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"hardlink.txt",
@@ -1176,7 +1220,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1189,7 +1235,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"hardlink.txt",
@@ -1206,7 +1254,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"original.txt",
@@ -1242,7 +1292,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1260,7 +1312,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             0,
             b"original.txt",
@@ -1288,8 +1342,10 @@ mod tests {
         let owner_creds = Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         };
 
         let (dir_id, _) = fs
@@ -1314,7 +1370,9 @@ mod tests {
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
+                gid_known: true,
                 gids: vec![1000],
+                groups_complete: true,
             },
             file_id,
             0,
@@ -1338,7 +1396,9 @@ mod tests {
                 &AuthContext {
                     uid: 2000,
                     gid: 2000,
+                    gid_known: true,
                     gids: vec![2000],
+                    groups_complete: true,
                 },
                 file_id,
                 0,
@@ -1391,7 +1451,9 @@ mod tests {
         let auth = AuthContext {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: true,
             gids: vec![],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -1528,7 +1590,9 @@ mod tests {
         let auth = AuthContext {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: true,
             gids: vec![],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs
@@ -1563,7 +1627,9 @@ mod tests {
         let auth = AuthContext {
             uid: creds.uid,
             gid: creds.gid,
+            gid_known: true,
             gids: vec![],
+            groups_complete: true,
         };
 
         let (file_id, _) = fs

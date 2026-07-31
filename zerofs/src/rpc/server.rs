@@ -110,7 +110,9 @@ fn root_auth() -> AuthContext {
     AuthContext {
         uid: 0,
         gid: 0,
+        gid_known: true,
         gids: Vec::new(),
+        groups_complete: true,
     }
 }
 

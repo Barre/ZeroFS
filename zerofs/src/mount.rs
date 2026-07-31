@@ -90,16 +90,33 @@ pub enum MountAccess {
     All,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct UserIdentity {
+    uid: u32,
+    gid: u32,
+}
+
+impl UserIdentity {
+    fn from_request(req: &Request) -> Self {
+        Self {
+            uid: req.uid(),
+            gid: req.gid(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct InodeEntry {
     lookup: u64,
-    /// One fid per uid that holds this inode. Every request acts as its caller
-    /// (v9fs `access=user` semantics), so each user gets its own server-side fid.
-    fids: HashMap<u32, u32>,
+    /// One fid per filesystem identity that holds this inode. Every request acts
+    /// as its caller (v9fs `access=user` semantics), so a uid using a different
+    /// primary gid gets a distinct server-side fid.
+    fids: HashMap<UserIdentity, u32>,
     /// Open fids for this inode, mapped to the uid that opened them. Verified
     /// fsync checks every handle because `fsync(fd)` persists writes issued
     /// through any handle to the file. The owner lets setattr safely reuse an
-    /// existing handle without changing `access=user` credential semantics.
+    /// existing handle across primary-gid changes without changing descriptor
+    /// capability semantics.
     handles: HashMap<u32, u32>,
     /// The server inode id behind this FUSE ino when it differs from the
     /// default `ino - 1` bijection: only the mount root of an `--aname` mount,
@@ -261,19 +278,19 @@ fn stat_to_attr(stat: &Stat) -> FileAttr {
     }
 }
 
-/// Return a fid bound to `ino` for user `uid`, binding a fresh one by inode id
-/// with `Trebind` if this user has no fid for it yet. Mirrors v9fs `access=user`:
-/// every request acts as its caller, so the server enforces that user's
+/// Return a fid bound to `ino` for this filesystem identity, binding a fresh
+/// one by inode id with `Trebind` if necessary. Mirrors v9fs `access=user`:
+/// every request acts as its caller, so the server enforces that identity's
 /// permissions.
 async fn user_fid(
     client: &Arc<NinePClient>,
     inodes: &Arc<DashMap<u64, InodeEntry>>,
-    uid: u32,
+    identity: UserIdentity,
     ino: u64,
 ) -> Result<u32, ClientError> {
     let server_inode = match inodes.get(&ino) {
         Some(e) => {
-            if let Some(&fid) = e.fids.get(&uid) {
+            if let Some(&fid) = e.fids.get(&identity) {
                 return Ok(fid);
             }
             // The inverse of `ino_of` (ino - 1), unless the entry pins another
@@ -284,22 +301,25 @@ async fn user_fid(
         // is stale.
         None => return Err(ClientError::Errno(libc::ESTALE as u32)),
     };
-    // Bind a fresh fid to the inode as `uid`.
+    // FUSE exposes only the request's primary gid, not supplementary groups.
     let newfid = client.alloc_fid();
-    if let Err(e) = client.rebind(newfid, server_inode, uid).await {
+    if let Err(e) = client
+        .rebind_with_primary_group(newfid, server_inode, identity.uid, identity.gid)
+        .await
+    {
         client.free_fid(newfid);
         return Err(e);
     }
     match inodes.get_mut(&ino) {
         Some(mut e) => {
-            if let Some(existing) = e.fids.get(&uid).copied() {
-                // Another task bound this user's fid while we were rebinding.
+            if let Some(existing) = e.fids.get(&identity).copied() {
+                // Another task bound this identity's fid while we were rebinding.
                 drop(e);
                 let _ = client.clunk(newfid).await;
                 client.free_fid(newfid);
                 Ok(existing)
             } else {
-                e.fids.insert(uid, newfid);
+                e.fids.insert(identity, newfid);
                 Ok(newfid)
             }
         }
@@ -379,15 +399,16 @@ fn tracked_handle_fid(
 
 /// Return an open handle only when it belongs to the current request uid.
 /// File descriptors can be passed between users, while 9P fids retain the
-/// identity that opened them, so a mismatched handle must use `user_fid`.
+/// uid that opened them. A primary-gid change does not revoke an open
+/// descriptor, while a uid mismatch must use `user_fid`.
 fn user_handle_fid(
     inodes: &Arc<DashMap<u64, InodeEntry>>,
     ino: u64,
-    uid: u32,
+    identity: UserIdentity,
     fh: Option<FileHandle>,
 ) -> Option<u32> {
     tracked_handle_fid(inodes, ino, fh)
-        .filter(|&(_, owner_uid)| owner_uid == uid)
+        .filter(|&(_, owner_uid)| owner_uid == identity.uid)
         .map(|(fid, _)| fid)
 }
 
@@ -396,7 +417,7 @@ fn user_handle_fid(
 async fn resolve_child(
     client: &Arc<NinePClient>,
     inodes: &Arc<DashMap<u64, InodeEntry>>,
-    uid: u32,
+    identity: UserIdentity,
     parent_fid: u32,
     name: &[u8],
 ) -> Result<(FileAttr, Option<u32>), ClientError> {
@@ -408,7 +429,7 @@ async fn resolve_child(
             return Err(e);
         }
     };
-    Ok(register_entry(inodes, uid, Some(nf), &stat))
+    Ok(register_entry(inodes, identity, Some(nf), &stat))
 }
 
 /// Register a lookup and retain at most one walked fid per user and inode.
@@ -416,7 +437,7 @@ async fn resolve_child(
 /// returned to the caller so it can reply to FUSE before clunking it.
 fn register_entry(
     inodes: &Arc<DashMap<u64, InodeEntry>>,
-    uid: u32,
+    identity: UserIdentity,
     walked: Option<u32>,
     stat: &Stat,
 ) -> (FileAttr, Option<u32>) {
@@ -426,7 +447,7 @@ fn register_entry(
         let mut entry = inodes.entry(ino).or_default();
         entry.lookup += 1;
         match walked {
-            Some(newfid) => match entry.fids.entry(uid) {
+            Some(newfid) => match entry.fids.entry(identity) {
                 Entry::Occupied(_) => Some(newfid),
                 Entry::Vacant(v) => {
                     v.insert(newfid);
@@ -502,18 +523,18 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
         self.rt.spawn(async move {
-            let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
+            let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
                     return;
                 }
             };
-            match resolve_child(&client, &inodes, uid, parent_fid, &name).await {
+            match resolve_child(&client, &inodes, identity, parent_fid, &name).await {
                 Ok((attr, redundant_fid)) => {
                     reply.entry(&ttl, &attr, Generation(0));
                     if let Some(fid) = redundant_fid {
@@ -569,11 +590,11 @@ impl Filesystem for Fuse9P {
         let ino = ino.0;
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
-        let uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         self.rt.spawn(async move {
             let fid = match tracked_handle_fid(&inodes, ino, fh) {
                 Some((fid, _)) => fid,
-                None => match user_fid(&client, &inodes, uid, ino).await {
+                None => match user_fid(&client, &inodes, identity, ino).await {
                     Ok(f) => f,
                     Err(e) => {
                         reply.error(errno(&e));
@@ -614,12 +635,12 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let caller_uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         let ino = ino.0;
         self.rt.spawn(async move {
-            let fid = match user_handle_fid(&inodes, ino, caller_uid, fh) {
+            let fid = match user_handle_fid(&inodes, ino, identity, fh) {
                 Some(fid) => fid,
-                None => match user_fid(&client, &inodes, caller_uid, ino).await {
+                None => match user_fid(&client, &inodes, identity, ino).await {
                     Ok(f) => f,
                     Err(e) => {
                         reply.error(errno(&e));
@@ -650,10 +671,10 @@ impl Filesystem for Fuse9P {
     fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
-        let uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         let ino = ino.0;
         self.rt.spawn(async move {
-            let fid = match user_fid(&client, &inodes, uid, ino).await {
+            let fid = match user_fid(&client, &inodes, identity, ino).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -683,13 +704,13 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let uid = req.uid();
-        let gid = req.gid();
+        let identity = UserIdentity::from_request(req);
+        let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
         let mode = (mode & 0o7777 & !umask) | libc::S_IFDIR;
         self.rt.spawn(async move {
-            let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
+            let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -698,7 +719,7 @@ impl Filesystem for Fuse9P {
             };
             match client.mkdir_attr(parent_fid, &name, mode, gid).await {
                 Ok(stat) => {
-                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    let (attr, redundant) = register_entry(&inodes, identity, None, &stat);
                     debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
@@ -724,8 +745,8 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let uid = req.uid();
-        let gid = req.gid();
+        let identity = UserIdentity::from_request(req);
+        let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
         let mode = (mode & 0o7777 & !umask) | (mode & libc::S_IFMT);
@@ -736,7 +757,7 @@ impl Filesystem for Fuse9P {
         let major = (rdev & 0x000f_ff00) >> 8;
         let minor = (rdev & 0xff) | ((rdev >> 12) & 0x000f_ff00);
         self.rt.spawn(async move {
-            let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
+            let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -748,7 +769,7 @@ impl Filesystem for Fuse9P {
                 .await
             {
                 Ok(stat) => {
-                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    let (attr, redundant) = register_entry(&inodes, identity, None, &stat);
                     debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
@@ -772,13 +793,13 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let uid = req.uid();
-        let gid = req.gid();
+        let identity = UserIdentity::from_request(req);
+        let gid = identity.gid;
         let name = link_name.as_bytes().to_vec();
         let target = target.as_os_str().as_bytes().to_vec();
         let parent = parent.0;
         self.rt.spawn(async move {
-            let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
+            let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -787,7 +808,7 @@ impl Filesystem for Fuse9P {
             };
             match client.symlink_attr(parent_fid, &name, &target, gid).await {
                 Ok(stat) => {
-                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    let (attr, redundant) = register_entry(&inodes, identity, None, &stat);
                     debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
@@ -797,11 +818,17 @@ impl Filesystem for Fuse9P {
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink_inner(req.uid(), parent, name, 0, reply);
+        self.unlink_inner(UserIdentity::from_request(req), parent, name, 0, reply);
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink_inner(req.uid(), parent, name, libc::AT_REMOVEDIR as u32, reply);
+        self.unlink_inner(
+            UserIdentity::from_request(req),
+            parent,
+            name,
+            libc::AT_REMOVEDIR as u32,
+            reply,
+        );
     }
 
     fn rename(
@@ -825,15 +852,15 @@ impl Filesystem for Fuse9P {
         }
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
-        let uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         let name = name.as_bytes().to_vec();
         let newname = newname.as_bytes().to_vec();
         let parent = parent.0;
         let newparent = newparent.0;
         self.rt.spawn(async move {
             let (Ok(old_fid), Ok(new_fid)) = (
-                user_fid(&client, &inodes, uid, parent).await,
-                user_fid(&client, &inodes, uid, newparent).await,
+                user_fid(&client, &inodes, identity, parent).await,
+                user_fid(&client, &inodes, identity, newparent).await,
             ) else {
                 reply.error(Errno::ESTALE);
                 return;
@@ -860,21 +887,21 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         let newname = newname.as_bytes().to_vec();
         let ino = ino.0;
         let newparent = newparent.0;
         self.rt.spawn(async move {
             let (Ok(file_fid), Ok(dir_fid)) = (
-                user_fid(&client, &inodes, uid, ino).await,
-                user_fid(&client, &inodes, uid, newparent).await,
+                user_fid(&client, &inodes, identity, ino).await,
+                user_fid(&client, &inodes, identity, newparent).await,
             ) else {
                 reply.error(Errno::ESTALE);
                 return;
             };
             match client.link_attr(dir_fid, file_fid, &newname).await {
                 Ok(stat) => {
-                    let (attr, redundant) = register_entry(&inodes, uid, None, &stat);
+                    let (attr, redundant) = register_entry(&inodes, identity, None, &stat);
                     debug_assert!(redundant.is_none());
                     reply.entry(&ttl, &attr, Generation(0));
                 }
@@ -895,7 +922,7 @@ impl Filesystem for Fuse9P {
             0
         };
         self.open_inner(
-            req.uid(),
+            UserIdentity::from_request(req),
             ino,
             flags,
             reply,
@@ -906,7 +933,15 @@ impl Filesystem for Fuse9P {
     }
 
     fn opendir(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        self.open_inner(req.uid(), ino, flags, reply, false, 0, false);
+        self.open_inner(
+            UserIdentity::from_request(req),
+            ino,
+            flags,
+            reply,
+            false,
+            0,
+            false,
+        );
     }
 
     fn read(
@@ -1184,8 +1219,8 @@ impl Filesystem for Fuse9P {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
-        let uid = req.uid();
-        let gid = req.gid();
+        let identity = UserIdentity::from_request(req);
+        let gid = identity.gid;
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
         let mode = (mode & 0o7777 & !umask) | libc::S_IFREG;
@@ -1201,7 +1236,7 @@ impl Filesystem for Fuse9P {
         // create is always a regular file, so direct I/O follows strict mode.
         let open_flags = handle_open_flags(self.writeback, self.strict);
         self.rt.spawn(async move {
-            let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
+            let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -1218,7 +1253,7 @@ impl Filesystem for Fuse9P {
                     let new_ino = ino_of(stat.qid.path);
                     let mut entry = inodes.entry(new_ino).or_default();
                     entry.lookup += 1;
-                    entry.handles.insert(nf, uid);
+                    entry.handles.insert(nf, identity.uid);
                     drop(entry);
                     let attr = stat_to_attr(&stat);
                     reply.created(
@@ -1240,14 +1275,14 @@ impl Filesystem for Fuse9P {
     fn statfs(&self, req: &Request, ino: INodeNo, reply: ReplyStatfs) {
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
-        let uid = req.uid();
+        let identity = UserIdentity::from_request(req);
         let ino = ino.0;
         self.rt.spawn(async move {
             // statfs is filesystem-wide, so any fid works; fall back to the
             // caller's root if the given inode isn't tracked.
-            let fid = match user_fid(&client, &inodes, uid, ino).await {
+            let fid = match user_fid(&client, &inodes, identity, ino).await {
                 Ok(f) => f,
-                Err(_) => match user_fid(&client, &inodes, uid, FUSE_ROOT).await {
+                Err(_) => match user_fid(&client, &inodes, identity, FUSE_ROOT).await {
                     Ok(f) => f,
                     Err(e) => {
                         reply.error(errno(&e));
@@ -1574,7 +1609,7 @@ impl Fuse9P {
     #[allow(clippy::too_many_arguments)]
     fn open_inner(
         &self,
-        uid: u32,
+        identity: UserIdentity,
         ino: INodeNo,
         flags: OpenFlags,
         reply: ReplyOpen,
@@ -1606,7 +1641,7 @@ impl Fuse9P {
         let orig = raw as u32;
         let open_flags = handle_open_flags(writeback, direct_io);
         self.rt.spawn(async move {
-            let inode_fid = match user_fid(&client, &inodes, uid, ino).await {
+            let inode_fid = match user_fid(&client, &inodes, identity, ino).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -1630,7 +1665,7 @@ impl Fuse9P {
                     // Track the open handle so a verified fsync of this inode (through
                     // ANY of its handles) presents this one's un-fsync'd writes too.
                     if let Some(mut e) = inodes.get_mut(&ino) {
-                        e.handles.insert(nf, uid);
+                        e.handles.insert(nf, identity.uid);
                     }
                     // Stash the folded-in bytes for `read` to serve, keyed by the
                     // handle, stamped now so a late first read can expire it.
@@ -1691,7 +1726,14 @@ impl Fuse9P {
         });
     }
 
-    fn unlink_inner(&self, uid: u32, parent: INodeNo, name: &OsStr, flags: u32, reply: ReplyEmpty) {
+    fn unlink_inner(
+        &self,
+        identity: UserIdentity,
+        parent: INodeNo,
+        name: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
         if name_too_long(name) {
             reply.error(Errno::ENAMETOOLONG);
             return;
@@ -1701,7 +1743,7 @@ impl Fuse9P {
         let name = name.as_bytes().to_vec();
         let parent = parent.0;
         self.rt.spawn(async move {
-            let parent_fid = match user_fid(&client, &inodes, uid, parent).await {
+            let parent_fid = match user_fid(&client, &inodes, identity, parent).await {
                 Ok(f) => f,
                 Err(e) => {
                     reply.error(errno(&e));
@@ -1950,16 +1992,46 @@ mod consistency_tests {
     fn setattr_reuses_only_same_user_handle_for_the_requested_inode() {
         let inodes = Arc::new(DashMap::new());
         let mut entry = InodeEntry::default();
-        entry.handles.insert(42, 1000);
+        let owner = UserIdentity {
+            uid: 1000,
+            gid: 2000,
+        };
+        entry.handles.insert(42, owner.uid);
         inodes.insert(7, entry);
 
         let handle = Some(FileHandle(42));
-        assert_eq!(tracked_handle_fid(&inodes, 7, handle), Some((42, 1000)));
-        assert_eq!(user_handle_fid(&inodes, 7, 1000, handle), Some(42));
-        assert_eq!(user_handle_fid(&inodes, 7, 1001, handle), None);
-        assert_eq!(user_handle_fid(&inodes, 8, 1000, handle), None);
         assert_eq!(
-            user_handle_fid(&inodes, 7, 1000, Some(FileHandle(43))),
+            tracked_handle_fid(&inodes, 7, handle),
+            Some((42, owner.uid))
+        );
+        assert_eq!(user_handle_fid(&inodes, 7, owner, handle), Some(42));
+        assert_eq!(
+            user_handle_fid(
+                &inodes,
+                7,
+                UserIdentity {
+                    uid: 1000,
+                    gid: 2001,
+                },
+                handle
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            user_handle_fid(
+                &inodes,
+                7,
+                UserIdentity {
+                    uid: 1001,
+                    gid: 2000,
+                },
+                handle
+            ),
+            None
+        );
+        assert_eq!(user_handle_fid(&inodes, 8, owner, handle), None);
+        assert_eq!(
+            user_handle_fid(&inodes, 7, owner, Some(FileHandle(43))),
             None
         );
     }
@@ -1993,14 +2065,28 @@ mod consistency_tests {
             data_version: 0,
         };
 
-        assert_eq!(register_entry(&inodes, 1000, Some(10), &stat).1, None);
-        assert_eq!(register_entry(&inodes, 1000, Some(11), &stat).1, Some(11));
-        assert_eq!(register_entry(&inodes, 1001, Some(12), &stat).1, None);
+        let first = UserIdentity {
+            uid: 1000,
+            gid: 2000,
+        };
+        let other_gid = UserIdentity {
+            uid: 1000,
+            gid: 2001,
+        };
+        let other_uid = UserIdentity {
+            uid: 1001,
+            gid: 2000,
+        };
+        assert_eq!(register_entry(&inodes, first, Some(10), &stat).1, None);
+        assert_eq!(register_entry(&inodes, first, Some(11), &stat).1, Some(11));
+        assert_eq!(register_entry(&inodes, other_gid, Some(12), &stat).1, None);
+        assert_eq!(register_entry(&inodes, other_uid, Some(13), &stat).1, None);
 
         let entry = inodes.get(&ino_of(42)).unwrap();
-        assert_eq!(entry.lookup, 3);
-        assert_eq!(entry.fids.get(&1000), Some(&10));
-        assert_eq!(entry.fids.get(&1001), Some(&12));
+        assert_eq!(entry.lookup, 4);
+        assert_eq!(entry.fids.get(&first), Some(&10));
+        assert_eq!(entry.fids.get(&other_gid), Some(&12));
+        assert_eq!(entry.fids.get(&other_uid), Some(&13));
     }
 }
 
@@ -3358,7 +3444,9 @@ mod client_tests {
         let root_auth = AuthContext {
             uid: 0,
             gid: 0,
+            gid_known: true,
             gids: Vec::new(),
+            groups_complete: true,
         };
         let root_creds = Credentials::from_auth_context(&root_auth);
 

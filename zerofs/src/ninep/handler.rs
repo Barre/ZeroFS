@@ -3,7 +3,7 @@ use super::lock_manager::{FileLock, FileLockManager, LockGuard};
 #[cfg(feature = "failpoints")]
 use crate::failpoints as fp;
 use crate::fs::errors::FsError;
-use crate::fs::inode::{Inode, InodeAttrs, InodeId};
+use crate::fs::inode::{Inode, InodeAttrs, InodeId, MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR};
 use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
@@ -50,6 +50,15 @@ pub const DEFAULT_BLKSIZE: u64 = 4096;
 
 // Block size for calculating block count
 pub const BLOCK_SIZE: u64 = 512;
+
+// 9P2000.L carries Linux open flags verbatim. Keep the small access subset
+// local so opening a fid is itself an authorization boundary: cached client
+// reads may never issue a later Tread on which to perform the check.
+const LINUX_O_ACCMODE: u32 = 0o3;
+const LINUX_O_WRONLY: u32 = 0o1;
+const LINUX_O_RDWR: u32 = 0o2;
+const LINUX_O_TRUNC: u32 = 0o1000;
+const LINUX_O_PATH: u32 = 0o10_000_000;
 
 /// Classify a post-dispatch error for failover retry semantics.
 fn post_dispatch_errno(error: P9Error, lease_is_valid: bool) -> u32 {
@@ -107,8 +116,14 @@ pub struct Fid {
 #[derive(Debug)]
 pub struct FidSlot {
     pub fid: Fid,
-    /// Open-handle pin, including provisional replay pins before `Tlopen`.
+    /// Open-handle pin installed only after an open is authorized.
     pub handle: Option<OpenHandle>,
+    /// `Trebind(OPENED)` expects this unopened fid to be reopened next.
+    ///
+    /// This is deliberately metadata rather than an `OpenHandle`: a
+    /// client-declared replay state must not pin storage before the server has
+    /// authorized an actual open.
+    replay_reopen: bool,
     /// Present once the fid takes its first byte-range lock; releases the fid's
     /// locks on drop.
     pub lock_guard: Option<LockGuard>,
@@ -119,6 +134,7 @@ impl FidSlot {
         Self {
             fid,
             handle: None,
+            replay_reopen: false,
             lock_guard: None,
         }
     }
@@ -133,51 +149,192 @@ struct SessionState {
     disconnected: bool,
 }
 
-impl From<&Tsetattr> for SetAttributes {
-    fn from(ts: &Tsetattr) -> Self {
-        SetAttributes {
-            mode: if ts.valid & SETATTR_MODE != 0 {
-                SetMode::Set(ts.mode)
-            } else {
-                SetMode::NoChange
-            },
-            uid: if ts.valid & SETATTR_UID != 0 {
-                SetUid::Set(ts.uid)
-            } else {
-                SetUid::NoChange
-            },
-            gid: if ts.valid & SETATTR_GID != 0 {
-                SetGid::Set(ts.gid)
-            } else {
-                SetGid::NoChange
-            },
-            size: if ts.valid & SETATTR_SIZE != 0 {
-                SetSize::Set(ts.size)
-            } else {
-                SetSize::NoChange
-            },
-            atime: if ts.valid & SETATTR_ATIME_SET != 0 {
-                SetTime::SetToClientTime(Timestamp {
-                    seconds: ts.atime_sec,
-                    nanoseconds: ts.atime_nsec as u32,
-                })
-            } else if ts.valid & SETATTR_ATIME != 0 {
-                SetTime::SetToServerTime
-            } else {
-                SetTime::NoChange
-            },
-            mtime: if ts.valid & SETATTR_MTIME_SET != 0 {
-                SetTime::SetToClientTime(Timestamp {
-                    seconds: ts.mtime_sec,
-                    nanoseconds: ts.mtime_nsec as u32,
-                })
-            } else if ts.valid & SETATTR_MTIME != 0 {
-                SetTime::SetToServerTime
-            } else {
-                SetTime::NoChange
-            },
-        }
+#[derive(Clone, Copy)]
+enum SetattrFidState {
+    Unopened,
+    OpenedNonWritable,
+    OpenedWritable,
+}
+
+struct SetattrFidContext {
+    inode_id: InodeId,
+    creds: Credentials,
+    state: SetattrFidState,
+    allows_read: bool,
+}
+
+struct OpenFidContext {
+    fid: Fid,
+    replay_reopen: bool,
+}
+
+/// Validate a wire setattr mask before interpreting any selected values.
+fn set_attributes_from_request(ts: &Tsetattr) -> P9Result<SetAttributes> {
+    const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+    if ts.valid & !SETATTR_KNOWN != 0
+        || ts.valid & SETATTR_ATIME_SET != 0 && ts.valid & SETATTR_ATIME == 0
+        || ts.valid & SETATTR_MTIME_SET != 0 && ts.valid & SETATTR_MTIME == 0
+        || ts.valid & SETATTR_ATIME_SET != 0 && ts.atime_nsec >= NSEC_PER_SEC
+        || ts.valid & SETATTR_MTIME_SET != 0 && ts.mtime_nsec >= NSEC_PER_SEC
+    {
+        return Err(P9Error::InvalidArgument);
     }
+
+    Ok(SetAttributes {
+        mode: if ts.valid & SETATTR_MODE != 0 {
+            SetMode::Set(ts.mode)
+        } else {
+            SetMode::NoChange
+        },
+        uid: if ts.valid & SETATTR_UID != 0 {
+            SetUid::Set(ts.uid)
+        } else {
+            SetUid::NoChange
+        },
+        gid: if ts.valid & SETATTR_GID != 0 {
+            SetGid::Set(ts.gid)
+        } else {
+            SetGid::NoChange
+        },
+        size: if ts.valid & SETATTR_SIZE != 0 {
+            SetSize::Set(ts.size)
+        } else {
+            SetSize::NoChange
+        },
+        atime: if ts.valid & SETATTR_ATIME_SET != 0 {
+            SetTime::SetToClientTime(Timestamp {
+                seconds: ts.atime_sec,
+                nanoseconds: ts.atime_nsec as u32,
+            })
+        } else if ts.valid & SETATTR_ATIME != 0 {
+            SetTime::SetToServerTime
+        } else {
+            SetTime::NoChange
+        },
+        mtime: if ts.valid & SETATTR_MTIME_SET != 0 {
+            SetTime::SetToClientTime(Timestamp {
+                seconds: ts.mtime_sec,
+                nanoseconds: ts.mtime_nsec as u32,
+            })
+        } else if ts.valid & SETATTR_MTIME != 0 {
+            SetTime::SetToServerTime
+        } else {
+            SetTime::NoChange
+        },
+    })
+}
+
+/// Decode the binary credential form of `Trebind.uname`.
+///
+/// A non-sentinel payload belongs to the legacy UTF-8 username form. Once the
+/// sentinel is present the whole payload must match the advertised version
+/// exactly; malformed or trailing data never falls back to username handling.
+fn parse_rebind_credentials(n_uname: u32, payload: &[u8]) -> P9Result<Option<Credentials>> {
+    if payload.first().copied() != Some(P9_REBIND_CREDENTIAL_SENTINEL) {
+        return Ok(None);
+    }
+    if payload.len() < P9_REBIND_CREDENTIAL_HEADER_SIZE
+        || payload[1] != P9_REBIND_CREDENTIAL_VERSION
+    {
+        return Err(P9Error::InvalidEncoding);
+    }
+
+    let groups_complete = payload[6] & P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE == 0;
+    let groups_count = (payload[6] & !P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE) as usize;
+    let expected_len = P9_REBIND_CREDENTIAL_HEADER_SIZE
+        .checked_add(
+            groups_count
+                .checked_mul(4)
+                .ok_or(P9Error::InvalidEncoding)?,
+        )
+        .ok_or(P9Error::InvalidEncoding)?;
+    if groups_count > P9_MAX_GROUPS || payload.len() != expected_len {
+        return Err(P9Error::InvalidEncoding);
+    }
+
+    let gid = u32::from_le_bytes(
+        payload[2..6]
+            .try_into()
+            .map_err(|_| P9Error::InvalidEncoding)?,
+    );
+    let mut groups = [0u32; P9_MAX_GROUPS];
+    for (index, group) in groups.iter_mut().take(groups_count).enumerate() {
+        let offset = P9_REBIND_CREDENTIAL_HEADER_SIZE + index * 4;
+        *group = u32::from_le_bytes(
+            payload[offset..offset + 4]
+                .try_into()
+                .map_err(|_| P9Error::InvalidEncoding)?,
+        );
+    }
+
+    Ok(Some(Credentials {
+        uid: n_uname,
+        gid,
+        gid_known: true,
+        groups,
+        groups_count,
+        groups_complete,
+    }))
+}
+
+/// Authorize the access represented by Linux `Tlopen.flags`.
+///
+/// This must run before publishing an opened fid. In particular, a native
+/// client can satisfy a read from its inode-wide page cache without sending a
+/// subsequent `Tread`, so deferring permission enforcement until I/O would let
+/// one user's cached pages bypass another user's access check.
+fn check_open_access(inode: &Inode, creds: &Credentials, flags: u32) -> P9Result<()> {
+    let access_mode = flags & LINUX_O_ACCMODE;
+    if access_mode == LINUX_O_ACCMODE {
+        return Err(P9Error::InvalidArgument);
+    }
+
+    // O_PATH obtains a path capability rather than readable/writable file
+    // content. Later operations still validate what that capability may do.
+    if flags & LINUX_O_PATH != 0 {
+        return Ok(());
+    }
+    if access_mode != LINUX_O_WRONLY {
+        check_access(inode, creds, AccessMode::Read)?;
+    }
+    if access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR || flags & LINUX_O_TRUNC != 0 {
+        check_access(inode, creds, AccessMode::Write)?;
+    }
+    Ok(())
+}
+
+/// Whether a still-linked non-directory has no ancestry a bind can verify.
+///
+/// Hardlinking clears the parent and name. Removing aliases does not restore
+/// them, so the lazy representation remains parentless even after its link
+/// count falls back to one. A global-root bind can accept that representation
+/// after checking root search access; a subtree bind still cannot prove
+/// membership. This deliberately avoids a namespace-wide alias scan: on a
+/// global-root endpoint, inode-id knowledge is accepted as the performance
+/// tradeoff.
+fn is_parentless_linked_non_directory(inode: &Inode) -> bool {
+    !inode.is_directory() && inode.nlink() > 0 && inode.parent().is_none() && inode.name().is_none()
+}
+
+fn fid_allows_read(fid: &Fid) -> bool {
+    if !fid.opened {
+        return false;
+    }
+    let Some(flags) = fid.mode else {
+        return false;
+    };
+    flags & LINUX_O_PATH == 0 && matches!(flags & LINUX_O_ACCMODE, 0 | LINUX_O_RDWR)
+}
+
+fn fid_allows_write(fid: &Fid) -> bool {
+    if !fid.opened {
+        return false;
+    }
+    let Some(flags) = fid.mode else {
+        return false;
+    };
+    flags & LINUX_O_PATH == 0 && matches!(flags & LINUX_O_ACCMODE, LINUX_O_WRONLY | LINUX_O_RDWR)
 }
 
 #[derive(Clone)]
@@ -258,6 +415,30 @@ impl NinePHandler {
         }
     }
 
+    /// Snapshot one fid and its replay-open marker under the same session lock.
+    ///
+    /// The marker carries no resource or access capability. It only lets a
+    /// denied replay reopen be reported as `ESTALE`, which tells the
+    /// reconnecting client to retire the fid instead of retrying forever.
+    fn get_open_fid_context(&self, fid: u32) -> P9Result<OpenFidContext> {
+        self.session_state()
+            .fids
+            .get(&fid)
+            .ok_or(P9Error::BadFid)
+            .map(|slot| OpenFidContext {
+                fid: slot.fid.clone(),
+                replay_reopen: slot.replay_reopen && !slot.fid.opened,
+            })
+    }
+
+    fn map_replay_open_error(replay_reopen: bool, error: P9Error) -> P9Error {
+        if replay_reopen && matches!(error, P9Error::Fs(FsError::PermissionDenied)) {
+            FsError::StaleHandle.into()
+        } else {
+            error
+        }
+    }
+
     /// Publish an opened compound-operation fid under the session lock.
     fn install_open_fid(
         &self,
@@ -279,6 +460,7 @@ impl NinePHandler {
                 slot
             }
         };
+        slot.replay_reopen = false;
         slot.handle = Some(self.filesystem.new_open_handle(inode_id));
         Ok(())
     }
@@ -360,12 +542,26 @@ impl NinePHandler {
 
     /// Snapshot only the fid fields needed by attribute mutations. Unlike
     /// `get_fid`, this does not allocate and clone the fid's path.
-    fn get_fid_inode_and_creds(&self, fid: u32) -> P9Result<(InodeId, Credentials)> {
+    fn get_fid_setattr_context(&self, fid: u32) -> P9Result<SetattrFidContext> {
         self.session_state()
             .fids
             .get(&fid)
             .ok_or(P9Error::BadFid)
-            .map(|slot| (slot.fid.inode_id, slot.fid.creds))
+            .map(|slot| {
+                let state = if !slot.fid.opened {
+                    SetattrFidState::Unopened
+                } else if fid_allows_write(&slot.fid) {
+                    SetattrFidState::OpenedWritable
+                } else {
+                    SetattrFidState::OpenedNonWritable
+                };
+                SetattrFidContext {
+                    inode_id: slot.fid.inode_id,
+                    creds: slot.fid.creds,
+                    state,
+                    allows_read: fid_allows_read(&slot.fid),
+                }
+            })
     }
 
     fn clamp_count(&self, count: u32, header: u32) -> u32 {
@@ -656,8 +852,8 @@ impl NinePHandler {
         let (uid, gid) = if let Some((override_uid, override_gid)) = self.credential_override {
             (override_uid, override_gid)
         } else {
-            // In 9P2000.L we trust the client and use UID as GID as a reasonable
-            // default. n_uname = -1 (0xFFFFFFFF) means "unspecified": map by name.
+            // An unspecified numeric uid is resolved by name. Otherwise the
+            // protocol supplies only a uid, so use it as the gid too.
             let uid = if n_uname == 0xFFFFFFFF {
                 match username {
                     "root" => 0,
@@ -668,14 +864,41 @@ impl NinePHandler {
             };
             (uid, uid)
         };
+        let gid_known = self.credential_override.is_some();
         let mut groups = [0u32; P9_MAX_GROUPS];
-        groups[0] = gid; // User is always a member of their primary group.
+        let groups_count = if gid_known {
+            groups[0] = gid;
+            1
+        } else {
+            0
+        };
         Credentials {
             uid,
             gid,
+            gid_known,
             groups,
-            groups_count: 1,
+            groups_count,
+            groups_complete: gid_known,
         }
+    }
+
+    /// Decode per-fid credentials for Trebind while preserving the original
+    /// UTF-8 username form used by existing clients. A configured override
+    /// replaces every client-supplied uid, gid, and supplementary group.
+    fn creds_for_rebind(&self, n_uname: u32, uname: &P9String) -> P9Result<Credentials> {
+        if let Some(credentials) = parse_rebind_credentials(n_uname, &uname.data)? {
+            return Ok(if self.credential_override.is_some() {
+                self.creds_for(n_uname, "")
+            } else {
+                credentials
+            });
+        }
+
+        let username = uname.as_str().map_err(|e| {
+            debug!("Invalid rebind username encoding: {:?}", e);
+            P9Error::InvalidEncoding
+        })?;
+        Ok(self.creds_for(n_uname, username))
     }
 
     async fn attach(&self, ta: Tattach) -> P9Result<Message> {
@@ -694,7 +917,6 @@ impl NinePHandler {
         );
 
         let creds = self.creds_for(ta.n_uname, username);
-
         if self.session_state().fids.contains_key(&ta.fid) {
             return Err(P9Error::FidInUse);
         }
@@ -737,7 +959,7 @@ impl NinePHandler {
                     .collect(),
                 inode_id: root_id,
                 root: root_id,
-                qid: qid.clone(),
+                qid,
                 opened: false,
                 mode: None,
                 creds,
@@ -746,19 +968,56 @@ impl NinePHandler {
         Ok(Message::Rattach(Rattach { qid }))
     }
 
-    /// Bind a replay fid to a linked inode by ID.
+    fn rebind_authorization_error(replay: bool) -> P9Error {
+        if replay {
+            FsError::StaleHandle.into()
+        } else {
+            FsError::PermissionDenied.into()
+        }
+    }
+
+    /// Require a searchable parent chain from `start_id` through `ancestor_id`.
+    async fn authorize_rebind_ancestry(
+        &self,
+        creds: &Credentials,
+        start_id: InodeId,
+        ancestor_id: InodeId,
+        start: &Inode,
+        replay: bool,
+    ) -> P9Result<()> {
+        let mut current_id = start_id;
+        let mut current = start.clone();
+        let mut hops = 0u32;
+        while current_id != ancestor_id {
+            if current_id == 0 || hops >= MAX_ANCESTOR_HOPS {
+                return Err(Self::rebind_authorization_error(replay));
+            }
+            hops += 1;
+            let parent_id = current
+                .parent()
+                .ok_or_else(|| Self::rebind_authorization_error(replay))?;
+            let parent = self.filesystem.inode_store.get(parent_id).await?;
+            if !parent.is_directory() {
+                return Err(Self::rebind_authorization_error(replay));
+            }
+            check_access(&parent, creds, AccessMode::Execute)
+                .map_err(|_| Self::rebind_authorization_error(replay))?;
+            current_id = parent_id;
+            current = parent;
+        }
+        Ok(())
+    }
+
+    /// Bind a linked inode by ID after re-authorizing its current namespace.
     async fn rebind(&self, tr: Trebind) -> P9Result<Message> {
-        let username = tr.uname.as_str().map_err(|e| {
-            debug!("Invalid rebind username encoding: {:?}", e);
-            P9Error::InvalidEncoding
-        })?;
+        let creds = self.creds_for_rebind(tr.n_uname, &tr.uname)?;
         if tr.flags & !P9_REBIND_KNOWN_FLAGS != 0
             || tr.flags & P9_REBIND_OPENED != 0 && tr.flags & P9_REBIND_REPLAY == 0
         {
             return Err(P9Error::InvalidArgument);
         }
         let replay = tr.flags & P9_REBIND_REPLAY != 0;
-        let opened = tr.flags & P9_REBIND_OPENED != 0;
+        let replay_reopen = tr.flags & P9_REBIND_OPENED != 0;
 
         // Like attach/walk, refuse to clobber a fid that's already in use.
         if self.session_state().fids.contains_key(&tr.fid) {
@@ -767,9 +1026,6 @@ impl NinePHandler {
         // The inode lock orders validation and fid installation against unlink.
         let _inode_guard = self.filesystem.lock_manager.acquire(tr.inode_id).await;
         let inode = self.filesystem.inode_store.get(tr.inode_id).await?;
-
-        let root_inode = tr.root_inode;
-        let establishing_root = tr.inode_id == root_inode;
 
         // Replay does not restore connection-local open-unlinked handles.
         if inode.nlink() == 0 {
@@ -780,37 +1036,35 @@ impl NinePHandler {
             }));
         }
 
-        if establishing_root {
-            // Attach-root replay uses stable directory identity.
-            if !matches!(inode, Inode::Directory(_)) {
-                return Err(P9Error::NotADirectory);
-            }
+        // Replay flags describe client intent; they are not an authorization
+        // credential. A fresh connection must pass the same namespace checks
+        // as a manual bind, including validation of a client-declared root.
+        let root = if tr.root_inode == tr.inode_id {
+            inode.clone()
         } else {
-            // Manual rebind requires current ancestry below the attach root.
-            // Automatic replay may restore a previously recorded linked fid.
-            if root_inode != 0 && !replay {
-                let mut current_id = tr.inode_id;
-                let mut current = inode.clone();
-                let mut hops = 0u32;
-                while current_id != root_inode {
-                    if hops >= MAX_ANCESTOR_HOPS {
-                        // Bound ancestry traversal under concurrent rename.
-                        return Err(P9Error::Fs(FsError::PermissionDenied));
-                    }
-                    hops += 1;
-                    if current_id == 0 {
-                        // The inode is outside the attach subtree.
-                        return Err(P9Error::Fs(FsError::PermissionDenied));
-                    }
-                    current_id = current
-                        .parent()
-                        .ok_or(P9Error::Fs(FsError::PermissionDenied))?;
-                    current = self.filesystem.inode_store.get(current_id).await?;
-                }
-            }
+            self.filesystem.inode_store.get(tr.root_inode).await?
+        };
+        if !root.is_directory() {
+            return Err(if replay {
+                FsError::StaleHandle.into()
+            } else {
+                P9Error::NotADirectory
+            });
+        }
+        self.authorize_rebind_ancestry(&creds, tr.root_inode, 0, &root, replay)
+            .await?;
+        let parentless_global = tr.root_inode == 0 && is_parentless_linked_non_directory(&inode);
+        if parentless_global {
+            // Keep hardlink rebinding O(1). Resolving an arbitrary alias would
+            // require a namespace-wide reverse search because hardlinked
+            // inodes intentionally retain no parent pointer.
+            check_access(&root, &creds, AccessMode::Execute)
+                .map_err(|_| Self::rebind_authorization_error(replay))?;
+        } else if tr.inode_id != tr.root_inode {
+            self.authorize_rebind_ancestry(&creds, tr.inode_id, tr.root_inode, &inode, replay)
+                .await?;
         }
 
-        let creds = self.creds_for(tr.n_uname, username);
         let path = self
             .filesystem
             .inode_store
@@ -821,26 +1075,28 @@ impl NinePHandler {
             .collect();
         let qid = inode_to_qid(&inode, tr.inode_id);
 
-        // Opened replay installs one provisional pin under the inode lock;
-        // `Tlopen` consumes that pin.
+        // OPENED records only that reconnect expects an in-place reopen next.
+        // The client-supplied replay flag grants neither access nor an
+        // open-handle pin; the actual open performs DAC checks and installs
+        // the first resource-bearing handle.
         let mut state = self.connected_session()?;
         if state.fids.contains_key(&tr.fid) {
             return Err(P9Error::FidInUse);
         }
-        let handle = opened.then(|| self.filesystem.new_open_handle(tr.inode_id));
         state.fids.insert(
             tr.fid,
             FidSlot {
                 fid: Fid {
                     path,
                     inode_id: tr.inode_id,
-                    root: root_inode,
-                    qid: qid.clone(),
+                    root: tr.root_inode,
+                    qid,
                     opened: false,
                     mode: None,
                     creds,
                 },
-                handle,
+                handle: None,
+                replay_reopen,
                 lock_guard: None,
             },
         );
@@ -928,12 +1184,11 @@ impl NinePHandler {
             {
                 Ok(id) => id,
                 Err(e) => {
-                    // Per 9P spec: if first element fails, return error.
-                    // If later element fails, return partial Rwalk with qids so far.
+                    // The first failed component is an error; a later failure
+                    // returns the successfully walked prefix.
                     if i == 0 {
                         return Err(e);
                     }
-                    // Partial walk - return what we have so far (newfid is NOT created)
                     return Ok(Message::Rwalk(Rwalk {
                         nwqid: wqids.len() as u16,
                         wqids,
@@ -1015,7 +1270,7 @@ impl NinePHandler {
                 path: current_path,
                 inode_id: current_id,
                 root: src_fid.root,
-                qid: wqids.last().cloned().unwrap_or_else(|| src_fid.qid.clone()),
+                qid: wqids.last().copied().unwrap_or(src_fid.qid),
                 opened: false,
                 mode: None,
                 creds: src_fid.creds,
@@ -1025,12 +1280,15 @@ impl NinePHandler {
         Ok(Message::Rwalkgetattr(Rwalkgetattr {
             nwqid: wqids.len() as u16,
             wqids,
-            stat: inode_to_stat(&stat_inode, current_id),
+            stat: inode_to_stat(&stat_inode, current_id)?,
         }))
     }
 
     async fn lopen(&self, tl: Tlopen) -> P9Result<Message> {
-        let fid_entry = self.get_fid(tl.fid)?;
+        let OpenFidContext {
+            fid: mut fid_entry,
+            replay_reopen,
+        } = self.get_open_fid_context(tl.fid)?;
 
         if fid_entry.opened {
             return Err(P9Error::FidAlreadyOpen);
@@ -1046,31 +1304,37 @@ impl NinePHandler {
 
         // Liveness check + open + handle-guard install, all under the inode lock
         // so the increment is ordered against remove/rename's defer decision.
-        let inode = {
+        let qid = {
             let _guard = self.filesystem.lock_manager.acquire(inode_id).await;
             let inode = self.filesystem.inode_store.get(inode_id).await?;
+            if replay_reopen && inode.nlink() == 0 {
+                return Err(FsError::StaleHandle.into());
+            }
+            check_open_access(&inode, &creds, tl.flags)
+                .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, inode_id);
             let mut state = self.connected_session()?;
             match state.fids.get_mut(&tl.fid) {
                 Some(slot) => {
-                    // Serialize racing opens under the session lock.
+                    // Publish the exact fid snapshot whose inode and
+                    // credentials were authorized. A racing in-place walk may
+                    // have replaced the table entry while the inode lock was
+                    // awaited; mutating that replacement would attach A's
+                    // authorization and handle to B's identity.
                     if slot.fid.opened {
                         return Err(P9Error::FidAlreadyOpen);
                     }
-                    slot.fid.qid = qid;
-                    slot.fid.opened = true;
-                    slot.fid.mode = Some(tl.flags);
-                    // Publish open state and its guard atomically.
-                    if slot.handle.is_none() {
-                        slot.handle = Some(self.filesystem.new_open_handle(inode_id));
-                    }
+                    fid_entry.qid = qid;
+                    fid_entry.opened = true;
+                    fid_entry.mode = Some(tl.flags);
+                    slot.fid = fid_entry;
+                    slot.replay_reopen = false;
+                    slot.handle = Some(self.filesystem.new_open_handle(inode_id));
                 }
                 None => return Err(P9Error::BadFid),
             }
-            inode
+            qid
         };
-
-        let qid = inode_to_qid(&inode, inode_id);
 
         Ok(Message::Rlopen(Rlopen {
             qid,
@@ -1083,16 +1347,25 @@ impl NinePHandler {
     // Twalk(clone) + Tlopen pair that standard Tlopen's fid-mutating semantics
     // force on it.
     async fn lopenat(&self, tl: Tlopenat) -> P9Result<Message> {
-        let src_fid = self.get_fid(tl.fid)?;
+        let OpenFidContext {
+            fid: src_fid,
+            replay_reopen,
+        } = self.get_open_fid_context(tl.fid)?;
 
         if tl.newfid != tl.fid && self.session_state().fids.contains_key(&tl.newfid) {
             return Err(P9Error::FidInUse);
         }
 
+        let replay_reopen = tl.newfid == tl.fid && replay_reopen;
         // The inode lock orders fid publication against unlink.
-        let inode = {
+        let qid = {
             let _guard = self.filesystem.lock_manager.acquire(src_fid.inode_id).await;
             let inode = self.filesystem.inode_store.get(src_fid.inode_id).await?;
+            if replay_reopen && inode.nlink() == 0 {
+                return Err(FsError::StaleHandle.into());
+            }
+            check_open_access(&inode, &src_fid.creds, tl.flags)
+                .map_err(|error| Self::map_replay_open_error(replay_reopen, error))?;
             let qid = inode_to_qid(&inode, src_fid.inode_id);
             let mut state = self.connected_session()?;
             let new_fid = Fid {
@@ -1105,10 +1378,8 @@ impl NinePHandler {
                 creds: src_fid.creds,
             };
             self.install_open_fid(&mut state, tl.newfid, tl.fid, new_fid)?;
-            inode
+            qid
         };
-
-        let qid = inode_to_qid(&inode, src_fid.inode_id);
 
         Ok(Message::Rlopenat(Rlopenat {
             qid,
@@ -1140,14 +1411,20 @@ impl NinePHandler {
         // Clamp with the Rlopenatread overhead (not P9_IOHDRSZ): its reply carries an
         // extra qid+iounit+eof, so the whole `29 + count` frame must fit the msize.
         let count = self.clamp_count(tl.count, P9_RLOPENATREAD_HDR);
-        let auth = AuthContext::from(&new_fid.creds);
-        let (data, eof) = match self
-            .filesystem
-            .read_file(&auth, new_fid.inode_id, 0, count)
-            .await
-        {
-            Ok((d, e)) => (DekuBytes::from(d), e),
-            Err(_) => (DekuBytes::default(), false),
+        let (data, eof) = if fid_allows_read(&new_fid) {
+            // The open already authorized this immutable fid capability.
+            // Keep an open descriptor and the inode-wide client page cache
+            // consistent after chmod/chown.
+            match self
+                .filesystem
+                .read_file_opened(new_fid.inode_id, 0, count)
+                .await
+            {
+                Ok((d, e)) => (DekuBytes::from(d), e),
+                Err(_) => (DekuBytes::default(), false),
+            }
+        } else {
+            (DekuBytes::default(), false)
         };
 
         Ok(Message::Rlopenatread(Rlopenatread {
@@ -1220,19 +1497,19 @@ impl NinePHandler {
     async fn readdir(&self, tr: Treaddir) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
-        if !fid_entry.opened {
+        if !fid_allows_read(&fid_entry) {
             return Err(P9Error::FidNotOpen);
         }
 
         let count = self.clamp_count(tr.count, P9_IOHDRSZ);
 
-        let auth = AuthContext::from(&fid_entry.creds);
-
         // tr.offset is the cookie from the last entry the client received (0 for first call)
-        // Pass it directly to readdir which handles . and .. with cookies 1 and 2
+        // Pass it directly to readdir which handles . and .. with cookies 1 and 2.
+        // Permission was checked at open: like Tread, use that capability so a
+        // paged listing cannot fail halfway through on a later chmod.
         let mut result = self
             .filesystem
-            .readdir(&auth, fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
+            .readdir_opened(fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
             .await?;
         self.clamp_dotdot_at_attach_root(&fid_entry, &mut result.entries)
             .await?;
@@ -1272,16 +1549,15 @@ impl NinePHandler {
     // and skip a getattr/lookup per entry.
     async fn readdir_attr(&self, tr: Treaddirattr) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
-        if !fid_entry.opened {
+        if !fid_allows_read(&fid_entry) {
             return Err(P9Error::FidNotOpen);
         }
 
         let count = self.clamp_count(tr.count, P9_IOHDRSZ);
 
-        let auth = AuthContext::from(&fid_entry.creds);
         let mut result = self
             .filesystem
-            .readdir(&auth, fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
+            .readdir_opened(fid_entry.inode_id, tr.offset, P9_READDIR_BATCH_SIZE)
             .await?;
         self.clamp_dotdot_at_attach_root(&fid_entry, &mut result.entries)
             .await?;
@@ -1293,7 +1569,7 @@ impl NinePHandler {
                 qid: attrs_to_qid(&entry.attr, entry.fileid),
                 offset: entry.cookie,
                 type_: filetype_to_dt(entry.attr.file_type),
-                stat: attrs_to_stat(&entry.attr, entry.fileid),
+                stat: attrs_to_stat(&entry.attr, entry.fileid)?,
                 name: P9String::new(entry.name),
             };
 
@@ -1368,11 +1644,14 @@ impl NinePHandler {
             if slot.fid.opened {
                 return Err(P9Error::FidAlreadyOpen);
             }
-            slot.fid.path.push(Bytes::from(tc.name.data));
-            slot.fid.inode_id = child_id;
-            slot.fid.qid = qid.clone();
-            slot.fid.opened = true;
-            slot.fid.mode = Some(tc.flags);
+            let mut opened_fid = parent_fid;
+            opened_fid.path.push(Bytes::from(tc.name.data));
+            opened_fid.inode_id = child_id;
+            opened_fid.qid = qid;
+            opened_fid.opened = true;
+            opened_fid.mode = Some(tc.flags);
+            slot.fid = opened_fid;
+            slot.replay_reopen = false;
             slot.handle = Some(self.filesystem.new_open_handle(child_id));
         }
 
@@ -1421,24 +1700,25 @@ impl NinePHandler {
 
         Ok(Message::Rlcreateattr(Rlcreateattr {
             iounit: self.iounit(),
-            stat: attrs_to_stat(&post_attr, child_id),
+            stat: attrs_to_stat(&post_attr, child_id)?,
         }))
     }
 
     async fn read(&self, tr: Tread) -> P9Result<Message> {
         let fid_entry = self.get_fid(tr.fid)?;
 
-        if !fid_entry.opened {
-            return Err(P9Error::FidNotOpen);
+        if !fid_allows_read(&fid_entry) {
+            return Err(P9Error::BadFid);
         }
 
         let count = self.clamp_count(tr.count, P9_IOHDRSZ);
 
-        let auth = AuthContext::from(&fid_entry.creds);
-
+        // Permission was checked under the inode lock before this fid became
+        // open. Use that capability rather than mutable inode DAC so a cache
+        // miss behaves like a cache hit after a later chmod/chown.
         let (data, _eof) = self
             .filesystem
-            .read_file(&auth, fid_entry.inode_id, tr.offset, count)
+            .read_file_opened(fid_entry.inode_id, tr.offset, count)
             .await?;
 
         Ok(Message::Rread(Rread {
@@ -1450,8 +1730,8 @@ impl NinePHandler {
     async fn write(&self, tw: Twrite, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let fid_entry = self.get_fid(tw.fid)?;
 
-        if !fid_entry.opened {
-            return Err(P9Error::FidNotOpen);
+        if !fid_allows_write(&fid_entry) {
+            return Err(P9Error::BadFid);
         }
 
         debug!(
@@ -1469,7 +1749,7 @@ impl NinePHandler {
         let data = Bytes::from(tw.data);
 
         self.filesystem
-            .write_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
+            .write_opened_idempotent(&auth, fid_entry.inode_id, tw.offset, &data, op_id)
             .await
             .inspect_err(|&e| {
                 debug!("write: failed with error: {:?}", e);
@@ -1488,17 +1768,56 @@ impl NinePHandler {
 
         Ok(Message::Rgetattr(Rgetattr {
             valid: tg.request_mask & GETATTR_ALL,
-            stat: inode_to_stat(&inode, fid_entry.inode_id),
+            stat: inode_to_stat(&inode, fid_entry.inode_id)?,
         }))
     }
 
-    async fn setattr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (inode_id, creds) = self.get_fid_inode_and_creds(ts.fid)?;
-        let attr = SetAttributes::from(&ts);
+    async fn apply_setattr(
+        &self,
+        ts: &Tsetattr,
+        op_id: crate::dedup::OpId,
+    ) -> P9Result<(InodeId, FileAttributes)> {
+        if ts.valid & SETATTR_ATIME_ACCESS != 0 {
+            if !self.zerofs_protocol_enabled() || ts.valid != SETATTR_ATIME_ACCESS | SETATTR_ATIME {
+                return Err(P9Error::InvalidArgument);
+            }
+            let context = self.get_fid_setattr_context(ts.fid)?;
+            if !context.allows_read {
+                return Err(P9Error::BadFid);
+            }
+            let post_attr = self
+                .filesystem
+                .record_access_time_idempotent(context.inode_id, Timestamp::now(), op_id)
+                .await?;
+            return Ok((context.inode_id, post_attr));
+        }
 
-        self.filesystem
-            .setattr_idempotent(&creds, inode_id, &attr, op_id)
-            .await?;
+        let attr = set_attributes_from_request(ts)?;
+        let context = self.get_fid_setattr_context(ts.fid)?;
+
+        let size_uses_open_fid = if matches!(attr.size, SetSize::Set(_)) {
+            match context.state {
+                SetattrFidState::Unopened => false,
+                SetattrFidState::OpenedNonWritable => return Err(P9Error::BadFid),
+                SetattrFidState::OpenedWritable => true,
+            }
+        } else {
+            false
+        };
+        let post_attr = if size_uses_open_fid {
+            self.filesystem
+                .setattr_opened_idempotent(&context.creds, context.inode_id, &attr, op_id)
+                .await?
+        } else {
+            self.filesystem
+                .setattr_idempotent(&context.creds, context.inode_id, &attr, op_id)
+                .await?
+        };
+        Ok((context.inode_id, post_attr))
+    }
+
+    async fn setattr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        self.apply_setattr(&ts, op_id).await?;
         Ok(Message::Rsetattr(Rsetattr))
     }
 
@@ -1507,8 +1826,8 @@ impl NinePHandler {
             return Err(P9Error::NotSupported);
         }
         let fid_entry = self.get_fid(tf.fid)?;
-        if !fid_entry.opened {
-            return Err(P9Error::FidNotOpen);
+        if !fid_allows_write(&fid_entry) {
+            return Err(P9Error::BadFid);
         }
         let mode = match classify_fallocate_mode(tf.mode) {
             Some(FallocateKind::Allocate) => FallocateMode::Allocate,
@@ -1520,11 +1839,18 @@ impl NinePHandler {
         let auth = AuthContext::from(&fid_entry.creds);
         if crate::dedup::has_op_id(&op_id) {
             self.filesystem
-                .fallocate_idempotent(&auth, fid_entry.inode_id, tf.offset, tf.length, mode, op_id)
+                .fallocate_opened_idempotent(
+                    &auth,
+                    fid_entry.inode_id,
+                    tf.offset,
+                    tf.length,
+                    mode,
+                    op_id,
+                )
                 .await?;
         } else {
             self.filesystem
-                .fallocate(&auth, fid_entry.inode_id, tf.offset, tf.length, mode)
+                .fallocate_opened(&auth, fid_entry.inode_id, tf.offset, tf.length, mode)
                 .await?;
         }
         Ok(Message::Rfallocate(Rfallocate))
@@ -1533,15 +1859,9 @@ impl NinePHandler {
     // ZeroFS fast path: Tsetattr whose reply carries the post-op stat (which the
     // filesystem computes anyway), sparing the client its follow-up Tgetattr.
     async fn setattr_attr(&self, ts: Tsetattr, op_id: crate::dedup::OpId) -> P9Result<Message> {
-        let (inode_id, creds) = self.get_fid_inode_and_creds(ts.fid)?;
-        let attr = SetAttributes::from(&ts);
-
-        let post_attr = self
-            .filesystem
-            .setattr_idempotent(&creds, inode_id, &attr, op_id)
-            .await?;
+        let (inode_id, post_attr) = self.apply_setattr(&ts, op_id).await?;
         Ok(Message::Rsetattrattr(Rsetattrattr {
-            stat: attrs_to_stat(&post_attr, inode_id),
+            stat: attrs_to_stat(&post_attr, inode_id)?,
         }))
     }
 
@@ -1593,7 +1913,7 @@ impl NinePHandler {
     async fn mkdir_attr(&self, tm: Tmkdir, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let (new_id, post_attr) = self.make_dir(&tm, op_id).await?;
         Ok(Message::Rmkdirattr(Rmkdirattr {
-            stat: attrs_to_stat(&post_attr, new_id),
+            stat: attrs_to_stat(&post_attr, new_id)?,
         }))
     }
 
@@ -1635,7 +1955,7 @@ impl NinePHandler {
     async fn symlink_attr(&self, ts: Tsymlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let (new_id, post_attr) = self.make_symlink(&ts, op_id).await?;
         Ok(Message::Rsymlinkattr(Rsymlinkattr {
-            stat: attrs_to_stat(&post_attr, new_id),
+            stat: attrs_to_stat(&post_attr, new_id)?,
         }))
     }
 
@@ -1656,6 +1976,10 @@ impl NinePHandler {
             S_IFSOCK => FileType::Socket,
             _ => return Err(P9Error::InvalidDeviceType),
         };
+        let rdev = match device_type {
+            FileType::CharDevice | FileType::BlockDevice => Some((tm.major, tm.minor)),
+            _ => None,
+        };
 
         let gid = self.effective_gid(tm.gid, &parent_fid.creds);
         Ok(self
@@ -1671,10 +1995,7 @@ impl NinePHandler {
                     gid: SetGid::Set(gid),
                     ..Default::default()
                 },
-                match device_type {
-                    FileType::CharDevice | FileType::BlockDevice => Some((tm.major, tm.minor)),
-                    _ => None,
-                },
+                rdev,
                 op_id,
             )
             .await?)
@@ -1690,7 +2011,7 @@ impl NinePHandler {
     async fn mknod_attr(&self, tm: Tmknod, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let (child_id, post_attr) = self.make_node(&tm, op_id).await?;
         Ok(Message::Rmknodattr(Rmknodattr {
-            stat: attrs_to_stat(&post_attr, child_id),
+            stat: attrs_to_stat(&post_attr, child_id)?,
         }))
     }
 
@@ -1742,7 +2063,7 @@ impl NinePHandler {
     async fn link_attr(&self, tl: Tlink, op_id: crate::dedup::OpId) -> P9Result<Message> {
         let (file_id, attrs) = self.make_link(&tl, op_id).await?;
         Ok(Message::Rlinkattr(Rlinkattr {
-            stat: attrs_to_stat(&attrs, file_id),
+            stat: attrs_to_stat(&attrs, file_id)?,
         }))
     }
 
@@ -1814,6 +2135,10 @@ impl NinePHandler {
     }
 
     async fn unlinkat(&self, tu: Tunlinkat, op_id: crate::dedup::OpId) -> P9Result<Message> {
+        if tu.flags & !AT_REMOVEDIR != 0 {
+            return Err(P9Error::InvalidArgument);
+        }
+
         let dir_fid = self.get_fid(tu.dirfid)?;
 
         let parent_id = dir_fid.inode_id;
@@ -1827,29 +2152,16 @@ impl NinePHandler {
             return Ok(Message::Runlinkat(Runlinkat));
         }
 
-        let child_id = self
-            .filesystem
-            .lookup(&creds, parent_id, &tu.name.data)
-            .await?;
-
-        let child_inode = self.filesystem.inode_store.get(child_id).await?;
-
-        let is_dir = matches!(child_inode, Inode::Directory(_));
-
-        // If AT_REMOVEDIR is set, we must be removing a directory
-        if (tu.flags & AT_REMOVEDIR) != 0 && !is_dir {
-            return Err(P9Error::NotADirectory);
-        }
-
-        // If AT_REMOVEDIR is not set, we must not be removing a directory
-        if (tu.flags & AT_REMOVEDIR) == 0 && is_dir {
-            return Err(P9Error::IsADirectory);
-        }
-
         let auth = AuthContext::from(&creds);
 
         self.filesystem
-            .remove_idempotent(&auth, parent_id, &tu.name.data, op_id)
+            .remove_idempotent_checked(
+                &auth,
+                parent_id,
+                &tu.name.data,
+                op_id,
+                tu.flags & AT_REMOVEDIR != 0,
+            )
             .await?;
 
         Ok(Message::Runlinkat(Runlinkat))
@@ -1968,7 +2280,7 @@ impl NinePHandler {
             );
 
             return Ok(Message::Rlock(Rlock {
-                status: LockStatus::Success,
+                status: LockStatus::Success.as_wire(),
             }));
         }
 
@@ -1993,7 +2305,7 @@ impl NinePHandler {
             debug!("Lock conflict on inode {}", slot.fid.inode_id);
             if (tl.flags & P9_LOCK_FLAGS_BLOCK) != 0 {
                 return Ok(Message::Rlock(Rlock {
-                    status: LockStatus::Blocked,
+                    status: LockStatus::Blocked.as_wire(),
                 }));
             } else {
                 return Err(P9Error::LockConflict);
@@ -2013,7 +2325,7 @@ impl NinePHandler {
         }
 
         Ok(Message::Rlock(Rlock {
-            status: LockStatus::Success,
+            status: LockStatus::Success.as_wire(),
         }))
     }
 
@@ -2053,7 +2365,7 @@ impl NinePHandler {
     }
 }
 
-pub fn inode_to_qid(inode: &Inode, inode_id: u64) -> Qid {
+fn inode_to_qid(inode: &Inode, inode_id: u64) -> Qid {
     let type_ = match inode {
         Inode::Directory(_) => QID_TYPE_DIR,
         Inode::Symlink(_) => QID_TYPE_SYMLINK,
@@ -2067,7 +2379,7 @@ pub fn inode_to_qid(inode: &Inode, inode_id: u64) -> Qid {
     }
 }
 
-pub fn attrs_to_qid(attrs: &FileAttributes, fileid: u64) -> Qid {
+fn attrs_to_qid(attrs: &FileAttributes, fileid: u64) -> Qid {
     let type_ = match attrs.file_type {
         FileType::Directory => QID_TYPE_DIR,
         FileType::Symlink => QID_TYPE_SYMLINK,
@@ -2081,7 +2393,7 @@ pub fn attrs_to_qid(attrs: &FileAttributes, fileid: u64) -> Qid {
     }
 }
 
-pub fn filetype_to_dt(ft: FileType) -> u8 {
+fn filetype_to_dt(ft: FileType) -> u8 {
     match ft {
         FileType::Directory => DT_DIR,
         FileType::Regular => DT_REG,
@@ -2095,7 +2407,7 @@ pub fn filetype_to_dt(ft: FileType) -> u8 {
 
 // Build a wire Stat from the readdir-supplied attributes (already fetched, so
 // readdirplus costs no extra round trips). Mirrors `inode_to_stat`.
-pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
+fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> P9Result<Stat> {
     let type_bits = match attrs.file_type {
         FileType::Regular => S_IFREG,
         FileType::Directory => S_IFDIR,
@@ -2105,9 +2417,10 @@ pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
         FileType::Fifo => S_IFIFO,
         FileType::Socket => S_IFSOCK,
     };
-    let rdev = attrs
-        .rdev
-        .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64));
+    let rdev = match attrs.rdev {
+        Some((major, minor)) => linux_new_encode_dev(major, minor)?,
+        None => 0,
+    };
     // FileAttributes uses the NFS-facing conventional 4 KiB directory size,
     // while the established 9P getattr representation reports directory size
     // as zero. Keep compound/readdir stats identical to `inode_to_stat`.
@@ -2116,7 +2429,7 @@ pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
     } else {
         attrs.size
     };
-    Stat {
+    Ok(Stat {
         qid: attrs_to_qid(attrs, fileid),
         mode: (attrs.mode & 0o7777) | type_bits,
         uid: attrs.uid,
@@ -2136,10 +2449,10 @@ pub fn attrs_to_stat(attrs: &FileAttributes, fileid: u64) -> Stat {
         btime_nsec: 0,
         r#gen: 0,
         data_version: 0,
-    }
+    })
 }
 
-pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
+fn inode_to_stat(inode: &Inode, inode_id: u64) -> P9Result<Stat> {
     let (type_bits, size, rdev) = match inode {
         Inode::File(f) => (S_IFREG, f.size, 0),
         Inode::Directory(_) => (S_IFDIR, 0, 0),
@@ -2147,20 +2460,24 @@ pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
         Inode::CharDevice(d) => (
             S_IFCHR,
             0,
-            d.rdev
-                .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64)),
+            match d.rdev {
+                Some((major, minor)) => linux_new_encode_dev(major, minor)?,
+                None => 0,
+            },
         ),
         Inode::BlockDevice(d) => (
             S_IFBLK,
             0,
-            d.rdev
-                .map_or(0, |(maj, min)| ((maj as u64) << 8) | (min as u64)),
+            match d.rdev {
+                Some((major, minor)) => linux_new_encode_dev(major, minor)?,
+                None => 0,
+            },
         ),
         Inode::Fifo(_) => (S_IFIFO, 0, 0),
         Inode::Socket(_) => (S_IFSOCK, 0, 0),
     };
 
-    Stat {
+    Ok(Stat {
         qid: inode_to_qid(inode, inode_id),
         mode: inode.mode() | type_bits,
         uid: inode.uid(),
@@ -2180,17 +2497,29 @@ pub fn inode_to_stat(inode: &Inode, inode_id: u64) -> Stat {
         btime_nsec: 0,
         r#gen: 0,
         data_version: 0,
+    })
+}
+
+/// Encode a Linux device number using the userspace-facing `new_encode_dev`
+/// layout used by 9P2000.L's `Stat.rdev`.
+///
+/// Linux passes a `dev_t` to `new_encode_dev`, so the input already fits its
+/// 12-bit major / 20-bit minor layout. Reject an older malformed stored tuple
+/// instead of masking it into the identity of a different device.
+fn linux_new_encode_dev(major: u32, minor: u32) -> P9Result<u64> {
+    if major > MAX_DEVICE_MAJOR || minor > MAX_DEVICE_MINOR {
+        return Err(P9Error::Overflow);
     }
+    Ok(((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::FileLockManager;
     use super::*;
     use crate::fs::ZeroFS;
     use crate::fs::permissions::Credentials;
     use crate::fs::types::SetAttributes;
-    use libc::O_RDONLY;
+    use libc::{O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2342,6 +2671,911 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standard_attach_uses_unknown_group_dac_without_group_credentials() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let group = 65_534;
+        let attrs = SetAttributes {
+            mode: SetMode::Set(0o060),
+            uid: SetUid::Set(42),
+            gid: SetGid::Set(group),
+            ..Default::default()
+        };
+        fs.create(&test_creds(), 0, b"group-file", &attrs)
+            .await
+            .unwrap();
+        fs.mkdir(&test_creds(), 0, b"group-directory", &attrs)
+            .await
+            .unwrap();
+        fs.create(
+            &test_creds(),
+            0,
+            b"denied",
+            &SetAttributes {
+                mode: SetMode::Set(0),
+                uid: SetUid::Set(42),
+                gid: SetGid::Set(group),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs.create(
+            &test_creds(),
+            0,
+            b"other-readable",
+            &SetAttributes {
+                mode: SetMode::Set(0o004),
+                uid: SetUid::Set(42),
+                // Standard Tattach's synthetic gid happens to equal this, but
+                // it must not override the real caller's "other" class.
+                gid: SetGid::Set(65_533),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        assert!(matches!(
+            negotiate(&handler, DEFAULT_MSIZE, VERSION_9P2000L)
+                .await
+                .body,
+            Message::Rversion(_)
+        ));
+        assert!(matches!(
+            attach(&handler, 1, 1, b"test", b"", 65_533).await.body,
+            Message::Rattach(_)
+        ));
+        let attach_credentials = handler.get_fid(1).unwrap().creds;
+        assert!(!attach_credentials.gid_known);
+        assert!(!attach_credentials.groups_complete);
+
+        for (tag, fid, flags) in [
+            (2, 2, O_RDONLY as u32),
+            (4, 3, O_WRONLY as u32),
+            (6, 4, O_RDWR as u32),
+        ] {
+            expect_walk(&handler, tag, 1, fid, &[b"group-file"]).await;
+            assert!(matches!(
+                request(&handler, tag + 1, Message::Tlopen(Tlopen { fid, flags }))
+                    .await
+                    .body,
+                Message::Rlopen(_)
+            ));
+        }
+
+        expect_walk(&handler, 8, 1, 5, &[b"group-directory"]).await;
+        assert!(matches!(
+            request(
+                &handler,
+                9,
+                Message::Tlopen(Tlopen {
+                    fid: 5,
+                    flags: O_RDONLY as u32,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlopen(_)
+        ));
+
+        expect_walk(&handler, 10, 1, 6, &[b"group-file"]).await;
+        assert!(matches!(
+            request(
+                &handler,
+                11,
+                Message::Tlopen(Tlopen {
+                    fid: 6,
+                    flags: LINUX_O_ACCMODE,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+
+        expect_walk(&handler, 12, 1, 7, &[b"denied"]).await;
+        assert!(matches!(
+            request(
+                &handler,
+                13,
+                Message::Tlopen(Tlopen {
+                    fid: 7,
+                    flags: O_RDONLY as u32,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        expect_walk(&handler, 14, 1, 8, &[b"other-readable"]).await;
+        assert!(matches!(
+            request(
+                &handler,
+                15,
+                Message::Tlopen(Tlopen {
+                    fid: 8,
+                    flags: O_RDONLY as u32,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlopen(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lopen_with_authoritative_credentials_checks_access_before_open() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        fs.create(
+            &test_creds(),
+            0,
+            b"read-only",
+            &SetAttributes {
+                mode: SetMode::Set(0o400),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        handler.credential_override = Some((test_creds().uid, test_creds().gid));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"read-only"]).await;
+
+        for (tag, flags) in [
+            (3, O_WRONLY as u32),
+            (4, O_RDWR as u32),
+            (5, (O_RDONLY | O_TRUNC) as u32),
+        ] {
+            let denied = request(&handler, tag, Message::Tlopen(Tlopen { fid: 2, flags })).await;
+            assert!(
+                matches!(
+                    denied.body,
+                    Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+                ),
+                "flags {flags:#x} unexpectedly opened a read-only inode: {:?}",
+                denied.body
+            );
+            let state = handler.session_state();
+            let slot = state.fids.get(&2).unwrap();
+            assert!(!slot.fid.opened);
+            assert!(slot.handle.is_none());
+        }
+
+        let invalid = request(
+            &handler,
+            6,
+            Message::Tlopen(Tlopen {
+                fid: 2,
+                flags: LINUX_O_ACCMODE,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            invalid.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+
+        let allowed = request(
+            &handler,
+            7,
+            Message::Tlopen(Tlopen {
+                fid: 2,
+                flags: O_RDONLY as u32,
+            }),
+        )
+        .await;
+        assert!(matches!(allowed.body, Message::Rlopen(_)));
+    }
+
+    #[tokio::test]
+    async fn lopen_never_attaches_snapshot_authority_to_a_racing_walk_replacement() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (replacement_id, _) = fs
+            .create(&test_creds(), 0, b"replacement", &SetAttributes::default())
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+
+        // Hold the snapshotted root inode between Tlopen's fid read and its
+        // final session-table update, then replace that same fid via Twalk.
+        let inode_guard = fs.lock_manager.acquire(0).await;
+        let mut opening = Box::pin(request(
+            &handler,
+            2,
+            Message::Tlopen(Tlopen {
+                fid: 1,
+                flags: O_RDONLY as u32,
+            }),
+        ));
+        assert!(futures::poll!(opening.as_mut()).is_pending());
+
+        expect_walk(&handler, 3, 1, 1, &[b"replacement"]).await;
+        assert_eq!(handler.get_fid(1).unwrap().inode_id, replacement_id);
+
+        drop(inode_guard);
+        assert!(matches!(opening.await.body, Message::Rlopen(_)));
+
+        let final_fid = handler.get_fid(1).unwrap();
+        assert_eq!(final_fid.inode_id, 0);
+        assert!(final_fid.opened);
+        assert_eq!(final_fid.qid.path, 0);
+        assert_eq!(fs.open_handle_count(0), 1);
+        assert_eq!(fs.open_handle_count(replacement_id), 0);
+    }
+
+    #[tokio::test]
+    async fn compound_opens_authorize_before_installing_newfid() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(
+                &creds,
+                0,
+                b"write-only",
+                &SetAttributes {
+                    mode: SetMode::Set(0o200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.write(
+            &AuthContext::from(&creds),
+            file_id,
+            0,
+            &Bytes::from_static(b"secret"),
+        )
+        .await
+        .unwrap();
+
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"write-only"]).await;
+
+        let denied_open = request(
+            &handler,
+            3,
+            Message::Tlopenat(Tlopenat {
+                fid: 2,
+                newfid: 3,
+                flags: O_RDONLY as u32,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            denied_open.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+        assert!(handler.get_fid(3).is_err());
+
+        let denied_open_read = request(
+            &handler,
+            4,
+            Message::Tlopenatread(Tlopenatread {
+                fid: 2,
+                newfid: 4,
+                flags: O_RDONLY as u32,
+                count: 4096,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            denied_open_read.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+        assert!(handler.get_fid(4).is_err());
+
+        let allowed = request(
+            &handler,
+            5,
+            Message::Tlopenatread(Tlopenatread {
+                fid: 2,
+                newfid: 5,
+                flags: O_WRONLY as u32,
+                count: 4096,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            allowed.body,
+            Message::Rlopenatread(Rlopenatread {
+                count: 0,
+                ref data,
+                ..
+            }) if data.is_empty()
+        ));
+        assert!(handler.get_fid(5).unwrap().opened);
+    }
+
+    #[tokio::test]
+    async fn rebind_credentials_isolate_users_at_open() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let owner = test_creds();
+        let (file_id, _) = fs
+            .create(
+                &owner,
+                0,
+                b"private",
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let outsider_uid = owner.uid + 1;
+        let outsider_payload = rebind_credential_payload(outsider_uid, &[outsider_uid]);
+        assert!(matches!(
+            request(
+                &handler,
+                2,
+                Message::Trebind(Trebind {
+                    fid: 2,
+                    inode_id: file_id,
+                    root_inode: 0,
+                    flags: 0,
+                    uname: P9String::new(outsider_payload),
+                    n_uname: outsider_uid,
+                }),
+            )
+            .await
+            .body,
+            Message::Rrebind(_)
+        ));
+        let denied = request(
+            &handler,
+            3,
+            Message::Tlopenat(Tlopenat {
+                fid: 2,
+                newfid: 3,
+                flags: O_RDONLY as u32,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            denied.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+        assert!(handler.get_fid(3).is_err());
+
+        let owner_payload = rebind_credential_payload(owner.gid, &[owner.gid]);
+        assert!(matches!(
+            request(
+                &handler,
+                4,
+                Message::Trebind(Trebind {
+                    fid: 4,
+                    inode_id: file_id,
+                    root_inode: 0,
+                    flags: 0,
+                    uname: P9String::new(owner_payload),
+                    n_uname: owner.uid,
+                }),
+            )
+            .await
+            .body,
+            Message::Rrebind(_)
+        ));
+        assert!(matches!(
+            request(
+                &handler,
+                5,
+                Message::Tlopenat(Tlopenat {
+                    fid: 4,
+                    newfid: 5,
+                    flags: O_RDONLY as u32,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlopenat(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebind_incomplete_groups_authorize_group_only_open() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let uid = 65_533;
+        let primary_gid = 65_532;
+        let file_gid = 65_534;
+        let attrs = SetAttributes {
+            mode: SetMode::Set(0o060),
+            uid: SetUid::Set(42),
+            gid: SetGid::Set(file_gid),
+            ..Default::default()
+        };
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"group-file", &attrs)
+            .await
+            .unwrap();
+        let (directory_id, _) = fs
+            .mkdir(&test_creds(), 0, b"group-directory", &attrs)
+            .await
+            .unwrap();
+        let (known_group_denied_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"known-group-denied",
+                &SetAttributes {
+                    mode: SetMode::Set(0o004),
+                    uid: SetUid::Set(42),
+                    gid: SetGid::Set(primary_gid),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        for (tag, fid, newfid, inode_id, flags) in [
+            (1, 1, 2, file_id, O_RDONLY as u32),
+            (3, 3, 4, file_id, O_WRONLY as u32),
+            (5, 5, 6, file_id, O_RDWR as u32),
+            (7, 7, 8, directory_id, O_RDONLY as u32),
+        ] {
+            let mut payload = rebind_credential_payload(primary_gid, &[]);
+            payload[6] |= P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE;
+            assert!(matches!(
+                request(
+                    &handler,
+                    tag,
+                    Message::Trebind(Trebind {
+                        fid,
+                        inode_id,
+                        root_inode: 0,
+                        flags: 0,
+                        uname: P9String::new(payload),
+                        n_uname: uid,
+                    }),
+                )
+                .await
+                .body,
+                Message::Rrebind(_)
+            ));
+            let credentials = handler.get_fid(fid).unwrap().creds;
+            assert!(credentials.gid_known);
+            assert!(!credentials.groups_complete);
+            let roundtrip = Credentials::from_auth_context(&AuthContext::from(&credentials));
+            assert!(roundtrip.gid_known);
+            assert!(!roundtrip.groups_complete);
+            assert!(matches!(
+                request(
+                    &handler,
+                    tag + 1,
+                    Message::Tlopenat(Tlopenat { fid, newfid, flags }),
+                )
+                .await
+                .body,
+                Message::Rlopenat(_)
+            ));
+        }
+
+        let mut payload = rebind_credential_payload(primary_gid, &[]);
+        payload[6] |= P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE;
+        assert!(matches!(
+            request(
+                &handler,
+                9,
+                Message::Trebind(Trebind {
+                    fid: 9,
+                    inode_id: known_group_denied_id,
+                    root_inode: 0,
+                    flags: 0,
+                    uname: P9String::new(payload),
+                    n_uname: uid,
+                }),
+            )
+            .await
+            .body,
+            Message::Rrebind(_)
+        ));
+        assert!(matches!(
+            request(
+                &handler,
+                10,
+                Message::Tlopenat(Tlopenat {
+                    fid: 9,
+                    newfid: 10,
+                    flags: O_RDONLY as u32,
+                }),
+            )
+            .await
+            .body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+    }
+
+    #[tokio::test]
+    async fn opened_fids_preserve_authorized_io_after_chmod() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let root = Credentials {
+            uid: 0,
+            gid: 0,
+            gid_known: true,
+            groups: [0; P9_MAX_GROUPS],
+            groups_count: 1,
+            groups_complete: true,
+        };
+        let contents = b"open capability";
+        let (file_id, _) = fs
+            .create(
+                &creds,
+                0,
+                b"capability",
+                &SetAttributes {
+                    mode: SetMode::Set(0o600),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        fs.write(
+            &AuthContext::from(&creds),
+            file_id,
+            0,
+            &Bytes::from_static(contents),
+        )
+        .await
+        .unwrap();
+        // Make the session user an "other" user with read/write permission.
+        // This avoids ZeroFS's NFS-compatible owner-write exception masking a
+        // post-open permission recheck in the assertions below.
+        fs.setattr(
+            &root,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o006),
+                uid: SetUid::Set(creds.uid + 1),
+                gid: SetGid::Set(creds.gid + 1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"capability"]).await;
+        expect_walk(&handler, 3, 2, 3, &[]).await;
+        expect_walk(&handler, 4, 2, 4, &[]).await;
+        open_fid(&handler, 4, 2, O_RDONLY as u32).await;
+        open_fid(&handler, 5, 3, O_WRONLY as u32).await;
+
+        fs.setattr(
+            &root,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let read = request(
+            &handler,
+            6,
+            Message::Tread(Tread {
+                fid: 2,
+                offset: 0,
+                count: 4096,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            read.body,
+            Message::Rread(Rread { ref data, .. }) if data.as_ref() == contents
+        ));
+
+        let bad_write = request(
+            &handler,
+            7,
+            Message::Twrite(Twrite {
+                fid: 2,
+                offset: 0,
+                count: 1,
+                data: DekuBytes::from(vec![b'x']),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            bad_write.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+
+        let bad_fallocate = request(
+            &handler,
+            8,
+            Message::Tfallocate(Tfallocate {
+                fid: 2,
+                offset: 0,
+                length: 4096,
+                mode: 0,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            bad_fallocate.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+
+        let mut read_only_truncate = blank_setattr(2, SETATTR_SIZE);
+        read_only_truncate.size = 4;
+        let denied = request(&handler, 9, Message::Tsetattrattr(read_only_truncate)).await;
+        assert!(matches!(
+            denied.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+
+        let mut path_truncate = blank_setattr(4, SETATTR_SIZE);
+        path_truncate.size = 4;
+        let denied = request(&handler, 10, Message::Tsetattr(path_truncate)).await;
+        assert!(matches!(
+            denied.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        let mut opened_truncate = blank_setattr(3, SETATTR_SIZE);
+        opened_truncate.size = 4;
+        let truncated = request(&handler, 11, Message::Tsetattrattr(opened_truncate)).await;
+        assert!(matches!(
+            truncated.body,
+            Message::Rsetattrattr(Rsetattrattr {
+                stat: Stat { size: 4, .. }
+            })
+        ));
+
+        let bad_read = request(
+            &handler,
+            12,
+            Message::Tread(Tread {
+                fid: 3,
+                offset: 0,
+                count: 1,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            bad_read.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+
+        assert!(matches!(
+            request(
+                &handler,
+                13,
+                Message::Twrite(Twrite {
+                    fid: 3,
+                    offset: contents.len() as u64,
+                    count: 1,
+                    data: DekuBytes::from(vec![b'!']),
+                }),
+            )
+            .await
+            .body,
+            Message::Rwrite(Rwrite { count: 1 })
+        ));
+        assert!(matches!(
+            request(
+                &handler,
+                14,
+                Message::Tfallocate(Tfallocate {
+                    fid: 3,
+                    offset: 4096,
+                    length: 4096,
+                    mode: 0,
+                }),
+            )
+            .await
+            .body,
+            Message::Rfallocate(_)
+        ));
+    }
+
+    fn rebind_credential_payload(gid: u32, groups: &[u32]) -> Vec<u8> {
+        assert!(groups.len() <= P9_MAX_GROUPS);
+        let mut payload = Vec::with_capacity(P9_REBIND_CREDENTIAL_HEADER_SIZE + groups.len() * 4);
+        payload.push(P9_REBIND_CREDENTIAL_SENTINEL);
+        payload.push(P9_REBIND_CREDENTIAL_VERSION);
+        payload.extend_from_slice(&gid.to_le_bytes());
+        payload.push(groups.len() as u8);
+        for group in groups {
+            payload.extend_from_slice(&group.to_le_bytes());
+        }
+        payload
+    }
+
+    fn linux_new_decode_dev(encoded: u32) -> (u32, u32) {
+        let major = (encoded & 0x000f_ff00) >> 8;
+        let minor = (encoded & 0xff) | ((encoded >> 12) & 0x000f_ff00);
+        (major, minor)
+    }
+
+    #[test]
+    fn linux_device_encoding_round_trips_high_minor_and_boundaries() {
+        for (major, minor) in [
+            (0, 0),
+            (1, 0x100),
+            (0xabc, 0xabcde),
+            (MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR),
+        ] {
+            let encoded = linux_new_encode_dev(major, minor).unwrap();
+            assert!(encoded <= u32::MAX as u64);
+            assert_eq!(linux_new_decode_dev(encoded as u32), (major, minor));
+        }
+
+        assert_eq!(
+            linux_new_encode_dev(MAX_DEVICE_MAJOR, MAX_DEVICE_MINOR).unwrap(),
+            u32::MAX as u64
+        );
+    }
+
+    #[test]
+    fn linux_device_encoding_rejects_unrepresentable_components() {
+        for (major, minor) in [(MAX_DEVICE_MAJOR + 1, 0), (0, MAX_DEVICE_MINOR + 1)] {
+            assert!(matches!(
+                linux_new_encode_dev(major, minor),
+                Err(P9Error::Overflow)
+            ));
+        }
+        assert_eq!(P9Error::Overflow.to_errno(), libc::EOVERFLOW as u32);
+    }
+
+    #[tokio::test]
+    async fn mknodattr_and_getattr_encode_high_minor_with_linux_layout() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let major = 0xabc;
+        let minor = 0xabcde;
+        let expected = linux_new_encode_dev(major, minor).unwrap();
+        let created = request(
+            &handler,
+            2,
+            Message::Tmknodattr(Tmknod {
+                dfid: 1,
+                name: P9String::new(b"high-minor".to_vec()),
+                mode: S_IFCHR | 0o640,
+                major,
+                minor,
+                gid: 1000,
+            }),
+        )
+        .await;
+        let created_stat = match created.body {
+            Message::Rmknodattr(reply) => reply.stat,
+            other => panic!("expected Rmknodattr, got {other:?}"),
+        };
+        assert_eq!(created_stat.rdev, expected);
+        assert_ne!(
+            created_stat.rdev,
+            ((major as u64) << 8) | minor as u64,
+            "the legacy encoding aliases high minor bits with the major"
+        );
+        assert_eq!(
+            linux_new_decode_dev(created_stat.rdev as u32),
+            (major, minor)
+        );
+
+        expect_walk(&handler, 3, 1, 2, &[b"high-minor"]).await;
+        let fetched = request(
+            &handler,
+            4,
+            Message::Tgetattr(Tgetattr {
+                fid: 2,
+                request_mask: GETATTR_ALL,
+            }),
+        )
+        .await;
+        let fetched_stat = match fetched.body {
+            Message::Rgetattr(reply) => reply.stat,
+            other => panic!("expected Rgetattr, got {other:?}"),
+        };
+        assert_eq!(fetched_stat.rdev, expected);
+        assert_eq!(
+            linux_new_decode_dev(fetched_stat.rdev as u32),
+            (major, minor)
+        );
+    }
+
+    #[tokio::test]
+    async fn mknod_rejects_unrepresentable_linux_device_numbers() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        for (tag, name, major, minor) in [
+            (2, b"bad-major".as_slice(), MAX_DEVICE_MAJOR + 1, 0),
+            (3, b"bad-minor".as_slice(), 0, MAX_DEVICE_MINOR + 1),
+        ] {
+            let response = request(
+                &handler,
+                tag,
+                Message::Tmknodattr(Tmknod {
+                    dfid: 1,
+                    name: P9String::new(name.to_vec()),
+                    mode: S_IFBLK | 0o600,
+                    major,
+                    minor,
+                    gid: 1000,
+                }),
+            )
+            .await;
+            match response.body {
+                Message::Rlerror(error) => assert_eq!(error.ecode, libc::EINVAL as u32),
+                other => panic!("expected EINVAL Rlerror, got {other:?}"),
+            }
+        }
+
+        for (tag, name) in [(4, b"bad-major".as_slice()), (5, b"bad-minor".as_slice())] {
+            let response = walk_fid(&handler, tag, 1, tag as u32 + 10, &[name]).await;
+            match response.body {
+                Message::Rlerror(error) => assert_eq!(error.ecode, libc::ENOENT as u32),
+                other => panic!("rejected device was created: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn getattr_rejects_legacy_unrepresentable_device_number() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (device_id, _) = fs
+            .mknod(
+                &creds,
+                0,
+                b"legacy-device",
+                FileType::CharDevice,
+                &SetAttributes::default(),
+                Some((1, 2)),
+            )
+            .await
+            .unwrap();
+
+        // Model a record created before mknod began enforcing the Linux
+        // 12/20-bit dev_t split.
+        let mut inode = fs.inode_store.get(device_id).await.unwrap();
+        let Inode::CharDevice(device) = &mut inode else {
+            panic!("mknod returned a non-character-device inode");
+        };
+        device.rdev = Some((MAX_DEVICE_MAJOR + 1, 2));
+        let mut txn = fs.db.new_transaction().unwrap();
+        fs.inode_store.save(&mut txn, device_id, &inode).unwrap();
+        fs.write_coordinator.commit(txn).await.unwrap();
+
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"legacy-device"]).await;
+        let response = request(
+            &handler,
+            3,
+            Message::Tgetattr(Tgetattr {
+                fid: 2,
+                request_mask: GETATTR_ALL,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            response.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EOVERFLOW as u32
+        ));
+    }
+
+    #[tokio::test]
     async fn failed_empty_walk_getattr_does_not_publish_newfid() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
@@ -2419,6 +3653,292 @@ mod tests {
             .await;
         assert!(matches!(numeric.body, Message::Rrebind(_)));
         assert_eq!(handler.get_fid(3).unwrap().creds.uid, 1234);
+    }
+
+    #[tokio::test]
+    async fn rebind_installs_binary_filesystem_credentials() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let response = handler
+            .handle_message(
+                1,
+                Message::Trebind(Trebind {
+                    fid: 1,
+                    inode_id: 0,
+                    root_inode: 0,
+                    flags: 0,
+                    uname: P9String::new(rebind_credential_payload(2345, &[3456, 4567])),
+                    n_uname: 1234,
+                }),
+            )
+            .await;
+        assert!(matches!(response.body, Message::Rrebind(_)));
+
+        let credentials = handler.get_fid(1).unwrap().creds;
+        assert_eq!(credentials.uid, 1234);
+        assert_eq!(credentials.gid, 2345);
+        assert_eq!(credentials.groups_count, 2);
+        assert_eq!(&credentials.groups[..2], &[3456, 4567]);
+    }
+
+    #[tokio::test]
+    async fn rebind_binary_credentials_are_strictly_validated() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        negotiate_zerofs(&handler).await;
+
+        let mut wrong_version = rebind_credential_payload(1, &[]);
+        wrong_version[1] = P9_REBIND_CREDENTIAL_VERSION + 1;
+        let mut too_many = vec![0; P9_REBIND_CREDENTIAL_HEADER_SIZE + (P9_MAX_GROUPS + 1) * 4];
+        too_many[0] = P9_REBIND_CREDENTIAL_SENTINEL;
+        too_many[1] = P9_REBIND_CREDENTIAL_VERSION;
+        too_many[6] = (P9_MAX_GROUPS + 1) as u8;
+        let mut truncated = rebind_credential_payload(1, &[]);
+        truncated[6] = 1;
+        let mut trailing = rebind_credential_payload(1, &[]);
+        trailing.push(0);
+
+        for (index, payload) in [
+            vec![P9_REBIND_CREDENTIAL_SENTINEL],
+            wrong_version,
+            too_many,
+            truncated,
+            trailing,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fid = index as u32 + 1;
+            let result = handler
+                .rebind(Trebind {
+                    fid,
+                    inode_id: 0,
+                    root_inode: 0,
+                    flags: 0,
+                    uname: P9String::new(payload),
+                    n_uname: 1234,
+                })
+                .await;
+            assert!(matches!(result, Err(P9Error::InvalidEncoding)));
+            assert!(!handler.session_state().fids.contains_key(&fid));
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_credential_override_replaces_binary_credentials() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let mut handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        handler.credential_override = Some((42, 84));
+        negotiate_zerofs(&handler).await;
+
+        let mut payload = rebind_credential_payload(2345, &[3456]);
+        payload[6] |= P9_REBIND_CREDENTIAL_GROUPS_INCOMPLETE;
+        let response = handler
+            .handle_message(
+                1,
+                Message::Trebind(Trebind {
+                    fid: 1,
+                    inode_id: 0,
+                    root_inode: 0,
+                    flags: 0,
+                    uname: P9String::new(payload),
+                    n_uname: 1234,
+                }),
+            )
+            .await;
+        assert!(matches!(response.body, Message::Rrebind(_)));
+
+        let credentials = handler.get_fid(1).unwrap().creds;
+        assert_eq!(credentials.uid, 42);
+        assert_eq!(credentials.gid, 84);
+        assert_eq!(credentials.groups_count, 1);
+        assert_eq!(credentials.groups[0], 84);
+        assert!(credentials.groups_complete);
+    }
+
+    fn blank_setattr(fid: u32, valid: u32) -> Tsetattr {
+        Tsetattr {
+            fid,
+            valid,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+        }
+    }
+
+    #[test]
+    fn setattr_wire_values_are_validated_before_conversion() {
+        let invalid_masks = [
+            SETATTR_KNOWN | 0x4000_0000,
+            SETATTR_ATIME_SET,
+            SETATTR_MTIME_SET,
+        ];
+        for valid in invalid_masks {
+            assert!(matches!(
+                set_attributes_from_request(&blank_setattr(1, valid)),
+                Err(P9Error::InvalidArgument)
+            ));
+        }
+
+        let mut bad_atime = blank_setattr(1, SETATTR_ATIME | SETATTR_ATIME_SET);
+        bad_atime.atime_nsec = 1_000_000_000;
+        assert!(matches!(
+            set_attributes_from_request(&bad_atime),
+            Err(P9Error::InvalidArgument)
+        ));
+
+        let mut bad_mtime = blank_setattr(1, SETATTR_MTIME | SETATTR_MTIME_SET);
+        bad_mtime.mtime_nsec = u64::MAX;
+        assert!(matches!(
+            set_attributes_from_request(&bad_mtime),
+            Err(P9Error::InvalidArgument)
+        ));
+
+        let mut boundary = blank_setattr(
+            1,
+            SETATTR_ATIME | SETATTR_ATIME_SET | SETATTR_MTIME | SETATTR_MTIME_SET,
+        );
+        boundary.atime_nsec = 999_999_999;
+        boundary.mtime_nsec = 999_999_999;
+        assert!(set_attributes_from_request(&boundary).is_ok());
+
+        let mut ignored = blank_setattr(1, SETATTR_MODE);
+        ignored.atime_nsec = u64::MAX;
+        ignored.mtime_nsec = u64::MAX;
+        assert!(set_attributes_from_request(&ignored).is_ok());
+    }
+
+    #[tokio::test]
+    async fn setattr_accepts_the_ctime_bit_the_linux_client_sends() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"a", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"a"]).await;
+
+        // chmod_common() sets ATTR_MODE | ATTR_CTIME, which v9fs maps straight
+        // onto the wire, so rejecting the ctime bit fails every stock chmod.
+        let mut chmod = blank_setattr(2, SETATTR_MODE | SETATTR_CTIME);
+        chmod.mode = 0o600;
+        let response = request(&handler, 3, Message::Tsetattr(chmod)).await;
+        assert!(
+            matches!(response.body, Message::Rsetattr(_)),
+            "chmod carrying the ctime bit was rejected: {:?}",
+            response.body
+        );
+        assert_eq!(
+            fs.inode_store.get(file_id).await.unwrap().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn access_time_extension_requires_a_readable_open_fid() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (_file_id, prepared) = fs
+            .create(
+                &creds,
+                0,
+                b"atime",
+                &SetAttributes {
+                    atime: SetTime::SetToClientTime(Timestamp {
+                        seconds: 1,
+                        nanoseconds: 0,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"atime"]).await;
+        expect_walk(&handler, 3, 2, 3, &[]).await;
+        open_fid(&handler, 4, 2, O_RDONLY as u32).await;
+        open_fid(&handler, 5, 3, O_WRONLY as u32).await;
+
+        let valid = SETATTR_ATIME_ACCESS | SETATTR_ATIME;
+        let denied = handler
+            .handle_message_with_op_id(
+                6,
+                [0x91; 16],
+                Message::Tsetattrattr(blank_setattr(3, valid)),
+            )
+            .await;
+        assert!(matches!(
+            denied.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EBADF as u32
+        ));
+
+        let malformed = handler
+            .handle_message_with_op_id(
+                7,
+                [0x92; 16],
+                Message::Tsetattrattr(blank_setattr(2, SETATTR_ATIME_ACCESS)),
+            )
+            .await;
+        assert!(matches!(
+            malformed.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+
+        let updated = handler
+            .handle_message_with_op_id(
+                8,
+                [0x93; 16],
+                Message::Tsetattrattr(blank_setattr(2, valid)),
+            )
+            .await;
+        let Message::Rsetattrattr(Rsetattrattr { stat }) = updated.body else {
+            panic!("access-time update failed: {:?}", updated.body);
+        };
+        assert!(stat.atime_sec > 1);
+        assert_eq!(
+            (stat.ctime_sec, stat.ctime_nsec),
+            (prepared.ctime.seconds, prepared.ctime.nanoseconds as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn both_setattr_handlers_reject_invalid_wire_values() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs, Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+
+        let standard = handler
+            .handle_message(
+                2,
+                Message::Tsetattr(blank_setattr(1, SETATTR_KNOWN | 0x4000_0000)),
+            )
+            .await;
+        assert!(matches!(
+            standard.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+
+        let mut bad_nsec = blank_setattr(1, SETATTR_ATIME | SETATTR_ATIME_SET);
+        bad_nsec.atime_nsec = 1_000_000_000;
+        let compound = handler
+            .handle_message_with_op_id(3, [0x73; 16], Message::Tsetattrattr(bad_nsec))
+            .await;
+        assert!(matches!(
+            compound.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
     }
 
     #[test]
@@ -2560,6 +4080,61 @@ mod tests {
             fs.lookup(&test_creds(), 0, b"must-stay-absent").await,
             Err(FsError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn zero_length_twrite_retry_keeps_its_typed_result() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"empty-write", &SetAttributes::default())
+            .await
+            .unwrap();
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_session(&handler, DEFAULT_MSIZE, VERSION_9P2000L_ZEROFS, b"").await;
+        expect_walk(&handler, 2, 1, 2, &[b"empty-write"]).await;
+        open_fid(&handler, 3, 2, O_WRONLY as u32).await;
+
+        let op_id = [0x63; 16];
+        let empty_write = Message::Twrite(Twrite {
+            fid: 2,
+            offset: 1_000_000,
+            count: 0,
+            data: DekuBytes::default(),
+        });
+        let initial = handler
+            .handle_message_with_op_id(4, op_id, empty_write.clone())
+            .await;
+        assert!(matches!(initial.body, Message::Rwrite(Rwrite { count: 0 })));
+        let original_attrs = match fs.dedup.get(&op_id) {
+            Some(crate::dedup::DedupResult::Write { attrs }) => attrs,
+            result => panic!("zero-length write stored an untyped result: {result:?}"),
+        };
+        assert_eq!(original_attrs.size, 0);
+
+        fs.write(
+            &AuthContext::from(&creds),
+            file_id,
+            0,
+            &Bytes::from_static(b"later"),
+        )
+        .await
+        .unwrap();
+
+        let retry = handler
+            .handle_message_with_op_envelope(5, op_id, ninep_proto::P9_OP_FLAG_RETRY, empty_write)
+            .await;
+        assert!(matches!(retry.body, Message::Rwrite(Rwrite { count: 0 })));
+        assert!(matches!(
+            fs.dedup.get(&op_id),
+            Some(crate::dedup::DedupResult::Write { ref attrs })
+                if attrs.size == original_attrs.size && attrs.mtime == original_attrs.mtime
+        ));
+        let (data, _) = fs
+            .read_file(&AuthContext::from(&creds), file_id, 0, 5)
+            .await
+            .unwrap();
+        assert_eq!(data.as_ref(), b"later");
     }
 
     #[tokio::test]
@@ -2875,11 +4450,8 @@ mod tests {
                 assert!(rstatfs.ffree > 0);
                 assert_eq!(rstatfs.namelen, 255);
 
-                // Verify totals match our constants
                 const TOTAL_BYTES: u64 = u64::MAX;
                 assert_eq!(rstatfs.blocks, TOTAL_BYTES.div_ceil(4096));
-                // files = used_inodes + available_inodes, ffree = available_inodes
-                // Since no files created yet (only root inode), files should equal ffree + used
                 assert!(rstatfs.files > 0);
                 assert!(rstatfs.ffree > 0);
             }
@@ -2951,8 +4523,10 @@ mod tests {
         let creds = Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         };
         for i in 0..10 {
             fs.create(
@@ -3018,8 +4592,10 @@ mod tests {
         let creds = Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         };
         for i in 0..5 {
             fs.create(
@@ -3073,8 +4649,10 @@ mod tests {
         let creds = Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         };
 
         for i in 0..1002 {
@@ -3159,7 +4737,7 @@ mod tests {
                         batch_count, current_offset
                     );
 
-                    // If we got less than a reasonable amount, we might be at the end
+                    // A zero-entry page ends enumeration.
                     if batch_count == 0 {
                         break;
                     }
@@ -3210,8 +4788,10 @@ mod tests {
         let creds = Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         };
         let (_empty_dir_id, _) = fs
             .mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
@@ -3350,6 +4930,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlinkat_rejects_unknown_flags_and_preserves_wrong_kinds() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let handler = NinePHandler::new(fs.clone(), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[]).await;
+        create_file(&handler, 3, 2, b"file").await;
+        assert!(matches!(
+            handler
+                .handle_message(4, Message::Tclunk(Tclunk { fid: 2 }))
+                .await
+                .body,
+            Message::Rclunk(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle_message(
+                    5,
+                    Message::Tmkdir(Tmkdir {
+                        dfid: 1,
+                        name: P9String::new(b"directory".to_vec()),
+                        mode: 0o755,
+                        gid: 1000,
+                    }),
+                )
+                .await
+                .body,
+            Message::Rmkdir(_)
+        ));
+
+        let unknown = handler
+            .handle_message(
+                6,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"file".to_vec()),
+                    flags: 1,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            unknown.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EINVAL as u32
+        ));
+
+        let file_as_directory = handler
+            .handle_message(
+                7,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"file".to_vec()),
+                    flags: AT_REMOVEDIR,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            file_as_directory.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ENOTDIR as u32
+        ));
+
+        let directory_as_file = handler
+            .handle_message(
+                8,
+                Message::Tunlinkat(Tunlinkat {
+                    dirfid: 1,
+                    name: P9String::new(b"directory".to_vec()),
+                    flags: 0,
+                }),
+            )
+            .await;
+        assert!(matches!(
+            directory_as_file.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EISDIR as u32
+        ));
+
+        assert!(fs.lookup(&test_creds(), 0, b"file").await.is_ok());
+        assert!(
+            fs.lookup(&test_creds(), 0, b"directory").await.is_ok(),
+            "wrong-kind remove must preserve the directory"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_releases_open_handle_immediately() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let handler = zerofs_handler(&fs).await;
@@ -3376,6 +5038,7 @@ mod tests {
                     creds,
                 },
                 handle: Some(handle),
+                replay_reopen: false,
                 lock_guard: None,
             },
         );
@@ -3479,7 +5142,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_replay_recovers_parentless_hardlink() {
+    async fn rebind_enforces_ancestor_search_from_global_root() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (directory_id, _) = fs
+            .mkdir(
+                &creds,
+                0,
+                b"private",
+                &SetAttributes {
+                    mode: SetMode::Set(0o700),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (file_id, _) = fs
+            .create(&creds, directory_id, b"file", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.setattr(
+            &creds,
+            directory_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&handler, 1, 1, file_id, 0, 0).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        let replay = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&replay, 2, 1, file_id, 0, P9_REBIND_REPLAY).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+        ));
+        assert!(replay.get_fid(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn root_self_rebind_checks_the_declared_root_path() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (parent_id, _) = fs
+            .mkdir(&creds, 0, b"private-parent", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (attach_root, _) = fs
+            .mkdir(&creds, parent_id, b"attach-root", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.setattr(
+            &creds,
+            parent_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let manual = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&manual, 1, 1, attach_root, attach_root, 0).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        let replay = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(
+                &replay,
+                2,
+                1,
+                attach_root,
+                attach_root,
+                P9_REBIND_REPLAY,
+            )
+            .await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+        ));
+        assert!(replay.get_fid(1).is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_parentless_hardlink_without_subtree_witness() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let creds = test_creds();
         let auth = AuthContext::from(&creds);
@@ -3500,10 +5254,6 @@ mod tests {
             .await
             .unwrap();
 
-        let old_pin = {
-            let _lock = fs.lock_manager.acquire(file_id).await;
-            fs.new_open_handle(file_id)
-        };
         fs.link(&auth, file_id, other_id, b"alias").await.unwrap();
         assert!(matches!(
             fs.inode_store.get(file_id).await.unwrap(),
@@ -3524,82 +5274,25 @@ mod tests {
             Message::Rlerror(_)
         ));
 
-        // Automatic replay restores the recorded linked fid without an open pin.
-        drop(old_pin);
+        // A replay bit is not proof that either alias belongs to the declared
+        // subtree. Both lock-only and opened replay therefore fail closed.
         assert_eq!(fs.open_handle_count(file_id), 0);
-        let lock_only = zerofs_handler(&fs).await;
-        assert!(matches!(
-            rebind(&lock_only, 3, 1, file_id, tenant_id, P9_REBIND_REPLAY).await,
-            Message::Rrebind(_)
-        ));
-        assert_eq!(fs.open_handle_count(file_id), 0);
-        assert!(matches!(
-            lock_only
-                .handle_message(
-                    4,
-                    Message::Tlock(Tlock {
-                        fid: 1,
-                        lock_type: LockType::WriteLock,
-                        flags: 0,
-                        start: 0,
-                        length: 0,
-                        proc_id: 7,
-                        client_id: P9String::new(b"replayed-lock".to_vec()),
-                    }),
-                )
-                .await
-                .body,
-            Message::Rlock(Rlock {
-                status: LockStatus::Success
-            })
-        ));
-        assert_eq!(
-            fs.open_handle_count(file_id),
-            0,
-            "a replayed lock-only fid remains unpinned"
-        );
-
-        // `Tlopen` consumes the provisional replay pin.
-        let promoted = zerofs_handler(&fs).await;
-        assert!(matches!(
-            rebind(
-                &promoted,
-                4,
-                1,
-                file_id,
-                tenant_id,
-                P9_REBIND_REPLAY | P9_REBIND_OPENED,
-            )
-            .await,
-            Message::Rrebind(_)
-        ));
-        assert_eq!(fs.open_handle_count(file_id), 1);
-        assert!(matches!(
-            promoted
-                .handle_message(
-                    5,
-                    Message::Tlopen(Tlopen {
-                        fid: 1,
-                        flags: O_RDONLY as u32,
-                    }),
-                )
-                .await
-                .body,
-            Message::Rlopen(_)
-        ));
-        assert_eq!(fs.open_handle_count(file_id), 1);
-        assert!(matches!(
-            promoted
-                .handle_message(6, Message::Tclunk(Tclunk { fid: 1 }))
-                .await
-                .body,
-            Message::Rclunk(_)
-        ));
+        for (tag, flags) in [
+            (3, P9_REBIND_REPLAY),
+            (4, P9_REBIND_REPLAY | P9_REBIND_OPENED),
+        ] {
+            let reconnect = zerofs_handler(&fs).await;
+            assert!(matches!(
+                rebind(&reconnect, tag, 1, file_id, tenant_id, flags).await,
+                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            ));
+            assert!(reconnect.get_fid(1).is_err());
+        }
         assert_eq!(fs.open_handle_count(file_id), 0);
     }
 
     #[tokio::test]
-    async fn moved_open_fid_rebinds_to_its_old_root_after_promotion() {
+    async fn replay_rejects_inode_moved_outside_recorded_root() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let creds = test_creds();
         let auth = AuthContext::from(&creds);
@@ -3619,19 +5312,6 @@ mod tests {
             .create(&creds, old_root, b"file", &SetAttributes::default())
             .await
             .unwrap();
-        let old_pin = {
-            let _lock = fs.lock_manager.acquire(file_id).await;
-            fs.new_open_handle(file_id)
-        };
-        fs.write(
-            &auth,
-            file_id,
-            0,
-            &Bytes::from_static(b"moved-open contents"),
-        )
-        .await
-        .unwrap();
-
         fs.rename(&auth, old_root, b"file", new_root, b"moved")
             .await
             .unwrap();
@@ -3648,8 +5328,8 @@ mod tests {
             Message::Rlerror(_)
         ));
 
-        // Promotion replay restores the recorded fid by identity.
-        drop(old_pin);
+        // Replay cannot turn the old attach root into an authorization
+        // capability after the inode has moved outside it.
         let promoted = zerofs_handler(&fs).await;
         assert!(matches!(
             rebind(
@@ -3661,43 +5341,10 @@ mod tests {
                 P9_REBIND_REPLAY | P9_REBIND_OPENED,
             )
             .await,
-            Message::Rrebind(_)
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
         ));
-        assert_eq!(promoted.get_fid(1).unwrap().root, old_root);
-        assert_eq!(fs.open_handle_count(file_id), 1);
-        assert!(matches!(
-            promoted
-                .handle_message(
-                    4,
-                    Message::Tlopen(Tlopen {
-                        fid: 1,
-                        flags: O_RDONLY as u32,
-                    }),
-                )
-                .await
-                .body,
-            Message::Rlopen(_)
-        ));
-        assert_eq!(
-            fs.open_handle_count(file_id),
-            1,
-            "Tlopen must consume the moved fid's provisional pin"
-        );
-        let read = promoted
-            .handle_message(
-                5,
-                Message::Tread(Tread {
-                    fid: 1,
-                    offset: 0,
-                    count: 64,
-                }),
-            )
-            .await;
-        assert!(matches!(
-            read.body,
-            Message::Rread(Rread { ref data, .. })
-                if data.as_ref() == b"moved-open contents"
-        ));
+        assert!(promoted.get_fid(1).is_err());
+        assert_eq!(fs.open_handle_count(file_id), 0);
     }
 
     #[tokio::test]
@@ -3730,7 +5377,7 @@ mod tests {
         assert_eq!(
             fs.open_handle_count(root_id),
             1,
-            "rejected replay must not install a provisional pin"
+            "rejected replay must not install an open pin"
         );
 
         let denied = rebind(&handler, 3, 3, root_id, root_id, 0).await;
@@ -3744,7 +5391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linked_provisional_rebind_pin_releases_on_disconnect() {
+    async fn replay_opened_is_only_a_marker_until_reopen_succeeds() {
         let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
         let creds = test_creds();
         let (file_id, _) = fs
@@ -3772,7 +5419,13 @@ mod tests {
             .await,
             Message::Rrebind(_)
         ));
-        assert_eq!(fs.open_handle_count(file_id), 1);
+        assert_eq!(fs.open_handle_count(file_id), 0);
+        {
+            let state = handler.session_state();
+            let slot = state.fids.get(&1).unwrap();
+            assert!(slot.handle.is_none());
+            assert!(slot.replay_reopen);
+        }
 
         assert!(matches!(
             handler
@@ -3784,7 +5437,7 @@ mod tests {
         assert_eq!(
             fs.open_handle_count(file_id),
             0,
-            "clunk immediately releases an abandoned provisional pin"
+            "an abandoned replay marker never owned an open pin"
         );
 
         let retry = zerofs_handler(&fs).await;
@@ -3800,22 +5453,370 @@ mod tests {
             .await,
             Message::Rrebind(_)
         ));
-        assert_eq!(fs.open_handle_count(file_id), 1);
+        assert_eq!(fs.open_handle_count(file_id), 0);
 
-        retry.close_for_disconnect();
+        let reopened = request(
+            &retry,
+            5,
+            Message::Tlopenat(Tlopenat {
+                fid: 1,
+                newfid: 1,
+                flags: O_RDONLY as u32,
+            }),
+        )
+        .await;
+        assert!(matches!(reopened.body, Message::Rlopenat(_)));
+        assert_eq!(fs.open_handle_count(file_id), 1);
         {
             let state = retry.session_state();
-            let retired = state
-                .fids
-                .get(&1)
-                .expect("provisional replay fid metadata remains available");
-            assert!(retired.handle.is_none());
-            assert!(retired.lock_guard.is_none());
+            let slot = state.fids.get(&1).unwrap();
+            assert!(slot.fid.opened);
+            assert!(slot.handle.is_some());
+            assert!(!slot.replay_reopen);
         }
+        assert!(matches!(
+            request(&retry, 6, Message::Tclunk(Tclunk { fid: 1 }))
+                .await
+                .body,
+            Message::Rclunk(_)
+        ));
         assert_eq!(
             fs.open_handle_count(file_id),
             0,
-            "disconnect must release an incomplete Trebind/Tlopen pin immediately"
+            "the first real open pin is released by clunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_reopen_loses_to_final_unlink_without_repinning_the_orphan() {
+        for use_lopenat in [false, true] {
+            let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+            let creds = test_creds();
+            let name = if use_lopenat {
+                b"lopenat-race".as_slice()
+            } else {
+                b"lopen-race".as_slice()
+            };
+            let (file_id, _) = fs
+                .create(&creds, 0, name, &SetAttributes::default())
+                .await
+                .unwrap();
+            let existing_open = {
+                let _guard = fs.lock_manager.acquire(file_id).await;
+                fs.new_open_handle(file_id)
+            };
+            let handler = zerofs_handler(&fs).await;
+            assert!(matches!(
+                rebind(
+                    &handler,
+                    1,
+                    1,
+                    file_id,
+                    0,
+                    P9_REBIND_REPLAY | P9_REBIND_OPENED,
+                )
+                .await,
+                Message::Rrebind(_)
+            ));
+            assert_eq!(
+                fs.open_handle_count(file_id),
+                1,
+                "Trebind must not add a second pin"
+            );
+
+            fs.remove(&AuthContext::from(&creds), 0, name)
+                .await
+                .unwrap();
+            assert_eq!(fs.inode_store.get(file_id).await.unwrap().nlink(), 0);
+
+            let reopen = if use_lopenat {
+                request(
+                    &handler,
+                    2,
+                    Message::Tlopenat(Tlopenat {
+                        fid: 1,
+                        newfid: 1,
+                        flags: O_RDONLY as u32,
+                    }),
+                )
+                .await
+            } else {
+                request(
+                    &handler,
+                    2,
+                    Message::Tlopen(Tlopen {
+                        fid: 1,
+                        flags: O_RDONLY as u32,
+                    }),
+                )
+                .await
+            };
+            assert!(matches!(
+                reopen.body,
+                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            ));
+            assert_eq!(
+                fs.open_handle_count(file_id),
+                1,
+                "a lost replay race must not repin the orphan"
+            );
+            {
+                let state = handler.session_state();
+                let slot = state.fids.get(&1).unwrap();
+                assert!(slot.handle.is_none());
+                assert!(slot.replay_reopen);
+            }
+
+            drop(existing_open);
+            assert_eq!(fs.open_handle_count(file_id), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rebind_binds_a_hardlinked_inode_without_ancestry() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let auth = AuthContext::from(&creds);
+        let (dir_id, _) = fs
+            .mkdir(&creds, 0, b"dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        let (file_id, _) = fs
+            .create(&creds, dir_id, b"a", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.link(&auth, file_id, dir_id, b"b").await.unwrap();
+        // A second name clears the parent pointer, so there is no ancestry left
+        // to walk. Binding by identity must still work, or every operation on a
+        // hardlinked file fails once the client's fid cache misses.
+        assert!(
+            fs.inode_store
+                .get(file_id)
+                .await
+                .unwrap()
+                .parent()
+                .is_none()
+        );
+
+        let handler = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&handler, 1, 1, file_id, 0, 0).await,
+            Message::Rrebind(_)
+        ));
+
+        // A subtree attach still has to prove membership it cannot prove here.
+        assert!(matches!(
+            rebind(&handler, 2, 2, file_id, dir_id, 0).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        // Removing one alias leaves the surviving inode in the same lazy
+        // parentless representation, now with nlink == 1.
+        fs.remove(&auth, dir_id, b"b").await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
+        assert_eq!(inode.nlink(), 1);
+        assert!(inode.parent().is_none());
+        assert!(inode.name().is_none());
+
+        assert!(matches!(
+            rebind(&handler, 3, 3, file_id, 0, 0).await,
+            Message::Rrebind(_)
+        ));
+        assert!(matches!(
+            rebind(&handler, 4, 4, file_id, dir_id, 0).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+
+        // The parentless exception still requires search access at the global
+        // root; knowing an inode number must not bypass a revoked root.
+        let root = fs.inode_store.get(0).await.unwrap();
+        let root_owner = Credentials {
+            uid: root.uid(),
+            gid: root.gid(),
+            gid_known: true,
+            groups: [root.gid(); P9_MAX_GROUPS],
+            groups_count: 1,
+            groups_complete: true,
+        };
+        fs.setattr(
+            &root_owner,
+            0,
+            &SetAttributes {
+                mode: SetMode::Set(0o600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            rebind(&handler, 5, 5, file_id, 0, 0).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+        let replay = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(&replay, 6, 1, file_id, 0, P9_REBIND_REPLAY).await,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_opened_flag_does_not_bypass_current_dac() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (file_id, _) = fs
+            .create(&creds, 0, b"a", &SetAttributes::default())
+            .await
+            .unwrap();
+        // The descriptor being replayed was opened before this.
+        fs.setattr(
+            &creds,
+            file_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = zerofs_handler(&fs).await;
+        assert!(matches!(
+            rebind(
+                &handler,
+                1,
+                1,
+                file_id,
+                0,
+                P9_REBIND_REPLAY | P9_REBIND_OPENED
+            )
+            .await,
+            Message::Rrebind(_)
+        ));
+        assert_eq!(
+            fs.open_handle_count(file_id),
+            0,
+            "OPENED is only a pending-reopen marker"
+        );
+        let clone_denied = request(
+            &handler,
+            2,
+            Message::Tlopenat(Tlopenat {
+                fid: 1,
+                newfid: 2,
+                flags: O_RDWR as u32,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            clone_denied.body,
+            Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32
+        ));
+        assert!(handler.get_fid(2).is_err());
+
+        let replayed = request(
+            &handler,
+            3,
+            Message::Tlopenat(Tlopenat {
+                fid: 1,
+                newfid: 1,
+                flags: O_RDWR as u32,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                replayed.body,
+                Message::Rlerror(Rlerror { ecode }) if ecode == libc::ESTALE as u32
+            ),
+            "replay OPENED bypassed DAC: {:?}",
+            replayed.body
+        );
+        assert_eq!(
+            fs.open_handle_count(file_id),
+            0,
+            "failed reopen must not create an open pin"
+        );
+        {
+            let state = handler.session_state();
+            let slot = state.fids.get(&1).unwrap();
+            assert!(slot.handle.is_none());
+            assert!(slot.replay_reopen);
+        }
+        assert!(matches!(
+            request(&handler, 4, Message::Tclunk(Tclunk { fid: 1 }))
+                .await
+                .body,
+            Message::Rclunk(_)
+        ));
+        assert_eq!(fs.open_handle_count(file_id), 0);
+
+        // A fresh open of the same inode is still checked.
+        assert!(matches!(
+            rebind(&handler, 5, 3, file_id, 0, 0).await,
+            Message::Rrebind(_)
+        ));
+        let denied = request(
+            &handler,
+            6,
+            Message::Tlopenat(Tlopenat {
+                fid: 3,
+                newfid: 4,
+                flags: O_RDWR as u32,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied.body, Message::Rlerror(Rlerror { ecode }) if ecode == libc::EACCES as u32),
+            "unauthorized open succeeded: {:?}",
+            denied.body
+        );
+    }
+
+    #[tokio::test]
+    async fn readdir_uses_the_capability_the_open_authorized() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let creds = test_creds();
+        let (dir_id, _) = fs
+            .mkdir(&creds, 0, b"dir", &SetAttributes::default())
+            .await
+            .unwrap();
+        fs.create(&creds, dir_id, b"a", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let handler = NinePHandler::new(Arc::clone(&fs), Arc::new(FileLockManager::new()));
+        start_plain_session(&handler).await;
+        expect_walk(&handler, 2, 1, 2, &[b"dir"]).await;
+        open_fid(&handler, 3, 2, O_RDONLY as u32).await;
+
+        // Revoking read after the open must not fail the paged listing halfway
+        // through, exactly as it does not fail an open file's reads.
+        fs.setattr(
+            &creds,
+            dir_id,
+            &SetAttributes {
+                mode: SetMode::Set(0o000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let listed = request(
+            &handler,
+            4,
+            Message::Treaddir(Treaddir {
+                fid: 2,
+                offset: 0,
+                count: DEFAULT_MSIZE - P9_IOHDRSZ,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(listed.body, Message::Rreaddir(_)),
+            "readdir on an open directory fid failed after chmod: {:?}",
+            listed.body
         );
     }
 
@@ -4640,8 +6641,10 @@ mod tests {
         Credentials {
             uid: 1000,
             gid: 1000,
+            gid_known: true,
             groups: [1000; 16],
             groups_count: 1,
+            groups_complete: true,
         }
     }
 }

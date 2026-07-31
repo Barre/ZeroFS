@@ -10,6 +10,14 @@ documentation = "https://docs.rs/ninep-proto"
 keywords = ["9p", "9p2000l", "protocol", "filesystem", "zerofs"]
 categories = ["network-programming", "filesystem", "encoding"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(MODULE)"] }
+
+[features]
+default = ["std"]
+owned = ["dep:bytes", "dep:deku", "deku/alloc"]
+std = ["owned", "bytes?/std", "deku?/std"]
+
 [dependencies]
-deku = "0.20"
-bytes = "1.10"
+deku = { version = "0.20", default-features = false, optional = true }
+bytes = { version = "1.10", default-features = false, optional = true }
