@@ -14,7 +14,7 @@ This guide covers installing ZeroFS, writing a basic configuration, and mounting
 
 ## Installation
 
-ZeroFS is distributed as a single binary. The Linux amd64 and arm64 builds are statically linked against musl; the other Linux builds link glibc dynamically. On Debian/Ubuntu and Fedora/RHEL, install from the apt or dnf repository: it keeps `zerofs` up to date through the package manager and also installs a systemd service and a config skeleton. On other platforms, use the install script or build from source.
+ZeroFS is distributed as a single binary. The Linux amd64 and arm64 builds are statically linked against musl; the other Linux builds link glibc dynamically. On Debian/Ubuntu, Fedora/RHEL, and openSUSE, install from the apt, dnf, or zypper repository: it keeps `zerofs` up to date through the package manager and also installs a systemd service and a config skeleton. On other platforms, use the install script or build from source.
 
 <CodeGroup>
 
@@ -29,6 +29,14 @@ sudo apt update && sudo apt install zerofs
 # x86_64 and aarch64
 curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo
 sudo dnf install zerofs
+```
+
+```bash {{ title: 'Zypper (openSUSE) (Recommended)' }}
+# x86_64 and aarch64
+sudo curl -fsSL https://pkgs.zerofs.net/zerofs.repo \
+  -o /etc/zypp/repos.d/zerofs.repo
+sudo zypper --gpg-auto-import-keys refresh
+sudo zypper install zerofs
 ```
 
 ```bash {{ title: 'Install script' }}
@@ -336,20 +344,26 @@ docker run -d \
 
 ## Mount the Filesystem
 
-With ZeroFS running, mount the filesystem. On Linux, the recommended client is ZeroFS's own `zerofs mount`. It connects to the 9P server, mounts as a regular user without root, and reconnects on its own if the server restarts or is temporarily unavailable. NFS and the Linux kernel 9P client also work:
+With ZeroFS running, mount the filesystem. On Linux, use the [native kernel client](/kernel-client) when a matching module is installed. Otherwise use `zerofs mount`, the bundled FUSE client. NFS and stock Linux v9fs also work.
 
 <CodeGroup>
 
-```bash {{ title: 'zerofs mount (Recommended)' }}
-# Linux: ZeroFS's own client. Requires [servers.ninep] in your config.
-
-# Create mount point
+```bash {{ title: 'Native kernel client' }}
+# Requires a matching module and [servers.ninep] in the server config.
 sudo mkdir -p /mnt/zerofs
+sudo mount -t zerofs \
+  -o consistency=relaxed,msize=10485760 \
+  127.0.0.1:5564 /mnt/zerofs
+```
 
-# Connect to the 9P server and mount via FUSE (runs as a regular user)
+```bash {{ title: 'zerofs mount (FUSE fallback)' }}
+# Requires [servers.ninep] in the server config.
+sudo mkdir -p /mnt/zerofs
+sudo chown "$USER" /mnt/zerofs
+
 zerofs mount 127.0.0.1:5564 /mnt/zerofs
 
-# Or over a Unix socket for lower-latency local mounts:
+# Or use a Unix socket for a local mount:
 # zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
 ```
 
@@ -369,18 +383,16 @@ sudo mkdir -p /mnt/zerofs
 sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
 ```
 
-```bash {{ title: 'Linux (kernel 9P)' }}
-# The Linux kernel's own 9P client. Make sure 9P is configured in your TOML file:
+```bash {{ title: 'Linux (stock v9fs)' }}
+# Make sure 9P is configured in your TOML file:
 # [servers.ninep]
 # addresses = ["127.0.0.1:5564"]
 
-# Create mount point
 sudo mkdir -p /mnt/9p
 
-# Mount ZeroFS via the kernel 9P client
+# Mount through Linux's stock 9P client.
 sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
 ```
-
 
 </CodeGroup>
 

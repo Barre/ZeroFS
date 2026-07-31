@@ -206,7 +206,7 @@ ZeroFS NFS server does not implement authentication or access control. Consider:
 
 Be aware of these NFS characteristics:
 
-- **No File Locking**: ZeroFS doesn't support NFS locking protocols. `fcntl` byte-range locking is available over 9P, from both the kernel client and `zerofs mount`; applications that need locks (SQLite, other embedded databases) should mount that way. See [File Locking](/9p-access#file-locking).
+- **No File Locking**: ZeroFS doesn't support NFS locking protocols. `fcntl` byte-range locking is available through the [native kernel client](/kernel-client), stock v9fs, and `zerofs mount`; applications that need locks (SQLite, other embedded databases) should mount over 9P. See [File Locking](/9p-access#file-locking).
 - **UID/GID Mapping**: NFS uses numeric IDs, not usernames
 - **Stateless Protocol**: The server keeps no per-client state
 - **Cache Coherency**: Multiple clients may see stale data briefly

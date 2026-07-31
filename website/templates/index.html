@@ -359,15 +359,16 @@ mount -t nfs 127.0.0.1:/ /mnt/zerofs</pre>
           </div>
           <div class="proto rv">
             <h3>9P</h3>
-            <p>fsync returns only after data reaches stable storage. The bundled FUSE client, <code>zerofs mount</code>,
-              mounts without root and reconnects on its own; it is the recommended Linux mount.</p>
-            <pre><span class="c"># bundled FUSE client, no root</span>
-zerofs mount 127.0.0.1:5564 /mnt/zerofs</pre>
+            <p>This isrecommended Linux mount.</p>
+            <pre><span class="c"># bundled FUSE client</span>
+zerofs mount 127.0.0.1:5564 /mnt/zerofs
+            <pre><span class="c"># Native kernel client</span>
+mount -t zerofs 127.0.0.1:5564 /mnt/zerofs
+</pre>
           </div>
           <div class="proto rv">
             <h3>NBD</h3>
-            <p>Device files in a <code>.nbd</code> directory attach as raw block devices; ZFS pools and VM boot disks
-              run on them. FLUSH and FUA replies return only after data is durable, so write barriers hold.</p>
+            <p>Device files in a <code>.nbd</code> directory attach as raw block devices.</p>
             <pre><span class="c"># attach a block device</span>
 nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
           </div>

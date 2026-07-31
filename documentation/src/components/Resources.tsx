@@ -61,13 +61,26 @@ const resources: Array<Resource> = [
     href: '/9p-access',
     name: '9P File Access',
     description:
-      'High-performance file access on Linux using the 9P protocol with advanced caching options.',
+      'Mount through stock Linux v9fs or the bundled FUSE client.',
     icon: LinkIcon,
     pattern: {
       y: -6,
       squares: [
         [-1, 2],
         [1, 3],
+      ],
+    },
+  },
+  {
+    href: '/kernel-client',
+    name: 'Native Kernel Client',
+    description: 'Mount through the native module when one matches the kernel.',
+    icon: PackageIcon,
+    pattern: {
+      y: 10,
+      squares: [
+        [0, 2],
+        [2, 3],
       ],
     },
   },

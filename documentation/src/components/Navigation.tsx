@@ -268,6 +268,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'Web UI', href: '/web-ui' },
       { title: 'PostgreSQL in the Browser', href: '/postgresql-in-the-browser' },
       { title: 'NFS File Access', href: '/nfs-access' },
+      { title: 'Native Kernel Client', href: '/kernel-client' },
       { title: '9P File Access', href: '/9p-access' },
       { title: '9P Protocol Extensions', href: '/9p-extensions' },
       { title: 'Client Libraries', href: '/client-libraries' },

@@ -1,6 +1,7 @@
 export const metadata = {
   title: '9P File Access',
-  description: 'Mount ZeroFS over the 9P protocol on Linux, with the kernel client or the bundled zerofs mount client.',
+  description:
+    'Mount ZeroFS over 9P with the native kernel client, stock Linux v9fs, or the bundled FUSE client.',
 }
 
 # 9P File Access
@@ -11,9 +12,11 @@ export const metadata = {
 Over 9P, fsync returns only after data reaches stable storage. NFS COMMIT semantics allow fsync to return before data reaches stable storage, so applications that depend on fsync durability (databases, transactional systems) should mount over 9P.
 </Note>
 
-## Installation
+For a compatible exact kernel, prefer the [ZeroFS native kernel client](/kernel-client). The commands below cover stock Linux v9fs and the bundled `zerofs mount` FUSE client.
 
-9P support is included in the Linux kernel. You may need to load the module:
+## Stock v9fs Installation
+
+Stock 9P support is included in the Linux kernel. You may need to load its modules:
 
 ```bash
 # Load 9P modules
@@ -67,7 +70,7 @@ sudo umount /mnt/zerofs-9p
 
 ## Mounting with `zerofs mount`
 
-The commands above use the kernel's 9P client. ZeroFS also ships its own client, run as `zerofs mount`, which connects to the same 9P server but runs in userspace over FUSE. The `mount` subcommand is compiled into Linux builds only; on macOS, mount over [NFS](/nfs-access) instead.
+The commands above use stock Linux v9fs. ZeroFS also ships its own client, run as `zerofs mount`, which connects to the same 9P server but runs in userspace over FUSE. The `mount` subcommand is compiled into Linux builds only; on macOS, mount over [NFS](/nfs-access) instead.
 
 ```bash
 # TCP
@@ -82,27 +85,27 @@ zerofs mount /tmp/zerofs.sock /mnt/zerofs-9p
 
 One target is `host` (the port defaults to 5564), `host:port`, `tcp://host:port`, or `unix:/path/to.sock`. A bare path starting with `/` or `.` is treated as a Unix socket; hostnames are resolved through DNS. For [high availability](/high-availability), pass both nodes as a comma-separated target set. `zerofs mount` probes them concurrently and re-probes the set after a disconnect.
 
-Connection-loss behavior differs. The kernel client does not rebuild a session after a server restart or network interruption; operations fail until the filesystem is unmounted and remounted. `zerofs mount` retries indefinitely with 50–500 ms backoff and rebuilds the session. Undispatched operations block until a server is available.
+Connection-loss behavior differs. Stock v9fs does not rebuild a session after a server restart or network interruption; operations fail until the filesystem is remounted. `zerofs mount` retries indefinitely with 50–500 ms backoff. The [native kernel client](/kernel-client) retries within its configured reconnect grace.
 
-Session replay rebinds linked open handles by stable inode id and re-acquires recorded byte-range locks. An open file with no remaining namespace link is connection-local and cannot be replayed. Its presence during reconnect makes the logical mount session terminal with `ESTALE`; recovery requires a new mount.
+Session replay rebinds linked open handles by stable inode id and re-acquires recorded byte-range locks. An open file with no remaining namespace link is connection-local and cannot be replayed, so that descriptor becomes stale after reconnect. Other fids remain usable; losing a fid that held a byte-range lock is session-terminal because its lock guarantee cannot be preserved.
 
 Reorder-sensitive `9P2000.L.Z` mutations retain the same operation envelope across retries. Automatic retry ends at the 120-second protocol horizon. An unresolved result is reported as an ambiguous connection failure.
 
 A few other practical differences:
 
-- It mounts as a regular user through `fusermount3`, so no `sudo` and no kernel module.
-- `--msize` defaults to 10 MiB, which is also the server's maximum: the server clamps every client's requested msize to 10 MiB, so the default is the effective ceiling and raising it has no effect. The kernel client defaults to 128 KiB (see the options table below).
-- Because the client and server ship together, they negotiate [private 9P extensions](/9p-extensions) the kernel client doesn't have, including metadata fast paths and atomic fallocate.
-- Writeback caching is on by default, so writes are buffered and flushed asynchronously (similar to the kernel client's `cache=mmap`); pass `--writeback false` to write through synchronously.
+- It mounts as a regular user through `fusermount3`, so no `sudo` and no ZeroFS-specific kernel module.
+- `--msize` defaults to 10 MiB, which is also the server's maximum: the server clamps every client's requested msize to 10 MiB, so the default is the effective ceiling and raising it has no effect. Stock v9fs defaults to 128 KiB (see the options table below).
+- Because the client and server ship together, they negotiate [private 9P extensions](/9p-extensions) that stock v9fs does not have, including metadata fast paths and atomic fallocate.
+- Writeback caching is on by default, so writes are buffered and flushed asynchronously (similar to v9fs with `cache=mmap`); pass `--writeback false` to write through synchronously.
 - `--read-only` mounts the filesystem read-only.
 
-Like the kernel client's `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions, with no uid to configure. (As with `access=user` over an unauthenticated transport, this trusts the client-supplied uid and assumes a shared uid namespace.) The `--access owner|root|all` option controls who may reach the mount; `root` and `all` require `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
+Like stock v9fs with `access=user`, each operation runs on the server as the local user that issued it: files are owned by whoever created them and the server enforces each user's own permissions, with no uid to configure. (As with `access=user` over an unauthenticated transport, this trusts the client-supplied uid and assumes a shared uid namespace.) The `--access owner|root|all` option controls who may reach the mount; `root` and `all` require `user_allow_other` in `/etc/fuse.conf` unless you mount as root.
 
 <Note>
 Unmount it like any FUSE mount with `fusermount3 -u /mnt/zerofs-9p`, or stop the `zerofs mount` process. Run `zerofs mount --help` for the full set of options.
 </Note>
 
-## Mount Options
+## Stock v9fs Mount Options
 
 ### Required Options
 
@@ -135,13 +138,13 @@ The `cache=mmap` option doesn't create a cache - it enables support for memory-m
 
 ## File Locking
 
-ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`, over 9P, from both the kernel client and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes.
+ZeroFS supports POSIX byte-range locks, `fcntl` with `F_SETLK`, `F_SETLKW`, and `F_GETLK`, over 9P from the native kernel client, stock v9fs, and `zerofs mount`. The clients carry lock requests as 9P `Tlock` and `Tgetlock` messages. Semantics follow POSIX: unlocking part of a range splits the lock, an overlapping lock from the same owner replaces the old one, read locks share a range, and write locks exclude all others. Locks are advisory: they constrain other lock requests, not reads and writes.
 
 The server arbitrates locks between clients. Processes sharing one mount are arbitrated locally by that client, since the whole mount is a single 9P session. `F_GETLK` on a range locked by another client reports the holder's pid negated, the v9fs convention for a pid that has no meaning in the local pid namespace.
 
 Blocking acquisition (`F_SETLKW`) through `zerofs mount` is polled: the server answers a contended request immediately instead of queueing the waiter, and the client retries every 50 ms until the lock is grantable.
 
-Locks live in server memory, not in the object store. A client's locks are released when its connection closes, and a server restart or HA takeover starts with an empty lock table. `zerofs mount` records its locks and re-acquires the complete set before publishing a rebuilt session; the kernel client does not, since its mount is wedged after a disconnect. Another session may acquire a lock during the gap, so replay is not continuous ownership and advisory locks are not a distributed fencing primitive.
+Locks live in server memory, not in the object store. A client's locks are released when its connection closes, and a server restart or HA takeover starts with an empty lock table. `zerofs mount` and the native kernel client re-acquire recorded locks before resuming I/O. Stock v9fs does not reconnect. Another session may acquire a lock during the gap, so replay is not continuous ownership and advisory locks are not a distributed fencing primitive.
 
 ## Configuration
 
@@ -262,7 +265,7 @@ sudo mount -t 9p -o cache=loose,trans=tcp,port=5564 127.0.0.1 /mnt/zerofs-fast
 Be aware of these 9P characteristics:
 
 - **No Extended Attributes**: The server rejects `Txattrwalk` with `ENOTSUP`, so xattrs (and POSIX ACLs, which are stored as xattrs) are unavailable from any client (`zerofs mount` returns `ENOSYS` for xattr calls without contacting the server). `setfacl` and `getfattr` fail; `rsync -X` and `cp --preserve=xattr` cannot copy xattrs onto the mount.
-- **No Supplementary Groups**: A 9P2000.L attach carries a single numeric uid. ZeroFS uses that uid as the gid and builds a one-entry group list, so the server sees each user as a member of exactly one group, numbered the same as their uid. Access granted only through another group (a mode 070 directory owned by a shared group, for example) fails with `EACCES`. An unspecified uid (`n_uname = -1`) maps to 0 for uname `root` and to 65534 (nobody) otherwise.
+- **Stock v9fs has no supplementary groups**: A plain 9P2000.L attach carries a single numeric uid. ZeroFS uses that uid as the gid and builds a one-entry group list, so stock v9fs presents each user as a member of exactly one group, numbered the same as their uid. Access granted only through another group (a mode 070 directory owned by a shared group, for example) fails with `EACCES`. An unspecified uid (`n_uname = -1`) maps to 0 for uname `root` and to 65534 (nobody) otherwise. This limitation applies only to stock v9fs.
 - **Partially supported operations on `zerofs mount`**: plain `fallocate` (mode 0) reserves quota and extends the file when needed. Hole punching (`PUNCH_HOLE | KEEP_SIZE`) and zero-range with optional keep-size are also supported. Zero-filled ranges are represented as sparse holes while logical growth remains quota-accounted. Standalone keep-size preallocation, collapse-range, insert-range, unshare-range, and write-zeroes return `EOPNOTSUPP`.
 - **Unsupported operations on `zerofs mount`**: `copy_file_range`, `lseek` with `SEEK_HOLE`/`SEEK_DATA`, `ioctl`, and `poll` return `ENOSYS`. Where the kernel has a fallback it uses it (`cp` copies with regular reads and writes).
 - **No rename Flags on `zerofs mount`**: `rename` with flags (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT`) returns `EINVAL` because 9P `renameat` carries no flag field. Plain `rename` works.
