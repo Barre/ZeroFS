@@ -1112,7 +1112,10 @@ mod tests {
             ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            l0_sst_size_bytes: usize::MAX,
+            // Match production's barrier-controlled flush configuration while
+            // satisfying SlateDB's strict threshold ordering.
+            l0_sst_size_bytes: usize::MAX - 1,
+            max_unflushed_bytes: usize::MAX,
             ..Default::default()
         };
         let slatedb = Arc::new(

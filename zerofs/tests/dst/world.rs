@@ -163,7 +163,10 @@ impl Storage {
             Arc::new(zerofs::retrying_object_store::RetryingObjectStore::new(sim));
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            l0_sst_size_bytes: usize::MAX,
+            // Match production's barrier-controlled flush configuration while
+            // satisfying SlateDB's strict threshold ordering.
+            l0_sst_size_bytes: usize::MAX - 1,
+            max_unflushed_bytes: usize::MAX,
             l0_max_ssts: 256,
             l0_max_ssts_per_key: 256,
             ..Default::default()

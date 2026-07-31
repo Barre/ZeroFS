@@ -21,7 +21,7 @@ use slatedb::config::GarbageCollectorDirectoryOptions;
 use slatedb::config::GarbageCollectorOptions;
 use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::path::Path;
-use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader};
+use slatedb::{BlockTransformer, CompactorBuilder, DbBuilder, DbReader, DbReaderMode};
 use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -524,6 +524,12 @@ fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
         .handle()
 }
 
+// SlateDB 0.15 validates that max_unflushed_bytes is strictly greater than
+// l0_sst_size_bytes. ZeroFS must effectively disable both thresholds because
+// only a seal-barrier-controlled flush may make metadata durable.
+const BARRIER_CONTROLLED_L0_SST_SIZE_BYTES: usize = usize::MAX - 1;
+const BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES: usize = usize::MAX;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -597,18 +603,17 @@ pub async fn build_slatedb(
         // None` does not — that only kills the WAL timer). Left finite, the
         // size check would dispatch a durable L0 flush from a background task
         // that never takes our seal barrier, publishing FrameLocs for a
-        // still-un-PUT segment. At usize::MAX the memtable freezes only on our
-        // barrier-gated `db.flush()`, which also drains it (RAM-bounded) on
-        // every flush.
-        l0_sst_size_bytes: usize::MAX,
+        // still-un-PUT segment. Keep both size thresholds effectively disabled
+        // so the memtable freezes only on our barrier-gated `db.flush()`, which
+        // also drains it (RAM-bounded) on every flush. SlateDB requires the
+        // backpressure threshold to be strictly greater than the freeze
+        // threshold, hence MAX - 1 and MAX rather than MAX for both.
+        l0_sst_size_bytes: BARRIER_CONTROLLED_L0_SST_SIZE_BYTES,
         compactor_options: None,
         flush_interval: None,
         // Independent of HA authority checks.
         manifest_poll_interval: std::time::Duration::from_secs(5),
-        // Backpressure ceiling for frozen-but-not-yet-L0 memtables. Our flushes
-        // are serialized, so at most one frozen memtable exists at a time and
-        // this never actually triggers — a safety floor, not a tuning knob.
-        max_unflushed_bytes: 1_073_741_824,
+        max_unflushed_bytes: BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES,
         compression_codec: None, // Disable compression as we handle it in encryption layer
         l0_flush_parallelism: 16,
         min_filter_keys: 10,
@@ -773,7 +778,7 @@ pub async fn build_slatedb(
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
 
             let mut reader_builder = DbReader::builder(db_path, object_store)
-                .with_checkpoint_id(checkpoint_id)
+                .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
@@ -1219,6 +1224,19 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn barrier_controlled_flush_thresholds_are_valid() {
+        let settings = slatedb::config::Settings {
+            l0_sst_size_bytes: BARRIER_CONTROLLED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES,
+            ..Default::default()
+        };
+
+        settings
+            .validate()
+            .expect("barrier-controlled flush thresholds must satisfy SlateDB validation");
+    }
 
     #[test]
     fn maintenance_runtime_is_shared_across_open_attempts() {

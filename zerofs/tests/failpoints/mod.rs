@@ -73,13 +73,15 @@ impl CrashTestContext {
     async fn create_fs(&self) -> Arc<ZeroFS> {
         let db_path = Path::from("slatedb");
         // Mirror the production durability-critical SlateDB config (see
-        // cli/server.rs): WAL off + l0_sst_size_bytes MAX means the only path to a
-        // durable manifest is our seal-gated flush. Without this the harness would
-        // use SlateDB's default WAL recovery, which resurrects un-flushed writes on
-        // restart and so never exercises the barrier the data plane relies on.
+        // cli/server.rs): WAL off + effectively disabled size thresholds mean the
+        // only path to a durable manifest is our seal-gated flush. Without this the
+        // harness would use SlateDB's default WAL recovery, which resurrects
+        // un-flushed writes on restart and so never exercises the barrier the data
+        // plane relies on. SlateDB requires max_unflushed_bytes > l0_sst_size_bytes.
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            l0_sst_size_bytes: usize::MAX,
+            l0_sst_size_bytes: usize::MAX - 1,
+            max_unflushed_bytes: usize::MAX,
             l0_max_ssts: 256,
             l0_max_ssts_per_key: 256,
             ..Default::default()
