@@ -181,10 +181,11 @@ struct ReplayProgressState {
 struct ReplayProgress {
     state: Mutex<ReplayProgressState>,
     advanced: Notify,
+    stall_timeout: Duration,
 }
 
-impl Default for ReplayProgress {
-    fn default() -> Self {
+impl ReplayProgress {
+    fn new(stall_timeout: Duration) -> Self {
         Self {
             state: Mutex::new(ReplayProgressState {
                 completed: 0,
@@ -192,25 +193,32 @@ impl Default for ReplayProgress {
                 last_advance: runtime::Clock::now(),
             }),
             advanced: Notify::new(),
+            stall_timeout,
         }
     }
-}
 
-impl ReplayProgress {
     fn set_total(&self, total: usize) {
         self.state.lock().unwrap().total = total as u64;
     }
 
-    fn reach(&self, completed: usize) {
+    /// Records a new high-water mark unless the previous one has already
+    /// stalled. Returning `false` prevents a late replay response from
+    /// reviving an expired candidate before the watchdog task is polled.
+    fn reach(&self, completed: usize) -> bool {
         let mut state = self.state.lock().unwrap();
+        let now = runtime::Clock::now();
+        if now.duration_since(&state.last_advance) >= self.stall_timeout {
+            return false;
+        }
         let completed = completed as u64;
         if completed <= state.completed {
-            return;
+            return true;
         }
         state.completed = completed;
-        state.last_advance = runtime::Clock::now();
+        state.last_advance = now;
         drop(state);
         self.advanced.notify_waiters();
+        true
     }
 
     fn snapshot(&self) -> (u64, u64) {
@@ -218,9 +226,10 @@ impl ReplayProgress {
         (state.completed, state.total)
     }
 
-    fn stall_remaining(&self, stall_timeout: Duration) -> Option<Duration> {
-        let elapsed = self.state.lock().unwrap().last_advance.elapsed();
-        stall_timeout
+    fn stall_remaining(&self) -> Option<Duration> {
+        let state = self.state.lock().unwrap();
+        let elapsed = runtime::Clock::now().duration_since(&state.last_advance);
+        self.stall_timeout
             .checked_sub(elapsed)
             .filter(|remaining| !remaining.is_zero())
     }
@@ -230,11 +239,7 @@ impl ReplayProgress {
 ///
 /// Keeping the original future across watchdog windows is important: restarting
 /// it would reproduce the reconnect livelock this helper is meant to prevent.
-async fn timeout_on_stall<F>(
-    stall_timeout: Duration,
-    progress: &ReplayProgress,
-    future: F,
-) -> Result<F::Output, ()>
+async fn timeout_on_stall<F>(progress: &ReplayProgress, future: F) -> Result<F::Output, ()>
 where
     F: std::future::Future,
 {
@@ -245,16 +250,21 @@ where
         // time elapsed since the event rather than since this task was polled.
         let mut advanced = Box::pin(progress.advanced.notified());
         advanced.as_mut().enable();
-        let Some(remaining) = progress.stall_remaining(stall_timeout) else {
+        let Some(remaining) = progress.stall_remaining() else {
             return Err(());
         };
         let wake = Box::pin(async {
             let timer = Box::pin(runtime::sleep(remaining));
             let _ = select(advanced, timer).await;
         });
-        match select(future, wake).await {
-            Either::Left((output, _)) => return Ok(output),
-            Either::Right(((), pending)) => future = pending,
+        // Poll the wake side first. If both the replay and its timer became
+        // ready while this task was delayed, expiry must win. Recheck before
+        // accepting output to also cover a deadline crossed during one poll.
+        match select(wake, future).await {
+            Either::Left(((), pending)) => future = pending,
+            Either::Right((output, _)) => {
+                return progress.stall_remaining().map(|_| output).ok_or(());
+            }
         }
     }
 }
@@ -1002,9 +1012,8 @@ impl NinePClient {
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
         debug_assert_eq!(msize, self.msize);
-        let progress = ReplayProgress::default();
+        let progress = ReplayProgress::new(REPLAY_STALL_TIMEOUT);
         match timeout_on_stall(
-            REPLAY_STALL_TIMEOUT,
             &progress,
             self.replay_with_progress(&conn, &progress, || Self::has_external_owner(self)),
         )
@@ -1050,7 +1059,7 @@ impl NinePClient {
     /// Rebuilds recorded fids and locks on `conn`. Roots precede descendants.
     #[cfg(test)]
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
-        let progress = ReplayProgress::default();
+        let progress = ReplayProgress::new(REPLAY_STALL_TIMEOUT);
         self.replay_with_progress(conn, &progress, || true).await
     }
 
@@ -1092,7 +1101,9 @@ impl NinePClient {
                     gone_unopened.push(fid);
                 }
                 completed_fids = completed_fids.saturating_add(1);
-                progress.reach(completed_fids);
+                if !progress.reach(completed_fids) {
+                    return Err(ClientError::Disconnected);
+                }
                 continue;
             }
             if let Some(flags) = rec.opened {
@@ -1119,7 +1130,9 @@ impl NinePClient {
             }
             ensure_replay_owned(&keep_replaying)?;
             completed_fids = completed_fids.saturating_add(1);
-            progress.reach(completed_fids);
+            if !progress.reach(completed_fids) {
+                return Err(ClientError::Disconnected);
+            }
         }
 
         let mut conflict_backoff = RECONNECT_BACKOFF_MIN;
@@ -1147,7 +1160,9 @@ impl NinePClient {
                         let completed_locks = lock_index.saturating_add(1);
                         if completed_locks > lock_high_water {
                             lock_high_water = completed_locks;
-                            progress.reach(fid_count.saturating_add(lock_high_water));
+                            if !progress.reach(fid_count.saturating_add(lock_high_water)) {
+                                return Err(ClientError::Disconnected);
+                            }
                         }
                     }
                     Ok(Message::Rlock(Rlock {
@@ -3376,53 +3391,74 @@ mod session_transition_tests {
 
     #[tokio::test(start_paused = true)]
     async fn replay_watchdog_allows_total_work_longer_than_one_stall_window() {
-        let progress = ReplayProgress::default();
+        let progress = ReplayProgress::new(Duration::from_secs(30));
         let work = async {
             for completed in 1..=6 {
                 runtime::sleep(Duration::from_secs(17)).await;
-                progress.reach(completed);
+                assert!(progress.reach(completed));
             }
             42
         };
 
-        assert_eq!(
-            timeout_on_stall(Duration::from_secs(30), &progress, work).await,
-            Ok(42)
-        );
+        assert_eq!(timeout_on_stall(&progress, work).await, Ok(42));
     }
 
     #[tokio::test(start_paused = true)]
     async fn replay_watchdog_rejects_a_candidate_that_stops_progressing() {
-        let progress = ReplayProgress::default();
-        progress.reach(7);
+        let progress = ReplayProgress::new(Duration::from_secs(30));
+        assert!(progress.reach(7));
 
         assert!(
-            timeout_on_stall(
-                Duration::from_secs(30),
-                &progress,
-                std::future::pending::<()>(),
-            )
-            .await
-            .is_err()
+            timeout_on_stall(&progress, std::future::pending::<()>())
+                .await
+                .is_err()
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn replay_watchdog_measures_from_the_last_progress_event() {
-        let progress = ReplayProgress::default();
+        let progress = ReplayProgress::new(Duration::from_secs(30));
         let started = tokio::time::Instant::now();
         let work = async {
             runtime::sleep(Duration::from_secs(1)).await;
-            progress.reach(1);
+            assert!(progress.reach(1));
             std::future::pending::<()>().await;
         };
 
-        assert!(
-            timeout_on_stall(Duration::from_secs(30), &progress, work)
-                .await
-                .is_err()
-        );
+        assert!(timeout_on_stall(&progress, work).await.is_err());
         assert_eq!(started.elapsed(), Duration::from_secs(31));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_watchdog_prioritizes_an_expired_timer_over_ready_replay() {
+        let progress = ReplayProgress::new(Duration::from_secs(30));
+        let (release, released) = oneshot::channel::<()>();
+        let work = async {
+            released.await.unwrap();
+            assert!(progress.reach(1));
+            42
+        };
+        let watchdog = timeout_on_stall(&progress, work);
+        tokio::pin!(watchdog);
+
+        // Install the timer and leave replay waiting. Then make both branches
+        // ready without polling the watchdog in between.
+        assert!(futures::poll!(watchdog.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        release.send(()).unwrap();
+
+        assert_eq!(watchdog.await, Err(()));
+        assert_eq!(progress.snapshot().0, 0, "expired replay was polled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_progress_cannot_renew_an_expired_deadline() {
+        let progress = ReplayProgress::new(Duration::from_secs(30));
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert!(!progress.reach(1));
+        assert_eq!(progress.snapshot().0, 0);
+        assert!(progress.stall_remaining().is_none());
     }
 
     #[tokio::test]
@@ -3438,7 +3474,7 @@ mod session_transition_tests {
         let replay_conn = Arc::clone(&conn);
         let supervisor = Arc::clone(&client);
         let replay = tokio::spawn(async move {
-            let progress = ReplayProgress::default();
+            let progress = ReplayProgress::new(REPLAY_STALL_TIMEOUT);
             supervisor
                 .replay_with_progress(&replay_conn, &progress, || {
                     NinePClient::has_external_owner(&supervisor)

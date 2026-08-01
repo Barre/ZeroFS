@@ -15,7 +15,11 @@ impl Clock {
     }
 
     pub(crate) fn elapsed(&self) -> Duration {
-        self.0.elapsed()
+        Self::now().duration_since(self)
+    }
+
+    pub(crate) fn duration_since(&self, earlier: &Self) -> Duration {
+        self.0.saturating_duration_since(earlier.0)
     }
 }
 
@@ -46,7 +50,11 @@ impl Clock {
     }
 
     pub(crate) fn elapsed(&self) -> Duration {
-        Duration::from_millis((monotonic_millis() - self.0).max(0.0) as u64)
+        Self::now().duration_since(self)
+    }
+
+    pub(crate) fn duration_since(&self, earlier: &Self) -> Duration {
+        Duration::from_millis((self.0 - earlier.0).max(0.0) as u64)
     }
 }
 
