@@ -5,7 +5,7 @@ import { HeroPattern } from '@/components/HeroPattern'
 export const metadata = {
   title: 'ZeroFS Documentation',
   description:
-    'ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as block devices over NBD.',
+    'ZeroFS exposes object storage through filesystem mounts, client libraries, and NBD block devices.',
 }
 
 export const sections = [
@@ -17,7 +17,7 @@ export const sections = [
 
 # ZeroFS Documentation
 
-ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as block devices over NBD. Stock NFS and 9P clients need no installation. On supported Linux kernels, the [native kernel client](/kernel-client) is the fastest mount option; the bundled FUSE client works across a wider range and mounts without root. The server itself runs in userspace.
+ZeroFS exposes S3-compatible, Azure Blob Storage, or Google Cloud Storage through filesystem mounts and NBD block devices. Stock NFS and Linux 9P clients need no ZeroFS-specific software. On supported Linux kernels, the [native kernel client](/kernel-client) is the fastest mount option; the bundled FUSE client works across a wider range and mounts without root. The server itself runs in userspace.
 
 <div className="not-prose mt-6 mb-16 flex gap-3">
   <Button href="/quickstart" arrow="right">
@@ -30,11 +30,11 @@ ZeroFS serves S3-compatible buckets as POSIX filesystems over NFS and 9P, and as
 
 ## What ZeroFS does {{ anchor: false }}
 
-ZeroFS stores your files in S3 and uses local disk only as a cache, so databases, code builds, and VM boot disks run directly against the bucket. It differs from other "filesystem on S3" projects in a few ways: {{ className: 'lead' }}
+ZeroFS keeps filesystem data and metadata in the configured object store and uses local disk only for caching. Every protocol reaches the same filesystem. {{ className: 'lead' }}
 
-- **POSIX-conformant**, verified against pjdfstest and xfstests.
-- **Near-raw-S3 throughput on large files**, and scales to workloads of millions of small files.
-- **No external database service**; all state, data and metadata alike, lives in the bucket.
+- **Filesystem behavior is tested continuously** with pjdfstest, xfstests, crash injection, and model-based simulation. See [Durability and consistency](/durability#continuous-integration-testing).
+- **Separate metadata and data paths** handle namespace operations independently from immutable file-data segments.
+- **No external database service**; data and metadata live in the object store.
 - **Encrypted before upload**: every block is compressed, then encrypted with XChaCha20-Poly1305, with no unencrypted mode.
 
 <div className="not-prose">

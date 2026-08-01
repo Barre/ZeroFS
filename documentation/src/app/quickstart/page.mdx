@@ -1,38 +1,35 @@
 export const metadata = {
   title: 'Quickstart',
   description:
-    'Install ZeroFS, write a configuration, and mount an S3-backed filesystem over NFS or 9P.',
+    'Install ZeroFS, configure an object-store backend, and mount the filesystem.',
 }
 
 # Quickstart
 
-This guide covers installing ZeroFS, writing a basic configuration, and mounting an S3-backed filesystem. At the end you have a POSIX filesystem that stores its data in S3. {{ className: 'lead' }}
+Install ZeroFS, configure a storage backend, start the server, and mount the filesystem. {{ className: 'lead' }}
 
 <Note>
-  Before you begin, ensure you have access to an S3-compatible storage service and the necessary credentials (access key ID and secret access key). For quick testing without external storage, you can use a `memory:///` URL, which keeps everything in memory (ephemeral: data is lost when the process exits).
+  To try ZeroFS without object storage, use `url = "memory:///"` and omit the `[aws]`
+  table. The filesystem is then empty after every server restart.
 </Note>
 
-## Installation
-
-ZeroFS is distributed as a single binary. The Linux amd64 and arm64 builds are statically linked against musl; the other Linux builds link glibc dynamically. On Debian/Ubuntu, Fedora/RHEL, and openSUSE, install from the apt, dnf, or zypper repository: it keeps `zerofs` up to date through the package manager and also installs a systemd service and a config skeleton. On other platforms, use the install script or build from source.
+## Install ZeroFS
 
 <CodeGroup>
 
-```bash {{ title: 'APT (Debian/Ubuntu) (Recommended)' }}
-# amd64 and arm64
+```bash {{ title: 'APT (Debian/Ubuntu)' }}
 curl -fsSL https://pkgs.zerofs.net/zerofs.gpg | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg
 echo "deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main" | sudo tee /etc/apt/sources.list.d/zerofs.list
-sudo apt update && sudo apt install zerofs
+sudo apt update
+sudo apt install zerofs
 ```
 
-```bash {{ title: 'DNF (Fedora/RHEL) (Recommended)' }}
-# x86_64 and aarch64
+```bash {{ title: 'DNF (Fedora/RHEL)' }}
 curl -fsSL https://pkgs.zerofs.net/zerofs.repo | sudo tee /etc/yum.repos.d/zerofs.repo
 sudo dnf install zerofs
 ```
 
-```bash {{ title: 'Zypper (openSUSE) (Recommended)' }}
-# x86_64 and aarch64
+```bash {{ title: 'Zypper (openSUSE)' }}
 sudo curl -fsSL https://pkgs.zerofs.net/zerofs.repo \
   -o /etc/zypp/repos.d/zerofs.repo
 sudo zypper --gpg-auto-import-keys refresh
@@ -41,483 +38,96 @@ sudo zypper install zerofs
 
 ```bash {{ title: 'Install script' }}
 curl -sSfL https://sh.zerofs.net | sh
-
-# Pin a release and install without root
-curl -sSfL https://sh.zerofs.net | VERSION=v1.2.5 INSTALL_DIR=$HOME/.local/bin sh
 ```
 
-```bash {{ title: 'Build from Source' }}
-# Requires Rust toolchain
+```bash {{ title: 'Build from source' }}
 git clone https://github.com/Barre/ZeroFS
 cd ZeroFS/zerofs
 cargo build --release
-sudo mv target/release/zerofs /usr/local/bin/
-
-# This build omits the Web UI.
-# See "Building with the Web UI" below.
-```
-
-```bash {{ title: 'Docker' }}
-# Pull the ZeroFS Docker image
-docker pull ghcr.io/barre/zerofs:latest
-```
-
-```yaml {{ title: 'GitHub Action' }}
-# Use in your workflow
-- uses: Barre/zerofs@main
-  with:
-    object-store-url: 's3://bucket/path'
-    encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+sudo install target/release/zerofs /usr/local/bin/zerofs
 ```
 
 </CodeGroup>
 
-### Supported platforms
+The package-manager installations also provide a disabled systemd unit and a configuration skeleton under `/etc/zerofs`. This quickstart runs the server directly. For containers, systemd, alternate installation directories, or a build that includes the Web UI, see [System integration](/configuration#system-integration) and [Docker](/configuration#docker).
 
-Each release ships prebuilt binaries for ten targets:
+## Configure Storage
 
-| Target | Platform | Linking |
-| --- | --- | --- |
-| `x86_64-unknown-linux-musl` | Linux amd64 | Static (musl) |
-| `aarch64-unknown-linux-musl` | Linux arm64 | Static (musl) |
-| `armv7-unknown-linux-gnueabihf` | Linux armv7 | Dynamic (glibc) |
-| `i686-unknown-linux-gnu` | Linux i686 | Dynamic (glibc) |
-| `powerpc64le-unknown-linux-gnu` | Linux ppc64le | Dynamic (glibc) |
-| `s390x-unknown-linux-gnu` | Linux s390x | Dynamic (glibc) |
-| `riscv64gc-unknown-linux-gnu` | Linux riscv64 | Dynamic (glibc) |
-| `x86_64-apple-darwin` | macOS x86_64 | Dynamic (system libc) |
-| `aarch64-apple-darwin` | macOS aarch64 | Dynamic (system libc) |
-| `x86_64-unknown-freebsd` | FreeBSD amd64 | Dynamic (system libc) |
-
-The aarch64 binaries are built with jemalloc configured for page sizes up to 64 KiB (`JEMALLOC_SYS_WITH_LG_PAGE=16`). They run on kernels with 4 KiB, 16 KiB, or 64 KiB pages.
-
-### Package repositories (apt/dnf)
-
-The apt and dnf repositories serve `zerofs` for amd64/arm64 only (the statically linked musl builds); other architectures use the install script or tarball. The repository metadata and packages are GPG-signed. Unlike the install script, a package also installs a systemd service and a config skeleton:
-
-| Path | Purpose |
-| --- | --- |
-| `/usr/bin/zerofs` | the binary |
-| `/lib/systemd/system/zerofs.service` | systemd unit, runs as the `zerofs` user |
-| `/etc/zerofs/config.toml` | configuration (preserved across upgrades) |
-| `/etc/zerofs/zerofs.env` | secrets, mode `0600` (preserved across upgrades) |
-
-The service is **not enabled by default**: it cannot start until you set the storage URL and credentials. Secrets are read from `zerofs.env` and referenced as `${VAR}` from `config.toml`:
+Generate a configuration file:
 
 ```bash
-sudoedit /etc/zerofs/zerofs.env    # set ZEROFS_PASSWORD and S3 credentials
-sudoedit /etc/zerofs/config.toml   # set [storage] url, protocols and ports
-sudo systemctl enable --now zerofs
-```
-
-The unit is hardened (`ProtectSystem=strict`, private `/tmp`, restricted capabilities). Its cache lives in `/var/cache/zerofs` and its unix sockets in `/run/zerofs`. If you point `[cache] dir` at another path, grant write access with `sudo systemctl edit zerofs` and a `ReadWritePaths=` line.
-
-### Install script options
-
-The install script reads three environment variables. Set them on the right side of the pipe, as in the pinned-release example above.
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `VERSION` | `latest` | Release tag to install, for example `v1.2.5` |
-| `INSTALL_DIR` | `/usr/local/bin` | Destination directory. `INSTALL_DIR=$HOME/.local/bin` installs without root. The script uses sudo when the destination is not writable. |
-| `SKIP_CHECKSUM` | `false` | `true` skips SHA-256 verification |
-
-By default the script downloads the multiplatform release tarball and verifies it against the published `.sha256` file before extracting.
-
-### Verifying downloads
-
-Each release binary and the multiplatform tarball carry GitHub build provenance attestations. Verify a downloaded file with the GitHub CLI:
-
-```bash
-gh attestation verify zerofs-pgo-multiplatform.tar.gz -R Barre/ZeroFS
-```
-
-The tarball's SHA-256 digest is published alongside it as `zerofs-pgo-multiplatform.tar.gz.sha256`.
-
-### Building with the Web UI
-
-`cargo build --release` produces a binary without the [Web UI](/web-ui); the `webui` cargo feature is off by default. A binary built without the feature accepts a `[servers.webui]` section in its configuration but starts no web server and logs no warning.
-
-To build with the Web UI, run make from the repository root:
-
-```bash
-make build-release
-```
-
-The target builds the shared Rust client for the browser with `wasm-pack`, then builds the frontend (npm ci, buf generate, the v86 VM image script, npm run build), and finally runs `cargo build --profile release --features webui`. Running `cargo build --features webui` on its own fails: the binary embeds `webui/dist` at compile time, and the directory exists only after the frontend build.
-
-Install the WebAssembly target and `wasm-pack` before building:
-
-```bash
-rustup target add wasm32-unknown-unknown
-cargo install wasm-pack --version 0.15.0 --locked
-```
-
-The frontend also needs Node.js (CI uses Node 22), bsdtar (the `libarchive-tools` package on Debian/Ubuntu), and squashfs-tools. The VM image script downloads an Alpine 3.21 ISO and v86 BIOS files and verifies their SHA-256 checksums.
-
-Prebuilt release binaries and the Docker image are built with the `webui` feature and include the Web UI.
-
-### Docker image
-
-`ghcr.io/barre/zerofs` is published for linux/amd64, linux/arm64, linux/arm/v7, and linux/386, with a provenance attestation and SBOM. Tags: `latest` (newest release), `X.Y.Z`, `X.Y`, and `sha-<commit>`.
-
-The entrypoint is the `zerofs` binary, so arguments after the image name are `zerofs` subcommands. The container runs as user `zerofs` (UID 1001), not root; a bind-mounted cache directory must be writable by UID 1001. The image exposes ports 2049 (NFS), 5564 (9P), and 10809 (NBD). Actual listeners come from the `[servers.*]` sections in the configuration, and each protocol in use needs its own `-p` mapping.
-
-## Configuration
-
-Create a configuration file for ZeroFS:
-
-```bash
-# Write a config template to ./zerofs.toml
-# (overwrites an existing file)
 zerofs init
-
-# Or write the template to stdout
-zerofs init - > /path/to/zerofs.toml
 ```
 
-Edit the configuration file with your settings:
+This writes `zerofs.toml` in the current directory, overwriting a file with that name if one already exists. Open it in your preferred editor and set the storage URL, encryption password, and credentials for that backend. You can put values directly in the file or keep its environment-variable placeholders. See the [configuration reference](/configuration#storage-backends) for S3-compatible, Azure, and GCS settings.
 
-<CodeGroup>
+## Start the Server
 
-```toml {{ title: 'S3 Configuration' }}
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
-memory_size_gb = 2.0    # Optional memory cache
-
-[storage]
-url = "s3://my-bucket/zerofs-data"
-encryption_password = "your-secure-password"
-
-[aws]
-access_key_id = "your-access-key"
-secret_access_key = "your-secret-key"
-region = "us-east-1"
-
-[servers.ninep]
-addresses = ["127.0.0.1:5564"]
-
-[servers.nfs]
-addresses = ["127.0.0.1:2049"]
-```
-
-```toml {{ title: 'Azure Configuration' }}
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
-memory_size_gb = 2.0
-
-[storage]
-url = "azure://my-container/zerofs-data"
-encryption_password = "your-secure-password"
-
-[azure]
-storage_account_name = "your-account"
-storage_account_key = "your-key"
-
-[servers.ninep]
-addresses = ["127.0.0.1:5564"]
-
-[servers.nfs]
-addresses = ["127.0.0.1:2049"]
-```
-
-```toml {{ title: 'Local Testing' }}
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
-memory_size_gb = 2.0
-
-[storage]
-url = "memory:///"
-encryption_password = "your-secure-password"
-
-[servers.nfs]
-addresses = ["127.0.0.1:2049"]
-
-[servers.ninep]
-addresses = ["127.0.0.1:5564"]
-```
-
-```toml {{ title: 'MinIO/S3-Compatible' }}
-[cache]
-dir = "/var/cache/zerofs"
-disk_size_gb = 10.0
-memory_size_gb = 2.0
-
-[storage]
-url = "s3://my-bucket/zerofs-data"
-encryption_password = "your-secure-password"
-
-[aws]
-access_key_id = "minioadmin"
-secret_access_key = "minioadmin"
-endpoint = "https://minio.example.com"
-allow_http = "true"    # For HTTP endpoints
-
-[servers.ninep]
-addresses = ["127.0.0.1:5564"]
-
-[servers.nfs]
-addresses = ["127.0.0.1:2049"]
-```
-
-</CodeGroup>
-
-<div className="not-prose">
-  <Button href="/configuration" variant="text" arrow="right">
-    See all configuration options
-  </Button>
-</div>
-
-## Start ZeroFS
-
-Now start ZeroFS with your configuration:
-
-<CodeGroup>
-
-```bash {{ title: 'Basic Start' }}
-# Start ZeroFS with configuration file
+```bash
 zerofs run --config zerofs.toml
-
-# Or use the shorthand
-zerofs run -c zerofs.toml
 ```
 
-```bash {{ title: 'With Environment Variables' }}
-# You can override config values with environment variables
-export ZEROFS_PASSWORD='override-password'
-export AWS_ACCESS_KEY_ID='override-key'
-export AWS_SECRET_ACCESS_KEY='override-secret'
-
-# Config file can reference environment variables
-# [storage]
-# encryption_password = "${ZEROFS_PASSWORD}"
-
-zerofs run -c zerofs.toml
-```
-
-```bash {{ title: 'With NBD Support' }}
-# Add NBD configuration to your TOML file
-cat >> zerofs.toml <<EOF
-[servers.nbd]
-addresses = ["127.0.0.1:10809"]
-EOF
-
-# Start ZeroFS
-zerofs run -c zerofs.toml
-
-# Create NBD devices via the filesystem
-mkdir -p /mnt/zerofs/.nbd
-truncate -s 10G /mnt/zerofs/.nbd/device1
-```
-
-```bash {{ title: 'Docker' }}
-# Generate the config template from the image
-docker run --rm ghcr.io/barre/zerofs:latest init - > zerofs.toml
-
-# Edit zerofs.toml:
-#   - set [storage] url and credentials
-#   - set [cache] dir = "/cache"
-#   - bind server addresses to 0.0.0.0 so the
-#     host can reach them
-
-# The container runs as UID 1001; the bind-mounted cache
-# directory must be writable by that user
-mkdir -p ./cache && sudo chown 1001 ./cache
-
-# Run with Docker. Map a port for each enabled server:
-# 2049 (NFS), 5564 (9P), 10809 (NBD)
-docker run -d \
-  -e ZEROFS_PASSWORD='your-password' \
-  -e AWS_ACCESS_KEY_ID='your-key' \
-  -e AWS_SECRET_ACCESS_KEY='your-secret' \
-  -v $(pwd)/zerofs.toml:/config/zerofs.toml:ro \
-  -v $(pwd)/cache:/cache \
-  -p 2049:2049 \
-  -p 5564:5564 \
-  ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
-```
-
-</CodeGroup>
+Keep that process running. The first start creates the filesystem metadata at the configured storage path.
 
 ## Mount the Filesystem
 
-With ZeroFS running, mount the filesystem. On Linux, use the [native kernel client](/kernel-client) when a matching module is installed. Otherwise use `zerofs mount`, the bundled FUSE client. NFS and stock Linux v9fs also work.
+Open another terminal. On Linux, use the [native kernel client](/kernel-client) when a package is available for your kernel. Install the matching package before using the first command below. The bundled FUSE client works without the ZeroFS kernel module. macOS and Linux can also use NFS.
 
 <CodeGroup>
 
-```bash {{ title: 'Native kernel client' }}
-# Requires a matching module and [servers.ninep] in the server config.
+```bash {{ title: 'Linux (native kernel client)' }}
 sudo mkdir -p /mnt/zerofs
 sudo mount -t zerofs \
   -o consistency=relaxed,msize=10485760 \
   127.0.0.1:5564 /mnt/zerofs
 ```
 
-```bash {{ title: 'zerofs mount (FUSE fallback)' }}
-# Requires [servers.ninep] in the server config.
-sudo mkdir -p /mnt/zerofs
-sudo chown "$USER" /mnt/zerofs
-
-zerofs mount 127.0.0.1:5564 /mnt/zerofs
-
-# Or use a Unix socket for a local mount:
-# zerofs mount /tmp/zerofs.9p.sock /mnt/zerofs
-```
-
-```bash {{ title: 'macOS' }}
-# Create mount point
-sudo mkdir -p /mnt/zerofs
-
-# Mount ZeroFS
-sudo mount -t nfs -o async,nolocks,vers=3,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```bash {{ title: 'Linux (bundled FUSE client)' }}
+mkdir -p "$HOME/mnt/zerofs"
+zerofs mount 127.0.0.1:5564 "$HOME/mnt/zerofs"
 ```
 
 ```bash {{ title: 'Linux (NFS)' }}
-# Create mount point
 sudo mkdir -p /mnt/zerofs
-
-# Mount ZeroFS via NFS
-sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+sudo mount -t nfs \
+  -o vers=3,nolock,tcp,port=2049,mountport=2049 \
+  127.0.0.1:/ /mnt/zerofs
 ```
 
-```bash {{ title: 'Linux (stock v9fs)' }}
-# Make sure 9P is configured in your TOML file:
-# [servers.ninep]
-# addresses = ["127.0.0.1:5564"]
-
-sudo mkdir -p /mnt/9p
-
-# Mount through Linux's stock 9P client.
-sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
+```bash {{ title: 'macOS (NFS)' }}
+sudo mkdir -p /mnt/zerofs
+sudo mount -t nfs \
+  -o vers=3,nolocks,tcp,port=2049,mountport=2049 \
+  127.0.0.1:/ /mnt/zerofs
 ```
 
 </CodeGroup>
 
-## Using NBD Block Devices
+The native client is an out-of-tree module distributed for specific kernels; see [Native kernel client](/kernel-client) for compatibility and installation. The FUSE command stays in the foreground; press `Ctrl+C` to unmount. For stock v9fs, Unix sockets, or FUSE client controls, see [9P file access](/9p-access). For NFS mount behavior and limitations, see [NFS file access](/nfs-access).
 
-With NBD enabled, block devices are created as files under the `.nbd` directory. New devices are picked up at runtime without a server restart:
+## Verify the Mount
 
-<CodeGroup>
-
-```bash {{ title: 'Create & Connect NBD Device' }}
-# First, ensure NBD is configured in your TOML:
-# [servers.nbd]
-# addresses = ["127.0.0.1:10809"]
-
-# Mount the filesystem (if not already mounted)
-sudo mount -t nfs -o vers=3,async,nolock 127.0.0.1:/ /mnt/zerofs
-
-# Create a block device file
-sudo mkdir -p /mnt/zerofs/.nbd
-sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
-
-# Install nbd-client if needed
-sudo apt-get install nbd-client  # Debian/Ubuntu
-sudo yum install nbd              # RHEL/CentOS
-
-# Connect to the NBD device
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
-
-# Create filesystem
-sudo mkfs.ext4 /dev/nbd0
-
-# Mount the block device
-sudo mkdir -p /mnt/nbd0
-sudo mount /dev/nbd0 /mnt/nbd0
-```
-
-```bash {{ title: 'Multiple Devices' }}
-# Create multiple block devices
-sudo truncate -s 10G /mnt/zerofs/.nbd/device1
-sudo truncate -s 20G /mnt/zerofs/.nbd/device2
-
-# Connect each device
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1
-sudo nbd-client 127.0.0.1 10809 /dev/nbd1 -N device2
-
-# Format and mount
-sudo mkfs.ext4 /dev/nbd0
-sudo mkfs.ext4 /dev/nbd1
-
-sudo mkdir -p /mnt/nbd0 /mnt/nbd1
-sudo mount /dev/nbd0 /mnt/nbd0
-sudo mount /dev/nbd1 /mnt/nbd1
-```
-
-```bash {{ title: 'Disconnect NBD' }}
-# Unmount first
-sudo umount /mnt/nbd0
-
-# Disconnect NBD device
-sudo nbd-client -d /dev/nbd0
-```
-
-</CodeGroup>
-
-<div className="not-prose">
-  <Button href="/nbd-devices" variant="text" arrow="right">
-    Learn more about NBD devices
-  </Button>
-</div>
-
-## Verify It's Working
-
-Test your new filesystem:
+Change to the mount point you chose, then write and read a file:
 
 ```bash
-# Check mount
-df -h /mnt/zerofs
-
-# Create a test file
-echo "Hello from ZeroFS!" > /mnt/zerofs/test.txt
-
-# Read it back
-cat /mnt/zerofs/test.txt
-
-# Check file metadata
-ls -la /mnt/zerofs/
+cd /path/to/mount
+echo "Hello from ZeroFS" > hello.txt
+cat hello.txt
 ```
 
-<div className="not-prose">
-  <Button href="/nfs-access" variant="text" arrow="right">
-    Learn about NFS operations
-  </Button>
-</div>
+## Monitor the Server
 
-## Watch the Filesystem
-
-With the server running, `zerofs monitor` opens a live dashboard in the terminal: read and write throughput and IOPS, operation counters, garbage collection, the segment store's footprint (durable on the store versus still buffered in RAM), and process memory.
-
-![The zerofs monitor dashboard](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/monitor_command.png)
-
-The dashboard reads from the admin RPC server. The `zerofs init` template enables it; if you wrote the configuration by hand, add a `[servers.rpc]` section:
-
-```toml
-[servers.rpc]
-addresses = ["127.0.0.1:7000"]
-```
+The generated configuration enables the RPC listener used by the terminal dashboard:
 
 ```bash
-# Refreshes every 250 ms by default; press q to quit
-zerofs monitor -c zerofs.toml
+zerofs monitor --config zerofs.toml
 ```
 
-For per-operation tracing, `zerofs fatrace` prints one line per filesystem operation and `zerofs otrace` one line per object-store request.
+See [Monitoring and tracing](/monitoring) for per-operation and object-store request traces.
 
-<div className="not-prose">
-  <Button href="/monitoring" variant="text" arrow="right">
-    Monitoring and tracing
-  </Button>
-</div>
+## Related Guides
 
-## Next Steps
-
-The filesystem is mounted and storing its data in S3. From here:
-
-- [Configure NBD block devices](/nbd-devices) for raw block storage
-- [Learn about encryption](/encryption) and how data is encrypted before upload
-- [Configure caching](/caching) to size the memory and disk caches
-- [Explore advanced architectures](/advanced-use-cases) like geo-distributed storage
+- [Configuration reference](/configuration) for Azure, GCS, S3-compatible stores, quotas, and server settings
+- [NBD block devices](/nbd-devices) for raw block storage
+- [Encryption](/encryption) for key handling and password changes
+- [Caching](/caching) for cache sizing and behavior

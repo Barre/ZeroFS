@@ -24,9 +24,10 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: {
     template: '%s - ZeroFS Documentation',
-    default: 'ZeroFS - The Filesystem That Makes S3 Your Primary Storage',
+    default: 'ZeroFS Documentation',
   },
-  description: 'ZeroFS documentation - Learn how to mount S3 as a high-performance filesystem with NFS and NBD support, encryption, and caching.',
+  description:
+    'Install, configure, and operate ZeroFS with object storage, filesystem mounts, client libraries, and block devices.',
   icons: {
     icon: [
       {

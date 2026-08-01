@@ -16,7 +16,7 @@ The **decoded-block cache** holds metadata blocks after decryption and decompres
 
 A third, RAM-only **tail cache** holds each inode's most-recently-written extent, 32 MiB total, updated only after the write's transaction commits. A sequential append splices into the cached tail instead of re-reading it.
 
-Both disk tiers sit in a per-bucket directory inside `cache.dir`:
+Both disk tiers sit in a per-volume directory inside `cache.dir`:
 
 ```
 /var/cache/zerofs/
@@ -87,14 +87,14 @@ Three behaviors reduce GET counts further. Concurrent misses inside the same win
 
 Above the per-object prefetcher, a logical read-ahead follows a file's extents across segment objects. After 2 consecutive sequential reads it prefetches an 8 MiB window ahead of the read, with at most 16 concurrent fetches, and it fires only when the window crosses into a different segment object; within one segment, the per-object prefetcher already covers it.
 
-## Per-Bucket Cache Isolation
+## Per-Volume Cache Isolation
 
 On first open, ZeroFS writes a `.zerofs_bucket_id` marker containing a UUID at the database path on the object store; later opens read the same marker. The local cache for that volume lives in `bucket_<8hex>` inside `cache.dir`, named after the first 8 hex characters of the UUID, so several volumes can share one `cache.dir` without mixing entries.
 
-Deleting and recreating a bucket produces a new UUID. The volume starts over with an empty cache directory; the old `bucket_*` directory is orphaned and ZeroFS does not remove it. Delete it manually to reclaim disk space.
+If `.zerofs_bucket_id` is absent, the next read-write open creates a new UUID and uses a fresh cache directory. The old `bucket_*` directory is then orphaned; ZeroFS does not remove it automatically.
 
 <div className="not-prose">
   <Button href="/configuration" variant="text" arrow="right">
-    See all configuration options
+    Configuration reference
   </Button>
 </div>

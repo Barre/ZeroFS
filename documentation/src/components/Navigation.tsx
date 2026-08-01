@@ -257,8 +257,6 @@ export const navigation: Array<NavGroup> = [
       },
       { title: 'Monitoring & Tracing', href: '/monitoring' },
       { title: 'Prometheus Metrics', href: '/prometheus' },
-      { title: 'Troubleshooting', href: '/troubleshooting' },
-      { title: 'Advanced Use Cases', href: '/advanced-use-cases' },
       { title: 'Telemetry', href: '/telemetry' },
     ],
   },

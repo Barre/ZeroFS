@@ -8,7 +8,7 @@ export const metadata = {
 
 # Encryption & Security
 
-ZeroFS encrypts all data with XChaCha20-Poly1305. There is no unencrypted mode. This page covers the key architecture, what is and is not visible on the object store, and password handling. {{ className: 'lead' }}
+ZeroFS encrypts file contents and filesystem metadata with XChaCha20-Poly1305. There is no unencrypted mode; object names, manifests, and some format metadata remain visible to the storage backend. {{ className: 'lead' }}
 
 ## How Encryption Works
 
@@ -99,7 +99,7 @@ There are two encryption domains.
         Every segment object ends with a fixed 64-byte plaintext footer: magic `ZSEG`, version, frame count, directory offset and length, sealed epoch, counter, sealed sequence number, total length, and a CRC32C. The CRC32C is keyless torn-write detection, not authentication; integrity comes from the per-frame AEAD tags. The plaintext `u32` length prefix before each frame reveals per-extent compressed sizes.
       </Property>
       <Property name="Object Metadata" type="plaintext">
-        SST and segment object names, sizes, and counts (anything visible to an S3 LIST). A segment key encodes its writer epoch and segment counter.
+        SST and segment object names, sizes, and counts (anything visible through an object listing). A segment key encodes its writer epoch and segment counter.
       </Property>
     </Properties>
 
@@ -119,7 +119,7 @@ There are two encryption domains.
   </Col>
   <Col>
 
-    ```bash {{ title: 'What S3 Sees' }}
+    ```bash {{ title: 'Object-store layout' }}
     # File data in segment objects,
     # metadata in SST files:
     s3://bucket/path/
@@ -156,7 +156,6 @@ There are two encryption domains.
     # - SST footer (SsTableInfo): plaintext, includes
     #   the SST's first and last key
     # The manifest is plaintext.
-    # No wal/ objects: the WAL is permanently off.
     ```
 
   </Col>
@@ -191,7 +190,7 @@ The KEK is derived from the encryption password; nothing else can unwrap the DEK
 ZeroFS validates the password before opening the database or loading the encryption key: at `zerofs run` startup (the server refuses to start), in `zerofs change-password` (validated before the store is even contacted), and in the debug commands.
 
 - **Non-empty**: empty passwords are rejected
-- **Minimum length**: 8 characters, enforced with the error `Password must be at least 8 characters long`. Use 25+ characters in practice.
+- **Minimum length**: 8 characters, enforced with the error `Password must be at least 8 characters long`
 - **Not the placeholder**: the literal string `CHANGEME` is rejected with `Please choose a secure password, not 'CHANGEME'`
 
 ### Changing the Password
@@ -202,32 +201,7 @@ ZeroFS validates the password before opening the database or loading the encrypt
 printf '%s\n' "$NEW_PASSWORD" | zerofs change-password --config zerofs.toml
 ```
 
-This form suits feeding from a secret manager. The command re-wraps the DEK inside `zerofs.key`; data is not re-encrypted. If the configured current password is still `CHANGEME`, the command fails with `Current password is still the default. Please update your config file first`; set a real password in the config before changing it. After a successful change, update the config file or environment variable yourself; ZeroFS does not modify the config.
-
-### Secure Password Practices
-
-```bash
-# Generate a secure password
-openssl rand -base64 32
-
-# Store in a secret manager (AWS example)
-aws secretsmanager create-secret \
-  --name zerofs-prod-password \
-  --secret-string "$(openssl rand -base64 32)"
-
-# Use in production with environment variable substitution
-# In zerofs.toml:
-# [storage]
-# encryption_password = "${ZEROFS_PASSWORD}"
-
-export ZEROFS_PASSWORD=$(
-  aws secretsmanager get-secret-value \
-    --secret-id zerofs-prod-password \
-    --query SecretString --output text
-)
-
-zerofs run --config zerofs.toml
-```
+Feed the command one line from the deployment's chosen secret source. It re-wraps the DEK inside `zerofs.key`; data is not re-encrypted. If the configured current password is still `CHANGEME`, the command fails with `Current password is still the default. Please update your config file first`; set a real password in the config before changing it. After a successful change, update the configuration value yourself; ZeroFS does not modify the file.
 
 ### Lost Password Recovery
 
@@ -235,24 +209,17 @@ zerofs run --config zerofs.toml
   If the password is lost, the data is permanently inaccessible; ZeroFS has no key material recovery mechanism. Keep a backup of the password.
 </Warning>
 
-## Security Best Practices
+## Network Exposure
 
-### Network Security
+Encryption at rest does not protect the network protocols. NFS, 9P, NBD, RPC, and the Web UI provide no transport encryption or client authentication. Bind them to loopback, a Unix socket where supported, or a restricted network. The `zerofs init` template uses loopback addresses, but a hand-written NFS, 9P, NBD, or RPC section has no implicit bind address.
 
 ```toml
-# Bind to localhost only (default) in zerofs.toml
 [servers.nfs]
 addresses = ["127.0.0.1:2049"]
 
 [servers.nbd]
 addresses = ["127.0.0.1:10809"]
-
-# For remote access, use VPN or SSH tunneling
-# ssh -L 2049:localhost:2049 user@zerofs-server
 ```
-
-
-
 
 ## Security Architecture
 
@@ -273,21 +240,14 @@ graph TB
         SLATE --> BT
     end
 
-    S3[S3 Storage<br/>Object Storage]
+    STORE[Object Store]
 
     APP --> PROTO
     PROTO -->|file data: 32 KiB extents| FRAME
     PROTO -->|metadata + FrameLoc pointers| SLATE
-    SEGBUF -->|immutable segment objects| S3
-    BT -->|SST blocks| S3
+    SEGBUF -->|immutable segment objects| STORE
+    BT -->|SST blocks| STORE
 
-    class SLATE,S3 storage
+    class SLATE,STORE storage
     class FRAME,BT crypto
 `} />
-
-
-<div className="not-prose">
-  <Button href="/troubleshooting" variant="text" arrow="right">
-    Learn about security-related errors
-  </Button>
-</div>
