@@ -973,8 +973,21 @@ impl NinePClient {
         });
     }
 
+    /// Whether somebody other than the reconnect supervisor still owns us.
+    ///
+    /// The supervisor upgrades its weak reference before each attempt and is
+    /// therefore one strong owner itself. Once it is the only owner left,
+    /// continuing replay would postpone [`Self::drop`] and retain any locks
+    /// already installed on the candidate for no caller.
+    fn has_external_owner(supervisor: &Arc<Self>) -> bool {
+        Arc::strong_count(supervisor) > 1
+    }
+
     /// Dials, replays, and installs one replacement connection.
-    async fn reconnect_once(&self) -> ClientResult<()> {
+    async fn reconnect_once(self: &Arc<Self>) -> ClientResult<()> {
+        if !Self::has_external_owner(self) {
+            return Err(ClientError::Disconnected);
+        }
         let msize = self.msize();
         let (conn, msize) = Self::probe(
             &self.targets,
@@ -993,7 +1006,7 @@ impl NinePClient {
         match timeout_on_stall(
             REPLAY_STALL_TIMEOUT,
             &progress,
-            self.replay_with_progress(&conn, &progress),
+            self.replay_with_progress(&conn, &progress, || Self::has_external_owner(self)),
         )
         .await
         {
@@ -1038,15 +1051,21 @@ impl NinePClient {
     #[cfg(test)]
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
         let progress = ReplayProgress::default();
-        self.replay_with_progress(conn, &progress).await
+        self.replay_with_progress(conn, &progress, || true).await
     }
 
-    async fn replay_with_progress(
+    async fn replay_with_progress<C>(
         &self,
         conn: &Conn,
         progress: &ReplayProgress,
-    ) -> ClientResult<()> {
+        keep_replaying: C,
+    ) -> ClientResult<()>
+    where
+        C: Fn() -> bool,
+    {
+        ensure_replay_owned(&keep_replaying)?;
         let snapshot = self.state.lock().unwrap().clone();
+        ensure_replay_owned(&keep_replaying)?;
         let fid_count = snapshot.fids.len();
         progress.set_total(fid_count.saturating_add(snapshot.locks.len()));
         let mut gone_unopened = Vec::new();
@@ -1058,8 +1077,11 @@ impl NinePClient {
             .iter()
             .partition(|(_, rec)| rec.inode_id == rec.root_inode);
         for (&fid, rec) in roots.into_iter().chain(descendants) {
+            ensure_replay_owned(&keep_replaying)?;
             let has_lock = snapshot.locks.iter().any(|lock| lock.fid == fid);
-            let restored = self.replay_fid(conn, fid, rec).await?;
+            let restored = self.replay_fid(conn, fid, rec).await;
+            ensure_replay_owned(&keep_replaying)?;
+            let restored = restored?;
             if !restored {
                 if has_lock {
                     return Err(self.replay_state_lost("fid with a held lock could not be rebound"));
@@ -1095,6 +1117,7 @@ impl NinePClient {
                     Err(e) => return Err(e),
                 }
             }
+            ensure_replay_owned(&keep_replaying)?;
             completed_fids = completed_fids.saturating_add(1);
             progress.reach(completed_fids);
         }
@@ -1102,9 +1125,11 @@ impl NinePClient {
         let mut conflict_backoff = RECONNECT_BACKOFF_MIN;
         let mut lock_high_water = 0usize;
         'lock_replay: loop {
+            ensure_replay_owned(&keep_replaying)?;
             // Install the complete recorded lock set or roll back its prefix.
             let mut acquired = Vec::new();
             for (lock_index, lk) in snapshot.locks.iter().enumerate() {
+                ensure_replay_owned(&keep_replaying)?;
                 let body = Message::Tlock(Tlock {
                     fid: lk.fid,
                     lock_type: lk.lock_type,
@@ -1114,7 +1139,9 @@ impl NinePClient {
                     proc_id: lk.proc_id,
                     client_id: P9String::new(lk.client_id.clone()),
                 });
-                match Self::send_raw_rpc(conn, body).await {
+                let result = Self::send_raw_rpc(conn, body).await;
+                ensure_replay_owned(&keep_replaying)?;
+                match result {
                     Ok(Message::Rlock(r)) if r.status == LockStatus::Success.as_wire() => {
                         acquired.push(lk);
                         let completed_locks = lock_index.saturating_add(1);
@@ -1155,6 +1182,7 @@ impl NinePClient {
                     }
                 }
             }
+            ensure_replay_owned(&keep_replaying)?;
             if !gone_unopened.is_empty() || !stale_opened.is_empty() {
                 let mut state = self.state.lock().unwrap();
                 for fid in gone_unopened.iter().chain(&stale_opened) {
@@ -1168,6 +1196,7 @@ impl NinePClient {
                     self.stale_fids.insert(*fid);
                 }
             }
+            ensure_replay_owned(&keep_replaying)?;
             return Ok(());
         }
     }
@@ -2722,6 +2751,14 @@ impl NinePClient {
     }
 }
 
+fn ensure_replay_owned(keep_replaying: &impl Fn() -> bool) -> ClientResult<()> {
+    if keep_replaying() {
+        Ok(())
+    } else {
+        Err(ClientError::Disconnected)
+    }
+}
+
 impl Drop for NinePClient {
     fn drop(&mut self) {
         // Reader and writer tasks retain `Arc<Conn>` until explicit shutdown.
@@ -3386,6 +3423,50 @@ mod session_transition_tests {
                 .is_err()
         );
         assert_eq!(started.elapsed(), Duration::from_secs(31));
+    }
+
+    #[tokio::test]
+    async fn replay_stops_when_the_supervisor_is_the_last_owner() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        {
+            let mut state = client.state.lock().unwrap();
+            state.fids.insert(7, attach_fid(70, 0));
+            state.fids.insert(8, attach_fid(80, 0));
+        }
+
+        let replay_conn = Arc::clone(&conn);
+        let supervisor = Arc::clone(&client);
+        let replay = tokio::spawn(async move {
+            let progress = ReplayProgress::default();
+            supervisor
+                .replay_with_progress(&replay_conn, &progress, || {
+                    NinePClient::has_external_owner(&supervisor)
+                })
+                .await
+        });
+
+        let request = recv_request(&mut requests, "first replay record").await;
+        let Message::Trebind(rebind) = request.body else {
+            panic!("expected Trebind");
+        };
+        drop(client);
+        reply(
+            &conn,
+            request.tag,
+            Message::Rrebind(Rrebind {
+                qid: qid(rebind.inode_id),
+            }),
+        );
+
+        assert!(matches!(
+            replay.await.unwrap(),
+            Err(ClientError::Disconnected)
+        ));
+        assert!(
+            requests.try_recv().is_err(),
+            "replay must not start another record after its last caller drops"
+        );
     }
 
     #[test]
