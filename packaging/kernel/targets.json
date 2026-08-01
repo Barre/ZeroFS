@@ -605,8 +605,8 @@
     {
       "id": "opensuse-tumbleweed-default-x86-64-7.1.4-1-default-r2",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "opensuse-tumbleweed-default-x86-64",
       "package_revision": "2",
       "kernel_release": "7.1.4-1-default",
@@ -618,6 +618,24 @@
         "kind": "opensuse-history",
         "identity": "kernel-default@7.1.4-1.2,kernel-default-devel@7.1.4-1.2,kernel-devel@7.1.4-1.2,kernel-source@7.1.4-1.2,kernel-syms@7.1.4-1.1",
         "snapshot": "20260729"
+      }
+    },
+    {
+      "id": "opensuse-tumbleweed-default-x86-64-7.1.5-1-default-r3",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "opensuse-tumbleweed-default-x86-64",
+      "package_revision": "3",
+      "kernel_release": "7.1.5-1-default",
+      "kernel_package_name": "kernel-default",
+      "kernel_package_version": "7.1.5-1.1",
+      "kernel_selector_version": "7.1.5-1.1",
+      "builder_image": "registry.opensuse.org/opensuse/tumbleweed:20260724.37.69@sha256:2707c307c6a91a5562a400c54860372d7fdb1a3e6bc0c3203542564146637ed7",
+      "source": {
+        "kind": "opensuse-history",
+        "identity": "kernel-default@7.1.5-1.1,kernel-default-devel@7.1.5-1.1,kernel-devel@7.1.5-1.1,kernel-source@7.1.5-1.1,kernel-syms@7.1.5-1.1",
+        "snapshot": "20260731"
       }
     }
   ],
