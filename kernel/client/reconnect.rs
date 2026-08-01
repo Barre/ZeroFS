@@ -198,6 +198,14 @@ impl Session {
                     }
                     ReplayOutcome::Gone => gone.push((fid, record.opened), GFP_KERNEL)?,
                 }
+                if monotonic_ns() >= stall_deadline_ns {
+                    pr_warn!(
+                        "zerofs: fid replay progress arrived after the {}ms stall deadline at {} records\n",
+                        REPLAY_STALL_TIMEOUT_MS,
+                        completed_fids
+                    );
+                    return Err(ETIMEDOUT);
+                }
                 completed_fids = completed_fids.saturating_add(1);
                 stall_deadline_ns = replay_stall_deadline_ns();
             }
@@ -273,6 +281,14 @@ impl Session {
                 }
                 match self.replay_lock_step(transport, io, &record) {
                     Ok(LockReplayOutcome::Acquired) => {
+                        if monotonic_ns() >= *stall_deadline_ns {
+                            pr_warn!(
+                                "zerofs: lock replay progress arrived after the {}ms stall deadline at {} records\n",
+                                REPLAY_STALL_TIMEOUT_MS,
+                                high_water
+                            );
+                            return Err(ETIMEDOUT);
+                        }
                         acquired = from;
                         completed = completed.saturating_add(1);
                         if completed > high_water {
