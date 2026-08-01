@@ -163,9 +163,6 @@ impl Drop for StatefulCancellationGuard<'_> {
     }
 }
 
-/// Timeout for rebuilding one candidate session. Expiry discards the candidate.
-const REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[derive(Debug)]
 pub enum ClientError {
     /// The server returned an `Rlerror` with this Linux errno.
@@ -881,7 +878,7 @@ impl NinePClient {
     }
 
     /// Dials, replays, and installs one replacement connection.
-    async fn reconnect_once(&self) -> ClientResult<()> {
+    async fn reconnect_once(self: &Arc<Self>) -> ClientResult<()> {
         let msize = self.msize();
         let (conn, msize) = Self::probe(
             &self.targets,
@@ -896,17 +893,9 @@ impl NinePClient {
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
         debug_assert_eq!(msize, self.msize);
-        match runtime::timeout(REPLAY_TIMEOUT, self.replay(&conn)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.discard_replay_candidate(&conn).await;
-                return Err(e);
-            }
-            Err(_) => {
-                self.discard_replay_candidate(&conn).await;
-                warn!("9P session replay stalled past {REPLAY_TIMEOUT:?}; retrying reconnect");
-                return Err(ClientError::Disconnected);
-            }
+        if let Err(error) = self.replay_supervised(&conn).await {
+            self.discard_replay_candidate(&conn).await;
+            return Err(error);
         }
         let old = self.conn.swap(conn);
         old.dead.store(true, Ordering::Release);
@@ -930,8 +919,32 @@ impl NinePClient {
         conn.shutdown();
     }
 
-    /// Rebuilds recorded fids and locks on `conn`. Roots precede descendants.
+    /// Rebuild recorded state while the reconnect supervisor owns `self`.
+    async fn replay_supervised(self: &Arc<Self>, conn: &Conn) -> ClientResult<()> {
+        self.replay_inner(conn, REQUEST_TIMEOUT, Some(self)).await
+    }
+
+    #[cfg(test)]
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
+        self.replay_inner(conn, REQUEST_TIMEOUT, None).await
+    }
+
+    #[cfg(test)]
+    async fn replay_with_rpc_timeout(
+        &self,
+        conn: &Conn,
+        rpc_timeout: Duration,
+    ) -> ClientResult<()> {
+        self.replay_inner(conn, rpc_timeout, None).await
+    }
+
+    /// Rebuilds recorded fids and locks on `conn`. Roots precede descendants.
+    async fn replay_inner(
+        &self,
+        conn: &Conn,
+        rpc_timeout: Duration,
+        supervisor_owner: Option<&Arc<Self>>,
+    ) -> ClientResult<()> {
         let snapshot = self.state.lock().unwrap().clone();
         let mut gone_unopened = Vec::new();
         let mut stale_opened = Vec::new();
@@ -942,7 +955,7 @@ impl NinePClient {
             .partition(|(_, rec)| rec.inode_id == rec.root_inode);
         for (&fid, rec) in roots.into_iter().chain(descendants) {
             let has_lock = snapshot.locks.iter().any(|lock| lock.fid == fid);
-            let restored = self.replay_fid(conn, fid, rec).await?;
+            let restored = self.replay_fid(conn, fid, rec, rpc_timeout).await?;
             if !restored {
                 if has_lock {
                     return Err(self.replay_state_lost("fid with a held lock could not be rebound"));
@@ -955,7 +968,13 @@ impl NinePClient {
                 continue;
             }
             if let Some(flags) = rec.opened {
-                match Self::send_raw_rpc(conn, Message::Tlopen(Tlopen { fid, flags })).await {
+                match Self::send_replay_rpc(
+                    conn,
+                    Message::Tlopen(Tlopen { fid, flags }),
+                    rpc_timeout,
+                )
+                .await
+                {
                     Ok(Message::Rlopen(_)) => {}
                     Ok(_) => {
                         return Err(
@@ -966,7 +985,13 @@ impl NinePClient {
                         if has_lock {
                             return Err(self.replay_state_lost("locked fid could not be reopened"));
                         }
-                        match Self::send_raw_rpc(conn, Message::Tclunk(Tclunk { fid })).await {
+                        match Self::send_replay_rpc(
+                            conn,
+                            Message::Tclunk(Tclunk { fid }),
+                            rpc_timeout,
+                        )
+                        .await
+                        {
                             Ok(Message::Rclunk(_)) => {}
                             Ok(_) => return Err(ClientError::Unexpected("replay clunk")),
                             Err(error) => return Err(error),
@@ -978,11 +1003,45 @@ impl NinePClient {
             }
         }
 
+        self.replay_locks(conn, &snapshot.locks, rpc_timeout, supervisor_owner)
+            .await?;
+
+        if !gone_unopened.is_empty() || !stale_opened.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            for fid in gone_unopened.iter().chain(&stale_opened) {
+                state.fids.remove(fid);
+            }
+            state.locks.retain(|lock| {
+                !gone_unopened.contains(&lock.fid) && !stale_opened.contains(&lock.fid)
+            });
+            drop(state);
+            for fid in &stale_opened {
+                self.stale_fids.insert(*fid);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reinstall the complete lock set, retrying conflicts as one unit.
+    async fn replay_locks(
+        &self,
+        conn: &Conn,
+        locks: &[LockRecord],
+        rpc_timeout: Duration,
+        supervisor_owner: Option<&Arc<Self>>,
+    ) -> ClientResult<()> {
         let mut conflict_backoff = RECONNECT_BACKOFF_MIN;
         'lock_replay: loop {
+            // The supervisor temporarily owns one strong reference while
+            // reconnecting. If it is now the last owner, the mount/client was
+            // dropped and no operation remains whose locks need restoration.
+            if supervisor_owner.is_some_and(|owner| Arc::strong_count(owner) == 1) {
+                conn.shutdown();
+                return Err(ClientError::Disconnected);
+            }
             // Install the complete recorded lock set or roll back its prefix.
             let mut acquired = Vec::new();
-            for lk in &snapshot.locks {
+            for lk in locks {
                 let body = Message::Tlock(Tlock {
                     fid: lk.fid,
                     lock_type: lk.lock_type,
@@ -992,7 +1051,7 @@ impl NinePClient {
                     proc_id: lk.proc_id,
                     client_id: P9String::new(lk.client_id.clone()),
                 });
-                match Self::send_raw_rpc(conn, body).await {
+                match Self::send_replay_rpc(conn, body, rpc_timeout).await {
                     Ok(Message::Rlock(r)) if r.status == LockStatus::Success.as_wire() => {
                         acquired.push(lk);
                     }
@@ -1026,19 +1085,6 @@ impl NinePClient {
                         Self::rollback_replayed_locks(conn, &acquired).await;
                         return Err(e);
                     }
-                }
-            }
-            if !gone_unopened.is_empty() || !stale_opened.is_empty() {
-                let mut state = self.state.lock().unwrap();
-                for fid in gone_unopened.iter().chain(&stale_opened) {
-                    state.fids.remove(fid);
-                }
-                state.locks.retain(|lock| {
-                    !gone_unopened.contains(&lock.fid) && !stale_opened.contains(&lock.fid)
-                });
-                drop(state);
-                for fid in &stale_opened {
-                    self.stale_fids.insert(*fid);
                 }
             }
             return Ok(());
@@ -1090,7 +1136,13 @@ impl NinePClient {
     }
 
     /// Rebinds one fid. `Ok(false)` denotes `ENOENT` or `ESTALE`.
-    async fn replay_fid(&self, conn: &Conn, fid: u32, rec: &FidRecord) -> ClientResult<bool> {
+    async fn replay_fid(
+        &self,
+        conn: &Conn,
+        fid: u32,
+        rec: &FidRecord,
+        rpc_timeout: Duration,
+    ) -> ClientResult<bool> {
         let body = Message::Trebind(Trebind {
             fid,
             inode_id: rec.inode_id,
@@ -1104,7 +1156,7 @@ impl NinePClient {
             uname: P9String::new(rec.uname.clone()),
             n_uname: rec.n_uname,
         });
-        match Self::send_raw_rpc(conn, body).await {
+        match Self::send_replay_rpc(conn, body, rpc_timeout).await {
             Ok(Message::Rrebind(_)) => Ok(true),
             Ok(_) => Err(ClientError::Unexpected("replay fid")),
             Err(ClientError::Errno(errno)) if Self::replay_state_lost_errno(errno) => Ok(false),
@@ -1582,6 +1634,24 @@ impl NinePClient {
         match Self::send_raw(conn, body).await? {
             Message::Rlerror(e) => Err(ClientError::Errno(e.ecode)),
             other => Ok(other),
+        }
+    }
+
+    /// Bound one replay exchange without bounding the finite replay pass.
+    async fn send_replay_rpc(
+        conn: &Conn,
+        body: Message,
+        timeout: Duration,
+    ) -> ClientResult<Message> {
+        match runtime::timeout(timeout, Self::send_raw_rpc(conn, body)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // A timed-out dispatched tag remains quarantined until its
+                // connection ends. Closing the candidate both releases it and
+                // wakes transport tasks that may still own the frame.
+                conn.shutdown();
+                Err(ClientError::Disconnected)
+            }
         }
     }
 
@@ -3256,6 +3326,64 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
+    async fn progressing_fid_replay_has_no_aggregate_deadline() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        {
+            let mut state = client.state.lock().unwrap();
+            state.fids.insert(1, attach_fid(10, 0));
+            state.fids.insert(2, inode_fid(11, 10, 0, None));
+        }
+
+        let responder_conn = Arc::clone(&conn);
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let request = recv_request(&mut requests, "replay rebind").await;
+                let Message::Trebind(rebind) = request.body else {
+                    panic!("expected Trebind");
+                };
+                // Each exchange makes progress within its own budget. Their
+                // finite sequence has no separate aggregate cutoff.
+                runtime::sleep(Duration::from_millis(20)).await;
+                reply(
+                    &responder_conn,
+                    request.tag,
+                    Message::Rrebind(Rrebind {
+                        qid: qid(rebind.inode_id),
+                    }),
+                );
+            }
+        });
+
+        client
+            .replay_with_rpc_timeout(&conn, Duration::from_secs(1))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_fid_replay_is_bounded_per_exchange() {
+        let (conn, _requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(1, attach_fid(10, 0));
+
+        assert!(matches!(
+            client
+                .replay_with_rpc_timeout(&conn, Duration::from_millis(5))
+                .await,
+            Err(ClientError::Disconnected)
+        ));
+        assert!(conn.dead.load(Ordering::Acquire));
+        assert!(conn.pending.is_empty());
+    }
+
+    #[tokio::test]
     async fn reconnect_winner_rejects_an_old_stateful_response() {
         let old = test_conn();
         let client = test_client(Arc::clone(&old));
@@ -4011,7 +4139,7 @@ mod session_transition_tests {
     }
 
     #[tokio::test]
-    async fn persistent_lock_conflict_remains_retryable() {
+    async fn persistent_lock_conflict_keeps_the_candidate_without_terminating_the_session() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
         client.state.lock().unwrap().locks.push(write_lock(7, 0, 0));
@@ -4031,14 +4159,43 @@ mod session_transition_tests {
         });
 
         assert!(
-            runtime::timeout(Duration::from_secs(1), client.replay(&conn))
+            runtime::timeout(Duration::from_millis(100), client.replay(&conn))
                 .await
                 .is_err(),
-            "persistent lock conflicts must remain a retryable replay wait"
+            "a lock conflict should keep waiting on the restored candidate"
         );
         assert_eq!(client.terminal_errno.load(Ordering::Acquire), 0);
         responder.abort();
         let _ = responder.await;
+    }
+
+    #[tokio::test]
+    async fn supervised_lock_replay_stops_after_the_last_external_owner_drops() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let client = test_client(Arc::clone(&conn));
+        client.state.lock().unwrap().locks.push(write_lock(7, 0, 0));
+
+        let replay_client = Arc::clone(&client);
+        let replay_conn = Arc::clone(&conn);
+        let replay =
+            tokio::spawn(async move { replay_client.replay_supervised(&replay_conn).await });
+
+        let request = recv_request(&mut requests, "conflicting replay lock").await;
+        assert!(matches!(request.body, Message::Tlock(_)));
+        reply(
+            &conn,
+            request.tag,
+            Message::Rlock(Rlock {
+                status: LockStatus::Blocked.as_wire(),
+            }),
+        );
+
+        drop(client);
+        assert!(matches!(
+            runtime::timeout(Duration::from_secs(1), replay).await,
+            Ok(Ok(Err(ClientError::Disconnected)))
+        ));
+        assert!(conn.dead.load(Ordering::Acquire));
     }
 
     #[tokio::test]
