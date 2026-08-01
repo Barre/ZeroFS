@@ -1,12 +1,12 @@
 export const metadata = {
   title: 'Telemetry',
   description:
-    'What anonymous usage data ZeroFS collects, where it is sent, and how to disable it.',
+    'What usage data ZeroFS sends, how installations are identified, and how to disable reporting.',
 }
 
 # Telemetry
 
-ZeroFS collects anonymous usage data. This page lists what is collected, how it is sent, and how to disable it. {{ className: 'lead' }}
+ZeroFS sends usage events to PostHog under a randomly generated installation ID. Telemetry is enabled by default and can be disabled in the configuration. {{ className: 'lead' }}
 
 ## What Is Collected
 
@@ -18,7 +18,7 @@ Sent once each time the server starts:
 
 | Property | Example | Purpose |
 | --- | --- | --- |
-| `version` | `1.0.6` | Track adoption of new releases |
+| `version` | `2.x.y` | Track adoption of new releases |
 | `os` | `linux` | Know which platforms to prioritize |
 | `arch` | `x86_64` | Know which architectures to support |
 | `backend_type` | `s3`, `gcs`, `azure`, `local` | Understand which storage backends are used |
@@ -30,7 +30,7 @@ Sent once on startup, then every hour:
 
 | Property | Example | Purpose |
 | --- | --- | --- |
-| `version` | `1.0.6` | Correlate stats with versions |
+| `version` | `2.x.y` | Correlate stats with versions |
 | `used_bytes` | `1073741824` | Understand typical filesystem sizes |
 | `used_inodes` | `4521` | Understand typical file counts |
 | `max_bytes` | `107374182400` | Understand quota configurations |
@@ -38,19 +38,19 @@ Sent once on startup, then every hour:
 | `cache_disk_gb` | `10.0` | Understand cache sizing |
 | `cache_memory_gb` | `2.0` | Understand memory cache sizing |
 
-### What Is NOT Collected
+### Data Not Included in Event Properties
 
 - No file names, paths, or contents
 - No encryption passwords or keys
-- No IP addresses or hostnames
 - No cloud provider credentials
-- No personally identifiable information
+- No account name, email address, or other user profile
 
-### Anonymous Identity
 
-A random UUID is generated on first run and stored locally in your cache directory as `zerofs-telemetry-id`. This ID is used to count unique installations and is not linked to any personal information.
+### Installation Identity
 
-## How to Disable
+A random UUID is generated on first run and stored in the cache directory as `zerofs-telemetry-id`. It is sent as PostHog's `distinct_id`, allowing events from the same installation to be grouped. ZeroFS does not associate it with a user account.
+
+## Disable Telemetry
 
 Add the following to your configuration file:
 
@@ -63,4 +63,4 @@ When the `[telemetry]` section is absent from the config, telemetry is enabled b
 
 ## Implementation
 
-Telemetry is implemented as HTTPS POST requests to PostHog's ingestion API. Events are sent asynchronously with a 5 second timeout and never block filesystem operations. All errors are silently ignored. The source code is in [`src/telemetry.rs`](https://github.com/Barre/ZeroFS/blob/main/zerofs/src/telemetry.rs).
+Telemetry uses HTTPS POST requests to PostHog's ingestion API. Events are sent asynchronously with a five-second timeout and do not block filesystem operations. Delivery errors are ignored. The source code is in [`src/telemetry.rs`](https://github.com/Barre/ZeroFS/blob/main/zerofs/src/telemetry.rs).

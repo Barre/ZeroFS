@@ -6,7 +6,7 @@ export const metadata = {
 
 # Garbage Collection
 
-Deleting a file is immediate at the filesystem level: the unlink transaction commits and the file is gone from the namespace. The bytes in the bucket are reclaimed later, by background stages that each run on their own schedule. File contents live in immutable segment objects under `segments/`; reclamation ends when segment GC deletes those objects. A bucket that shrinks minutes after a deletion is operating normally. {{ className: 'lead' }}
+Deleting a file removes it from the filesystem namespace immediately. Its bytes are reclaimed later by background stages. File contents live in immutable objects under `segments/`; storage usage decreases only when segment garbage collection deletes or repacks those objects. {{ className: 'lead' }}
 
 ## What Deletion Does
 
@@ -20,7 +20,7 @@ Deleting a file is immediate at the filesystem level: the unlink transaction com
 
     If the file is still open, the unlink only detaches the inode from the namespace and records it as an orphan; the same small-file/tombstone decision runs when the last handle closes.
 
-    Deleting an extent key removes a 32-byte pointer (a FrameLoc) from the metadata store and debits the live-byte counter of the segment that holds the extent's frame. It does not touch the segment object; the data bytes stay in the bucket until segment GC removes or repacks the segment.
+    Deleting an extent key removes a 32-byte pointer (a FrameLoc) from the metadata store and debits the live-byte counter of the segment that holds the extent's frame. It does not touch the segment object; the data bytes remain in object storage until segment GC removes or repacks the segment.
 
     Renaming over an existing file deletes the replaced file through the same path. In both cases the operation returns before any space is reclaimed.
 
@@ -49,11 +49,11 @@ Deleting a file is immediate at the filesystem level: the unlink transaction com
 File contents are packed as encrypted frames into immutable segment objects; the metadata LSM holds one 32-byte pointer per extent and a live-byte counter per segment. Space returns in two stages for file data and one for metadata. Each is eventual, and none is triggered by the deletion itself:
 
 1. **Tombstone GC** deletes the file's extent pointer keys and debits each source segment's live-byte counter. No object is deleted; the segment objects still hold the frames.
-2. **Segment GC** deletes segment objects whose live-byte counter has reached zero and repacks fragmented ones. This is where the bucket's billed size for file data drops.
+2. **Segment GC** deletes segment objects whose live-byte counter has reached zero and repacks fragmented ones. This is where billed object-store usage for file data decreases.
 3. **Metadata compaction and object GC** rewrite and delete metadata SSTs. The SSTs hold only metadata (inodes, directories, extent pointers, counters), so this stage reclaims metadata space, not file data.
 
 <Note>
-  A delay between deleting files and the bucket shrinking is normal operation,
+  A delay between deleting files and object-store usage decreasing is normal,
   not a fault. Each stage runs in the background on its own schedule.
 </Note>
 
@@ -68,7 +68,7 @@ File contents are packed as encrypted frames into immutable segment objects; the
 
     Each delete runs under the per-inode write lock and, in the same transaction, debits the live-byte counter of every removed frame's source segment. Those counters are how the next stage finds dead and fragmented segments.
 
-    After this stage, the extent pointers are gone from the metadata store. The bucket holds the same segment objects it held before.
+    After this stage, the extent pointers are gone from the metadata store. The object store still holds the same segment objects.
 
   </Col>
   <Col>
@@ -89,13 +89,25 @@ File contents are packed as encrypted frames into immutable segment objects; the
 
 ## Stage 2: Segment GC
 
-The writer runs a dedicated segment GC task: one pass at startup, then one per interval. The interval adapts across three configurable tiers: a 60-second base; a 15-second drain while the store is active but its dead backlog is large (dead space at or above 20%, or reserve-deferred seams remaining); and a 5-second fast tier while the previous pass hit a work budget with actionable backlog remaining and the store was completely idle since that pass (zero bytes read or written, zero mutations, no seal in flight). Each pass repeats its selection and compaction step back-to-back: a configurable floor of batches (4 by default) runs regardless of client activity, so a loaded store drains several batches per pass instead of one, and past the floor the pass continues only while the store stays idle, up to 32 batches, re-checking between batches and yielding within one batch of any arriving operation. The barrier and counter scan run once per pass, so batching amortizes them across the drain rather than paying them per batch. An error or a drained backlog returns the cadence to the base interval, and the loop never sleeps longer than the base interval. Each pass logs its chosen plan (tier, next interval, batch floor, and the deciding reason). A pass begins by sealing the open segment buffer and flushing the metadata store under the flush barrier, so the durable view matches the in-memory view; a segment GC pass is therefore also a flush trigger. On a fast idle pass the barrier is a near no-op because the idle test admitted no writes since the last one; the pass's cost is the reclamation work itself which can be a full round of gathers, segment PUTs, and deletes plus about two small bookkeeping PUTs of fixed overhead (the previous pass's own commits flushing).
+The writer runs one segment GC pass at startup, then selects the delay before each subsequent pass from three configurable tiers:
+
+| Tier | Default interval | Used when |
+| --- | --- | --- |
+| Base | 60 seconds | The backlog is drained, an error occurred, or neither faster condition applies. |
+| Drain | 15 seconds | The store is active and dead space is at least 20%, or reserve-deferred seams remain. |
+| Fast | 5 seconds | The previous pass exhausted its work budget, actionable work remains, and no reads, writes, mutations, or seals occurred since that pass. |
+
+A pass runs at least four compaction batches by default, even under client load. After that floor it continues only while the store remains idle, up to 32 batches, checking for foreground work between batches. The flush barrier and segment-counter scan run once for the entire pass.
+
+Before selecting candidates, the pass seals the open segment buffer and flushes metadata under the flush barrier. Segment GC is therefore also a flush trigger. Each pass logs the selected cadence, its reason, and the work completed or left queued.
 
 The pass then reads every per-segment live-byte counter in one scan; it lists nothing on the object store. Only segments sealed before the pass are eligible. Two actions follow:
 
-**Dead-segment deletion.** A segment whose counter is zero is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment, since a leaked segment is preferred to lost data. The object DELETE is the point where the bucket's billed size drops.
+**Dead-segment deletion.** A segment whose counter is zero is a delete candidate. It is deleted only after a per-segment delete horizon has passed, and only after a verification step reads the segment's directory and confirms that no extent pointer still references it. Verification is fail-closed: any read error keeps the segment, since a leaked segment is preferred to lost data. The object DELETE is the point where billed usage decreases.
 
-**Segment compaction.** Segments that are fragmented (live bytes below 50% of the object size) or small (below 1 MiB) are repacked: their live frames are fetched with coalesced ranged GETs, sorted by (inode, extent) so a file's data becomes physically contiguous, and sealed into new segments of up to 256 MiB. Drained sources are not deleted in the same pass: they become dead and a later pass removes them, which keeps in-flight reads of the old locations valid. Candidates that recent reads fanned out across are selected first, up to half the per-pass budget; the rest is filled most-fragmented-first. A dense segment with no dead bytes is rewritten by exactly one path, a hot-seam chain repack, described under [Read-Directed Compaction](/read-directed-compaction); one carrying dead bytes above the scrub floor falls to the tail scrub below once write-cold.
+**Segment compaction.** Segments below 50% live or smaller than 1 MiB are repacked. Their live frames are fetched with coalesced ranged GETs, sorted by inode and extent, and sealed into new segments of up to 256 MiB.
+
+Drained source segments become dead but are not deleted in the same pass, so in-flight reads of their old locations remain valid. Recent read fan-out supplies candidates for up to half the budget; remaining capacity is filled most-fragmented-first. [Read-directed compaction](/read-directed-compaction) handles dense hot-seam chains, while the tail scrub handles write-cold segments above its dead-space floor.
 
 | Parameter | Value |
 |-----------|-------|
@@ -112,9 +124,13 @@ The pass then reads every per-segment live-byte counter in one scan; it lists no
 
 A pass issues a 64-byte footer GET plus a directory GET per segment it verifies or repacks, and one DELETE per dead segment; a pass that repacks additionally issues the coalesced ranged GETs for the live frames and one PUT per packed segment. No pass lists the object store, so steady-state GC traffic is proportional to the garbage produced, not to the data owned.
 
-**Tail scrubbing.** The two candidacy rules above leave a band of dead space unreclaimed: a segment between the scrub floor (default 5%) and 50% dead that is never written again stays above the fragmentation threshold indefinitely, so a store whose files were each about 20% deleted would reclaim nothing from it. Pass budget left over after deletion and compaction is spent repacking such segments, most-dead-first, but only when they are write-cold: sealed at least 30 seal rotations before the current open segment within the current process's lifetime, or the whole store write-quiescent for 5 minutes (the only path by which data sealed before the last restart qualifies). The scrub consumes only budget that deletion and compaction did not use, so it runs mostly during idle periods; after an upgrade, a store with an accumulated tail works it off over the following passes.
+**Tail scrubbing.** Normal compaction leaves a band of partially dead segments above its fragmentation threshold. The scrub spends leftover budget on that band, most-dead-first, once a segment is write-cold.
 
-**Orphan sweep.** A segment object with no counter at all (from a crash between sealing an object and the commit that would have credited it, or a repack whose relocated extents were all overwritten before the repoint) is invisible to the counter scan. A slow sweep reclaims these: once every 24 hours of wall-clock time (the last-run timestamp is persisted, so frequent restarts cannot postpone it), it streams one LIST of `segments/`, issued per shard prefix with bounded concurrency, and point-checks each listed object's counter. Counter-less objects pass the same directory verification as dead segments and are deleted after the same style of horizon, capped at 1,024 per sweep. This is the only object listing in the system, and orphans are rare.
+A segment is write-cold after 30 seal rotations in the current process, or after the whole store has had no writes for five minutes. Because the scrub uses only budget left after deletion and ordinary compaction, it primarily runs during idle periods.
+
+**Orphan sweep.** A crash can leave a segment object without a live-byte counter, making it invisible to the normal scan. Once every 24 hours, a persisted schedule lists `segments/` by shard and checks whether each object has a counter.
+
+Counter-less objects pass the same fail-closed directory verification and deletion horizon as dead segments, with at most 1,024 deletions per sweep. This is the only path that lists the segment namespace.
 
 ### Checkpoints Delay Reclamation
 
@@ -128,7 +144,7 @@ A pass issues a 64-byte footer GET plus a directory GET per segment it verifies 
 
 The metadata LSM holds only inodes, directory entries, tombstones, extent pointers, and segment counters. Its compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process; metadata compaction always runs inside `zerofs run`.
 
-The metadata store's object garbage collector, also in the writer process, scans four object directories (WAL, manifest, compacted SSTs, and compaction state) every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
+The metadata store's object garbage collector, also in the writer process, scans its manifest, compacted-SST, and compaction-state objects every 1 minute, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment GC.
 
 ## Where Reclamation Runs
 
@@ -138,7 +154,7 @@ The metadata store's object garbage collector, also in the writer process, scans
 | Read-only mount | no | no | no |
 | Checkpoint mount | no | no | no |
 
-All reclamation runs in the writer process. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run no stage, but their checkpoints delay segment reclamation as described above. The bucket shrinks only while the read-write instance is running.
+All reclamation runs in the writer process. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run no stage, but their checkpoints delay segment reclamation as described above. Object-store usage can decrease only while the read-write instance is running.
 
 ## Crash Safety
 
@@ -161,7 +177,9 @@ The [Prometheus endpoint](/prometheus) exports four counters for tombstone GC:
 
 All four counters count from process start. Within one run, `zerofs_tombstones_created_total` minus `zerofs_tombstones_processed_total` approximates the tombstone backlog; a gap that grows over time means deletions are outpacing collection. Files of 10 extents or fewer never create tombstones, so a small-file workload shows no tombstone activity. The monitor dashboard (`zerofs monitor`) and the [web UI](/web-ui) display the same counters.
 
-Segment GC exports its own metric family, listed in full on the [Prometheus page](/prometheus): footprint gauges that track the store's dead-space ratio between passes (`zerofs_segment_appended_bytes`, `zerofs_segment_live_bytes`, `zerofs_segment_reclaimable_bytes`, `zerofs_segment_dead_ratio`), per-pass counters for the work done (`zerofs_segment_gc_segments_deleted_total`, `zerofs_segment_gc_deleted_bytes_total`, `zerofs_segment_gc_segments_compacted_total`, `zerofs_segment_gc_frames_relocated_total`, `zerofs_segment_gc_tail_scrubbed_total`, `zerofs_segment_gc_chains_packed_total`, `zerofs_segment_gc_orphans_reclaimed_total`, plus the [read-directed](/read-directed-compaction) nomination and hot-seam counters), and backlog gauges (`zerofs_segment_gc_candidate_backlog`, `zerofs_segment_gc_awaiting_delete`, `zerofs_segment_gc_saturated`, the last being 1 whenever a pass leaves actionable backlog). Each pass also logs one info-level summary line carrying the same numbers, including the unpacked-chain breakdown by cause (deferred, warm, over-reserve); of those, only the reserve-deferred count is exported as a gauge (`zerofs_segment_gc_chains_deferred`), while warm and over-reserve appear in the log line alone. It then logs the chosen cadence plan (tier, next interval, batch floor, and reason), and the bucket's object count and size under `segments/` reflect the net effect.
+Segment GC exposes footprint, work-completed, and backlog metrics. The [Prometheus reference](/prometheus) lists every series and its units; the terminal monitor and Web UI show the main footprint and cadence values.
+
+Each pass also emits an info-level summary with its deletes, compactions, relocated frames, remaining backlog, deferred-chain reasons, and next cadence. The object count and total size under `segments/` show the resulting change at the backend.
 
 ## NBD TRIM
 

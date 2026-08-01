@@ -10,12 +10,11 @@ export const sections = [
   { title: 'Secure Boot', id: 'secure-boot' },
   { title: 'Mounting', id: 'mounting' },
   { title: 'Kernels without Rust', id: 'kernels-without-rust' },
-  { title: 'Limits', id: 'limits' },
 ]
 
 # Native Kernel Client
 
-The native client is an out-of-tree Linux module. It registers the `zerofs` filesystem with VFS and speaks `9P2000.L.Z` over TCP or a Unix socket. Use it when ZeroFS supports your distribution and kernel channel. Use [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) otherwise. {{ className: 'lead' }}
+The native client is an out-of-tree Linux module. It registers the `zerofs` filesystem with VFS and speaks `9P2000.L.Z` over TCP or a Unix socket. It is the fastest ZeroFS mount path when a module is available for the running kernel; use [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) otherwise. {{ className: 'lead' }}
 
 ## How it works {{ id: 'how-it-works' }}
 

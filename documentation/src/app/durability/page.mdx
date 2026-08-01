@@ -1,231 +1,67 @@
 export const metadata = {
   title: 'Durability & Consistency',
   description:
-    'Technical documentation of ZeroFS durability guarantees, write atomicity, ordering semantics, and consistency model.',
+    'ZeroFS write atomicity, ordering, flush behavior, crash recovery, and backend durability.',
 }
 
 # Durability & Consistency
 
-This document describes the durability and consistency guarantees provided by ZeroFS, including write atomicity, operation ordering, and crash recovery semantics. {{ className: 'lead' }}
+ZeroFS makes each filesystem mutation visible atomically, orders mutations through one commit path, and persists them through explicit or periodic flush barriers. {{ className: 'lead' }}
 
 ## Overview
 
-ZeroFS implements a transactional storage model on object storage. File contents live as compressed, encrypted frames inside immutable segment objects written directly to the object store. Metadata (inodes, directory entries, and one 32-byte `FrameLoc` pointer per 32 KiB extent) lives in an LSM-tree database. This architecture provides three properties:
+File contents live as compressed, encrypted frames inside immutable segment objects. Metadata—including inodes, directory entries, and one 32-byte `FrameLoc` per 32 KiB extent—lives in an object-backed LSM tree. The recovered state after a crash is an atomic prefix of the mutations that were visible before the crash. An explicit durability barrier determines which prefix must survive.
 
-1. **Write Atomicity**: All filesystem operations are atomic at the transaction level
-2. **Strict Ordering**: Operations are totally ordered and this order is preserved across crashes
-3. **Recovery-Free Startup**: No filesystem check or repair is required after unexpected termination
+Startup reads the latest durable manifest; it does not replay a journal or run a filesystem repair pass.
 
 ## Write Atomicity
 
-Each filesystem operation executes within a single database transaction. A transaction bundles all related modifications into an atomic unit that either commits entirely or has no effect.
+Each filesystem mutation executes in one database transaction. A write transaction contains its extent pointers, per-segment accounting changes, inode metadata, directory changes, and global statistics updates. The extent bytes are compressed, encrypted, and appended to the in-memory open segment while the transaction is staged; the foreground write does not issue an object-store PUT.
 
-<Row>
-  <Col>
+The transaction's metadata changes commit as one `WriteBatch`. The possible outcomes are:
 
-    ### Transaction Scope
+| Event | Visible state |
+| --- | --- |
+| Failure before commit | None of the mutation is visible. |
+| Commit with an uncertain outcome | The complete mutation is visible or absent; no partial transaction is exposed. |
+| Crash before a durability barrier | A previously visible mutation can be absent after restart, but only as part of an atomic unflushed suffix. |
+| Crash after a completed durability barrier | The complete mutation is present after restart. |
 
-    A write operation includes the following modifications within a single transaction:
-
-    - Extent pointers: one 32-byte `FrameLoc` per 32 KiB extent
-    - Per-segment live-byte counter deltas
-    - Inode metadata (size, timestamps, mode)
-    - Directory entry updates
-    - Global statistics counters
-
-    The extent bytes themselves are compressed, encrypted, and appended to the in-RAM open segment buffer as the transaction is staged. No object-store PUT occurs on the write path; the transaction commits only pointers and metadata.
-
-    The database commits these changes using a WriteBatch, which provides all-or-nothing semantics. Partial writes cannot occur.
-
-    ### Failure Modes
-
-    | Event | Outcome |
-    |-------|---------|
-    | Crash before commit | Transaction discarded, no changes visible |
-    | Crash during commit | Transaction discarded, no changes visible |
-    | Crash after commit | All changes visible |
-
-    The intermediate state where some but not all modifications are visible is not possible.
-
-  </Col>
-  <Col>
-
-    ```rust {{ title: 'Transaction Structure' }}
-    // Create transaction
-    let mut txn = db.new_transaction();
-
-    // Seal extents into the open segment buffer,
-    // stage FrameLoc pointers in the transaction
-    extent_store.write(&mut txn, id, offset, data, old_size);
-
-    inode.size = new_size;
-    inode.mtime = now;
-    inode_store.save(&mut txn, id, &inode);
-
-    directory_store.add(&mut txn, ...);
-
-    // Atomic commit via the single-writer coalescer
-    write_coordinator.commit(txn).await;
-    ```
-
-  </Col>
-</Row>
+Frames left in a segment without committed pointers are unreachable and are reclaimed later. A transaction never exposes only some of its metadata or extent pointers.
 
 ## Operation Ordering
 
-ZeroFS provides a total order over all write operations. This order is preserved exactly across process termination and restart.
+All write transactions pass through one commit worker. It drains pending transactions, merges them into an atomic batch, and submits batches in order. Per-inode locks serialize mutations that inspect the same file or directory; the commit worker is the sole writer of global statistics and per-segment counters.
 
-<Row>
-  <Col>
+If operation A completes before operation B begins, B is submitted in a later batch. Therefore:
 
-    ### Ordering Guarantee
+```
+visible(B) → visible(A)
+```
 
-    All write transactions are submitted through a single commit coalescer: each operation sends its transaction to a dedicated worker task that drains the queue, merges pending transactions into one `WriteBatch`, and issues a single atomic write:
-
-    ```rust
-    // caller
-    write_coordinator.commit(txn).await;
-
-    // worker (single task, FIFO drain)
-    let mut batch = vec![rx.recv().await];
-    while let Ok(m) = rx.try_recv() { batch.push(m); }
-    let mut merged = WriteBatch::new();
-    for (txn, _) in &batch { txn.apply_to(&mut merged); }
-    db.write(merged).await;
-    ```
-
-    Per-inode locks (covering files and directories) serialize operations that observe each other's state; global statistics and per-segment counters are folded by the single commit worker itself, which is their sole writer. If operation A completes before operation B begins, B's transaction is sent strictly after A's commit returned, and therefore lands in a strictly later batch. The visibility of B implies the visibility of A.
-
-    ### Formal Property
-
-    For operations A and B where A completes before B starts:
-
-    ```
-    visible(B) → visible(A)
-    ```
-
-    The contrapositive also holds: if A is not visible, B cannot be visible.
-
-  </Col>
-  <Col>
-
-    ### Comparison with Other Filesystems
-
-    Many filesystems permit write reordering for performance optimization:
-
-    - **ext4**: May reorder writes within journal transactions
-    - **XFS**: Delayed allocation can reorder data relative to metadata
-    - **Hardware**: SSDs and disk controllers may reorder writes internally
-
-    Such reordering can result in states where a later write is visible while an earlier write is not. Applications that depend on ordering semantics (databases, logging systems, configuration management) may observe inconsistent state after recovery.
-
-    ZeroFS does not reorder writes. The single-writer commit path enforces a total order over batches that survives crashes.
-
-  </Col>
-</Row>
+After a crash, the recovered durable state preserves a prefix of that order. It cannot contain B while omitting an earlier completed A. Mutations in the unflushed suffix may all be absent.
 
 ## Crash Recovery
 
-ZeroFS requires no recovery procedure after unexpected termination.
+SSTs and segment objects are immutable. Each segment frame has an authenticated-encryption tag, while the segment footer includes a CRC32C for torn-write detection.
 
-<Row>
-  <Col>
+A flush uploads the open data segment before flushing metadata that refers to it. A durable manifest therefore never points to an unuploaded segment. A crash between those steps can leave an unreferenced segment object, which garbage collection later removes, but not a durable dangling extent pointer.
 
-    ### Recovery-Free Design
-
-    The underlying storage model has several properties that eliminate the need for crash recovery:
-
-    **Atomic Commits**: WriteBatch operations are atomic at the database level. A transaction either appears in full or not at all.
-
-    **Immutable Storage**: SST files and segment objects written to object storage are immutable. Once uploaded, they cannot be corrupted by subsequent operations. Each segment frame carries its own authenticated-encryption tag (XChaCha20-Poly1305); the segment footer carries a keyless CRC32C that detects torn writes.
-
-    **Self-Describing State**: The database manifest describes the complete set of valid SST files. On startup, ZeroFS reads the manifest and has immediate access to the latest consistent state.
-
-    **Seal-Before-Manifest Ordering**: A flush uploads the open segment before the metadata flush that references it. A durable manifest never points at a missing segment object. A crash between the two steps leaves only an orphaned segment, later reclaimed by segment GC, never a dangling pointer.
-
-    **No Write-Ahead Log**: The WAL is permanently disabled and not configurable. A WAL flush is not gated by the seal barrier: it could make a `FrameLoc` pointer durable while the segment it points at is still the un-uploaded in-RAM buffer. With the WAL off, the barrier-gated flush is the only path that makes metadata durable, and startup has no log to replay.
-
-  </Col>
-  <Col>
-
-    ### Startup Procedure
-
-    After any termination (graceful or unexpected):
-
-    1. Read manifest from object storage
-    2. Load database state from referenced SST files
-    3. Resume operation
-
-    No scanning, replay, or repair is performed. The time to resume operation is independent of filesystem size.
-
-  </Col>
-</Row>
+On startup, ZeroFS reads the latest manifest and opens the referenced SSTs. It does not scan the namespace, replay a filesystem journal, or run an fsck-style repair step.
 
 ## Durability Semantics
 
-ZeroFS follows standard POSIX durability semantics. Write operations are buffered in memory and persisted to durable storage upon explicit synchronization.
+Ordinary writes can return while file data remains in the in-memory open segment and metadata remains in the LSM memtable. The open segment is also sealed in the background when it reaches 256 MiB; at most four uploads run concurrently.
 
-<Row>
-  <Col>
+A flush runs under one barrier: it seals and uploads the open segment, then flushes the metadata memtable. If the segment seal or upload fails, metadata is not flushed. A flush occurs when:
 
-    ### Buffering Model
+- a client requests durability (`fsync`, NFS COMMIT, or NBD FLUSH/FUA);
+- the periodic interval elapses (`flush_interval_secs`, 30 seconds by default, 5 seconds minimum);
+- a batch completes with `sync_writes = true`;
+- segment garbage collection begins; or
+- the process shuts down gracefully.
 
-    File data flows through the following stages:
-
-    1. **Application Buffer**: User-space buffers managed by the application
-    2. **Page Cache**: OS-managed in-memory buffers
-    3. **Open Segment Buffer**: In-RAM buffer of compressed, encrypted frames
-    4. **Segment Objects**: Immutable objects in object storage
-
-    Metadata (inodes, directory entries, `FrameLoc` pointers) flows through the LSM memtable into immutable SST files. The open segment uploads in the background once it reaches 256 MiB; at most 4 uploads run concurrently.
-
-    A flush is two-phase under a single barrier lock: seal and upload the open segment, then flush the memtable. If the seal fails, the metadata flush is aborted. Flushes occur when:
-    - A client requests durability (`fsync()`, NFS COMMIT, NBD flush)
-    - The periodic flush interval elapses (`flush_interval_secs`, default 30 s, minimum 5 s)
-    - `sync_writes = true` completes a commit batch
-    - A segment GC pass begins
-    - The process terminates gracefully
-
-    There is no memtable-capacity flush trigger; the memtable drains only at the barrier-gated flush.
-
-    ### POSIX Compliance
-
-    This behavior conforms to POSIX semantics, which specify that `write()` transfers data to system buffers while `fsync()` ensures data reaches stable storage. All major filesystems (ext4, XFS, APFS, ZFS...) implement this model.
-
-  </Col>
-  <Col>
-
-    ### Synchronization API
-
-    ```c
-    // POSIX interface
-    write(fd, data, len);   // Buffer in memory
-    fsync(fd);              // Persist to storage
-    ```
-
-    ```python
-    # Python
-    f.write(data)
-    f.flush()
-    os.fsync(f.fileno())
-    ```
-
-    ```go
-    // Go
-    f.Write(data)
-    f.Sync()
-    ```
-
-    ```rust
-    // Rust
-    file.write_all(data)?;
-    file.sync_all()?;
-    ```
-
-    Applications requiring immediate durability must call the appropriate synchronization function.
-
-  </Col>
-</Row>
+There is no independent memtable-capacity flush. Applications that require a particular write to survive a crash must use the synchronization operation provided by their access protocol, subject to the protocol differences below.
 
 ## Verified fsync
 
@@ -242,10 +78,10 @@ By default, writes between fsync calls live in the open segment buffer and memta
 When enabled, the commit coordinator forces a flush after every coalesced write batch before returning success to the caller. Concurrent writes still merge into a single batch and a single flush.
 
 <Note>
-This flag does not change POSIX semantics. With `sync_writes = false` (the default), explicit `fsync` from clients is always honored and waits for durable persistence, the same behavior all major filesystems implement. The flag only governs what happens to writes *between* fsync calls.
+This flag does not change `fsync` behavior. With `sync_writes = false` (the default), explicit `fsync` from clients is still honored and waits for durable persistence. The flag only governs what happens to writes *between* fsync calls.
 </Note>
 
-The trade-off is per-operation latency. The WAL is permanently off, so each batch waits for the full durability barrier: the open segment is sealed and uploaded, then the memtable flushes to an L0 SST. No cheaper WAL-append path exists. This is expensive for chatty workloads.
+The trade-off is per-operation latency. Each batch waits for the full durability barrier: the open segment is sealed and uploaded, then the memtable flushes to an L0 SST. This is expensive for chatty workloads.
 
 ```toml
 [lsm]
@@ -363,9 +199,16 @@ This verifies that the atomicity and ordering guarantees hold at each injected c
 
 ## Deterministic Simulation Testing
 
-The data path, namespace mutations, segment garbage collection, compaction, and crash recovery also run under deterministic simulation. A simulated world executes on a single-threaded runtime with virtual time: every object-store operation is assigned a pseudo-random latency from a seeded generator, and those latencies decide the order in which concurrent tasks wake. One seed defines one exact schedule, hours of simulated activity execute in seconds, and the same seed replays the same run. Seeds are drawn fresh from OS entropy on every run and printed, so repeated runs accumulate coverage and any failure is reproducible from its printed seed. A companion test replays one seed and compares the two runs' complete execution traces, so replay determinism is itself under test.
+The data path, namespace mutations, garbage collection, compaction, and crash recovery also run under deterministic simulation. Each run uses a single-threaded runtime and virtual time. A seed assigns object-store latency and therefore the order in which concurrent tasks wake; replaying that seed reproduces the schedule. Fresh seeds accumulate coverage, while a companion test verifies that replay produces the same execution trace.
 
-Each world races ordinary file writers (writes, truncates, hole punches, verified reads, whole-file scans, and fsyncs), two disjoint-region writers on one shared inode, a namespace actor, and live garbage-collection passes. The namespace actor creates and removes files and directories, mutates file content, renames and overwrites entries, creates hardlinks, symlinks, and special nodes, retries idempotent creates, and exercises open-unlink reclamation. The world runs over an in-memory object store in the production durability configuration and behind the production retry layer. Some worlds also inject seeded transient store faults, including puts and deletes whose effect lands but whose response is lost, so retries collide with their own already-applied writes. At a seeded instant the world crashes mid-flight. Every task is cancelled at whatever await point it happens to occupy, the store rejects all in-flight I/O (a dead process completes no writes), and a fresh instance recovers from the surviving objects.
+Each simulated world runs several kinds of work concurrently:
+
+- file writes, truncates, hole punches, reads, scans, and fsyncs;
+- writers updating separate regions of one inode;
+- namespace changes, including rename, links, special nodes, and open-unlink cleanup; and
+- live garbage-collection passes.
+
+The simulation uses the production retry and durability paths over an in-memory object store. Some runs inject transient failures whose mutation succeeds but response is lost, forcing retries to meet an already-applied write. At a seeded point, the process crashes: tasks are cancelled, in-flight storage requests stop, and a new instance opens the surviving objects.
 
 At every quiesced point and after every crash, the state must satisfy a model-based oracle:
 
@@ -378,7 +221,7 @@ At every quiesced point and after every crash, the state must satisfy a model-ba
 
 Garbage-collection passes run with seeded per-pass tuning so the rarely-taken paths execute too: checkpoint-pinned passes, the write-cold gates (tail scrub, chain compaction), small round budgets that exercise the gather caps, and multi-batch drains.
 
-A companion mode composes the simulation with failpoints. Some windows are too narrow for a timer to land in (a read-decide-act gap with no await inside it), so each round can arm a failpoint that crashes the world at that exact code point, and can widen such a gap by a few virtual milliseconds so concurrent commits land inside it before the code acts. This combination reproduces historical bugs whose window is the space between a garbage-collection decision and the irreversible action it drives. The failpoint suite remains alongside as the deterministic pointwise guard for each window.
+A companion mode combines the simulation with failpoints for crash windows that contain no await point. It can pause between a garbage-collection decision and its irreversible action, allow concurrent commits to land, and then crash at that exact code location. The pointwise failpoint suite remains as a separate guard for each window.
 
 CI runs the simulation as a dedicated test target with the required SlateDB and Tokio configuration flags. A scheduled job additionally soaks fresh seeds for 50 minutes every hour.
 
@@ -466,44 +309,16 @@ AWS S3, Azure Blob Storage, and Google Cloud Storage support conditional writes 
 conditional_put = "redis://localhost:6379"
 ```
 
-When configured, ZeroFS uses Redis to coordinate conditional write operations, providing the same fencing guarantees as native conditional put support. See the [Configuration Guide](/configuration) for details.
+When configured, ZeroFS uses Redis to coordinate conditional write operations, providing the same fencing guarantees as native conditional put support. See the [configuration reference](/configuration) for details.
 
 ## Backend Durability
 
 ZeroFS delegates storage durability to the object storage backend.
 
-| Backend | Designed Durability | Replication |
-|---------|---------------------|-------------|
-| Amazon S3 | 99.999999999% | Automatic across availability zones |
-| Azure Blob Storage | 99.999999999% | Configurable geo-redundancy |
-| Google Cloud Storage | 99.999999999% | Configurable multi-region |
+| Backend | What determines failure-domain coverage |
+| --- | --- |
+| [Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html) | Storage class and region; One Zone classes do not survive loss of their availability zone. |
+| [Azure Blob Storage](https://learn.microsoft.com/en-us/azure/storage/common/storage-redundancy) | The selected LRS, ZRS, GRS, GZRS, RA-GRS, or RA-GZRS redundancy option. |
+| [Google Cloud Storage](https://cloud.google.com/storage/docs/availability-durability) | Bucket location type and placement. |
 
-These services maintain multiple replicas across independent failure domains. Once data is persisted to object storage, it is protected against hardware failures, facility outages, and other localized events without additional configuration.
-
-## Summary
-
-ZeroFS provides the following durability and consistency guarantees:
-
-<Properties>
-  <Property name="Write Atomicity">
-    Filesystem operations are atomic. Each operation either completes fully or has no effect. Partial or torn writes are not possible.
-  </Property>
-  <Property name="Total Ordering">
-    All write operations flow through a single-writer commit path that defines a total order over batches. This order is preserved across crashes. If operation B is visible after recovery, all operations that completed before B started are also visible.
-  </Property>
-  <Property name="Immediate Recovery">
-    No recovery procedure is required after unexpected termination. The filesystem resumes operation by reading the current manifest from object storage.
-  </Property>
-  <Property name="POSIX Durability">
-    Data is persisted to stable storage upon fsync() invocation, consistent with POSIX semantics and the behavior of other filesystems.
-  </Property>
-  <Property name="Backend Replication">
-    Persisted data inherits the durability properties of the object storage backend, typically providing automatic replication across multiple failure domains.
-  </Property>
-</Properties>
-
-<div className="not-prose">
-  <Button href="/architecture" variant="text" arrow="right">
-    System architecture documentation
-  </Button>
-</div>
+ZeroFS considers a flush durable after the backend acknowledges the required object writes. The failures that acknowledgment protects against depend on the provider, storage class, region, and replication configuration; ZeroFS does not add another remote replica outside that configuration.

@@ -17,7 +17,7 @@ export const sections = [
 
 # 9P Protocol Extensions
 
-ZeroFS serves standard [9P2000.L](/9p-access), the Linux dialect of the protocol. Its own clients select one private dialect, `9P2000.L.Z`, which includes fewer round trips on metadata-heavy work, idempotent retry across a reconnect, fid rebinding that survives a server restart, durability-aware fsync, and atomic fallocate operations. This page documents what that dialect does and how it is framed on the wire. {{ className: 'lead' }}
+ZeroFS serves standard [9P2000.L](/9p-access) to stock clients. Its own clients select `9P2000.L.Z`, a private dialect with compound operations, idempotent retry, fid rebinding after reconnect, durability-aware fsync, and atomic fallocate operations. {{ className: 'lead' }}
 
 ## Overview {{ id: 'overview' }}
 
@@ -186,10 +186,6 @@ Every private message and its 9P type id. Reply types are paired with their requ
 | 254 / 255 | `Treaddirattr` / `Rreaddirattr` | Readdirplus: entries with their stat inline. |
 
 The operation envelope is not a separate message. It is a 25-byte framing field carried by the request types listed under [idempotent retries](#idempotent-retries).
-
----
-
-## Next steps
 
 <div className="not-prose mt-6 flex gap-3">
   <Button href="/9p-access" arrow="right">

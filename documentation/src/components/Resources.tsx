@@ -33,7 +33,7 @@ const resources: Array<Resource> = [
     href: '/quickstart',
     name: 'Quickstart',
     description:
-      'Get up and running with ZeroFS in minutes. Install, configure, and mount your first S3 filesystem.',
+      'Install ZeroFS, generate a configuration, start the server, and mount the filesystem.',
     icon: ShapesIcon,
     pattern: {
       y: 16,
@@ -47,7 +47,7 @@ const resources: Array<Resource> = [
     href: '/nfs-access',
     name: 'NFS File Access',
     description:
-      'Mount ZeroFS as a network filesystem on any OS. Access files with standard POSIX operations.',
+      'Mount ZeroFS over NFSv3 from macOS, Linux, or Windows.',
     icon: FolderIcon,
     pattern: {
       y: 22,
@@ -88,7 +88,7 @@ const resources: Array<Resource> = [
     href: '/client-libraries',
     name: 'Client Libraries',
     description:
-      'Access ZeroFS from Python, TypeScript, or Go. Path-based filesystem operations over 9P, no mount required.',
+      'Use path-based filesystem operations from Python, TypeScript, or Go without mounting.',
     icon: ChevronRightLeftIcon,
     pattern: {
       y: 14,
@@ -102,7 +102,7 @@ const resources: Array<Resource> = [
     href: '/nbd-devices',
     name: 'NBD Block Devices',
     description:
-      'Create raw block devices backed by S3. Perfect for ZFS pools, databases, or any filesystem.',
+      'Attach files under .nbd as Linux block devices for filesystems, volume managers, or VM disks.',
     icon: PackageIcon,
     pattern: {
       y: 32,

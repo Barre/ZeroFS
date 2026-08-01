@@ -35,7 +35,7 @@ One read-write instance and any number of read-only instances can run against th
 
 ## Freshness
 
-A replica does not open the database for writing. It opens the metadata store in reader mode, which polls the object store for new manifest files every 10 seconds. The data database's WAL is permanently disabled, so there are no WAL entries to replay: a replica sees exactly the writer's flushed state, and its view advances in whole-manifest steps: each poll adopts the newest flushed manifest. The poll interval is an engine default; `zerofs.toml` has no setting for it.
+A replica does not open the database for writing. It opens the metadata store in reader mode, which polls the object store for new manifest files every 10 seconds. A replica sees exactly the writer's flushed state, and its view advances in whole-manifest steps: each poll adopts the newest flushed manifest. The poll interval is an engine default; `zerofs.toml` has no setting for it.
 
 A write becomes visible on a replica after two delays:
 
@@ -44,7 +44,14 @@ A write becomes visible on a replica after two delays:
 
 Worst-case staleness is therefore the writer's flush delay plus the 10-second poll interval.
 
-The reader registers its own metadata-store checkpoint with a 10-minute lifetime and renews it from the poll task. The checkpoint pins both halves of the store. The metadata garbage collector deletes only SSTs that no active manifest or checkpoint references, so the writer does not delete SSTs a replica is still reading. The writer's segment garbage collection honors the same checkpoints: a dead segment object is deleted only after a per-segment horizon recorded when a pass first sees it dead: the latest ephemeral-checkpoint expiry known at that moment plus a 30-second clock-skew margin, and never earlier than 60 seconds after first sight. Checkpoints created or renewed after that moment do not extend the horizon; a following replica is protected because it advances its view every poll. When a replica stops, its checkpoint expires after at most 10 minutes and the writer's garbage collection reclaims the SSTs and segments it pinned. Both the lifetime and the poll interval are engine defaults, not configurable in `zerofs.toml`.
+The replica registers a metadata-store checkpoint with a 10-minute lifetime and renews it from the poll task. That checkpoint prevents metadata GC from deleting SSTs the replica may still read.
+
+Segment GC observes the same checkpoints. When it first sees a dead segment, it records a deletion horizon no earlier than both:
+
+- 60 seconds after the segment was first seen dead; and
+- the latest known ephemeral-checkpoint expiry plus 30 seconds for clock skew.
+
+Later checkpoint renewals do not extend an already recorded horizon. A running replica remains protected by advancing its view on each poll. After a replica stops, its checkpoint expires within 10 minutes and the writer can reclaim the SSTs and segments it pinned. The checkpoint lifetime and poll interval are engine defaults, not `zerofs.toml` settings.
 
 ## What a Replica Does Not Run
 
@@ -89,6 +96,6 @@ The two flags are mutually exclusive; passing both is a startup error.
 
 <div className="not-prose">
   <Button href="/checkpoints" variant="text" arrow="right">
-    Learn more about checkpoints
+    Checkpoints
   </Button>
 </div>

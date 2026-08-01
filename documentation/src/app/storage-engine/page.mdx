@@ -18,7 +18,7 @@ export const sections = [
 
 # Storage Engine: Segments and Extents
 
-ZeroFS stores file contents in immutable segment objects written directly to the object store. An LSM tree on the same object store holds only metadata: inodes, directory entries, and one 32-byte pointer per extent. This page documents the on-object format, the write and read paths, and space reclamation. {{ className: 'lead' }}
+ZeroFS stores file contents in immutable segment objects written directly to the object store. An LSM tree on the same object store holds only metadata: inodes, directory entries, and one 32-byte pointer per extent. {{ className: 'lead' }}
 
 ## Overview {{ id: 'overview' }}
 
@@ -111,7 +111,7 @@ The CRC32C is a keyless torn-write detector for the directory and footer only; f
 
 `fsync` (and every other flush) runs a fixed sequence: drain in-flight seals, re-upload any failed seal, seal the current open buffer, then flush the metadata LSM. If sealing fails, the metadata flush does not run. The invariant: **a durable metadata manifest never references an un-uploaded segment**. A crash between segment upload and metadata flush leaves an orphaned segment object, which garbage collection reclaims, never a durable pointer to a missing object. This invariant is exercised by failpoint crash tests.
 
-The LSM tree's write-ahead log is permanently off and not configurable: a WAL flush is not gated by the seal barrier and could persist a FrameLoc to a segment that was never uploaded.
+Metadata becomes durable only through this coordinated barrier, so no metadata persistence path can bypass segment upload.
 
 Flushes are triggered by:
 
@@ -140,20 +140,18 @@ The parts cache stores raw object bytes: extent data is compressed and encrypted
 
 The metadata LSM tracks live bytes per segment. Transactions carry signed deltas; the single-writer commit worker folds them into absolute counters. Overwriting or deleting an extent debits the segment that held its old frame.
 
-A garbage-collection pass runs on the writer: every 60 seconds while the store is active, every 5 seconds while a budget-saturated backlog meets a completely idle store (both intervals configurable, see `[gc]` under [Configuration](/configuration)):
+A garbage-collection task runs only on the writer. Its cadence adapts between the configured base, busy-backlog, and idle intervals:
 
 1. **Seal and flush** under the barrier, so the durable view matches memory.
 2. **Scan** the per-segment counters: O(number of segments), not extents. No pass lists the object store; the only listing is the daily orphan sweep.
-3. **Delete dead segments**: a segment with zero live bytes gets a delete horizon on first sight (at least 60 s in the future, extended 30 s past any ephemeral checkpoint expiry) and is deleted on a later pass, at most 1024 per pass. Every delete is gated by a fail-closed verification that re-reads the segment directory and confirms no extent still points at it; any error skips the delete (a leak, never data loss). Persistent [checkpoints](/checkpoints) protect the segments they can reference.
-4. **Pack fragmented segments**: segments under 50% live or smaller than 1 MiB are repacked into fresh segments targeting 256 MiB, at most 64 sources and 256 MiB per round. Live frames are fetched via coalesced ranged GETs, re-sorted by (inode, extent index) for physical contiguity, sealed durably, then repointed with a conditional swap under the per-inode lock. Drained sources are not deleted in the same pass; they become dead and are removed later, so in-flight reads stay valid. Leftover round budget is spent scrubbing the tail: write-cold segments above the scrub floor (default 5%) of dead bytes that neither predicate would ever select; without this, dead space in never-touched-again segments would be stranded permanently. A dense segment with no dead bytes is rewritten by exactly one path: a hot-seam chain repack ([Read-Directed Compaction](/read-directed-compaction)).
+3. **Delete dead segments** after a safety horizon and a fail-closed check that no extent still references them. [Checkpoints](/checkpoints) extend or pause deletion.
+4. **Repack fragmented or small segments** into larger objects, then repoint their live extents atomically. Tail scrubbing and [read-directed compaction](/read-directed-compaction) handle candidates outside the ordinary fragmentation threshold.
 
-Directory reads during GC are two ranged GETs (the 64-byte footer suffix, then the directory span), never the whole object.
-
-File data no longer rides LSM compaction. The embedded compactor still runs in `zerofs run`, but rewrites only metadata SSTs. Deleted-file extent pointers are removed by the tombstone sweep described on the [Garbage Collection](/garbage-collection) page; the segment bytes are then reclaimed by the pass above.
+The [Garbage Collection](/garbage-collection) page documents the cadence, thresholds, request costs, crash safety, checkpoint interaction, and metrics. File data does not participate in LSM compaction; the embedded compactor rewrites metadata SSTs only.
 
 ## Design Constants {{ id: 'design-constants' }}
 
-Apart from the four `[gc]` keys ([Configuration](/configuration)), these values are compile-time constants:
+Apart from the configurable `[gc]` fields ([Configuration](/configuration)), these values are compile-time constants:
 
 | Constant | Value |
 |----------|-------|
@@ -183,15 +181,15 @@ The engine responds to these configuration keys:
 | `[filesystem] compression` | `zstd-3` | Per-frame codec: `lz4` or `zstd-1` through `zstd-22`. The algorithm is auto-detected on read, so changing it on an existing store is safe; old and new frames coexist. |
 | `[filesystem] ignore_fsync` | `false` | Client fsync returns without a seal and flush. Intended for [HA](/high-availability), where the standby already holds the write. Cannot be combined with `sync_writes`. |
 | `[lsm] flush_interval_secs` | `30` (min 5) | Interval of the periodic barrier-gated flush: seal the open segment, then flush metadata. |
-| `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive: the WAL is off, so each batch waits for a full seal plus memtable flush. |
+| `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive because each batch waits for a full seal plus memtable flush. |
 | `[lsm] l0_max_ssts` | `256` (min 4) | Level-0 SST backlog for the metadata LSM; also applied per key. |
-| `[lsm] max_concurrent_compactions` | `8` (min 1) | Concurrency of the embedded metadata compactor. |
+| `[lsm] max_concurrent_compactions` | `2` (min 1) | Concurrency of the embedded metadata compactor. |
 | `[gc] interval_secs` | `60` (min 5) | Segment GC pass interval while the store is active; the ceiling of the adaptive cadence. |
 | `[gc] idle_interval_secs` | `5` (min 1, ≤ interval) | Pass interval while a saturated backlog meets an idle store; equal to `interval_secs` disables adaptation. |
 | `[gc] read_directed` | `true` | Reads steer compaction: nominations, seam heat, chain repacks ([Read-Directed Compaction](/read-directed-compaction)). |
 | `[gc] tail_scrub_min_dead_percent` | `5` (1–50) | Tail-scrub floor; caps write-cold space overhead at 1/(1 − floor/100). 50 disables the scrub. |
 
-`[lsm] wal_enabled` and `[lsm] max_unflushed_gb` no longer exist; a configuration that sets either fails to parse. Cache sizing (`[cache] disk_size_gb`, `memory_size_gb`, `warm_metadata`) is covered on the [Caching](/caching) page.
+Cache sizing (`[cache] disk_size_gb`, `memory_size_gb`, `warm_metadata`) is covered on the [Caching](/caching) page.
 
 <div className="not-prose">
   <Button href="/architecture" variant="text" arrow="left">

@@ -3,7 +3,7 @@ import { Mermaid } from '@/components/Mermaid'
 export const metadata = {
   title: 'Architecture',
   description:
-    'How ZeroFS is layered: NFS, 9P, and NBD servers over a shared filesystem core, with file data in immutable segment objects on S3 and metadata in an LSM tree. Covers protocol choice and filesystem limits.',
+    'How ZeroFS layers protocol servers over a shared filesystem core, immutable data segments, and an object-backed metadata LSM tree.',
 }
 
 export const sections = [
@@ -15,7 +15,7 @@ export const sections = [
 
 # Architecture
 
-This page describes how ZeroFS is structured: the protocol servers, the shared filesystem core, and the two storage planes beneath it. {{ className: 'lead' }}
+ZeroFS layers NFS, 9P, and NBD servers over one filesystem core, with separate metadata and file-data storage planes beneath it. {{ className: 'lead' }}
 
 ## System Overview {{ id: 'system-overview' }}
 
@@ -53,7 +53,7 @@ graph TB
 
     subgraph "Storage Backend"
         CACHE[Raw-Parts Cache<br/>RAM + disk, 128 KiB parts]
-        S3[S3 Object Store]
+        S3[Object Store]
 
         CACHE --> S3
     end
@@ -91,7 +91,7 @@ The LSM tree stores metadata only; file bytes never enter it:
 | Segment counters | Live bytes per segment; input to garbage collection |
 | Tombstones, orphans, statistics | Deferred deletion and accounting |
 
-The LSM tree also provides writer fencing (a monotonic writer epoch that doubles as the epoch in segment object keys) plus the manifest that anchors durability, checkpoints, and read replicas. Its write-ahead log is permanently disabled: metadata becomes durable only through the flush barrier, which seals and uploads the open segment first. A durable manifest therefore never references a segment that is not in the object store.
+The LSM tree also provides writer fencing (a monotonic writer epoch that doubles as the epoch in segment object keys) plus the manifest that anchors durability, checkpoints, and read replicas. Metadata becomes durable only through the flush barrier, which seals and uploads the open segment first. A durable manifest therefore never references a segment that is not in the object store.
 
 ### Read Path
 
@@ -111,7 +111,7 @@ Because the servers share one filesystem layer, protocols mix on a single instan
 
 | Mount | Client | Use case |
 |-------|--------|----------|
-| [NFS](/nfs-access) | NFS client that ships with macOS, Linux, and Windows | Mounting from any operating system without installing software |
+| [NFS](/nfs-access) | NFS client available on macOS, Linux, and Windows | Cross-platform mounts without a ZeroFS-specific client |
 | [Native kernel client](/kernel-client) | Exact-kernel `zerofs` module; speaks private 9P directly through VFS and netfslib | Fast Linux mounts with reconnect and HA failover |
 | [Stock 9P](/9p-access) | Linux v9fs module | No ZeroFS client installation; fsync-dependent workloads |
 | [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) | FUSE client bundled in the `zerofs` binary; speaks private 9P | Linux mounts without root; reconnect and HA failover across a wider kernel range |
@@ -131,7 +131,7 @@ The limits below are design constants of the on-disk format:
 | Hardlinks per file | 2^32 | Link counts are stored as 32-bit integers |
 | Extent size | 32 KiB | File data is split into 32 KiB extents with 64-bit indexing |
 
-In practice, S3 provider limits, performance with billions of objects, and storage cost take effect long before these values.
+In practice, object-store limits, performance with billions of objects, and storage cost take effect long before these values.
 
 `df` reports the configured [quota](/configuration#filesystem-quotas) (`max_size_gb`) as the filesystem's total size; without a quota, the total is 16 EiB. The NFS server caps the sizes it reports at 8 EiB because some NFS clients cannot handle larger values, while the 9P server reports the full quota, so `df` can show different totals for the same filesystem depending on the mount protocol.
 

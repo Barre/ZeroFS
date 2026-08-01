@@ -34,8 +34,8 @@ sudo systemctl enable --now zerofs
 
 The unit is hardened (`ProtectSystem=strict`, private tmp, restricted caps).
 The cache lives in `CacheDirectory=/var/cache/zerofs` and the unix sockets in
-`RuntimeDirectory=/run/zerofs`. If you point `[cache] dir` or a `file://` WAL at
-another path, grant write access with a drop-in:
+`RuntimeDirectory=/run/zerofs`. If you point `[cache] dir` at another path,
+grant write access with a drop-in:
 
 ```
 sudo systemctl edit zerofs
