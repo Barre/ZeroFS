@@ -129,9 +129,11 @@ Failover, client recovery, and mutation retry use one static timing policy. Thes
 | Final marker recovery attempt | up to 3 s |
 | Response drain after authority loss | up to 2 s |
 | `Claiming` grace before `Opening` | 9 s |
-| Abandoned handoff observation | 5 s unchanged |
+| Abandoned handoff observation | 5 s |
 
-The 300 ms ACK window is three heartbeat periods. The 5-second abandoned-handoff window is five renewal periods. The 9-second claim grace is derived as `3 s authority + 3 s final recovery + 2 s response drain + 1 s scheduling margin`. The client and dedup policy is checked with the same contract: a request may spend at most 64 seconds proving that its connection is alive, the conservative request/takeover/probe/replay sequence is 108 seconds, automatic mutation retry ends at 120 seconds, and the completed result remains available for 150 seconds.
+The short windows cover the work expected during each phase. An ACK stays fresh for three heartbeat periods, and an abandoned handoff is observed for five renewal periods. The 9-second claim grace allows 3 seconds for existing authority, 3 seconds for final recovery, 2 seconds to drain responses, and 1 second of scheduling margin.
+
+Client recovery uses separate limits. Connection liveness checks can take up to 64 seconds. Session replay has no overall deadline; only its individual wire exchanges are timed. This lets large fid tables finish and lets lock replay wait through conflicts with capped backoff. A dispatched mutation may be retried for 120 seconds, while its recorded result remains available for 150 seconds. Replay can continue after the original request returns a disconnect error.
 
 An authority grant is measured from the validation request's start, so storage latency consumes the grant rather than extending it. Fresh exact-epoch heartbeat ACKs suppress marker reads. Once ACKs are stale, the leader validates its exact `Active` identity immediately and schedules each subsequent read from the one-second cadence. A read may take up to three seconds; the cadence no longer doubles as its timeout. If authority expires first, successful responses remain suspended during one final bounded validation; mismatch, timeout, error, or writer fencing retires the process.
 

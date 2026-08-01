@@ -199,9 +199,6 @@ const RECONNECT_BACKOFF_MAX_MS: u64 = 500;
 /// is exactly where memory is least likely to be available.
 const REPLAY_FRAME_BYTES: usize = 256;
 
-/// Maximum time a replacement connection may take to rebuild recorded fids.
-const REPLAY_TIMEOUT_MS: u64 = 30_000;
-
 /// Byte-range locks one mount may hold at once.
 ///
 /// The userspace client keeps an unbounded list. Pinned kernel memory driven by
@@ -214,8 +211,8 @@ const REPLAY_TIMEOUT_MS: u64 = 30_000;
 /// unlock is taken before its caller gives up the local grant.
 ///
 /// The value is a replay cost as much as a memory one. Every record is one
-/// round trip on every reconnect, so a set this size already costs more of the
-/// replay timeout than a mount should spend.
+/// round trip on every reconnect, so the bound also keeps recovery work and
+/// pinned state finite.
 const MAX_LOCK_RECORDS: usize = 1024;
 
 /// Bytes in the per-mount lock owner identity: `zerofs-` plus a hex UUID.

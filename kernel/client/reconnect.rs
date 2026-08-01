@@ -30,7 +30,7 @@ use super::session::{Session, SessionStatus};
 use super::slots::ExpectedResponse;
 use super::{
     CLIENT_ID_LEN, MIN_MSIZE, RECONNECT_BACKOFF_MAX_MS, RECONNECT_BACKOFF_MIN_MS,
-    REPLAY_FRAME_BYTES, REPLAY_TIMEOUT_MS, ROOT_FID, ROOT_INODE_ID, jiffies_for_ms, monotonic_ns,
+    REPLAY_FRAME_BYTES, ROOT_FID, ROOT_INODE_ID, jiffies_for_ms,
 };
 
 pub(super) struct BootstrappedTransport {
@@ -164,8 +164,6 @@ impl Session {
     /// granted on the connection this one replaces carries its epoch, so its
     /// store is refused rather than landing behind the pass below.
     fn replay_session(&self, transport: &SocketTransport) -> Result<()> {
-        let deadline_ns =
-            monotonic_ns().saturating_add(REPLAY_TIMEOUT_MS.saturating_mul(1_000_000));
         let mut io = [0u8; REPLAY_FRAME_BYTES];
         let mut gone: KVec<(u32, bool)> = KVec::new();
 
@@ -174,9 +172,6 @@ impl Session {
             let mut from = 0usize;
             while let Some((index, record, credentials)) = self.next_replay_record(from, roots)? {
                 from = index.saturating_add(1);
-                if monotonic_ns() >= deadline_ns {
-                    return Err(ETIMEDOUT);
-                }
                 let fid = index as u32;
                 match self.replay_fid(transport, &mut io, fid, &record, &credentials)? {
                     ReplayOutcome::Restored => {}
@@ -224,7 +219,7 @@ impl Session {
         // to reinstall first; a Tlock on a fid this connection does not have
         // earns EBADF, which is neither a conflict nor a lost object, so it
         // would fail every reconnect round forever.
-        self.replay_locks(transport, &mut io, deadline_ns)
+        self.replay_locks(transport, &mut io)
     }
 
     /// Reinstall the complete recorded lock set on `transport`.
@@ -239,7 +234,6 @@ impl Session {
         &self,
         transport: &SocketTransport,
         io: &mut [u8],
-        deadline_ns: u64,
     ) -> Result<()> {
         // Declared out here so it keeps growing across attempts rather than
         // restarting at the minimum on every retry.
@@ -250,34 +244,28 @@ impl Session {
             let mut from = 0usize;
             while let Some((index, record)) = self.next_replay_lock(from) {
                 from = index.saturating_add(1);
-                if monotonic_ns() >= deadline_ns {
-                    // The candidate is discarded on this error and its Tversion
-                    // releases the prefix, which is more than a rollback past
-                    // the deadline could promise.
-                    return Err(ETIMEDOUT);
-                }
                 match self.replay_lock_step(transport, io, &record) {
                     Ok(LockReplayOutcome::Acquired) => acquired = from,
                     Ok(LockReplayOutcome::Conflict) => {
-                        if !self.rollback_replayed_locks(transport, io, acquired, deadline_ns) {
+                        if !self.rollback_replayed_locks(transport, io, acquired) {
                             // Ranges may still be held under a prefix this
                             // client can no longer account for. EAGAIN is
                             // non-terminal, so the candidate is discarded and
                             // its Tversion is what releases them.
                             return Err(EAGAIN);
                         }
-                        self.replay_conflict_backoff(backoff_ms, deadline_ns)?;
+                        self.replay_conflict_backoff(backoff_ms)?;
                         backoff_ms = backoff_ms.saturating_mul(2).min(RECONNECT_BACKOFF_MAX_MS);
                         continue 'attempt;
                     }
                     // Rollback first: replay_state_lost shuts the candidate
                     // down, and these unlocks still have to reach it.
                     Ok(LockReplayOutcome::Refused(reason)) => {
-                        self.rollback_replayed_locks(transport, io, acquired, deadline_ns);
+                        self.rollback_replayed_locks(transport, io, acquired);
                         return Err(self.replay_state_lost(reason));
                     }
                     Err(error) => {
-                        self.rollback_replayed_locks(transport, io, acquired, deadline_ns);
+                        self.rollback_replayed_locks(transport, io, acquired);
                         return Err(error);
                     }
                 }
@@ -289,11 +277,10 @@ impl Session {
     /// Reacquire one recorded range, classifying what came back.
     ///
     /// Never asks to block: a blocking request parks inside the server, where
-    /// this client can neither bound the wait nor cancel it, and a request
-    /// parked there outlives both the replay deadline and the reconnect grace.
-    /// A conflict therefore arrives as an `Rlerror` carrying `EAGAIN`, and as
-    /// `LOCK_BLOCKED` from a server that answers a non-blocking request that
-    /// way anyway.
+    /// this client cannot cancel it when the mount is terminated. A conflict
+    /// therefore arrives as an `Rlerror` carrying `EAGAIN`, and as
+    /// `LOCK_BLOCKED` from a server that answers a non-blocking request that way
+    /// anyway. The client owns the retry wait, where termination can wake it.
     ///
     /// The conflict is read off the decoded `Rlerror` rather than off an errno,
     /// because a socket that hits `SO_RCVTIMEO` or `SO_SNDTIMEO` reports
@@ -351,23 +338,18 @@ impl Session {
     /// acquired lock. Reverse order matches that client; the ranges are disjoint
     /// by construction, so it is fidelity rather than a requirement.
     ///
-    /// Returns whether every unlock was acknowledged. Anything else, including
-    /// running out of replay budget part way, leaves ranges held that only the
-    /// candidate's `Tversion` reset can clear.
+    /// Returns whether every unlock was acknowledged. Anything else leaves
+    /// ranges held that only the candidate's `Tversion` reset can clear.
     fn rollback_replayed_locks(
         &self,
         transport: &SocketTransport,
         io: &mut [u8],
         acquired: usize,
-        deadline_ns: u64,
     ) -> bool {
         let mut acknowledged = true;
         let mut before = acquired;
         while let Some((index, record)) = self.previous_replay_lock(before) {
             before = index;
-            if monotonic_ns() >= deadline_ns {
-                return false;
-            }
             let request = Request::Tlock {
                 fid: record.fid,
                 lock_type: protocol::LOCK_TYPE_UNLCK,
@@ -388,24 +370,19 @@ impl Session {
         acknowledged
     }
 
-    /// Wait out one lock conflict without outliving the replay budget.
+    /// Wait out one lock conflict while remaining interruptible by termination.
     ///
     /// Waiting on the status condvar rather than sleeping is what lets an
-    /// unmount or a termination break the retry at once; nothing can cancel a
-    /// sleeping kthread, which is what the userspace client's cancellable
-    /// timeout does for it.
-    fn replay_conflict_backoff(&self, backoff_ms: u64, deadline_ns: u64) -> Result<()> {
-        let remaining_ms = deadline_ns.saturating_sub(monotonic_ns()) / 1_000_000;
-        if remaining_ms == 0 {
-            return Err(ETIMEDOUT);
-        }
+    /// unmount or a termination break the retry at once; a plain sleeping
+    /// kthread would keep teardown waiting for the whole backoff.
+    fn replay_conflict_backoff(&self, backoff_ms: u64) -> Result<()> {
         let mut state = self.state.lock();
         if let SessionStatus::Dead(status) = state.status {
             return Err(Error::from_errno(status));
         }
         let _ = self.live_changed.wait_interruptible_timeout(
             &mut state,
-            jiffies_for_ms(backoff_ms.min(remaining_ms)).max(1),
+            jiffies_for_ms(backoff_ms).max(1),
         );
         // A session that ended while this waited has already shut the candidate
         // down, so the next Tlock would only wait out a request timeout.
