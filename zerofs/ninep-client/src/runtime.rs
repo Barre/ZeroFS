@@ -2,16 +2,20 @@ use std::future::Future;
 use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) struct Clock(std::time::Instant);
+pub(crate) struct Clock(tokio::time::Instant);
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Clock {
     pub(crate) fn now() -> Self {
-        Self(std::time::Instant::now())
+        Self(tokio::time::Instant::now())
     }
 
     pub(crate) fn elapsed_millis(&self) -> u64 {
-        self.0.elapsed().as_millis() as u64
+        self.elapsed().as_millis() as u64
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.0.elapsed()
     }
 }
 
@@ -38,7 +42,11 @@ impl Clock {
     }
 
     pub(crate) fn elapsed_millis(&self) -> u64 {
-        (monotonic_millis() - self.0).max(0.0) as u64
+        self.elapsed().as_millis() as u64
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        Duration::from_millis((monotonic_millis() - self.0).max(0.0) as u64)
     }
 }
 

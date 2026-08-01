@@ -172,27 +172,57 @@ impl Drop for StatefulCancellationGuard<'_> {
 /// makes reconnect loop forever without ever installing a candidate.
 const REPLAY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Default)]
+struct ReplayProgressState {
+    completed: u64,
+    total: u64,
+    last_advance: runtime::Clock,
+}
+
 struct ReplayProgress {
-    completed: AtomicU64,
-    total: AtomicU64,
+    state: Mutex<ReplayProgressState>,
+    advanced: Notify,
+}
+
+impl Default for ReplayProgress {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ReplayProgressState {
+                completed: 0,
+                total: 0,
+                last_advance: runtime::Clock::now(),
+            }),
+            advanced: Notify::new(),
+        }
+    }
 }
 
 impl ReplayProgress {
     fn set_total(&self, total: usize) {
-        self.total.store(total as u64, Ordering::Relaxed);
+        self.state.lock().unwrap().total = total as u64;
     }
 
     fn reach(&self, completed: usize) {
-        self.completed
-            .fetch_max(completed as u64, Ordering::Relaxed);
+        let mut state = self.state.lock().unwrap();
+        let completed = completed as u64;
+        if completed <= state.completed {
+            return;
+        }
+        state.completed = completed;
+        state.last_advance = runtime::Clock::now();
+        drop(state);
+        self.advanced.notify_waiters();
     }
 
     fn snapshot(&self) -> (u64, u64) {
-        (
-            self.completed.load(Ordering::Relaxed),
-            self.total.load(Ordering::Relaxed),
-        )
+        let state = self.state.lock().unwrap();
+        (state.completed, state.total)
+    }
+
+    fn stall_remaining(&self, stall_timeout: Duration) -> Option<Duration> {
+        let elapsed = self.state.lock().unwrap().last_advance.elapsed();
+        stall_timeout
+            .checked_sub(elapsed)
+            .filter(|remaining| !remaining.is_zero())
     }
 }
 
@@ -202,26 +232,29 @@ impl ReplayProgress {
 /// it would reproduce the reconnect livelock this helper is meant to prevent.
 async fn timeout_on_stall<F>(
     stall_timeout: Duration,
-    progress: &AtomicU64,
+    progress: &ReplayProgress,
     future: F,
 ) -> Result<F::Output, ()>
 where
     F: std::future::Future,
 {
     let mut future = Box::pin(future);
-    let mut observed = progress.load(Ordering::Relaxed);
     loop {
-        let timer = Box::pin(runtime::sleep(stall_timeout));
-        match select(future, timer).await {
+        // Register before reading the deadline so an advance between the two
+        // cannot be lost. The timestamp still makes a delayed wake account for
+        // time elapsed since the event rather than since this task was polled.
+        let mut advanced = Box::pin(progress.advanced.notified());
+        advanced.as_mut().enable();
+        let Some(remaining) = progress.stall_remaining(stall_timeout) else {
+            return Err(());
+        };
+        let wake = Box::pin(async {
+            let timer = Box::pin(runtime::sleep(remaining));
+            let _ = select(advanced, timer).await;
+        });
+        match select(future, wake).await {
             Either::Left((output, _)) => return Ok(output),
-            Either::Right(((), pending)) => {
-                let current = progress.load(Ordering::Relaxed);
-                if current == observed {
-                    return Err(());
-                }
-                observed = current;
-                future = pending;
-            }
+            Either::Right(((), pending)) => future = pending,
         }
     }
 }
@@ -959,7 +992,7 @@ impl NinePClient {
         let progress = ReplayProgress::default();
         match timeout_on_stall(
             REPLAY_STALL_TIMEOUT,
-            &progress.completed,
+            &progress,
             self.replay_with_progress(&conn, &progress),
         )
         .await
@@ -3306,11 +3339,11 @@ mod session_transition_tests {
 
     #[tokio::test(start_paused = true)]
     async fn replay_watchdog_allows_total_work_longer_than_one_stall_window() {
-        let progress = AtomicU64::new(0);
+        let progress = ReplayProgress::default();
         let work = async {
             for completed in 1..=6 {
                 runtime::sleep(Duration::from_secs(17)).await;
-                progress.store(completed, Ordering::Relaxed);
+                progress.reach(completed);
             }
             42
         };
@@ -3323,7 +3356,8 @@ mod session_transition_tests {
 
     #[tokio::test(start_paused = true)]
     async fn replay_watchdog_rejects_a_candidate_that_stops_progressing() {
-        let progress = AtomicU64::new(7);
+        let progress = ReplayProgress::default();
+        progress.reach(7);
 
         assert!(
             timeout_on_stall(
@@ -3334,6 +3368,24 @@ mod session_transition_tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_watchdog_measures_from_the_last_progress_event() {
+        let progress = ReplayProgress::default();
+        let started = tokio::time::Instant::now();
+        let work = async {
+            runtime::sleep(Duration::from_secs(1)).await;
+            progress.reach(1);
+            std::future::pending::<()>().await;
+        };
+
+        assert!(
+            timeout_on_stall(Duration::from_secs(30), &progress, work)
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(31));
     }
 
     #[test]
