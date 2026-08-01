@@ -30,7 +30,8 @@ use super::session::{Session, SessionStatus};
 use super::slots::ExpectedResponse;
 use super::{
     CLIENT_ID_LEN, MIN_MSIZE, RECONNECT_BACKOFF_MAX_MS, RECONNECT_BACKOFF_MIN_MS,
-    REPLAY_FRAME_BYTES, REPLAY_TIMEOUT_MS, ROOT_FID, ROOT_INODE_ID, jiffies_for_ms, monotonic_ns,
+    REPLAY_FRAME_BYTES, REPLAY_STALL_TIMEOUT_MS, ROOT_FID, ROOT_INODE_ID, jiffies_for_ms,
+    monotonic_ns,
 };
 
 pub(super) struct BootstrappedTransport {
@@ -164,17 +165,22 @@ impl Session {
     /// granted on the connection this one replaces carries its epoch, so its
     /// store is refused rather than landing behind the pass below.
     fn replay_session(&self, transport: &SocketTransport) -> Result<()> {
-        let deadline_ns =
-            monotonic_ns().saturating_add(REPLAY_TIMEOUT_MS.saturating_mul(1_000_000));
+        let mut stall_deadline_ns = replay_stall_deadline_ns();
         let mut io = [0u8; REPLAY_FRAME_BYTES];
         let mut gone: KVec<(u32, bool)> = KVec::new();
+        let mut completed_fids = 0usize;
 
         // Attach roots must exist before descendants resolve against them.
         for roots in [true, false] {
             let mut from = 0usize;
             while let Some((index, record, credentials)) = self.next_replay_record(from, roots)? {
                 from = index.saturating_add(1);
-                if monotonic_ns() >= deadline_ns {
+                if monotonic_ns() >= stall_deadline_ns {
+                    pr_warn!(
+                        "zerofs: fid replay made no progress for {}ms after {} records\n",
+                        REPLAY_STALL_TIMEOUT_MS,
+                        completed_fids
+                    );
                     return Err(ETIMEDOUT);
                 }
                 let fid = index as u32;
@@ -192,6 +198,8 @@ impl Session {
                     }
                     ReplayOutcome::Gone => gone.push((fid, record.opened), GFP_KERNEL)?,
                 }
+                completed_fids = completed_fids.saturating_add(1);
+                stall_deadline_ns = replay_stall_deadline_ns();
             }
         }
 
@@ -224,7 +232,7 @@ impl Session {
         // to reinstall first; a Tlock on a fid this connection does not have
         // earns EBADF, which is neither a conflict nor a lost object, so it
         // would fail every reconnect round forever.
-        self.replay_locks(transport, &mut io, deadline_ns)
+        self.replay_locks(transport, &mut io, &mut stall_deadline_ns)
     }
 
     /// Reinstall the complete recorded lock set on `transport`.
@@ -239,45 +247,74 @@ impl Session {
         &self,
         transport: &SocketTransport,
         io: &mut [u8],
-        deadline_ns: u64,
+        stall_deadline_ns: &mut u64,
     ) -> Result<()> {
         // Declared out here so it keeps growing across attempts rather than
         // restarting at the minimum on every retry.
         let mut backoff_ms = RECONNECT_BACKOFF_MIN_MS;
+        let mut high_water = 0usize;
         'attempt: loop {
             // What this pass holds, as an exclusive bound on record indices.
             let mut acquired = 0usize;
+            let mut completed = 0usize;
             let mut from = 0usize;
             while let Some((index, record)) = self.next_replay_lock(from) {
                 from = index.saturating_add(1);
-                if monotonic_ns() >= deadline_ns {
+                if monotonic_ns() >= *stall_deadline_ns {
                     // The candidate is discarded on this error and its Tversion
-                    // releases the prefix, which is more than a rollback past
-                    // the deadline could promise.
+                    // releases the prefix, which is more than a rollback after
+                    // a stalled candidate could promise.
+                    pr_warn!(
+                        "zerofs: lock replay made no progress for {}ms after {} records\n",
+                        REPLAY_STALL_TIMEOUT_MS,
+                        high_water
+                    );
                     return Err(ETIMEDOUT);
                 }
                 match self.replay_lock_step(transport, io, &record) {
-                    Ok(LockReplayOutcome::Acquired) => acquired = from,
+                    Ok(LockReplayOutcome::Acquired) => {
+                        acquired = from;
+                        completed = completed.saturating_add(1);
+                        if completed > high_water {
+                            high_water = completed;
+                            *stall_deadline_ns = replay_stall_deadline_ns();
+                        }
+                    }
                     Ok(LockReplayOutcome::Conflict) => {
-                        if !self.rollback_replayed_locks(transport, io, acquired, deadline_ns) {
+                        if !self.rollback_replayed_locks(
+                            transport,
+                            io,
+                            acquired,
+                            *stall_deadline_ns,
+                        ) {
                             // Ranges may still be held under a prefix this
                             // client can no longer account for. EAGAIN is
                             // non-terminal, so the candidate is discarded and
                             // its Tversion is what releases them.
                             return Err(EAGAIN);
                         }
-                        self.replay_conflict_backoff(backoff_ms, deadline_ns)?;
+                        self.replay_conflict_backoff(backoff_ms, *stall_deadline_ns)?;
                         backoff_ms = backoff_ms.saturating_mul(2).min(RECONNECT_BACKOFF_MAX_MS);
                         continue 'attempt;
                     }
                     // Rollback first: replay_state_lost shuts the candidate
                     // down, and these unlocks still have to reach it.
                     Ok(LockReplayOutcome::Refused(reason)) => {
-                        self.rollback_replayed_locks(transport, io, acquired, deadline_ns);
+                        self.rollback_replayed_locks(
+                            transport,
+                            io,
+                            acquired,
+                            *stall_deadline_ns,
+                        );
                         return Err(self.replay_state_lost(reason));
                     }
                     Err(error) => {
-                        self.rollback_replayed_locks(transport, io, acquired, deadline_ns);
+                        self.rollback_replayed_locks(
+                            transport,
+                            io,
+                            acquired,
+                            *stall_deadline_ns,
+                        );
                         return Err(error);
                     }
                 }
@@ -570,6 +607,10 @@ impl Session {
         self.terminate(error);
         error
     }
+}
+
+fn replay_stall_deadline_ns() -> u64 {
+    monotonic_ns().saturating_add(REPLAY_STALL_TIMEOUT_MS.saturating_mul(1_000_000))
 }
 
 /// Whether a replayed fid, or one step of its replay, was restored or is gone.

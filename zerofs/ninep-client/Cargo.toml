@@ -42,3 +42,6 @@ web-sys = { version = "0.3", features = [
     "Performance",
     "WebSocket",
 ] }
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }

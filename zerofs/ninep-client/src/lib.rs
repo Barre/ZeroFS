@@ -29,6 +29,7 @@ use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
 use deku::prelude::*;
 use futures::StreamExt;
+use futures::future::{Either, select};
 use futures::stream::FuturesUnordered;
 pub use ninep_proto::NOFID;
 use ninep_proto::retry::MUTATION_RETRY_HORIZON;
@@ -163,8 +164,67 @@ impl Drop for StatefulCancellationGuard<'_> {
     }
 }
 
-/// Timeout for rebuilding one candidate session. Expiry discards the candidate.
-const REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest replay interval allowed without completing a new state record.
+///
+/// This is deliberately a stall timeout rather than a deadline for the whole
+/// replay. Large mounts can have enough live fids that a healthy sequential
+/// replay takes longer than this; discarding that work on a fixed deadline
+/// makes reconnect loop forever without ever installing a candidate.
+const REPLAY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct ReplayProgress {
+    completed: AtomicU64,
+    total: AtomicU64,
+}
+
+impl ReplayProgress {
+    fn set_total(&self, total: usize) {
+        self.total.store(total as u64, Ordering::Relaxed);
+    }
+
+    fn reach(&self, completed: usize) {
+        self.completed
+            .fetch_max(completed as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.completed.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Runs `future` while it continues to advance `progress`.
+///
+/// Keeping the original future across watchdog windows is important: restarting
+/// it would reproduce the reconnect livelock this helper is meant to prevent.
+async fn timeout_on_stall<F>(
+    stall_timeout: Duration,
+    progress: &AtomicU64,
+    future: F,
+) -> Result<F::Output, ()>
+where
+    F: std::future::Future,
+{
+    let mut future = Box::pin(future);
+    let mut observed = progress.load(Ordering::Relaxed);
+    loop {
+        let timer = Box::pin(runtime::sleep(stall_timeout));
+        match select(future, timer).await {
+            Either::Left((output, _)) => return Ok(output),
+            Either::Right(((), pending)) => {
+                let current = progress.load(Ordering::Relaxed);
+                if current == observed {
+                    return Err(());
+                }
+                observed = current;
+                future = pending;
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -896,7 +956,14 @@ impl NinePClient {
         // Settlement and snapshot/replay/install are mutually exclusive.
         let _transition = self.session_transition.lock().await;
         debug_assert_eq!(msize, self.msize);
-        match runtime::timeout(REPLAY_TIMEOUT, self.replay(&conn)).await {
+        let progress = ReplayProgress::default();
+        match timeout_on_stall(
+            REPLAY_STALL_TIMEOUT,
+            &progress.completed,
+            self.replay_with_progress(&conn, &progress),
+        )
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 self.discard_replay_candidate(&conn).await;
@@ -904,7 +971,11 @@ impl NinePClient {
             }
             Err(_) => {
                 self.discard_replay_candidate(&conn).await;
-                warn!("9P session replay stalled past {REPLAY_TIMEOUT:?}; retrying reconnect");
+                let (completed, total) = progress.snapshot();
+                warn!(
+                    "9P session replay made no progress for {REPLAY_STALL_TIMEOUT:?} \
+                     ({completed}/{total} records restored); retrying reconnect"
+                );
                 return Err(ClientError::Disconnected);
             }
         }
@@ -931,10 +1002,23 @@ impl NinePClient {
     }
 
     /// Rebuilds recorded fids and locks on `conn`. Roots precede descendants.
+    #[cfg(test)]
     async fn replay(&self, conn: &Conn) -> ClientResult<()> {
+        let progress = ReplayProgress::default();
+        self.replay_with_progress(conn, &progress).await
+    }
+
+    async fn replay_with_progress(
+        &self,
+        conn: &Conn,
+        progress: &ReplayProgress,
+    ) -> ClientResult<()> {
         let snapshot = self.state.lock().unwrap().clone();
+        let fid_count = snapshot.fids.len();
+        progress.set_total(fid_count.saturating_add(snapshot.locks.len()));
         let mut gone_unopened = Vec::new();
         let mut stale_opened = Vec::new();
+        let mut completed_fids = 0usize;
 
         let (roots, descendants): (Vec<_>, Vec<_>) = snapshot
             .fids
@@ -952,6 +1036,8 @@ impl NinePClient {
                 } else {
                     gone_unopened.push(fid);
                 }
+                completed_fids = completed_fids.saturating_add(1);
+                progress.reach(completed_fids);
                 continue;
             }
             if let Some(flags) = rec.opened {
@@ -976,13 +1062,16 @@ impl NinePClient {
                     Err(e) => return Err(e),
                 }
             }
+            completed_fids = completed_fids.saturating_add(1);
+            progress.reach(completed_fids);
         }
 
         let mut conflict_backoff = RECONNECT_BACKOFF_MIN;
+        let mut lock_high_water = 0usize;
         'lock_replay: loop {
             // Install the complete recorded lock set or roll back its prefix.
             let mut acquired = Vec::new();
-            for lk in &snapshot.locks {
+            for (lock_index, lk) in snapshot.locks.iter().enumerate() {
                 let body = Message::Tlock(Tlock {
                     fid: lk.fid,
                     lock_type: lk.lock_type,
@@ -995,6 +1084,11 @@ impl NinePClient {
                 match Self::send_raw_rpc(conn, body).await {
                     Ok(Message::Rlock(r)) if r.status == LockStatus::Success.as_wire() => {
                         acquired.push(lk);
+                        let completed_locks = lock_index.saturating_add(1);
+                        if completed_locks > lock_high_water {
+                            lock_high_water = completed_locks;
+                            progress.reach(fid_count.saturating_add(lock_high_water));
+                        }
                     }
                     Ok(Message::Rlock(Rlock {
                         status: LOCK_BLOCKED,
@@ -3208,6 +3302,38 @@ mod session_transition_tests {
             proc_id: 1,
             client_id: b"owner".to_vec(),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_watchdog_allows_total_work_longer_than_one_stall_window() {
+        let progress = AtomicU64::new(0);
+        let work = async {
+            for completed in 1..=6 {
+                runtime::sleep(Duration::from_secs(17)).await;
+                progress.store(completed, Ordering::Relaxed);
+            }
+            42
+        };
+
+        assert_eq!(
+            timeout_on_stall(Duration::from_secs(30), &progress, work).await,
+            Ok(42)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_watchdog_rejects_a_candidate_that_stops_progressing() {
+        let progress = AtomicU64::new(7);
+
+        assert!(
+            timeout_on_stall(
+                Duration::from_secs(30),
+                &progress,
+                std::future::pending::<()>(),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
