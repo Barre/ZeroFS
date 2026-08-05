@@ -104,6 +104,24 @@ class SystemRunner:
             fail(f"cannot probe {url}: {error}")
         return False
 
+    def splice_rpm_sighdr(
+        self,
+        sighdr: Path,
+        package: Path,
+        destination: Path,
+    ) -> None:
+        self.run(
+            [
+                "python3",
+                "-c",
+                "import sys, koji; koji.splice_rpm_sighdr("
+                "open(sys.argv[1], 'rb').read(), sys.argv[2], sys.argv[3])",
+                str(sighdr),
+                str(package),
+                str(destination),
+            ]
+        )
+
     def kernel_auto_conf(self, package: Path, destination: Path) -> str:
         destination.mkdir(parents=True, exist_ok=True)
         first = subprocess.Popen(
