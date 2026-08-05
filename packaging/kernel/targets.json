@@ -211,8 +211,8 @@
     {
       "id": "ubuntu-26.04-generic-7.0.0-28",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "ubuntu-26.04-generic-x86-64",
       "package_revision": "1",
       "kernel_release": "7.0.0-28-generic",
@@ -229,8 +229,8 @@
     {
       "id": "ubuntu-26.04-generic-7.0.0-28-aarch64",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "ubuntu-26.04-generic-aarch64",
       "package_revision": "1",
       "kernel_release": "7.0.0-28-generic",
@@ -547,8 +547,8 @@
     {
       "id": "fedora-44-kernel-core-aarch64-7.1.5-201.fc44.aarch64-r2",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-44-kernel-core-aarch64",
       "package_revision": "2",
       "kernel_release": "7.1.5-201.fc44.aarch64",
@@ -576,8 +576,8 @@
     {
       "id": "fedora-44-kernel-core-x86-64-7.1.5-201.fc44.x86-64-r2",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-44-kernel-core-x86-64",
       "package_revision": "2",
       "kernel_release": "7.1.5-201.fc44.x86_64",
@@ -636,6 +636,100 @@
         "kind": "opensuse-history",
         "identity": "kernel-default@7.1.5-1.1,kernel-default-devel@7.1.5-1.1,kernel-devel@7.1.5-1.1,kernel-source@7.1.5-1.1,kernel-syms@7.1.5-1.1",
         "snapshot": "20260731"
+      }
+    },
+    {
+      "id": "fedora-44-kernel-core-x86-64-7.1.6-201.fc44.x86-64-r3",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-44-kernel-core-x86-64",
+      "package_revision": "3",
+      "kernel_release": "7.1.6-201.fc44.x86_64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.6-201.fc44.x86_64",
+      "kernel_selector_version": "7.1.6-201.fc44",
+      "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.6-201.fc44",
+        "snapshot": "koji-signed-build:36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6:x86_64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc44.x86_64.rpm": "b9931f7a3c140fa9f33df4410a92724a5e9824808592967961e3cfcea19f56b7",
+          "kernel-7.1.6-201.fc44.src.rpm": "b965cbd06c815331030f0dd09da25cebdd892f6466e1e6ea3f7dbe4128bda52a",
+          "kernel-core-7.1.6-201.fc44.x86_64.rpm": "c9bd9cc6d9db8f8f02b1022c1902f2bc80fa33fbfcdbe8dd7e2cc9303e115812",
+          "kernel-devel-7.1.6-201.fc44.x86_64.rpm": "95168dce64af4c80ed5304fe5317a19c7f88da7a98a045af6773d1cd98ce1f12",
+          "kernel-modules-core-7.1.6-201.fc44.x86_64.rpm": "4a25f7be09af03da63acfcce4c5a3972f168884dbe10c04e654bf0721841af0d",
+          "rust-1.97.1-1.fc44.x86_64.rpm": "79b49e6371de60a7bc4dcfbe179eda7be7007db0008fd6af1db5277919c75397",
+          "rust-src-1.97.1-1.fc44.noarch.rpm": "e8730ab6cb13f46604929b1ce134431ac40d1446a95cef04edfbe3d97093554f",
+          "rust-std-static-1.97.1-1.fc44.x86_64.rpm": "7ac4019f0a257142bbfeba2423a8420b92904354d624a5b0716e0cd5faa8ad08",
+          "rustfmt-1.97.1-1.fc44.x86_64.rpm": "9e0122684d937fe09f1a7f5bd1b0252a5988587a38731fb741847f5bb60554c6"
+        }
+      }
+    },
+    {
+      "id": "fedora-44-kernel-core-aarch64-7.1.6-201.fc44.aarch64-r3",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-44-kernel-core-aarch64",
+      "package_revision": "3",
+      "kernel_release": "7.1.6-201.fc44.aarch64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.6-201.fc44.aarch64",
+      "kernel_selector_version": "7.1.6-201.fc44",
+      "builder_image": "fedora:44@sha256:6c75d5bf57cb0fa5aa4b92c6a83c86c791644496d9ac230de7711f5b8ec3b898",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.6-201.fc44",
+        "snapshot": "koji-signed-build:36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6:aarch64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc44.aarch64.rpm": "b9a5e2a583693fd5a1a9c78270d3dc40cf46326e7f92636e46b5c36b82ff3a5f",
+          "kernel-7.1.6-201.fc44.src.rpm": "b965cbd06c815331030f0dd09da25cebdd892f6466e1e6ea3f7dbe4128bda52a",
+          "kernel-core-7.1.6-201.fc44.aarch64.rpm": "40c399fffecc070d4671a67205eccdfba3aa3cbd14964d03954dda2c7b4f856b",
+          "kernel-devel-7.1.6-201.fc44.aarch64.rpm": "22cf4c35c4faa5ca138e1b8f24c669b791122b0c4e0606ce15863a320770f5a3",
+          "kernel-modules-core-7.1.6-201.fc44.aarch64.rpm": "e51b00be7d918412ab3aec88bda3dead3f75c4667d48961853ad8e342a3101f5",
+          "rust-1.97.1-1.fc44.aarch64.rpm": "c04ef4cf7e712aae73933c624eac33a2a54c0368d28af4467c6928557cf16350",
+          "rust-src-1.97.1-1.fc44.noarch.rpm": "e8730ab6cb13f46604929b1ce134431ac40d1446a95cef04edfbe3d97093554f",
+          "rust-std-static-1.97.1-1.fc44.aarch64.rpm": "5ea7fe6ad90d99ff45fedab6d37e510920d677f86b9998ea821678eb429e534e",
+          "rustfmt-1.97.1-1.fc44.aarch64.rpm": "313cfefe6f14d0e4d3836ff2916f6e75d5ff0c63e062bdf0e3f905d3f0a0d418"
+        }
+      }
+    },
+    {
+      "id": "ubuntu-26.04-generic-x86-64-7.0.0-29-generic-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "ubuntu-26.04-generic-x86-64",
+      "package_revision": "2",
+      "kernel_release": "7.0.0-29-generic",
+      "kernel_package_name": "linux-image-7.0.0-29-generic",
+      "kernel_package_version": "7.0.0-29.29",
+      "kernel_selector_version": "7.0.0-29.29",
+      "builder_image": "ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "ubuntu:linux@7.0.0-29.29",
+        "snapshot": "20260805T072350Z"
+      }
+    },
+    {
+      "id": "ubuntu-26.04-generic-aarch64-7.0.0-29-generic-r2",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "ubuntu-26.04-generic-aarch64",
+      "package_revision": "2",
+      "kernel_release": "7.0.0-29-generic",
+      "kernel_package_name": "linux-image-7.0.0-29-generic",
+      "kernel_package_version": "7.0.0-29.29",
+      "kernel_selector_version": "7.0.0-29.29",
+      "builder_image": "ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb",
+      "source": {
+        "kind": "apt-snapshot",
+        "identity": "ubuntu:linux@7.0.0-29.29",
+        "snapshot": "20260805T072350Z"
       }
     }
   ],
