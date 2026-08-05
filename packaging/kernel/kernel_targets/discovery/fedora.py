@@ -61,7 +61,20 @@ def _download_rpm(
 ) -> Path:
     filename = f"{name}-{nvr}.{arch}.rpm"
     path = directory / filename
-    runner.download(f"{url}/{arch}/{filename}", path)
+    unsigned = directory / f"{filename}.unsigned"
+    sighdr = directory / f"{filename}.sig"
+    # koji garbage-collects the materialized signed copies once a build is
+    # untagged, but keeps the original rpm and the detached signature header
+    # for the life of the build. Splicing the two reproduces the signed rpm
+    # byte for byte.
+    runner.download(f"{url}/{arch}/{filename}", unsigned)
+    runner.download(
+        f"{url}/data/sigcache/{fingerprint[-8:]}/{arch}/{filename}.sig",
+        sighdr,
+    )
+    runner.splice_rpm_sighdr(sighdr, unsigned, path)
+    unsigned.unlink()
+    sighdr.unlink()
     _verify_rpm(
         runner,
         path,
@@ -167,11 +180,10 @@ def discover(
     version, separator, release = kernel_nvr.rpartition("-")
     if not separator:
         fail("invalid Fedora kernel build")
-    runner.run(["dnf", "-y", "install", "cpio"])
-    key = fingerprint[-8:]
+    runner.run(["dnf", "-y", "install", "cpio", "python3-koji"])
     kernel_base = (
         "https://kojipkgs.fedoraproject.org/packages/kernel/"
-        f"{version}/{release}/data/signed/{key}"
+        f"{version}/{release}"
     )
     with tempfile.TemporaryDirectory(prefix="zerofs-discovery-") as raw:
         directory = Path(raw)
@@ -216,7 +228,7 @@ def discover(
             fail("invalid Fedora Rust build")
         rust_base = (
             "https://kojipkgs.fedoraproject.org/packages/rust/"
-            f"{rust_version}/{rust_release}/data/signed/{key}"
+            f"{rust_version}/{rust_release}"
         )
         rust_source = f"rust-{rust_nvr}.src.rpm"
         for package in ("cargo", "rust", "rust-std-static", "rustfmt"):

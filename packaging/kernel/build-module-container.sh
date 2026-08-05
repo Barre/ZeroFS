@@ -132,6 +132,42 @@ verify_fedora_signature() {
         die "Fedora RPM has the wrong signature: ${path##*/}"
 }
 
+# koji garbage-collects the materialized signed copies once a build is
+# untagged, but keeps the original rpm and the detached signature header for
+# the life of the build. Splicing the two reproduces the signed rpm byte for
+# byte.
+fetch_fedora_rpm() {
+    local base=$1
+    local arch_dir=$2
+    local filename=$3
+    local destination=$4
+    local signing_key
+
+    if [[ -z "$fedora_signing_fingerprint" ]]; then
+        curl --fail --location --retry 5 --retry-all-errors \
+            --output "$destination" \
+            "$base/$arch_dir/$filename"
+        return
+    fi
+    signing_key=${fedora_signing_fingerprint: -8}
+    curl --fail --location --retry 5 --retry-all-errors \
+        --output "$destination.unsigned" \
+        "$base/$arch_dir/$filename"
+    curl --fail --location --retry 5 --retry-all-errors \
+        --output "$destination.sig" \
+        "$base/data/sigcache/$signing_key/$arch_dir/$filename.sig"
+    python3 - "$destination.sig" "$destination.unsigned" "$destination" <<'PY'
+import sys
+
+import koji
+
+sighdr, unsigned, destination = sys.argv[1:]
+with open(sighdr, "rb") as source:
+    koji.splice_rpm_sighdr(source.read(), unsigned, destination)
+PY
+    rm -f -- "$destination.unsigned" "$destination.sig"
+}
+
 validate_fedora_source_artifacts() {
     local kernel_nvr=$1
     local rust_nvr=$2
@@ -372,7 +408,6 @@ configure_fedora() {
     local package_version
     local package_path
     local koji_base
-    local signing_key
     local rpm_dir="$work_root/fedora-rpms"
     local rpmbuild_root="$work_root/rpmbuild"
     local snapshot_suffix
@@ -431,6 +466,7 @@ configure_fedora() {
         make \
         openssl-devel \
         python3 \
+        python3-koji \
         rpm-build \
         rust \
         bindgen-cli \
@@ -444,22 +480,15 @@ configure_fedora() {
     require_command sha256sum
     mkdir -p "$rpm_dir"
     koji_base="https://kojipkgs.fedoraproject.org/packages/kernel/$package_version/$package_release"
-    if [[ -n "$fedora_signing_fingerprint" ]]; then
-        signing_key=${fedora_signing_fingerprint: -8}
-        koji_base+="/data/signed/$signing_key"
-    fi
     for package in kernel-core kernel-modules-core kernel-devel; do
         package_path="$rpm_dir/$package-$nvr.$target_arch.rpm"
-        curl --fail --location --retry 5 --retry-all-errors \
-            --output "$package_path" \
-            "$koji_base/$target_arch/$package-$nvr.$target_arch.rpm"
+        fetch_fedora_rpm "$koji_base" "$target_arch" \
+            "$package-$nvr.$target_arch.rpm" "$package_path"
         verify_source_artifact "$package_path"
         verify_fedora_signature "$package_path"
     done
     package_path="$rpm_dir/kernel-$nvr.src.rpm"
-    curl --fail --location --retry 5 --retry-all-errors \
-        --output "$package_path" \
-        "$koji_base/src/kernel-$nvr.src.rpm"
+    fetch_fedora_rpm "$koji_base" src "kernel-$nvr.src.rpm" "$package_path"
     verify_source_artifact "$package_path"
     verify_fedora_signature "$package_path"
 
@@ -710,7 +739,6 @@ install_fedora_rust_tools() {
     local rust_version
     local rustc_text
     local rust_nvr
-    local signing_key
     local toolchain_matches=true
     local -a packages=()
 
@@ -752,25 +780,19 @@ install_fedora_rust_tools() {
     [[ "$rpm_arch" == "$target_rpm_arch" ]] ||
         die "Fedora builder $rpm_arch does not match $target_rpm_arch"
     koji_base="https://kojipkgs.fedoraproject.org/packages/rust/$rust_version/$rust_release"
-    if [[ -n "$fedora_signing_fingerprint" ]]; then
-        signing_key=${fedora_signing_fingerprint: -8}
-        koji_base+="/data/signed/$signing_key"
-    fi
     mkdir -p "$rpm_dir"
     for package in cargo rust rust-std-static rustfmt; do
         package_path="$rpm_dir/$package-$rust_nvr.$rpm_arch.rpm"
         packages+=("$package_path")
-        curl --fail --location --retry 5 --retry-all-errors \
-            --output "$package_path" \
-            "$koji_base/$rpm_arch/$package-$rust_nvr.$rpm_arch.rpm"
+        fetch_fedora_rpm "$koji_base" "$rpm_arch" \
+            "$package-$rust_nvr.$rpm_arch.rpm" "$package_path"
         verify_source_artifact "$package_path"
         verify_fedora_signature "$package_path"
     done
     package_path="$rpm_dir/rust-src-$rust_nvr.noarch.rpm"
     packages+=("$package_path")
-    curl --fail --location --retry 5 --retry-all-errors \
-        --output "$package_path" \
-        "$koji_base/noarch/rust-src-$rust_nvr.noarch.rpm"
+    fetch_fedora_rpm "$koji_base" noarch \
+        "rust-src-$rust_nvr.noarch.rpm" "$package_path"
     verify_source_artifact "$package_path"
     verify_fedora_signature "$package_path"
 

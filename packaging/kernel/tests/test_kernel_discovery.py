@@ -45,6 +45,9 @@ class FakeRunner:
         self.downloads.append(url)
         destination.write_bytes(destination.name.encode())
 
+    def splice_rpm_sighdr(self, _sighdr, _package, destination):
+        destination.write_bytes(destination.name.encode())
+
     def url_exists(self, url):
         return url in self.existing_urls
 
@@ -526,15 +529,21 @@ class KernelDiscoveryTest(unittest.TestCase):
             runner,
         )
 
-        self.assertEqual(len(runner.downloads), 9)
+        self.assertEqual(len(runner.downloads), 18)
         self.assertEqual(len(candidate["source"]["artifacts"]), 9)
         self.assertEqual(
             candidate["source"]["snapshot"],
             f"koji-signed-build:{fingerprint}:{arch},noarch,src",
         )
+        rpms = [url for url in runner.downloads if url.endswith(".rpm")]
+        sigs = [url for url in runner.downloads if url.endswith(".rpm.sig")]
+        self.assertEqual(len(rpms), 9)
+        self.assertEqual(len(sigs), 9)
+        self.assertFalse(
+            any("/data/signed/" in url for url in runner.downloads)
+        )
         self.assertTrue(
-            all(f"/data/signed/{fingerprint[-8:]}/" in url
-                for url in runner.downloads)
+            all(f"/data/sigcache/{fingerprint[-8:]}/" in url for url in sigs)
         )
         self.assertTrue(
             all(
