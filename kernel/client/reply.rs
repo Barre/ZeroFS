@@ -1,18 +1,23 @@
 use core::mem;
+use core::sync::atomic::Ordering;
 
 use kernel::{
     alloc::KVVec,
+    bindings,
     prelude::*,
     sync::{CondVar, CondVarTimeoutResult},
 };
 
-use super::errors::protocol_errno;
+use crate::protocol::{self, Request, Response};
+
+use super::errors::{codec_errno, protocol_errno};
 use super::flush::FlushOutcome;
 use super::receive::validate_response_frame;
 use super::retry::AttemptOutcome;
 use super::session::{Dispatch, Session};
 use super::signals::{SendSignalMask, sleep_uninterruptible_tick};
-use super::slots::{ExpectedResponse, PendingSlot, PendingState, vacate_slot};
+use super::slots::{ExpectedResponse, FrameSend, PendingSlot, PendingState, vacate_slot};
+use super::{MAX_PROBE_EXTENSIONS, PROBE_TIMEOUT_MS, jiffies_for_ms};
 
 pub(super) struct OwnedFrame<'a> {
     pub(super) bytes: ReplyBytes<'a>,
@@ -145,6 +150,7 @@ impl Session {
         // signals; the loop paces the two unmaskable ones against the same
         // reply deadline.
         let mut uncancellable: Option<SendSignalMask> = None;
+        let mut probe_extensions = 0u32;
         loop {
             let mut slots = shard.lock();
             let Some(slot) = slots.get_mut(local_tag) else {
@@ -182,7 +188,7 @@ impl Session {
                 if sleep_uninterruptible_tick(&mut remaining) {
                     continue;
                 }
-                self.handle_reply_deadline(tag, dispatch)?;
+                self.handle_reply_deadline(tag, dispatch, &mut probe_extensions)?;
                 remaining = self.timeout_jiffies;
                 continue;
             }
@@ -203,7 +209,7 @@ impl Session {
                 }
                 CondVarTimeoutResult::Timeout => {
                     drop(slots);
-                    self.handle_reply_deadline(tag, dispatch)?;
+                    self.handle_reply_deadline(tag, dispatch, &mut probe_extensions)?;
                     remaining = self.timeout_jiffies;
                 }
             }
@@ -211,24 +217,151 @@ impl Session {
     }
 
     /// Recheck an expired reply and either extend its deadline or retire it.
-    fn handle_reply_deadline(&self, tag: usize, dispatch: &Dispatch) -> Result<()> {
+    fn handle_reply_deadline(
+        &self,
+        tag: usize,
+        dispatch: &Dispatch,
+        probe_extensions: &mut u32,
+    ) -> Result<()> {
         let (shard, local_tag) = self.slot_shard(tag)?;
         let slots = shard.lock();
         if slot_completed(&slots, local_tag) {
             return Ok(());
         }
-        // A slow request is not a dead connection. As long as other replies
-        // keep proving the peer alive, let server-side backpressure reach this
-        // waiter instead of forcing an unnecessary reconnect. A silent peer
-        // still expires after one full window without a decoded frame.
+        // Other replies prove the connection is still alive.
         if self.heard_recently() {
             return Ok(());
         }
         drop(slots);
+        // Tgetlineage remains available during a backend stall and verifies
+        // that this peer still has serving authority.
+        if *probe_extensions < MAX_PROBE_EXTENSIONS && self.probe_peer(dispatch) {
+            *probe_extensions += 1;
+            return Ok(());
+        }
         let error = ETIMEDOUT;
         self.retire_connection(error, dispatch.epoch);
         self.release_slot(tag);
         Err(error)
+    }
+
+    /// Run or coalesce an in-band liveness probe.
+    fn probe_peer(&self, dispatch: &Dispatch) -> bool {
+        if self.probe_in_flight.swap(true, Ordering::Acquire) {
+            // The active probe will refresh liveness or retire the connection.
+            return true;
+        }
+        let alive = self.exchange_probe(dispatch);
+        self.probe_in_flight.store(false, Ordering::Release);
+        alive
+    }
+
+    /// Run one bounded Tgetlineage round trip.
+    fn exchange_probe(&self, dispatch: &Dispatch) -> bool {
+        let request = Request::Tgetlineage;
+        let Ok(expected) = ExpectedResponse::for_request(&request) else {
+            return false;
+        };
+        let Ok(maximum_response) = expected.maximum_frame_size(self.msize) else {
+            return false;
+        };
+        // Do not wait for capacity that only an incoming reply can free.
+        let Ok(tag) = self.reserve_slot(expected, maximum_response, None, 1, &[]) else {
+            return false;
+        };
+        let mut frame = [0u8; protocol::HEADER_SIZE];
+        let Ok(encoded) = protocol::encode_request(&mut frame, self.msize, tag as u16, request)
+        else {
+            self.release_slot(tag);
+            return false;
+        };
+        let Some(request_frame) = frame.get(..encoded) else {
+            self.release_slot(tag);
+            return false;
+        };
+        match self.send_frame(tag, request_frame, dispatch) {
+            FrameSend::Sent => self.wait_for_probe_reply(tag, dispatch),
+            FrameSend::Rejected(_) => {
+                self.release_slot(tag);
+                false
+            }
+            FrameSend::Broken(error) => {
+                // The frame may be partially sent, so retire before reuse.
+                self.retire_connection(error, dispatch.epoch);
+                self.release_slot(tag);
+                false
+            }
+        }
+    }
+
+    /// Wait uninterruptibly for a probe response within its timeout.
+    ///
+    /// A sent tag cannot be abandoned while its reply may still arrive.
+    fn wait_for_probe_reply(&self, tag: usize, dispatch: &Dispatch) -> bool {
+        let mut remaining = jiffies_for_ms(u64::from(PROBE_TIMEOUT_MS))
+            .min(self.timeout_jiffies)
+            .max(1);
+        loop {
+            let Ok((shard, local_tag)) = self.slot_shard(tag) else {
+                self.terminate(protocol_errno());
+                return false;
+            };
+            let mut slots = shard.lock();
+            let Some(slot) = slots.get_mut(local_tag) else {
+                drop(slots);
+                self.terminate(protocol_errno());
+                return false;
+            };
+            match &slot.state {
+                PendingState::Completed(_) => {
+                    let reply = take_completed_reply(slot);
+                    drop(slots);
+                    match self.release_normal_tag_if_idle(tag) {
+                        Ok(_) => self.changed.notify_all(),
+                        Err(error) => {
+                            self.terminate(error);
+                            return false;
+                        }
+                    }
+                    let Some(reply) = reply else {
+                        return false;
+                    };
+                    let verdict = validate_probe_response(
+                        reply.bytes.as_slice(),
+                        self.msize,
+                        tag as u16,
+                        reply.expected,
+                    );
+                    self.release_reply_credit(reply.reply_credit);
+                    self.recycle_reply_buffer(reply.bytes);
+                    return match verdict {
+                        Ok(alive) => alive,
+                        Err(error) => {
+                            self.terminate(error);
+                            false
+                        }
+                    };
+                }
+                PendingState::Failed(_) => {
+                    drop(slots);
+                    self.release_slot(tag);
+                    return false;
+                }
+                PendingState::Sent => {}
+                PendingState::Reserved | PendingState::Consuming | PendingState::Vacant => {
+                    drop(slots);
+                    self.terminate(protocol_errno());
+                    return false;
+                }
+            }
+            drop(slots);
+            if !sleep_uninterruptible_tick(&mut remaining) {
+                // Retire before vacating so the receiver cannot publish here.
+                self.retire_connection(ETIMEDOUT, dispatch.epoch);
+                self.release_slot(tag);
+                return false;
+            }
+        }
     }
 
     /// Act on a signal that interrupted a wait for `tag` while its slot was
@@ -253,6 +386,23 @@ impl Session {
                 Ok(())
             }
         }
+    }
+}
+
+/// Decode and validate a probe response.
+fn validate_probe_response(
+    frame: &[u8],
+    msize: u32,
+    tag: u16,
+    expected: ExpectedResponse,
+) -> Result<bool> {
+    let decoded = protocol::decode_response(frame, msize, tag).map_err(codec_errno)?;
+    match decoded.body {
+        // A valid Rlerror rejects the probe; invalid errnos are protocol errors.
+        Response::Rlerror(error) if (1..=bindings::MAX_ERRNO).contains(&error.ecode) => Ok(false),
+        Response::Rlerror(_) => Err(protocol_errno()),
+        response if expected.matches(&response) => Ok(true),
+        _ => Err(protocol_errno()),
     }
 }
 

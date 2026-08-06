@@ -67,7 +67,7 @@ use kernel::{
     alloc::KBox, bindings, ffi, prelude::*, sync::aref::ARef, task::Task, time::msecs_to_jiffies,
 };
 
-use crate::protocol::{self, HEADER_SIZE, Qid};
+use crate::protocol::{self, Qid, HEADER_SIZE};
 
 use self::errors::not_connected_errno;
 use self::reconnect::bootstrap_connection;
@@ -169,6 +169,9 @@ const MUTATION_RETRY_HORIZON_MS: u64 = protocol::retry::MUTATION_RETRY_HORIZON.a
 /// Clamped below the reply timeout in [`Session::new`] so the evidence is
 /// always fresher than the wait that consumed it.
 const LIVENESS_WINDOW_MS: u64 = 3_000;
+
+/// Maximum liveness-probe extensions for one reply wait.
+const MAX_PROBE_EXTENSIONS: u32 = 7;
 
 /// Most server addresses one mount will rotate through.
 ///
