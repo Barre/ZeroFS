@@ -56,6 +56,8 @@ pub(super) struct Session {
     pub(super) msize_mismatch_warned: AtomicBool,
     /// Monotonic nanoseconds when a frame was last decoded on any connection.
     pub(super) last_frame_ns: AtomicU64,
+    /// Set while an in-band liveness probe is active.
+    pub(super) probe_in_flight: AtomicBool,
     /// Lock-free mirror of `SessionState::connection_epoch`.
     ///
     /// A receiver checks this before and after taking a tag shard. Retirement
@@ -287,6 +289,7 @@ impl Session {
                 preferred_target: AtomicU32::new(target as u32),
                 msize_mismatch_warned: AtomicBool::new(false),
                 last_frame_ns: AtomicU64::new(monotonic_ns()),
+                probe_in_flight: AtomicBool::new(false),
                 active_epoch: AtomicU64::new(0),
                 sent_count: AtomicUsize::new(0),
                 bulk_reads: AtomicU32::new(0),

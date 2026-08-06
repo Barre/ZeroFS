@@ -13,9 +13,7 @@ use crate::{
 };
 
 use super::RECEIVE_BATCH_BYTES;
-use super::errors::{
-    message_size_errno, not_connected_errno, protocol_errno,
-};
+use super::errors::{message_size_errno, not_connected_errno, protocol_errno};
 use super::registry::is_tombstoned_locked;
 use super::session::{Dispatch, Session, SessionState, SessionStatus};
 use super::signals::{SendSignalMask, resume_interrupted_send, sleep_uninterruptible_tick};
@@ -163,10 +161,8 @@ impl Session {
                 return Err(errno!(ESTALE));
             }
 
-            // Tclunk returns remote resources and Tfsyncdur releases dirty
-            // mutation state. Let their tiny responses use emergency credit so
-            // VFS-held data frames cannot deadlock either control path. The
-            // finite wire namespace still bounds these reservations.
+            // Control replies must remain reservable when data replies exhaust
+            // the credit pool. The wire tag limit bounds emergency reservations.
             let credit_available = expected.has_emergency_credit()
                 || state
                     .used_reply_credit
@@ -518,7 +514,10 @@ pub(super) enum ExpectedResponse {
 
 impl ExpectedResponse {
     fn has_emergency_credit(self) -> bool {
-        matches!(self, Self::Flush | Self::Clunk | Self::Fsync)
+        matches!(
+            self,
+            Self::Lineage | Self::Flush | Self::Clunk | Self::Fsync
+        )
     }
 
     pub(super) fn for_request(request: &Request<'_>) -> Result<Self> {
