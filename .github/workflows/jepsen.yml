@@ -30,6 +30,10 @@ jobs:
           # render latency/rate PNGs; without it that checker throws and the
           # verdict drops to :unknown.
           sudo apt-get install -y fuse3 gnuplot
+          # Runner image 20260804.265.1 ships a non-setuid helper in
+          # /usr/local/bin that shadows the distro's setuid helper.
+          sudo rm -f /usr/local/bin/fusermount3
+          test "$(command -v fusermount3)" = /usr/bin/fusermount3
           curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
             -o /usr/local/bin/lein
           sudo chmod +x /usr/local/bin/lein
