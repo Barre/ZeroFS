@@ -489,8 +489,8 @@
     {
       "id": "fedora-43-kernel-core-aarch64-7.1.5-101.fc43.aarch64-r2",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-43-kernel-core-aarch64",
       "package_revision": "2",
       "kernel_release": "7.1.5-101.fc43.aarch64",
@@ -518,8 +518,8 @@
     {
       "id": "fedora-43-kernel-core-x86-64-7.1.5-101.fc43.x86-64-r2",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "fedora-43-kernel-core-x86-64",
       "package_revision": "2",
       "kernel_release": "7.1.5-101.fc43.x86_64",
@@ -730,6 +730,64 @@
         "kind": "apt-snapshot",
         "identity": "ubuntu:linux@7.0.0-29.29",
         "snapshot": "20260805T072350Z"
+      }
+    },
+    {
+      "id": "fedora-43-kernel-core-aarch64-7.1.6-101.fc43.aarch64-r3",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-43-kernel-core-aarch64",
+      "package_revision": "3",
+      "kernel_release": "7.1.6-101.fc43.aarch64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.6-101.fc43.aarch64",
+      "kernel_selector_version": "7.1.6-101.fc43",
+      "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.6-101.fc43",
+        "snapshot": "koji-signed-build:c6e7f081cf80e13146676e88829b606631645531:aarch64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc43.aarch64.rpm": "f4548016555f5e7f00a21ce30fe5bc489b61e45094ebf59970db2bf08193533e",
+          "kernel-7.1.6-101.fc43.src.rpm": "25382bc1bcc52d34d43a2e6d225df752e76d9d8256de092ee12a5badf169061f",
+          "kernel-core-7.1.6-101.fc43.aarch64.rpm": "4a80aeb71c27d1457ed37a4c02a6dbfd7f78c4aae81b2130d01bea60ebd6607c",
+          "kernel-devel-7.1.6-101.fc43.aarch64.rpm": "5ad13661a23a02f97ff53b0ba5aef361eb210b9e9cf727f0e6fa4fabf5a69e8d",
+          "kernel-modules-core-7.1.6-101.fc43.aarch64.rpm": "b0d79d2b89cbc1e37c854d89e3361c1aec5ea67535f278f1b060521702cfac5b",
+          "rust-1.97.1-1.fc43.aarch64.rpm": "62d8fd649c36ee96aa82d3e0ee2530d09d4dcdc7381bcf17a741c6e8d054c471",
+          "rust-src-1.97.1-1.fc43.noarch.rpm": "2812df8f03607dc4d97eef0578092073164b8ef5d024e12ccbe57bbb3e184daa",
+          "rust-std-static-1.97.1-1.fc43.aarch64.rpm": "c67a77053776a6be18d9fe87c4e64c3526e78b16281cddf83fec8b01de34450e",
+          "rustfmt-1.97.1-1.fc43.aarch64.rpm": "26d2d2e8cccd3fe10736c2af056ca25460f120e880513a24428da3005a81501e"
+        }
+      }
+    },
+    {
+      "id": "fedora-43-kernel-core-x86-64-7.1.6-101.fc43.x86-64-r3",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "fedora-43-kernel-core-x86-64",
+      "package_revision": "3",
+      "kernel_release": "7.1.6-101.fc43.x86_64",
+      "kernel_package_name": "kernel-core-uname-r",
+      "kernel_package_version": "7.1.6-101.fc43.x86_64",
+      "kernel_selector_version": "7.1.6-101.fc43",
+      "builder_image": "fedora:43@sha256:762d73ba1c455232b0272c5d445a34f36c4b9f421cbc05ce8102552325b6a222",
+      "source": {
+        "kind": "koji",
+        "identity": "kernel-7.1.6-101.fc43",
+        "snapshot": "koji-signed-build:c6e7f081cf80e13146676e88829b606631645531:x86_64,noarch,src",
+        "artifacts": {
+          "cargo-1.97.1-1.fc43.x86_64.rpm": "aab6e4242ff2cdfa5d1d1a70838e2f71474e57da2cf6426d87506fa6a1a8cfff",
+          "kernel-7.1.6-101.fc43.src.rpm": "25382bc1bcc52d34d43a2e6d225df752e76d9d8256de092ee12a5badf169061f",
+          "kernel-core-7.1.6-101.fc43.x86_64.rpm": "262fe884c0f4911edf81857cb4b315659d81274d696f1b06f38ab1a67ffcab51",
+          "kernel-devel-7.1.6-101.fc43.x86_64.rpm": "67f0d546428e320dca259df84f8ba872e3fd9e4f36217ba11369423aadb5ca3d",
+          "kernel-modules-core-7.1.6-101.fc43.x86_64.rpm": "41134841f26660733c3e3b56c309657c4a8bd8b0113263beb5047654ceef9930",
+          "rust-1.97.1-1.fc43.x86_64.rpm": "0f47f90efe573e23f281a4704a85df13767ba07af9224d9edb1c7ecbcdc6b568",
+          "rust-src-1.97.1-1.fc43.noarch.rpm": "2812df8f03607dc4d97eef0578092073164b8ef5d024e12ccbe57bbb3e184daa",
+          "rust-std-static-1.97.1-1.fc43.x86_64.rpm": "6138d031218e005bb09e4fa9717d5ee3cdfa2a744c04252b1d4583b9a01f6ad0",
+          "rustfmt-1.97.1-1.fc43.x86_64.rpm": "4579d58a854ba30f743fd7002b15d6c61461e798745cb9490b2e55ebf334cf5b"
+        }
       }
     }
   ],
