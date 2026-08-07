@@ -4,8 +4,8 @@ use core::{
     cmp,
     ffi::c_void,
     marker::PhantomData,
+    pin::Pin,
     ptr::{self, NonNull},
-    sync::atomic::Ordering,
 };
 
 use kernel::{
@@ -33,10 +33,11 @@ use crate::{
 };
 
 use super::attributes::{
-    expire_cached_data, invalidate_inode_attributes, monotonic_now_ns, protocol_error,
+    expire_cached_data, monotonic_now_ns, protocol_error, record_local_content_change,
 };
 use super::{
-    FileState, READ_REPLY_OVERHEAD, REQUEST_FILE_STATE, block_direct_io_excluded,
+    FileState, READ_REPLY_OVERHEAD, RELAXED_CACHE_REVALIDATE_NS, REQUEST_FILE_STATE,
+    block_direct_io_excluded,
     io::{InodeRef, OpenFileRef},
 };
 
@@ -162,10 +163,10 @@ pub(super) unsafe extern "C" fn zerofs_netfs_free_group(group: *mut netfs::netfs
     if !file_state_ref.mount().teardown_started() {
         let _ = file_state_ref.mount().client.clunk(file_state_ref.fid());
     }
-    // SAFETY: zerofs_open transferred exactly one KBox allocation to this
+    // SAFETY: zerofs_open transferred exactly one pinned KBox allocation to this
     // refcount. This callback runs exactly once at the zero transition.
     unsafe {
-        drop(<KBox<FileState> as ForeignOwnable>::from_foreign(
+        drop(<Pin<KBox<FileState>> as ForeignOwnable>::from_foreign(
             file_state.cast::<c_void>(),
         ));
     }
@@ -297,6 +298,47 @@ pub(super) unsafe extern "C" fn zerofs_netfs_issue_read(
     }
 }
 
+/// Serve a read from a complete-file open prefetch when it is still current.
+fn read_open_prefetch(
+    file_state: &FileState,
+    inode: &InodeRef<'_>,
+    origin: NetfsOrigin,
+    subrequest: &mut ReadSubrequest<'_>,
+) -> Option<Result<(usize, bool)>> {
+    let prefetch = file_state.prefetch()?;
+    let now = monotonic_now_ns();
+    if now.wrapping_sub(prefetch.observed_ns) >= RELAXED_CACHE_REVALIDATE_NS {
+        file_state.clear_prefetch(&prefetch);
+        return None;
+    }
+    if origin.is_direct_read() {
+        file_state.clear_prefetch(&prefetch);
+        return None;
+    }
+    let inode_state = inode.state().ok()?;
+    let current = {
+        let cached = inode_state.cached_attributes.lock();
+        prefetch.content_generation == cached.content_generation
+    };
+    if !current {
+        file_state.clear_prefetch(&prefetch);
+        return None;
+    }
+
+    let data = prefetch.data.as_slice();
+    let start = usize::try_from(subrequest.position()).unwrap_or(usize::MAX);
+    if start >= data.len() {
+        return Some(Ok((0, true)));
+    }
+    let length = subrequest.remaining().min(data.len() - start);
+    let end = start + length;
+    let copied = subrequest.copy_to_iter(&data[start..end]);
+    if copied != length {
+        return Some(Err(EFAULT));
+    }
+    Some(Ok((copied, end == data.len())))
+}
+
 fn zerofs_netfs_issue_read_sync(mut subrequest: ReadSubrequest<'_>) {
     let Some(request) = subrequest.request() else {
         subrequest.set_result(Err(EBADF));
@@ -306,22 +348,28 @@ fn zerofs_netfs_issue_read_sync(mut subrequest: ReadSubrequest<'_>) {
     let origin = request.origin();
     let inode_size = request.inode_size();
     let remote_inode_size = request.remote_inode_size();
+    // SAFETY: netfslib retains the request inode until this subrequest ends.
+    let inode = unsafe { InodeRef::from_raw(request.inode_ptr()) }.ok();
     let accessed =
         subrequest.with_request_private(&REQUEST_FILE_STATE, |file_state, subrequest| {
             let remaining = subrequest.remaining();
             let count = cmp::min(remaining, u32::MAX as usize) as u32;
             let position = subrequest.position();
             let result = if count == 0 {
-                Ok(0usize)
+                Ok((0usize, false))
+            } else if let Some(prefetched) = inode
+                .as_ref()
+                .and_then(|inode| read_open_prefetch(file_state, inode, origin, subrequest))
+            {
+                prefetched
             } else {
                 let state = file_state.mount();
                 let fid = file_state.fid();
                 match subrequest.reply_destination() {
-                    Some(mut destination) => {
-                        state
-                            .client
-                            .read_into(fid, position, count, &mut destination)
-                    }
+                    Some(mut destination) => state
+                        .client
+                        .read_into(fid, position, count, &mut destination)
+                        .map(|transferred| (transferred, false)),
                     None => match state.client.read(fid, position, count) {
                         Ok(payload) => {
                             let bytes = payload.as_slice();
@@ -329,7 +377,7 @@ fn zerofs_netfs_issue_read_sync(mut subrequest: ReadSubrequest<'_>) {
                             if copied != bytes.len() {
                                 Err(EFAULT)
                             } else {
-                                Ok(copied)
+                                Ok((copied, false))
                             }
                         }
                         Err(error) => Err(error),
@@ -338,7 +386,7 @@ fn zerofs_netfs_issue_read_sync(mut subrequest: ReadSubrequest<'_>) {
             };
 
             match result {
-                Ok(transferred) => {
+                Ok((transferred, prefetch_eof)) => {
                     if transferred != 0 {
                         subrequest.add_transferred(transferred);
                         subrequest.mark_progress();
@@ -347,11 +395,15 @@ fn zerofs_netfs_issue_read_sync(mut subrequest: ReadSubrequest<'_>) {
                     // EOF indication even if relaxed-consistency i_size has not
                     // observed a peer's recent truncate yet.
                     let end = position.saturating_add(transferred as u64);
-                    if transferred == 0 || inode_size.is_some_and(|size| end >= size) {
+                    if prefetch_eof
+                        || transferred == 0
+                        || inode_size.is_some_and(|size| end >= size)
+                    {
                         subrequest.mark_eof();
                     }
                     if !origin.is_direct_read()
-                        && remote_inode_size.is_some_and(|remote_size| end >= remote_size)
+                        && (prefetch_eof
+                            || remote_inode_size.is_some_and(|remote_size| end >= remote_size))
                     {
                         subrequest.mark_clear_tail();
                     }
@@ -524,10 +576,5 @@ fn netfs_post_modify(inode: &InodeRef<'_>) {
     if let (Ok(mount), Ok(remote_inode)) = (inode.mount(), inode.remote_id()) {
         mount.invalidate_object_hints(&[remote_inode]);
     }
-    invalidate_inode_attributes(inode);
-    if let Ok(state) = inode.state() {
-        state
-            .last_data_revalidate_ns
-            .store(monotonic_now_ns(), Ordering::Release);
-    }
+    record_local_content_change(inode);
 }

@@ -188,13 +188,22 @@ pub(super) fn getattr_attributes(
     Ok(attributes)
 }
 
-pub(super) fn open_inode(
-    client: &Client,
+pub(super) struct OpenedInode<'a> {
+    pub(super) fid: u32,
+    pub(super) iounit: u32,
+    pub(super) prefetch: Option<(u64, u64, OwnedPayload<'a>)>,
+}
+
+pub(super) fn open_inode<'a>(
+    client: &'a Client,
     inode: &InodeRef<'_>,
     credentials: &RebindCredentials,
     expected_qid_type: u8,
     flags: u32,
-) -> Result<(u32, u32)> {
+    prefetch_count: u32,
+    prefetch_observed_ns: u64,
+    prefetch_content_generation: u64,
+) -> Result<OpenedInode<'a>> {
     let inode_id = inode.remote_id()?;
     let bound_fid = acquire_bound_fid(client, inode, credentials, expected_qid_type)?;
 
@@ -205,10 +214,34 @@ pub(super) fn open_inode(
             return Err(error);
         }
     };
-    match client.openat(bound_fid.fid, opened_fid, flags) {
-        Ok(opened) if opened.qid.path == inode_id && opened.qid.type_ == expected_qid_type => {
+    let opened = if prefetch_count == 0 {
+        client
+            .openat(bound_fid.fid, opened_fid, flags)
+            .map(|open| (open, None))
+    } else {
+        client
+            .openat_read(bound_fid.fid, opened_fid, flags, prefetch_count)
+            .map(|reply| {
+                (
+                    reply.open,
+                    reply.eof.then_some((
+                        prefetch_observed_ns,
+                        prefetch_content_generation,
+                        reply.payload,
+                    )),
+                )
+            })
+    };
+    match opened {
+        Ok((opened, prefetch))
+            if opened.qid.path == inode_id && opened.qid.type_ == expected_qid_type =>
+        {
             match bound_fid.cleanup(client) {
-                Ok(()) => Ok((opened_fid, opened.iounit)),
+                Ok(()) => Ok(OpenedInode {
+                    fid: opened_fid,
+                    iounit: opened.iounit,
+                    prefetch,
+                }),
                 Err(error) => {
                     let _ = client.clunk(opened_fid);
                     Err(error)

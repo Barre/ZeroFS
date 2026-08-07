@@ -21,14 +21,15 @@ use crate::{
 };
 
 use super::{
-    BoundFidUse, CallbackDrainedMappingGuard, CallbackInodeWriteGuard, LOOKUP_REVAL,
-    MODE_PERMISSIONS, MountState, OpenedCreation, RELAXED_CACHE_REVALIDATE_NS,
+    BoundFidUse, CacheObservation, CallbackDrainedMappingGuard, CallbackInodeWriteGuard,
+    LOOKUP_REVAL, MODE_PERMISSIONS, MountState, OpenedCreation, RELAXED_CACHE_REVALIDATE_NS,
     attributes::{
-        cache_getattr_attributes_at, cache_inode_attributes_at, cached_inode_attributes,
-        creation_gid, expected_qid_type, expire_cached_data, fill_kstat, from_const_ptr_result,
-        from_ptr_result, invalidate_inode_attributes, mark_dentry_invalidated,
-        mark_dentry_observed, mark_spliced_dentry_observed, monotonic_now_ns, protocol_error,
-        publish_mutation_stat, validate_stat, validate_stat_for_inode,
+        apply_killpriv_mode_at, cache_getattr_attributes_at, cache_inode_attributes_at,
+        cache_inode_mutation_attributes_at, cached_inode_attributes, creation_gid,
+        expected_qid_type, expire_cached_attributes_at, expire_cached_data_at, fill_kstat,
+        from_const_ptr_result, from_ptr_result, mark_dentry_invalidated, mark_dentry_observed,
+        mark_spliced_dentry_observed, monotonic_now_ns, protocol_error, publish_mutation_stat,
+        validate_stat, validate_stat_for_inode,
     },
     compat,
     inode::get_inode,
@@ -74,26 +75,24 @@ fn lookup_entry(
     } else {
         None
     };
-    let (attributes, observed_ns, walked_fid) = if let Some((attributes, observed_ns)) = hint {
-        (attributes, observed_ns, None)
+    let (attributes, observation, walked_fid) = if let Some((attributes, observation)) = hint {
+        (attributes, observation, None)
     } else {
+        let observation = state.begin_cache_observation();
         let lookup = match lookup_attributes(&state.client, parent, name, &credentials) {
             Ok(lookup) => lookup,
             Err(error) if error == ENOENT => {
                 // SAFETY: lookup owns this unhashed dentry. A null inode
                 // records a negative result for the current path walk.
                 unsafe {
-                    mark_dentry_observed(dentry.as_dentry(), &credentials, now);
+                    mark_dentry_observed(dentry.as_dentry(), &credentials, observation);
                     bindings::d_add(dentry.as_ptr(), ptr::null_mut());
                 }
                 return Ok(ptr::null_mut());
             }
             Err(error) => return Err(error),
         };
-        // Use the request start as the observation order. A slower,
-        // older lookup must not overwrite attributes fetched by a newer
-        // request that completed first.
-        (lookup.stat, now, Some(lookup.child_fid))
+        (lookup.stat, observation, Some(lookup.child_fid))
     };
     // Clunk the walked fid unless it is transferred to the inode cache.
     let walked_fid = ScopeGuard::new_with_data(walked_fid, |fid: Option<u32>| {
@@ -106,7 +105,7 @@ fn lookup_entry(
         return Err(protocol_error());
     };
 
-    let inode = get_inode(&super_block, &attributes, observed_ns)?;
+    let inode = get_inode(&super_block, &attributes, observation)?;
     if let Some(fid) = walked_fid.dismiss() {
         retain_bound_fid(&state.client, &inode.as_ref(), &credentials, fid);
     }
@@ -114,7 +113,7 @@ fn lookup_entry(
     // SAFETY: d_splice_alias() consumes the inode reference and returns either
     // null, an alias dentry, or an ERR_PTR, exactly as lookup requires.
     let result = unsafe { bindings::d_splice_alias(inode.into_raw(), dentry.as_ptr()) };
-    mark_spliced_dentry_observed(dentry.as_dentry(), result, &credentials, observed_ns);
+    mark_spliced_dentry_observed(dentry.as_dentry(), result, &credentials, observation);
     Ok(result)
 }
 
@@ -170,10 +169,10 @@ pub(super) unsafe extern "C" fn zerofs_getattr(
 
         let attributes = loop {
             // The observation starts before the writeback barrier. Any writer
-            // that completes after this point advances the cache watermark and
+            // that completes after this point advances the cache generation and
             // makes the resulting Stat unpublishable; retrying repeats this
             // barrier.
-            let request_started_ns = monotonic_now_ns();
+            let observation = state.begin_cache_observation();
             if let Some(mapping) = writeback_mapping.as_ref() {
                 // A remote Stat cannot authoritatively describe a locally
                 // extended or timestamp-modified dirty file. Cached getattr
@@ -216,7 +215,7 @@ pub(super) unsafe extern "C" fn zerofs_getattr(
                     Err(error) => return Err(error),
                 };
             validate_stat_for_inode(&inode, &attributes)?;
-            if cache_getattr_attributes_at(&inode, &attributes, request_started_ns) {
+            if cache_getattr_attributes_at(&inode, &attributes, observation) {
                 // Both independently ordered subsets came from this response.
                 // Use it for the current stat even if a very slow RPC consumed
                 // the entire cache-validity window.
@@ -271,11 +270,11 @@ pub(super) unsafe extern "C" fn zerofs_permission(
 
             let credentials = RebindCredentials::current()?;
             let expected_type = expected_qid_type(inode.file_type())?;
-            let request_started_ns = monotonic_now_ns();
+            let observation = mount.begin_cache_observation();
             let attributes =
                 getattr_attributes(&mount.client, &inode, &credentials, expected_type)?;
             validate_stat_for_inode(&inode, &attributes)?;
-            if cache_inode_attributes_at(&inode, &attributes, request_started_ns) {
+            if cache_inode_attributes_at(&inode, &attributes, observation) {
                 break;
             }
             // A local mutation or newer metadata request outranked this reply.
@@ -463,6 +462,7 @@ pub(super) unsafe extern "C" fn zerofs_setattr(
             callback_mapping_guard = Some(coherent);
         }
         let result = state.client.setattrattr(fid, &mutation);
+        let observation = state.begin_cache_observation();
         // Rsetattrattr is the mutation's commit point. A subsequent Tclunk
         // failure kills the session and releases its server-side fids, but
         // must not turn the already-committed setattr into an error or
@@ -476,17 +476,18 @@ pub(super) unsafe extern "C" fn zerofs_setattr(
         // locally fresh at their pre-operation values.
         state.fence_readdir_replies();
         state.invalidate_object_hints(&[remote_inode]);
-        expire_cached_data(&inode_ref);
+        let content_changed = requested & bindings::ATTR_SIZE != 0;
+        if content_changed {
+            expire_cached_data_at(&inode_ref, observation.generation);
+        } else {
+            expire_cached_attributes_at(&inode_ref, observation.generation);
+        }
         let remote = result?;
         validate_stat_for_inode(&inode_ref, &remote)?;
         if write_killpriv {
-            // This callback may hold i_rwsem only shared. Apply only confirmed
-            // set-id removals, then invalidate metadata after the update. A
-            // newer observation either preceded this invalidation and becomes
-            // stale, or follows it and restores the genuinely current remote
-            // mode.
-            inode_ref.apply_killpriv_mode(&remote);
-            invalidate_inode_attributes(&inode_ref);
+            // This callback may hold i_rwsem only shared. The generation check
+            // prevents an older set-id clear from replacing newer metadata.
+            apply_killpriv_mode_at(&inode_ref, &remote, observation.generation);
             return Ok(0);
         }
 
@@ -521,7 +522,7 @@ pub(super) unsafe extern "C" fn zerofs_setattr(
         // A metadata-only setattr must not import an unrelated concurrent
         // remote size without cache invalidation. ATTR_SIZE was handled above
         // while holding mapping.invalidate_lock.
-        publish_mutation_stat(&inode_ref, &remote);
+        publish_mutation_stat(&inode_ref, &remote, content_changed, observation);
         Ok(0)
     })
 }
@@ -600,13 +601,14 @@ impl<'a> NewEntryContext<'a> {
     /// A transport error after dispatch is ambiguous: the server may have
     /// committed even though this syscall has no successful reply. Doing this
     /// for a proven pre-dispatch error costs only a later revalidation.
-    fn invalidate_after_attempt(&self) {
+    fn invalidate_after_attempt(&self, generation: u64) {
         invalidate_new_entry_attempt(
             self.mount,
             &self.parent,
             self.parent_id,
             self.dentry.as_dentry(),
             self.name().ok(),
+            generation,
         );
     }
 
@@ -628,23 +630,28 @@ impl<'a> NewEntryContext<'a> {
     }
 
     /// Instantiate an ordinary non-directory child after its RPC committed.
-    fn instantiate(self, remote: &Stat, expected_type: u32) -> Result<()> {
+    fn instantiate(
+        self,
+        remote: &Stat,
+        expected_type: u32,
+        observation: CacheObservation,
+    ) -> Result<()> {
         self.validate_created(remote, expected_type)?;
-        let observed_ns = monotonic_now_ns();
-        let inode = get_inode(&self.parent.super_block()?, remote, observed_ns)?;
+        let inode = get_inode(&self.parent.super_block()?, remote, observation)?;
         // SAFETY: The constructor captured the create callback's exclusive
         // negative dentry. d_instantiate consumes the inode reference.
         unsafe {
-            mark_dentry_observed(self.dentry.as_dentry(), &self.credentials, observed_ns);
+            mark_dentry_observed(self.dentry.as_dentry(), &self.credentials, observation);
             bindings::d_instantiate(self.dentry.as_ptr(), inode.into_raw());
         }
         Ok(())
     }
 
     fn finish_non_directory(self, result: Result<Stat>, expected_type: u32) -> Result<()> {
-        self.invalidate_after_attempt();
+        let observation = self.mount.begin_cache_observation();
+        self.invalidate_after_attempt(observation.generation);
         match result {
-            Ok(remote) => self.instantiate(&remote, expected_type),
+            Ok(remote) => self.instantiate(&remote, expected_type, observation),
             Err(error) => {
                 self.drop_failed_negative();
                 Err(error)
@@ -659,8 +666,9 @@ fn invalidate_new_entry_attempt(
     parent_id: u64,
     dentry: &DentryRef<'_>,
     name: Option<&[u8]>,
+    generation: u64,
 ) {
-    mark_dentry_invalidated(dentry, monotonic_now_ns());
+    mark_dentry_invalidated(dentry, generation);
     mount.fence_readdir_replies();
     if let Some(name) = name {
         // Another client may have unlinked this name after our readdir cached
@@ -669,7 +677,7 @@ fn invalidate_new_entry_attempt(
         mount.invalidate_entry_hint(parent_id, name);
     }
     mount.invalidate_object_hints(&[parent_id]);
-    invalidate_inode_attributes(parent);
+    expire_cached_attributes_at(parent, generation);
 }
 
 pub(super) unsafe extern "C" fn zerofs_create(
@@ -754,12 +762,7 @@ pub(super) unsafe extern "C" fn zerofs_atomic_open(
         let parent_id = parent_ref.remote_id()?;
         let wire_mode = (mode as u32 & MODE_PERMISSIONS) | bindings::S_IFREG;
         let mut retried_create = false;
-        let OpenedCreation {
-            stat: remote,
-            fid,
-            iounit,
-            parent_cleanup,
-        } = loop {
+        let (created, observation) = loop {
             let result = create_opened_regular_file(
                 &state.client,
                 &parent_ref,
@@ -769,15 +772,17 @@ pub(super) unsafe extern "C" fn zerofs_atomic_open(
                 wire_mode,
                 open_flags,
             );
+            let observation = state.begin_cache_observation();
             invalidate_new_entry_attempt(
                 state,
                 &parent_ref,
                 parent_id,
                 dentry_ref.as_dentry(),
                 Some(name),
+                observation.generation,
             );
             match result {
-                Ok(created) => break created,
+                Ok(created) => break (created, observation),
                 Err(error) if error == EEXIST && flags & bindings::O_EXCL == 0 => {
                     if retried_create {
                         // The outer open path retries ESTALE with
@@ -813,6 +818,12 @@ pub(super) unsafe extern "C" fn zerofs_atomic_open(
                 }
             }
         };
+        let OpenedCreation {
+            stat: remote,
+            fid,
+            iounit,
+            parent_cleanup,
+        } = created;
 
         // Clunk the created fid unless it reaches the published FileState.
         let fid = ScopeGuard::new_with_data(fid, |fid| {
@@ -832,9 +843,8 @@ pub(super) unsafe extern "C" fn zerofs_atomic_open(
             return Err(protocol_error());
         }
 
-        let observed_ns = monotonic_now_ns();
-        let inode = get_inode(&parent_ref.super_block()?, &remote, observed_ns)?;
-        let file_state = new_file_state(state, *fid, iounit, force_unbuffered, credentials)?;
+        let inode = get_inode(&parent_ref.super_block()?, &remote, observation)?;
+        let file_state = new_file_state(state, *fid, iounit, force_unbuffered, credentials, None)?;
 
         // The newly created inode cannot have a pre-existing alias. Publish it
         // before finish_open so do_dentry_open observes the final
@@ -843,7 +853,7 @@ pub(super) unsafe extern "C" fn zerofs_atomic_open(
             mark_dentry_observed(
                 dentry_ref.as_dentry(),
                 file_state.credentials(),
-                observed_ns,
+                observation,
             );
             bindings::d_instantiate(dentry_ref.as_ptr(), inode.into_raw());
         }
@@ -887,7 +897,8 @@ fn create_directory_entry(
         entry.gid,
         wire_mode,
     );
-    entry.invalidate_after_attempt();
+    let observation = entry.mount.begin_cache_observation();
+    entry.invalidate_after_attempt(observation.generation);
     let remote = match result {
         Ok(remote) => remote,
         Err(error) => {
@@ -902,15 +913,14 @@ fn create_directory_entry(
     unsafe {
         bindings::inc_nlink(entry.parent.as_ptr());
     }
-    let observed_ns = monotonic_now_ns();
-    let inode = get_inode(&entry.parent.super_block()?, &remote, observed_ns)?;
+    let inode = get_inode(&entry.parent.super_block()?, &remote, observation)?;
     // mkdir receives a hashed negative dentry, while d_splice_alias requires
     // an unhashed one. Remote filesystems must drop it first so an already
     // cached directory alias can be moved into place safely. d_splice_alias
     // consumes the inode reference and returns the mkdir result: null for this
     // dentry, an alternate alias, or ERR_PTR.
     let result = unsafe {
-        mark_dentry_observed(entry.dentry.as_dentry(), &entry.credentials, observed_ns);
+        mark_dentry_observed(entry.dentry.as_dentry(), &entry.credentials, observation);
         bindings::d_drop(entry.dentry.as_ptr());
         bindings::d_splice_alias(inode.into_raw(), entry.dentry.as_ptr())
     };
@@ -918,7 +928,7 @@ fn create_directory_entry(
         entry.dentry.as_dentry(),
         result,
         &entry.credentials,
-        observed_ns,
+        observation,
     );
     Ok(result)
 }
@@ -1060,15 +1070,16 @@ fn create_hard_link_entry(context: LinkContext<'_>) -> Result<()> {
         &credentials,
         expected_type,
     );
+    let observation = state.begin_cache_observation();
     // A dispatched link can commit even when interruption or disconnect hides
     // its reply. Expire both namespace and source metadata before interpreting
     // the outcome; pre-dispatch failures merely pay a revalidation.
-    mark_dentry_invalidated(context.new_dentry.as_dentry(), monotonic_now_ns());
+    mark_dentry_invalidated(context.new_dentry.as_dentry(), observation.generation);
     state.fence_readdir_replies();
     state.invalidate_entry_hint(parent_id, name);
     state.invalidate_object_hints(&[parent_id, inode_id]);
-    invalidate_inode_attributes(&context.parent);
-    invalidate_inode_attributes(&inode_ref);
+    expire_cached_attributes_at(&context.parent, observation.generation);
+    expire_cached_attributes_at(&inode_ref, observation.generation);
     let remote = match result {
         Ok(remote) => remote,
         Err(error) => {
@@ -1081,19 +1092,15 @@ fn create_hard_link_entry(context: LinkContext<'_>) -> Result<()> {
     validate_stat_for_inode(&inode_ref, &remote)?;
 
     // Both parent and source inode are write-locked by the VFS link path.
-    // Publish returned timestamps/ownership when they win their independent
-    // watermarks, but apply the VFS link transition exactly once regardless of
+    // Publish returned timestamps/ownership when their generations win, but
+    // apply the VFS link transition exactly once regardless of
     // whether a newer observation already won cache publication.
-    let _ = cache_inode_attributes_at(&inode_ref, &remote, monotonic_now_ns());
+    let _ = cache_inode_mutation_attributes_at(&inode_ref, &remote, observation);
     unsafe {
         bindings::inode_set_ctime_current(inode);
         bindings::inc_nlink(inode);
         bindings::ihold(inode);
-        mark_dentry_observed(
-            context.new_dentry.as_dentry(),
-            &credentials,
-            monotonic_now_ns(),
-        );
+        mark_dentry_observed(context.new_dentry.as_dentry(), &credentials, observation);
         bindings::d_instantiate(context.new_dentry.as_ptr(), inode);
     }
     Ok(())
@@ -1121,14 +1128,15 @@ fn unlink_entry(
     let parent_id = parent.remote_id()?;
     let victim_id = victim_ref.remote_id()?;
     let result = remove_entry(&state.client, parent, name, &credentials, remove_directory);
+    let observation = state.begin_cache_observation();
     // Removal may have committed before an interrupted or lost reply. Expire
     // the victim dentry and all related hints/attributes for every outcome.
-    mark_dentry_invalidated(dentry.as_dentry(), monotonic_now_ns());
+    mark_dentry_invalidated(dentry.as_dentry(), observation.generation);
     state.fence_readdir_replies();
     state.invalidate_entry_hint(parent_id, name);
     state.invalidate_object_hints(&[parent_id, victim_id]);
-    invalidate_inode_attributes(parent);
-    invalidate_inode_attributes(&victim_ref);
+    expire_cached_attributes_at(parent, observation.generation);
+    expire_cached_attributes_at(&victim_ref, observation.generation);
     result?;
 
     // The VFS removes the dentry after this callback; maintain only inode link
@@ -1223,11 +1231,12 @@ pub(super) unsafe extern "C" fn zerofs_rename(
             new_name,
             &credentials,
         );
+        let observation = state.begin_cache_observation();
         // A timeout, disconnect or interrupted reply does not prove that rename
         // was rejected. Make both names and every touched inode stale before
         // propagating the outcome.
-        mark_dentry_invalidated(old_dentry_ref.as_dentry(), monotonic_now_ns());
-        mark_dentry_invalidated(new_dentry_ref.as_dentry(), monotonic_now_ns());
+        mark_dentry_invalidated(old_dentry_ref.as_dentry(), observation.generation);
+        mark_dentry_invalidated(new_dentry_ref.as_dentry(), observation.generation);
         state.fence_readdir_replies();
         state.invalidate_rename_hints(
             old_parent_id,
@@ -1236,15 +1245,15 @@ pub(super) unsafe extern "C" fn zerofs_rename(
             new_name,
             &objects[..object_count],
         );
-        invalidate_inode_attributes(&old_parent_ref);
+        expire_cached_attributes_at(&old_parent_ref, observation.generation);
         if new_parent != old_parent {
-            invalidate_inode_attributes(&new_parent_ref);
+            expire_cached_attributes_at(&new_parent_ref, observation.generation);
         }
         if let Some(source) = source_ref.as_ref() {
-            invalidate_inode_attributes(source);
+            expire_cached_attributes_at(source, observation.generation);
         }
         if let Some(target) = target_ref.as_ref() {
-            invalidate_inode_attributes(target);
+            expire_cached_attributes_at(target, observation.generation);
         }
         result?;
         // VFS performs the dcache move after this callback. It already holds every
@@ -1254,13 +1263,12 @@ pub(super) unsafe extern "C" fn zerofs_rename(
         let target = target_ref
             .as_ref()
             .map_or(ptr::null_mut(), InodeRef::as_ptr);
-        let observed_ns = monotonic_now_ns();
         // VFS moves this dentry to the destination name after the callback.
-        mark_dentry_observed(old_dentry_ref.as_dentry(), &credentials, observed_ns);
+        mark_dentry_observed(old_dentry_ref.as_dentry(), &credentials, observation);
         // Renaming one hard-link alias over another alias of the same inode is a
         // successful no-op and must not decrement the shared inode's link count.
         if source == target {
-            mark_dentry_observed(new_dentry_ref.as_dentry(), &credentials, observed_ns);
+            mark_dentry_observed(new_dentry_ref.as_dentry(), &credentials, observation);
             return Ok(0);
         }
         let source_is_directory = source_ref.file_type() == bindings::S_IFDIR;

@@ -14,7 +14,8 @@ use kernel::{
 use crate::protocol::Stat;
 
 use super::{
-    BoundFidCache, CachedAttributes, DataCacheBaseline, InodeState, WritebackGroupCache,
+    BoundFidCache, CacheObservation, CachedAttributes, DataCacheBaseline, InodeState,
+    WritebackGroupCache,
     attributes::{cache_inode_attributes_at, inode_number, protocol_error, validate_stat},
     io::{IgetInode, OwnedInode, SuperBlockRef},
 };
@@ -22,7 +23,7 @@ use super::{
 pub(super) fn get_inode(
     super_block: &SuperBlockRef<'_>,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) -> Result<OwnedInode> {
     validate_stat(attributes)?;
     let inode_number = inode_number(attributes.qid)?;
@@ -46,7 +47,7 @@ pub(super) fn get_inode(
             }
             // Publish the safe shared subset under the target's i_lock rather
             // than nesting its i_rwsem below the parent directory lock.
-            cache_inode_attributes_at(&inode_ref, attributes, observed_ns);
+            cache_inode_attributes_at(&inode_ref, attributes, observation);
             return Ok(inode);
         }
         IgetInode::New(inode) => inode,
@@ -59,19 +60,22 @@ pub(super) fn get_inode(
             cached_attributes <- new_mutex!(CachedAttributes {
                 stat: *attributes,
                 data_baseline: DataCacheBaseline::from_stat(attributes),
-                metadata_watermark_ns: observed_ns,
-                data_watermark_ns: observed_ns,
-                data_ordering_watermark_ns: observed_ns,
+                metadata_observed_ns: observation.observed_ns,
+                data_observed_ns: observation.observed_ns,
+                metadata_generation: observation.generation,
+                data_generation: observation.generation,
+                mapping_generation: observation.generation,
+                content_generation: observation.generation,
                 metadata_valid: true,
                 data_valid: true,
             }),
-            metadata_fresh_ns: AtomicU64::new(observed_ns),
+            metadata_fresh_ns: AtomicU64::new(observation.observed_ns),
             bound_fids <- new_mutex!(BoundFidCache::new()),
             writeback_groups <- new_mutex!(WritebackGroupCache::new()),
             data_revalidate <- new_mutex!(()),
             // This inode was just populated from an authoritative Stat, so
             // both relaxed-consistency windows begin at its observation time.
-            last_data_revalidate_ns: AtomicU64::new(observed_ns),
+            last_data_revalidate_ns: AtomicU64::new(observation.observed_ns),
         }),
         GFP_KERNEL,
     )

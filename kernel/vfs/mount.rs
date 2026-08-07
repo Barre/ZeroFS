@@ -15,9 +15,9 @@ use kernel::{
     },
     ffi,
     init::InPlaceInit,
-    new_mutex, pr_err, try_pin_init,
+    new_mutex, pr_err,
     seq_file::SeqFile,
-    seq_print,
+    seq_print, try_pin_init,
 };
 
 use crate::{
@@ -79,7 +79,19 @@ fn try_fill_super(
     if root_qid.path != 0 || root_qid.type_ != QID_TYPE_DIR {
         return Err(protocol_error());
     }
-    let root_reply = client.getattr(client.root_fid())?;
+    let state = KBox::pin_init(
+        try_pin_init!(MountState {
+            client,
+            consistency,
+            readdir_hints <- new_mutex!(ReaddirHintCache::new()?),
+            hint_generation: AtomicU64::new(0),
+            cache_generation: AtomicU64::new(0),
+            teardown_started: AtomicBool::new(false),
+        }),
+        GFP_KERNEL,
+    )?;
+    let root_observation = state.begin_cache_observation();
+    let root_reply = state.client.getattr(state.client.root_fid())?;
     if root_reply.valid & GETATTR_ALL != GETATTR_ALL {
         return Err(protocol_error());
     }
@@ -89,16 +101,6 @@ fn try_fill_super(
         return Err(protocol_error());
     }
 
-    let state = KBox::pin_init(
-        try_pin_init!(MountState {
-            client,
-            consistency,
-            readdir_hints <- new_mutex!(ReaddirHintCache::new()?),
-            hint_generation: AtomicU64::new(0),
-            teardown_started: AtomicBool::new(false),
-        }),
-        GFP_KERNEL,
-    )?;
     // Nodev superblocks start on noop_backing_dev_info, whose zero ra_pages
     // disables generic file readahead even when an address-space callback is
     // installed. Keep several rsize-bounded subrequests in the BDI window so
@@ -119,7 +121,7 @@ fn try_fill_super(
 
     // The configured superblock has valid operation tables and mount state.
     // NewInode owns every failure transition before d_make_root consumes it.
-    let root_inode = get_inode(&super_block.as_ref(), &root_attributes, monotonic_now_ns())?;
+    let root_inode = get_inode(&super_block.as_ref(), &root_attributes, root_observation)?;
 
     // SAFETY: d_make_root() consumes the inode reference on both success and
     // failure. A null return denotes allocation failure.
@@ -355,7 +357,7 @@ pub(super) unsafe extern "C" fn zerofs_d_revalidate(
         // racing that remote lookup then observes ENOENT. Revalidate in place,
         // as 9p, NFS and FUSE do, and ask the VFS to invalidate only when the
         // name really changed.
-        let valid = revalidate_dentry(&parent, &dentry, name, &credentials, now)?;
+        let valid = revalidate_dentry(&parent, &dentry, name, &credentials)?;
         Ok(valid.into())
     })
 }
@@ -366,15 +368,16 @@ fn revalidate_dentry(
     dentry: &DentryRef<'_>,
     name: &[u8],
     credentials: &RebindCredentials,
-    observed_ns: u64,
 ) -> Result<bool> {
     let inode = dentry.inode()?;
-    let client = &parent.mount()?.client;
+    let mount = parent.mount()?;
+    let observation = mount.begin_cache_observation();
+    let client = &mount.client;
     let lookup = match lookup_attributes(client, parent, name, credentials) {
         Ok(lookup) => lookup,
         Err(error) if error == ENOENT => {
             if inode.is_none() {
-                mark_dentry_observed(dentry, credentials, observed_ns);
+                mark_dentry_observed(dentry, credentials, observation);
                 return Ok(true);
             }
             return Ok(false);
@@ -399,9 +402,9 @@ fn revalidate_dentry(
 
     // Publish permission-relevant shared fields under i_lock. Regular-file
     // size and data-derived timestamps still require the data-cache barrier.
-    cache_inode_attributes_at(&inode, &lookup.stat, observed_ns);
+    cache_inode_attributes_at(&inode, &lookup.stat, observation);
     retain_bound_fid(client, &inode, credentials, lookup.child_fid);
-    mark_dentry_observed(dentry, credentials, observed_ns);
+    mark_dentry_observed(dentry, credentials, observation);
     Ok(true)
 }
 
@@ -436,6 +439,7 @@ pub(super) unsafe extern "C" fn zerofs_d_weak_revalidate(
         }
 
         let expected_type = expected_qid_type(inode.file_type())?;
+        let observation = state.begin_cache_observation();
         let attributes =
             match getattr_attributes(&state.client, &inode, &credentials, expected_type) {
                 Ok(attributes) => attributes,
@@ -449,8 +453,8 @@ pub(super) unsafe extern "C" fn zerofs_d_weak_revalidate(
         {
             return Ok(0);
         }
-        cache_inode_attributes_at(&inode, &attributes, now);
-        mark_dentry_observed(&dentry, &credentials, now);
+        cache_inode_attributes_at(&inode, &attributes, observation);
+        mark_dentry_observed(&dentry, &credentials, observation);
         Ok(1)
     })
 }

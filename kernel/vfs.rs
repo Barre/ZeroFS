@@ -11,16 +11,17 @@ use core::{
     ffi::c_void,
     marker::PhantomData,
     mem::size_of,
+    pin::Pin,
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence},
 };
 
 use kernel::{
-    alloc::{KBox, KVec, flags::GFP_KERNEL},
+    alloc::{KBox, KVVec, KVec, flags::GFP_KERNEL},
     bindings, ffi, new_spinlock,
     prelude::*,
     sync::{
-        Mutex, SpinLock,
+        Arc, Mutex, SpinLock,
         aref::{ARef, AlwaysRefCounted},
     },
     types::Opaque,
@@ -88,6 +89,8 @@ const ST_NODEV: ffi::c_long = 1 << 2;
 const ST_VALID: ffi::c_long = 1 << 5;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const RELAXED_CACHE_REVALIDATE_NS: u64 = NSEC_PER_SEC;
+/// Maximum complete-file payload requested with a relaxed read-only open.
+const OPEN_PREFETCH_WINDOW: u32 = 128 * 1024;
 /// Poll interval for the client-side `F_SETLKW` wait, mirroring the userspace
 /// mount's `LOCK_POLL`. The server answers a conflicting blocking request
 /// immediately rather than queueing it, so the wait belongs to the client.
@@ -137,6 +140,13 @@ pub(crate) enum Consistency {
     Strict,
 }
 
+#[derive(Clone, Copy)]
+struct CacheObservation {
+    // Generations order cache events; time is used only for expiry.
+    generation: u64,
+    observed_ns: u64,
+}
+
 #[pin_data]
 struct DentryState {
     // Rare records and invalidations serialize; path-walk readers stay lockless.
@@ -144,7 +154,8 @@ struct DentryState {
     writer: SpinLock<()>,
     sequence: AtomicU64,
     observed_ns: AtomicU64,
-    invalidated_ns: AtomicU64,
+    observed_generation: AtomicU64,
+    invalidated_generation: AtomicU64,
     identity_len: AtomicU64,
     identity_words: [AtomicU64; REBIND_CREDENTIAL_IDENTITY_WORDS],
 }
@@ -155,19 +166,17 @@ impl DentryState {
             writer <- new_spinlock!(()),
             sequence: AtomicU64::new(0),
             observed_ns: AtomicU64::new(0),
-            invalidated_ns: AtomicU64::new(0),
+            observed_generation: AtomicU64::new(0),
+            invalidated_generation: AtomicU64::new(0),
             identity_len: AtomicU64::new(0),
             identity_words: [const { AtomicU64::new(0) }; REBIND_CREDENTIAL_IDENTITY_WORDS],
         })
     }
 
-    fn record(&self, credentials: &RebindCredentials, observed_ns: u64) {
+    fn record(&self, credentials: &RebindCredentials, observation: CacheObservation) {
         let _writer = self.writer.lock();
-        // A lookup is timestamped before its RPC, while a namespace mutation is
-        // timestamped after commit. A late lookup must not make stale state
-        // fresh again.
-        if observed_ns <= self.observed_ns.load(Ordering::Relaxed)
-            || observed_ns <= self.invalidated_ns.load(Ordering::Acquire)
+        if observation.generation <= self.observed_generation.load(Ordering::Relaxed)
+            || observation.generation < self.invalidated_generation.load(Ordering::Acquire)
         {
             return;
         }
@@ -177,18 +186,22 @@ impl DentryState {
             destination.store(word, Ordering::Relaxed);
         }
         self.identity_len.store(length as u64, Ordering::Relaxed);
-        self.observed_ns.store(observed_ns, Ordering::Relaxed);
+        self.observed_ns
+            .store(observation.observed_ns, Ordering::Relaxed);
+        self.observed_generation
+            .store(observation.generation, Ordering::Relaxed);
         self.sequence
             .store(sequence.wrapping_add(2), Ordering::Release);
     }
 
-    fn invalidate(&self, invalidated_ns: u64) {
+    fn invalidate(&self, generation: u64) {
         let _writer = self.writer.lock();
-        if invalidated_ns <= self.invalidated_ns.load(Ordering::Relaxed) {
+        if generation <= self.invalidated_generation.load(Ordering::Relaxed) {
             return;
         }
         let sequence = self.sequence.fetch_add(1, Ordering::AcqRel);
-        self.invalidated_ns.store(invalidated_ns, Ordering::Relaxed);
+        self.invalidated_generation
+            .store(generation, Ordering::Relaxed);
         self.sequence
             .store(sequence.wrapping_add(2), Ordering::Release);
     }
@@ -211,7 +224,8 @@ impl DentryState {
             }
             let stored_length = self.identity_len.load(Ordering::Relaxed) as usize;
             let observed_ns = self.observed_ns.load(Ordering::Relaxed);
-            let invalidated_ns = self.invalidated_ns.load(Ordering::Acquire);
+            let observed_generation = self.observed_generation.load(Ordering::Relaxed);
+            let invalidated_generation = self.invalidated_generation.load(Ordering::Acquire);
             let identity_matches = stored_length == length
                 && self
                     .identity_words
@@ -223,7 +237,7 @@ impl DentryState {
             if before == self.sequence.load(Ordering::Acquire) {
                 return identity_matches
                     && observed_ns != 0
-                    && observed_ns > invalidated_ns
+                    && observed_generation >= invalidated_generation
                     && now_ns.wrapping_sub(observed_ns) < RELAXED_CACHE_REVALIDATE_NS;
             }
         }
@@ -258,6 +272,7 @@ struct ReaddirHint {
     name: KVec<u8>,
     attributes: Stat,
     observed_ns: u64,
+    attribute_generation: u64,
     generation: u64,
     credentials: RebindCredentials,
 }
@@ -297,9 +312,9 @@ impl ReaddirHintCache {
                         && existing.name.as_slice() == hint.name.as_slice()
                         && existing.credentials.eq(&hint.credentials) =>
                 {
-                    // Deduplicate repeated getdents passes and always retain
-                    // the newest observation for this exact key.
-                    self.entries[index] = Some(hint);
+                    if hint.attribute_generation > existing.attribute_generation {
+                        self.entries[index] = Some(hint);
+                    }
                     return;
                 }
                 Some(existing)
@@ -333,7 +348,7 @@ impl ReaddirHintCache {
         name: &[u8],
         credentials: &RebindCredentials,
         now_ns: u64,
-    ) -> Option<(Stat, u64)> {
+    ) -> Option<(Stat, CacheObservation)> {
         let key_hash = readdir_hint_hash(parent_inode, name);
         for probe in 0..READDIR_HINT_PROBES {
             let entry = &mut self.entries[Self::slot(key_hash, probe)];
@@ -353,7 +368,13 @@ impl ReaddirHintCache {
             });
             if matches {
                 let hint = entry.take()?;
-                return Some((hint.attributes, hint.observed_ns));
+                return Some((
+                    hint.attributes,
+                    CacheObservation {
+                        generation: hint.attribute_generation,
+                        observed_ns: hint.observed_ns,
+                    },
+                ));
             }
         }
         None
@@ -395,6 +416,7 @@ struct MountState {
     #[pin]
     readdir_hints: Mutex<ReaddirHintCache>,
     hint_generation: AtomicU64,
+    cache_generation: AtomicU64,
     teardown_started: AtomicBool,
 }
 
@@ -435,11 +457,16 @@ struct CachedAttributes {
     stat: Stat,
     // Updated only after the page cache has been reconciled with this Stat.
     data_baseline: DataCacheBaseline,
-    // Publication and invalidation order for the two cached Stat subsets.
-    metadata_watermark_ns: u64,
-    data_watermark_ns: u64,
-    // Also advances for data observations not yet reconciled with the mapping.
-    data_ordering_watermark_ns: u64,
+    // Observation times enforce TTLs; generations enforce causal order.
+    metadata_observed_ns: u64,
+    data_observed_ns: u64,
+    // Metadata and full-Stat replies are ordered independently.
+    metadata_generation: u64,
+    data_generation: u64,
+    // Mapping barriers are separate from atime-only Stat updates.
+    mapping_generation: u64,
+    // Prefetched bytes are valid only at this exact generation.
+    content_generation: u64,
     metadata_valid: bool,
     data_valid: bool,
 }
@@ -695,6 +722,7 @@ impl WritebackGroupCache {
 /// `group` is first so netfslib can retain the originating `access=user`
 /// identity after the struct file closes.  The final group reference clunks
 /// every capability this open holds and frees this allocation.
+#[pin_data]
 #[repr(C)]
 struct FileState {
     group: UnsafeCell<netfs::netfs_group>,
@@ -707,6 +735,20 @@ struct FileState {
     // read-modify-write.
     force_unbuffered: bool,
     credentials: RebindCredentials,
+    #[pin]
+    prefetch: SpinLock<Option<Arc<OpenPrefetch>>>,
+}
+
+struct OpenPrefetch {
+    observed_ns: u64,
+    content_generation: u64,
+    data: KVVec<u8>,
+}
+
+struct OpenPrefetchSeed<'a> {
+    observed_ns: u64,
+    content_generation: u64,
+    data: &'a [u8],
 }
 
 impl FileState {
@@ -735,11 +777,47 @@ impl FileState {
     fn credentials(&self) -> &RebindCredentials {
         &self.credentials
     }
+
+    fn prefetch(&self) -> Option<Arc<OpenPrefetch>> {
+        let prefetch = self.prefetch.lock();
+        prefetch.as_ref().cloned()
+    }
+
+    fn clear_expired_prefetch(&self, now_ns: u64) {
+        let retired = {
+            let mut prefetch = self.prefetch.lock();
+            if prefetch.as_ref().is_some_and(|current| {
+                now_ns.wrapping_sub(current.observed_ns) >= RELAXED_CACHE_REVALIDATE_NS
+            }) {
+                prefetch.take()
+            } else {
+                None
+            }
+        };
+        drop(retired);
+    }
+
+    fn clear_prefetch(&self, expected: &Arc<OpenPrefetch>) {
+        let retired = {
+            let mut prefetch = self.prefetch.lock();
+            if prefetch
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                prefetch.take()
+            } else {
+                None
+            }
+        };
+        // The last Arc may free a kvmalloc-backed buffer, so drop it unlocked.
+        drop(retired);
+    }
 }
 
-// SAFETY: FileState's Rust fields are immutable after publication. Netfslib
-// mutates only the UnsafeCell-wrapped group refcount, whose atomic operations
-// synchronize the allocation's lifetime across worker contexts.
+// SAFETY: FileState's ordinary fields are immutable after publication, and
+// prefetch mutation is serialized by its spinlock. Netfslib mutates only the
+// UnsafeCell-wrapped group refcount, whose atomic operations synchronize the
+// allocation's lifetime across worker contexts.
 unsafe impl Send for FileState {}
 unsafe impl Sync for FileState {}
 
@@ -776,9 +854,23 @@ fn new_file_state(
     iounit: u32,
     force_unbuffered: bool,
     credentials: RebindCredentials,
-) -> Result<KBox<FileState>> {
-    let state = KBox::new(
-        FileState {
+    prefetch: Option<OpenPrefetchSeed<'_>>,
+) -> Result<Pin<KBox<FileState>>> {
+    let prefetch = prefetch.and_then(|seed| {
+        let mut data = KVVec::from_elem(0u8, seed.data.len(), GFP_KERNEL).ok()?;
+        data.as_mut_slice().copy_from_slice(seed.data);
+        Arc::new(
+            OpenPrefetch {
+                observed_ns: seed.observed_ns,
+                content_generation: seed.content_generation,
+                data,
+            },
+            GFP_KERNEL,
+        )
+        .ok()
+    });
+    let state = KBox::pin_init(
+        pin_init!(FileState {
             group: UnsafeCell::new(netfs::netfs_group {
                 ref_: bindings::refcount_t::default(),
                 free: Some(zerofs_netfs_free_group),
@@ -788,7 +880,8 @@ fn new_file_state(
             iounit,
             force_unbuffered,
             credentials,
-        },
+            prefetch <- new_spinlock!(prefetch),
+        }),
         GFP_KERNEL,
     )
     .map_err(|_| ENOMEM)?;
@@ -813,6 +906,20 @@ impl MountState {
         self.consistency == Consistency::Relaxed
     }
 
+    fn next_cache_generation(&self) -> u64 {
+        // Keep zero for state that has never been published.
+        self.cache_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn begin_cache_observation(&self) -> CacheObservation {
+        CacheObservation {
+            generation: self.next_cache_generation(),
+            observed_ns: attributes::monotonic_now_ns(),
+        }
+    }
+
     fn begin_teardown(&self) {
         self.teardown_started.store(true, Ordering::Release);
     }
@@ -826,7 +933,7 @@ impl MountState {
         parent_inode: u64,
         name: &[u8],
         attributes: Stat,
-        observed_ns: u64,
+        observation: CacheObservation,
         generation: u64,
         credentials: &RebindCredentials,
     ) -> Result<()> {
@@ -845,7 +952,8 @@ impl MountState {
                 parent_inode,
                 name: owned_name,
                 attributes,
-                observed_ns,
+                observed_ns: observation.observed_ns,
+                attribute_generation: observation.generation,
                 generation,
                 credentials: credentials.clone(),
             },
@@ -865,7 +973,7 @@ impl MountState {
         name: &[u8],
         credentials: &RebindCredentials,
         now_ns: u64,
-    ) -> Option<(Stat, u64)> {
+    ) -> Option<(Stat, CacheObservation)> {
         if !self.is_relaxed() {
             return None;
         }

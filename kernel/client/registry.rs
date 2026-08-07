@@ -256,9 +256,7 @@ impl Session {
     /// store be infallible: a fid the server has already installed must never
     /// end up without a record.
     fn reserve_records(&self, fid: u32) -> Result<()> {
-        let minimum = (fid as usize)
-            .checked_add(1)
-            .ok_or_else(|| EOVERFLOW)?;
+        let minimum = (fid as usize).checked_add(1).ok_or_else(|| EOVERFLOW)?;
         loop {
             let length = {
                 let state = self.state.lock();
@@ -416,9 +414,7 @@ impl Session {
                 }
                 state.credentials.len()
             };
-            let minimum = length
-                .checked_add(1)
-                .ok_or_else(|| EOVERFLOW)?;
+            let minimum = length.checked_add(1).ok_or_else(|| EOVERFLOW)?;
             let replacement =
                 KVVec::from_elem(None, grown_table_length(length, minimum)?, GFP_KERNEL)?;
             let mut state = self.state.lock();
@@ -817,9 +813,9 @@ pub(super) fn request_fids(request: &Request<'_>) -> ([u32; 2], usize) {
         | Request::Tsymlinkattr { dfid, .. }
         | Request::Tmknodattr { dfid, .. } => ([dfid, 0], 1),
         Request::Tunlinkat { dirfid, .. } => ([dirfid, 0], 1),
-        Request::Twalkgetattr { fid, newfid, .. } | Request::Tlopenat { fid, newfid, .. } => {
-            ([fid, newfid], 2)
-        }
+        Request::Twalkgetattr { fid, newfid, .. }
+        | Request::Tlopenat { fid, newfid, .. }
+        | Request::Tlopenatread { fid, newfid, .. } => ([fid, newfid], 2),
         Request::Tlcreateattr { dfid, newfid, .. } => ([dfid, newfid], 2),
         Request::Tlinkattr { dfid, fid, .. } => ([dfid, fid], 2),
         Request::Trenameat {

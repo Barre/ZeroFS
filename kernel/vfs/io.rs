@@ -742,10 +742,8 @@ impl<'a> InodeRef<'a> {
             bindings::spin_lock(ptr::addr_of_mut!((*inode).i_lock));
             if refresh.metadata {
                 (*inode).i_mode = attributes.mode as bindings::umode_t;
-                (*inode).i_uid =
-                    compat::make_kuid((*(*inode).i_sb).s_user_ns, attributes.uid);
-                (*inode).i_gid =
-                    compat::make_kgid((*(*inode).i_sb).s_user_ns, attributes.gid);
+                (*inode).i_uid = compat::make_kuid((*(*inode).i_sb).s_user_ns, attributes.uid);
+                (*inode).i_gid = compat::make_kgid((*(*inode).i_sb).s_user_ns, attributes.gid);
                 (*inode).i_generation = attributes.r#gen as u32;
                 if refresh.link_count {
                     bindings::set_nlink(inode, attributes.nlink as ffi::c_uint);
@@ -768,8 +766,7 @@ impl<'a> InodeRef<'a> {
     ///
     /// Netfslib invokes that setattr path while holding i_rwsem only shared.
     /// Clearing bits under i_lock is safe there and cannot replace unrelated
-    /// permission bits. The caller must invalidate metadata afterward so an
-    /// older clear cannot coexist with a newer cached mode observation.
+    /// permission bits. The caller orders it against metadata publication.
     pub(super) fn apply_killpriv_mode(&self, attributes: &Stat) {
         let set_id = (bindings::S_ISUID | bindings::S_ISGID) as bindings::umode_t;
         let clear = set_id & !(attributes.mode as bindings::umode_t);
@@ -1481,7 +1478,7 @@ impl<'a> FileOpenRef<'a> {
     }
 
     /// Transfer the initial netfs group reference into `private_data`.
-    pub(super) fn publish(self, state: KBox<FileState>, created: bool) {
+    pub(super) fn publish(self, state: Pin<KBox<FileState>>, created: bool) {
         // SAFETY: The constructor verified the unpublished slot was empty;
         // successful open publication is the sole writer.
         unsafe {
@@ -2120,7 +2117,7 @@ impl<'a> OpenFileRef<'a> {
 }
 
 pub(super) struct ReadCall<'a> {
-    iocb: Kiocb<'a, KBox<FileState>>,
+    iocb: Kiocb<'a, Pin<KBox<FileState>>>,
     destination: &'a mut IovIterDest<'a>,
     file: OpenFileRef<'a>,
     flags: ffi::c_int,
@@ -2266,7 +2263,7 @@ impl<'a> ReadCall<'a> {
         // SAFETY: The callback contract guarantees a live kiocb and file.
         let file = unsafe { OpenFileRef::from_raw((*iocb).ki_filp)? };
         // SAFETY: The caller guarantees the kiocb/private-data contract.
-        let iocb = unsafe { Kiocb::<KBox<FileState>>::from_raw(iocb) };
+        let iocb = unsafe { Kiocb::<Pin<KBox<FileState>>>::from_raw(iocb) };
         // SAFETY: read_iter receives an ITER_DEST iterator exclusively.
         let destination = unsafe { IovIterDest::from_raw(destination) };
         // SAFETY: The callback owns access to ki_flags for this operation.
@@ -2383,7 +2380,7 @@ impl<'a> ReadCall<'a> {
 }
 
 pub(super) struct WriteCall<'a> {
-    iocb: Kiocb<'a, KBox<FileState>>,
+    iocb: Kiocb<'a, Pin<KBox<FileState>>>,
     source: &'a mut IovIterSource<'a>,
     file: OpenFileRef<'a>,
     flags: ffi::c_int,
@@ -2408,7 +2405,7 @@ impl<'a> WriteCall<'a> {
         // SAFETY: The callback owns access to these operation fields.
         let (flags, asynchronous) = unsafe { ((*iocb).ki_flags, (*iocb).ki_complete.is_some()) };
         // SAFETY: The caller guarantees the kiocb/private-data contract.
-        let iocb = unsafe { Kiocb::<KBox<FileState>>::from_raw(iocb) };
+        let iocb = unsafe { Kiocb::<Pin<KBox<FileState>>>::from_raw(iocb) };
         // SAFETY: write_iter receives an ITER_SOURCE iterator exclusively.
         let source = unsafe { IovIterSource::from_raw(source) };
         Ok(Self {

@@ -21,13 +21,14 @@ use crate::{
 };
 
 use super::{
-    AttributeRefresh, DrainedCoherentMappingGuard, FILE_VM_OPERATIONS, FMODE_WRITE, FileState,
-    IOCB_APPEND, IOCB_DSYNC, IOCB_NOWAIT, IOCB_SYNC, InodeState, IoExcludedInodeGuard,
-    MMAP_INVALIDATION_RETRIES, MmapRefresh, MmapRevalidation, MountState,
-    RELAXED_CACHE_REVALIDATE_NS, RevalidateState, RevalidateStatus,
+    AttributeRefresh, CacheObservation, DrainedCoherentMappingGuard, FILE_VM_OPERATIONS,
+    FMODE_WRITE, FileState, IOCB_APPEND, IOCB_DSYNC, IOCB_NOWAIT, IOCB_SYNC, InodeState,
+    IoExcludedInodeGuard, MMAP_INVALIDATION_RETRIES, MmapRefresh, MmapRevalidation, MountState,
+    OPEN_PREFETCH_WINDOW, OpenPrefetchSeed, RELAXED_CACHE_REVALIDATE_NS, RevalidateState,
+    RevalidateStatus,
     attributes::{
-        cache_data_observation, cache_metadata_observation, expire_cached_data, from_fault_result,
-        invalidate_inode_attributes, monotonic_now_ns, protocol_error,
+        cache_data_observation, cache_metadata_observation, expire_cached_attributes_at,
+        expire_cached_data_at, from_fault_result, monotonic_now_ns, protocol_error,
         publish_coherent_data_stat_at, publish_mutation_stat, stat_matches_inode,
         store_data_cache_baseline, validate_stat, validate_stat_for_inode,
     },
@@ -66,6 +67,29 @@ pub(super) unsafe extern "C" fn zerofs_open(
             bindings::S_IFREG => QID_TYPE_FILE,
             _ => return Err(errno!(EOPNOTSUPP)),
         };
+        // Start the TTL before eligibility and the RPC. Content validity uses
+        // the generation captured under the attribute-cache lock below.
+        let prefetch_observed_ns = monotonic_now_ns();
+        let prefetch_content_generation =
+            if expected_qid_type == QID_TYPE_FILE && state.is_relaxed() {
+                let inode_state = inode_ref.state()?;
+                let cached = inode_state.cached_attributes.lock();
+                (mapped_data_is_fresh(inode_state) && cached.data_valid)
+                    .then_some(cached.content_generation)
+            } else {
+                None
+            };
+        let prefetch_count = if prefetch_content_generation.is_some()
+            && open_flags == bindings::O_RDONLY
+            && !direct
+            && file.flags() & bindings::O_TRUNC == 0
+        {
+            OPEN_PREFETCH_WINDOW.min(protocol::max_lopenatread_payload(
+                state.client.negotiated_msize(),
+            ))
+        } else {
+            0
+        };
         let mut force_unbuffered = expected_qid_type == QID_TYPE_FILE
             && (!state.is_relaxed() || (direct && open_flags == bindings::O_WRONLY));
         // Buffered partial-folio writes may need to fetch the untouched bytes.
@@ -87,8 +111,11 @@ pub(super) unsafe extern "C" fn zerofs_open(
             &credentials,
             expected_qid_type,
             open_flags,
+            prefetch_count,
+            prefetch_observed_ns,
+            prefetch_content_generation.unwrap_or(0),
         );
-        let (fid, iounit) = match opened {
+        let opened = match opened {
             // The upgrade asks the server for read access userspace never
             // requested, which a write-only file (mode 0200) denies. Fall back
             // to the capability that was actually asked for and keep the
@@ -101,15 +128,38 @@ pub(super) unsafe extern "C" fn zerofs_open(
                     &credentials,
                     expected_qid_type,
                     bindings::O_WRONLY,
+                    0,
+                    prefetch_observed_ns,
+                    0,
                 )?
             }
             other => other?,
         };
         // Clunk the fid unless the file publishes it.
-        let fid = ScopeGuard::new_with_data(fid, |fid| {
+        let fid = ScopeGuard::new_with_data(opened.fid, |fid| {
             let _ = state.client.clunk(fid);
         });
-        let file_state = new_file_state(state, *fid, iounit, force_unbuffered, credentials)?;
+        let prefetch =
+            opened
+                .prefetch
+                .as_ref()
+                .and_then(|(observed_ns, content_generation, payload)| {
+                    let inode_state = inode_ref.state().ok()?;
+                    let cached = inode_state.cached_attributes.lock();
+                    (*content_generation == cached.content_generation).then_some(OpenPrefetchSeed {
+                        observed_ns: *observed_ns,
+                        content_generation: *content_generation,
+                        data: payload.as_slice(),
+                    })
+                });
+        let file_state = new_file_state(
+            state,
+            *fid,
+            opened.iounit,
+            force_unbuffered,
+            credentials,
+            prefetch,
+        )?;
 
         // This is the successful open path's sole publication. release() drops
         // the file's reference; dirty folios and in-flight netfs requests may
@@ -413,6 +463,7 @@ fn zerofs_read_iter_inner(call: &mut ReadCall<'_>) -> Result<isize> {
     if call.position() < 0 {
         return Err(EINVAL);
     }
+    call.state().clear_expired_prefetch(monotonic_now_ns());
     if count == 0 {
         return Ok(0);
     }
@@ -473,32 +524,32 @@ fn persist_read_access_time(call: &ReadCall<'_>, state: &MountState, before: bin
         return;
     }
 
-    let observed_ns = monotonic_now_ns();
     let result = state.client.record_access_time(call.state().fid());
+    let observation = state.begin_cache_observation();
     state.fence_readdir_replies();
     if let Ok(remote_inode) = call.inode().remote_id() {
         state.invalidate_object_hints(&[remote_inode]);
     }
 
     let Ok(attributes) = result else {
-        invalidate_inode_attributes(call.inode());
+        expire_cached_attributes_at(call.inode(), observation.generation);
         return;
     };
     if validate_stat_for_inode(call.inode(), &attributes).is_err() {
-        invalidate_inode_attributes(call.inode());
+        expire_cached_attributes_at(call.inode(), observation.generation);
         return;
     }
     let Ok(inode_state) = call.inode().state() else {
         return;
     };
     let mut cached = inode_state.cached_attributes.lock();
-    if observed_ns <= cached.data_ordering_watermark_ns {
+    if observation.generation <= cached.data_generation {
         return;
     }
     call.inode().refresh_access_time_from_stat(&attributes);
     cached.stat.atime_sec = attributes.atime_sec;
     cached.stat.atime_nsec = attributes.atime_nsec;
-    cached.data_ordering_watermark_ns = observed_ns;
+    cached.data_generation = observation.generation;
 }
 
 /// Whether an authoritative Stat matches the relaxed-consistency baseline for
@@ -514,14 +565,14 @@ fn retains_cached_pages(inode: &InodeRef<'_>, inode_state: &InodeState, remote: 
 /// Publish a mmap-safe data refresh under inode and mapping exclusion.
 ///
 /// The caller has already written back and invalidated the mapping as needed.
-/// Keeping the attribute watermark mutex across metadata, size and baseline
+/// Keeping the attribute-cache mutex across metadata, size and baseline
 /// publication makes a racing local write either precede this snapshot or
 /// invalidate it afterward.
 fn publish_mapped_data_at(
     coherent: &DrainedCoherentMappingGuard<'_>,
     inode_state: &InodeState,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
     refresh_size: bool,
 ) -> Result<bool> {
     let inode = coherent.inode();
@@ -529,12 +580,11 @@ fn publish_mapped_data_at(
         return Ok(false);
     }
     let mut cached = inode_state.cached_attributes.lock();
-    if observed_ns <= cached.data_ordering_watermark_ns {
+    if observation.generation <= cached.data_generation {
         return Ok(false);
     }
 
-    let publish_metadata = observed_ns > cached.metadata_watermark_ns;
-    let publish_cached_data = observed_ns > cached.data_watermark_ns;
+    let publish_metadata = observation.generation > cached.metadata_generation;
     // Preserve VFS-maintained relative link-count updates while refreshing
     // data; namespace operations can still have a newer metadata observation.
     inode.refresh_attributes_from_stat(
@@ -548,25 +598,31 @@ fn publish_mapped_data_at(
     if refresh_size {
         coherent.refresh_size_after_invalidation(attributes.size)?;
     }
-    cached.data_ordering_watermark_ns = observed_ns;
-    if publish_cached_data {
-        cache_data_observation(&mut cached, attributes, observed_ns);
+    if refresh_size {
+        cached.content_generation = observation.generation;
     }
+    cache_data_observation(&mut cached, attributes, observation);
     if publish_metadata {
-        cache_metadata_observation(inode_state, &mut cached, attributes, observed_ns, false);
+        cache_metadata_observation(inode_state, &mut cached, attributes, observation, false);
     }
-    store_data_cache_baseline(inode_state, &mut cached, attributes, observed_ns);
+    store_data_cache_baseline(
+        inode_state,
+        &mut cached,
+        attributes,
+        observation.observed_ns,
+    );
+    cached.mapping_generation = observation.generation;
     Ok(true)
 }
 
-/// Whether a reply that began at `request_started_ns` still outranks every
+/// Whether a reply still outranks every
 /// observation and invalidation recorded for this inode.
 ///
-/// This is an early check for the watermark publication rechecks while holding
+/// This is an early check for the generation publication rechecks while holding
 /// the attribute-cache mutex.
-fn attributes_reply_is_current(inode_state: &InodeState, request_started_ns: u64) -> bool {
+fn attributes_reply_is_current(inode_state: &InodeState, observation: CacheObservation) -> bool {
     let cached = inode_state.cached_attributes.lock();
-    request_started_ns > cached.data_ordering_watermark_ns
+    observation.generation > cached.data_generation
 }
 
 /// Refresh metadata without discarding a single cached folio.
@@ -589,15 +645,15 @@ fn try_retain_cached_file(
 
     // Take the authoritative snapshot after writeback: a dirty upload may
     // itself change remote size or timestamps.
-    let request_started_ns = monotonic_now_ns();
+    let observation = state.begin_cache_observation();
     let reply = state.client.getattr(file_state.fid())?;
     validate_stat_for_inode(inode, &reply.stat)?;
     if !retains_cached_pages(inode, inode_state, &reply.stat)
-        || !attributes_reply_is_current(inode_state, request_started_ns)
+        || !attributes_reply_is_current(inode_state, observation)
     {
         return Ok(false);
     }
-    if !publish_coherent_data_stat_at(&coherent, &reply.stat, request_started_ns)? {
+    if !publish_coherent_data_stat_at(&coherent, &reply.stat, observation)? {
         return Ok(false);
     }
     Ok(true)
@@ -640,7 +696,7 @@ fn revalidate_mapped_file(
         )?;
 
         loop {
-            let request_started_ns = monotonic_now_ns();
+            let observation = state.begin_cache_observation();
             let reply = state.client.getattr(file_state.fid())?;
             validate_stat_for_inode(inode, &reply.stat)?;
 
@@ -669,13 +725,7 @@ fn revalidate_mapped_file(
                     return Err(error);
                 }
             }
-            if publish_mapped_data_at(
-                &coherent,
-                inode_state,
-                &reply.stat,
-                request_started_ns,
-                changed,
-            )? {
+            if publish_mapped_data_at(&coherent, inode_state, &reply.stat, observation, changed)? {
                 return Ok(MmapRefresh::Complete);
             }
             // A newer stat observation or mutation outranked this reply.
@@ -732,7 +782,7 @@ fn revalidate_cached_file(
     )?;
 
     loop {
-        let request_started_ns = monotonic_now_ns();
+        let observation = state.begin_cache_observation();
         let reply = state.client.getattr(file_state.fid())?;
         validate_stat_for_inode(inode, &reply.stat)?;
 
@@ -742,11 +792,11 @@ fn revalidate_cached_file(
         if !state.is_relaxed() || !retains_cached_pages(inode, inode_state, &reply.stat) {
             coherent.truncate_all();
         }
-        if publish_coherent_data_stat_at(&coherent, &reply.stat, request_started_ns)? {
+        if publish_coherent_data_stat_at(&coherent, &reply.stat, observation)? {
             return Ok(());
         }
         // A newer full-stat observation or mutation won the coherent-data
-        // watermark. Retry while exclusion is held rather than treating an
+        // generation. Retry while exclusion is held rather than treating an
         // older, unpublishable mapping snapshot as success.
     }
 }
@@ -947,19 +997,21 @@ pub(super) unsafe extern "C" fn zerofs_fallocate(
         let result = state
             .client
             .fallocate(fid, offset as u64, length as u64, mode);
+        let mutation = state.begin_cache_observation();
         // A range mutation can commit before an interrupted/lost reply. Invalidate
         // its attributes and full-file data baseline for either outcome.
         state.fence_readdir_replies();
         if let Some(identifier) = remote_inode {
             state.invalidate_object_hints(&[identifier]);
         }
-        expire_cached_data(file.inode());
+        expire_cached_data_at(file.inode(), mutation.generation);
         result?;
 
         // ZeroFS fallocate also updates blocks, mtime/ctime, and may clear set-id
         // bits. Fetch those fields while the open fid remains valid. The mutation
         // is already committed, so a failed refresh must not turn it into an error;
         // retain the minimum size bookkeeping needed by the local VFS instead.
+        let refresh = state.begin_cache_observation();
         let attributes_refreshed = match (remote_inode, state.client.getattr(fid)) {
             (Some(identifier), Ok(reply))
                 if validate_stat(&reply.stat).is_ok()
@@ -970,13 +1022,13 @@ pub(super) unsafe extern "C" fn zerofs_fallocate(
                 // Import metadata but not a size concurrently changed by another
                 // client. This fallocate's own deterministic size extension is
                 // applied below.
-                publish_mutation_stat(file.inode(), &reply.stat);
+                publish_mutation_stat(file.inode(), &reply.stat, false, refresh);
                 true
             }
             _ => false,
         };
         if !attributes_refreshed {
-            invalidate_inode_attributes(file.inode());
+            expire_cached_attributes_at(file.inode(), refresh.generation);
         }
         if extends_size {
             coherent.extend_size_to(end)?;

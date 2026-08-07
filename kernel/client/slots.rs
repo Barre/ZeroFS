@@ -13,9 +13,7 @@ use crate::{
 };
 
 use super::RECEIVE_BATCH_BYTES;
-use super::errors::{
-    message_size_errno, not_connected_errno, protocol_errno,
-};
+use super::errors::{message_size_errno, not_connected_errno, protocol_errno};
 use super::registry::is_tombstoned_locked;
 use super::session::{Dispatch, Session, SessionState, SessionStatus};
 use super::signals::{SendSignalMask, resume_interrupted_send, sleep_uninterruptible_tick};
@@ -497,6 +495,7 @@ pub(super) enum ExpectedResponse {
     Setattrattr,
     Fallocate,
     Openat,
+    OpenatRead { maximum: usize },
     Lcreateattr,
     Mkdirattr,
     Symlinkattr,
@@ -536,6 +535,9 @@ impl ExpectedResponse {
             Request::Tsetattrattr { .. } => Self::Setattrattr,
             Request::Tfallocate { .. } => Self::Fallocate,
             Request::Tlopenat { .. } => Self::Openat,
+            Request::Tlopenatread { count, .. } => Self::OpenatRead {
+                maximum: *count as usize,
+            },
             Request::Tlcreateattr { .. } => Self::Lcreateattr,
             Request::Tmkdirattr { .. } => Self::Mkdirattr,
             Request::Tsymlinkattr { .. } => Self::Symlinkattr,
@@ -581,6 +583,9 @@ impl ExpectedResponse {
             | Self::Linkattr => HEADER_SIZE + protocol::STAT_WIRE_SIZE,
             Self::Fallocate | Self::Renameat | Self::Unlinkat => HEADER_SIZE,
             Self::Openat => HEADER_SIZE + protocol::QID_WIRE_SIZE + 4,
+            Self::OpenatRead { maximum } => protocol::RLOPENATREAD_OVERHEAD
+                .checked_add(maximum.min(protocol::max_lopenatread_payload(msize) as usize))
+                .ok_or_else(message_size_errno)?,
             Self::Lcreateattr => HEADER_SIZE + 4 + protocol::STAT_WIRE_SIZE,
             Self::Readlink => {
                 (msize as usize).min(HEADER_SIZE + core::mem::size_of::<u16>() + u16::MAX as usize)
@@ -621,6 +626,7 @@ impl ExpectedResponse {
             Self::Setattrattr => protocol::message_type::RSETATTRATTR,
             Self::Fallocate => protocol::message_type::RFALLOCATE,
             Self::Openat => protocol::message_type::RLOPENAT,
+            Self::OpenatRead { .. } => protocol::message_type::RLOPENATREAD,
             Self::Lcreateattr => protocol::message_type::RLCREATEATTR,
             Self::Mkdirattr => protocol::message_type::RMKDIRATTR,
             Self::Symlinkattr => protocol::message_type::RSYMLINKATTR,
@@ -673,6 +679,9 @@ impl ExpectedResponse {
                 attributes.valid & GETATTR_ALL == GETATTR_ALL
             }
             (Self::WalkGetattr { qids }, Response::Rwalkgetattr(walk)) => walk.qids.len() == qids,
+            (Self::OpenatRead { maximum }, Response::Rlopenatread(open)) => {
+                open.eof <= 1 && open.data.len() <= maximum
+            }
             (Self::Read { maximum }, Response::Rread(read)) => read.data.len() <= maximum,
             (Self::Write { maximum }, Response::Rwrite(write)) => write.count as usize <= maximum,
             (Self::Readdirattr { maximum }, Response::Rreaddirattr(directory)) => {

@@ -60,6 +60,13 @@ impl OwnedPayload<'_> {
     }
 }
 
+/// Result of an open with a best-effort read from offset zero.
+pub(crate) struct OpenReadPayload<'a> {
+    pub(crate) open: Rlopen,
+    pub(crate) eof: bool,
+    pub(crate) payload: OwnedPayload<'a>,
+}
+
 /// Record-table space promised to one unlock that has not been sent yet.
 ///
 /// Dropping it returns the promise, so a caller that gives up before sending
@@ -467,9 +474,8 @@ impl Client {
             )?;
             let open = expect_body!(self, &frame, Response::Rlopenat(open) => open)?;
             // The open lands on newfid; the source fid stays unopened, so only
-            // newfid gets a Tlopen on replay. Both call sites mask to
-            // O_ACCMODE, which is what keeps a recorded O_TRUNC from
-            // truncating the file when it is reopened.
+            // newfid gets a Tlopen on replay. The VFS supplies access-mode bits
+            // only, so replay cannot reapply O_TRUNC.
             if self
                 .session()
                 .record_derived_fid(
@@ -484,6 +490,67 @@ impl Client {
                 continue;
             }
             return Ok(open);
+        }
+    }
+
+    /// Open `fid` as `newfid` and prefetch from offset zero.
+    pub(crate) fn openat_read(
+        &self,
+        fid: u32,
+        newfid: u32,
+        flags: u32,
+        count: u32,
+    ) -> Result<OpenReadPayload<'_>> {
+        let count = count.min(protocol::max_lopenatread_payload(self.negotiated_msize()));
+        if count == 0 {
+            return Err(message_size_errno());
+        }
+        let wire_fid = self.route_fid(fid)?;
+        let wire_newfid = self.route_fid(newfid)?;
+        let mut attempt = OpAttempt::new(false);
+        loop {
+            let frame = self.resend_loop(
+                &mut attempt,
+                |_| Request::Tlopenatread {
+                    fid: wire_fid,
+                    newfid: wire_newfid,
+                    flags,
+                    count,
+                },
+                None,
+            )?;
+            let (open, eof, length) = expect_body!(
+                self,
+                &frame,
+                Response::Rlopenatread(reply) if reply.eof <= 1 && reply.data.len() <= count as usize => (
+                    Rlopen {
+                        qid: reply.qid,
+                        iounit: reply.iounit,
+                    },
+                    reply.eof != 0,
+                    reply.data.len(),
+                )
+            )?;
+            // Reconnect replay needs the open capability, not the disposable
+            // prefetch.
+            if self
+                .session()
+                .record_derived_fid(
+                    fid,
+                    newfid,
+                    Some(open.qid.path),
+                    Some(flags),
+                    frame.connection_epoch,
+                )
+                .should_retry()?
+            {
+                continue;
+            }
+            return Ok(OpenReadPayload {
+                open,
+                eof,
+                payload: payload_from_frame(frame, protocol::RLOPENATREAD_OVERHEAD, length)?,
+            });
         }
     }
 
