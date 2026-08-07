@@ -20,6 +20,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3
+          # Runner image 20260804.265.1 ships a non-setuid helper in
+          # /usr/local/bin that shadows the distro's setuid helper.
+          sudo rm -f /usr/local/bin/fusermount3
+          test "$(command -v fusermount3)" = /usr/bin/fusermount3
 
       - name: Fetch the prebuilt binaries
         uses: actions/download-artifact@v4
