@@ -58,6 +58,12 @@ macro_rules! for_each_request {
                 mode: u32
             };
             Tlopenat, TLOPENAT, tag, { fid: u32, newfid: u32, flags: u32 };
+            Tlopenatread, TLOPENATREAD, tag, {
+                fid: u32,
+                newfid: u32,
+                flags: u32,
+                count: u32
+            };
             Tlcreateattr, TLCREATEATTR, tag, {
                 envelope: envelope,
                 dfid: u32,

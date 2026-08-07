@@ -17,8 +17,9 @@ use crate::{
 };
 
 use super::{
-    AttributeRefresh, CachedAttributes, DataCacheBaseline, DrainedCoherentMappingGuard, InodeState,
-    MountState, NSEC_PER_SEC, RELAXED_CACHE_REVALIDATE_NS, compat,
+    AttributeRefresh, CacheObservation, CachedAttributes, DataCacheBaseline,
+    DrainedCoherentMappingGuard, InodeState, MountState, NSEC_PER_SEC, RELAXED_CACHE_REVALIDATE_NS,
+    compat,
     io::{DentryRef, InodeRef, KstatOut},
 };
 
@@ -61,24 +62,26 @@ pub(super) fn cache_metadata_observation(
     inode_state: &InodeState,
     cached: &mut CachedAttributes,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
     refresh_link_count: bool,
 ) {
     merge_metadata_attributes(&mut cached.stat, attributes, refresh_link_count);
-    cached.metadata_watermark_ns = observed_ns;
+    cached.metadata_observed_ns = observation.observed_ns;
+    cached.metadata_generation = observation.generation;
     cached.metadata_valid = true;
     inode_state
         .metadata_fresh_ns
-        .store(observed_ns, Ordering::Release);
+        .store(observation.observed_ns, Ordering::Release);
 }
 
 pub(super) fn cache_data_observation(
     cached: &mut CachedAttributes,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) {
     merge_data_attributes(&mut cached.stat, attributes);
-    cached.data_watermark_ns = observed_ns;
+    cached.data_observed_ns = observation.observed_ns;
+    cached.data_generation = observation.generation;
     cached.data_valid = true;
 }
 
@@ -100,36 +103,61 @@ pub(super) fn validate_stat_for_inode(inode: &InodeRef<'_>, attributes: &Stat) -
     }
 }
 
-/// Make a lock transition a cache coherency point.
-///
-/// This expires the revalidation watermark rather than invalidating here:
-/// dropping folios needs the invalidation semaphore, which a `->lock` caller
-/// must not hold across the `F_SETLKW` wait, and the proven revalidate path
-/// already does the work on the next access. Invalidating before the grant, as
-/// `fs/9p` does, would leave a window in which a racing read repopulates the
-/// cache from the pre-lock state.
+/// Force the next data access through the barriered revalidation path without
+/// trying to drop folios under the caller's existing locks.
 pub(super) fn expire_cached_data(inode: &InodeRef<'_>) {
-    invalidate_inode_attributes(inode);
-    if let Ok(inode_state) = inode.state() {
-        inode_state.last_data_revalidate_ns.store(
-            monotonic_now_ns().wrapping_sub(RELAXED_CACHE_REVALIDATE_NS),
-            Ordering::Release,
-        );
-    }
+    let Ok(mount) = inode.mount() else {
+        return;
+    };
+    let Ok(state) = inode.state() else {
+        return;
+    };
+    let expired_ns = monotonic_now_ns().wrapping_sub(RELAXED_CACHE_REVALIDATE_NS);
+    let mut cached = state.cached_attributes.lock();
+    let generation = mount.next_cache_generation();
+    invalidate_inode_attributes_locked(state, &mut cached, generation, true, Some(expired_ns));
+}
+
+pub(super) fn expire_cached_data_at(inode: &InodeRef<'_>, generation: u64) {
+    let expired_ns = monotonic_now_ns().wrapping_sub(RELAXED_CACHE_REVALIDATE_NS);
+    invalidate_inode_attributes_at(inode, generation, true, Some(expired_ns));
+}
+
+/// Record new local bytes without claiming a full-file mapping refresh.
+pub(super) fn record_local_content_change(inode: &InodeRef<'_>) {
+    let Ok(mount) = inode.mount() else {
+        return;
+    };
+    let Ok(state) = inode.state() else {
+        return;
+    };
+    let mut cached = state.cached_attributes.lock();
+    let generation = mount.next_cache_generation();
+    invalidate_inode_attributes_locked(state, &mut cached, generation, false, None);
+    cached.content_generation = cmp::max(cached.content_generation, generation);
+}
+
+pub(super) fn expire_cached_attributes_at(inode: &InodeRef<'_>, generation: u64) {
+    invalidate_inode_attributes_at(inode, generation, false, None);
 }
 
 enum AttributePublishMode {
-    Mutation,
-    MetadataOnly,
+    Mutation { content_changed: bool },
+    MetadataOnly { accept_equal: bool },
 }
 
 /// Publish a mutation response without renewing the page-cache baseline.
-pub(super) fn publish_mutation_stat(inode: &InodeRef<'_>, attributes: &Stat) {
+pub(super) fn publish_mutation_stat(
+    inode: &InodeRef<'_>,
+    attributes: &Stat,
+    content_changed: bool,
+    observation: CacheObservation,
+) {
     publish_inode_attributes_at(
         inode,
         attributes,
-        monotonic_now_ns(),
-        AttributePublishMode::Mutation,
+        observation,
+        AttributePublishMode::Mutation { content_changed },
     );
 }
 
@@ -137,7 +165,7 @@ pub(super) fn publish_mutation_stat(inode: &InodeRef<'_>, attributes: &Stat) {
 pub(super) fn publish_coherent_data_stat_at(
     coherent: &DrainedCoherentMappingGuard<'_>,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) -> Result<bool> {
     let inode = coherent.inode();
     if !stat_matches_inode(inode, attributes) {
@@ -147,11 +175,12 @@ pub(super) fn publish_coherent_data_stat_at(
         return Ok(false);
     };
     let mut cached = state.cached_attributes.lock();
-    if observed_ns <= cached.data_ordering_watermark_ns {
+    if observation.generation <= cached.data_generation {
         return Ok(false);
     }
 
-    let publish_metadata = observed_ns > cached.metadata_watermark_ns;
+    let content_changed = !cached.data_baseline.matches(inode, attributes);
+    let publish_metadata = observation.generation > cached.metadata_generation;
     inode.refresh_attributes_from_stat(
         attributes,
         AttributeRefresh {
@@ -162,23 +191,24 @@ pub(super) fn publish_coherent_data_stat_at(
     );
     coherent.refresh_size_from_stat(attributes)?;
     if publish_metadata {
-        cache_metadata_observation(state, &mut cached, attributes, observed_ns, true);
+        cache_metadata_observation(state, &mut cached, attributes, observation, true);
     }
-    cached.data_ordering_watermark_ns = observed_ns;
-    if observed_ns > cached.data_watermark_ns {
-        cache_data_observation(&mut cached, attributes, observed_ns);
+    if content_changed {
+        cached.content_generation = observation.generation;
     }
+    cache_data_observation(&mut cached, attributes, observation);
     // Baseline and freshness are the final part of the same cache-mutex
-    // transaction as the watermark check and i_size publication. A racing
+    // transaction as the generation check and i_size publication. A racing
     // getattr or mutation can only run entirely before or after it.
-    store_data_cache_baseline(state, &mut cached, attributes, observed_ns);
+    store_data_cache_baseline(state, &mut cached, attributes, observation.observed_ns);
+    cached.mapping_generation = observation.generation;
     Ok(true)
 }
 
 fn publish_inode_attributes_at(
     inode: &InodeRef<'_>,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
     mode: AttributePublishMode,
 ) -> bool {
     if !stat_matches_inode(inode, attributes) {
@@ -189,21 +219,22 @@ fn publish_inode_attributes_at(
     };
     let mut cached = state.cached_attributes.lock();
     let regular_file = inode.file_type() == bindings::S_IFREG;
-    let publish_metadata = observed_ns > cached.metadata_watermark_ns;
-    let (refresh_file_data, refresh_link_count) = match mode {
-        AttributePublishMode::Mutation => (true, true),
-        AttributePublishMode::MetadataOnly => (false, false),
+    let (refresh_file_data, refresh_link_count, content_changed, accept_equal) = match mode {
+        AttributePublishMode::Mutation { content_changed } => (true, true, content_changed, true),
+        AttributePublishMode::MetadataOnly { accept_equal } => (false, false, false, accept_equal),
     };
+    let publish_metadata = observation.generation > cached.metadata_generation
+        || accept_equal && observation.generation == cached.metadata_generation;
     let wants_data = refresh_file_data || !regular_file;
-    let publish_data = wants_data && observed_ns > cached.data_ordering_watermark_ns;
+    let publish_data = wants_data
+        && (observation.generation > cached.data_generation
+            || accept_equal && observation.generation == cached.data_generation);
     if !publish_metadata && !publish_data {
         return false;
     }
 
-    // Permission/path observations may be newer than a data-coherent refresh
-    // (or vice versa). Publish each independent subset only when it wins that
-    // subset's watermark, while holding one cache lock across the matching VFS
-    // i_lock updates.
+    // Metadata and data replies race independently. Publish each subset only
+    // when its generation wins, under the same lock as the VFS update.
     inode.refresh_attributes_from_stat(
         attributes,
         AttributeRefresh {
@@ -220,15 +251,15 @@ fn publish_inode_attributes_at(
             state,
             &mut cached,
             attributes,
-            observed_ns,
+            observation,
             refresh_link_count || !refresh_file_data,
         );
     }
     if publish_data {
-        cached.data_ordering_watermark_ns = observed_ns;
-        if observed_ns > cached.data_watermark_ns {
-            cache_data_observation(&mut cached, attributes, observed_ns);
+        if content_changed {
+            cached.content_generation = observation.generation;
         }
+        cache_data_observation(&mut cached, attributes, observation);
     }
 
     if refresh_file_data {
@@ -241,7 +272,7 @@ fn publish_inode_attributes_at(
 pub(super) fn cache_inode_attributes_at(
     inode: &InodeRef<'_>,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) -> bool {
     // Permission/path revalidation may overlap dirty regular-file data. Import
     // ownership and mode, but leave regular-file data-derived fields to the
@@ -249,9 +280,44 @@ pub(super) fn cache_inode_attributes_at(
     publish_inode_attributes_at(
         inode,
         attributes,
-        observed_ns,
-        AttributePublishMode::MetadataOnly,
+        observation,
+        AttributePublishMode::MetadataOnly {
+            accept_equal: false,
+        },
     )
+}
+
+/// Publish metadata returned by the mutation that produced `observation`.
+pub(super) fn cache_inode_mutation_attributes_at(
+    inode: &InodeRef<'_>,
+    attributes: &Stat,
+    observation: CacheObservation,
+) -> bool {
+    publish_inode_attributes_at(
+        inode,
+        attributes,
+        observation,
+        AttributePublishMode::MetadataOnly { accept_equal: true },
+    )
+}
+
+/// Apply a write-triggered set-id clear unless newer metadata already won.
+pub(super) fn apply_killpriv_mode_at(inode: &InodeRef<'_>, attributes: &Stat, generation: u64) {
+    let Ok(state) = inode.state() else {
+        return;
+    };
+    let mut cached = state.cached_attributes.lock();
+    if generation < cached.metadata_generation {
+        return;
+    }
+
+    let set_id = (bindings::S_ISUID | bindings::S_ISGID) as u32;
+    let clear = set_id & !attributes.mode;
+    inode.apply_killpriv_mode(attributes);
+    cached.stat.mode &= !clear;
+    cached.metadata_generation = generation;
+    cached.metadata_valid = false;
+    state.metadata_fresh_ns.store(0, Ordering::Release);
 }
 
 /// Cache a full stat result without claiming that its regular-file data was
@@ -263,7 +329,7 @@ pub(super) fn cache_inode_attributes_at(
 pub(super) fn cache_getattr_attributes_at(
     inode: &InodeRef<'_>,
     attributes: &Stat,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) -> bool {
     if !stat_matches_inode(inode, attributes) {
         return false;
@@ -272,14 +338,14 @@ pub(super) fn cache_getattr_attributes_at(
         return false;
     };
     let mut cached = state.cached_attributes.lock();
-    let publish_metadata = observed_ns > cached.metadata_watermark_ns;
-    let publish_data = observed_ns > cached.data_watermark_ns;
+    let publish_metadata = observation.generation > cached.metadata_generation;
+    let publish_data = observation.generation > cached.data_generation;
     if !publish_metadata && !publish_data {
         return false;
     }
 
     // Only permission-relevant shared fields are safe without the data-cache
-    // barrier. The complete Stat remains protected by its own two watermarks.
+    // barrier. Metadata and data retain independent generations.
     inode.refresh_attributes_from_stat(
         attributes,
         AttributeRefresh {
@@ -289,20 +355,19 @@ pub(super) fn cache_getattr_attributes_at(
         },
     );
     if publish_metadata {
-        cache_metadata_observation(state, &mut cached, attributes, observed_ns, true);
+        cache_metadata_observation(state, &mut cached, attributes, observation, true);
     }
     if publish_data {
         let mapping_changed = !cached.data_baseline.matches(inode, attributes);
-        cache_data_observation(&mut cached, attributes, observed_ns);
-        // This observation is newer than any in-flight page-cache refresh, but
-        // it did not itself reconcile the mapping. Advance the ordering
-        // watermark so an older refresh retries; do not advance the relaxed
-        // data-freshness timestamp or baseline here.
-        cached.data_ordering_watermark_ns =
-            cmp::max(cached.data_ordering_watermark_ns, observed_ns);
+        cache_data_observation(&mut cached, attributes, observation);
+        // Reject older mapping refreshes, but do not renew mapping freshness or
+        // replace its baseline without the mapping barrier.
         if mapping_changed {
+            cached.content_generation = observation.generation;
             state.last_data_revalidate_ns.store(
-                observed_ns.wrapping_sub(RELAXED_CACHE_REVALIDATE_NS),
+                observation
+                    .observed_ns
+                    .wrapping_sub(RELAXED_CACHE_REVALIDATE_NS),
                 Ordering::Release,
             );
         }
@@ -320,28 +385,60 @@ pub(super) fn cached_inode_attributes(
     if !allow_expired
         && (!cached.metadata_valid
             || !cached.data_valid
-            || cached.metadata_watermark_ns == 0
-            || cached.data_watermark_ns == 0
-            || now_ns.wrapping_sub(cached.metadata_watermark_ns) >= RELAXED_CACHE_REVALIDATE_NS
-            || now_ns.wrapping_sub(cached.data_watermark_ns) >= RELAXED_CACHE_REVALIDATE_NS)
+            || cached.metadata_observed_ns == 0
+            || cached.data_observed_ns == 0
+            || now_ns.wrapping_sub(cached.metadata_observed_ns) >= RELAXED_CACHE_REVALIDATE_NS
+            || now_ns.wrapping_sub(cached.data_observed_ns) >= RELAXED_CACHE_REVALIDATE_NS)
     {
         return None;
     }
     Some(cached.stat)
 }
 
-pub(super) fn invalidate_inode_attributes(inode: &InodeRef<'_>) {
+fn invalidate_inode_attributes_at(
+    inode: &InodeRef<'_>,
+    generation: u64,
+    content: bool,
+    data_revalidate_ns: Option<u64>,
+) {
     let Ok(state) = inode.state() else {
         return;
     };
-    let invalidated_ns = monotonic_now_ns();
     let mut cached = state.cached_attributes.lock();
-    cached.metadata_watermark_ns = cmp::max(cached.metadata_watermark_ns, invalidated_ns);
-    cached.data_watermark_ns = cmp::max(cached.data_watermark_ns, invalidated_ns);
-    cached.data_ordering_watermark_ns = cmp::max(cached.data_ordering_watermark_ns, invalidated_ns);
-    cached.metadata_valid = false;
-    cached.data_valid = false;
-    state.metadata_fresh_ns.store(0, Ordering::Release);
+    invalidate_inode_attributes_locked(state, &mut cached, generation, content, data_revalidate_ns)
+}
+
+fn invalidate_inode_attributes_locked(
+    state: &InodeState,
+    cached: &mut CachedAttributes,
+    generation: u64,
+    content: bool,
+    data_revalidate_ns: Option<u64>,
+) {
+    let invalidate_metadata = generation >= cached.metadata_generation;
+    let invalidate_data = generation >= cached.data_generation;
+    if invalidate_metadata {
+        cached.metadata_generation = generation;
+        cached.metadata_valid = false;
+        state.metadata_fresh_ns.store(0, Ordering::Release);
+    }
+    if invalidate_data {
+        cached.data_generation = generation;
+        cached.data_valid = false;
+    }
+    let invalidate_mapping = content && generation > cached.mapping_generation;
+    if invalidate_mapping {
+        cached.mapping_generation = generation;
+        cached.data_valid = false;
+        if let Some(revalidate_ns) = data_revalidate_ns {
+            state
+                .last_data_revalidate_ns
+                .store(revalidate_ns, Ordering::Release);
+        }
+    }
+    if content {
+        cached.content_generation = cmp::max(cached.content_generation, generation);
+    }
 }
 
 pub(super) fn dentry_cache_is_fresh(
@@ -360,16 +457,16 @@ pub(super) fn dentry_cache_is_fresh(
 pub(super) fn mark_dentry_observed(
     dentry: &DentryRef<'_>,
     credentials: &RebindCredentials,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) {
     if let Some(state) = dentry.state() {
-        state.record(credentials, observed_ns);
+        state.record(credentials, observation);
     }
 }
 
-pub(super) fn mark_dentry_invalidated(dentry: &DentryRef<'_>, invalidated_ns: u64) {
+pub(super) fn mark_dentry_invalidated(dentry: &DentryRef<'_>, generation: u64) {
     if let Some(state) = dentry.state() {
-        state.invalidate(invalidated_ns);
+        state.invalidate(generation);
     }
 }
 
@@ -377,18 +474,18 @@ pub(super) fn mark_spliced_dentry_observed(
     candidate: &DentryRef<'_>,
     result: *mut bindings::dentry,
     credentials: &RebindCredentials,
-    observed_ns: u64,
+    observation: CacheObservation,
 ) {
     if kernel::error::from_err_ptr(result).is_err() {
         return;
     }
     if result.is_null() {
-        mark_dentry_observed(candidate, credentials, observed_ns);
+        mark_dentry_observed(candidate, credentials, observation);
     } else if let Ok(installed) = unsafe {
         // d_splice_alias returns a live referenced alias on this branch.
         DentryRef::from_raw(result)
     } {
-        mark_dentry_observed(&installed, credentials, observed_ns);
+        mark_dentry_observed(&installed, credentials, observation);
     }
 }
 
@@ -579,5 +676,5 @@ pub(super) fn protocol_error() -> Error {
 
 pub(super) fn monotonic_now_ns() -> u64 {
     // This clock accessor has no caller-side safety preconditions.
-    unsafe { bindings::ktime_get_mono_fast_ns() }
+    unsafe { bindings::ktime_get_raw_fast_ns() }
 }

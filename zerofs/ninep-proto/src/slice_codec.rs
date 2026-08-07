@@ -166,6 +166,9 @@ pub const OP_ENVELOPE_SIZE: usize = P9_OP_ENVELOPE_LEN;
 /// Fixed wire bytes in an enveloped `Twrite`, before its data payload.
 pub const TWRITE_OVERHEAD: usize = HEADER_SIZE + OP_ENVELOPE_SIZE + 4 + 8 + 4;
 
+/// Fixed wire bytes in `Rlopenatread`, before its data payload.
+pub const RLOPENATREAD_OVERHEAD: usize = P9_RLOPENATREAD_HDR as usize;
+
 /// Serialized size of a [`Qid`].
 pub const QID_WIRE_SIZE: usize = Qid::WIRE_SIZE;
 
@@ -209,6 +212,11 @@ pub enum CodecError {
 /// Largest data payload an enveloped `Twrite` can carry within `msize`.
 pub fn max_write_payload(msize: u32) -> u32 {
     msize.saturating_sub(TWRITE_OVERHEAD as u32)
+}
+
+/// Largest data payload an `Rlopenatread` can carry within `msize`.
+pub fn max_lopenatread_payload(msize: u32) -> u32 {
+    msize.saturating_sub(RLOPENATREAD_OVERHEAD as u32)
 }
 
 /// One request supported by the native client.
@@ -261,6 +269,13 @@ pub enum Request<'a> {
     },
     /// Open a copy of `fid` as `newfid`.
     Tlopenat { fid: u32, newfid: u32, flags: u32 },
+    /// Open a copy of `fid` and prefetch bytes from offset zero.
+    Tlopenatread {
+        fid: u32,
+        newfid: u32,
+        flags: u32,
+        count: u32,
+    },
     /// Create and open a regular file on `newfid`, preserving `dfid`.
     Tlcreateattr {
         envelope: MutationEnvelope,
@@ -363,9 +378,9 @@ pub enum Request<'a> {
     },
 }
 
-// Request encoding, type IDs, tag rules, and size arithmetic come from the
-// table in `wire_requests.rs`. The borrowed enum and owned codec declare their
-// fields separately; cross-codec tests keep all three representations aligned.
+// Request encoding, type IDs, tag rules, and size arithmetic come from
+// `wire_requests.rs`. The borrowed enum and owned codec declare their fields
+// separately, so cross-codec tests keep their representations aligned.
 
 macro_rules! put_request_field {
     ($writer:expr, $value:expr, u8) => {
@@ -630,6 +645,8 @@ pub enum Response<'a> {
     Rlopen(Rlopen),
     /// ZeroFS-private response to `Tlopenat` (type 237).
     Rlopenat(Rlopen),
+    /// ZeroFS-private response to `Tlopenatread` (type 231).
+    Rlopenatread(Rlopenatread<'a>),
     Rlcreateattr(Rlcreateattr),
     Rmkdirattr(Stat),
     Rsymlinkattr(Stat),
@@ -669,6 +686,16 @@ pub struct Rreadlink<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rread<'a> {
+    pub data: WireBytes<&'a [u8]>,
+}
+
+/// Open result and best-effort data prefetched from offset zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rlopenatread<'a> {
+    pub qid: Qid,
+    pub iounit: u32,
+    /// One when `data` reaches EOF; zero when the prefetch is incomplete.
+    pub eof: u8,
     pub data: WireBytes<&'a [u8]>,
 }
 
@@ -819,6 +846,20 @@ pub fn decode_response<'a>(
             } else {
                 Response::Rlopenat(open)
             }
+        }
+        message_type::RLOPENATREAD => {
+            let qid = decode_qid(&mut reader)?;
+            let iounit = reader.get_u32()?;
+            let eof = reader.get_u8()?;
+            let count = reader.get_u32()? as usize;
+            let data = reader.take(count)?;
+            reader.require_end()?;
+            Response::Rlopenatread(Rlopenatread {
+                qid,
+                iounit,
+                eof,
+                data: WireBytes::from(data),
+            })
         }
         message_type::RLCREATEATTR => {
             let iounit = reader.get_u32()?;
@@ -1324,7 +1365,7 @@ mod tests {
 
     /// Every request, with values chosen so each field kind is exercised.
     #[cfg(all(not(MODULE), feature = "owned"))]
-    fn request_corpus() -> [(u16, Request<'static>); 25] {
+    fn request_corpus() -> [(u16, Request<'static>); 26] {
         const ENVELOPE: MutationEnvelope = MutationEnvelope {
             op_id: [
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
@@ -1536,6 +1577,15 @@ mod tests {
                     client_id: b"probe",
                 },
             ),
+            (
+                25,
+                Request::Tlopenatread {
+                    fid: 109,
+                    newfid: 113,
+                    flags: 0,
+                    count: 4096,
+                },
+            ),
         ]
     }
 
@@ -1627,6 +1677,135 @@ mod tests {
             b'Z',
         ];
         assert_eq!(&output[..length], &expected);
+    }
+
+    #[test]
+    fn tlopenatread_matches_the_compound_open_layout() {
+        let request = Request::Tlopenatread {
+            fid: 0x1122_3344,
+            newfid: 0x5566_7788,
+            flags: 0x99aa_bbcc,
+            count: 0xddee_ff00,
+        };
+        assert_eq!(encoded_request_size(&request), Ok(HEADER_SIZE + 4 * 4));
+
+        let mut output = [0u8; HEADER_SIZE + 4 * 4];
+        let length = encode_request(&mut output, TEST_MSIZE, 0x1234, request).unwrap();
+        let expected = [
+            23,
+            0,
+            0,
+            0,
+            message_type::TLOPENATREAD,
+            0x34,
+            0x12,
+            0x44,
+            0x33,
+            0x22,
+            0x11,
+            0x88,
+            0x77,
+            0x66,
+            0x55,
+            0xcc,
+            0xbb,
+            0xaa,
+            0x99,
+            0x00,
+            0xff,
+            0xee,
+            0xdd,
+        ];
+        assert_eq!(length, expected.len());
+        assert_eq!(output, expected);
+
+        let request_size = output.len();
+        assert_eq!(
+            encode_request(&mut output, (request_size - 1) as u32, 0x1234, request),
+            Err(CodecError::MessageTooLarge)
+        );
+        assert_eq!(
+            encode_request(&mut output[..request_size - 1], TEST_MSIZE, 0x1234, request),
+            Err(CodecError::BufferTooSmall)
+        );
+        assert_eq!(
+            encode_request(&mut output, TEST_MSIZE, NOTAG, request),
+            Err(CodecError::InvalidTag)
+        );
+    }
+
+    #[test]
+    fn decodes_and_bounds_lopenatread_payloads() {
+        assert_eq!(
+            RLOPENATREAD_OVERHEAD,
+            HEADER_SIZE + QID_WIRE_SIZE + 4 + 1 + 4
+        );
+        let tag = 0x1234;
+        let qid = Qid {
+            type_: QID_TYPE_FILE,
+            version: 0x5566_7788,
+            path: 0x0102_0304_0506_0708,
+        };
+        let mut frame = vec![0u8; RLOPENATREAD_OVERHEAD + 3];
+        put_header(&mut frame, message_type::RLOPENATREAD, tag);
+        let mut writer = Writer::new(&mut frame[HEADER_SIZE..]);
+        put_qid(&mut writer, qid);
+        writer.put_u32(8192).unwrap();
+        writer.put_u8(1).unwrap();
+        writer.put_u32(3).unwrap();
+        writer.put(b"abc").unwrap();
+
+        match decode_response(&frame, frame.len() as u32, tag)
+            .unwrap()
+            .body
+        {
+            Response::Rlopenatread(reply) => {
+                assert_eq!(reply.qid, qid);
+                assert_eq!(reply.iounit, 8192);
+                assert_eq!(reply.eof, 1);
+                assert_eq!(reply.data.as_ref(), b"abc");
+                assert_eq!(
+                    reply.data.as_ref().as_ptr(),
+                    frame[RLOPENATREAD_OVERHEAD..].as_ptr()
+                );
+            }
+            _ => panic!("wrong response"),
+        }
+        assert!(matches!(
+            decode_response(&frame, frame.len() as u32 - 1, tag),
+            Err(CodecError::MessageTooLarge)
+        ));
+        assert_eq!(max_lopenatread_payload(frame.len() as u32), 3);
+        assert_eq!(max_lopenatread_payload(RLOPENATREAD_OVERHEAD as u32 - 1), 0);
+
+        let mut fixed_prefix_truncated = vec![0u8; RLOPENATREAD_OVERHEAD - 1];
+        put_header(&mut fixed_prefix_truncated, message_type::RLOPENATREAD, tag);
+        assert!(matches!(
+            decode_response(&fixed_prefix_truncated, TEST_MSIZE, tag),
+            Err(CodecError::Truncated)
+        ));
+
+        let count_offset = RLOPENATREAD_OVERHEAD - 4;
+        let mut count_overrun = frame.clone();
+        count_overrun[count_offset..RLOPENATREAD_OVERHEAD].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(
+            decode_response(&count_overrun, TEST_MSIZE, tag),
+            Err(CodecError::Truncated)
+        ));
+
+        let mut maximum_count = frame.clone();
+        maximum_count[count_offset..RLOPENATREAD_OVERHEAD].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_response(&maximum_count, TEST_MSIZE, tag),
+            Err(CodecError::Truncated)
+        ));
+
+        let mut trailing = frame;
+        trailing[count_offset..RLOPENATREAD_OVERHEAD].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            decode_response(&trailing, TEST_MSIZE, tag),
+            Err(CodecError::TrailingData)
+        ));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::{client::OwnedPayload, protocol};
 
 use super::{
     MountState, READ_REPLY_OVERHEAD, READDIR_BATCH,
-    attributes::{inode_number, monotonic_now_ns, protocol_error, validate_stat},
+    attributes::{inode_number, protocol_error, validate_stat},
     io::{DirectoryEmitContext, OpenFileRef},
 };
 
@@ -51,13 +51,10 @@ pub(super) unsafe extern "C" fn zerofs_iterate_shared(
 
         loop {
             let outcome = (|| -> Result<DirectoryBatch> {
-                // Capture the mutation generation and the observation order before
-                // the RPC. A concurrent namespace change then prevents this older
-                // reply from repopulating the lookup-hint cache, and a mutation
-                // that commits while the reply is outstanding outranks the hint at
-                // every watermark comparison.
+                // Capture both cache generations before the RPC so a concurrent
+                // namespace mutation cannot reintroduce this reply as a hint.
                 let hint_generation = state.hint_generation.load(Ordering::Acquire);
-                let observed_ns = monotonic_now_ns();
+                let observation = state.begin_cache_observation();
                 let buffer = match remote_readdir(state, fid, cookie, batch_size)? {
                     Some(buffer) => buffer,
                     None => return Ok(DirectoryBatch::Eof),
@@ -114,7 +111,7 @@ pub(super) unsafe extern "C" fn zerofs_iterate_shared(
                             parent_inode,
                             entry.name,
                             entry.stat,
-                            observed_ns,
+                            observation,
                             hint_generation,
                             &file_credentials,
                         );
