@@ -108,6 +108,9 @@ impl UserIdentity {
 #[derive(Default)]
 struct InodeEntry {
     lookup: u64,
+    /// Brackets local operations that may change file bytes or size.
+    /// Open prefetches remain usable only while this value is unchanged.
+    content_generation: u64,
     /// One fid per filesystem identity that holds this inode. Every request acts
     /// as its caller (v9fs `access=user` semantics), so a uid using a different
     /// primary gid gets a distinct server-side fid.
@@ -122,6 +125,13 @@ struct InodeEntry {
     /// default `ino - 1` bijection: only the mount root of an `--aname` mount,
     /// where FUSE ino 1 maps to the attach subtree's root inode.
     server_inode: Option<u64>,
+}
+
+struct OpenPrefetch {
+    fetched_at: Instant,
+    ino: u64,
+    content_generation: u64,
+    data: Bytes,
 }
 
 struct Fuse9P {
@@ -143,8 +153,8 @@ struct Fuse9P {
     dir_reads: Arc<DashMap<u64, Arc<AsyncMutex<DirRead>>>>,
     /// Same, for directories the kernel reads via readdirplus.
     dir_reads_plus: Arc<DashMap<u64, Arc<AsyncMutex<DirReadPlus>>>>,
-    /// Complete-file open prefetches keyed by file handle and fetch time.
-    prefetch: Arc<DashMap<u64, (Instant, Bytes)>>,
+    /// Complete-file open prefetches keyed by file handle.
+    prefetch: Arc<DashMap<u64, OpenPrefetch>>,
     /// Attribute/entry cache lifetime returned to the kernel.
     ttl: Duration,
     /// When true, request the FUSE writeback cache so the kernel buffers writes
@@ -161,6 +171,16 @@ struct Fuse9P {
 // root. Shifting keeps every other inode collision-free with FUSE_ROOT.
 fn ino_of(qid_path: u64) -> u64 {
     qid_path.wrapping_add(1)
+}
+
+fn content_generation(inodes: &DashMap<u64, InodeEntry>, ino: u64) -> Option<u64> {
+    inodes.get(&ino).map(|entry| entry.content_generation)
+}
+
+fn advance_content_generation(inodes: &DashMap<u64, InodeEntry>, ino: u64) {
+    if let Some(mut entry) = inodes.get_mut(&ino) {
+        entry.content_generation = entry.content_generation.wrapping_add(1);
+    }
 }
 
 fn errno(e: &ClientError) -> Errno {
@@ -570,14 +590,14 @@ impl Filesystem for Fuse9P {
         // forget, so `handles` is empty here; clunking it anyway is leak-hygiene if a
         // handle outlived its release.
         if let Some((_, entry)) = self.inodes.remove_if(&ino, |_, e| e.lookup == 0) {
+            // Drop prefetches before this inode number can be registered again
+            // at generation zero.
+            for fid in entry.handles.keys() {
+                self.prefetch.remove(&(*fid as u64));
+            }
             let client = Arc::clone(&self.client);
-            let prefetch = Arc::clone(&self.prefetch);
             self.rt.spawn(async move {
                 for fid in entry.fids.into_values().chain(entry.handles.into_keys()) {
-                    // Same leak-hygiene as the clunk: drop any prefetch buffer that
-                    // outlived its release (keyed by the open-handle fid; a no-op for
-                    // the inode fids, which never hold one).
-                    prefetch.remove(&(fid as u64));
                     let _ = client.clunk(fid).await;
                     client.free_fid(fid);
                 }
@@ -632,11 +652,15 @@ impl Filesystem for Fuse9P {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let ino = ino.0;
+        let changes_content = size.is_some();
+        if changes_content {
+            advance_content_generation(&self.inodes, ino);
+        }
         let client = Arc::clone(&self.client);
         let inodes = Arc::clone(&self.inodes);
         let ttl = self.ttl;
         let identity = UserIdentity::from_request(req);
-        let ino = ino.0;
         self.rt.spawn(async move {
             let fid = match user_handle_fid(&inodes, ino, identity, fh) {
                 Some(fid) => fid,
@@ -656,7 +680,11 @@ impl Filesystem for Fuse9P {
                 .atime(atime.map(setattr_time))
                 .mtime(mtime.map(setattr_time))
                 .build();
-            match client.setattr_attr(ts).await {
+            let result = client.setattr_attr(ts).await;
+            if changes_content {
+                advance_content_generation(&inodes, ino);
+            }
+            match result {
                 Ok(stat) => {
                     let attr = stat_to_attr(&stat);
                     reply.attr(&ttl, &attr);
@@ -913,6 +941,9 @@ impl Filesystem for Fuse9P {
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         // Prefetch applies to relaxed, read-only, non-truncating opens.
         let raw = flags.0;
+        if (raw & libc::O_TRUNC) != 0 {
+            advance_content_generation(&self.inodes, ino.0);
+        }
         let prefetch = if !self.strict
             && (raw & libc::O_ACCMODE) == libc::O_RDONLY
             && (raw & libc::O_TRUNC) == 0
@@ -947,7 +978,7 @@ impl Filesystem for Fuse9P {
     fn read(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -956,21 +987,34 @@ impl Filesystem for Fuse9P {
         reply: ReplyData,
     ) {
         let fid = fh.0 as u32;
+        let ino = ino.0;
         // Prefetch expiry matches the attribute cache. Reads past it reach the server.
         if let Some(entry) = self.prefetch.get(&fh.0) {
-            let (fetched, buf) = entry.value();
-            if fetched.elapsed() <= self.ttl && (offset as usize) <= buf.len() {
+            let prefetched = entry.value();
+            let fetched_at = prefetched.fetched_at;
+            let prefetched_ino = prefetched.ino;
+            let prefetched_generation = prefetched.content_generation;
+            let data = prefetched.data.clone();
+            drop(entry);
+            let inode = self.inodes.get(&ino);
+            let generation_matches = prefetched_ino == ino
+                && inode.as_ref().map(|entry| entry.content_generation)
+                    == Some(prefetched_generation);
+            if generation_matches
+                && fetched_at.elapsed() <= self.ttl
+                && (offset as usize) <= data.len()
+            {
                 let start = offset as usize;
-                let end = (start + size as usize).min(buf.len());
-                let consumed = end >= buf.len();
-                reply.data(&buf[start..end]);
-                drop(entry);
+                let end = (start + size as usize).min(data.len());
+                let consumed = end >= data.len();
+                reply.data(&data[start..end]);
+                drop(inode);
                 if consumed {
                     self.prefetch.remove(&fh.0);
                 }
                 return;
             }
-            drop(entry);
+            drop(inode);
             self.prefetch.remove(&fh.0);
         }
         let client = Arc::clone(&self.client);
@@ -986,7 +1030,7 @@ impl Filesystem for Fuse9P {
     fn write(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -995,13 +1039,18 @@ impl Filesystem for Fuse9P {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
+        advance_content_generation(&self.inodes, ino.0);
         let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let ino = ino.0;
         let fid = fh.0 as u32;
         // The FUSE buffer expires with this callback. Own it once so chunking
         // and retries need no additional staging copy before serialization.
         let data = Bytes::copy_from_slice(data);
         self.rt.spawn(async move {
-            match client.write_bytes(fid, offset, data).await {
+            let result = client.write_bytes(fid, offset, data).await;
+            advance_content_generation(&inodes, ino);
+            match result {
                 // A single FUSE write is bounded by the kernel's max write, so it fits u32.
                 Ok(n) => reply.written(n as u32),
                 Err(e) => reply.error(errno(&e)),
@@ -1382,6 +1431,7 @@ impl Filesystem for Fuse9P {
             return;
         };
         let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
         let locks = Arc::clone(&self.locks);
         let client_id = Arc::clone(&self.client_id);
         let ino = ino.0;
@@ -1427,6 +1477,7 @@ impl Filesystem for Fuse9P {
                     .await
                 {
                     Ok(LockStatus::Success) => {
+                        advance_content_generation(&inodes, ino);
                         reply.ok();
                         return;
                     }
@@ -1537,7 +1588,7 @@ impl Filesystem for Fuse9P {
     fn fallocate(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         length: u64,
@@ -1552,10 +1603,15 @@ impl Filesystem for Fuse9P {
             }
         };
 
+        advance_content_generation(&self.inodes, ino.0);
         let client = Arc::clone(&self.client);
+        let inodes = Arc::clone(&self.inodes);
+        let ino = ino.0;
         let fid = fh.0 as u32;
         self.rt.spawn(async move {
-            match client.fallocate(fid, offset, length, mode).await {
+            let result = client.fallocate(fid, offset, length, mode).await;
+            advance_content_generation(&inodes, ino);
+            match result {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }
@@ -1628,6 +1684,7 @@ impl Fuse9P {
         // read-modify-write of interior pages) to EOF. v9fs strips O_APPEND for
         // the same reason.
         let raw = flags.0 & !libc::O_APPEND;
+        let truncates = raw & libc::O_TRUNC != 0;
         // Under the writeback cache the kernel performs read-modify-write on
         // partially-written pages, issuing reads even on a write-only fd, so the
         // backing fid must be readable. Upgrade O_WRONLY to O_RDWR (as v9fs does)
@@ -1650,7 +1707,12 @@ impl Fuse9P {
             };
             // Keep the inode fid stable across compound-open fallback.
             let nf = client.alloc_fid();
-            let opened = if prefetch > 0 {
+            let prefetch_observation = if prefetch > 0 {
+                content_generation(&inodes, ino).map(|generation| (Instant::now(), generation))
+            } else {
+                None
+            };
+            let opened = if prefetch_observation.is_some() {
                 client
                     .open_clone_prefetch(inode_fid, nf, lflags, prefetch)
                     .await
@@ -1660,6 +1722,9 @@ impl Fuse9P {
                     .await
                     .map(|(qid, iounit)| (qid, iounit, None))
             };
+            if truncates {
+                advance_content_generation(&inodes, ino);
+            }
             match opened {
                 Ok((_qid, _iounit, buf)) => {
                     // Track the open handle so a verified fsync of this inode (through
@@ -1667,10 +1732,23 @@ impl Fuse9P {
                     if let Some(mut e) = inodes.get_mut(&ino) {
                         e.handles.insert(nf, identity.uid);
                     }
-                    // Stash the folded-in bytes for `read` to serve, keyed by the
-                    // handle, stamped now so a late first read can expire it.
-                    if let Some(buf) = buf {
-                        prefetch_map.insert(nf as u64, (Instant::now(), buf));
+                    // Install only if the content generation stayed unchanged
+                    // during the compound request. `Instant` is only the TTL clock.
+                    if let (Some(buf), Some((fetched_at, generation))) = (buf, prefetch_observation)
+                    {
+                        let inode = inodes.get(&ino);
+                        if inode.as_ref().map(|entry| entry.content_generation) == Some(generation)
+                        {
+                            prefetch_map.insert(
+                                nf as u64,
+                                OpenPrefetch {
+                                    fetched_at,
+                                    ino,
+                                    content_generation: generation,
+                                    data: buf,
+                                },
+                            );
+                        }
                     }
                     reply.opened(FileHandle(nf as u64), open_flags);
                 }
@@ -1817,6 +1895,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
         FUSE_ROOT,
         InodeEntry {
             lookup: u64::MAX,
+            content_generation: 0,
             fids: HashMap::new(),
             handles: HashMap::new(),
             server_inode: Some(root_inode),
@@ -1952,6 +2031,36 @@ mod consistency_tests {
         // Strict (direct I/O) bypasses the page cache and wins over writeback.
         assert_eq!(handle_open_flags(false, true), FopenFlags::FOPEN_DIRECT_IO);
         assert_eq!(handle_open_flags(true, true), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    #[test]
+    fn content_generation_is_per_inode() {
+        let inodes = DashMap::new();
+        inodes.insert(7, InodeEntry::default());
+        inodes.insert(8, InodeEntry::default());
+
+        let captured = content_generation(&inodes, 7).unwrap();
+        advance_content_generation(&inodes, 7);
+        advance_content_generation(&inodes, 9);
+
+        assert_ne!(content_generation(&inodes, 7), Some(captured));
+        assert_eq!(content_generation(&inodes, 8), Some(0));
+        assert!(!inodes.contains_key(&9));
+    }
+
+    #[test]
+    fn mutation_completion_rejects_inflight_prefetches() {
+        let inodes = DashMap::new();
+        inodes.insert(7, InodeEntry::default());
+
+        advance_content_generation(&inodes, 7);
+        let first_capture = content_generation(&inodes, 7).unwrap();
+        advance_content_generation(&inodes, 7);
+        let second_capture = content_generation(&inodes, 7).unwrap();
+
+        advance_content_generation(&inodes, 7);
+        assert_ne!(content_generation(&inodes, 7), Some(first_capture));
+        assert_ne!(content_generation(&inodes, 7), Some(second_capture));
     }
 
     #[test]
