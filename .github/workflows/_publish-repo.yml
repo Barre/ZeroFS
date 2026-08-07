@@ -307,16 +307,6 @@ jobs:
           rpm --dbpath "$rpm_db" --initdb
           rpm --dbpath "$rpm_db" --import zerofs.gpg
 
-          rpm_identity() {
-            local identity
-            local header_digest
-            identity=$(rpm -qp \
-              --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}|%{SHA256HEADER}\n' \
-              "$1")
-            header_digest=${identity##*|}
-            [[ "$header_digest" =~ ^[A-Fa-f0-9]{64}$ ]]
-            printf '%s\n' "$identity"
-          }
           verify_signed_rpm() {
             local verification
             verification=$(rpm --dbpath "$rpm_db" --checksig "$1")
@@ -332,18 +322,13 @@ jobs:
             verify_signed_rpm "$package"
           done
           new_packages=(out/*.rpm)
+          # Re-publishing a tag is intentionally last-write-wins. Re-sign and
+          # replace matching filenames after validating the existing repository.
           for package in "${new_packages[@]}"; do
             filename=${package##*/}
             existing="rpmrepo/$filename"
             if [[ -e "$existing" ]]; then
               [[ -f "$existing" && ! -L "$existing" ]]
-              [[ "$(rpm_identity "$package")" == \
-                 "$(rpm_identity "$existing")" ]] || {
-                echo "published RPM changed without a version bump: $filename" >&2
-                exit 1
-              }
-              cp "$existing" "$package"
-              continue
             fi
             rpmsign --addsign \
               --define "_openpgp_sign_id $GPG_FINGERPRINT" \
@@ -381,7 +366,6 @@ jobs:
             --visibility private \
             --sign "$GPG_FINGERPRINT" \
             --gpg-options="--pinentry-mode=loopback --batch --yes" \
-            --fail-if-exists \
             --preserve-versions \
             out/*.deb
           deb-s3 verify \
