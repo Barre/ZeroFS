@@ -98,7 +98,17 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = parse_arguments()
-    catalog = load_catalog(arguments.manifest)
+    allow_builder_image_drift = arguments.command in {
+        "apply",
+        "check",
+        "discover",
+    } or (
+        arguments.command == "matrix" and arguments.scope == "discover"
+    )
+    catalog = load_catalog(
+        arguments.manifest,
+        allow_builder_image_drift=allow_builder_image_drift,
+    )
 
     if arguments.command == "matrix":
         if arguments.scope == "discover":
@@ -163,7 +173,10 @@ def main() -> int:
 
     if arguments.command != "published":
         fail(f"unsupported command: {arguments.command}")
-    base = load_catalog(arguments.base)
+    # A replacement target repairs a base manifest whose channel builder image
+    # changed without its newest target. Keep that historical base readable,
+    # while the current manifest remains subject to the strict check above.
+    base = load_catalog(arguments.base, allow_builder_image_drift=True)
     entries = [
         target_matrix_entry(target)
         for target in newly_published_targets(base, catalog)

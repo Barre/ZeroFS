@@ -228,6 +228,32 @@ class KernelTargetsTest(unittest.TestCase):
         self.assertEqual(new["builder_image"], builder_image)
         self.assertTrue(new["publish"])
 
+    def test_runtime_matrix_rejects_builder_image_drift(self):
+        document = manifest()
+        builder_image = f"ubuntu:new@sha256:{'1' * 64}"
+        document["channels"][0]["discovery"]["builder_image"] = builder_image
+        path = self.write_json("builder-image-drift.json", document)
+
+        result = self.run_controller(
+            path,
+            "matrix",
+            "--scope",
+            "ci",
+            succeeds=False,
+        )
+
+        self.assertIn("newest target 'ubuntu-kernel-r1'", result.stderr)
+        self.assertIn("apply a candidate", result.stderr)
+
+        discovery = self.run_controller(
+            path,
+            "matrix",
+            "--scope",
+            "discover",
+        )
+        entry = json.loads(discovery.stdout)["include"][0]
+        self.assertEqual(entry["id"], "ubuntu-stable-generic-x86-64")
+
     def test_apply_orders_channels_independently_of_arguments(self):
         second_channel = channel(
             "ubuntu-stable-generic-aarch64",
@@ -650,9 +676,9 @@ class KernelTargetsTest(unittest.TestCase):
     def test_published_rejects_existing_target_changes(self):
         base = manifest(targets=[target(publish=True)])
         current = copy.deepcopy(base)
-        current["targets"][0]["builder_image"] = (
-            f"ubuntu:changed@sha256:{'1' * 64}"
-        )
+        builder_image = f"ubuntu:changed@sha256:{'1' * 64}"
+        current["channels"][0]["discovery"]["builder_image"] = builder_image
+        current["targets"][0]["builder_image"] = builder_image
         base_path = self.write_json("base.json", base)
         current_path = self.write_json("current.json", current)
 
@@ -665,6 +691,33 @@ class KernelTargetsTest(unittest.TestCase):
         )
 
         self.assertIn("existing target cannot be changed", result.stderr)
+
+    def test_published_accepts_replacement_for_drifted_base(self):
+        base = manifest(targets=[target(publish=True)])
+        builder_image = f"ubuntu:new@sha256:{'1' * 64}"
+        base["channels"][0]["discovery"]["builder_image"] = builder_image
+        current = copy.deepcopy(base)
+        current["targets"][0]["ci"] = False
+        current["targets"][0]["publish"] = False
+        replacement = target(
+            "ubuntu-kernel-r2",
+            revision=2,
+            publish=True,
+        )
+        replacement["builder_image"] = builder_image
+        current["targets"].append(replacement)
+        base_path = self.write_json("drifted-base.json", base)
+        current_path = self.write_json("replacement-current.json", current)
+
+        result = self.run_controller(
+            current_path,
+            "published",
+            "--base",
+            base_path,
+        )
+
+        entries = json.loads(result.stdout)["include"]
+        self.assertEqual([entry["id"] for entry in entries], ["ubuntu-kernel-r2"])
 
     def test_published_rejects_removed_targets(self):
         old = target("ubuntu-kernel-r1", revision=1)

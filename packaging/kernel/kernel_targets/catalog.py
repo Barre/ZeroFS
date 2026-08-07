@@ -485,7 +485,12 @@ def validate_unsupported_target(value: Any, label: str) -> None:
             fail(f"{label}.{field}: unsupported path token")
 
 
-def validate_catalog(value: Any, label: str) -> Catalog:
+def validate_catalog(
+    value: Any,
+    label: str,
+    *,
+    allow_builder_image_drift: bool = False,
+) -> Catalog:
     if not isinstance(value, dict):
         fail(f"{label}: top level must be an object")
     expected_top_level = {
@@ -581,6 +586,17 @@ def validate_catalog(value: Any, label: str) -> Catalog:
                 f"{label}: publish target {target_id!r} is not the newest "
                 f"target in channel {channel_id!r}"
             )
+    if not allow_builder_image_drift:
+        for channel_id, (_, target_id) in revisions.items():
+            target_image = targets_by_id[target_id]["builder_image"]
+            channel_image = channels[channel_id]["discovery"]["builder_image"]
+            if target_image != channel_image:
+                fail(
+                    f"{label}: newest target {target_id!r} uses builder image "
+                    f"{target_image!r}, but channel {channel_id!r} configures "
+                    f"{channel_image!r}; apply a candidate to create a "
+                    "replacement target"
+                )
 
     return Catalog(
         document=copy.deepcopy(value),
@@ -590,5 +606,13 @@ def validate_catalog(value: Any, label: str) -> Catalog:
     )
 
 
-def load_catalog(path: Path) -> Catalog:
-    return validate_catalog(read_json(path, "manifest"), str(path))
+def load_catalog(
+    path: Path,
+    *,
+    allow_builder_image_drift: bool = False,
+) -> Catalog:
+    return validate_catalog(
+        read_json(path, "manifest"),
+        str(path),
+        allow_builder_image_drift=allow_builder_image_drift,
+    )

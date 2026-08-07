@@ -623,8 +623,8 @@
     {
       "id": "opensuse-tumbleweed-default-x86-64-7.1.5-1-default-r3",
       "enabled": true,
-      "ci": true,
-      "publish": true,
+      "ci": false,
+      "publish": false,
       "channel_id": "opensuse-tumbleweed-default-x86-64",
       "package_revision": "3",
       "kernel_release": "7.1.5-1-default",
@@ -788,6 +788,24 @@
           "rust-std-static-1.97.1-1.fc43.x86_64.rpm": "6138d031218e005bb09e4fa9717d5ee3cdfa2a744c04252b1d4583b9a01f6ad0",
           "rustfmt-1.97.1-1.fc43.x86_64.rpm": "4579d58a854ba30f743fd7002b15d6c61461e798745cb9490b2e55ebf334cf5b"
         }
+      }
+    },
+    {
+      "id": "opensuse-tumbleweed-default-x86-64-7.1.5-1-default-r4",
+      "enabled": true,
+      "ci": true,
+      "publish": true,
+      "channel_id": "opensuse-tumbleweed-default-x86-64",
+      "package_revision": "4",
+      "kernel_release": "7.1.5-1-default",
+      "kernel_package_name": "kernel-default",
+      "kernel_package_version": "7.1.5-1.1",
+      "kernel_selector_version": "7.1.5-1.1",
+      "builder_image": "opensuse/tumbleweed:latest",
+      "source": {
+        "kind": "opensuse-history",
+        "identity": "kernel-default@7.1.5-1.1,kernel-default-devel@7.1.5-1.1,kernel-devel@7.1.5-1.1,kernel-source@7.1.5-1.1,kernel-syms@7.1.5-1.1",
+        "snapshot": "20260731"
       }
     }
   ],
