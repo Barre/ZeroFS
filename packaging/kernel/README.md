@@ -103,9 +103,11 @@ available. It does not modify branches or pull requests. Each issue contains
 the `discover` and `apply` commands for a manifest update. Manifest PRs run the
 target build and QEMU smoke tests.
 
-`build-target.sh` builds one manifest target in its digest-pinned container. It
-selects the external-module, generated-metadata, or self-contained build from
-the target inputs. With `--module`, the host must already contain the matching
+`build-target.sh` builds one manifest target in its configured container.
+Builder images are digest-pinned except for openSUSE Tumbleweed, whose official
+Docker Hub image exposes only the rolling `latest` tag. It selects the
+external-module, generated-metadata, or self-contained build from the target
+inputs. With `--module`, the host must already contain the matching
 `/lib/modules/<release>` tree and `/boot/vmlinuz-<release>`.
 The host also needs a statically linked, target-architecture `busybox`.
 `build-target.sh` verifies its architecture and required applets before adding
@@ -129,7 +131,7 @@ header tree. The container also prefers the compiler named by
 both the configured and selected compiler in `build-info`. A same-family
 fallback remains visible as `target_cc_exact=false`; the self-contained path
 rejects such a fallback because it requires the exact target compiler.
-The pinned openSUSE builder image supplies its trusted distribution keys;
+The official openSUSE builder image supplies its trusted distribution keys;
 snapshot refreshes never import a key advertised by repository metadata.
 
 The self-contained path handles a narrower `CONFIG_RUST=n` case; it is not a

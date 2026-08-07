@@ -195,7 +195,7 @@
       },
       "discovery": {
         "kind": "opensuse-history",
-        "builder_image": "registry.opensuse.org/opensuse/tumbleweed:20260724.37.69@sha256:2707c307c6a91a5562a400c54860372d7fdb1a3e6bc0c3203542564146637ed7",
+        "builder_image": "opensuse/tumbleweed:latest",
         "selector": "kernel-default",
         "packages": [
           "kernel-default",

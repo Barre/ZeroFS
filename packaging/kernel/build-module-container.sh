@@ -586,7 +586,7 @@ configure_opensuse() {
 
     zypper --non-interactive removerepo --all || true
     zypper --non-interactive addrepo --check "$repository_url" zerofs-snapshot
-    # The digest-pinned builder image provides the trusted distribution keys.
+    # The official builder image provides the trusted distribution keys.
     # Never import a key supplied by repository metadata.
     zypper --non-interactive refresh
     zypper --non-interactive install --oldpackage \

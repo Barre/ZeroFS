@@ -481,7 +481,7 @@ class KernelTargetsTest(unittest.TestCase):
 
     def test_opensuse_upgrade_gate_uses_kernel_default_version(self):
         channel_id = "opensuse-tumbleweed-default-x86-64"
-        builder_image = f"opensuse:test@sha256:{DIGEST}"
+        builder_image = "opensuse/tumbleweed:latest"
         packages = [
             "kernel-default",
             "kernel-default-devel",
@@ -558,6 +558,21 @@ class KernelTargetsTest(unittest.TestCase):
             f"--privileged@sha256:{DIGEST}"
         )
         path = self.write_json("targets.json", document)
+
+        result = self.run_controller(
+            path,
+            "matrix",
+            "--scope",
+            "ci",
+            succeeds=False,
+        )
+
+        self.assertIn("digest-pinned OCI image name", result.stderr)
+
+    def test_tagged_builder_image_is_rejected_outside_opensuse(self):
+        document = manifest()
+        document["channels"][0]["discovery"]["builder_image"] = "ubuntu:test"
+        path = self.write_json("tagged-builder.json", document)
 
         result = self.run_controller(
             path,

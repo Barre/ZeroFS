@@ -26,7 +26,8 @@ usage: $script_name \
   [--source-root PATH] \
   [--module PREBUILT-ZEROFS.KO]
 
-Without --module, the pinned builder image acquires and builds the exact target.
+Without --module, the configured builder image acquires and builds the exact
+target.
 --source-root selects the ZeroFS checkout to build; tooling comes from the
 current checkout. It defaults to the current checkout and cannot be combined
 with --module.
