@@ -879,8 +879,12 @@ copy_uncompressed_module() {
 
 build_source_package_module() {
     local auto_conf="$kdir/include/config/auto.conf"
+    local dkms_make_log
     local installed_source
     local installed_module
+    local installed_module_root
+    local package_install_status=0
+    local resolved_installed_module
     local package_version
 
     if [[ "$distro" == ubuntu || "$distro" == debian ]]; then
@@ -917,26 +921,37 @@ build_source_package_module() {
     case $distro in
         ubuntu | debian)
             package_version=$(dpkg-deb --field "$source_package" Version)
-            DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                --no-install-recommends "$source_package"
             ;;
-        fedora)
+        fedora | opensuse)
             package_version=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' \
                 "$source_package")
-            dnf install -y "$source_package"
             ;;
-        opensuse)
-            package_version=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' \
-                "$source_package")
-            zypper --non-interactive install --allow-unsigned-rpm \
-                "$source_package"
-            ;;
-        *)
-            die "unsupported package target: $distro"
-            ;;
+        *) die "unsupported package target: $distro" ;;
     esac
     [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$ ]] ||
         die "source-DKMS package has an unsafe version: $package_version"
+    case $distro in
+        ubuntu | debian)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                --no-install-recommends "$source_package" ||
+                package_install_status=$?
+            ;;
+        fedora)
+            dnf install -y "$source_package" || package_install_status=$?
+            ;;
+        opensuse)
+            zypper --non-interactive install --allow-unsigned-rpm \
+                "$source_package" || package_install_status=$?
+            ;;
+    esac
+    if ((package_install_status != 0)); then
+        dkms_make_log="/var/lib/dkms/zerofs/$package_version/build/make.log"
+        if [[ -f "$dkms_make_log" && ! -L "$dkms_make_log" ]]; then
+            printf '\n%s\n' "DKMS build log: $dkms_make_log" >&2
+            cat -- "$dkms_make_log" >&2 || true
+        fi
+        return "$package_install_status"
+    fi
     installed_source="/usr/src/zerofs-$package_version/kernel"
     [[ -d "$installed_source" && ! -L "$installed_source" ]] ||
         die "installed source-DKMS package has no regular kernel source tree"
@@ -947,12 +962,17 @@ build_source_package_module() {
 
     installed_module=$(modinfo -k "$kernel_release" -n zerofs) ||
         die "DKMS did not install zerofs for $kernel_release"
-    case $installed_module in
-        "/lib/modules/$kernel_release/"*) ;;
-        *) die "DKMS returned an unsafe module path: $installed_module" ;;
-    esac
     [[ -f "$installed_module" && ! -L "$installed_module" ]] ||
         die "DKMS module is not a regular file: $installed_module"
+    installed_module_root=$(realpath -e -- "/lib/modules/$kernel_release") ||
+        die "cannot resolve the module directory for $kernel_release"
+    resolved_installed_module=$(realpath -e -- "$installed_module") ||
+        die "cannot resolve the DKMS module path: $installed_module"
+    case $resolved_installed_module in
+        "$installed_module_root/"*) ;;
+        *) die "DKMS returned an unsafe module path: $installed_module" ;;
+    esac
+    installed_module=$resolved_installed_module
     copy_uncompressed_module "$installed_module" "$module"
     [[ -s "$module" && ! -L "$module" ]] ||
         die "DKMS installed module could not be copied"
