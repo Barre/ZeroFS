@@ -13,6 +13,13 @@ class Runner(Protocol):
 
     def download(self, url: str, destination: Path) -> None: ...
 
+    def splice_rpm_sighdr(
+        self,
+        sighdr: Path,
+        package: Path,
+        destination: Path,
+    ) -> None: ...
+
     def url_exists(self, url: str) -> bool: ...
 
     def kernel_auto_conf(self, package: Path, destination: Path) -> str: ...
@@ -29,24 +36,12 @@ def require_native_arch(channel: dict[str, Any], runner: Runner) -> None:
 
 
 def base_candidate(
-    channel: dict[str, Any],
     current: dict[str, Any],
-    kernel_release: str,
-    package_name: str,
-    package_version: str,
-    source: dict[str, Any],
-    *,
-    selector_version: str | None = None,
+    lock: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "channel_id": channel["id"],
         "base_target_id": current["id"],
-        "kernel_release": kernel_release,
-        "kernel_package_name": package_name,
-        "kernel_package_version": package_version,
-        "kernel_selector_version": selector_version or package_version,
-        "source": source,
+        "lock": lock,
     }
 
 

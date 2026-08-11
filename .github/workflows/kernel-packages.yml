@@ -2,190 +2,160 @@ name: kernel-packages
 
 on:
   workflow_call:
+    inputs:
+      checkout-ref:
+        description: Immutable source and tooling ref; defaults to the event commit
+        type: string
+    outputs:
+      package-version:
+        description: Version read from the audited source-DKMS packages
+        value: ${{ jobs.source-package.outputs.package_version }}
 
 permissions:
   contents: read
 
 jobs:
-  resolve:
-    name: Resolve kernel package targets
+  source-package:
+    name: Build source-DKMS packages
     runs-on: ubuntu-26.04
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      has_targets: ${{ steps.matrix.outputs.has_targets }}
-      source_date_epoch: ${{ steps.matrix.outputs.source_date_epoch }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      package_version: ${{ steps.audit.outputs.version }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
 
-      - name: Validate kernel tooling
-        id: matrix
+      - name: Validate kernel tooling and resolve targets
+        id: resolve
+        run: .github/scripts/kernel-packages/resolve.sh
+
+      - name: Install package tools
         run: |
-          python3 -m unittest discover \
-            -s kernel/ci/tests \
-            -p 'test_*.py'
-          python3 -m unittest discover \
-            -s packaging/kernel/tests \
-            -p 'test_*.py'
-          matrix=$(python3 packaging/kernel/kernel-targets.py \
-            --manifest packaging/kernel/targets.json \
-            matrix --scope ci)
-          target_count=$(python3 -c \
-            'import json,sys; print(len(json.load(sys.stdin)["include"]))' \
-            <<<"$matrix")
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          if ((target_count)); then
-            echo "has_targets=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_targets=false" >> "$GITHUB_OUTPUT"
-            echo "No kernel package target is CI-enabled."
-          fi
-          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" \
-            >> "$GITHUB_OUTPUT"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cpio docker.io rpm
+          sudo systemctl start docker
+          docker version
+          .github/scripts/install-nfpm.sh
 
-  package:
-    name: Kernel package (${{ matrix.id }}, ${{ matrix.family }})
-    needs: resolve
-    if: ${{ needs.resolve.outputs.has_targets == 'true' }}
+      - name: Build source-DKMS packages
+        run: packaging/kernel/kernel-source-package.py --output staged
+
+      - name: Audit source-DKMS packages
+        id: audit
+        run: |
+          version=$(kernel/ci/dkms-package-smoke.py \
+            staged/deb/*.deb staged/rpm/*.rpm)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install and remove source-DKMS packages
+        run: |
+          kernel/ci/dkms-package-install-smoke.sh \
+            staged/deb/*.deb staged/rpm/*.rpm
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zerofs-kernel-source-packages
+          path: staged
+          if-no-files-found: error
+          retention-days: 3
+
+  target:
+    name: DKMS build (${{ matrix.id }})
+    needs: source-package
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.source-package.outputs.matrix) }}
     env:
-      ZEROFS_KERNEL_TARGET_ID: ${{ matrix.id }}
       ZEROFS_KERNEL_ARTIFACT_DIR: /tmp/zerofs-kernel-${{ matrix.id }}
-      ZEROFS_KERNEL_PACKAGE_LICENSE: LicenseRef-ZeroFS-CI-Only
-      ZEROFS_TARGET_STRIP: /usr/bin/strip
-      NFPM_VERSION: "2.47.0"
-      NFPM_SHA256_X86_64: "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
-      NFPM_SHA256_ARM64: "1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c"
-      SOURCE_DATE_EPOCH: ${{ needs.resolve.outputs.source_date_epoch }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
 
-      - name: Install package audit tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: zerofs-kernel-source-packages
+          path: kernel-packages
+
+      - name: Install target-build tools
         run: |
-          case '${{ matrix.arch }}' in
-            x86_64)
-              nfpm_arch=x86_64
-              nfpm_sha=$NFPM_SHA256_X86_64
-              ;;
-            aarch64)
-              nfpm_arch=arm64
-              nfpm_sha=$NFPM_SHA256_ARM64
-              ;;
-            *)
-              echo 'unsupported package runner architecture' >&2
-              exit 1
-              ;;
-          esac
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils busybox-static cpio diffutils docker.io kmod openssl rpm
-          mkdir -p "$HOME/.local/bin"
-          nfpm_archive="$RUNNER_TEMP/nfpm.tar.gz"
-          nfpm_url="https://github.com/goreleaser/nfpm/releases/download"
-          nfpm_url+="/v${NFPM_VERSION}"
-          nfpm_url+="/nfpm_${NFPM_VERSION}_Linux_${nfpm_arch}.tar.gz"
-          curl -fsSL "$nfpm_url" -o "$nfpm_archive"
-          echo "$nfpm_sha  $nfpm_archive" | sha256sum --check -
-          tar xzf "$nfpm_archive" -C "$HOME/.local/bin" nfpm
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            binutils busybox-static docker.io kmod rpm
           sudo systemctl start docker
           docker version
 
-      - name: Build kernel package
+      - name: Install and build the source package
         run: |
-          install -d -m 0755 "$ZEROFS_KERNEL_ARTIFACT_DIR"
           packaging/kernel/build-target.sh \
-            --manifest packaging/kernel/targets.json \
-            --target-id "$ZEROFS_KERNEL_TARGET_ID" \
+            --manifest packaging/kernel/kernels.lock.json \
+            --target-id "${{ matrix.id }}" \
+            --source-package kernel-packages \
             --output-dir "$ZEROFS_KERNEL_ARTIFACT_DIR"
-          [[ -s "$ZEROFS_KERNEL_ARTIFACT_DIR/artifact.json" ]]
 
-      - name: Audit package
-        run: |
-          kernel/ci/package-smoke.sh \
-            --manifest packaging/kernel/targets.json \
-            --target-id "$ZEROFS_KERNEL_TARGET_ID" \
-            --artifact-dir "$ZEROFS_KERNEL_ARTIFACT_DIR"
-
-      - name: Upload kernel package
+      - name: Upload target artifact
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: zerofs-kernel-${{ matrix.id }}
           path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}
           if-no-files-found: warn
+          retention-days: 7
 
   smoke:
-    name: Kernel smoke (${{ matrix.id }})
-    needs: [resolve, package]
+    name: Kernel boot (${{ matrix.id }})
+    needs: [source-package, target]
     if: >-
-      ${{ !cancelled() &&
-          needs.package.result == 'success' &&
-          needs.resolve.outputs.has_targets == 'true' }}
+      ${{
+        !cancelled() &&
+        needs.source-package.result == 'success' &&
+        (needs.target.result == 'success' ||
+         needs.target.result == 'failure')
+      }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.source-package.outputs.matrix) }}
     env:
       ZEROFS_KERNEL_ARTIFACT_DIR: /tmp/zerofs-kernel-${{ matrix.id }}
-      ZEROFS_KERNEL_TARGET_ID: ${{ matrix.id }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.checkout-ref || github.sha }}
 
-      - name: Download kernel package
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: zerofs-kernel-${{ matrix.id }}
           path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}
 
-      - name: Download the ZeroFS server
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: zerofs-ci-bin
           path: zerofs/target/ci
 
-      - name: Install smoke-test tools
+      - name: Install boot-test tools
         run: |
           case '${{ matrix.arch }}' in
             x86_64) qemu_package=qemu-system-x86 ;;
             aarch64) qemu_package=qemu-system-arm ;;
-            *)
-              echo 'unsupported smoke architecture' >&2
-              exit 1
-              ;;
+            *) exit 1 ;;
           esac
           chmod +x zerofs/target/ci/zerofs
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cpio "$qemu_package"
+            binutils cpio kmod "$qemu_package"
 
-      - name: Mount and exercise the packaged module
+      - name: Load and exercise ZeroFS
         run: |
-          kernel/ci/module-smoke.sh package \
-            packaging/kernel/targets.json \
-            "$ZEROFS_KERNEL_TARGET_ID" \
+          kernel/ci/module-smoke.sh artifact \
+            packaging/kernel/kernels.lock.json \
+            "${{ matrix.id }}" \
             "$ZEROFS_KERNEL_ARTIFACT_DIR" \
             zerofs/target/ci/zerofs
-
-  gate:
-    name: Kernel package gate
-    if: always()
-    needs: [resolve, package, smoke]
-    runs-on: ubuntu-26.04
-    env:
-      HAS_TARGETS: ${{ needs.resolve.outputs.has_targets }}
-      PACKAGE_RESULT: ${{ needs.package.result }}
-      RESOLVE_RESULT: ${{ needs.resolve.result }}
-      SMOKE_RESULT: ${{ needs.smoke.result }}
-    steps:
-      - name: Check kernel packages
-        run: |
-          [[ "$RESOLVE_RESULT" == success ]]
-          if [[ "$HAS_TARGETS" == true ]]; then
-            [[ "$PACKAGE_RESULT" == success ]]
-            [[ "$SMOKE_RESULT" == success ]]
-          fi

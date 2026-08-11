@@ -4,22 +4,20 @@ set -euo pipefail
 export LC_ALL=C
 
 readonly script_name=${0##*/}
-readonly tooling_root=/zerofs-tools
-readonly source_root=/zerofs-source
 readonly output_root=/zerofs-out
 readonly work_root=/zerofs-work
 
 fedora_signing_fingerprint=
+output_owner=
 
 usage() {
     cat >&2 <<EOF
 usage: $script_name DISTRO RELEASE KERNEL_RELEASE KERNEL_PACKAGE_VERSION \
-SOURCE_IDENTITY SNAPSHOT ZEROFS_VERSION
+SOURCE_IDENTITY SNAPSHOT APT_SUITE
 
 This is the container-side implementation used by build-target.sh. The
-current packaging tooling must be mounted read-only at $tooling_root, the
-ZeroFS source checkout at $source_root, and an empty output directory at
-$output_root.
+source-DKMS package must be mounted at /zerofs-source-package.deb or
+/zerofs-source-package.rpm, and an empty output directory at $output_root.
 EOF
 }
 
@@ -33,28 +31,14 @@ require_command() {
         die "required command not found: $1"
 }
 
-directory_is_empty() (
-    local directory=$1
-    local -a entries
-
-    shopt -s dotglob nullglob
-    entries=("$directory"/*)
-    ((${#entries[@]} == 0))
-)
-
 restore_output_ownership() {
     local status=$?
 
     trap - EXIT
-    if [[ ${ZEROFS_HOST_UID:-} =~ ^[0-9]+$ &&
-          ${ZEROFS_HOST_GID:-} =~ ^[0-9]+$ ]]; then
-        chown -R "$ZEROFS_HOST_UID:$ZEROFS_HOST_GID" "$output_root" ||
-            echo "$script_name: could not restore output ownership" >&2
-    fi
+    chown -R -- "$output_owner" "$output_root" ||
+        echo "$script_name: could not restore output ownership" >&2
     exit "$status"
 }
-
-trap restore_output_ownership EXIT
 
 select_command() {
     local candidate
@@ -124,7 +108,6 @@ verify_fedora_signature() {
     local expected
     local verification
 
-    [[ -n "$fedora_signing_fingerprint" ]] || return 0
     expected="key fingerprint: $fedora_signing_fingerprint: OK"
     verification=$(rpmkeys --checksig --verbose "$path") ||
         die "Fedora signature verification failed: ${path##*/}"
@@ -143,12 +126,6 @@ fetch_fedora_rpm() {
     local destination=$4
     local signing_key
 
-    if [[ -z "$fedora_signing_fingerprint" ]]; then
-        curl --fail --location --retry 5 --retry-all-errors \
-            --output "$destination" \
-            "$base/$arch_dir/$filename"
-        return
-    fi
     signing_key=${fedora_signing_fingerprint: -8}
     curl --fail --location --retry 5 --retry-all-errors \
         --output "$destination.unsigned" \
@@ -166,53 +143,6 @@ with open(sighdr, "rb") as source:
     koji.splice_rpm_sighdr(source.read(), unsigned, destination)
 PY
     rm -f -- "$destination.unsigned" "$destination.sig"
-}
-
-validate_fedora_source_artifacts() {
-    local kernel_nvr=$1
-    local rust_nvr=$2
-    local arch=$3
-
-    python3 - \
-        "$source_artifacts_json" "$kernel_nvr" "$rust_nvr" "$arch" <<'PY'
-import json
-import re
-import sys
-
-try:
-    artifacts = json.loads(sys.argv[1])
-except json.JSONDecodeError as error:
-    raise SystemExit(f"invalid Fedora source artifact map: {error}")
-if not isinstance(artifacts, dict):
-    raise SystemExit("Fedora source artifact map must be an object")
-
-kernel_nvr, rust_nvr, arch = sys.argv[2:]
-expected = {
-    f"kernel-{kernel_nvr}.src.rpm",
-    f"rust-src-{rust_nvr}.noarch.rpm",
-}
-expected.update(
-    f"{name}-{kernel_nvr}.{arch}.rpm"
-    for name in ("kernel-core", "kernel-devel", "kernel-modules-core")
-)
-expected.update(
-    f"{name}-{rust_nvr}.{arch}.rpm"
-    for name in ("cargo", "rust", "rust-std-static", "rustfmt")
-)
-actual = set(artifacts)
-if actual != expected:
-    missing = ", ".join(sorted(expected - actual)) or "none"
-    extra = ", ".join(sorted(actual - expected)) or "none"
-    raise SystemExit(
-        f"Fedora source artifact pins differ: missing [{missing}], "
-        f"extra [{extra}]"
-    )
-for filename, digest in artifacts.items():
-    if not isinstance(digest, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", digest
-    ):
-        raise SystemExit(f"invalid SHA-256 pin for {filename}")
-PY
 }
 
 apt_package_available() {
@@ -235,26 +165,17 @@ install_apt_snapshot_ca() {
 }
 
 configure_ubuntu() {
+    local auto_conf
     local candidate
     local identity
     local rust_metadata
     local rust_metadata_package
     local source_package
     local source_version
-    local suite
     local ubuntu_source_root="$work_root/ubuntu-source"
     local -a packages=()
     local -a source_candidates=()
 
-    case $release in
-        24.04)
-            suite=noble
-            ;;
-        26.04)
-            suite=resolute
-            ;;
-        *) die "unsupported Ubuntu release: $release" ;;
-    esac
     [[ "$source_identity" == ubuntu:*@* ]] ||
         die "invalid Ubuntu source identity: $source_identity"
     identity=${source_identity#ubuntu:}
@@ -270,7 +191,7 @@ configure_ubuntu() {
     cat >/etc/apt/sources.list.d/zerofs.sources <<EOF
 Types: deb deb-src
 URIs: https://snapshot.ubuntu.com/ubuntu/$snapshot/
-Suites: $suite ${suite}-updates ${suite}-security
+Suites: $apt_suite ${apt_suite}-updates ${apt_suite}-security
 Components: main universe
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
@@ -301,14 +222,17 @@ EOF
         --no-install-recommends "${packages[@]}"
 
     kdir=$(realpath "/lib/modules/$kernel_release/build")
+    auto_conf="$kdir/include/config/auto.conf"
     rust_metadata="/usr/src/linux-lib-rust-$kernel_release/rust"
-    if [[ ! -s "$kdir/rust/libkernel.rmeta" &&
+    if grep -qx 'CONFIG_RUST=y' "$auto_conf" &&
+       [[ ! -s "$kdir/rust/libkernel.rmeta" &&
           -s "$rust_metadata/libkernel.rmeta" ]]; then
         [[ -L "$kdir/rust" ]] ||
             die "kernel headers do not expose their packaged Rust metadata"
         ln -sfn "$rust_metadata" "$kdir/rust"
     fi
-    if [[ -s "$kdir/rust/libkernel.rmeta" ]]; then
+    if grep -qx 'CONFIG_RUST=y' "$auto_conf" &&
+       [[ -s "$kdir/rust/libkernel.rmeta" ]]; then
         kernel_source=
         return
     fi
@@ -330,22 +254,25 @@ EOF
     [[ ${#source_candidates[@]} -eq 1 ]] ||
         die "cannot select the exact Ubuntu kernel source tree"
     kernel_source=${source_candidates[0]}
+    kernel_source_package_version=$source_version
+    kernel_headers_package_version=$kernel_package_version
     make -s -C "$kernel_source" mrproper
 }
 
 configure_debian() {
+    local base_suite=${apt_suite%-backports}
     local identity
     local source_package
     local source_series=${kernel_release%%+*}
     local source_version
+    local suite_suffix=:$apt_suite
 
-    [[ "$release" == 13-backports ]] ||
-        die "unsupported Debian release: $release"
-    [[ "$source_identity" == \
-       debian:*@*:trixie-backports ]] ||
+    [[ "$apt_suite" == *-backports && -n "$base_suite" ]] ||
+        die "invalid Debian backports suite: $apt_suite"
+    [[ "$source_identity" == debian:*@*"$suite_suffix" ]] ||
         die "invalid Debian source identity: $source_identity"
     identity=${source_identity#debian:}
-    identity=${identity%:trixie-backports}
+    identity=${identity%"$suite_suffix"}
     source_package=${identity%%@*}
     source_version=${identity#*@}
     [[ "$source_package" == linux &&
@@ -359,8 +286,8 @@ configure_debian() {
 
     rm -f -- /etc/apt/sources.list /etc/apt/sources.list.d/*
     cat >/etc/apt/sources.list <<EOF
-deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$snapshot trixie main
-deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$snapshot trixie-backports main
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$snapshot $base_suite main
+deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$snapshot $apt_suite main
 EOF
     install_apt_snapshot_ca
 
@@ -399,6 +326,8 @@ EOF
         -print -quit)
     [[ -n "$kernel_source" ]] ||
         die "cannot find extracted Debian kernel source"
+    kernel_source_package_version=$source_version
+    kernel_headers_package_version=$kernel_package_version
 }
 
 configure_fedora() {
@@ -421,13 +350,8 @@ configure_fedora() {
     esac
     [[ "$source_identity" == kernel-* ]] ||
         die "invalid Fedora source identity: $source_identity"
-    [[ "$release" == 43 || "$release" == 44 ]] ||
-        die "unsupported Fedora release: $release"
     snapshot_suffix=":$target_arch,noarch,src"
     case $snapshot in
-        "koji-download-build$snapshot_suffix")
-            fedora_signing_fingerprint=
-            ;;
         "koji-signed-build:"*"$snapshot_suffix")
             fedora_signing_fingerprint=${snapshot#koji-signed-build:}
             fedora_signing_fingerprint=${fedora_signing_fingerprint%"$snapshot_suffix"}
@@ -521,12 +445,20 @@ configure_fedora() {
         die "prepared Fedora kernel source selection failed"
     fi
     kernel_source=${source_candidates[0]}
+    kernel_source_package_version="0:$nvr"
+    kernel_headers_package_version="0:$nvr"
     [[ -f "$kernel_source/Makefile" &&
        -f "$kernel_source/rust/Makefile" ]] ||
         die "prepared Fedora source tree is incomplete: $kernel_source"
     source_version=$(make -s -C "$kernel_source" kernelversion)
-    [[ -n "$source_version" && "$kernel_release" == "$source_version"-* ]] ||
-        die "Fedora source version $source_version does not match $kernel_release"
+    [[ -n "$source_version" ]] ||
+        die "Fedora source tree did not report a kernel version"
+    case $kernel_release in
+        "$source_version" | "$source_version"-*) ;;
+        *)
+            die "Fedora source version $source_version does not match $kernel_release"
+            ;;
+    esac
     # Fedora's %prep runs its configuration checks in the source directory.
     # Remove only their generated Kbuild state before reusing the tree with
     # kernel-devel as a separate output directory.
@@ -537,7 +469,7 @@ configure_fedora() {
         die "Fedora prepared source tree could not be cleaned for an O= build"
     kdir=$(realpath "/lib/modules/$kernel_release/build")
     install_fedora_rust_tools \
-        "$kdir/include/config/auto.conf" "$nvr" "$target_arch"
+        "$kdir/include/config/auto.conf" "$target_arch"
 }
 
 configure_opensuse() {
@@ -594,7 +526,6 @@ configure_opensuse() {
         binutils \
         bison \
         clang \
-        curl \
         diffutils \
         dwarves \
         findutils \
@@ -620,6 +551,8 @@ configure_opensuse() {
 
     kdir=$(realpath "/lib/modules/$kernel_release/build")
     kernel_source=$(realpath /usr/src/linux)
+    kernel_source_package_version="0:${package_versions[kernel-source]}"
+    kernel_headers_package_version="0:${package_versions[kernel-default-devel]}"
 }
 
 install_apt_rust_tools() {
@@ -635,12 +568,14 @@ install_apt_rust_tools() {
     local rustc_package_version
     local rust_src_package
     local rustfmt_binary
+    local rustfmt_package
     local rustfmt_package_version
     local -a rustfmt_binaries=()
     local -a packages=()
 
     rustc_text=$(config_value "$auto_conf" CONFIG_RUSTC_VERSION_TEXT)
     bindgen_text=$(config_value "$auto_conf" CONFIG_BINDGEN_VERSION_TEXT)
+    rustc_series=
 
     if [[ -n "$rustc_text" ]]; then
         rustc_release=${rustc_text#rustc }
@@ -717,7 +652,6 @@ install_apt_rust_tools() {
     rustfmt_package_version=$(
         dpkg-query -W -f='${Version}' "$rustfmt_package"
     )
-    rustfmt_source="apt:$rustfmt_package@$rustfmt_package_version"
     if [[ -n "$rustc_text" ]]; then
         [[ "$rustfmt_package_version" == "$rustc_package_version" ]] ||
             die "$rustfmt_package does not match $rustc_package"
@@ -726,8 +660,7 @@ install_apt_rust_tools() {
 
 install_fedora_rust_tools() {
     local auto_conf=$1
-    local kernel_nvr=$2
-    local target_rpm_arch=$3
+    local target_rpm_arch=$2
     local installed_package_nvr
     local installed_version
     local koji_base
@@ -755,9 +688,6 @@ install_fedora_rust_tools() {
         die "unsafe Fedora Rust build identifier: $rust_nvr"
     rust_version=${rust_nvr%%-*}
     rust_release=${rust_nvr#*-}
-    validate_fedora_source_artifacts \
-        "$kernel_nvr" "$rust_nvr" "$target_rpm_arch"
-
     for package in cargo rust rust-src rust-std-static rustfmt; do
         installed_package_nvr=$(
             rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$package" \
@@ -771,7 +701,6 @@ install_fedora_rust_tools() {
           "$toolchain_matches" == true ]]; then
         RUSTFMT=$(select_command /usr/bin/rustfmt rustfmt) ||
             die "cannot find Fedora rustfmt"
-        rustfmt_source="fedora:$rust_nvr"
         export RUSTFMT
         return
     fi
@@ -812,7 +741,6 @@ install_fedora_rust_tools() {
     done
     RUSTFMT=$(select_command /usr/bin/rustfmt rustfmt) ||
         die "cannot find Fedora rustfmt"
-    rustfmt_source="fedora:$rust_nvr"
     export RUSTFMT
 }
 
@@ -860,10 +788,6 @@ select_rust_tools() {
         rustfmt) || die "cannot find rustfmt"
     RUSTFMT=$rustfmt
     export RUSTFMT
-    if [[ -z "$rustfmt_source" ]]; then
-        rustfmt_source=distribution-default
-    fi
-
     if [[ -n "$rustc_text" && "$("$rustc" --version)" != "$rustc_text" ]]; then
         die "rustc does not match target configuration: $("$rustc" --version)"
     fi
@@ -875,6 +799,8 @@ select_rust_tools() {
 select_target_cc() {
     local auto_conf=$1
     local configured_cc
+    local target_cc_text
+    local target_cc_version
 
     target_cc_text=$(config_value "$auto_conf" CONFIG_CC_VERSION_TEXT)
     configured_cc=${target_cc_text%% *}
@@ -894,11 +820,8 @@ select_target_cc() {
         die "cannot find the target kernel C compiler"
 
     target_cc_version=$(LC_ALL=C "$target_cc" --version | sed -n '1p')
-    if [[ -n "$target_cc_text" &&
-          "$target_cc_version" == "$target_cc_text" ]]; then
-        target_cc_exact=true
-    else
-        target_cc_exact=false
+    if [[ -z "$target_cc_text" ||
+          "$target_cc_version" != "$target_cc_text" ]]; then
         echo "warning: selected C compiler does not exactly match target" >&2
         echo "  target: ${target_cc_text:-unknown}" >&2
         echo "  selected: $target_cc_version" >&2
@@ -940,134 +863,104 @@ select_llvm_tools() {
         die "cannot find llvm-nm $llvm_major"
 }
 
-build_rust_metadata() {
-    local syscall_reference=arch/x86/entry/syscalls/syscall_32.tbl
+copy_uncompressed_module() {
+    local source=$1
+    local destination=$2
 
-    [[ -n "$kernel_source" ]] ||
-        die "target needs Rust metadata but no exact kernel source is available"
-
-    if [[ "$target_arch" == aarch64 &&
-          ( "$distro" == ubuntu || "$distro" == debian ) ]] &&
-       grep -qx 'CONFIG_CC_IS_GCC=y' "$kdir/include/config/auto.conf" &&
-       grep -qx 'CONFIG_COMPAT_VDSO=y' "$kdir/include/config/auto.conf"; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            --no-install-recommends gcc-arm-linux-gnueabihf
-        require_command arm-linux-gnueabihf-gcc
-        require_command arm-linux-gnueabihf-ld
-    fi
-
-    if [[ -f "$kdir/scripts/checksyscalls.sh" &&
-          ! -f "$kdir/$syscall_reference" ]]; then
-        [[ ! -e "$kdir/$syscall_reference" &&
-           ! -L "$kdir/$syscall_reference" ]] ||
-            die "kernel syscall reference is not a regular file"
-        [[ -f "$kernel_source/$syscall_reference" ]] ||
-            die "kernel source is missing $syscall_reference"
-        install -D -m 0644 \
-            "$kernel_source/$syscall_reference" \
-            "$kdir/$syscall_reference"
-    fi
-
-    echo "building missing Rust metadata from $source_identity"
-    if [[ -L "$kdir/rust" ]]; then
-        rm -f -- "$kdir/rust"
-    fi
-    make -C "$kernel_source" O="$kdir" \
-        CC="$target_cc" \
-        RUSTC="$rustc" \
-        RUSTFMT="$rustfmt" \
-        BINDGEN="$bindgen" \
-        KERNELRELEASE="$kernel_release" \
-        -j "$jobs" \
-        rust/kernel.o
-    [[ -s "$kdir/rust/libkernel.rmeta" ]] ||
-        die "kernel build did not produce $kdir/rust/libkernel.rmeta"
-    [[ "$(<"$kdir/include/config/kernel.release")" == "$kernel_release" ]] ||
-        die "Rust metadata build changed the target kernel release"
+    case $source in
+        *.ko) install -m 0644 "$source" "$destination" ;;
+        *.ko.gz) gzip -dc -- "$source" >"$destination" ;;
+        *.ko.xz) xz -dc -- "$source" >"$destination" ;;
+        *.ko.zst) zstd -dc -q -- "$source" >"$destination" ;;
+        *) die "unsupported module compression: $source" ;;
+    esac
+    chmod 0644 "$destination"
 }
 
-build_zerofs_module() {
+build_source_package_module() {
     local auto_conf="$kdir/include/config/auto.conf"
-    local module_output="$work_root/module-output"
-    local staged_source
-    local staged_kernel
-    local -a llvm_args
-
-    staged_source="$work_root/zerofs-$zerofs_version"
-    staged_kernel="$staged_source/kernel"
-
-    [[ -s "$auto_conf" ]] ||
-        die "kernel configuration is missing: $auto_conf"
-    [[ -s "$kdir/Module.symvers" ]] ||
-        die "kernel symbol versions are missing: $kdir/Module.symvers"
-    [[ "$(<"$kdir/include/config/kernel.release")" == "$kernel_release" ]] ||
-        die "kernel headers do not target $kernel_release"
+    local installed_source
+    local installed_module
+    local package_version
 
     if [[ "$distro" == ubuntu || "$distro" == debian ]]; then
         install_apt_rust_tools "$auto_conf"
     fi
     select_rust_tools "$auto_conf"
     select_target_cc "$auto_conf"
+    if ! grep -qx 'CONFIG_RUST=y' "$auto_conf"; then
+        select_llvm_tools
+    fi
 
-    "$source_root/kernel/stage-module-source.sh" "$staged_source"
-    mkdir -p "$module_output"
+    export ZEROFS_DKMS_KERNEL=$kernel_release
+    module="$output_root/module/zerofs.ko"
+    install -d -m 0755 "${module%/*}"
+    export ZEROFS_RUSTC=$rustc
+    export ZEROFS_RUSTFMT=$rustfmt
+    export ZEROFS_BINDGEN=$bindgen
+    export ZEROFS_TARGET_CC=$target_cc
+    if [[ -n "$kernel_source" ]]; then
+        [[ -n "$kernel_source_package_version" &&
+           -n "$kernel_headers_package_version" ]] ||
+            die "exact kernel source/header package provenance is missing"
+        export ZEROFS_KERNEL_SOURCE=$kernel_source
+        export ZEROFS_KERNEL_SOURCE_PACKAGE_VERSION=$kernel_source_package_version
+        export ZEROFS_KERNEL_HEADERS_PACKAGE_VERSION=$kernel_headers_package_version
+    fi
+    if [[ -n "$clang" ]]; then
+        export ZEROFS_CLANG=$clang
+        export ZEROFS_LLVM_LINK=$llvm_link
+        export ZEROFS_LLVM_OPT=$llvm_opt
+        export ZEROFS_LLVM_NM=$llvm_nm
+    fi
 
-    make -C "$staged_kernel" \
-        KDIR="$kdir" \
-        CC="$target_cc" \
-        RUSTC="$rustc" \
-        RUSTFMT="$rustfmt" \
-        BINDGEN="$bindgen" \
+    case $distro in
+        ubuntu | debian)
+            package_version=$(dpkg-deb --field "$source_package" Version)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                --no-install-recommends "$source_package"
+            ;;
+        fedora)
+            package_version=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' \
+                "$source_package")
+            dnf install -y "$source_package"
+            ;;
+        opensuse)
+            package_version=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' \
+                "$source_package")
+            zypper --non-interactive install --allow-unsigned-rpm \
+                "$source_package"
+            ;;
+        *)
+            die "unsupported package target: $distro"
+            ;;
+    esac
+    [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$ ]] ||
+        die "source-DKMS package has an unsafe version: $package_version"
+    installed_source="/usr/src/zerofs-$package_version/kernel"
+    [[ -d "$installed_source" && ! -L "$installed_source" ]] ||
+        die "installed source-DKMS package has no regular kernel source tree"
+    make -C "$installed_source" \
+        "KDIR=$kdir" \
+        "RUSTC=$rustc" \
         test
 
-    if [[ -s "$kdir/rust/libkernel.rmeta" ]]; then
-        build_kind=kernel-rust
-    elif grep -qx 'CONFIG_RUST=y' "$auto_conf"; then
-        build_rust_metadata
-        build_kind=kernel-rust-generated-metadata
-    else
-        [[ -n "$kernel_source" ]] ||
-            die "CONFIG_RUST is disabled and no exact kernel source is available"
-        build_kind=self-contained
-    fi
-
-    if [[ "$build_kind" == self-contained ]]; then
-        select_llvm_tools
-        llvm_args=(
-            "CLANG=$clang"
-            "LLVM_LINK=$llvm_link"
-            "LLVM_OPT=$llvm_opt"
-            "LLVM_NM=$llvm_nm"
-        )
-        ZEROFS_KERNEL_SOURCE_PROVENANCE="$source_identity" \
-            make -C "$staged_kernel" \
-                KDIR="$kdir" \
-                KERNEL_SRC="$kernel_source" \
-                MO="$module_output" \
-                CC="$target_cc" \
-                TARGET_CC="$target_cc" \
-                RUSTC="$rustc" \
-                RUSTFMT="$rustfmt" \
-                BINDGEN="$bindgen" \
-                "${llvm_args[@]}" \
-                self-contained
-    else
-        make -j "$jobs" -C "$staged_kernel" \
-            KDIR="$kdir" \
-            MO="$module_output" \
-            CC="$target_cc" \
-            RUSTC="$rustc" \
-            RUSTFMT="$rustfmt" \
-            BINDGEN="$bindgen"
-    fi
-    module="$module_output/zerofs.ko"
-    [[ -s "$module" ]] ||
-        die "ZeroFS module build did not produce $module"
+    installed_module=$(modinfo -k "$kernel_release" -n zerofs) ||
+        die "DKMS did not install zerofs for $kernel_release"
+    case $installed_module in
+        "/lib/modules/$kernel_release/"*) ;;
+        *) die "DKMS returned an unsafe module path: $installed_module" ;;
+    esac
+    [[ -f "$installed_module" && ! -L "$installed_module" ]] ||
+        die "DKMS module is not a regular file: $installed_module"
+    copy_uncompressed_module "$installed_module" "$module"
+    [[ -s "$module" && ! -L "$module" ]] ||
+        die "DKMS installed module could not be copied"
     [[ "$(modinfo -F name "$module")" == zerofs ]] ||
-        die "built module name is not zerofs"
+        die "DKMS built a module with the wrong name"
     case $(modinfo -F vermagic "$module") in
         "$kernel_release" | "$kernel_release "*) ;;
-        *) die "built module vermagic does not match $kernel_release" ;;
+        *) die "DKMS module vermagic does not match $kernel_release" ;;
     esac
 }
 
@@ -1117,14 +1010,7 @@ copy_module_plan() {
             printf -v dependency_output \
                 '%s/%04d.ko' \
                 "$output_directory" "$dependency_index"
-            case $path in
-                *.ko) install -m 0644 "$path" "$dependency_output" ;;
-                *.ko.gz) gzip -dc -- "$path" >"$dependency_output" ;;
-                *.ko.xz) xz -dc -- "$path" >"$dependency_output" ;;
-                *.ko.zst) zstd -dc -- "$path" >"$dependency_output" ;;
-                *) die "unsupported module compression: $path" ;;
-            esac
-            chmod 0644 "$dependency_output"
+            copy_uncompressed_module "$path" "$dependency_output"
             case $(modinfo -F vermagic "$dependency_output") in
                 "$kernel_release" | "$kernel_release "*) ;;
                 *)
@@ -1146,15 +1032,6 @@ copy_boot_modules() {
     esac
     copy_module_plan "$output_root/boot-modules" "" \
         "$transport" virtio_net
-}
-
-copy_module_dependencies() {
-    local external_module="/lib/modules/$kernel_release/updates/zerofs/zerofs.ko"
-
-    install -d -m 0755 "$(dirname -- "$external_module")"
-    install -m 0644 "$module" "$external_module"
-    depmod -a "$kernel_release"
-    copy_module_plan "$output_root/module-dependencies" zerofs zerofs
 }
 
 arm64_image_is_raw() {
@@ -1254,7 +1131,6 @@ normalize_arm64_kernel_image() {
 }
 
 publish_build_outputs() {
-    local auto_conf="$kdir/include/config/auto.conf"
     local kernel_image
     local published_kernel_image="$output_root/vmlinuz"
     local candidate
@@ -1274,38 +1150,11 @@ publish_build_outputs() {
     [[ -n "$kernel_image" ]] ||
         die "target kernel image is missing for $kernel_release"
 
-    mkdir -p "$output_root/module"
-    install -m 0644 "$module" "$output_root/module/zerofs.ko"
     if [[ "$target_arch" == aarch64 ]]; then
         normalize_arm64_kernel_image "$kernel_image" "$published_kernel_image"
     else
         install -m 0644 "$kernel_image" "$published_kernel_image"
     fi
-    install -m 0644 "$kdir/.config" "$output_root/kernel.config"
-    install -m 0644 "$kdir/Module.symvers" "$output_root/Module.symvers"
-
-    {
-        printf 'target_id=%s\n' "$target_id"
-        printf 'source_identity=%s\n' "$source_identity"
-        printf 'builder_os=%s\n' \
-            "$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '\"')"
-        printf 'build_kind=%s\n' "$build_kind"
-        printf 'rustc=%s\n' "$("$rustc" --version)"
-        printf 'rustfmt=%s\n' "$("$rustfmt" --version)"
-        printf 'rustfmt_source=%s\n' "$rustfmt_source"
-        printf 'bindgen=%s\n' "$("$bindgen" --version)"
-        if [[ -n "$clang" ]]; then
-            printf 'clang=%s\n' "$("$clang" --version | sed -n '1p')"
-        else
-            printf 'clang=not-used\n'
-        fi
-        printf 'target_cc=%s\n' "$target_cc"
-        printf 'target_cc_exact=%s\n' "$target_cc_exact"
-        printf 'target_cc_version=%s\n' "$target_cc_version"
-        printf 'target_cc_config=%s\n' "$target_cc_text"
-        printf 'target_ld=%s\n' "$(config_value "$auto_conf" CONFIG_LD_VERSION)"
-    } >"$output_root/build-info"
-    chmod 0644 "$output_root/build-info"
 }
 
 [[ $# -eq 7 ]] || {
@@ -1319,60 +1168,62 @@ kernel_release=$3
 kernel_package_version=$4
 source_identity=$5
 snapshot=$6
-zerofs_version=$7
-target_id=${ZEROFS_KERNEL_TARGET_ID:-unknown}
-target_arch=${ZEROFS_TARGET_ARCH:-}
+apt_suite=$7
 source_artifacts_json=${ZEROFS_SOURCE_ARTIFACTS:-'{}'}
 
-case $target_arch in
-    x86_64 | aarch64) ;;
-    *) die "unsupported or missing target architecture: ${target_arch:-unset}" ;;
+case $distro in
+    ubuntu | debian)
+        [[ "$apt_suite" =~ ^[a-z0-9][a-z0-9._+-]*$ ]] ||
+            die "invalid APT suite: ${apt_suite:-unset}"
+        source_package=/zerofs-source-package.deb
+        ;;
+    fedora | opensuse)
+        [[ -z "$apt_suite" ]] ||
+            die "$distro target must not provide an APT suite"
+        source_package=/zerofs-source-package.rpm
+        ;;
+    *) die "unsupported build distribution: $distro" ;;
 esac
-case $(uname -m) in
+
+container_machine=$(uname -m)
+case $container_machine in
     x86_64)
-        builder_arch=x86_64
+        target_arch=x86_64
         ;;
     aarch64 | arm64)
-        builder_arch=aarch64
+        target_arch=aarch64
         ;;
     *)
-        die "unsupported builder architecture: $(uname -m)"
+        die "unsupported builder architecture: $container_machine"
         ;;
 esac
-[[ "$builder_arch" == "$target_arch" ]] ||
-    die "builder architecture $builder_arch does not match target $target_arch"
+[[ -f "$source_package" && ! -L "$source_package" ]] ||
+    die "source-DKMS package is not a regular file: $source_package"
 
-[[ -f "$tooling_root/packaging/kernel/build-module-container.sh" ]] ||
-    die "packaging tooling is not mounted at $tooling_root"
-[[ -f "$source_root/zerofs/Cargo.toml" ]] ||
-    die "ZeroFS source is not mounted at $source_root"
-[[ -x "$source_root/kernel/stage-module-source.sh" ]] ||
-    die "ZeroFS source has no executable kernel/stage-module-source.sh"
 [[ -d "$output_root" ]] ||
     die "output directory is not mounted at $output_root"
-directory_is_empty "$output_root" ||
+[[ -z $(find -P "$output_root" -mindepth 1 -print -quit) ]] ||
     die "output directory is not empty"
+output_owner=$(stat -c '%u:%g' "$output_root") ||
+    die "cannot read output directory ownership"
+[[ "$output_owner" =~ ^[0-9]+:[0-9]+$ ]] ||
+    die "output directory has invalid ownership"
+trap restore_output_ownership EXIT
 mkdir -p "$work_root"
 
-jobs=$(nproc)
-((jobs > 0)) || jobs=1
 kdir=
 kernel_source=
+kernel_source_package_version=
+kernel_headers_package_version=
 rustc=
 bindgen=
 rustfmt=
-rustfmt_package=
-rustfmt_source=
 clang=
 llvm_link=
 llvm_opt=
 llvm_nm=
 target_cc=
-target_cc_exact=false
-target_cc_text=
-target_cc_version=
 module=
-build_kind=
 
 case $distro in
     ubuntu) configure_ubuntu ;;
@@ -1382,16 +1233,11 @@ case $distro in
     *) die "unsupported build distribution: $distro" ;;
 esac
 
-require_command depmod
 require_command make
 require_command modinfo
 require_command modprobe
-require_command realpath
-require_command sha256sum
 
-build_zerofs_module
-copy_module_dependencies
+build_source_package_module
+copy_module_plan "$output_root/module-dependencies" zerofs zerofs
 copy_boot_modules
 publish_build_outputs
-
-echo "built $target_id for $kernel_release using $build_kind"

@@ -10,95 +10,97 @@ from pathlib import Path
 REPOSITORY = Path(__file__).resolve().parents[3]
 CONTROLLER = REPOSITORY / "packaging/kernel/kernel-targets.py"
 DIGEST = "0" * 64
+sys.path.insert(0, str(REPOSITORY / "packaging/kernel"))
+
+from kernel_targets.catalog import validate_catalog
 
 
-def channel(
-    channel_id="ubuntu-stable-generic-x86-64",
+def apt_lock(
     *,
-    arch="x86_64",
-):
-    return {
-        "id": channel_id,
-        "distro": "ubuntu",
-        "release": "stable",
-        "family": "deb",
-        "arch": arch,
-        "flavor": "generic",
-        "apt": {
-            "codename": "stable",
-            "suite": "stable",
-            "component": "main",
-        },
-        "discovery": {
-            "kind": "ubuntu-snapshot",
-            "builder_image": f"ubuntu:test@sha256:{DIGEST}",
-            "selector": "linux-image-generic",
-            "suite": "stable",
-        },
-    }
-
-
-def target(
-    target_id="ubuntu-kernel-r1",
-    *,
-    channel_id="ubuntu-stable-generic-x86-64",
-    revision=1,
     kernel_release="7.0.1-generic",
     package_version="7.0.1-1",
-    selector_version=None,
-    publish=False,
+    source_version=None,
+    snapshot="20260729T000000Z",
 ):
     return {
-        "id": target_id,
-        "enabled": True,
-        "ci": True,
-        "publish": publish,
-        "channel_id": channel_id,
-        "package_revision": str(revision),
-        "kernel_release": kernel_release,
-        "kernel_package_name": f"linux-image-{kernel_release}",
-        "kernel_package_version": package_version,
-        "kernel_selector_version": selector_version or package_version,
-        "builder_image": f"ubuntu:test@sha256:{DIGEST}",
-        "source": {
-            "kind": "apt-snapshot",
-            "identity": f"ubuntu:linux@{package_version}",
-            "snapshot": "20260729T000000Z",
+        "kernel": kernel_release,
+        "version": package_version,
+        "source_version": source_version or package_version,
+        "snapshot": snapshot,
+    }
+
+
+def manifest(
+    *,
+    x86_locks=None,
+    arm_locks=None,
+):
+    architectures = {
+        "x86_64": [apt_lock()] if x86_locks is None else x86_locks
+    }
+    if arm_locks is not None:
+        architectures["aarch64"] = arm_locks
+    return {
+        "schema_version": 3,
+        "streams": {
+            "ubuntu-stable-generic": {
+                "provider": "ubuntu",
+                "release": "stable",
+                "builder": f"ubuntu:test@sha256:{DIGEST}",
+                "suite": "stable",
+                "selector": "linux-image-generic",
+                "architectures": architectures,
+            }
         },
     }
 
 
-def manifest(channels=None, targets=None):
-    return {
-        "schema_version": 1,
-        "channels": channels or [channel()],
-        "targets": targets or [target()],
-        "unsupported_targets": [],
+def normalized_targets(document):
+    return validate_catalog(document, "test lock").targets
+
+
+def normalized_target(document, channel_id="ubuntu-stable-generic-x86-64"):
+    return [
+        item
+        for item in normalized_targets(document)
+        if item["channel_id"] == channel_id
+    ][-1]
+
+
+def fedora_artifacts(kernel_nvr, rust_nvr, arch="x86_64"):
+    filenames = {
+        f"kernel-{kernel_nvr}.src.rpm",
+        f"rust-src-{rust_nvr}.noarch.rpm",
+        *(
+            f"{name}-{kernel_nvr}.{arch}.rpm"
+            for name in ("kernel-core", "kernel-devel", "kernel-modules-core")
+        ),
+        *(
+            f"{name}-{rust_nvr}.{arch}.rpm"
+            for name in ("cargo", "rust", "rust-std-static", "rustfmt")
+        ),
     }
+    return {filename: DIGEST for filename in filenames}
 
 
-def candidate(
-    *,
+def candidate_for(
+    document,
     channel_id="ubuntu-stable-generic-x86-64",
-    base_target_id="ubuntu-kernel-r1",
-    kernel_release="7.0.1-generic",
-    package_version="7.0.1-1",
-    selector_version=None,
+    *,
+    kernel_release=None,
+    package_version=None,
     snapshot="20260730T000000Z",
 ):
+    current = normalized_target(document, channel_id)
+    kernel_release = kernel_release or current["kernel_release"]
+    package_version = package_version or current["kernel_package_version"]
     return {
-        "schema_version": 1,
-        "channel_id": channel_id,
-        "base_target_id": base_target_id,
-        "kernel_release": kernel_release,
-        "kernel_package_name": f"linux-image-{kernel_release}",
-        "kernel_package_version": package_version,
-        "kernel_selector_version": selector_version or package_version,
-        "source": {
-            "kind": "apt-snapshot",
-            "identity": f"ubuntu:linux@{package_version}",
-            "snapshot": snapshot,
-        },
+        "base_target_id": current["id"],
+        "lock": apt_lock(
+            kernel_release=kernel_release,
+            package_version=package_version,
+            snapshot=snapshot,
+        ),
     }
 
 
@@ -115,13 +117,18 @@ class KernelTargetsTest(unittest.TestCase):
         path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
         return path
 
-    def run_controller(self, manifest_path, *arguments, succeeds=True):
+    def run_controller(self, document, *arguments, succeeds=True):
+        path = (
+            document
+            if isinstance(document, Path)
+            else self.write_json("lock.json", document)
+        )
         result = subprocess.run(
             [
                 sys.executable,
                 str(CONTROLLER),
                 "--manifest",
-                str(manifest_path),
+                str(path),
                 *map(str, arguments),
             ],
             cwd=REPOSITORY,
@@ -136,636 +143,447 @@ class KernelTargetsTest(unittest.TestCase):
             self.fail("controller unexpectedly succeeded")
         return result
 
-    def apply(self, document, *candidates):
-        manifest_path = self.write_json("targets.json", document)
-        candidate_paths = [
-            self.write_json(f"candidate-{index}.json", value)
-            for index, value in enumerate(candidates)
-        ]
-        self.run_controller(manifest_path, "apply", *candidate_paths)
-        return (
-            json.loads(manifest_path.read_text(encoding="utf-8")),
-            manifest_path.read_text(encoding="utf-8"),
-        )
+    def reconcile(
+        self,
+        document,
+        *candidates,
+        pending_base=None,
+        pending_head=None,
+        succeeds=True,
+    ):
+        path = self.write_json("reconciled.lock.json", document)
+        arguments = ["reconcile"]
+        if pending_base is not None:
+            arguments.extend(
+                [
+                    "--pending-base",
+                    self.write_json("pending-base.lock.json", pending_base),
+                    "--pending-head",
+                    self.write_json("pending-head.lock.json", pending_head),
+                ]
+            )
+        for index, value in enumerate(candidates):
+            arguments.append(self.write_json(f"candidate-{index}.json", value))
+        result = self.run_controller(path, *arguments, succeeds=succeeds)
+        if not succeeds:
+            return result
+        return json.loads(path.read_text(encoding="utf-8"))
 
-    def test_apply_promotes_current_without_snapshot_churn(self):
+    def two_arch_manifest(self):
+        return manifest(arm_locks=[apt_lock()])
+
+    def test_reconcile_noop_preserves_lock_exactly(self):
         document = manifest()
-        original = copy.deepcopy(document["targets"][0])
+        updated = self.reconcile(document, candidate_for(document))
+        self.assertEqual(updated, document)
 
-        updated, _ = self.apply(document, candidate())
-
-        self.assertEqual(len(updated["targets"]), 1)
-        promoted = updated["targets"][0]
-        self.assertTrue(promoted["enabled"])
-        self.assertTrue(promoted["ci"])
-        self.assertTrue(promoted["publish"])
-        self.assertEqual(promoted["source"], original["source"])
-        self.assertNotIn("family", promoted)
-        self.assertNotIn("kernel_dependency", promoted)
-
-    def test_apply_is_idempotent_for_published_target(self):
-        document = manifest(targets=[target(publish=True)])
-
-        _, first = self.apply(document, candidate())
-        _, second = self.apply(json.loads(first), candidate())
-
-        self.assertEqual(first, second)
-
-    def test_apply_appends_same_uname_package_rebuild(self):
-        updated, _ = self.apply(
-            manifest(),
-            candidate(package_version="7.0.1-2"),
-        )
-
-        old, new = updated["targets"]
-        self.assertTrue(old["enabled"])
-        self.assertFalse(old["ci"])
-        self.assertFalse(old["publish"])
-        self.assertEqual(
-            new["id"],
-            "ubuntu-stable-generic-x86-64-7.0.1-generic-r2",
-        )
-        self.assertEqual(new["package_revision"], "2")
-        self.assertEqual(new["kernel_release"], old["kernel_release"])
-        self.assertEqual(new["kernel_package_version"], "7.0.1-2")
-        self.assertEqual(
-            new["builder_image"],
-            updated["channels"][0]["discovery"]["builder_image"],
-        )
-        self.assertTrue(new["publish"])
-
-    def test_apply_persists_selector_only_update(self):
-        updated, _ = self.apply(
-            manifest(),
-            candidate(selector_version="7.0.1-2"),
-        )
-
-        self.assertEqual(len(updated["targets"]), 2)
-        self.assertEqual(
-            updated["targets"][-1]["kernel_selector_version"],
-            "7.0.1-2",
-        )
-        self.assertEqual(
-            updated["targets"][-1]["kernel_package_version"],
-            "7.0.1-1",
-        )
-
-    def test_apply_appends_when_builder_image_changes(self):
+    def test_field_exposes_validated_apt_suite(self):
         document = manifest()
-        builder_image = f"ubuntu:new@sha256:{'1' * 64}"
-        document["channels"][0]["discovery"]["builder_image"] = builder_image
+        target = normalized_target(document)
 
-        updated, _ = self.apply(document, candidate())
+        result = self.run_controller(document, "field", target["id"], "suite")
 
-        old, new = updated["targets"]
-        self.assertFalse(old["ci"])
-        self.assertFalse(old["publish"])
-        self.assertEqual(new["package_revision"], "2")
-        self.assertEqual(
-            new["kernel_package_version"],
-            old["kernel_package_version"],
-        )
-        self.assertEqual(new["builder_image"], builder_image)
-        self.assertTrue(new["publish"])
+        self.assertEqual(result.stdout, "stable\n")
 
-    def test_runtime_matrix_rejects_builder_image_drift(self):
+    def test_builder_image_is_resolved_by_provider_and_release(self):
         document = manifest()
-        builder_image = f"ubuntu:new@sha256:{'1' * 64}"
-        document["channels"][0]["discovery"]["builder_image"] = builder_image
-        path = self.write_json("builder-image-drift.json", document)
+        stream = document["streams"].pop("ubuntu-stable-generic")
+        document["streams"]["renamed-stream"] = stream
 
         result = self.run_controller(
-            path,
-            "matrix",
-            "--scope",
-            "ci",
+            document,
+            "builder-image",
+            "ubuntu",
+            "stable",
+        )
+
+        self.assertEqual(
+            result.stdout,
+            f"ubuntu:test@sha256:{DIGEST}\n",
+        )
+
+    def test_builder_image_rejects_an_unknown_provider_release(self):
+        result = self.run_controller(
+            manifest(),
+            "builder-image",
+            "fedora",
+            "stable",
             succeeds=False,
         )
 
-        self.assertIn("newest target 'ubuntu-kernel-r1'", result.stderr)
-        self.assertIn("apply a candidate", result.stderr)
+        self.assertIn("no builder image matches", result.stderr)
 
-        discovery = self.run_controller(
-            path,
-            "matrix",
-            "--scope",
-            "discover",
-        )
-        entry = json.loads(discovery.stdout)["include"][0]
-        self.assertEqual(entry["id"], "ubuntu-stable-generic-x86-64")
+    def test_builder_image_rejects_ambiguous_images(self):
+        document = manifest()
+        second = copy.deepcopy(document["streams"]["ubuntu-stable-generic"])
+        second["builder"] = f"ubuntu:other@sha256:{'1' * 64}"
+        document["streams"]["ubuntu-stable-hwe"] = second
 
-    def test_apply_orders_channels_independently_of_arguments(self):
-        second_channel = channel(
-            "ubuntu-stable-generic-aarch64",
-            arch="aarch64",
-        )
-        second_target = target(
-            "ubuntu-arm-kernel-r1",
-            channel_id=second_channel["id"],
-        )
-        document = manifest(
-            channels=[second_channel, channel()],
-            targets=[second_target, target()],
-        )
-        first_candidate = candidate(package_version="7.0.2-1")
-        second_candidate = candidate(
-            channel_id=second_channel["id"],
-            base_target_id=second_target["id"],
-            package_version="7.0.2-1",
-        )
-
-        _, forward = self.apply(
-            copy.deepcopy(document),
-            first_candidate,
-            second_candidate,
-        )
-        _, reverse = self.apply(
-            copy.deepcopy(document),
-            second_candidate,
-            first_candidate,
-        )
-
-        self.assertEqual(forward, reverse)
-        appended = [
-            item["channel_id"] for item in json.loads(forward)["targets"][2:]
-        ]
-        self.assertEqual(appended, sorted(appended))
-
-    def test_apply_rejects_stale_and_duplicate_candidates(self):
-        path = self.write_json("targets.json", manifest())
-        stale = candidate(base_target_id="old-target")
-        stale_path = self.write_json("stale.json", stale)
         result = self.run_controller(
-            path,
-            "apply",
-            stale_path,
+            document,
+            "builder-image",
+            "ubuntu",
+            "stable",
             succeeds=False,
         )
+
+        self.assertIn("multiple builder images match", result.stderr)
+
+    def test_reconcile_same_uname_package_rebuild_replaces_lock(self):
+        document = manifest()
+        old_id = normalized_target(document)["id"]
+        updated = self.reconcile(
+            document,
+            candidate_for(document, package_version="7.0.1-2"),
+        )
+        lock = updated["streams"]["ubuntu-stable-generic"]["architectures"][
+            "x86_64"
+        ][0]
+        self.assertEqual(lock["version"], "7.0.1-2")
+        self.assertNotEqual(normalized_target(updated)["id"], old_id)
+
+    def test_reconcile_accepts_distinct_apt_source_version(self):
+        document = manifest()
+        update = candidate_for(document, package_version="7.0.1-2+b1")
+        update["lock"]["source_version"] = "7.0.1-2"
+
+        updated = self.reconcile(document, update)
+
+        lock = updated["streams"]["ubuntu-stable-generic"]["architectures"][
+            "x86_64"
+        ][0]
+        self.assertEqual(lock["version"], "7.0.1-2+b1")
+        self.assertEqual(lock["source_version"], "7.0.1-2")
+
+    def test_reconcile_accepts_ubuntu_source_name_from_candidate(self):
+        document = manifest()
+        update = candidate_for(document, package_version="7.0.1-2")
+        update["lock"]["source_name"] = "linux-oem-7.0"
+
+        updated = self.reconcile(document, update)
+
+        lock = updated["streams"]["ubuntu-stable-generic"]["architectures"][
+            "x86_64"
+        ][0]
+        self.assertEqual(lock["source_name"], "linux-oem-7.0")
+
+    def test_reconcile_retains_two_distinct_kernels_and_prunes_oldest(self):
+        first = apt_lock(
+            kernel_release="7.0.1-generic", package_version="7.0.1-1"
+        )
+        second = apt_lock(
+            kernel_release="7.0.2-generic", package_version="7.0.2-1"
+        )
+        document = manifest(x86_locks=[first, second])
+        updated = self.reconcile(
+            document,
+            candidate_for(
+                document,
+                kernel_release="7.0.3-generic",
+                package_version="7.0.3-1",
+            ),
+        )
+        self.assertEqual(
+            [
+                item["kernel"]
+                for item in updated["streams"]["ubuntu-stable-generic"][
+                    "architectures"
+                ]["x86_64"]
+            ],
+            ["7.0.2-generic", "7.0.3-generic"],
+        )
+
+    def test_reconcile_rejects_rebuild_of_non_latest_retained_kernel(self):
+        first = apt_lock(
+            kernel_release="7.0.1-generic", package_version="7.0.1-1"
+        )
+        second = apt_lock(
+            kernel_release="7.0.2-generic", package_version="7.0.2-1"
+        )
+        document = manifest(x86_locks=[first, second])
+        result = self.reconcile(
+            document,
+            candidate_for(
+                document,
+                kernel_release="7.0.1-generic",
+                package_version="7.0.1-2",
+            ),
+            succeeds=False,
+        )
+        self.assertIn("cannot replace non-latest retained kernel", result.stderr)
+
+        pending = copy.deepcopy(document)
+        locks = pending["streams"]["ubuntu-stable-generic"]["architectures"][
+            "x86_64"
+        ]
+        locks[:] = [
+            apt_lock(
+                kernel_release="7.0.1-generic",
+                package_version="7.0.1-2",
+            ),
+            copy.deepcopy(second),
+        ]
+        result = self.reconcile(
+            copy.deepcopy(document),
+            pending_base=document,
+            pending_head=pending,
+            succeeds=False,
+        )
+        self.assertIn("cannot replace non-latest retained kernel", result.stderr)
+
+    def test_reconcile_rejects_stale_and_duplicate_candidates(self):
+        document = manifest()
+        stale = candidate_for(document)
+        stale["base_target_id"] = "stale-target"
+        result = self.reconcile(document, stale, succeeds=False)
         self.assertIn("stale candidate", result.stderr)
 
-        current_path = self.write_json("current.json", candidate())
-        result = self.run_controller(
-            path,
-            "apply",
-            current_path,
-            current_path,
-            succeeds=False,
-        )
+        fresh = candidate_for(document)
+        result = self.reconcile(document, fresh, fresh, succeeds=False)
         self.assertIn("multiple candidates", result.stderr)
 
-    def test_apply_rejects_retired_package(self):
-        old = target(
-            "ubuntu-kernel-r1",
-            revision=1,
-            package_version="7.0.1-1",
+    def test_reconcile_two_architectures_is_order_independent(self):
+        document = self.two_arch_manifest()
+        arm_id = "ubuntu-stable-generic-aarch64"
+        x86 = candidate_for(document, package_version="7.0.1-2")
+        arm = candidate_for(document, arm_id, package_version="7.0.1-2")
+        forward = self.reconcile(copy.deepcopy(document), x86, arm)
+        reverse = self.reconcile(copy.deepcopy(document), arm, x86)
+        self.assertEqual(forward, reverse)
+
+    def test_reconcile_carries_failed_channel_from_pending_pr(self):
+        base = self.two_arch_manifest()
+        arm_id = "ubuntu-stable-generic-aarch64"
+        pending = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, arm_id, package_version="7.0.1-2"),
         )
-        current = target(
-            "ubuntu-kernel-r2",
-            revision=2,
-            package_version="7.0.2-1",
+        updated = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, package_version="7.0.1-3"),
+            pending_base=base,
+            pending_head=pending,
         )
-        old["ci"] = False
-        document = manifest(targets=[old, current])
-        rollback = candidate(
-            base_target_id=current["id"],
-            package_version=old["kernel_package_version"],
-        )
-
-        path = self.write_json("targets.json", document)
-        candidate_path = self.write_json("rollback.json", rollback)
-        result = self.run_controller(
-            path,
-            "apply",
-            candidate_path,
-            succeeds=False,
-        )
-
-        self.assertIn("matches retired target", result.stderr)
-
-    def test_apply_rejects_malformed_candidate(self):
-        malformed = candidate()
-        malformed["builder_image"] = f"ubuntu:test@sha256:{DIGEST}"
-        path = self.write_json("targets.json", manifest())
-        candidate_path = self.write_json("candidate.json", malformed)
-
-        result = self.run_controller(
-            path,
-            "apply",
-            candidate_path,
-            succeeds=False,
-        )
-
-        self.assertIn("expected fields", result.stderr)
-
-    def test_apply_enforces_apt_package_name(self):
-        malformed = candidate()
-        malformed["kernel_package_name"] = "linux-image-other"
-        path = self.write_json("targets.json", manifest())
-        candidate_path = self.write_json("candidate.json", malformed)
-
-        result = self.run_controller(
-            path,
-            "apply",
-            candidate_path,
-            succeeds=False,
-        )
-
-        self.assertIn("kernel_package_name: expected", result.stderr)
-
-    def test_fedora_candidate_must_use_signed_koji_source(self):
-        fingerprint = "a" * 40
-        builder_image = f"fedora:44@sha256:{DIGEST}"
-        channel_id = "fedora-44-kernel-core-x86-64"
-        kernel_nvr = "7.1.5-200.fc44"
-        rust_nvr = "1.97.1-1.fc44"
-        artifacts = {
-            f"kernel-{kernel_nvr}.src.rpm": DIGEST,
-            f"rust-src-{rust_nvr}.noarch.rpm": DIGEST,
+        versions = {
+            item["channel_id"]: item["kernel_package_version"]
+            for item in normalized_targets(updated)
         }
-        artifacts.update(
-            {
-                f"{name}-{kernel_nvr}.x86_64.rpm": DIGEST
-                for name in (
-                    "kernel-core",
-                    "kernel-devel",
-                    "kernel-modules-core",
-                )
-            }
-        )
-        artifacts.update(
-            {
-                f"{name}-{rust_nvr}.x86_64.rpm": DIGEST
-                for name in (
-                    "cargo",
-                    "rust",
-                    "rust-std-static",
-                    "rustfmt",
-                )
-            }
-        )
-        fedora_channel = {
-            "id": channel_id,
-            "distro": "fedora",
-            "release": "44",
-            "family": "rpm",
-            "arch": "x86_64",
-            "flavor": "kernel-core",
-            "rpm": {"repo_id": "zerofs-fedora-44"},
-            "discovery": {
-                "kind": "fedora-koji",
-                "builder_image": builder_image,
-                "selector": "kernel-core",
-                "signing_fingerprint": fingerprint,
-            },
-        }
-        fedora_target = {
-            "id": "fedora-kernel-r1",
-            "enabled": True,
-            "ci": True,
-            "publish": False,
-            "channel_id": channel_id,
-            "package_revision": "1",
-            "kernel_release": f"{kernel_nvr}.x86_64",
-            "kernel_package_name": "kernel-core-uname-r",
-            "kernel_package_version": f"{kernel_nvr}.x86_64",
-            "kernel_selector_version": kernel_nvr,
-            "builder_image": builder_image,
-            "source": {
-                "kind": "koji",
-                "identity": f"kernel-{kernel_nvr}",
-                "snapshot": "koji-download-build:x86_64,noarch,src",
-                "artifacts": artifacts,
-            },
-        }
-        base = manifest(
-            channels=[fedora_channel],
-            targets=[fedora_target],
-        )
-        wrong_selector = copy.deepcopy(base)
-        wrong_selector["targets"][0]["kernel_selector_version"] = "1"
-        wrong_selector_path = self.write_json(
-            "wrong-fedora-selector.json",
-            wrong_selector,
-        )
-        result = self.run_controller(
-            wrong_selector_path,
-            "matrix",
-            "--scope",
-            "ci",
-            succeeds=False,
-        )
-        self.assertIn("expected Fedora kernel NVR", result.stderr)
+        self.assertEqual(versions["ubuntu-stable-generic-x86-64"], "7.0.1-3")
+        self.assertEqual(versions[arm_id], "7.0.1-2")
 
-        signed = {
-            "schema_version": 1,
-            "channel_id": channel_id,
-            "base_target_id": fedora_target["id"],
-            "kernel_release": fedora_target["kernel_release"],
-            "kernel_package_name": fedora_target["kernel_package_name"],
-            "kernel_package_version": fedora_target[
-                "kernel_package_version"
-            ],
-            "kernel_selector_version": fedora_target[
-                "kernel_selector_version"
-            ],
-            "source": copy.deepcopy(fedora_target["source"]),
-        }
-        path = self.write_json("targets.json", base)
-        unsigned_path = self.write_json("unsigned.json", signed)
-        result = self.run_controller(
-            path,
-            "apply",
-            unsigned_path,
-            succeeds=False,
+    def test_reconcile_keeps_pending_pr_when_all_discovery_fails(self):
+        base = self.two_arch_manifest()
+        arm_id = "ubuntu-stable-generic-aarch64"
+        pending = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, arm_id, package_version="7.0.1-2"),
         )
-        self.assertIn("source.snapshot: expected", result.stderr)
-
-        signed["source"]["snapshot"] = (
-            f"koji-signed-build:{fingerprint}:x86_64,noarch,src"
-        )
-        signed_base = copy.deepcopy(base)
-        signed_base["targets"][0]["source"] = copy.deepcopy(signed["source"])
-        changed_hash = copy.deepcopy(signed)
-        artifact = next(iter(changed_hash["source"]["artifacts"]))
-        changed_hash["source"]["artifacts"][artifact] = "1" * 64
-        manifest_path = self.write_json("signed-base.json", signed_base)
-        candidate_path = self.write_json("changed-hash.json", changed_hash)
-        result = self.run_controller(
-            manifest_path,
-            "apply",
-            candidate_path,
-            succeeds=False,
-        )
-        self.assertIn("artifact hashes changed", result.stderr)
-
-        updated, _ = self.apply(copy.deepcopy(base), signed)
-        self.assertEqual(len(updated["targets"]), 2)
         self.assertEqual(
-            updated["targets"][-1]["source"]["snapshot"],
-            signed["source"]["snapshot"],
+            self.reconcile(
+                copy.deepcopy(base),
+                pending_base=base,
+                pending_head=pending,
+            ),
+            pending,
         )
 
-    def test_opensuse_upgrade_gate_uses_kernel_default_version(self):
-        channel_id = "opensuse-tumbleweed-default-x86-64"
-        builder_image = "opensuse/tumbleweed:latest"
-        packages = [
-            "kernel-default",
-            "kernel-default-devel",
-            "kernel-devel",
-            "kernel-source",
-            "kernel-syms",
+    def test_reconcile_keeps_pending_pr_after_noop_discovery(self):
+        base = manifest()
+        pending = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, package_version="7.0.1-2"),
+        )
+
+        self.assertEqual(
+            self.reconcile(
+                copy.deepcopy(base),
+                candidate_for(base),
+                pending_base=base,
+                pending_head=pending,
+            ),
+            pending,
+        )
+
+    def test_reconcile_default_branch_wins_without_blocking_other_channels(self):
+        base = self.two_arch_manifest()
+        arm_id = "ubuntu-stable-generic-aarch64"
+        pending = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, package_version="7.0.1-2"),
+        )
+        current = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, package_version="7.0.1-3"),
+        )
+        updated = self.reconcile(
+            current,
+            candidate_for(current, arm_id, package_version="7.0.1-4"),
+            pending_base=base,
+            pending_head=pending,
+        )
+        versions = {
+            item["channel_id"]: item["kernel_package_version"]
+            for item in normalized_targets(updated)
+        }
+        self.assertEqual(versions["ubuntu-stable-generic-x86-64"], "7.0.1-3")
+        self.assertEqual(versions[arm_id], "7.0.1-4")
+
+    def test_reconcile_discards_pending_removed_channel(self):
+        base = self.two_arch_manifest()
+        arm_id = "ubuntu-stable-generic-aarch64"
+        pending = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, arm_id, package_version="7.0.1-2"),
+        )
+        current = copy.deepcopy(base)
+        del current["streams"]["ubuntu-stable-generic"]["architectures"][
+            "aarch64"
         ]
-        channel_value = {
-            "id": channel_id,
-            "distro": "opensuse",
-            "release": "tumbleweed",
-            "family": "rpm",
-            "arch": "x86_64",
-            "flavor": "default",
-            "rpm": {"repo_id": "zerofs-opensuse"},
-            "discovery": {
-                "kind": "opensuse-history",
-                "builder_image": builder_image,
-                "selector": "kernel-default",
-                "packages": packages,
-            },
-        }
-        version = "7.1.4-1.1"
-        target_value = {
-            "id": "opensuse-kernel-r1",
-            "enabled": True,
-            "ci": True,
-            "publish": False,
-            "channel_id": channel_id,
-            "package_revision": "1",
-            "kernel_release": "7.1.4-1-default",
-            "kernel_package_name": "kernel-default",
-            "kernel_package_version": version,
-            "kernel_selector_version": version,
-            "builder_image": builder_image,
-            "source": {
-                "kind": "opensuse-history",
-                "identity": ",".join(
-                    f"{package}@{version}" for package in packages
-                ),
-                "snapshot": "20260729",
-            },
-        }
-        path = self.write_json(
-            "opensuse.json",
-            manifest(channels=[channel_value], targets=[target_value]),
+
+        updated = self.reconcile(
+            current,
+            candidate_for(current, package_version="7.0.1-3"),
+            pending_base=base,
+            pending_head=pending,
         )
 
-        result = self.run_controller(
-            path,
-            "field",
-            target_value["id"],
-            "kernel_upgrade_conflict",
+        targets = normalized_targets(updated)
+        self.assertEqual(
+            [item["channel_id"] for item in targets],
+            ["ubuntu-stable-generic-x86-64"],
         )
-        self.assertEqual(result.stdout.strip(), f"kernel-default > {version}")
+        self.assertEqual(targets[0]["kernel_package_version"], "7.0.1-3")
 
-        target_value["kernel_selector_version"] = "1"
-        path = self.write_json(
-            "opensuse-wrong-selector.json",
-            manifest(channels=[channel_value], targets=[target_value]),
+    def test_reconcile_rejects_pending_configuration_change(self):
+        base = manifest()
+        pending = self.reconcile(
+            copy.deepcopy(base),
+            candidate_for(base, package_version="7.0.1-2"),
         )
-        result = self.run_controller(
-            path,
-            "matrix",
-            "--scope",
-            "ci",
+        pending["streams"]["ubuntu-stable-generic"]["builder"] = (
+            f"ubuntu:new@sha256:{'1' * 64}"
+        )
+        result = self.reconcile(
+            copy.deepcopy(base),
+            pending_base=base,
+            pending_head=pending,
             succeeds=False,
         )
-        self.assertIn("must match kernel-default version", result.stderr)
+        self.assertIn("changes non-lock configuration", result.stderr)
 
-    def test_builder_image_must_be_an_oci_name(self):
-        document = manifest()
-        document["channels"][0]["discovery"]["builder_image"] = (
-            f"--privileged@sha256:{DIGEST}"
+    def test_matrices_are_derived_from_stream_architectures(self):
+        result = self.run_controller(self.two_arch_manifest(), "discovery-matrix")
+        entries = json.loads(result.stdout)["include"]
+        self.assertEqual(
+            [entry["id"] for entry in entries],
+            [
+                "ubuntu-stable-generic-x86-64",
+                "ubuntu-stable-generic-aarch64",
+            ],
         )
-        path = self.write_json("targets.json", document)
+        build = self.run_controller(self.two_arch_manifest(), "matrix")
+        build_entries = json.loads(build.stdout)["include"]
+        self.assertEqual(set(build_entries[0]), {"id", "arch", "runner"})
 
-        result = self.run_controller(
-            path,
-            "matrix",
-            "--scope",
-            "ci",
+    def test_reconcile_rejects_mutated_pending_lock(self):
+        base = manifest()
+        pending = copy.deepcopy(base)
+        lock = pending["streams"]["ubuntu-stable-generic"]["architectures"][
+            "x86_64"
+        ][0]
+        lock["snapshot"] = "20260730T000000Z"
+        result = self.reconcile(
+            copy.deepcopy(base),
+            pending_base=base,
+            pending_head=pending,
             succeeds=False,
         )
+        self.assertIn("cannot change an existing locked package", result.stderr)
 
-        self.assertIn("digest-pinned OCI image name", result.stderr)
-
-    def test_tagged_builder_image_is_rejected_outside_opensuse(self):
-        document = manifest()
-        document["channels"][0]["discovery"]["builder_image"] = "ubuntu:test"
-        path = self.write_json("tagged-builder.json", document)
-
-        result = self.run_controller(
-            path,
-            "matrix",
-            "--scope",
-            "ci",
-            succeeds=False,
-        )
-
-        self.assertIn("digest-pinned OCI image name", result.stderr)
-
-    def test_fields_expose_upgrade_gate(self):
-        document = manifest(
-            targets=[
-                target(
+    def test_reconcile_rejects_pending_retention_shrink(self):
+        base = manifest(
+            x86_locks=[
+                apt_lock(
+                    kernel_release="7.0.1-generic",
                     package_version="7.0.1-1",
-                    selector_version="7.0.1.2",
-                )
+                ),
+                apt_lock(
+                    kernel_release="7.0.2-generic",
+                    package_version="7.0.2-1",
+                ),
             ]
         )
-        path = self.write_json("targets.json", document)
+        pending = copy.deepcopy(base)
+        del pending["streams"]["ubuntu-stable-generic"]["architectures"][
+            "x86_64"
+        ][0]
 
-        field_result = self.run_controller(
-            path,
-            "field",
-            "ubuntu-kernel-r1",
-            "kernel_upgrade_conflict",
-        )
-        self.assertEqual(
-            field_result.stdout.strip(),
-            "linux-image-generic (>> 7.0.1.2)",
-        )
-
-    def test_kind_type_errors_are_reported_without_tracebacks(self):
-        for location in ("discovery", "source"):
-            with self.subTest(location=location):
-                document = manifest()
-                if location == "discovery":
-                    document["channels"][0]["discovery"]["kind"] = []
-                else:
-                    document["targets"][0]["source"]["kind"] = []
-                path = self.write_json(f"{location}.json", document)
-
-                result = self.run_controller(
-                    path,
-                    "matrix",
-                    "--scope",
-                    "ci",
-                    succeeds=False,
-                )
-
-                self.assertIn(".kind: must be a non-empty", result.stderr)
-                self.assertNotIn("Traceback", result.stderr)
-
-    def test_published_tolerates_reviewed_channel_changes(self):
-        base = manifest()
-        current = copy.deepcopy(base)
-        current["channels"][0]["apt"]["suite"] = "kernel"
-        current["targets"][0]["publish"] = True
-        base_path = self.write_json("base.json", base)
-        current_path = self.write_json("current.json", current)
-
-        result = self.run_controller(
-            current_path,
-            "published",
-            "--base",
-            base_path,
-        )
-
-        self.assertEqual(
-            json.loads(result.stdout)["include"][0]["id"],
-            "ubuntu-kernel-r1",
-        )
-
-    def test_published_rejects_existing_target_changes(self):
-        base = manifest(targets=[target(publish=True)])
-        current = copy.deepcopy(base)
-        builder_image = f"ubuntu:changed@sha256:{'1' * 64}"
-        current["channels"][0]["discovery"]["builder_image"] = builder_image
-        current["targets"][0]["builder_image"] = builder_image
-        base_path = self.write_json("base.json", base)
-        current_path = self.write_json("current.json", current)
-
-        result = self.run_controller(
-            current_path,
-            "published",
-            "--base",
-            base_path,
+        result = self.reconcile(
+            copy.deepcopy(base),
+            pending_base=base,
+            pending_head=pending,
             succeeds=False,
         )
 
-        self.assertIn("existing target cannot be changed", result.stderr)
+        self.assertIn("cannot drop retained kernels below 2", result.stderr)
 
-    def test_published_accepts_replacement_for_drifted_base(self):
-        base = manifest(targets=[target(publish=True)])
-        builder_image = f"ubuntu:new@sha256:{'1' * 64}"
-        base["channels"][0]["discovery"]["builder_image"] = builder_image
-        current = copy.deepcopy(base)
-        current["targets"][0]["ci"] = False
-        current["targets"][0]["publish"] = False
-        replacement = target(
-            "ubuntu-kernel-r2",
-            revision=2,
-            publish=True,
-        )
-        replacement["builder_image"] = builder_image
-        current["targets"].append(replacement)
-        base_path = self.write_json("drifted-base.json", base)
-        current_path = self.write_json("replacement-current.json", current)
-
-        result = self.run_controller(
-            current_path,
-            "published",
-            "--base",
-            base_path,
-        )
-
-        entries = json.loads(result.stdout)["include"]
-        self.assertEqual([entry["id"] for entry in entries], ["ubuntu-kernel-r2"])
-
-    def test_published_rejects_removed_targets(self):
-        old = target("ubuntu-kernel-r1", revision=1)
-        old["ci"] = False
-        current = target(
-            "ubuntu-kernel-r2",
-            revision=2,
-            kernel_release="7.0.2-generic",
-            package_version="7.0.2-1",
-            publish=True,
-        )
-        base = manifest(targets=[old, current])
-        changed = manifest(targets=[current])
-        base_path = self.write_json("base.json", base)
-        current_path = self.write_json("current.json", changed)
-
-        result = self.run_controller(
-            current_path,
-            "published",
-            "--base",
-            base_path,
-            succeeds=False,
-        )
-
-        self.assertIn("existing targets cannot be removed", result.stderr)
-
-    def test_discovery_matrix_comes_from_channels(self):
-        path = self.write_json("targets.json", manifest())
-
-        result = self.run_controller(
-            path,
-            "matrix",
-            "--scope",
-            "discover",
-        )
-
-        self.assertEqual(
-            json.loads(result.stdout),
-            {
-                "include": [
-                    {
-                        "id": "ubuntu-stable-generic-x86-64",
-                        "runner": "ubuntu-26.04",
-                        "image": f"ubuntu:test@sha256:{DIGEST}",
-                    }
-                ]
+    def test_reconcile_allows_fedora_key_rollover_only_once(self):
+        old_fingerprint = "a" * 40
+        new_fingerprint = "b" * 40
+        kernel_nvr = "7.1.5-200.fc44"
+        source_rpm = f"kernel-{kernel_nvr}.src.rpm"
+        base = {
+            "schema_version": 3,
+            "streams": {
+                "fedora-44-kernel-core": {
+                    "provider": "fedora",
+                    "release": "44",
+                    "builder": f"fedora:44@sha256:{DIGEST}",
+                    "signing_fingerprint": old_fingerprint,
+                    "architectures": {
+                        "x86_64": [
+                            {
+                                "nvr": f"kernel-{kernel_nvr}",
+                                "signing_fingerprint": old_fingerprint,
+                                "artifacts": fedora_artifacts(
+                                    kernel_nvr,
+                                    "1.97.1-1.fc44",
+                                ),
+                            }
+                        ]
+                    },
+                }
             },
+        }
+        configured = copy.deepcopy(base)
+        stream = configured["streams"]["fedora-44-kernel-core"]
+        stream["signing_fingerprint"] = new_fingerprint
+        resigned = copy.deepcopy(configured)
+        resigned_lock = resigned["streams"]["fedora-44-kernel-core"][
+            "architectures"
+        ]["x86_64"][0]
+        resigned_lock["signing_fingerprint"] = new_fingerprint
+        resigned_lock["artifacts"][source_rpm] = "1" * 64
+        self.assertEqual(
+            self.reconcile(
+                copy.deepcopy(configured),
+                pending_base=configured,
+                pending_head=resigned,
+            ),
+            resigned,
         )
+
+        same_key_mutation = copy.deepcopy(resigned)
+        same_key_mutation["streams"]["fedora-44-kernel-core"][
+            "architectures"
+        ]["x86_64"][0]["artifacts"][source_rpm] = "2" * 64
+        result = self.reconcile(
+            copy.deepcopy(resigned),
+            pending_base=resigned,
+            pending_head=same_key_mutation,
+            succeeds=False,
+        )
+        self.assertIn("cannot change an existing locked package", result.stderr)
 
 
 if __name__ == "__main__":

@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import ManifestError, fail, load_catalog
-from .discovery import check_channel, discover_candidate, parse_as_of
-from .updates import (
-    apply_candidates,
-    discovery_matrix_entry,
-    load_candidate,
-    newly_published_targets,
-    target_matrix_entry,
-)
+from .discovery import discover_candidate, parse_as_of
+from .updates import load_candidate, reconcile_candidates
+
+
+RUNNERS = {
+    "x86_64": "ubuntu-26.04",
+    "aarch64": "ubuntu-26.04-arm",
+}
 
 
 def print_matrix(entries: list[dict[str, Any]]) -> None:
@@ -24,10 +24,6 @@ def print_matrix(entries: list[dict[str, Any]]) -> None:
 def print_value(value: Any) -> None:
     if isinstance(value, (dict, list)):
         print(json.dumps(value, separators=(",", ":"), sort_keys=True))
-    elif value is None:
-        print("null")
-    elif isinstance(value, bool):
-        print("true" if value else "false")
     else:
         print(value)
 
@@ -68,12 +64,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    matrix = subparsers.add_parser("matrix")
-    matrix.add_argument(
-        "--scope",
-        choices=("ci", "publish", "discover"),
-        required=True,
-    )
+    subparsers.add_parser("matrix")
+    subparsers.add_parser("discovery-matrix")
+
+    builder_image = subparsers.add_parser("builder-image")
+    builder_image.add_argument("provider")
+    builder_image.add_argument("release")
 
     field = subparsers.add_parser("field")
     field.add_argument("target_id")
@@ -84,51 +80,57 @@ def parse_arguments() -> argparse.Namespace:
     discover.add_argument("--as-of", required=True)
     discover.add_argument("--output", type=Path)
 
-    check = subparsers.add_parser("check")
-    check.add_argument("channel_id")
-    check.add_argument("--as-of", required=True)
+    reconcile = subparsers.add_parser("reconcile")
+    reconcile.add_argument("--pending-base", type=Path)
+    reconcile.add_argument("--pending-head", type=Path)
+    reconcile.add_argument("candidates", type=Path, nargs="*")
 
-    apply = subparsers.add_parser("apply")
-    apply.add_argument("candidates", type=Path, nargs="+")
-
-    published = subparsers.add_parser("published")
-    published.add_argument("--base", type=Path, required=True)
     return parser.parse_args()
 
 
 def main() -> int:
     arguments = parse_arguments()
-    allow_builder_image_drift = arguments.command in {
-        "apply",
-        "check",
-        "discover",
-    } or (
-        arguments.command == "matrix" and arguments.scope == "discover"
-    )
-    catalog = load_catalog(
-        arguments.manifest,
-        allow_builder_image_drift=allow_builder_image_drift,
-    )
+    catalog = load_catalog(arguments.manifest)
 
     if arguments.command == "matrix":
-        if arguments.scope == "discover":
-            entries = [
-                discovery_matrix_entry(channel)
-                for channel in catalog.channels.values()
-            ]
-        elif arguments.scope == "ci":
-            entries = [
-                target_matrix_entry(target)
-                for target in catalog.targets
-                if target["enabled"] and target["ci"]
-            ]
-        else:
-            entries = [
-                target_matrix_entry(target)
-                for target in catalog.targets
-                if target["publish"]
-            ]
+        entries = [
+            {
+                "id": target["id"],
+                "arch": target["arch"],
+                "runner": RUNNERS[target["arch"]],
+            }
+            for target in catalog.targets
+        ]
         print_matrix(entries)
+        return 0
+
+    if arguments.command == "discovery-matrix":
+        entries = [
+            {
+                "id": channel["id"],
+                "runner": RUNNERS[channel["arch"]],
+                "image": channel["discovery"]["builder_image"],
+            }
+            for channel in catalog.channels.values()
+        ]
+        print_matrix(entries)
+        return 0
+
+    if arguments.command == "builder-image":
+        images = {
+            stream["builder"]
+            for stream in catalog.document["streams"].values()
+            if stream["provider"] == arguments.provider
+            and stream["release"] == arguments.release
+        }
+        description = (
+            f"provider {arguments.provider!r}, release {arguments.release!r}"
+        )
+        if not images:
+            fail(f"no builder image matches {description}")
+        if len(images) != 1:
+            fail(f"multiple builder images match {description}")
+        print_value(next(iter(images)))
         return 0
 
     if arguments.command == "field":
@@ -152,37 +154,30 @@ def main() -> int:
             sys.stdout.write(serialized_manifest(candidate))
         return 0
 
-    if arguments.command == "check":
-        print_value(
-            check_channel(
-                catalog,
-                arguments.channel_id,
-                parse_as_of(arguments.as_of),
-            )
-        )
-        return 0
-
-    if arguments.command == "apply":
+    if arguments.command == "reconcile":
+        if (arguments.pending_base is None) != (
+            arguments.pending_head is None
+        ):
+            fail("--pending-base and --pending-head must be used together")
         candidates = [
-            load_candidate(path, catalog.channels)
+            load_candidate(path, catalog)
             for path in arguments.candidates
         ]
-        document = apply_candidates(catalog, candidates)
+        pending_base = None
+        pending_head = None
+        if arguments.pending_base is not None:
+            pending_base = load_catalog(arguments.pending_base)
+            pending_head = load_catalog(arguments.pending_head)
+        document = reconcile_candidates(
+            catalog,
+            candidates,
+            pending_base=pending_base,
+            pending_head=pending_head,
+        )
         write_manifest(arguments.manifest, document)
         return 0
 
-    if arguments.command != "published":
-        fail(f"unsupported command: {arguments.command}")
-    # A replacement target repairs a base manifest whose channel builder image
-    # changed without its newest target. Keep that historical base readable,
-    # while the current manifest remains subject to the strict check above.
-    base = load_catalog(arguments.base, allow_builder_image_drift=True)
-    entries = [
-        target_matrix_entry(target)
-        for target in newly_published_targets(base, catalog)
-    ]
-    print_matrix(entries)
-    return 0
+    fail(f"unsupported command: {arguments.command}")
 
 
 def run() -> None:
