@@ -266,6 +266,7 @@ with tarfile.open(target, "w") as archive:
         extraction = self.root / "extracted"
         environment = {
             **os.environ,
+            "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
             "ZEROFS_KERNEL_SOURCE": str(archive),
         }
         if trusted_version is not None:
@@ -322,6 +323,20 @@ with tarfile.open(target, "w") as archive:
         )
 
         self.assertEqual(result.returncode, 0)
+
+    def test_source_resolver_ignores_failed_rpm_ownership_diagnostic(self):
+        archive = self.source_archive(package_version="7.0.1-28.28")
+        self.write_executable(
+            self.fake_bin / "rpm",
+            """#!/bin/sh
+printf 'file %s is not owned by any package\n' "$4"
+exit 1
+""",
+        )
+
+        result = self.resolve(archive, trusted_version="7.0.1-28.28")
+
+        self.assertNotIn("not owned by any package", result.stderr)
 
     def test_source_resolver_rejects_wrong_ubuntu_abi(self):
         archive = self.source_archive(package_version="7.0.1-29.29")

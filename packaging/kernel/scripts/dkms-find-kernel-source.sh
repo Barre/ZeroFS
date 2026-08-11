@@ -66,17 +66,24 @@ fi
 package_version_for_path() {
     local path=$1
     local owner
+    local version
 
     if command -v dpkg-query >/dev/null 2>&1; then
-        owner=$(dpkg-query -S "$path" 2>/dev/null | sed -n '1s/: \/.*//p')
-        if [[ -n "$owner" ]]; then
-            dpkg-query -W -f='${Version}\n' "$owner" 2>/dev/null
+        if owner=$(dpkg-query -S "$path" 2>/dev/null |
+            sed -n '1s/: \/.*//p') && [[ -n "$owner" ]]; then
+            if version=$(dpkg-query -W -f='${Version}\n' "$owner" \
+                2>/dev/null); then
+                printf '%s\n' "$version"
+            fi
             return
         fi
     fi
     if command -v rpm >/dev/null 2>&1; then
-        rpm -qf --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' "$path" \
-            2>/dev/null
+        if version=$(rpm -qf \
+            --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' "$path" \
+            2>/dev/null); then
+            printf '%s\n' "$version"
+        fi
     fi
 }
 
