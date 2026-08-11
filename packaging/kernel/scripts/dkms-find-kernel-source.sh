@@ -94,6 +94,7 @@ validate_packaging_revision() {
     local changelog_version=
     local first_line
     local header_version
+    local saw_changelog=false
     local source_version
     local ubuntu_abi
     local changelog_pattern='^[^[:space:]]+[[:space:]]+\(([^)]+)\)'
@@ -101,13 +102,36 @@ validate_packaging_revision() {
     # Prefer local package ownership. CI may supply the exact versions from its
     # authenticated target lock when a prepared source tree is intentionally
     # outside the package database.
-    changelog=$(find "$source" -maxdepth 2 -type f \
-        \( -path '*/debian/changelog' -o -path '*/debian.master/changelog' \) \
-        -print -quit)
-    if [[ -n "$changelog" ]]; then
-        IFS= read -r first_line <"$changelog"
-        if [[ "$first_line" =~ $changelog_pattern ]]; then
-            changelog_version=${BASH_REMATCH[1]}
+    if [[ -n "$explicit_source_version" ]]; then
+        while IFS= read -r -d '' changelog; do
+            case ${changelog#"$source"/} in
+                debian/changelog | debian.*/changelog) ;;
+                *) continue ;;
+            esac
+            IFS= read -r first_line <"$changelog"
+            if [[ "$first_line" =~ $changelog_pattern ]]; then
+                saw_changelog=true
+                if [[ "${BASH_REMATCH[1]}" == "$explicit_source_version" ]]; then
+                    changelog_version=${BASH_REMATCH[1]}
+                    break
+                fi
+            fi
+        done < <(find "$source" -mindepth 2 -maxdepth 2 -type f \
+            -name changelog -print0)
+        if [[ "$saw_changelog" == true && -z "$changelog_version" ]]; then
+            candidate_error="no source changelog matches trusted source version $explicit_source_version"
+            return 1
+        fi
+    else
+        changelog=$(find "$source" -maxdepth 2 -type f \
+            \( -path '*/debian/changelog' -o \
+               -path '*/debian.master/changelog' \) \
+            -print -quit)
+        if [[ -n "$changelog" ]]; then
+            IFS= read -r first_line <"$changelog"
+            if [[ "$first_line" =~ $changelog_pattern ]]; then
+                changelog_version=${BASH_REMATCH[1]}
+            fi
         fi
     fi
     source_version=$(package_version_for_path "$origin" || true)
