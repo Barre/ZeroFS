@@ -150,7 +150,12 @@ build_module() {
 }
 
 build_rust_metadata() {
+    local dangling_link
     local syscall_reference=arch/x86/entry/syscalls/syscall_32.tbl
+    local -a metadata_tar_excludes=(
+        '--exclude=./rust'
+        '--exclude=./source'
+    )
     local -a metadata_make_arguments=()
 
     find_kernel_source
@@ -166,8 +171,15 @@ build_rust_metadata() {
     # Dereference the prepared headers into a private output tree. Relative
     # distro-header symlinks would otherwise escape this tree and let Kbuild
     # write generated Rust files into package-owned /usr/src directories.
-    tar --create --dereference \
-        --exclude='./rust' --exclude='./source' \
+    # Header packages may also contain dangling links to unpackaged tooling;
+    # omit only those links because tar cannot dereference them.
+    while IFS= read -r -d '' dangling_link; do
+        metadata_tar_excludes+=(
+            "--exclude=./${dangling_link#"$kernel_build"/}"
+        )
+    done < <(find -P "$kernel_build" -xtype l -print0)
+    tar --create --dereference --anchored --no-wildcards \
+        "${metadata_tar_excludes[@]}" \
         --directory "$kernel_build" --file - . |
         tar --extract --directory "$metadata_output" --file -
     if [[ -f "$metadata_output/scripts/checksyscalls.sh" &&
