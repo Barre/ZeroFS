@@ -191,8 +191,14 @@ if ((source_is_recorded)); then
         fail "KERNEL_SRC produces $source_release, but KDIR was built as $kernel_release"
 else
     source_version=$(make -s -C "$kernel_source" kernelversion)
-    [[ -n "$source_version" && "$kernel_release" == "$source_version"* ]] ||
-        fail "pinned source version $source_version does not match target release $kernel_release"
+    [[ -n "$source_version" ]] ||
+        fail "pinned source did not report a kernel version"
+    case $kernel_release in
+        "$source_version" | "$source_version"[-+._~]*) ;;
+        *)
+            fail "pinned source version $source_version does not match target release $kernel_release"
+            ;;
+    esac
     printf 'self-contained module build: using packaged kernel source %s\n' \
         "$kernel_source_provenance"
 fi
