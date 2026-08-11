@@ -74,7 +74,7 @@ const resources: Array<Resource> = [
   {
     href: '/kernel-client',
     name: 'Native Kernel Client',
-    description: 'Mount through the native module when one matches the kernel.',
+    description: 'Mount through the DKMS-built native module.',
     icon: PackageIcon,
     pattern: {
       y: 10,

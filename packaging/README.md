@@ -1,15 +1,16 @@
 # Native packages (.deb / .rpm)
 
 Signed apt and yum repositories for ZeroFS, hosted on Cloudflare R2. The
-`Publish userspace packages` workflow (`.github/workflows/release-packages.yml`)
-builds userspace packages from the PGO release binaries on a `v*` tag push,
-pulling the same `zerofs-pgo-multiplatform.tar.gz` release asset the Docker
-build uses.
+`Publish native packages` workflow (`.github/workflows/release-packages.yml`)
+builds userspace packages from the PGO release binaries on a `v*` tag push.
+The source-DKMS kernel-client package is published into the same `deb` and
+`rpm` repositories.
 
 Userspace packages cover **amd64** and **arm64** only (the statically linked
 musl release binaries). The other architectures stay on the install script /
-tarball. Native kernel-client packages use a separate kernel-target matrix; the
-userspace architecture list does not imply kernel-module availability.
+tarball. Kernel compatibility CI uses the matrix derived from
+`packaging/kernel/kernels.lock.json`; the userspace architecture list does not
+imply kernel-module availability.
 
 ## What the userspace package installs
 
@@ -65,19 +66,23 @@ sudo dnf install zerofs
 
 ## Native kernel client
 
-`zerofs-kernel-client` selects the tested kernel and module package for its
-repository channel. Every channel uses a module built for one exact kernel.
+Each supported package family publishes `zerofs-kernel-client`. It installs
+the ZeroFS module source under `/usr/src`, registers it with DKMS, and enables
+automatic builds for eligible installed and future kernels. DKMS excludes
+releases below the Linux 6.18 floor and places no upper bound on eligible
+kernels. The DEB and RPM variants declare their portable build dependencies.
+Matching kernel headers are still required; kernels without packaged Rust
+metadata also need their exact distribution source package. The DKMS hook uses
+installed package inputs and never downloads dependencies itself.
 
-The selector installs the tested distro kernel and prebuilt module, attempts
-`modprobe zerofs` when the target is the running kernel, and installs
-`/usr/lib/modules-load.d/zerofs.conf` for subsequent boots. Installing a module
-for a kernel that is not running prepares the next boot without trying to load
-it into the wrong kernel. Package removal does not unload a module that is in
-use.
-
-Use the same `X.Y.Z` release on the server. The module does not depend on a
-local server package. The selector prevents the channel's rolling kernel
-package from advancing beyond the tested version.
+For `CONFIG_RUST=y`, the wrapper uses the normal external-module build and can
+regenerate missing Rust metadata from the packaged kernel source. Compatible
+x86-64 kernels with `CONFIG_RUST=n` use the self-contained build. Kernel
+discovery CI still builds and boots exact distro kernels, but the lock file is
+a compatibility record rather than package payload input. See the [kernel-client
+guide](../documentation/src/app/kernel-client/page.mdx) for user instructions
+and [the kernel packaging README](kernel/README.md) for build and update
+details.
 
 ## One-time infrastructure setup
 
@@ -114,46 +119,7 @@ gpg --armor --export-secret-keys <KEYID>        # -> GPG_PRIVATE_KEY secret
 Keep the private key backed up offline. RSA-4096 is used for the broadest
 apt/dnf compatibility.
 
-### 4. Prebuilt kernel module signing identity
-
-Kernel modules use a separate private key and X.509 certificate. Do not reuse
-the OpenPGP repository key. The release workflow accepts a passphrase-less PEM
-private key and matching PEM certificate, verifies that they match, and
-requires the certificate to remain valid for at least 30 days. The certificate
-must include the Code Signing extended key usage.
-
-```bash
-umask 077
-openssl req -new -x509 -newkey rsa:4096 -sha256 -nodes \
-  -keyout zerofs-module-signing-key.pem \
-  -out zerofs-module-signing-cert.pem \
-  -days 3650 \
-  -subj '/CN=ZeroFS Kernel Module/' \
-  -addext 'basicConstraints=critical,CA:FALSE' \
-  -addext 'keyUsage=critical,digitalSignature' \
-  -addext 'extendedKeyUsage=codeSigning,1.3.6.1.4.1.2312.16.1.2'
-chmod 0600 zerofs-module-signing-key.pem
-chmod 0644 zerofs-module-signing-cert.pem
-```
-
-Back up the private key offline. Replacing it requires users with Secure Boot
-to enroll the replacement certificate.
-
-This signature identifies a prebuilt module but does not automatically make
-its key trusted by Secure Boot. Prebuilt selectors install the public
-certificate at `/usr/share/zerofs/zerofs-module-signing-cert.der`. If
-`modprobe` is rejected, enroll it through the distribution's MOK flow:
-
-```bash
-sudo mokutil --import \
-  /usr/share/zerofs/zerofs-module-signing-cert.der
-```
-
-Complete the firmware/MOK prompt and reboot. The modules-load entry retries the
-load on the next boot; package installation remains successful while the key
-awaits enrollment.
-
-### 5. GitHub Actions configuration
+### 4. GitHub Actions configuration
 
 Settings -> Secrets and variables -> Actions.
 
@@ -164,7 +130,6 @@ Settings -> Secrets and variables -> Actions.
 | `REPO_BASE_URL` | `https://pkgs.zerofs.net` |
 | `R2_BUCKET` | `zerofs-packages` |
 | `GPG_KEY_ID` | full fingerprint from step 3 |
-| `KERNEL_MODULE_PACKAGE_LICENSE` | reviewed license expression for the combined module payload |
 
 **Secrets**
 
@@ -174,31 +139,34 @@ Settings -> Secrets and variables -> Actions.
 | `R2_ACCESS_KEY_ID` | R2 token access key id |
 | `R2_SECRET_ACCESS_KEY` | R2 token secret |
 | `GPG_PRIVATE_KEY` | armored private key from step 3 |
-| `KERNEL_MODULE_SIGNING_KEY` | passphrase-less PEM private key from step 4 |
-| `KERNEL_MODULE_SIGNING_CERT` | matching PEM X.509 certificate from step 4 |
 
 ### Bucket layout produced
 
 ```
 <bucket>/
-  deb/                 apt repo (dists/, pool/) managed by deb-s3
-  rpm/                 yum repo (*.rpm + repodata/, signed repomd.xml)
-  kernel/apt/<distro>/<release>/<flavor>/<arch>/
-                       exact-kernel apt channel + zerofs-kernel.list
-  kernel/rpm/<distro>/<release>/<flavor>/<arch>/
-                       exact-kernel yum channel + zerofs-kernel.repo
+  deb/                 unified apt repo (userspace + kernel packages)
+  rpm/                 unified rpm repo (userspace + kernel packages)
   zerofs.gpg           armored public key
   zerofs.repo          yum repo descriptor
 ```
 
 ## Publishing
 
-Repository publication is serialized and preserves previously published
-package versions.
+Repository writers are serialized with `queue: max`, and publication preserves
+old versions. Source-DKMS publication also rejects downgrades and changed
+equal-version packages. Userspace and source-DKMS packages are published from
+normal `v*` releases (or a manual dispatch for a tag containing this packaging
+tooling) into the unified `deb` and `rpm` repositories.
 
-Userspace publishing runs on a `v*` tag push. To (re)publish for an existing
-tag, run the workflow manually with the tag, for example `v1.4.1`. Kernel
-packages are published for stable releases and targets marked `publish: true`.
+The release workflow resolves the tag to one commit before building anything
+and uses that commit for every source and publishing-tool checkout. Before a
+source-DKMS package is published, its DEB and RPM are installed and removed in
+clean distribution containers, then the same package is built for every
+retained kernel lock and boot-tested with the released ZeroFS server binary.
+
+Kernel-lock changes certify compatibility but do not publish packages. See the
+[kernel update flow](kernel/README.md#kernel-update-flow) for discovery, failed
+compatibility checks, and lock-branch reconciliation.
 
 ## Building userspace packages locally
 

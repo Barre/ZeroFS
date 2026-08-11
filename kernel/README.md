@@ -79,10 +79,11 @@ Here `arm64` means the 64-bit AArch64 ABI. The 32-bit ARM/ARMv7 ABI is not
 supported.
 
 Linux 6.18 is the source-compatibility floor. It is the first upstream 6.x
-release with the Rust abstractions this module currently consumes. Kbuild does
-not select behavior from the release number: target-generated bindings,
-target-derived layout assertions, and the netfslib compatibility bridge decide
-whether the exact kernel tree is buildable.
+release with the Rust abstractions this module currently consumes. The DKMS
+package excludes module builds for older releases and defines no maximum.
+Above that floor, Kbuild does not select behavior from the release number:
+target-generated bindings, target-derived layout assertions, and the netfslib
+compatibility bridge decide whether the exact kernel tree is buildable.
 
 Build against the exact target kernel:
 
@@ -124,20 +125,21 @@ even when the relevant C headers are identical.
 Do not insert `zerofs.ko` into a different kernel release from the one it was
 built against.
 
-### Self-contained prebuilt modules
+### Self-contained source builds
 
-Release CI can also build ZeroFS for a kernel with `CONFIG_RUST=n`. This mode
-compiles the exact kernel tree's Rust support and ZeroFS together as LLVM
-bitcode, internalizes the Rust implementation, eliminates unreachable support
-code, and passes the resulting object through the target kernel's ordinary
-module and modpost machinery. The finished module imports only exported C
-kernel symbols; it does not require Rust support in the running kernel.
+The source-DKMS wrapper and release CI can also build ZeroFS for a kernel with
+`CONFIG_RUST=n`. This mode compiles the exact kernel tree's Rust support and
+ZeroFS together as LLVM bitcode, internalizes the Rust implementation,
+eliminates unreachable support code, and passes the resulting object through
+the target kernel's ordinary module and modpost machinery. The finished module
+imports only exported C kernel symbols; it does not require Rust support in the
+running kernel.
 
-This is a prebuilt/manual path. It requires the exact full kernel source and
-configured build tree, including a complete `Module.symvers`, the
+This path requires the configured headers tree, including a complete
+`Module.symvers`, plus the separately packaged matching kernel source, the
 kernel-compatible Rust compiler with its standard-library sources, Python 3,
-`bindgen`, and matching Clang/LLVM tools. Distribution release jobs have those
-inputs; installed headers normally do not.
+`bindgen`, and matching Clang/LLVM tools. The DKMS hook uses installed package
+inputs and does not download them while building.
 
 The self-contained path supports x86_64 kernels built with GCC or Clang. It
 uses the target kernel's original C compiler and binutils for its C objects,
@@ -166,9 +168,9 @@ digest of every source file from which it was produced.
 
 The build uses a private support tree below `target/`, does not enable Rust in
 the target kernel, and fails if the final module retains an undefined Rust
-runtime or helper symbol. As with every prebuilt external module, the result is
-specific to the target distribution, kernel release/ABI, flavor, architecture,
-and configuration.
+runtime or helper symbol. As with every external module, the result is specific
+to the target distribution, kernel release/ABI, flavor, architecture, and
+configuration.
 
 The repository CI builds and boots an exact Clang-built Linux 6.18
 `CONFIG_RUST=n` target, covering the supported version floor, and verifies that

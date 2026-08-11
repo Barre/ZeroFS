@@ -24,7 +24,7 @@ The native client is an out-of-tree Linux module. It registers the `zerofs` file
 | --- | --- | --- |
 | Path | VFS and netfslib | VFS, FUSE, userspace client |
 | Protocol | `9P2000.L.Z` | `9P2000.L.Z` |
-| Install | Exact-kernel prebuilt module; root required | Included in the `zerofs` binary |
+| Install | Source module built by DKMS; root required | Included in the `zerofs` binary |
 | Reconnect | Waits up to `reconnect_grace_ms`, 120 seconds by default | Waits for a server; ambiguous mutation retries stop after 120 seconds |
 | HA discovery | Rotates between two configured endpoints | Probes both endpoints concurrently |
 
@@ -34,7 +34,10 @@ Stock Linux v9fs is also supported. It needs no ZeroFS module, but uses standard
 
 ## Compatibility {{ id: 'compatibility' }}
 
-Linux 6.18 is the minimum supported kernel. The target must also provide:
+Linux 6.18 is the minimum supported kernel. DKMS excludes module builds below
+that floor and applies no version exclusion above it. Every otherwise eligible
+kernel presented to DKMS is attempted, whether or not CI has certified it yet.
+The target must also provide:
 
 - x86-64 or little-endian arm64;
 - `CONFIG_MODULES`;
@@ -43,36 +46,26 @@ Linux 6.18 is the minimum supported kernel. The target must also provide:
 - `CONFIG_FILE_LOCKING`;
 - `CONFIG_RANDSTRUCT=n` and `CONFIG_GCC_PLUGIN_RANDSTRUCT=n`.
 
-Packages contain modules built for one exact kernel. Supported channels are:
+ZeroFS continuously tests the source package against these kernel channels:
 
 | Distribution | x86-64 | arm64 |
 | --- | --- | --- |
-| Ubuntu 26.04, generic | [repository][ubuntu-26-x86] | [repository][ubuntu-26-arm] |
-| Ubuntu 24.04, HWE generic | [repository][ubuntu-24-x86] | [repository][ubuntu-24-arm] |
-| Debian 13 backports | [repository][debian-13-x86] | [repository][debian-13-arm] |
-| Fedora 43 | [repository][fedora-43-x86] | [repository][fedora-43-arm] |
-| Fedora 44 | [repository][fedora-44-x86] | [repository][fedora-44-arm] |
-| openSUSE Tumbleweed | [repository][opensuse-x86] | — |
+| Ubuntu 26.04, generic | yes | yes |
+| Ubuntu 24.04, HWE generic | yes | yes |
+| Debian 13 backports | yes | yes |
+| Fedora 43 | yes | yes |
+| Fedora 44 | yes | yes |
+| openSUSE Tumbleweed | yes | — |
 
-[ubuntu-26-x86]: https://pkgs.zerofs.net/kernel/apt/ubuntu/26.04/generic/x86_64/zerofs-kernel.list
-[ubuntu-26-arm]: https://pkgs.zerofs.net/kernel/apt/ubuntu/26.04/generic/aarch64/zerofs-kernel.list
-[ubuntu-24-x86]: https://pkgs.zerofs.net/kernel/apt/ubuntu/24.04/generic-hwe/x86_64/zerofs-kernel.list
-[ubuntu-24-arm]: https://pkgs.zerofs.net/kernel/apt/ubuntu/24.04/generic-hwe/aarch64/zerofs-kernel.list
-[debian-13-x86]: https://pkgs.zerofs.net/kernel/apt/debian/13-backports/amd64/x86_64/zerofs-kernel.list
-[debian-13-arm]: https://pkgs.zerofs.net/kernel/apt/debian/13-backports/arm64/aarch64/zerofs-kernel.list
-[fedora-43-x86]: https://pkgs.zerofs.net/kernel/rpm/fedora/43/kernel-core/x86_64/zerofs-kernel.repo
-[fedora-43-arm]: https://pkgs.zerofs.net/kernel/rpm/fedora/43/kernel-core/aarch64/zerofs-kernel.repo
-[fedora-44-x86]: https://pkgs.zerofs.net/kernel/rpm/fedora/44/kernel-core/x86_64/zerofs-kernel.repo
-[fedora-44-arm]: https://pkgs.zerofs.net/kernel/rpm/fedora/44/kernel-core/aarch64/zerofs-kernel.repo
-[opensuse-x86]: https://pkgs.zerofs.net/kernel/rpm/opensuse/tumbleweed/default/x86_64/zerofs-kernel.repo
-
-Every published target is boot-tested with a ZeroFS mount and basic I/O.
+Every discovered kernel is built and boot-tested with a ZeroFS mount and basic
+I/O before its compatibility lock is merged. The lock is CI evidence only and
+does not gate installation.
 
 <Note>
-Ubuntu 24.04 packages target HWE. Server installations default to the
-unsupported 6.8 GA kernel; Desktop installations track HWE. Installing
-`zerofs-kernel-client` installs the tested HWE kernel. Reboot into it before
-mounting.
+The Ubuntu 24.04 CI channel tracks HWE. Server installations default to the
+unsupported 6.8 GA kernel; Desktop installations track HWE. Install and boot
+a supported HWE kernel before mounting. The ZeroFS package does not replace or
+hold the distribution kernel.
 </Note>
 
 Debian 13, Rocky Linux 9 and 10, and openSUSE Leap 16 ship kernels older than
@@ -82,49 +75,77 @@ Debian 13, Rocky Linux 9 and 10, and openSUSE Leap 16 ship kernels older than
 
 ### Package
 
-The repository links in the compatibility table point to the matching
-repository descriptor. Copy its URL into `repo_url`, then install the selector:
+Kernel and userspace packages share the standard ZeroFS repository. Configure
+it once, then install `zerofs` and the generic kernel-client package:
 
 <CodeGroup>
 
 ```bash {{ title: 'Debian / Ubuntu' }}
-repo_url='https://pkgs.zerofs.net/kernel/apt/ubuntu/26.04/generic/x86_64/zerofs-kernel.list'
-
 curl -fsSL https://pkgs.zerofs.net/zerofs.gpg \
   | sudo gpg --dearmor -o /usr/share/keyrings/zerofs.gpg
-curl -fsSL "$repo_url" \
-  | sudo tee /etc/apt/sources.list.d/zerofs-kernel.list >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/zerofs.gpg] https://pkgs.zerofs.net/deb stable main' \
+  | sudo tee /etc/apt/sources.list.d/zerofs.list >/dev/null
 sudo apt update
-sudo apt install zerofs-kernel-client
+sudo apt install zerofs zerofs-kernel-client
 ```
 
 ```bash {{ title: 'Fedora' }}
-repo_url="https://pkgs.zerofs.net/kernel/rpm/fedora/44/kernel-core/$(uname -m)/zerofs-kernel.repo"
-
-curl -fsSL "$repo_url" \
-  | sudo tee /etc/yum.repos.d/zerofs-kernel.repo >/dev/null
-sudo dnf install zerofs-kernel-client
+curl -fsSL https://pkgs.zerofs.net/zerofs.repo \
+  | sudo tee /etc/yum.repos.d/zerofs.repo >/dev/null
+sudo dnf install zerofs zerofs-kernel-client
 ```
 
 ```bash {{ title: 'openSUSE' }}
-repo_url='https://pkgs.zerofs.net/kernel/rpm/opensuse/tumbleweed/default/x86_64/zerofs-kernel.repo'
-
-sudo curl -fsSL "$repo_url" \
-  -o /etc/zypp/repos.d/zerofs-kernel.repo
+sudo curl -fsSL https://pkgs.zerofs.net/zerofs.repo \
+  -o /etc/zypp/repos.d/zerofs.repo
 sudo zypper --gpg-auto-import-keys refresh
-sudo zypper install zerofs-kernel-client
+sudo zypper install zerofs zerofs-kernel-client
 ```
 
 </CodeGroup>
 
-`zerofs-kernel-client` installs the tested kernel and its prebuilt module. Use
-the same ZeroFS release on the server.
+`zerofs-kernel-client` installs the module source under `/usr/src`, registers
+it with DKMS, and builds it for eligible kernels. `mount -t zerofs` loads the
+installed module through its filesystem alias. The commands above assume the
+matching headers and the compiler and bindgen versions recorded by the kernel
+are installed. Ubuntu normally also uses `linux-lib-rust-$(uname -r)`; Debian
+kernels without packaged Rust metadata need `linux-source-X.Y`; Fedora uses
+`kernel-devel`; and openSUSE uses `kernel-default-devel`, `kernel-devel`,
+`kernel-source`, and `kernel-syms`. Package names can differ for custom
+kernels. The DKMS hook uses only installed packages and never downloads build
+inputs itself.
 
-The selector prevents the channel's rolling kernel package from advancing
-beyond the tested version. It loads the module when it matches the running
-kernel and installs `/usr/lib/modules-load.d/zerofs.conf` for subsequent boots.
+Installing the package builds the module for the running and newest installed
+kernels that already have headers. With no eligible header tree, it registers
+the source, prints a warning, and leaves the package configured so a later
+distribution DKMS hook can build it. Later kernel installations trigger a
+build automatically when their development inputs are present. If that build
+fails, the new kernel has no ZeroFS module. Debian and Ubuntu normally leave
+kernel package configuration incomplete when their DKMS hook fails. Fedora and
+openSUSE may finish installing the kernel despite the failed module build.
+Check `dkms status` before rebooting and keep the preceding kernel installed as
+a boot fallback while the incompatibility is fixed; `zerofs mount` remains
+available without the kernel module. The package does not install or hold the
+distribution kernel. Use the same ZeroFS release on the server.
 
-### Source
+When `zerofs-kernel-client` is configured, missing kernel-specific Rust
+metadata or exact distribution source produces a warning and leaves the source
+registered. Install the missing input, then run `sudo dkms autoinstall`.
+Kernels below the version floor are skipped; other compilation and
+module-install failures fail this package configuration step. For kernels
+installed later, whether the kernel transaction also fails is determined by
+the distribution hook as described above.
+
+The build wrapper selects the appropriate path automatically:
+
+- kernels with `CONFIG_RUST=y` and packaged Rust metadata use the normal
+  external-module build;
+- kernels with `CONFIG_RUST=y` but no packaged metadata regenerate it from the
+  distribution kernel source;
+- compatible x86-64 kernels with `CONFIG_RUST=n` use the self-contained build
+  described below.
+
+### Manual source build
 
 A source build requires a kernel with `CONFIG_RUST=y`, its matching `rust/libkernel.rmeta`, kernel headers, and the compiler and bindgen versions used for that kernel. `CONFIG_MODVERSIONS=y` also requires `Module.symvers` and `CONFIG_EXTENDED_MODVERSIONS=y`.
 
@@ -137,8 +158,6 @@ module_path=$(make -s \
 sudo install -D -m 0644 "$module_path" \
   "/lib/modules/$(uname -r)/updates/zerofs/zerofs.ko"
 sudo depmod -a "$(uname -r)"
-printf '%s\n' zerofs | \
-  sudo tee /etc/modules-load.d/zerofs.conf >/dev/null
 sudo modprobe zerofs
 ```
 
@@ -151,49 +170,21 @@ grep zerofs /proc/filesystems
 
 ## Secure Boot {{ id: 'secure-boot' }}
 
-Release modules are signed with the ZeroFS module key. The selector installs
-its public certificate at:
-
-```text
-/usr/share/zerofs/zerofs-module-signing-cert.der
-```
-
-If Secure Boot rejects the module, install the distribution's `mokutil`
-package and check whether the certificate is already enrolled:
+DKMS signs locally built modules with its machine-local key when module signing
+is configured by the distribution. Check Secure Boot and the installed module:
 
 ```bash
-certificate=/usr/share/zerofs/zerofs-module-signing-cert.der
-
 mokutil --sb-state
-sudo mokutil --test-key "$certificate"
-```
-
-If `--test-key` reports that it is not enrolled, request enrollment:
-
-```bash
-certificate=/usr/share/zerofs/zerofs-module-signing-cert.der
-sudo mokutil --import "$certificate"
-```
-
-Set the one-time password requested by `mokutil`, then reboot. In the MOK
-manager, select **Enroll MOK** → **Continue** → **Yes**, then enter that
-password. Menu wording varies by distribution. Reboot again if prompted.
-
-Verify the enrollment and load the module:
-
-```bash
-sudo mokutil --test-key \
-  /usr/share/zerofs/zerofs-module-signing-cert.der
-sudo modprobe zerofs
 modinfo -F signer zerofs
 ```
 
-Enrollment is not required when Secure Boot is disabled or the certificate is
-already trusted. If package installation ran before enrollment,
-`modules-load.d` retries the module on the next boot. A module built from
-source must be signed with a key trusted by that machine. MOK enrollment
-requires UEFI boot through the distribution's shim and console access; other
-boot chains need their own key-enrollment procedure.
+If Secure Boot rejects the module, follow the distribution's DKMS/MOK prompt
+to enroll that local key, then reboot and run `sudo modprobe zerofs`. The key
+and enrollment command are distribution-specific; the ZeroFS package neither
+ships a universal module key nor enrolls one automatically. Enrollment is not
+required when Secure Boot is disabled or the local DKMS key is already
+trusted. MOK enrollment requires UEFI boot through the distribution's shim and
+console access; other boot chains need their own key-enrollment procedure.
 
 ## Mounting {{ id: 'mounting' }}
 
@@ -233,8 +224,17 @@ Unmount with `sudo umount /mnt/zerofs`.
 
 ## Kernels without Rust {{ id: 'kernels-without-rust' }}
 
-ZeroFS can build an x86-64 module for a compatible kernel with `CONFIG_RUST=n`. The release build compiles the exact kernel's Rust support and ZeroFS together, internalizes the Rust code, and runs the result through the target kernel's normal module build. The resulting module imports C kernel symbols and does not require Rust support from the running kernel.
+ZeroFS can build an x86-64 module for a compatible kernel with `CONFIG_RUST=n`.
+The DKMS wrapper compiles the matching kernel's Rust support and ZeroFS
+together, internalizes the Rust code, and runs the result through the target
+kernel's normal module build. The resulting module imports C kernel symbols
+and does not require Rust support from the running kernel.
 
-This requires the complete configured kernel source, `Module.symvers`, and matching Rust and LLVM tools. Distribution headers are not enough, so this path is limited to controlled prebuilt packages. It does not support kernels older than Linux 6.18.
+This path uses the configured headers tree for `.config`, generated headers,
+and `Module.symvers`, plus the separately packaged distribution kernel source
+and matching Rust, C, and LLVM tools. These must be installed through the
+package manager rather than downloaded by the DKMS hook. The self-contained
+path is narrower than the normal Rust build, currently supports x86-64 only,
+and does not support kernels older than Linux 6.18.
 
 CI tests this path by booting an upstream Linux 6.18 kernel built with `CONFIG_RUST=n`.
