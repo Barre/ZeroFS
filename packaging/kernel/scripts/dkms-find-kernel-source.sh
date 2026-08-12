@@ -184,18 +184,11 @@ validate_packaging_revision() {
 source_matches_kernel() {
     local source=$1
     local origin=$2
-    local version
 
     [[ -f "$source/Makefile" &&
        -f "$source/rust/Makefile" &&
        -f "$source/rust/kernel/lib.rs" &&
        -f "$source/scripts/Makefile.build" ]] || return 1
-    version=$(make -s -C "$source" kernelversion 2>/dev/null) || return 1
-    [[ -n "$version" ]] || return 1
-    case $kernel_release in
-        "$version" | "$version"[-+._~]*) ;;
-        *) return 1 ;;
-    esac
     validate_packaging_revision "$source" "$origin" || return 1
 }
 

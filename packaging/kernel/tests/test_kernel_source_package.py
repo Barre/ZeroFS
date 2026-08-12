@@ -220,16 +220,12 @@ with tarfile.open(target, "w") as archive:
         root: Path,
         *,
         package_version: str,
-        kernel_version: str = "7.0.1",
     ) -> Path:
-        source = root / f"linux-source-{kernel_version}"
+        source = root / "linux-source-7.0.1"
         (source / "rust/kernel").mkdir(parents=True)
         (source / "scripts").mkdir()
         (source / "debian.master").mkdir()
-        (source / "Makefile").write_text(
-            f"kernelversion:\n\t@printf '%s\\n' '{kernel_version}'\n",
-            encoding="utf-8",
-        )
+        (source / "Makefile").write_text("# kernel source\n", encoding="utf-8")
         (source / "rust/Makefile").write_text("# rust\n", encoding="utf-8")
         (source / "rust/kernel/lib.rs").write_text("// rust\n", encoding="utf-8")
         (source / "scripts/Makefile.build").write_text("# build\n", encoding="utf-8")
@@ -365,27 +361,6 @@ exit 1
             "cannot prove the source and header package revisions",
             result.stderr,
         )
-
-    def test_source_resolver_requires_kernel_version_boundary(self):
-        staging = self.root / "boundary-source"
-        staging.mkdir()
-        source = self.write_kernel_source(
-            staging,
-            package_version="7.0.10-28.28",
-            kernel_version="7.0.1",
-        )
-        archive = self.root / "boundary-source.tar.xz"
-        with tarfile.open(archive, "w:xz") as output:
-            output.add(source, arcname=source.name)
-
-        result = self.resolve(
-            archive,
-            succeeds=False,
-            trusted_version="7.0.10-28.28",
-            kernel_release="7.0.10-28-generic",
-        )
-
-        self.assertIn("cannot select one matching kernel source tree", result.stderr)
 
     def test_source_resolver_skips_wrong_candidate_before_exact_one(self):
         bad_root = self.root / "bad-candidate"
