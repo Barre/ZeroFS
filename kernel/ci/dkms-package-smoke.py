@@ -15,60 +15,24 @@ from pathlib import Path
 
 PACKAGE_NAME = "zerofs-kernel-client"
 VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$")
+MODULE_LAYOUT = "v1"
 DEB_DEPENDENCIES = {
-    "bc",
-    "bindgen",
-    "binutils",
-    "bison",
-    "bzip2",
-    "build-essential",
-    "clang",
+    "ca-certificates",
+    "curl",
     "dkms",
-    "dwarves",
-    "flex",
-    "gzip",
     "kmod",
-    "libdw-dev",
-    "libelf-dev",
-    "libssl-dev",
-    "lld",
-    "llvm",
     "openssl",
     "python3",
-    "rust-src",
-    "rustc",
-    "rustfmt",
     "xz-utils",
-    "zstd",
 }
 RPM_DEPENDENCIES = {
-    "(bindgen-cli or rust-bindgen)",
-    "(elfutils-devel or libdw-devel)",
-    "(elfutils-libelf-devel or libelf-devel)",
-    "(openssl-devel or libopenssl-devel)",
-    "bc",
-    "binutils",
-    "bison",
-    "bzip2",
-    "clang",
+    "ca-certificates",
+    "curl",
     "dkms >= 3.0.11",
-    "dwarves",
-    "findutils",
-    "flex",
-    "gcc",
-    "gzip",
     "kmod",
-    "lld",
-    "llvm",
-    "make",
     "openssl",
     "python3",
-    "rust",
-    "rust-src",
-    "/usr/bin/rustfmt",
-    "tar",
     "xz",
-    "zstd",
 }
 NETWORK_OR_PACKAGE_MANAGER = re.compile(
     r"(?<![A-Za-z0-9_.+-])"
@@ -176,7 +140,7 @@ def audit_dependencies(package: Path, family: str, dependencies: str) -> None:
     missing = sorted(expected - actual)
     if missing:
         raise AuditError(
-            f"{package}: missing portable build dependency {missing[0]!r}"
+            f"{package}: missing runtime dependency {missing[0]!r}"
         )
     if forbidden:
         raise AuditError(
@@ -190,7 +154,7 @@ def require_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def audit(package: Path) -> str:
+def audit(package: Path) -> tuple[str, bytes]:
     if not package.is_file() or package.is_symlink():
         raise AuditError(f"not a regular package: {package}")
     package = package.resolve()
@@ -206,30 +170,48 @@ def audit(package: Path) -> str:
         configuration = require_text(source / "dkms.conf")
         builder = source / "dkms-build"
         builder_text = require_text(builder)
+        fetcher = source / "dkms-fetch-module"
+        require_text(fetcher)
         resolver = source / "dkms-find-kernel-source"
         resolver_text = require_text(resolver)
-        for script in (builder, resolver):
+        for script in (builder, fetcher, resolver):
             if script.stat().st_mode & 0o111 == 0:
                 raise AuditError(f"{package}: {script.name} is not executable")
             subprocess.run(["bash", "-n", str(script)], check=True)
         require_text(source / "LICENSE")
+        certificate = source / "zerofs-module-signing-cert.pem"
+        require_text(certificate)
+        subprocess.run(
+            ["openssl", "x509", "-in", str(certificate), "-noout"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        layout = require_text(source / "zerofs-module-layout")
+        if layout != f"{MODULE_LAYOUT}\n":
+            raise AuditError(
+                f"{package}: unsupported module layout {layout!r}"
+            )
         for directory in (source / "kernel", source / "zerofs"):
             if not directory.is_dir() or directory.is_symlink():
                 raise AuditError(f"{package}: missing source directory {directory}")
 
         required_configuration = (
-            f'PACKAGE_NAME="zerofs"',
+            'PACKAGE_NAME="zerofs"',
             f'PACKAGE_VERSION="{version}"',
             'BUILT_MODULE_NAME[0]="zerofs"',
             'BUILT_MODULE_LOCATION[0]="dkms-output"',
             'DEST_MODULE_LOCATION[0]="/kernel/fs/zerofs"',
+            'STRIP[0]="no"',
             'AUTOINSTALL="yes"',
-            "dkms-build",
-            "$kernelver",
+            f'MAKE[0]="./dkms-build $kernelver {version}"',
+            'CLEAN="/bin/true"',
         )
         for entry in required_configuration:
             if entry not in configuration:
                 raise AuditError(f"{package}: dkms.conf omits {entry!r}")
+        if re.search(r"(?m)^\s*PRE_BUILD=", configuration):
+            raise AuditError(f"{package}: dkms.conf uses unreliable PRE_BUILD")
         kernel_policy = tuple(
             line.strip()
             for line in configuration.splitlines()
@@ -264,7 +246,6 @@ def audit(package: Path) -> str:
             raise AuditError(
                 f"{package}: package scripts invoke the network or package manager"
             )
-
         forbidden_payloads = [
             path
             for path in root.rglob("*")
@@ -280,17 +261,28 @@ def audit(package: Path) -> str:
             raise AuditError(
                 f"{package}: contains forbidden binary payload {forbidden_payloads[0]}"
             )
-        return version
+        return version, certificate.read_bytes()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("packages", type=Path, nargs="+")
+    parser.add_argument("--certificate-output", type=Path)
     arguments = parser.parse_args()
     try:
-        versions = {audit(package) for package in arguments.packages}
+        audits = [audit(package) for package in arguments.packages]
+        versions = {version for version, _ in audits}
         if len(versions) != 1:
             raise AuditError("native package versions differ")
+        certificates = {certificate for _, certificate in audits}
+        if len(certificates) != 1:
+            raise AuditError("native packages contain different trust certificates")
+        if arguments.certificate_output is not None:
+            output = arguments.certificate_output
+            if output.exists() or output.is_symlink():
+                raise AuditError(f"certificate output already exists: {output}")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(certificates.pop())
         print(versions.pop())
     except (AuditError, OSError, UnicodeError, subprocess.CalledProcessError) as error:
         print(f"dkms-package-smoke.py: {error}", file=sys.stderr)

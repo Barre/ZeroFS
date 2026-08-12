@@ -360,6 +360,8 @@ require_container_path "$kernel_image" file
 require_container_module_directory "$dependency_source_dir"
 require_container_module_directory "$boot_module_source_dir"
 validate_module "$module" zerofs
+[[ -z $(modinfo -F sig_id "$module") ]] ||
+    die "target builder produced an already signed zerofs module"
 install -m 0644 "$module" "$output_dir/zerofs.ko"
 
 dependencies_dir=$output_dir/modules

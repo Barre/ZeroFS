@@ -1,40 +1,46 @@
-# ZeroFS source-DKMS packages
+# ZeroFS kernel-client packages
 
-`zerofs-kernel-client` ships the ZeroFS kernel-module source, not prebuilt
-modules. The native package installs it under
+`zerofs-kernel-client` installs a DKMS-managed client under
 `/usr/src/zerofs-<package-version>`, registers it with DKMS, and sets
-`AUTOINSTALL=yes`. Installing the package builds for the running and newest
-installed kernels when their headers are present; distro kernel-install hooks
-build it when a kernel is added later.
+`AUTOINSTALL=yes`. Package installation asks DKMS to provide the module for the
+running and newest installed kernels when their headers are present; distro
+kernel-install hooks repeat that operation when a kernel is added later.
 
-The DEB and RPM variants carry portable dependencies on DKMS, kmod, and
-compiler tooling. Matching kernel headers are package-managed prerequisites;
-kernels without packaged Rust metadata also require their exact distribution
-source package. The build hook uses only installed files and must never contact
-a package repository or choose mutable build inputs itself.
+The DKMS build first requests an exact, signed module that ZeroFS CI has built
+and boot-tested for the installed kernel package. The client derives its URL
+from the local package database, verifies the dedicated ZeroFS X.509 signature,
+the signed distro/header-package identity, architecture, and vermagic, then
+hands it back to DKMS for normal installation and any configured machine-local
+signing. The lookup does not use the current operating-system release version,
+so a retained kernel continues to resolve after an OS upgrade. A missing or
+temporarily unreachable object falls through to source compilation; a
+downloaded object that fails verification is a hard error.
+
+The DEB and RPM variants depend only on DKMS and the tools needed to fetch and
+verify a published module. Matching kernel headers are package-managed
+prerequisites; kernels without packaged Rust metadata also require their exact
+distribution source package for the source fallback. That fallback uses only
+installed files and never invokes a package manager. It is an escape hatch for
+prepared development systems; published modules are the normal support path.
 
 The package does not install, select, or hold a distribution kernel. DKMS
 excludes module builds below the Linux 6.18 floor and applies no version
 exclusion above it. Every otherwise eligible kernel presented to DKMS is
-attempted. A failed build leaves the new kernel without `zerofs.ko`. On
-Debian-family systems, the DKMS kernel hook normally propagates that failure
-and leaves kernel package configuration incomplete. Fedora- and openSUSE-family
-kernel hooks may let the kernel transaction complete despite the failed module
-build. Keep the preceding kernel installed as a boot fallback and check
-`dkms status` before booting the new kernel. Removal unregisters the matching
-DKMS source version and leaves other ZeroFS versions alone.
+attempted. If neither a published object nor the optional source prerequisites
+are available, the eligible DKMS build fails rather than completing without
+`zerofs.ko`. Authentication, compilation, and installation errors are hard
+failures too. Debian-family kernel hooks normally propagate these failures and
+leave kernel package configuration incomplete; Fedora- and openSUSE-family
+hooks may let the transaction complete. Keep the preceding kernel installed as
+a boot fallback and check `dkms status` before booting the new kernel. Removal
+unregisters the matching DKMS source version and leaves other ZeroFS versions
+alone.
 
-If no installed kernel has headers yet, `zerofs-kernel-client` configuration
-succeeds after registering the source and prints a warning. The same package
-configuration step warns and leaves the source registered when an existing
-kernel lacks its kernel-specific Rust metadata or exact distribution source;
-install the missing input and run `dkms autoinstall`. Below-floor kernels are
-skipped. Other compilation and module-install failures fail this package
-configuration step. When a kernel is installed later, its distribution DKMS
-hook performs the build and determines whether a failure also fails the kernel
-transaction, as described above.
+With no installed headers, package configuration registers the source, warns,
+and succeeds. Once an eligible kernel with headers is presented, publish its
+module or install the source prerequisites before retrying `dkms autoinstall`.
 
-## Build modes
+## Source fallback modes
 
 The packaged wrapper examines the target build tree and chooses one of three
 paths:
@@ -54,14 +60,14 @@ distribution kernel source, Rust sources and compiler, and matching C and LLVM
 tools. It does not make kernels older than Linux 6.18 or otherwise incompatible
 kernel configurations work, and currently supports x86-64 only.
 
-No mode fetches toolchains or source while DKMS is running. Exact toolchain and
-source availability is an operating-system package prerequisite, not an
-install-script fallback.
+No fallback mode fetches toolchains or source while DKMS is running. Exact
+toolchain and source availability is an operating-system package prerequisite,
+not an install-script fallback.
 
 ## Compatibility lock
 
-`kernels.lock.json` records the exact distro kernels that CI has certified. It
-is test input, not a runtime gate or a list of modules embedded in
+`kernels.lock.json` records the exact distro kernels that CI has certified and
+for which it publishes signed modules. It is not embedded in
 `zerofs-kernel-client`:
 
 ```sh
@@ -74,8 +80,11 @@ python3 packaging/kernel/kernel-targets.py \
 The compact file groups discovery and reproducible build inputs by distro
 stream and architecture. Target IDs, package family, and workflow fields are
 derived by the loader. The retained locks give CI a current target and a
-rollback target and are ordered oldest to newest. The lock has no separate
-package revision because changing it does not publish the source package.
+rollback target and are ordered oldest to newest. A lock update publishes
+modules for the latest stable ZeroFS package without changing that package.
+The workflow downloads and audits the GPG-signed DEB and RPM already present
+in the public repositories; it does not reconstruct a hypothetical package
+revision from newer tooling.
 
 ZeroFS requires Linux 6.18 or newer because older kernels predate the required
 netfs API. The lock's stream and architecture keys are the source of truth for
@@ -84,23 +93,24 @@ shows the user-facing matrix.
 
 ## Kernel update flow
 
-The hourly `kernel-target-updates` workflow discovers all channels and
+Every 15 minutes, the `kernel-target-updates` workflow discovers all channels and
 maintains one aggregate update PR. Successful discoveries survive unrelated
 channel failures, while conflicting edits to the same channel fail closed.
 Force-with-lease and default-branch comparisons prevent stale automation from
 overwriting newer lock changes.
 
-The PR builds the actual source-DKMS package in a clean target environment,
-installs the exact kernel, headers, source, and toolchain, and lets DKMS build
-`zerofs.ko`. CI checks the resulting module and boots that kernel in QEMU,
-where it loads ZeroFS and runs mount and I/O smoke tests. A new kernel is not
-certified merely because compilation succeeds.
+The PR builds the actual kernel-client package in a clean target environment,
+installs the exact kernel, headers, source, and toolchain, and forces the DKMS
+source fallback to build `zerofs.ko`. CI checks the resulting module and boots
+that kernel in QEMU, where it loads ZeroFS and runs mount and I/O smoke tests. A
+new kernel is not certified merely because compilation succeeds.
 
 If the kernel is incompatible, the lock PR stays red. The ZeroFS fix lands
 through a normal source PR on the default branch; the next discovery run
 reconciles the lock branch on top of it and reruns compatibility CI. Merging
-the lock then records compatibility, and the fix reaches users in the next
-normal ZeroFS release. An hourly no-op closes an obsolete update PR. Lock
+the lock records compatibility and triggers publication of the boot-tested
+module for the latest stable ZeroFS release. Source fixes still reach users in
+the next normal ZeroFS release. A no-op run closes an obsolete update PR. Lock
 reconciliation uses force-with-lease, while repository writers use their
 shared `queue: max` concurrency group; these are separate race controls for
 separate resources.
@@ -157,17 +167,18 @@ dependencies, and a static target-architecture BusyBox. These are smoke-test
 payloads only and are not installed by or published inside the source package.
 Release builds require the tag version to match `zerofs/Cargo.toml`.
 
-## Secure Boot
+## Signing and Secure Boot
 
-Modules are built on the client, so DKMS uses the machine-local signing key
-configured by the distribution. ZeroFS does not publish a universal module
-private key or certificate. A Secure Boot machine may require its local DKMS
-key to be enrolled through the distribution's MOK workflow before
-`modprobe zerofs` succeeds. Package scripts never enroll a key automatically.
+Published modules carry a ZeroFS signature used to authenticate the downloaded
+artifact. DKMS preserves it and may append the machine-local key configured by
+the distribution. A Secure Boot machine may require that local DKMS key to be
+enrolled through the distribution's MOK workflow before `modprobe zerofs`
+succeeds. Package scripts never enroll a key automatically.
 
 ## Publication
 
-Kernel-lock updates only certify compatibility; `zerofs-kernel-client` ships
-through normal ZeroFS releases. Unified repository layout, signing,
-serialization, and the immutable release gate are documented in
+`zerofs-kernel-client` ships through normal ZeroFS releases. Releases and later
+kernel-lock updates add immutable objects below `kernel-modules/v1`; old
+objects remain available for rollback kernels. Unified repository layout,
+signing, serialization, and the release gate are documented in
 [native package publishing](../README.md#publishing).

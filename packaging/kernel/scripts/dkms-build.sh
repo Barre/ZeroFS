@@ -12,8 +12,17 @@ die() {
     exit 1
 }
 
+fallback_unavailable() {
+    printf '%s: source fallback unavailable: %s\n' \
+        "$script_name" "$*" >&2
+    # An eligible kernel must not finish its DKMS transaction without a
+    # module. Keep 77 for DKMS's version-floor exclusion; missing publication
+    # and fallback inputs are a hard failure that the distro hook can surface.
+    exit 1
+}
+
 usage() {
-    printf 'usage: %s KERNEL_RELEASE\n' "$script_name" >&2
+    printf 'usage: %s KERNEL_RELEASE PACKAGE_VERSION\n' "$script_name" >&2
     exit 2
 }
 
@@ -42,10 +51,13 @@ config_value() {
     printf '%s\n' "$value"
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -eq 2 ]] || usage
 kernel_release=$1
+package_version=$2
 [[ "$kernel_release" =~ ^[A-Za-z0-9][A-Za-z0-9._+~:-]*$ ]] ||
     die "unsafe kernel release: $kernel_release"
+[[ "$package_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+~:-]*$ ]] ||
+    die "unsafe package version: $package_version"
 
 module_source="$script_dir/kernel"
 kernel_build_link="/lib/modules/$kernel_release/build"
@@ -54,7 +66,6 @@ kernel_build_link="/lib/modules/$kernel_release/build"
 kernel_build=$(realpath -e -- "$kernel_build_link")
 auto_conf="$kernel_build/include/config/auto.conf"
 kernel_release_file="$kernel_build/include/config/kernel.release"
-[[ -s "$auto_conf" ]] || die "kernel configuration is missing: $auto_conf"
 [[ -s "$kernel_release_file" ]] ||
     die "kernel release file is missing: $kernel_release_file"
 [[ "$(<"$kernel_release_file")" == "$kernel_release" ]] ||
@@ -64,9 +75,51 @@ module_output="$script_dir/dkms-output"
 support_output="$script_dir/dkms-support/$kernel_release"
 source_output="$script_dir/dkms-kernel-source/$kernel_release"
 metadata_output="$script_dir/dkms-metadata/$kernel_release"
+build_complete=false
+
+cleanup_incomplete_module() {
+    local status=$?
+
+    if [[ $status -ne 0 || $build_complete != true ]]; then
+        rm -f -- "$module_output/zerofs.ko"
+    fi
+    exit "$status"
+}
+
+trap cleanup_incomplete_module EXIT
+
+# Prefer the exact module already built and boot-tested by ZeroFS CI.  A
+# missing or unreachable object is a cache miss and falls through to the
+# source build below.  A downloaded object that fails authentication or ABI
+# validation is fatal: silently compiling in that case would hide a broken or
+# tampered publication.
+install -d -m 0755 "$module_output"
+rm -f -- "$module_output/zerofs.ko"
+if [[ ${ZEROFS_DISABLE_PREBUILT:-0} != 1 ]]; then
+    fetch_status=0
+    "$script_dir/dkms-fetch-module" \
+        "$kernel_release" "$package_version" \
+        "$module_output/zerofs.ko" || fetch_status=$?
+    case $fetch_status in
+        0)
+            build_complete=true
+            exit 0
+            ;;
+        75) ;;
+        *) exit "$fetch_status" ;;
+    esac
+fi
+
+[[ -s "$auto_conf" ]] ||
+    fallback_unavailable "kernel configuration is missing: $auto_conf"
+for command_name in make find tar; do
+    command -v "$command_name" >/dev/null 2>&1 ||
+        fallback_unavailable "$command_name is not installed"
+done
 
 [[ -s "$kernel_build/Module.symvers" ]] ||
-    die "kernel symbol versions are missing: $kernel_build/Module.symvers"
+    fallback_unavailable \
+        "kernel symbol versions are missing: $kernel_build/Module.symvers"
 grep -qx 'CONFIG_MODULES=y' "$auto_conf" ||
     die "target kernel does not enable loadable modules"
 
@@ -80,7 +133,8 @@ rustc=$(select_command \
     "rustc-$rustc_series" \
     "/usr/bin/rustc-$rustc_series" \
     /usr/bin/rustc \
-    rustc) || die "the target kernel's Rust compiler is not installed"
+    rustc) || fallback_unavailable \
+        "the target kernel's Rust compiler is not installed"
 
 bindgen_text=$(config_value CONFIG_BINDGEN_VERSION_TEXT)
 bindgen_release=${bindgen_text#bindgen }
@@ -92,13 +146,15 @@ bindgen=$(select_command \
     "bindgen-$bindgen_series" \
     "/usr/bin/bindgen-$bindgen_series" \
     /usr/bin/bindgen \
-    bindgen) || die "bindgen is not installed"
+    bindgen) || fallback_unavailable "bindgen is not installed"
 
 if [[ -n "$rustc_text" && "$("$rustc" --version)" != "$rustc_text" ]]; then
-    die "installed rustc does not match target: $("$rustc" --version)"
+    fallback_unavailable \
+        "installed rustc does not match target: $("$rustc" --version)"
 fi
 if [[ -n "$bindgen_text" && "$("$bindgen" --version)" != "$bindgen_text" ]]; then
-    die "installed bindgen does not match target: $("$bindgen" --version)"
+    fallback_unavailable \
+        "installed bindgen does not match target: $("$bindgen" --version)"
 fi
 
 rustfmt=$(select_command \
@@ -107,7 +163,7 @@ rustfmt=$(select_command \
     "/usr/bin/rustfmt-$rustc_series" \
     "/usr/lib/rust-$rustc_series/bin/rustfmt" \
     /usr/bin/rustfmt \
-    rustfmt) || die "rustfmt is not installed"
+    rustfmt) || fallback_unavailable "rustfmt is not installed"
 
 target_cc_text=$(config_value CONFIG_CC_VERSION_TEXT)
 target_cc_name=${target_cc_text%% *}
@@ -117,7 +173,8 @@ if [[ -z "$target_cc" ]] && grep -qx 'CONFIG_CC_IS_CLANG=y' "$auto_conf"; then
 elif [[ -z "$target_cc" ]] && grep -qx 'CONFIG_CC_IS_GCC=y' "$auto_conf"; then
     target_cc=$(select_command gcc cc || true)
 fi
-[[ -n "$target_cc" ]] || die "the target kernel's C compiler is not installed"
+[[ -n "$target_cc" ]] || fallback_unavailable \
+    "the target kernel's C compiler is not installed"
 
 jobs=${ZEROFS_BUILD_JOBS:-}
 if [[ -z "$jobs" ]]; then
@@ -130,9 +187,15 @@ kernel_source_provenance=
 
 find_kernel_source() {
     local record
+    local status=0
 
     record=$("$script_dir/dkms-find-kernel-source" \
-        "$kernel_release" "$kernel_build" "$source_output")
+        "$kernel_release" "$kernel_build" "$source_output") || status=$?
+    case $status in
+        0) ;;
+        75) fallback_unavailable "exact kernel source is unavailable" ;;
+        *) die "kernel source resolver failed with status $status" ;;
+    esac
     IFS=$'\t' read -r kernel_source kernel_source_provenance <<<"$record"
     [[ -n "$kernel_source" && -n "$kernel_source_provenance" ]] ||
         die "kernel source resolver returned an invalid record"
@@ -210,7 +273,6 @@ build_rust_metadata() {
     auto_conf="$kernel_build/include/config/auto.conf"
 }
 
-install -d -m 0755 "$module_output"
 if grep -qx 'CONFIG_RUST=y' "$auto_conf"; then
     if [[ ! -s "$kernel_build/rust/libkernel.rmeta" ]]; then
         build_rust_metadata
@@ -220,21 +282,22 @@ else
     find_kernel_source
     rust_llvm=$("$rustc" -vV |
         sed -n 's/^LLVM version: \([0-9][0-9]*\).*/\1/p')
-    [[ -n "$rust_llvm" ]] || die "cannot determine rustc's LLVM version"
+    [[ -n "$rust_llvm" ]] || fallback_unavailable \
+        "cannot determine rustc's LLVM version"
     clang=$(select_command \
         "${ZEROFS_CLANG:-}" "clang-$rust_llvm" "clang$rust_llvm" clang) ||
-        die "Clang $rust_llvm is not installed"
+        fallback_unavailable "Clang $rust_llvm is not installed"
     llvm_link=$(select_command \
         "${ZEROFS_LLVM_LINK:-}" \
         "llvm-link-$rust_llvm" "llvm-link$rust_llvm" llvm-link) ||
-        die "llvm-link $rust_llvm is not installed"
+        fallback_unavailable "llvm-link $rust_llvm is not installed"
     llvm_opt=$(select_command \
         "${ZEROFS_LLVM_OPT:-}" "opt-$rust_llvm" "opt$rust_llvm" opt) ||
-        die "opt $rust_llvm is not installed"
+        fallback_unavailable "opt $rust_llvm is not installed"
     llvm_nm=$(select_command \
         "${ZEROFS_LLVM_NM:-}" \
         "llvm-nm-$rust_llvm" "llvm-nm$rust_llvm" llvm-nm) ||
-        die "llvm-nm $rust_llvm is not installed"
+        fallback_unavailable "llvm-nm $rust_llvm is not installed"
 
     ZEROFS_KERNEL_SOURCE_PROVENANCE="$kernel_source_provenance" \
         make -C "$module_source" \
@@ -255,3 +318,10 @@ fi
 
 [[ -s "$module_output/zerofs.ko" ]] ||
     die "the build completed without dkms-output/zerofs.ko"
+[[ $(modinfo -F name "$module_output/zerofs.ko") == zerofs ]] ||
+    die "the build produced a module with the wrong name"
+case $(modinfo -F vermagic "$module_output/zerofs.ko") in
+    "$kernel_release" | "$kernel_release "*) ;;
+    *) die "the build produced a module with the wrong vermagic" ;;
+esac
+build_complete=true

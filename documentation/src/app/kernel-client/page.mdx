@@ -24,7 +24,7 @@ The native client is an out-of-tree Linux module. It registers the `zerofs` file
 | --- | --- | --- |
 | Path | VFS and netfslib | VFS, FUSE, userspace client |
 | Protocol | `9P2000.L.Z` | `9P2000.L.Z` |
-| Install | Source module built by DKMS; root required | Included in the `zerofs` binary |
+| Install | Signed exact-kernel module managed by DKMS; root required | Included in the `zerofs` binary |
 | Reconnect | Waits up to `reconnect_grace_ms`, 120 seconds by default | Waits for a server; ambiguous mutation retries stop after 120 seconds |
 | HA discovery | Rotates between two configured endpoints | Probes both endpoints concurrently |
 
@@ -46,7 +46,7 @@ The target must also provide:
 - `CONFIG_FILE_LOCKING`;
 - `CONFIG_RANDSTRUCT=n` and `CONFIG_GCC_PLUGIN_RANDSTRUCT=n`.
 
-ZeroFS continuously tests the source package against these kernel channels:
+ZeroFS continuously builds, boot-tests, and publishes modules for these kernel channels:
 
 | Distribution | x86-64 | arm64 |
 | --- | --- | --- |
@@ -58,8 +58,16 @@ ZeroFS continuously tests the source package against these kernel channels:
 | openSUSE Tumbleweed | yes | — |
 
 Every discovered kernel is built and boot-tested with a ZeroFS mount and basic
-I/O before its compatibility lock is merged. The lock is CI evidence only and
-does not gate installation.
+I/O before its compatibility lock is merged. Merging the lock triggers module
+publication for the latest stable ZeroFS package.
+
+Only exact distribution header-package identities discovered for the channels
+above receive published modules. Derivative-specific, custom, and third-party
+kernel packages (including ELRepo kernels) use the optional source fallback
+instead. If its matching source and toolchain are not already installed, DKMS
+fails that eligible build and the distribution may leave the kernel or ZeroFS
+package transaction incomplete. Use `zerofs mount` when that policy is
+unsuitable.
 
 <Note>
 The Ubuntu 24.04 CI channel tracks HWE. Server installations default to the
@@ -104,37 +112,33 @@ sudo zypper install zerofs zerofs-kernel-client
 
 </CodeGroup>
 
-`zerofs-kernel-client` installs the module source under `/usr/src`, registers
-it with DKMS, and builds it for eligible kernels. `mount -t zerofs` loads the
-installed module through its filesystem alias. The commands above assume the
-matching headers and the compiler and bindgen versions recorded by the kernel
-are installed. Ubuntu normally also uses `linux-lib-rust-$(uname -r)`; Debian
-kernels without packaged Rust metadata need `linux-source-X.Y`; Fedora uses
-`kernel-devel`; and openSUSE uses `kernel-default-devel`, `kernel-devel`,
-`kernel-source`, and `kernel-syms`. Package names can differ for custom
-kernels. The DKMS hook uses only installed packages and never downloads build
-inputs itself.
+`zerofs-kernel-client` registers with DKMS and first downloads the exact,
+signed module that ZeroFS CI boot-tested for the installed kernel package. It
+uses a pinned public certificate shipped in the package to authenticate the
+module, its exact header-package identity, architecture, and ABI before DKMS
+installs it. The identity comes from the installed header package rather than
+the current OS release, so retained kernels keep working after a distribution
+upgrade. `mount -t zerofs` then loads the module through its filesystem alias.
+Matching kernel headers are required so DKMS can identify and manage the
+kernel.
 
-Installing the package builds the module for the running and newest installed
+Installing the package supplies the module for the running and newest installed
 kernels that already have headers. With no eligible header tree, it registers
 the source, prints a warning, and leaves the package configured so a later
-distribution DKMS hook can build it. Later kernel installations trigger a
-build automatically when their development inputs are present. If that build
-fails, the new kernel has no ZeroFS module. Debian and Ubuntu normally leave
-kernel package configuration incomplete when their DKMS hook fails. Fedora and
-openSUSE may finish installing the kernel despite the failed module build.
-Check `dkms status` before rebooting and keep the preceding kernel installed as
-a boot fallback while the incompatibility is fixed; `zerofs mount` remains
-available without the kernel module. The package does not install or hold the
+distribution DKMS hook can build it. Later kernel installations trigger DKMS
+automatically. When a module is unpublished or temporarily unreachable, DKMS
+attempts a source build using the matching compiler, bindgen, and Rust metadata
+or distribution kernel source, but never downloads them. If those inputs are
+also missing, the eligible DKMS build fails rather than completing without a
+ZeroFS module; kernels below the version floor are still skipped.
+Authentication, compilation, and installation errors are hard failures too.
+Debian and Ubuntu normally leave kernel package configuration incomplete after
+such a failure, while Fedora and openSUSE may finish the transaction. Once the
+module or source inputs are available, retry with `sudo dkms autoinstall` and
+finish any incomplete package configuration. Check `dkms status` before
+rebooting and keep the preceding kernel as a fallback; `zerofs mount` remains
+available without the module. The package does not install or hold the
 distribution kernel. Use the same ZeroFS release on the server.
-
-When `zerofs-kernel-client` is configured, missing kernel-specific Rust
-metadata or exact distribution source produces a warning and leaves the source
-registered. Install the missing input, then run `sudo dkms autoinstall`.
-Kernels below the version floor are skipped; other compilation and
-module-install failures fail this package configuration step. For kernels
-installed later, whether the kernel transaction also fails is determined by
-the distribution hook as described above.
 
 The build wrapper selects the appropriate path automatically:
 
@@ -170,8 +174,11 @@ grep zerofs /proc/filesystems
 
 ## Secure Boot {{ id: 'secure-boot' }}
 
-DKMS signs locally built modules with its machine-local key when module signing
-is configured by the distribution. Check Secure Boot and the installed module:
+Downloaded modules carry a ZeroFS signature used to authenticate the artifact.
+DKMS preserves it and may append its machine-local key when module signing is
+configured by the distribution. The ZeroFS signature authenticates the
+download; it does not add the ZeroFS certificate to the kernel's Secure Boot
+trust store. Check Secure Boot and the installed module:
 
 ```bash
 mokutil --sb-state
@@ -180,9 +187,9 @@ modinfo -F signer zerofs
 
 If Secure Boot rejects the module, follow the distribution's DKMS/MOK prompt
 to enroll that local key, then reboot and run `sudo modprobe zerofs`. The key
-and enrollment command are distribution-specific; the ZeroFS package neither
-ships a universal module key nor enrolls one automatically. Enrollment is not
-required when Secure Boot is disabled or the local DKMS key is already
+and enrollment command are distribution-specific; the ZeroFS package never
+enrolls a key automatically. Enrollment is not required when Secure Boot is
+disabled or the local DKMS key is already
 trusted. MOK enrollment requires UEFI boot through the distribution's shim and
 console access; other boot chains need their own key-enrollment procedure.
 

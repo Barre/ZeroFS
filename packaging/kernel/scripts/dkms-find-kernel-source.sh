@@ -11,18 +11,6 @@ die() {
 }
 
 source_unavailable() {
-    # DKMS reports every failed MAKE command with the same outer status. Leave
-    # a machine-readable signal so the package installer can distinguish a
-    # recoverable missing distribution input from a real compile failure.
-    install -d -m 0755 "${source_unavailable_marker%/*}"
-    if [[ -e "$source_unavailable_marker" ||
-          -L "$source_unavailable_marker" ]]; then
-        [[ -f "$source_unavailable_marker" &&
-           ! -L "$source_unavailable_marker" ]] ||
-            die "unsafe source-unavailable marker: $source_unavailable_marker"
-    fi
-    printf '%s\n' "$kernel_release" >"$source_unavailable_marker"
-    chmod 0644 "$source_unavailable_marker"
     printf '%s: %s\n' "$script_name" "$*" >&2
     exit 75
 }
@@ -42,15 +30,6 @@ case $extraction_directory in
         die "unsafe kernel source extraction directory: $extraction_directory"
         ;;
 esac
-source_unavailable_marker="${extraction_directory}.source-unavailable"
-if [[ -e "$source_unavailable_marker" ||
-      -L "$source_unavailable_marker" ]]; then
-    [[ -f "$source_unavailable_marker" &&
-       ! -L "$source_unavailable_marker" ]] ||
-        die "unsafe source-unavailable marker: $source_unavailable_marker"
-    rm -f -- "$source_unavailable_marker"
-fi
-
 kernel_source=
 provenance=
 candidate_error=
@@ -66,11 +45,20 @@ fi
 package_version_for_path() {
     local path=$1
     local owner
+    local ownership
     local version
 
     if command -v dpkg-query >/dev/null 2>&1; then
-        if owner=$(dpkg-query -S "$path" 2>/dev/null |
-            sed -n '1s/: \/.*//p') && [[ -n "$owner" ]]; then
+        owner=
+        while IFS= read -r ownership; do
+            # Diversion diagnostics can precede the actual ownership record.
+            if [[ $ownership =~ ^([a-z0-9][a-z0-9+.-]*(:[a-z0-9][a-z0-9-]*)?):[[:space:]]+(.+)$ &&
+                  ${BASH_REMATCH[3]} == "$path" ]]; then
+                owner=${BASH_REMATCH[1]}
+                break
+            fi
+        done < <(dpkg-query -S "$path" 2>/dev/null || true)
+        if [[ -n "$owner" ]]; then
             if version=$(dpkg-query -W -f='${Version}\n' "$owner" \
                 2>/dev/null); then
                 printf '%s\n' "$version"

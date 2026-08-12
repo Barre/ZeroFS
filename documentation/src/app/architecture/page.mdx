@@ -112,7 +112,7 @@ Because the servers share one filesystem layer, protocols mix on a single instan
 | Mount | Client | Use case |
 |-------|--------|----------|
 | [NFS](/nfs-access) | NFS client available on macOS, Linux, and Windows | Cross-platform mounts without a ZeroFS-specific client |
-| [Native kernel client](/kernel-client) | DKMS-built `zerofs` module; speaks private 9P directly through VFS and netfslib | Fast Linux mounts with reconnect and HA failover |
+| [Native kernel client](/kernel-client) | DKMS-managed `zerofs` module; speaks private 9P directly through VFS and netfslib | Fast Linux mounts with reconnect and HA failover |
 | [Stock 9P](/9p-access) | Linux v9fs module | No ZeroFS client installation; fsync-dependent workloads |
 | [`zerofs mount`](/9p-access#mounting-with-zerofs-mount) | FUSE client bundled in the `zerofs` binary; speaks private 9P | Linux mounts without root; reconnect and HA failover across a wider kernel range |
 | [NBD](/nbd-devices) | `nbd-client` | Raw block devices for ext4, XFS, ZFS pools, and VM disks |

@@ -1,6 +1,6 @@
 name: Publish native packages
 
-# Builds userspace and source-DKMS packages for one release and publishes the
+# Builds userspace and kernel-client packages for one release and publishes the
 # signed repositories described in packaging/README.md.
 
 on:
@@ -132,11 +132,17 @@ jobs:
           retention-days: 3
 
   kernel-package-gate:
-    name: Build and test released source-DKMS package
+    name: Build, test, and publish released kernel modules
     needs: userspace-packages
     uses: ./.github/workflows/kernel-packages.yml
     with:
-      checkout-ref: ${{ needs['userspace-packages'].outputs['release-commit'] }}
+      source-ref: ${{ needs['userspace-packages'].outputs['release-commit'] }}
+      publish-modules: true
+    secrets:
+      KERNEL_MODULE_SIGNING_KEY: ${{ secrets.KERNEL_MODULE_SIGNING_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
   publish-apt:
     name: Publish userspace APT repository
@@ -158,8 +164,8 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
   publish-kernel-apt:
-    name: Publish source-DKMS APT package
-    needs: [userspace-packages, kernel-package-gate]
+    name: Publish kernel-client APT package
+    needs: kernel-package-gate
     uses: ./.github/workflows/_publish-repo.yml
     with:
       family: deb
@@ -193,8 +199,8 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
   publish-kernel-yum:
-    name: Publish source-DKMS YUM package
-    needs: [userspace-packages, kernel-package-gate]
+    name: Publish kernel-client YUM package
+    needs: kernel-package-gate
     uses: ./.github/workflows/_publish-repo.yml
     with:
       family: rpm

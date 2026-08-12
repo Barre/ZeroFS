@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -12,10 +13,17 @@ from pathlib import Path
 REPOSITORY = Path(__file__).resolve().parents[3]
 PACKAGER = REPOSITORY / "packaging/kernel/kernel-source-package.py"
 RESOLVER = REPOSITORY / "packaging/kernel/scripts/dkms-find-kernel-source.sh"
+FETCHER = REPOSITORY / "packaging/kernel/scripts/dkms-fetch-module.sh"
+STAGER = REPOSITORY / "packaging/kernel/stage-prebuilt-modules.py"
 SPEC = importlib.util.spec_from_file_location("kernel_source_package", PACKAGER)
 assert SPEC is not None and SPEC.loader is not None
 kernel_source_package = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(kernel_source_package)
+sys.path.insert(0, str(STAGER.parent))
+STAGER_SPEC = importlib.util.spec_from_file_location("stage_prebuilt_modules", STAGER)
+assert STAGER_SPEC is not None and STAGER_SPEC.loader is not None
+stage_prebuilt_modules = importlib.util.module_from_spec(STAGER_SPEC)
+STAGER_SPEC.loader.exec_module(stage_prebuilt_modules)
 
 
 class KernelSourcePackageTest(unittest.TestCase):
@@ -53,6 +61,10 @@ with tarfile.open(target, "w") as archive:
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_package_revision_overrides_are_explicit(self):
+        self.assertEqual(kernel_source_package.package_revision("2.2.3"), 2)
+        self.assertEqual(kernel_source_package.package_revision("9.8.7"), 1)
+
     def test_builds_one_architecture_independent_package_per_family(self):
         output = self.root / "output"
         version = kernel_source_package.repository_version(REPOSITORY)
@@ -88,7 +100,13 @@ with tarfile.open(target, "w") as archive:
             prefix = "content/source"
             self.assertIn(f"{prefix}/dkms.conf", names)
             self.assertIn(f"{prefix}/dkms-build", names)
+            self.assertIn(f"{prefix}/dkms-fetch-module", names)
             self.assertIn(f"{prefix}/dkms-find-kernel-source", names)
+            self.assertIn(
+                f"{prefix}/zerofs-module-signing-cert.pem",
+                names,
+            )
+            self.assertIn(f"{prefix}/zerofs-module-layout", names)
             self.assertIn(f"{prefix}/kernel/Makefile", names)
             self.assertIn(f"{prefix}/kernel/self_contained/build.sh", names)
             self.assertIn(f"{prefix}/zerofs/ninep-proto/src/lib.rs", names)
@@ -114,7 +132,13 @@ with tarfile.open(target, "w") as archive:
             self.assertIsNotNone(config)
             configuration = config.read().decode()
             self.assertIn('AUTOINSTALL="yes"', configuration)
-            self.assertIn('MAKE[0]="./dkms-build $kernelver"', configuration)
+            self.assertIn(
+                f'MAKE[0]="./dkms-build $kernelver {dkms_version}"',
+                configuration,
+            )
+            self.assertNotRegex(configuration, r"(?m)^\s*PRE_BUILD=")
+            self.assertIn('CLEAN="/bin/true"', configuration)
+            self.assertIn('STRIP[0]="no"', configuration)
             self.assertIn(
                 'BUILD_EXCLUSIVE_KERNEL_MIN="6.18"',
                 configuration,
@@ -129,6 +153,346 @@ with tarfile.open(target, "w") as archive:
                 ['BUILD_EXCLUSIVE_KERNEL_MIN="6.18"'],
             )
             self.assertIn('  - "dkms (>= 3.0.11)"\n', manifest)
+            self.assertIn('  - "ca-certificates"\n', manifest)
+            self.assertIn('  - "curl"\n', manifest)
+
+    def test_prebuilt_paths_match_distribution_header_identities(self):
+        cases = (
+            (
+                {
+                    "id": "ubuntu-test",
+                    "distro": "ubuntu",
+                    "arch": "x86_64",
+                    "kernel_release": "7.0.0-1-generic",
+                    "kernel_package_version": "7.0.0-1.1",
+                },
+                ("ubuntu", "amd64", "linux-headers-7.0.0-1-generic",
+                 "7.0.0-1.1", "7.0.0-1-generic"),
+            ),
+            (
+                {
+                    "id": "debian-test",
+                    "distro": "debian",
+                    "arch": "x86_64",
+                    "kernel_release": "7.1.0+deb13-amd64",
+                    "kernel_package_version": "7.1.0-1~bpo13+1",
+                },
+                ("debian", "amd64", "linux-headers-7.1.0+deb13-amd64",
+                 "7.1.0-1~bpo13+1", "7.1.0+deb13-amd64"),
+            ),
+            (
+                {
+                    "id": "fedora-test",
+                    "distro": "fedora",
+                    "arch": "x86_64",
+                    "kernel_release": "7.1.0-1.fc44.x86_64",
+                    "kernel_package_version": "7.1.0-1.fc44.x86_64",
+                },
+                ("fedora", "x86_64", "kernel-devel",
+                 "0@7.1.0-1.fc44", "7.1.0-1.fc44.x86_64"),
+            ),
+            (
+                {
+                    "id": "opensuse-test",
+                    "distro": "opensuse",
+                    "arch": "x86_64",
+                    "kernel_release": "7.1.0-1-default",
+                    "kernel_package_version": "7.1.0-1.1",
+                    "source": {
+                        "identity": "kernel-default-devel@7.1.0-1.1"
+                    },
+                },
+                ("opensuse", "x86_64", "kernel-default-devel",
+                 "0@7.1.0-1.1", "7.1.0-1-default"),
+            ),
+        )
+        for target, identity in cases:
+            with self.subTest(distro=target["distro"]):
+                self.assertEqual(
+                    stage_prebuilt_modules.publication_identity(target),
+                    identity,
+                )
+                self.assertEqual(
+                    stage_prebuilt_modules.relative_module_path(
+                        target, "2.2.3-2"
+                    ).parts,
+                    ("kernel-modules", "v1", *identity, "2.2.3-2", "zerofs.ko.xz"),
+                )
+                self.assertNotIn(
+                    ":",
+                    stage_prebuilt_modules.relative_module_path(
+                        target, "2.2.3-2"
+                    ).as_posix(),
+                )
+
+    def test_fetcher_installs_only_the_exact_signed_module(self):
+        catalog = stage_prebuilt_modules.load_catalog(
+            REPOSITORY / "packaging/kernel/kernels.lock.json"
+        )
+        target = next(
+            target
+            for target in reversed(catalog.targets)
+            if target["distro"] == "ubuntu"
+            and target["release"] == "26.04"
+            and target["arch"] == "x86_64"
+        )
+        kernel_release = target["kernel_release"]
+        package_version = "2.2.3-2"
+        _, _, header_package, header_version, _ = (
+            stage_prebuilt_modules.publication_identity(target)
+        )
+        module_base_url = "https://modules.test/kernel-modules"
+        relative_module = stage_prebuilt_modules.relative_module_path(
+            target, package_version
+        )
+        expected_url = f"{module_base_url}/{'/'.join(relative_module.parts[1:])}"
+
+        modules_root = self.root / "lib/modules"
+        kernel_build = self.root / "headers"
+        (kernel_build / "include/config").mkdir(parents=True)
+        (kernel_build / "include/config/kernel.release").write_text(
+            f"{kernel_release}\n", encoding="utf-8"
+        )
+        kernel_link = modules_root / kernel_release / "build"
+        kernel_link.parent.mkdir(parents=True)
+        kernel_link.symlink_to(kernel_build, target_is_directory=True)
+        os_release = self.root / "os-release"
+        os_release.write_text("ID=ubuntu\n", encoding="utf-8")
+
+        artifact = self.root / "artifact"
+        artifact.mkdir()
+        module_source = artifact / "module.c"
+        unsigned_module = artifact / "zerofs.ko"
+        module_source.write_text(
+            "\n".join(
+                (
+                    '#define MODINFO(name, value) static const char name[] '
+                    '__attribute__((section(".modinfo"), used, aligned(1))) = value',
+                    'MODINFO(module_name, "name=zerofs");',
+                    f'MODINFO(vermagic, "vermagic={kernel_release} SMP");',
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["cc", "-c", "-o", unsigned_module, module_source],
+            check=True,
+        )
+
+        signing_key = self.root / "signing-key.pem"
+        signing_certificate = self.root / "signing-cert.pem"
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=ZeroFS fetcher test",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-keyout",
+                signing_key,
+                "-out",
+                signing_certificate,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        staged = self.root / "staged"
+        subprocess.run(
+            [
+                sys.executable,
+                str(STAGER),
+                "--manifest",
+                str(REPOSITORY / "packaging/kernel/kernels.lock.json"),
+                "--package-version",
+                package_version,
+                "--artifact",
+                f"{target['id']}={artifact}",
+                "--signer",
+                "kmodsign",
+                "--sign-key",
+                str(signing_key),
+                "--trusted-cert",
+                str(signing_certificate),
+                "--strip-tool",
+                "strip",
+                "--objcopy-tool",
+                "objcopy",
+                "--output",
+                str(staged),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        compressed_module = staged.joinpath(*relative_module.parts)
+        signed_module = self.root / "zerofs.signed.ko"
+        with signed_module.open("wb") as output:
+            subprocess.run(
+                ["xz", "--decompress", "--stdout", compressed_module],
+                check=True,
+                stdout=output,
+            )
+
+        def compress(module: Path, name: str) -> Path:
+            compressed = self.root / name
+            with compressed.open("wb") as output:
+                subprocess.run(
+                    ["xz", "--threads=1", "--stdout", module],
+                    check=True,
+                    stdout=output,
+                )
+            return compressed
+
+        tampered_module = self.root / "zerofs.tampered.ko"
+        tampered_bytes = bytearray(signed_module.read_bytes())
+        tampered_bytes[64] ^= 1
+        tampered_module.write_bytes(tampered_bytes)
+        tampered_compressed = compress(
+            tampered_module,
+            "zerofs.tampered.ko.xz",
+        )
+
+        trailer_module = self.root / "zerofs.bad-trailer.ko"
+        trailer_bytes = bytearray(signed_module.read_bytes())
+        signature_magic = b"~Module signature appended~\n"
+        trailer_start = (
+            len(trailer_bytes)
+            - len(signature_magic)
+            - stage_prebuilt_modules.SIGNATURE_TRAILER.size
+        )
+        trailer_bytes[trailer_start + 2] = 1
+        trailer_module.write_bytes(trailer_bytes)
+        trailer_compressed = compress(
+            trailer_module,
+            "zerofs.bad-trailer.ko.xz",
+        )
+
+        curl_log = self.root / "curl.log"
+        self.write_executable(
+            self.fake_bin / "curl",
+            """#!/usr/bin/env python3
+import os
+import pathlib
+import shutil
+import sys
+
+arguments = sys.argv[1:]
+if not arguments or arguments[0] != "--disable":
+    raise SystemExit(2)
+status = int(os.environ.get("FAKE_CURL_STATUS", "0"))
+if status:
+    raise SystemExit(status)
+output = pathlib.Path(arguments[arguments.index("--output") + 1])
+url = arguments[-1]
+with pathlib.Path(os.environ["CURL_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(f"{url}\\n")
+shutil.copyfile(os.environ["FAKE_MODULE"], output)
+""",
+        )
+        self.write_executable(
+            self.fake_bin / "dpkg",
+            """#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = --print-architecture ] || exit 2
+printf '%s\n' amd64
+""",
+        )
+        self.write_executable(
+            self.fake_bin / "dpkg-query",
+            f"""#!/bin/sh
+case $1 in
+    --search)
+        printf '%s\\n' 'diversion by local-kernel from: '"$2"
+        printf '%s\\n' 'diversion by local-kernel to: '"$2"
+        printf '%s: %s\\n' {header_package} "$2"
+        ;;
+    --show) printf '%s\\t%s\\n' {header_package} "$FAKE_HEADER_VERSION" ;;
+    *) exit 2 ;;
+esac
+""",
+        )
+        temporary_directory = self.root / "tmp"
+        destination_directory = self.root / "destination"
+        temporary_directory.mkdir()
+        destination_directory.mkdir()
+
+        def fetch(
+            header_version_value: str,
+            destination: Path,
+            *,
+            curl_status: int = 0,
+            module: Path = compressed_module,
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [str(FETCHER), kernel_release, package_version, destination],
+                env={
+                    **os.environ,
+                    "CURL_LOG": str(curl_log),
+                    "FAKE_CURL_STATUS": str(curl_status),
+                    "FAKE_HEADER_VERSION": header_version_value,
+                    "FAKE_MODULE": str(module),
+                    "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
+                    "TMPDIR": str(temporary_directory),
+                    "ZEROFS_MODULE_BASE_URL": module_base_url,
+                    "ZEROFS_MODULE_CERT_FILE": str(signing_certificate),
+                    "ZEROFS_MODULES_ROOT": str(modules_root),
+                    "ZEROFS_OS_RELEASE_FILE": str(os_release),
+                },
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        installed = destination_directory / "installed.ko"
+        result = fetch(header_version, installed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(installed.read_bytes(), signed_module.read_bytes())
+        self.assertEqual(curl_log.read_text(encoding="utf-8"), f"{expected_url}\n")
+
+        os_release.write_text(
+            'ID=linuxmint\nID_LIKE="ubuntu debian"\n', encoding="utf-8"
+        )
+        curl_log.write_text("", encoding="utf-8")
+        derivative = destination_directory / "derivative.ko"
+        result = fetch(header_version, derivative)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(derivative.read_bytes(), signed_module.read_bytes())
+        self.assertEqual(curl_log.read_text(encoding="utf-8"), f"{expected_url}\n")
+
+        rejected = destination_directory / "rejected.ko"
+        rejected.write_bytes(b"unchanged")
+        result = fetch(f"{header_version}+wrong", rejected)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("different publication identity", result.stderr)
+        self.assertEqual(rejected.read_bytes(), b"unchanged")
+        self.assertFalse(list(destination_directory.glob(".zerofs.ko.*")))
+
+        tampered = destination_directory / "tampered.ko"
+        result = fetch(header_version, tampered, module=tampered_compressed)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("valid ZeroFS signature", result.stderr)
+        self.assertFalse(tampered.exists())
+
+        bad_trailer = destination_directory / "bad-trailer.ko"
+        result = fetch(header_version, bad_trailer, module=trailer_compressed)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("signature is not PKCS#7", result.stderr)
+        self.assertFalse(bad_trailer.exists())
+
+        unavailable = destination_directory / "unavailable.ko"
+        result = fetch(header_version, unavailable, curl_status=60)
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertFalse(unavailable.exists())
 
     def test_delayed_builds_with_the_same_epoch_are_identical(self):
         environment = {
@@ -160,6 +524,71 @@ with tarfile.open(target, "w") as archive:
                 outputs[0].joinpath(filename).read_bytes(),
                 outputs[1].joinpath(filename).read_bytes(),
             )
+
+    def test_fetcher_serializes_rpm_epoch_without_a_colon(self):
+        kernel_release = "7.1.0-1.fc44.x86_64"
+        modules_root = self.root / "lib/modules"
+        kernel_build = self.root / "headers"
+        (kernel_build / "include/config").mkdir(parents=True)
+        (kernel_build / "include/config/kernel.release").write_text(
+            f"{kernel_release}\n", encoding="utf-8"
+        )
+        kernel_link = modules_root / kernel_release / "build"
+        kernel_link.parent.mkdir(parents=True)
+        kernel_link.symlink_to(kernel_build, target_is_directory=True)
+        os_release = self.root / "os-release"
+        os_release.write_text("ID=fedora\n", encoding="utf-8")
+        curl_log = self.root / "rpm-curl.log"
+        self.write_executable(
+            self.fake_bin / "curl",
+            """#!/bin/sh
+for argument do last=$argument; done
+printf '%s\n' "$last" >"$CURL_LOG"
+exit 22
+""",
+        )
+        self.write_executable(
+            self.fake_bin / "rpm",
+            """#!/bin/sh
+case " $* " in
+    *' --query --file '*)
+        printf '%s\t%s\t%s\t%s\n' kernel-devel 0 7.1.0 1.fc44
+        ;;
+    *' --eval '*) printf '%s\n' x86_64 ;;
+    *) exit 2 ;;
+esac
+""",
+        )
+        destination = self.root / "destination/zerofs.ko"
+        destination.parent.mkdir()
+        result = subprocess.run(
+            [str(FETCHER), kernel_release, "2.2.3-2", destination],
+            env={
+                **os.environ,
+                "CURL_LOG": str(curl_log),
+                "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ZEROFS_MODULE_BASE_URL": "https://modules.test/kernel-modules",
+                "ZEROFS_MODULE_CERT_FILE": str(
+                    REPOSITORY
+                    / "packaging/kernel/zerofs-module-signing-cert.pem"
+                ),
+                "ZEROFS_MODULES_ROOT": str(modules_root),
+                "ZEROFS_OS_RELEASE_FILE": str(os_release),
+            },
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(
+            curl_log.read_text(encoding="utf-8"),
+            "https://modules.test/kernel-modules/v1/fedora/x86_64/"
+            "kernel-devel/0@7.1.0-1.fc44/7.1.0-1.fc44.x86_64/"
+            "2.2.3-2/zerofs.ko.xz\n",
+        )
+        self.assertFalse(destination.exists())
 
     def test_timestamp_normalization_covers_files_and_directories(self):
         staging = self.root / "staging"
@@ -345,12 +774,6 @@ exit 1
 
         self.assertEqual(result.returncode, 75)
         self.assertIn("does not match 7.0.1-28-generic", result.stderr)
-        self.assertEqual(
-            (self.root / "extracted.source-unavailable").read_text(
-                encoding="utf-8"
-            ),
-            "7.0.1-28-generic\n",
-        )
 
     def test_source_resolver_rejects_unknown_package_revision(self):
         archive = self.source_archive(package_version="7.0.1-28.28")
@@ -388,7 +811,7 @@ exit 1
         source, _ = result.stdout.rstrip("\n").split("\t")
         self.assertIn("/good/", source)
 
-    def test_source_resolver_rejects_header_package_revision_mismatch(self):
+    def test_source_resolver_skips_diversions_then_checks_package_revision(self):
         archive = self.source_archive(package_version="7.0.1-28.28")
         fake_dpkg = self.fake_bin / "dpkg-query"
         self.write_executable(
@@ -396,6 +819,8 @@ exit 1
             """#!/bin/sh
 case $1 in
     -S)
+        printf 'diversion by local-kernel from: %s\n' "$2"
+        printf 'diversion by local-kernel to: %s\n' "$2"
         case $2 in
             */include/config/kernel.release)
                 printf 'linux-headers-test: %s\\n' "$2" ;;
@@ -651,7 +1076,7 @@ esac
             commands,
         )
 
-    def test_postinstall_skips_kernel_below_floor_and_builds_newer_kernel(self):
+    def test_postinstall_skips_kernel_below_floor_and_builds_next(self):
         script = self.render_postinstall()
         for kernel in ("6.17.12-old", "99.0.1-new"):
             (self.root / f"lib/modules/{kernel}/build").mkdir(parents=True)
@@ -705,128 +1130,6 @@ esac
             commands,
         )
 
-    def test_postinstall_skips_kernel_without_exact_source(self):
-        script = self.render_postinstall()
-        for kernel in ("7.0.1-old", "7.0.2-new"):
-            (self.root / f"lib/modules/{kernel}/build").mkdir(parents=True)
-        fake_uname = self.fake_bin / "uname"
-        self.write_executable(
-            fake_uname,
-            "#!/bin/sh\nprintf '%s\\n' 7.0.1-old\n",
-        )
-        fake_dkms = self.fake_bin / "dkms"
-        self.write_executable(
-            fake_dkms,
-            """#!/bin/sh
-printf '%s\\n' "$*" >>"$DKMS_LOG"
-case $1 in
-    status) exit 0 ;;
-    add|install) exit 0 ;;
-    build)
-        case " $* " in
-            *' -k 7.0.1-old '*)
-                mkdir -p "${SOURCE_UNAVAILABLE_MARKER%/*}"
-                printf '%s\\n' 7.0.1-old >"$SOURCE_UNAVAILABLE_MARKER"
-                exit 10
-                ;;
-            *) exit 0 ;;
-        esac
-        ;;
-    *) exit 2 ;;
-esac
-""",
-        )
-        log = self.root / "dkms-old-source.log"
-        marker = (
-            self.root
-            / "var/lib/dkms/zerofs/1.4.1-3/build/dkms-kernel-source"
-            / "7.0.1-old.source-unavailable"
-        )
-
-        result = self.run_postinstall(
-            script,
-            extra_environment={
-                "DKMS_LOG": str(log),
-                "SOURCE_UNAVAILABLE_MARKER": str(marker),
-            },
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("skipping kernel 7.0.1-old", result.stderr)
-        self.assertFalse(marker.exists())
-        commands = log.read_text(encoding="utf-8").splitlines()
-        self.assertIn(
-            "build -m zerofs -v 1.4.1-3 -k 7.0.1-old",
-            commands,
-        )
-        self.assertNotIn(
-            "install -m zerofs -v 1.4.1-3 -k 7.0.1-old",
-            commands,
-        )
-        self.assertIn(
-            "build -m zerofs -v 1.4.1-3 -k 7.0.2-new",
-            commands,
-        )
-        self.assertIn(
-            "install -m zerofs -v 1.4.1-3 -k 7.0.2-new",
-            commands,
-        )
-
-    def test_postinstall_skips_current_kernel_without_exact_source(self):
-        script = self.render_postinstall()
-        kernel = "7.0.2-current"
-        (self.root / f"lib/modules/{kernel}/build").mkdir(parents=True)
-        fake_uname = self.fake_bin / "uname"
-        self.write_executable(
-            fake_uname,
-            f"#!/bin/sh\nprintf '%s\\n' {kernel}\n",
-        )
-        fake_dkms = self.fake_bin / "dkms"
-        self.write_executable(
-            fake_dkms,
-            """#!/bin/sh
-printf '%s\\n' "$*" >>"$DKMS_LOG"
-case $1 in
-    status) exit 0 ;;
-    add|install) exit 0 ;;
-    build)
-        mkdir -p "${SOURCE_UNAVAILABLE_MARKER%/*}"
-        printf '%s\\n' 7.0.2-current >"$SOURCE_UNAVAILABLE_MARKER"
-        exit 10
-        ;;
-    *) exit 2 ;;
-esac
-""",
-        )
-        log = self.root / "dkms-current-source.log"
-        marker = (
-            self.root
-            / "var/lib/dkms/zerofs/1.4.1-3/build/dkms-kernel-source"
-            / f"{kernel}.source-unavailable"
-        )
-
-        result = self.run_postinstall(
-            script,
-            extra_environment={
-                "DKMS_LOG": str(log),
-                "SOURCE_UNAVAILABLE_MARKER": str(marker),
-            },
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"skipping kernel {kernel}", result.stderr)
-        self.assertIn("run dkms autoinstall", result.stderr)
-        self.assertFalse(marker.exists())
-        commands = log.read_text(encoding="utf-8").splitlines()
-        self.assertIn(
-            f"build -m zerofs -v 1.4.1-3 -k {kernel}",
-            commands,
-        )
-        self.assertNotIn(
-            f"install -m zerofs -v 1.4.1-3 -k {kernel}",
-            commands,
-        )
-
     def test_postinstall_keeps_selected_kernel_failure_fatal(self):
         script = self.render_postinstall()
         fake_dkms = self.fake_bin / "dkms"
@@ -835,11 +1138,7 @@ esac
             """#!/bin/sh
 case $1 in
     status|add) exit 0 ;;
-    build)
-        mkdir -p "${SOURCE_UNAVAILABLE_MARKER%/*}"
-        printf '%s\\n' 7.0.2-new >"$SOURCE_UNAVAILABLE_MARKER"
-        exit 10
-        ;;
+    build) exit 77 ;;
     *) exit 2 ;;
 esac
 """,
@@ -849,11 +1148,6 @@ esac
             script,
             extra_environment={
                 "ZEROFS_DKMS_KERNEL": "7.0.2-new",
-                "SOURCE_UNAVAILABLE_MARKER": str(
-                    self.root
-                    / "var/lib/dkms/zerofs/1.4.1-3/build/dkms-kernel-source"
-                    / "7.0.2-new.source-unavailable"
-                ),
             },
         )
 
@@ -927,6 +1221,17 @@ esac
 
         for tool in ("rustc", "rustfmt", "bindgen", "gcc"):
             self.write_executable(self.fake_bin / tool, "#!/bin/sh\nexit 0\n")
+        self.write_executable(
+            self.fake_bin / "modinfo",
+            f"""#!/bin/sh
+[ "$1" = -F ] || exit 2
+case $2 in
+    name) printf '%s\n' zerofs ;;
+    vermagic) printf '%s\n' '{kernel_release} SMP' ;;
+    *) exit 2 ;;
+esac
+""",
+        )
         fake_make = self.fake_bin / "make"
         self.write_executable(
             fake_make,
@@ -955,7 +1260,7 @@ esac
         make_log = self.root / "make.log"
 
         subprocess.run(
-            [str(wrapper), kernel_release],
+            [str(wrapper), kernel_release, "1.4.1-3"],
             env={
                 **os.environ,
                 "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
@@ -963,6 +1268,7 @@ esac
                 "MAKE_LOG": str(make_log),
                 "ZEROFS_BINDGEN": str(self.fake_bin / "bindgen"),
                 "ZEROFS_BUILD_JOBS": "1",
+                "ZEROFS_DISABLE_PREBUILT": "1",
                 "ZEROFS_RUSTC": str(self.fake_bin / "rustc"),
                 "ZEROFS_RUSTFMT": str(self.fake_bin / "rustfmt"),
                 "ZEROFS_TARGET_CC": str(self.fake_bin / "gcc"),
@@ -977,6 +1283,170 @@ esac
         module_command = next(command for command in commands if " modules" in command)
         self.assertIn("CONFIG_COMPAT_VDSO=", metadata_command)
         self.assertNotIn("CONFIG_COMPAT_VDSO=", module_command)
+
+    def test_unpublished_module_without_source_fallback_is_fatal(self):
+        wrapper_root = self.root / "missing-tool-wrapper"
+        wrapper_root.mkdir()
+        wrapper = wrapper_root / "dkms-build"
+        self.write_executable(
+            wrapper,
+            (REPOSITORY / "packaging/kernel/scripts/dkms-build.sh")
+            .read_text(encoding="utf-8")
+            .replace("/lib/modules", str(self.root / "lib/modules")),
+        )
+        (wrapper_root / "kernel").mkdir()
+        self.write_executable(
+            wrapper_root / "dkms-fetch-module",
+            "#!/bin/sh\nexit 75\n",
+        )
+
+        kernel_release = "7.0.3-missing-tool"
+        kernel_build = self.root / f"lib/modules/{kernel_release}/build"
+        (kernel_build / "include/config").mkdir(parents=True)
+        (kernel_build / "include/config/auto.conf").write_text(
+            "CONFIG_MODULES=y\n"
+            "CONFIG_RUST=y\n"
+            "CONFIG_RUSTC_VERSION_TEXT=\"rustc 99.99.99 test\"\n",
+            encoding="utf-8",
+        )
+        (kernel_build / "include/config/kernel.release").write_text(
+            f"{kernel_release}\n",
+            encoding="utf-8",
+        )
+        (kernel_build / "Module.symvers").write_text(
+            "symbols\n", encoding="utf-8"
+        )
+
+        result = subprocess.run(
+            [str(wrapper), kernel_release, "1.4.1-3"],
+            env={
+                **os.environ,
+                "PATH": "/usr/bin:/bin",
+            },
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("source fallback unavailable", result.stderr)
+
+    def test_prebuilt_wrapper_succeeds_without_source_build_inputs(self):
+        wrapper_root = self.root / "prebuilt-wrapper"
+        wrapper_root.mkdir()
+        wrapper = wrapper_root / "dkms-build"
+        self.write_executable(
+            wrapper,
+            (REPOSITORY / "packaging/kernel/scripts/dkms-build.sh")
+            .read_text(encoding="utf-8")
+            .replace("/lib/modules", str(self.root / "lib/modules")),
+        )
+        (wrapper_root / "kernel").mkdir()
+        self.write_executable(
+            wrapper_root / "dkms-fetch-module",
+            """#!/bin/sh
+printf '%s\n' prebuilt >"$3"
+""",
+        )
+
+        kernel_release = "7.0.4-prebuilt"
+        kernel_build = self.root / f"lib/modules/{kernel_release}/build"
+        (kernel_build / "include/config").mkdir(parents=True)
+        (kernel_build / "include/config/kernel.release").write_text(
+            f"{kernel_release}\n",
+            encoding="utf-8",
+        )
+        runtime_bin = self.root / "prebuilt-runtime-bin"
+        runtime_bin.mkdir()
+        for command in ("bash", "dirname", "install", "realpath", "rm"):
+            executable = shutil.which(command)
+            self.assertIsNotNone(executable)
+            (runtime_bin / command).symlink_to(executable)
+
+        result = subprocess.run(
+            [str(wrapper), kernel_release, "1.4.1-3"],
+            env={**os.environ, "PATH": str(runtime_bin)},
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (wrapper_root / "dkms-output/zerofs.ko").read_text(encoding="utf-8"),
+            "prebuilt\n",
+        )
+
+    def test_failed_build_removes_a_partial_module(self):
+        wrapper_root = self.root / "partial-wrapper"
+        wrapper_root.mkdir()
+        wrapper = wrapper_root / "dkms-build"
+        self.write_executable(
+            wrapper,
+            (REPOSITORY / "packaging/kernel/scripts/dkms-build.sh")
+            .read_text(encoding="utf-8")
+            .replace("/lib/modules", str(self.root / "lib/modules")),
+        )
+        (wrapper_root / "kernel").mkdir()
+        self.write_executable(
+            wrapper_root / "dkms-fetch-module",
+            "#!/bin/sh\nexit 75\n",
+        )
+
+        kernel_release = "7.0.4-partial"
+        kernel_build = self.root / f"lib/modules/{kernel_release}/build"
+        (kernel_build / "include/config").mkdir(parents=True)
+        (kernel_build / "rust").mkdir()
+        (kernel_build / "include/config/auto.conf").write_text(
+            "CONFIG_CC_IS_GCC=y\nCONFIG_MODULES=y\nCONFIG_RUST=y\n",
+            encoding="utf-8",
+        )
+        (kernel_build / "include/config/kernel.release").write_text(
+            f"{kernel_release}\n",
+            encoding="utf-8",
+        )
+        (kernel_build / "Module.symvers").write_text(
+            "symbols\n", encoding="utf-8"
+        )
+        (kernel_build / "rust/libkernel.rmeta").write_text(
+            "metadata\n", encoding="utf-8"
+        )
+        for tool in ("rustc", "rustfmt", "bindgen", "gcc"):
+            self.write_executable(self.fake_bin / tool, "#!/bin/sh\nexit 0\n")
+        self.write_executable(
+            self.fake_bin / "make",
+            """#!/bin/sh
+for argument in "$@"; do
+    case $argument in MO=*) output=${argument#MO=} ;; esac
+done
+mkdir -p "$output"
+printf '%s\n' partial >"$output/zerofs.ko"
+exit 1
+""",
+        )
+
+        result = subprocess.run(
+            [str(wrapper), kernel_release, "1.4.1-3"],
+            env={
+                **os.environ,
+                "PATH": f"{self.fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ZEROFS_BINDGEN": str(self.fake_bin / "bindgen"),
+                "ZEROFS_BUILD_JOBS": "1",
+                "ZEROFS_DISABLE_PREBUILT": "1",
+                "ZEROFS_RUSTC": str(self.fake_bin / "rustc"),
+                "ZEROFS_RUSTFMT": str(self.fake_bin / "rustfmt"),
+                "ZEROFS_TARGET_CC": str(self.fake_bin / "gcc"),
+            },
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((wrapper_root / "dkms-output/zerofs.ko").exists())
 
 
 if __name__ == "__main__":

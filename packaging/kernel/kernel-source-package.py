@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Build architecture-independent ZeroFS source-DKMS packages."""
+"""Build architecture-independent ZeroFS kernel-client packages."""
 
 from __future__ import annotations
 
@@ -18,7 +18,9 @@ from pathlib import Path
 
 PACKAGE_NAME = "zerofs-kernel-client"
 PACKAGE_LICENSE = "AGPL-3.0"
-PACKAGE_REVISION = 1
+# Repository packages are immutable. An old release may therefore be repacked
+# with newer packaging tooling only under an explicit higher revision.
+PACKAGE_REVISION_OVERRIDES = {"2.2.3": 2}
 DKMS_MODULE = "zerofs"
 FAMILY_ARCHITECTURES = {"deb": "all", "rpm": "noarch"}
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -27,57 +29,20 @@ SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~:-]*$")
 DEB_DEPENDENCIES = (
     "dkms (>= 3.0.11)",
     "kmod",
-    "build-essential",
-    "binutils",
-    "bc",
-    "bison",
-    "bzip2",
-    "flex",
-    "gzip",
-    "rustc",
-    "rust-src",
-    "rustfmt",
-    "bindgen",
-    "clang",
-    "llvm",
-    "lld",
+    "ca-certificates",
+    "curl",
     "python3",
-    "libelf-dev",
-    "libdw-dev",
-    "libssl-dev",
     "openssl",
-    "dwarves",
     "xz-utils",
-    "zstd",
 )
 RPM_DEPENDENCIES = (
     "dkms >= 3.0.11",
     "kmod",
-    "make",
-    "gcc",
-    "gzip",
-    "binutils",
-    "bc",
-    "bison",
-    "bzip2",
-    "flex",
-    "rust",
-    "rust-src",
-    "/usr/bin/rustfmt",
-    "(bindgen-cli or rust-bindgen)",
-    "clang",
-    "llvm",
-    "lld",
+    "ca-certificates",
+    "curl",
     "python3",
-    "(elfutils-libelf-devel or libelf-devel)",
-    "(elfutils-devel or libdw-devel)",
-    "(openssl-devel or libopenssl-devel)",
     "openssl",
-    "dwarves",
-    "findutils",
-    "tar",
     "xz",
-    "zstd",
 )
 
 
@@ -130,8 +95,12 @@ def source_date_epoch(source_root: Path) -> int:
     return int(value)
 
 
+def package_revision(version: str) -> int:
+    return PACKAGE_REVISION_OVERRIDES.get(version, 1)
+
+
 def package_version(version: str) -> str:
-    return f"{version}-{PACKAGE_REVISION}"
+    return f"{version}-{package_revision(version)}"
 
 
 def package_filename(family: str, version: str) -> str:
@@ -149,11 +118,15 @@ def dkms_configuration(version: str) -> str:
             f'PACKAGE_NAME="{DKMS_MODULE}"',
             f'PACKAGE_VERSION="{version}"',
             'BUILD_EXCLUSIVE_KERNEL_MIN="6.18"',
-            'MAKE[0]="./dkms-build $kernelver"',
+            '# DKMS 3.0.11 ignores PRE_BUILD failures; run the wrapper as MAKE.',
+            f'MAKE[0]="./dkms-build $kernelver {version}"',
+            '# Prebuilt installs do not need make, so suppress DKMS\'s default clean.',
+            'CLEAN="/bin/true"',
             'BUILT_MODULE_NAME[0]="zerofs"',
             'BUILT_MODULE_LOCATION[0]="dkms-output"',
             'DEST_MODULE_LOCATION[0]="/kernel/fs/zerofs"',
             'NO_WEAK_MODULES="yes"',
+            'STRIP[0]="no"',
             'AUTOINSTALL="yes"',
             "",
         )
@@ -200,11 +173,19 @@ def stage_source_tree(
     scripts = Path(__file__).with_name("scripts")
     for source_name, destination_name in (
         ("dkms-build.sh", "dkms-build"),
+        ("dkms-fetch-module.sh", "dkms-fetch-module"),
         ("dkms-find-kernel-source.sh", "dkms-find-kernel-source"),
     ):
         output = destination / destination_name
         shutil.copyfile(scripts / source_name, output)
         output.chmod(0o755)
+    signing_certificate = Path(__file__).with_name(
+        "zerofs-module-signing-cert.pem"
+    )
+    certificate_destination = destination / signing_certificate.name
+    shutil.copyfile(signing_certificate, certificate_destination)
+    certificate_destination.chmod(0o644)
+    (destination / "zerofs-module-layout").write_text("v1\n", encoding="ascii")
     configuration = destination / "dkms.conf"
     configuration.write_text(
         dkms_configuration(version),
@@ -245,14 +226,14 @@ def write_nfpm_configuration(
         f"arch: {yaml_string(FAMILY_ARCHITECTURES[family])}",
         "platform: linux",
         f"version: {yaml_string(version)}",
-        f"release: {PACKAGE_REVISION}",
+        f"release: {package_revision(version)}",
         "section: kernel",
         "priority: optional",
         "maintainer: Pierre Barre <pierre@zerofs.net>",
         "description: |",
-        "  ZeroFS native kernel client source.",
-        "  DKMS builds for the running and newest header-backed kernels at",
-        "  installation, then follows future kernel-install hooks.",
+        "  ZeroFS native kernel client managed by DKMS.",
+        "  Installs verified exact-kernel modules when published and retains",
+        "  a best-effort source-build fallback.",
         "vendor: ZeroFS",
         "homepage: https://www.zerofs.net",
         f"license: {yaml_string(PACKAGE_LICENSE)}",
@@ -352,10 +333,11 @@ def build_family_package(
 def build_source_packages(
     *,
     output_directory: Path,
+    source_root: Path | None = None,
 ) -> None:
     if shutil.which("nfpm") is None:
         fail("nfpm is required to build kernel client packages")
-    root = validate_source_root(repository_root())
+    root = validate_source_root(source_root or repository_root())
     version = repository_version(root)
     epoch = source_date_epoch(root)
     if output_directory.is_symlink():
@@ -376,13 +358,19 @@ def build_source_packages(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build ZeroFS source-DKMS repository packages.",
+        description="Build ZeroFS kernel-client repository packages.",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        help="release source checkout; defaults to the repository root",
+    )
     arguments = parser.parse_args()
     try:
         build_source_packages(
             output_directory=arguments.output,
+            source_root=arguments.source_root,
         )
     except (PackageError, OSError, subprocess.CalledProcessError) as error:
         print(f"kernel-source-package.py: {error}", file=sys.stderr)

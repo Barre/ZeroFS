@@ -28,7 +28,7 @@ ZeroFS differentiates itself from other "filesystem on S3" projects by:
 
 | | |
 |---|---|
-| **File access** | NFS and 9P servers. Use the native kernel client when DKMS can build it for the installed kernel, or `zerofs mount` as a fallback. |
+| **File access** | NFS and 9P servers. Use the native kernel client when DKMS can install it for the running kernel, or `zerofs mount` as a fallback. |
 | **Block access** | NBD devices with TRIM. FLUSH and FUA replies return only after data is durable. |
 | **Encryption** | Extents are encrypted with XChaCha20-Poly1305. Data key wrapped via Argon2id. |
 | **Compression** | zstd or lz4, before encryption. Codec changeable at any time without migration. |
@@ -259,7 +259,7 @@ sudo mount -t zerofs 127.0.0.1:5564 /mnt/zerofs
 sudo mount -t zerofs /tmp/zerofs.9p.sock /mnt/zerofs
 ```
 
-Source-DKMS packages, compatibility, and mount options:
+Kernel-client packages, compatibility, and mount options:
 [native kernel client](https://www.zerofs.net/kernel-client).
 
 ### `zerofs mount` (FUSE fallback)

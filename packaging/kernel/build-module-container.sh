@@ -16,7 +16,7 @@ usage: $script_name DISTRO RELEASE KERNEL_RELEASE KERNEL_PACKAGE_VERSION \
 SOURCE_IDENTITY SNAPSHOT APT_SUITE
 
 This is the container-side implementation used by build-target.sh. The
-source-DKMS package must be mounted at /zerofs-source-package.deb or
+kernel-client package must be mounted at /zerofs-source-package.deb or
 /zerofs-source-package.rpm, and an empty output directory at $output_root.
 EOF
 }
@@ -887,6 +887,13 @@ build_source_package_module() {
     local resolved_installed_module
     local package_version
 
+    # Release modules receive one stable vendor signature before the final
+    # exact-byte boot test. Prevent distro DKMS from appending an ephemeral
+    # build-container MOK signature first.
+    install -d -m 0755 /etc/dkms/framework.conf.d
+    printf '%s\n' 'sign_file="/bin/true"' \
+        >/etc/dkms/framework.conf.d/zerofs-ci-unsigned.conf
+
     if [[ "$distro" == ubuntu || "$distro" == debian ]]; then
         install_apt_rust_tools "$auto_conf"
     fi
@@ -897,6 +904,10 @@ build_source_package_module() {
     fi
 
     export ZEROFS_DKMS_KERNEL=$kernel_release
+    # Exact-target CI exercises the real local-build fallback.  Release
+    # publication later signs this boot-tested module centrally; it must not
+    # depend on, or accidentally consume, an already published object.
+    export ZEROFS_DISABLE_PREBUILT=1
     module="$output_root/module/zerofs.ko"
     install -d -m 0755 "${module%/*}"
     export ZEROFS_RUSTC=$rustc
@@ -929,7 +940,7 @@ build_source_package_module() {
         *) die "unsupported package target: $distro" ;;
     esac
     [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$ ]] ||
-        die "source-DKMS package has an unsafe version: $package_version"
+        die "kernel-client package has an unsafe version: $package_version"
     case $distro in
         ubuntu | debian)
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -954,7 +965,7 @@ build_source_package_module() {
     fi
     installed_source="/usr/src/zerofs-$package_version/kernel"
     [[ -d "$installed_source" && ! -L "$installed_source" ]] ||
-        die "installed source-DKMS package has no regular kernel source tree"
+        die "installed kernel-client package has no regular kernel source tree"
     make -C "$installed_source" \
         "KDIR=$kdir" \
         "RUSTC=$rustc" \
@@ -1218,7 +1229,7 @@ case $container_machine in
         ;;
 esac
 [[ -f "$source_package" && ! -L "$source_package" ]] ||
-    die "source-DKMS package is not a regular file: $source_package"
+    die "kernel-client package is not a regular file: $source_package"
 
 [[ -d "$output_root" ]] ||
     die "output directory is not mounted at $output_root"

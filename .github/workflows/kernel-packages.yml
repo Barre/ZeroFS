@@ -3,12 +3,28 @@ name: kernel-packages
 on:
   workflow_call:
     inputs:
-      checkout-ref:
-        description: Immutable source and tooling ref; defaults to the event commit
+      source-ref:
+        description: Immutable ZeroFS source ref; defaults to the event commit
         type: string
+      publish-modules:
+        description: Publish signed, boot-tested modules to R2
+        type: boolean
+        default: false
+      source-package-artifact:
+        description: Existing DKMS package artifact; empty builds one
+        type: string
+    secrets:
+      KERNEL_MODULE_SIGNING_KEY:
+        required: false
+      R2_ACCESS_KEY_ID:
+        required: false
+      R2_ACCOUNT_ID:
+        required: false
+      R2_SECRET_ACCESS_KEY:
+        required: false
     outputs:
       package-version:
-        description: Version read from the audited source-DKMS packages
+        description: Version read from the audited kernel-client packages
         value: ${{ jobs.source-package.outputs.package_version }}
 
 permissions:
@@ -16,7 +32,7 @@ permissions:
 
 jobs:
   source-package:
-    name: Build source-DKMS packages
+    name: Prepare kernel-client packages
     runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.resolve.outputs.matrix }}
@@ -24,37 +40,70 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          path: tooling
           persist-credentials: false
-          ref: ${{ inputs.checkout-ref || github.sha }}
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: ${{ inputs.source-package-artifact == '' }}
+        with:
+          path: source
+          persist-credentials: false
+          ref: ${{ inputs.source-ref || github.sha }}
+
+      - name: Install validation and package audit tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils cpio docker.io gcc kmod openssl rpm sbsigntool xz-utils
+          sudo systemctl start docker
+          docker version
 
       - name: Validate kernel tooling and resolve targets
         id: resolve
-        run: .github/scripts/kernel-packages/resolve.sh
+        run: tooling/.github/scripts/kernel-packages/resolve.sh
 
-      - name: Install package tools
+      - name: Install package builder
+        if: ${{ inputs.source-package-artifact == '' }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cpio docker.io rpm
-          sudo systemctl start docker
-          docker version
-          .github/scripts/install-nfpm.sh
+          tooling/.github/scripts/install-nfpm.sh
 
-      - name: Build source-DKMS packages
-        run: packaging/kernel/kernel-source-package.py --output staged
+      - name: Build kernel-client packages
+        if: ${{ inputs.source-package-artifact == '' }}
+        run: |
+          tooling/packaging/kernel/kernel-source-package.py \
+            --source-root source \
+            --output staged
 
-      - name: Audit source-DKMS packages
+      - name: Download published kernel-client packages
+        if: ${{ inputs.source-package-artifact != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.source-package-artifact }}
+          path: staged
+
+      - name: Audit kernel-client packages
         id: audit
         run: |
-          version=$(kernel/ci/dkms-package-smoke.py \
+          version=$(tooling/kernel/ci/dkms-package-smoke.py \
+            --certificate-output audited/zerofs-module-signing-cert.pem \
             staged/deb/*.deb staged/rpm/*.rpm)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Install and remove source-DKMS packages
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.publish-modules }}
+        with:
+          name: zerofs-kernel-package-metadata
+          path: audited
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Install and remove kernel-client packages
         run: |
-          kernel/ci/dkms-package-install-smoke.sh \
+          tooling/kernel/ci/dkms-package-install-smoke.sh \
             staged/deb/*.deb staged/rpm/*.rpm
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.source-package-artifact == '' }}
         with:
           name: zerofs-kernel-source-packages
           path: staged
@@ -74,12 +123,12 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          path: tooling
           persist-credentials: false
-          ref: ${{ inputs.checkout-ref || github.sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: zerofs-kernel-source-packages
+          name: ${{ inputs.source-package-artifact || 'zerofs-kernel-source-packages' }}
           path: kernel-packages
 
       - name: Install target-build tools
@@ -92,8 +141,8 @@ jobs:
 
       - name: Install and build the source package
         run: |
-          packaging/kernel/build-target.sh \
-            --manifest packaging/kernel/kernels.lock.json \
+          tooling/packaging/kernel/build-target.sh \
+            --manifest tooling/packaging/kernel/kernels.lock.json \
             --target-id "${{ matrix.id }}" \
             --source-package kernel-packages \
             --output-dir "$ZEROFS_KERNEL_ARTIFACT_DIR"
@@ -107,15 +156,105 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Upload unsigned module
+        if: ${{ success() && inputs.publish-modules }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zerofs-unsigned-module-${{ matrix.id }}
+          path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}/zerofs.ko
+          if-no-files-found: error
+          retention-days: 3
+
+  stage-modules:
+    name: Sign and stage kernel modules
+    needs: [source-package, target]
+    if: ${{ success() && inputs.publish-modules }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      LC_ALL: C
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: zerofs-unsigned-module-*
+          path: kernel-artifacts
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: zerofs-kernel-package-metadata
+          path: package-metadata
+
+      - name: Install signing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq kmod llvm openssl sbsigntool xz-utils
+
+      - name: Sign and stage exact modules
+        env:
+          MATRIX: ${{ needs.source-package.outputs.matrix }}
+          PACKAGE_VERSION: ${{ needs.source-package.outputs.package_version }}
+          SIGNING_KEY_PEM: ${{ secrets.KERNEL_MODULE_SIGNING_KEY }}
+        run: |
+          signing_dir="$RUNNER_TEMP/zerofs-module-signing"
+          install -d -m 0700 "$signing_dir"
+          key_file="$signing_dir/key.pem"
+          key_public="$signing_dir/key.pub"
+          cert_public="$signing_dir/cert.pub"
+          trap 'rm -f -- "$key_file" "$key_public" "$cert_public"' EXIT
+          umask 077
+          printf '%s\n' "$SIGNING_KEY_PEM" > "$key_file"
+
+          openssl pkey -in "$key_file" -pubout -out "$key_public"
+          openssl x509 \
+            -in package-metadata/zerofs-module-signing-cert.pem \
+            -pubkey -noout > "$cert_public"
+          cmp -s -- "$key_public" "$cert_public" || {
+            echo 'module-signing secret does not match the packaged certificate' >&2
+            exit 1
+          }
+
+          artifact_args=()
+          while IFS= read -r target; do
+            directory="kernel-artifacts/zerofs-unsigned-module-$target"
+            artifact_args+=(--artifact "$target=$directory")
+          done < <(jq -er '.include[].id' <<< "$MATRIX")
+
+          tooling/packaging/kernel/stage-prebuilt-modules.py \
+            --manifest tooling/packaging/kernel/kernels.lock.json \
+            --package-version "$PACKAGE_VERSION" \
+            "${artifact_args[@]}" \
+            --signer /usr/bin/kmodsign \
+            --sign-key "$key_file" \
+            --trusted-cert \
+              package-metadata/zerofs-module-signing-cert.pem \
+            --strip-tool llvm-strip \
+            --objcopy-tool llvm-objcopy \
+            --output staged
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zerofs-signed-kernel-modules
+          path: staged
+          if-no-files-found: error
+          retention-days: 3
+
   smoke:
     name: Kernel boot (${{ matrix.id }})
-    needs: [source-package, target]
+    needs: [source-package, target, stage-modules]
     if: >-
       ${{
+        always() &&
         !cancelled() &&
         needs.source-package.result == 'success' &&
         (needs.target.result == 'success' ||
-         needs.target.result == 'failure')
+         needs.target.result == 'failure') &&
+        (!inputs.publish-modules || needs.stage-modules.result == 'success')
       }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -127,13 +266,19 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          path: tooling
           persist-credentials: false
-          ref: ${{ inputs.checkout-ref || github.sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: zerofs-kernel-${{ matrix.id }}
           path: ${{ env.ZEROFS_KERNEL_ARTIFACT_DIR }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: ${{ inputs.publish-modules }}
+        with:
+          name: zerofs-signed-kernel-modules
+          path: signed
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -150,12 +295,144 @@ jobs:
           chmod +x zerofs/target/ci/zerofs
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils cpio kmod "$qemu_package"
+            binutils cpio jq kmod xz-utils "$qemu_package"
+
+      - name: Select the signed module
+        if: ${{ inputs.publish-modules }}
+        env:
+          TARGET_ID: ${{ matrix.id }}
+        run: |
+          module_path=$(
+            jq -er --arg target "$TARGET_ID" '
+              [.modules[] | select(.target_id == $target)] |
+              if length == 1 then .[0].path
+              else error("expected exactly one module for " + $target)
+              end
+            ' signed/manifest.json
+          )
+          [[ "$module_path" =~ ^kernel-modules/v1/[A-Za-z0-9._+~@/-]+/zerofs\.ko\.xz$ &&
+             "$module_path" != *//* &&
+             "/$module_path/" != */../* &&
+             "/$module_path/" != */./* ]]
+          compressed="signed/$module_path"
+          [[ -f "$compressed" && ! -L "$compressed" ]]
+          candidate="$ZEROFS_KERNEL_ARTIFACT_DIR/.zerofs.signed.ko"
+          xz --decompress --stdout -- "$compressed" > "$candidate"
+          install -m 0644 -- "$candidate" \
+            "$ZEROFS_KERNEL_ARTIFACT_DIR/zerofs.ko"
+          rm -f -- "$candidate"
 
       - name: Load and exercise ZeroFS
         run: |
-          kernel/ci/module-smoke.sh artifact \
-            packaging/kernel/kernels.lock.json \
+          tooling/kernel/ci/module-smoke.sh artifact \
+            tooling/packaging/kernel/kernels.lock.json \
             "${{ matrix.id }}" \
             "$ZEROFS_KERNEL_ARTIFACT_DIR" \
             zerofs/target/ci/zerofs
+
+  publish-modules:
+    name: Publish signed kernel modules
+    needs: smoke
+    if: ${{ success() && inputs.publish-modules }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    concurrency:
+      group: release-packages
+      cancel-in-progress: false
+      queue: max
+    env:
+      LC_ALL: C
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: zerofs-signed-kernel-modules
+          path: staged
+
+      - name: Install publishing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl rclone
+
+      - name: Publish immutable module objects
+        env:
+          CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          CONFIG_R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          CONFIG_R2_BUCKET: ${{ vars.R2_BUCKET }}
+          CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CONFIG_REPO_BASE_URL: ${{ vars.REPO_BASE_URL }}
+        run: |
+          [[ "$CONFIG_R2_ACCOUNT_ID" =~ ^[A-Fa-f0-9]{32}$ ]]
+          [[ "$CONFIG_R2_ACCESS_KEY_ID" =~ ^[A-Za-z0-9]{16,128}$ ]]
+          [[ ${#CONFIG_R2_SECRET_ACCESS_KEY} -ge 32 &&
+             ${#CONFIG_R2_SECRET_ACCESS_KEY} -le 256 &&
+             "$CONFIG_R2_SECRET_ACCESS_KEY" != *[$'\r\n']* ]]
+          [[ "$CONFIG_R2_BUCKET" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]
+          [[ "$CONFIG_REPO_BASE_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%+/-]*)?$ ]]
+          repo_path=${CONFIG_REPO_BASE_URL#https://}
+          [[ "$repo_path" != *//* ]]
+          repo_base_url=${CONFIG_REPO_BASE_URL%/}
+
+          install -d -m 0700 "$HOME/.config/rclone"
+          umask 077
+          cat > "$HOME/.config/rclone/rclone.conf" <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $CONFIG_R2_ACCESS_KEY_ID
+          secret_access_key = $CONFIG_R2_SECRET_ACCESS_KEY
+          endpoint = https://${CONFIG_R2_ACCOUNT_ID,,}.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+          EOF
+
+          mapfile -d '' objects < <(
+            find -P staged/kernel-modules -type f -print0
+          )
+          ((${#objects[@]}))
+
+          existing="$RUNNER_TEMP/zerofs-existing-modules"
+          rclone lsf "r2:$CONFIG_R2_BUCKET/kernel-modules" \
+            --recursive --files-only > "$existing"
+          new_objects="$RUNNER_TEMP/zerofs-new-modules"
+          : > "$new_objects"
+          for object in "${objects[@]}"; do
+            relative=${object#staged/kernel-modules/}
+            [[ "$relative" != "$object" &&
+               "$relative" =~ ^[A-Za-z0-9._+~@/-]+$ &&
+               "/$relative/" != */../* &&
+               "/$relative/" != */./* ]]
+            if ! grep -Fxq -- "$relative" "$existing"; then
+              printf '%s\n' "$relative" >> "$new_objects"
+            fi
+          done
+
+          if [[ -s "$new_objects" ]]; then
+            rclone copy --checksum --immutable \
+              --files-from-raw "$new_objects" \
+              staged/kernel-modules "r2:$CONFIG_R2_BUCKET/kernel-modules"
+          fi
+
+          probe="$RUNNER_TEMP/zerofs-module-probe"
+          published="$RUNNER_TEMP/zerofs-published-module"
+          for object in "${objects[@]}"; do
+            relative=${object#staged/kernel-modules/}
+            expected=$object
+            if ! grep -Fxq -- "$relative" "$new_objects"; then
+              # Published keys are immutable and were boot-tested when first
+              # created. Verify the retained R2 bytes through the public edge;
+              # a later rebuild need not reproduce their signing bytes.
+              rclone copyto \
+                "r2:$CONFIG_R2_BUCKET/kernel-modules/$relative" \
+                "$published"
+              expected=$published
+            fi
+            curl --disable --fail --location --retry 5 --retry-all-errors \
+              --proto '=https' --proto-redir '=https' \
+              --connect-timeout 10 --max-time 60 \
+              --output "$probe" \
+              "$repo_base_url/kernel-modules/$relative"
+            cmp -s -- "$expected" "$probe" || {
+              echo "public module object differs after publication: $relative" >&2
+              exit 1
+            }
+          done

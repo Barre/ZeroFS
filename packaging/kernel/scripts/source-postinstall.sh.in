@@ -75,42 +75,17 @@ for kernel do
         *': installed'*) continue ;;
         *': built'*) ;;
         *)
-            source_unavailable_marker="$state_directory/build/dkms-kernel-source/$kernel.source-unavailable"
-            if [ -e "$source_unavailable_marker" ] ||
-                [ -L "$source_unavailable_marker" ]; then
-                if [ ! -f "$source_unavailable_marker" ] ||
-                    [ -L "$source_unavailable_marker" ]; then
-                    printf 'zerofs: unsafe source-unavailable marker: %s\n' \
-                        "$source_unavailable_marker" >&2
-                    exit 1
-                fi
-                rm -f -- "$source_unavailable_marker"
-            fi
             build_result=0
             dkms build -m "$module" -v "$version" -k "$kernel" ||
                 build_result=$?
             if [ "$build_result" -ne 0 ]; then
-                # DKMS returns 77 when BUILD_EXCLUSIVE_KERNEL_MIN rejects an
-                # unsupported kernel. Skip it during ordinary package setup so
-                # an old running kernel cannot prevent a supported installed
-                # kernel from being built. Explicit CI requests stay strict.
+                # DKMS uses 77 when BUILD_EXCLUSIVE_KERNEL_MIN excludes a
+                # kernel below the supported floor. All failures for eligible
+                # kernels remain fatal. Explicit CI requests stay strict too.
                 if [ "$explicit_kernel" = false ] &&
                     [ "$build_result" -eq 77 ]; then
                     printf '%s\n' \
                         "zerofs: warning: skipping kernel $kernel because ZeroFS requires Linux 6.18 or newer" >&2
-                    continue
-                fi
-                # Portable package metadata cannot depend on an exact,
-                # kernel-release-specific Rust metadata or source package.
-                # Leave automatic installs registered until that distribution
-                # input becomes available. Explicit CI builds remain strict.
-                if [ "$explicit_kernel" = false ] &&
-                    [ -f "$source_unavailable_marker" ] &&
-                    [ ! -L "$source_unavailable_marker" ] &&
-                    [ "$(cat "$source_unavailable_marker")" = "$kernel" ]; then
-                    rm -f -- "$source_unavailable_marker"
-                    printf '%s\n' \
-                        "zerofs: warning: skipping kernel $kernel because its required distribution Rust metadata or exact source is unavailable; install it and run dkms autoinstall" >&2
                     continue
                 fi
                 exit "$build_result"

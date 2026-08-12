@@ -2,7 +2,7 @@ name: kernel-target-updates
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       as_of:

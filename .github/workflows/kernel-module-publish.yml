@@ -1,0 +1,180 @@
+name: Publish kernel modules
+
+# New distro kernels are built with the latest stable ZeroFS packages already
+# present in the signed repositories and the current compatibility tooling.
+on:
+  push:
+    branches: [main]
+    paths:
+      - packaging/kernel/kernels.lock.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    name: Download latest stable packages
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl dnf dnf-plugins-core gnupg rpm
+
+      - name: Download packages from the signed repositories
+        env:
+          EXPECTED_GPG_FINGERPRINT: ${{ vars.GPG_KEY_ID }}
+          REPO_BASE_URL: ${{ vars.REPO_BASE_URL }}
+        run: |
+          [[ "$EXPECTED_GPG_FINGERPRINT" =~ ^([A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$ ]]
+          [[ "$REPO_BASE_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~%+/-]*)?$ ]]
+          repository_dir="$RUNNER_TEMP/zerofs-repository"
+          install -d -m 0755 \
+            "$repository_dir/apt/lists/partial" \
+            "$repository_dir/apt/cache/archives/partial" \
+            "$repository_dir/yum.repos.d" \
+            published-kernel-package/deb \
+            published-kernel-package/rpm
+
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors \
+            --connect-timeout 10 --max-time 60 \
+            --output "$repository_dir/zerofs.gpg" \
+            "${REPO_BASE_URL%/}/zerofs.gpg"
+          mapfile -t fingerprints < <(
+            gpg --batch --show-keys --with-colons --fingerprint \
+              "$repository_dir/zerofs.gpg" |
+              awk -F: '
+                $1 == "pub" { primary = 1; next }
+                $1 == "sub" { primary = 0; next }
+                $1 == "fpr" && primary { print toupper($10); primary = 0 }
+              '
+          )
+          [[ ${#fingerprints[@]} -eq 1 &&
+             "${fingerprints[0]}" == "${EXPECTED_GPG_FINGERPRINT^^}" ]]
+          gpg --batch --yes --dearmor \
+            --output "$repository_dir/zerofs-keyring.gpg" \
+            "$repository_dir/zerofs.gpg"
+
+          cat > "$repository_dir/apt/sources.list" <<EOF
+          deb [signed-by=$repository_dir/zerofs-keyring.gpg] ${REPO_BASE_URL%/}/deb stable main
+          EOF
+          apt_options=(
+            -o "Dir::Etc::sourcelist=$repository_dir/apt/sources.list"
+            -o Dir::Etc::sourceparts=-
+            -o "Dir::State=$repository_dir/apt"
+            -o "Dir::Cache=$repository_dir/apt/cache"
+            -o Acquire::Retries=5
+          )
+          apt-get "${apt_options[@]}" update
+
+          cat > "$repository_dir/yum.repos.d/zerofs.repo" <<EOF
+          [zerofs]
+          name=ZeroFS
+          baseurl=${REPO_BASE_URL%/}/rpm
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=file://$repository_dir/zerofs.gpg
+          EOF
+          dnf_options=(
+            --assumeyes
+            --releasever=0
+            --setopt="reposdir=$repository_dir/yum.repos.d"
+            --setopt="cachedir=$repository_dir/dnf-cache"
+            --setopt="persistdir=$repository_dir/dnf-persist"
+            --disablerepo='*'
+            --enablerepo=zerofs
+          )
+
+          apt_versions="$repository_dir/apt-kernel-versions"
+          rpm_versions="$repository_dir/rpm-kernel-versions"
+          apt-cache "${apt_options[@]}" madison zerofs-kernel-client |
+            awk '{ print $3 }' | sort -u > "$apt_versions"
+          dnf --quiet "${dnf_options[@]}" repoquery --show-duplicates \
+            --queryformat '%{version}-%{release}' \
+            zerofs-kernel-client | sort -u > "$rpm_versions"
+          kernel_version=$(
+            comm -12 "$apt_versions" "$rpm_versions" | sort -V | tail -n 1
+          )
+          [[ "$kernel_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$ ]] || {
+            echo 'APT and RPM have no common stable kernel-client version' >&2
+            exit 1
+          }
+          userspace_version=${kernel_version%-*}
+
+          (
+            cd published-kernel-package/deb
+            apt-get "${apt_options[@]}" download \
+              "zerofs=$userspace_version" \
+              "zerofs-kernel-client=$kernel_version"
+          )
+          dnf "${dnf_options[@]}" \
+            download --destdir published-kernel-package/rpm \
+            "zerofs-kernel-client-$kernel_version.noarch"
+
+          shopt -s nullglob
+          debs=(published-kernel-package/deb/*.deb)
+          kernel_rpms=(published-kernel-package/rpm/*.rpm)
+          [[ ${#debs[@]} -eq 2 && ${#kernel_rpms[@]} -eq 1 ]]
+          for package in "${debs[@]}"; do
+            case $(dpkg-deb -f "$package" Package) in
+              zerofs) userspace_deb=$package ;;
+              zerofs-kernel-client) kernel_deb=$package ;;
+              *) exit 1 ;;
+            esac
+          done
+          [[ -n ${userspace_deb:-} && -n ${kernel_deb:-} ]]
+          [[ "$(dpkg-deb -f "$userspace_deb" Version)" == \
+             "$userspace_version" ]]
+          [[ "$(dpkg-deb -f "$kernel_deb" Version)" == \
+             "$kernel_version" ]]
+          [[ "$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "${kernel_rpms[0]}")" == \
+             "$kernel_version" ]]
+
+          rpm_db="$repository_dir/rpmdb"
+          install -d -m 0755 "$rpm_db"
+          rpm --dbpath "$rpm_db" --initdb
+          rpm --dbpath "$rpm_db" --import "$repository_dir/zerofs.gpg"
+          rpm_signature=$(
+            rpm --dbpath "$rpm_db" --checksig "${kernel_rpms[0]}"
+          )
+          printf '%s\n' "$rpm_signature"
+          [[ "$rpm_signature" == *'signatures OK'* ]]
+
+          dpkg-deb --extract "$userspace_deb" kernel-smoke-root
+          install -D -m 0755 kernel-smoke-root/usr/bin/zerofs \
+            kernel-smoke-server/zerofs
+          [[ "$(kernel-smoke-server/zerofs --version)" == \
+             "zerofs $userspace_version" ]]
+          rm -f -- "$userspace_deb"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zerofs-ci-bin
+          path: kernel-smoke-server
+          if-no-files-found: error
+          retention-days: 3
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zerofs-published-kernel-source-packages
+          path: published-kernel-package
+          if-no-files-found: error
+          retention-days: 3
+
+  kernel-modules:
+    name: Build, boot-test, and publish kernel modules
+    needs: packages
+    uses: ./.github/workflows/kernel-packages.yml
+    with:
+      publish-modules: true
+      source-package-artifact: zerofs-published-kernel-source-packages
+    secrets:
+      KERNEL_MODULE_SIGNING_KEY: ${{ secrets.KERNEL_MODULE_SIGNING_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
