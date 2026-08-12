@@ -21,7 +21,7 @@ usage() {
     cat >&2 <<EOF
 usage: $script_name prepare KERNEL_BUILD MODULE BUNDLE [BUSYBOX]
        $script_name bundle BUNDLE SERVER_BINARY
-       $script_name package MANIFEST TARGET_ID ARTIFACT_DIR SERVER_BINARY
+       $script_name artifact MANIFEST TARGET_ID ARTIFACT_DIR SERVER_BINARY
 EOF
 }
 
@@ -258,23 +258,105 @@ prepare_bundle() {
     echo "prepared module smoke bundle in $bundle"
 }
 
+resolve_artifact_file() {
+    local root=$1
+    local relative=$2
+    local output_variable=$3
+    local candidate=$root/$relative
+    local resolved
+
+    [[ -s "$candidate" && -f "$candidate" && ! -L "$candidate" ]] ||
+        die "artifact has no regular $relative"
+    resolved=$(realpath -e -- "$candidate")
+    case $resolved in
+        "$root"/*) ;;
+        *) die "artifact path escapes its directory: $relative" ;;
+    esac
+    printf -v "$output_variable" '%s' "$resolved"
+}
+
+resolve_artifact_modules() {
+    local root=$1
+    local relative=$2
+    local output_variable=$3
+    local directory=$root/$relative
+    local expected_name
+    local index=0
+    local path
+    local resolved
+    local -n output=$output_variable
+
+    if [[ ! -e "$directory" && ! -L "$directory" ]]; then
+        output=()
+        return
+    fi
+    [[ -d "$directory" && ! -L "$directory" ]] ||
+        die "artifact $relative is not a regular directory"
+    resolved=$(realpath -e -- "$directory")
+    case $resolved in
+        "$root"/*) ;;
+        *) die "artifact directory escapes its root: $relative" ;;
+    esac
+    output=()
+    while IFS= read -r -d '' path; do
+        printf -v expected_name '%04d.ko' "$index"
+        [[ "${path##*/}" == "$expected_name" ]] ||
+            die "$relative contains an unordered module: ${path##*/}"
+        [[ -s "$path" && -f "$path" && ! -L "$path" ]] ||
+            die "$relative contains an unsafe module: $path"
+        resolved=$(realpath -e -- "$path")
+        case $resolved in
+            "$root"/*) ;;
+            *) die "artifact module escapes its directory: $path" ;;
+        esac
+        output+=("$resolved")
+        ((index += 1))
+    done < <(find -P "$directory" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+}
+
+validate_artifact_module() {
+    local path=$1
+    local expected_name=${2:-}
+    local forbidden_name=${3:-}
+    local machine
+    local name
+
+    name=$(modinfo -F name "$path") ||
+        die "cannot read module metadata from $path"
+    [[ -n "$name" ]] || die "module name is empty: $path"
+    if [[ -n "$expected_name" && "$name" != "$expected_name" ]]; then
+        die "expected module $expected_name, found $name"
+    fi
+    if [[ -n "$forbidden_name" && "$name" == "$forbidden_name" ]]; then
+        die "artifact dependency includes forbidden module $name"
+    fi
+    case $(modinfo -F vermagic "$path") in
+        "$kernel_release" | "$kernel_release "*) ;;
+        *) die "$name does not target $kernel_release" ;;
+    esac
+    machine=$(readelf -h "$path" |
+        sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+    case $arch:$machine in
+        "x86_64:Advanced Micro Devices X86-64" | "aarch64:AArch64") ;;
+        *) die "$name has the wrong architecture: $machine" ;;
+    esac
+}
+
 resolve_artifact() {
     local manifest=$1
     local target_id=$2
     local artifact_dir=$3
-    local entry
-    local kind
+    local machine
     local path
 
     [[ -x "$catalog_helper" ]] ||
-        die "target catalog helper is missing: $catalog_helper"
-    manifest=$(realpath "$manifest")
-    artifact_dir=$(realpath "$artifact_dir")
-    [[ -f "$manifest" ]] || die "manifest is not a regular file: $manifest"
-    [[ -d "$artifact_dir" ]] ||
-        die "artifact directory does not exist: $artifact_dir"
-    [[ -f "$artifact_dir/artifact.json" ]] ||
-        die "artifact manifest is missing: $artifact_dir/artifact.json"
+        die "kernel lock helper is missing: $catalog_helper"
+    [[ -f "$manifest" && ! -L "$manifest" ]] ||
+        die "manifest is not a regular file: $manifest"
+    [[ -d "$artifact_dir" && ! -L "$artifact_dir" ]] ||
+        die "artifact directory is not a regular directory: $artifact_dir"
+    manifest=$(realpath -e -- "$manifest")
+    artifact_dir=$(realpath -e -- "$artifact_dir")
 
     arch=$("$catalog_helper" \
         --manifest "$manifest" field "$target_id" arch)
@@ -284,107 +366,30 @@ resolve_artifact() {
         die "kernel release contains unsupported characters: $kernel_release"
     case $arch in
         x86_64 | aarch64) ;;
-        *)
-            die "unsupported exact-kernel boot architecture: $arch"
-            ;;
+        *) die "unsupported exact-kernel boot architecture: $arch" ;;
     esac
 
-    export ZEROFS_ARTIFACT_DIR=$artifact_dir
-    export ZEROFS_TARGET_ID=$target_id
-    export ZEROFS_KERNEL_RELEASE=$kernel_release
-    export ZEROFS_TARGET_ARCH=$arch
-    mapfile -t artifact_entries < <(
-        python3 - "$artifact_dir/artifact.json" <<'PY'
-import hashlib
-import json
-import os
-import sys
-from pathlib import Path
+    resolve_artifact_file "$artifact_dir" kernel kernel_image
+    resolve_artifact_file "$artifact_dir" zerofs.ko module
+    resolve_artifact_file "$artifact_dir" busybox busybox
+    resolve_artifact_modules "$artifact_dir" modules dependencies
+    resolve_artifact_modules "$artifact_dir" boot-modules boot_modules
 
-manifest = Path(sys.argv[1])
-try:
-    value = json.loads(manifest.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as error:
-    raise SystemExit(f"{manifest}: invalid artifact manifest: {error}")
-if (
-    not isinstance(value, dict)
-    or type(value.get("schema_version")) is not int
-    or value["schema_version"] != 2
-):
-    raise SystemExit(f"{manifest}: expected artifact schema version 2")
-
-expected = {
-    "target_id": os.environ["ZEROFS_TARGET_ID"],
-    "kernel_release": os.environ["ZEROFS_KERNEL_RELEASE"],
-    "arch": os.environ["ZEROFS_TARGET_ARCH"],
-}
-for key, expected_value in expected.items():
-    if value.get(key) != expected_value:
-        raise SystemExit(
-            f"{manifest}: {key} is {value.get(key)!r}, expected {expected_value!r}"
-        )
-
-base = Path(os.environ["ZEROFS_ARTIFACT_DIR"]).resolve()
-digests = value.get("sha256")
-if not isinstance(digests, dict):
-    raise SystemExit(f"{manifest}: sha256 must be an object")
-
-
-def resolve(relative, key):
-    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
-        raise SystemExit(f"{manifest}: {key} must be a relative path")
-    if relative != relative.strip() or any(ord(char) < 32 for char in relative):
-        raise SystemExit(f"{manifest}: {key} contains unsupported characters")
-    candidate = (base / relative).resolve()
-    try:
-        candidate.relative_to(base)
-    except ValueError:
-        raise SystemExit(f"{manifest}: {key} escapes the artifact directory")
-    if not candidate.is_file():
-        raise SystemExit(f"{manifest}: {key} is not a regular file")
-    expected_digest = digests.get(relative)
-    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
-        raise SystemExit(f"{manifest}: missing SHA-256 for {key}")
-    if hashlib.sha256(candidate.read_bytes()).hexdigest() != expected_digest:
-        raise SystemExit(f"{manifest}: SHA-256 mismatch for {key}")
-    return candidate
-
-
-print(f"kernel\t{resolve(value.get('kernel_image'), 'kernel_image')}")
-print(f"module\t{resolve(value.get('module'), 'module')}")
-print(f"busybox\t{resolve(value.get('boot_busybox'), 'boot_busybox')}")
-dependencies = value.get("module_dependencies")
-boot_modules = value.get("boot_modules")
-if not isinstance(dependencies, list) or not isinstance(boot_modules, list):
-    raise SystemExit(f"{manifest}: module lists must be arrays")
-for index, relative in enumerate(dependencies):
-    print(f"dependency\t{resolve(relative, f'module_dependencies[{index}]')}")
-for index, relative in enumerate(boot_modules):
-    print(f"boot\t{resolve(relative, f'boot_modules[{index}]')}")
-PY
-    )
-
-    kernel_image=
-    module=
-    busybox=
-    dependencies=()
-    boot_modules=()
-    for entry in "${artifact_entries[@]}"; do
-        kind=${entry%%$'\t'*}
-        path=${entry#*$'\t'}
-        [[ "$path" != "$entry" ]] ||
-            die "artifact resolver returned an invalid entry"
-        case $kind in
-            kernel) kernel_image=$path ;;
-            module) module=$path ;;
-            busybox) busybox=$path ;;
-            dependency) dependencies+=("$path") ;;
-            boot) boot_modules+=("$path") ;;
-            *) die "artifact resolver returned an unknown entry: $kind" ;;
-        esac
+    validate_artifact_module "$module" zerofs
+    for path in "${dependencies[@]}" "${boot_modules[@]}"; do
+        validate_artifact_module "$path" "" zerofs
     done
-    [[ -n "$kernel_image" && -n "$module" && -n "$busybox" ]] ||
-        die "artifact manifest did not resolve its boot inputs"
+
+    machine=$(readelf -h "$busybox" |
+        sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+    case $arch:$machine in
+        "x86_64:Advanced Micro Devices X86-64" | "aarch64:AArch64") ;;
+        *) die "artifact busybox has the wrong architecture: $machine" ;;
+    esac
+    if readelf -l "$busybox" |
+        grep -F 'Requesting program interpreter' >/dev/null; then
+        die "artifact busybox must be statically linked"
+    fi
 }
 
 build_initramfs() {
@@ -601,12 +606,16 @@ run_bundle() {
     run_resolved "$2" "upstream kernel"
 }
 
-run_package() {
+run_artifact() {
     [[ $# -eq 4 ]] || {
         usage
         exit 2
     }
-    require_command python3
+    require_command find
+    require_command modinfo
+    require_command readelf
+    require_command realpath
+    require_command sort
     resolve_artifact "$1" "$2" "$3"
     unload_module=false
     run_resolved "$4" "exact distro kernel"
@@ -621,9 +630,9 @@ case ${1:-} in
         shift
         run_bundle "$@"
         ;;
-    package)
+    artifact)
         shift
-        run_package "$@"
+        run_artifact "$@"
         ;;
     *)
         usage

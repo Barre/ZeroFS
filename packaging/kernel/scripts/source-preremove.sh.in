@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+module=zerofs
+version='@DKMS_VERSION@'
+
+# Debian runs prerm before unpacking a replacement; RPM runs preun while the
+# old /usr/src tree still exists. Never unload a potentially active module.
+case ${1-} in
+    remove | upgrade | 0 | 1)
+        if command -v dkms >/dev/null 2>&1 &&
+            [ -n "$(dkms status -m "$module" -v "$version" 2>/dev/null)" ]; then
+            dkms remove -m "$module" -v "$version" --all
+        fi
+        ;;
+esac
+
+exit 0

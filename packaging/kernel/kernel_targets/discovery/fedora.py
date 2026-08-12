@@ -1,4 +1,3 @@
-import copy
 import hashlib
 import re
 import tempfile
@@ -6,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from ..catalog import fail
-from ..observation import KernelObservation, compare_observation
 from .common import Runner, base_candidate, rpm_compare
 
 
@@ -25,6 +23,8 @@ def _verify_rpm(
     nvr: str,
     arch: str,
     source_rpm: str | None,
+    *,
+    verify_arch: bool = True,
 ) -> None:
     signature = runner.run(
         ["rpmkeys", "--checksig", "--verbose", str(path)]
@@ -42,7 +42,11 @@ def _verify_rpm(
             str(path),
         ]
     ).strip().split("\t")
-    if len(query) != 4 or query[:3] != [name, nvr, arch]:
+    if (
+        len(query) != 4
+        or query[:2] != [name, nvr]
+        or (verify_arch and query[2] != arch)
+    ):
         fail(f"{path.name} has unexpected RPM metadata")
     if source_rpm is not None and query[3] != source_rpm:
         fail(f"{path.name} has an unexpected source RPM")
@@ -57,7 +61,8 @@ def _download_rpm(
     nvr: str,
     arch: str,
     source_rpm: str | None,
-    metadata_arch: str | None = None,
+    *,
+    verify_arch: bool = True,
 ) -> Path:
     filename = f"{name}-{nvr}.{arch}.rpm"
     path = directory / filename
@@ -81,8 +86,9 @@ def _download_rpm(
         fingerprint,
         name,
         nvr,
-        metadata_arch or arch,
+        arch,
         source_rpm,
+        verify_arch=verify_arch,
     )
     return path
 
@@ -99,9 +105,9 @@ def observe(
     channel: dict[str, Any],
     current: dict[str, Any],
     runner: Runner,
-) -> KernelObservation:
-    discovery = channel["discovery"]
+) -> str:
     target_arch = channel["arch"]
+    package_name = "kernel-core"
     runner.run(["dnf", "-y", "install", "ca-certificates", "rpm"])
     query = runner.run(
         [
@@ -115,7 +121,7 @@ def observe(
             "--queryformat",
             "%{name}\t%{epoch}\t%{version}\t%{release}"
             "\t%{arch}\t%{sourcerpm}",
-            discovery["selector"],
+            package_name,
         ]
     )
     rows = [line.split("\t") for line in query.splitlines() if line.strip()]
@@ -123,7 +129,7 @@ def observe(
         fail("cannot select one Fedora kernel-core build")
     name, epoch, version, release, package_arch, source_rpm = rows[0]
     if (
-        name != discovery["selector"]
+        name != package_name
         or epoch not in {"0", "(none)"}
         or package_arch != target_arch
         or not release.endswith(f".fc{channel['release']}")
@@ -139,44 +145,25 @@ def observe(
             f"is older than {old_nvr}"
         )
 
-    kernel_release = f"{kernel_nvr}.{target_arch}"
-    package_name = "kernel-core-uname-r"
-    fingerprint = discovery["signing_fingerprint"]
-    snapshot = (
-        f"koji-signed-build:{fingerprint}:{target_arch},noarch,src"
-    )
-    return KernelObservation(
-        kernel_release=kernel_release,
-        kernel_package_name=package_name,
-        kernel_package_version=kernel_release,
-        kernel_selector_version=kernel_nvr,
-        source_kind="koji",
-        source_identity=f"kernel-{kernel_nvr}",
-        source_snapshot=snapshot,
-    )
+    return f"kernel-{kernel_nvr}"
 
 
 def discover(
     channel: dict[str, Any],
     current: dict[str, Any],
+    current_lock: dict[str, Any],
     runner: Runner,
 ) -> dict[str, Any]:
-    observation = observe(channel, current, runner)
-    if not compare_observation(current, observation).update_available:
-        return base_candidate(
-            channel,
-            current,
-            observation.kernel_release,
-            observation.kernel_package_name,
-            observation.kernel_package_version,
-            copy.deepcopy(current["source"]),
-            selector_version=observation.kernel_selector_version,
-        )
+    kernel_identity = observe(channel, current, runner)
+    fingerprint = channel["discovery"]["signing_fingerprint"]
+    if (
+        kernel_identity == current_lock["nvr"]
+        and fingerprint == current_lock["signing_fingerprint"]
+    ):
+        return base_candidate(current, current_lock)
 
-    discovery = channel["discovery"]
     target_arch = channel["arch"]
-    fingerprint = discovery["signing_fingerprint"]
-    kernel_nvr = observation.source_identity.removeprefix("kernel-")
+    kernel_nvr = kernel_identity.removeprefix("kernel-")
     version, separator, release = kernel_nvr.rpartition("-")
     if not separator:
         fail("invalid Fedora kernel build")
@@ -212,7 +199,10 @@ def discover(
                 kernel_nvr,
                 "src",
                 None,
-                "x86_64",
+                # Koji files the SRPM below src/, while its RPM header records
+                # whichever architecture built it. The signature, name, and
+                # NVR provide the stable identity shared by every target arch.
+                verify_arch=False,
             )
         )
         devel = next(
@@ -261,18 +251,9 @@ def discover(
             for path in sorted(paths, key=lambda item: item.name)
         }
 
-    source = {
-        "kind": observation.source_kind,
-        "identity": observation.source_identity,
-        "snapshot": observation.source_snapshot,
+    lock = {
+        "nvr": kernel_identity,
+        "signing_fingerprint": fingerprint,
         "artifacts": artifacts,
     }
-    return base_candidate(
-        channel,
-        current,
-        observation.kernel_release,
-        observation.kernel_package_name,
-        observation.kernel_package_version,
-        source,
-        selector_version=observation.kernel_selector_version,
-    )
+    return base_candidate(current, lock)

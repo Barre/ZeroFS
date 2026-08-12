@@ -102,7 +102,6 @@ class SystemRunner:
             fail(f"cannot probe {url}: HTTP {error.code}")
         except urllib.error.URLError as error:
             fail(f"cannot probe {url}: {error}")
-        return False
 
     def splice_rpm_sighdr(
         self,

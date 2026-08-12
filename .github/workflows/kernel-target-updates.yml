@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: kernel-target-updates
@@ -35,38 +34,14 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Ensure update label
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const name = "kernel-update";
-            try {
-              await github.rest.issues.getLabel({ owner, repo, name });
-            } catch (error) {
-              if (error.status !== 404) throw error;
-              await github.rest.issues.createLabel({
-                owner,
-                repo,
-                name,
-                color: "1d76db",
-                description: "A newer distribution kernel is available",
-              });
-            }
-
       - name: Resolve discovery inputs
         id: resolve
         env:
           REQUESTED_AS_OF: ${{ inputs.as_of }}
         run: |
           matrix=$(packaging/kernel/kernel-targets.py \
-            --manifest packaging/kernel/targets.json \
-            matrix --scope discover)
-          count=$(python3 -c \
-            'import json,sys; print(len(json.load(sys.stdin)["include"]))' \
-            <<<"$matrix")
-          ((count > 0))
+            --manifest packaging/kernel/kernels.lock.json \
+            discovery-matrix)
 
           if [[ -n "$REQUESTED_AS_OF" ]]; then
             as_of=$REQUESTED_AS_OF
@@ -83,8 +58,8 @@ jobs:
             echo "matrix=$matrix"
           } >>"$GITHUB_OUTPUT"
 
-  check:
-    name: Check ${{ matrix.id }}
+  discover:
+    name: Discover ${{ matrix.id }}
     needs: resolve
     runs-on: ${{ matrix.runner }}
     container:
@@ -117,105 +92,73 @@ jobs:
             exit 1
           fi
 
-      - name: Check latest kernel
-        id: check
+      - name: Discover kernel candidate
         env:
           AS_OF: ${{ needs.resolve.outputs.as_of }}
           CHANNEL_ID: ${{ matrix.id }}
         run: |
-          entry=$(python3 packaging/kernel/kernel-targets.py \
-            --manifest packaging/kernel/targets.json \
-            check "$CHANNEL_ID" \
-            --as-of "$AS_OF")
-          echo "entry=$entry" >>"$GITHUB_OUTPUT"
+          python3 packaging/kernel/kernel-targets.py \
+            --manifest packaging/kernel/kernels.lock.json \
+            discover "$CHANNEL_ID" --as-of "$AS_OF" \
+            --output "kernel-candidates/$CHANNEL_ID.json"
 
-      - name: Reconcile update issue
+      - name: Upload update candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kernel-candidate-${{ matrix.id }}
+          path: kernel-candidates
+          if-no-files-found: error
+          retention-days: 1
+
+  propose:
+    name: Propose kernel target updates
+    needs: [resolve, discover]
+    if: >-
+      ${{
+        always() &&
+        needs.resolve.result == 'success' &&
+        (needs.discover.result == 'success' ||
+         needs.discover.result == 'failure')
+      }}
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    env:
+      UPDATE_BRANCH: automation/kernel-target-updates
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.base_sha }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: ${{ needs.discover.result == 'failure' }}
+        with:
+          pattern: kernel-candidate-*
+          path: kernel-candidates
+          merge-multiple: true
+
+      - name: Reconcile update branch
+        id: branch
+        env:
+          BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: .github/scripts/kernel-target-updates/reconcile-update-branch.sh
+
+      - name: Reconcile update pull request
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
-          ENTRY: ${{ steps.check.outputs.entry }}
+          CHANGED: ${{ steps.branch.outputs.changed }}
         with:
           script: |
-            const entry = JSON.parse(process.env.ENTRY);
-            const label = "kernel-update";
-            const marker =
-              `<!-- zerofs-kernel-channel: ${entry.channel_id} -->`;
-            const title = `Kernel update: ${entry.channel_id}`;
-            const body = [
-              marker,
-              "",
-              `Current target: \`${entry.current_target_id}\``,
-              `Current kernel: \`${entry.current_kernel_release}\``,
-              `Current package: \`${entry.current_kernel_package_version}\``,
-              `Current source: \`${entry.current_source_identity}\``,
-              `Current snapshot: \`${entry.current_source_snapshot}\``,
-              `Available kernel: \`${entry.candidate_kernel_release}\``,
-              `Available package: \`${entry.candidate_kernel_package_version}\``,
-              `Available source: \`${entry.candidate_source_identity}\``,
-              `Available snapshot: \`${entry.candidate_source_snapshot}\``,
-              "",
-              "Prepare the manifest update:",
-              "",
-              "```sh",
-              "as_of=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "candidate=$(mktemp)",
-              "packaging/kernel/kernel-targets.py \\",
-              "  --manifest packaging/kernel/targets.json \\",
-              `  discover ${entry.channel_id} --as-of "$as_of" \\`,
-              '  --output "$candidate"',
-              "packaging/kernel/kernel-targets.py \\",
-              "  --manifest packaging/kernel/targets.json \\",
-              '  apply "$candidate"',
-              'rm "$candidate"',
-              "```",
-            ].join("\n");
+            const run = require("./.github/scripts/kernel-target-updates/reconcile-update-pull-request.js");
+            await run({ github, context });
 
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const issues = await github.paginate(
-              github.rest.issues.listForRepo,
-              { owner, repo, state: "all", labels: label, per_page: 100 },
-            );
-            const matches = issues.filter(
-              issue =>
-                !issue.pull_request &&
-                (issue.body || "").split(/\r?\n/).includes(marker),
-            );
-            if (matches.length > 1) {
-              throw new Error(
-                `multiple kernel update issues exist for ${entry.channel_id}`,
-              );
-            }
-            const issue = matches[0];
-
-            if (entry.update_available) {
-              if (!issue) {
-                await github.rest.issues.create({
-                  owner,
-                  repo,
-                  title,
-                  body,
-                  labels: [label],
-                });
-              } else if (
-                issue.state !== "open" ||
-                issue.title !== title ||
-                issue.body !== body
-              ) {
-                await github.rest.issues.update({
-                  owner,
-                  repo,
-                  issue_number: issue.number,
-                  state: "open",
-                  title,
-                  body,
-                });
-              }
-            } else if (issue && issue.state === "open") {
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number: issue.number,
-                state: "closed",
-                state_reason: "completed",
-              });
-            }
+      - name: Ensure CI for the update commit
+        if: steps.branch.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.branch.outputs.head_sha }}
+        run: .github/scripts/kernel-target-updates/ensure-ci.sh

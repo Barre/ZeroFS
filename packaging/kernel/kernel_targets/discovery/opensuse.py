@@ -1,11 +1,8 @@
-import copy
 import xml.etree.ElementTree as ElementTree
 from datetime import datetime, timedelta
 from typing import Any
 
-from ..catalog import PACKAGE_VERSION_PATTERN, fail
-from ..observation import KernelObservation, compare_observation
-from ..updates import parse_opensuse_identity
+from ..catalog import OPENSUSE_PACKAGES, fail
 from .common import Runner, base_candidate, rpm_compare
 
 
@@ -22,9 +19,9 @@ def _snapshot(as_of: datetime, runner: Runner) -> str:
     fail("cannot find an openSUSE history snapshot in the previous 31 days")
 
 
-def _versions(packages: list[str], runner: Runner) -> dict[str, str]:
+def _versions(runner: Runner) -> dict[str, str]:
     versions = {}
-    for package in packages:
+    for package in OPENSUSE_PACKAGES:
         output = runner.run(
             [
                 "zypper",
@@ -66,10 +63,10 @@ def _versions(packages: list[str], runner: Runner) -> dict[str, str]:
 
 def observe(
     channel: dict[str, Any],
-    current: dict[str, Any],
+    current_lock: dict[str, Any],
     as_of: datetime,
     runner: Runner,
-) -> KernelObservation:
+) -> dict[str, Any]:
     runner.run(
         [
             "zypper",
@@ -96,68 +93,27 @@ def observe(
         ]
     )
     runner.run(["zypper", "--non-interactive", "refresh"])
-    packages = channel["discovery"]["packages"]
-    versions = _versions(packages, runner)
-    old_versions = parse_opensuse_identity(
-        current["source"]["identity"],
-        packages,
-        current["kernel_package_version"],
-        f"target {current['id']!r}",
-    )
-    for package in packages:
-        old = old_versions.get(package)
-        if old is None:
-            fail(f"current openSUSE identity omits {package}")
+    versions = _versions(runner)
+    old_versions = current_lock["packages"]
+    for package in OPENSUSE_PACKAGES:
+        old = old_versions[package]
         if rpm_compare(runner, versions[package], old) < 0:
             fail(
                 f"{channel['id']}: {package} {versions[package]} "
                 f"is older than {old}"
             )
 
-    identity = ",".join(f"{package}@{versions[package]}" for package in packages)
-    edition = versions[channel["discovery"]["selector"]]
-    version, separator, release = edition.rpartition("-")
-    if (
-        not separator
-        or "." not in release
-        or not PACKAGE_VERSION_PATTERN.fullmatch(edition)
-    ):
-        fail(f"cannot derive openSUSE uname from {edition}")
-    kernel_release = (
-        f"{version}-{release.rsplit('.', 1)[0]}-{channel['flavor']}"
-    )
-    return KernelObservation(
-        kernel_release=kernel_release,
-        kernel_package_name=channel["discovery"]["selector"],
-        kernel_package_version=edition,
-        kernel_selector_version=edition,
-        source_kind="opensuse-history",
-        source_identity=identity,
-        source_snapshot=snapshot,
-    )
+    return {"snapshot": snapshot, "packages": versions}
 
 
 def discover(
     channel: dict[str, Any],
     current: dict[str, Any],
+    current_lock: dict[str, Any],
     as_of: datetime,
     runner: Runner,
 ) -> dict[str, Any]:
-    observation = observe(channel, current, as_of, runner)
-    if compare_observation(current, observation).update_available:
-        source = {
-            "kind": observation.source_kind,
-            "identity": observation.source_identity,
-            "snapshot": observation.source_snapshot,
-        }
-    else:
-        source = copy.deepcopy(current["source"])
-    return base_candidate(
-        channel,
-        current,
-        observation.kernel_release,
-        observation.kernel_package_name,
-        observation.kernel_package_version,
-        source,
-        selector_version=observation.kernel_selector_version,
-    )
+    lock = observe(channel, current_lock, as_of, runner)
+    if lock["packages"] == current_lock["packages"]:
+        lock = current_lock
+    return base_candidate(current, lock)

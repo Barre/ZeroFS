@@ -1,10 +1,8 @@
-import copy
 import re
 from datetime import datetime
 from typing import Any
 
 from ..catalog import fail
-from ..observation import KernelObservation, compare_observation
 from .common import Runner, base_candidate
 
 
@@ -142,7 +140,7 @@ def observe(
     current: dict[str, Any],
     as_of: datetime,
     runner: Runner,
-) -> KernelObservation:
+) -> dict[str, Any]:
     discovery = channel["discovery"]
     suite = discovery["suite"]
     stamp = as_of.strftime("%Y%m%dT%H%M%SZ")
@@ -177,11 +175,12 @@ def observe(
         )
         runner.replace_apt_sources("zerofs.sources", source_list)
     else:
+        base_suite = suite.removesuffix("-backports")
         source_list = (
             "deb [check-valid-until=no "
             "signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] "
             f"https://snapshot.debian.org/archive/debian/{stamp} "
-            "trixie main\n"
+            f"{base_suite} main\n"
             "deb [check-valid-until=no "
             "signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] "
             f"https://snapshot.debian.org/archive/debian/{stamp} "
@@ -197,7 +196,7 @@ def observe(
         ]
     )
 
-    selector_version, selector = _candidate(
+    _, selector = _candidate(
         runner,
         discovery["selector"],
         suite,
@@ -206,8 +205,9 @@ def observe(
     package_name, package_version = _versioned_image(selector, suffix)
     if not package_version:
         package_version, _ = _candidate(runner, package_name, suite)
+    else:
+        _show_exact(runner, package_name, package_version, suite)
     kernel_release = package_name.removeprefix("linux-image-")
-    _show_exact(runner, package_name, package_version, suite)
     headers = _show_exact(
         runner,
         f"linux-headers-{kernel_release}",
@@ -223,7 +223,6 @@ def observe(
             package_version,
             suite,
         )
-        identity = f"ubuntu:{source_name}@{source_version}"
     else:
         if source_name != "linux":
             fail(f"unexpected Debian kernel source package: {source_name}")
@@ -237,55 +236,34 @@ def observe(
             source_version,
             suite,
         )
-        identity = f"debian:linux@{source_version}:{suite}"
-
     if _is_older(runner, package_version, current["kernel_package_version"]):
         fail(
             f"{channel['id']}: discovered kernel {package_version} "
             f"is older than {current['kernel_package_version']}"
         )
-    if _is_older(
-        runner,
-        selector_version,
-        current["kernel_selector_version"],
-    ):
-        fail(
-            f"{channel['id']}: discovered kernel selector "
-            f"{selector_version} is older than "
-            f"{current['kernel_selector_version']}"
-        )
-    return KernelObservation(
-        kernel_release=kernel_release,
-        kernel_package_name=package_name,
-        kernel_package_version=package_version,
-        kernel_selector_version=selector_version,
-        source_kind="apt-snapshot",
-        source_identity=identity,
-        source_snapshot=stamp,
-    )
+    lock = {
+        "kernel": kernel_release,
+        "version": package_version,
+        "source_version": source_version,
+        "snapshot": stamp,
+    }
+    if channel["distro"] == "ubuntu" and source_name != "linux":
+        lock["source_name"] = source_name
+    return lock
 
 
 def discover(
     channel: dict[str, Any],
     current: dict[str, Any],
+    current_lock: dict[str, Any],
     as_of: datetime,
     runner: Runner,
 ) -> dict[str, Any]:
-    observation = observe(channel, current, as_of, runner)
-    if compare_observation(current, observation).update_available:
-        source = {
-            "kind": observation.source_kind,
-            "identity": observation.source_identity,
-            "snapshot": observation.source_snapshot,
-        }
-    else:
-        source = copy.deepcopy(current["source"])
-    return base_candidate(
-        channel,
-        current,
-        observation.kernel_release,
-        observation.kernel_package_name,
-        observation.kernel_package_version,
-        source,
-        selector_version=observation.kernel_selector_version,
-    )
+    lock = observe(channel, current, as_of, runner)
+    comparable = {key: value for key, value in lock.items() if key != "snapshot"}
+    current_comparable = {
+        key: value for key, value in current_lock.items() if key != "snapshot"
+    }
+    if comparable == current_comparable:
+        lock = current_lock
+    return base_candidate(current, lock)
