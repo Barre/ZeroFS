@@ -148,7 +148,9 @@ jobs:
       architectures: amd64 arm64
       probe-package: zerofs
       probe-version: ${{ needs['userspace-packages'].outputs.version }}
-      tooling-ref: ${{ needs['userspace-packages'].outputs['release-commit'] }}
+      # Tag pushes still use the release commit. A manual republish uses the
+      # immutable workflow commit so publisher fixes can recover an old tag.
+      tooling-ref: ${{ github.sha }}
     secrets:
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -166,7 +168,7 @@ jobs:
       architectures: all
       probe-package: zerofs-kernel-client
       probe-version: ${{ needs['kernel-package-gate'].outputs['package-version'] }}
-      tooling-ref: ${{ needs['userspace-packages'].outputs['release-commit'] }}
+      tooling-ref: ${{ github.sha }}
     secrets:
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -183,7 +185,7 @@ jobs:
       architectures: x86_64 aarch64
       probe-package: zerofs
       probe-version: ${{ format('{0}-1', needs['userspace-packages'].outputs.version) }}
-      tooling-ref: ${{ needs['userspace-packages'].outputs['release-commit'] }}
+      tooling-ref: ${{ github.sha }}
     secrets:
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -201,7 +203,7 @@ jobs:
       architectures: noarch
       probe-package: zerofs-kernel-client
       probe-version: ${{ needs['kernel-package-gate'].outputs['package-version'] }}
-      tooling-ref: ${{ needs['userspace-packages'].outputs['release-commit'] }}
+      tooling-ref: ${{ github.sha }}
     secrets:
       GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

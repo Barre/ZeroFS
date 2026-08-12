@@ -42,7 +42,8 @@ new_packages=(out/*.rpm)
 rpm_content_id() {
     local identifier
 
-    identifier=$(rpm -qp --qf '%{SHA256HEADER}:%{PAYLOADDIGEST}' "$1")
+    # RPM 6 renamed RPM 4's PAYLOADDIGEST query tag to PAYLOADSHA256.
+    identifier=$(rpm -qp --qf '%{SHA256HEADER}:%{PAYLOADSHA256}' "$1")
     [[ "$identifier" =~ ^[A-Fa-f0-9]{64}:[A-Fa-f0-9]{64}$ ]] || {
         echo "$1: RPM has no usable SHA-256 content identity" >&2
         return 1
