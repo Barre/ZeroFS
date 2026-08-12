@@ -1,6 +1,10 @@
 const title = "Update distro kernel package targets";
-const body =
-  "Automated kernel lock update. CI builds and boots every retained target.";
+const body = [
+  "Automated kernel lock update. CI builds and boots every retained target.",
+  "",
+  "Lock-only PR workflows are intentionally skipped. The trusted updater",
+  "dispatches `ci` for this exact commit; merge when `ci / required` passes.",
+].join("\n");
 
 module.exports = async ({ github, context, env = process.env }) => {
   const owner = context.repo.owner;

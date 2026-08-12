@@ -15,7 +15,15 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+    # The kernel target updater dispatches this workflow for its exact head.
+    paths-ignore:
+      - "packaging/kernel/kernels.lock.json"
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Commit expected at the dispatched ref
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +33,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dispatch-ref:
+    name: Verify dispatched ref
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Require the expected commit
+        if: ${{ inputs.expected_sha != '' }}
+        env:
+          ACTUAL_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "invalid expected commit: $EXPECTED_SHA" >&2
+            exit 1
+          fi
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "dispatched ref resolved to $ACTUAL_SHA, expected $EXPECTED_SHA" >&2
+            exit 1
+          fi
+
   build:
     uses: ./.github/workflows/_build-ci-bin.yml
 
@@ -82,3 +109,41 @@ jobs:
   csi-e2e-k3s:
     needs: build
     uses: ./.github/workflows/csi-e2e-k3s.yml
+
+  required:
+    name: required
+    if: ${{ always() }}
+    needs:
+      - build
+      - jepsen
+      - jepsen-ha
+      - kernel-compile-9p
+      - kernel-compile-fuse
+      - kernel-compile-nfs
+      - kernel-packages
+      - pjdfstest
+      - pjdfstest-9p
+      - pjdfstest-fuse
+      - stress-ng
+      - xfstests-9p
+      - xfstests-fuse
+      - xfstests-nfs
+      - zfs-test
+      - csi-sanity
+      - csi-e2e-k3s
+      - dispatch-ref
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Require every CI job
+        env:
+          NEEDS_CONTEXT: ${{ toJSON(needs) }}
+        run: |
+          failures=$(jq -r '
+            to_entries[] |
+            select(.value.result != "success") |
+            "\(.key)=\(.value.result)"
+          ' <<<"$NEEDS_CONTEXT")
+          if [[ -n "$failures" ]]; then
+            printf 'Required CI jobs did not succeed:\n%s\n' "$failures" >&2
+            exit 1
+          fi

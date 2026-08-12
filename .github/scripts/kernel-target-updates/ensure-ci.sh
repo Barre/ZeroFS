@@ -19,10 +19,12 @@ runs=$(gh run list \
   --branch "$UPDATE_BRANCH" \
   --commit "$HEAD_SHA" \
   --limit 100 \
-  --json headSha)
+  --json event,headSha)
 if jq -e --arg head_sha "$HEAD_SHA" \
-    'any(.[]; .headSha == $head_sha)' <<<"$runs" >/dev/null; then
+    'any(.[]; .headSha == $head_sha and .event == "workflow_dispatch")' \
+    <<<"$runs" >/dev/null; then
   echo "CI already exists for $HEAD_SHA"
 else
-  gh workflow run ci.yml --ref "$UPDATE_BRANCH"
+  gh workflow run ci.yml --ref "$UPDATE_BRANCH" \
+    -f "expected_sha=$HEAD_SHA"
 fi

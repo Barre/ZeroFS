@@ -5,6 +5,8 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "packaging/kernel/kernels.lock.json"
   # Releases are immutable, so a failed tag run can't be re-triggered by
   # re-pushing the tag. Dispatch with a tag input rebuilds that release's
   # images from the current workflow definition.

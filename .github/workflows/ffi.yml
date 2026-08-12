@@ -5,6 +5,8 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "packaging/kernel/kernels.lock.json"
 
 permissions:
   contents: read

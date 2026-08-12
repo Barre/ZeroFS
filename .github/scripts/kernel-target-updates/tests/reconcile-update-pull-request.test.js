@@ -11,7 +11,10 @@ const context = {
 };
 
 const canonicalBody =
-  "Automated kernel lock update. CI builds and boots every retained target.";
+  "Automated kernel lock update. CI builds and boots every retained target.\n" +
+  "\n" +
+  "Lock-only PR workflows are intentionally skipped. The trusted updater\n" +
+  "dispatches `ci` for this exact commit; merge when `ci / required` passes.";
 
 function githubWith(pulls) {
   const calls = [];

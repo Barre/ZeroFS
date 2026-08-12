@@ -3,6 +3,8 @@ name: Cross Compile
 on:
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "packaging/kernel/kernels.lock.json"
   workflow_dispatch:
 
 env:
