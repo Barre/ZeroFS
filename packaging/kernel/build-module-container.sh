@@ -951,7 +951,10 @@ build_source_package_module() {
             dnf install -y "$source_package" || package_install_status=$?
             ;;
         opensuse)
-            zypper --non-interactive install --allow-unsigned-rpm \
+            # The mounted package is audited before target fan-out.  Unlike
+            # --allow-unsigned-rpm, this also accepts its verified signature
+            # when the isolated target container lacks the ZeroFS public key.
+            zypper --non-interactive --no-gpg-checks install \
                 "$source_package" || package_install_status=$?
             ;;
     esac
