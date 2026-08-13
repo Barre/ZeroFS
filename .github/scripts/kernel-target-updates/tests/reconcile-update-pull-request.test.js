@@ -14,7 +14,8 @@ const canonicalBody =
   "Automated kernel lock update. CI builds and boots every retained target.\n" +
   "\n" +
   "Lock-only PR workflows are intentionally skipped. The trusted updater\n" +
-  "dispatches `ci` for this exact commit; merge when `ci / required` passes.";
+  "dispatches `ci` for the exact commit and links the run in a PR comment.\n" +
+  "Merge when the linked run's `ci / required` job passes.";
 
 function githubWith(pulls) {
   const calls = [];
@@ -29,7 +30,10 @@ function githubWith(pulls) {
       rest: {
         pulls: {
           list,
-          create: async options => calls.push(["create", options]),
+          create: async options => {
+            calls.push(["create", options]);
+            return { data: { number: 568 } };
+          },
           update: async options => calls.push(["update", options]),
         },
       },
@@ -45,7 +49,11 @@ const changedEnv = {
 
 test("creates an update pull request", async () => {
   const fixture = githubWith([]);
-  await reconcile({ github: fixture.github, context, env: changedEnv });
+  const result = await reconcile({
+    github: fixture.github,
+    context,
+    env: changedEnv,
+  });
 
   assert.equal(fixture.calls[0][0], "list");
   assert.equal(fixture.calls[0][1], fixture.list);
@@ -60,13 +68,18 @@ test("creates an update pull request", async () => {
       body: canonicalBody,
     },
   ]);
+  assert.equal(result, "568");
 });
 
 test("updates a noncanonical existing update pull request", async () => {
   const fixture = githubWith([
     { number: 567, title: "Old title", body: "Old body" },
   ]);
-  await reconcile({ github: fixture.github, context, env: changedEnv });
+  const result = await reconcile({
+    github: fixture.github,
+    context,
+    env: changedEnv,
+  });
 
   assert.deepEqual(fixture.calls[1], [
     "update",
@@ -78,6 +91,7 @@ test("updates a noncanonical existing update pull request", async () => {
       body: canonicalBody,
     },
   ]);
+  assert.equal(result, "567");
 });
 
 test("leaves a canonical existing update pull request unchanged", async () => {
@@ -88,15 +102,20 @@ test("leaves a canonical existing update pull request unchanged", async () => {
       body: canonicalBody,
     },
   ]);
-  await reconcile({ github: fixture.github, context, env: changedEnv });
+  const result = await reconcile({
+    github: fixture.github,
+    context,
+    env: changedEnv,
+  });
 
   assert.equal(fixture.calls.length, 1);
   assert.equal(fixture.calls[0][0], "list");
+  assert.equal(result, "567");
 });
 
 test("closes the existing update pull request when nothing changed", async () => {
   const fixture = githubWith([{ number: 567 }]);
-  await reconcile({
+  const result = await reconcile({
     github: fixture.github,
     context,
     env: {
@@ -114,6 +133,7 @@ test("closes the existing update pull request when nothing changed", async () =>
       state: "closed",
     },
   ]);
+  assert.equal(result, "");
 });
 
 test("rejects duplicate update pull requests", async () => {

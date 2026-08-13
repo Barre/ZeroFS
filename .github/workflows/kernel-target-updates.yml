@@ -148,17 +148,32 @@ jobs:
         run: .github/scripts/kernel-target-updates/reconcile-update-branch.sh
 
       - name: Reconcile update pull request
+        id: pull_request
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           CHANGED: ${{ steps.branch.outputs.changed }}
         with:
+          result-encoding: string
           script: |
             const run = require("./.github/scripts/kernel-target-updates/reconcile-update-pull-request.js");
-            await run({ github, context });
+            return await run({ github, context });
 
       - name: Ensure CI for the update commit
+        id: ci
         if: steps.branch.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.branch.outputs.head_sha }}
         run: .github/scripts/kernel-target-updates/ensure-ci.sh
+
+      - name: Link CI from the update pull request
+        if: steps.branch.outputs.changed == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          HEAD_SHA: ${{ steps.branch.outputs.head_sha }}
+          PULL_NUMBER: ${{ steps.pull_request.outputs.result }}
+          RUN_ID: ${{ steps.ci.outputs.run_id }}
+        with:
+          script: |
+            const run = require("./.github/scripts/kernel-target-updates/reconcile-update-ci-comment.js");
+            await run({ github, context });

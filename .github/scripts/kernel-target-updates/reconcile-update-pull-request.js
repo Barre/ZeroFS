@@ -3,7 +3,8 @@ const body = [
   "Automated kernel lock update. CI builds and boots every retained target.",
   "",
   "Lock-only PR workflows are intentionally skipped. The trusted updater",
-  "dispatches `ci` for this exact commit; merge when `ci / required` passes.",
+  "dispatches `ci` for the exact commit and links the run in a PR comment.",
+  "Merge when the linked run's `ci / required` job passes.",
 ].join("\n");
 
 module.exports = async ({ github, context, env = process.env }) => {
@@ -38,7 +39,7 @@ module.exports = async ({ github, context, env = process.env }) => {
         state: "closed",
       });
     }
-    return;
+    return "";
   }
 
   if (pull) {
@@ -51,14 +52,16 @@ module.exports = async ({ github, context, env = process.env }) => {
         body,
       });
     }
-  } else {
-    await github.rest.pulls.create({
-      owner,
-      repo,
-      head: branch,
-      base: context.payload.repository.default_branch,
-      title,
-      body,
-    });
+    return String(pull.number);
   }
+
+  const { data: created } = await github.rest.pulls.create({
+    owner,
+    repo,
+    head: branch,
+    base: context.payload.repository.default_branch,
+    title,
+    body,
+  });
+  return String(created.number);
 };

@@ -12,6 +12,8 @@ cd -- "$repo_root"
 
 node \
     .github/scripts/kernel-target-updates/tests/reconcile-update-pull-request.test.js
+node \
+    .github/scripts/kernel-target-updates/tests/reconcile-update-ci-comment.test.js
 bash \
     .github/scripts/kernel-target-updates/tests/ensure-ci.test.sh
 python3 -m unittest discover \

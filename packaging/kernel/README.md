@@ -99,6 +99,11 @@ channel failures, while conflicting edits to the same channel fail closed.
 Force-with-lease and default-branch comparisons prevent stale automation from
 overwriting newer lock changes.
 
+Ordinary PR workflows are skipped when the lock is the only changed file. The
+trusted updater instead dispatches `ci` for the exact update-branch commit and
+keeps one PR comment linked to that CI run. Each reconciled head updates the
+same comment; merge when the linked run's `ci / required` job passes.
+
 The PR builds the actual kernel-client package in a clean target environment,
 installs the exact kernel, headers, source, and toolchain, and forces the DKMS
 source fallback to build `zerofs.ko`. CI checks the resulting module and boots
