@@ -2,8 +2,6 @@
 //! epoch-bound standby acknowledgement. Expiry suspends serving for one final
 //! ownership validation.
 //! Ownership loss, validation failure, and database fencing are terminal.
-#![cfg_attr(not(test), allow(dead_code))] // The CLI compiles this module separately.
-
 use crate::replication::leader_record::{self, ActiveOwnership};
 use crate::replication::replicator::{HeartbeatAck, ReplicationControl};
 use slatedb::object_store::ObjectStore;
@@ -520,7 +518,6 @@ pub struct AuthoritySupervisor {
 }
 
 impl AuthoritySupervisor {
-    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn start(
         lease: Arc<Lease>,
         object_store: Arc<dyn ObjectStore>,

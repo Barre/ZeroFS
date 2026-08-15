@@ -90,7 +90,6 @@ impl ZeroFS {
     /// Page through a directory fid whose read access was already authorized at
     /// open, so that a paged listing cannot fail halfway through on a chmod the
     /// same open descriptor would survive.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn readdir_opened(
         &self,
         dirid: InodeId,

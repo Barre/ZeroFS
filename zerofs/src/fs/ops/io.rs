@@ -49,7 +49,6 @@ impl ZeroFS {
     /// The original credentials are still used for ownership-sensitive
     /// metadata such as clearing SUID/SGID; only the mutable mode-bit access
     /// check is skipped so an open descriptor remains a stable capability.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn write_opened_idempotent(
         &self,
         auth: &AuthContext,
@@ -238,7 +237,6 @@ impl ZeroFS {
     }
 
     /// Read through a fid whose read access was already authorized at open.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn read_file_opened(
         &self,
         id: InodeId,
@@ -361,7 +359,6 @@ impl ZeroFS {
     /// ZeroFS represents zero-filled ranges as sparse holes. Its allocation
     /// guarantee comes from charging logical growth against quota, so a later
     /// write inside the file does not consume additional quota.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn fallocate_opened(
         &self,
         auth: &AuthContext,
@@ -375,7 +372,6 @@ impl ZeroFS {
     }
 
     /// Idempotent fallocate through an already-authorized opened fid.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn fallocate_opened_idempotent(
         &self,
         auth: &AuthContext,

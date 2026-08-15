@@ -249,15 +249,13 @@ pub(crate) struct PromotionSuperseded {
 
 impl ReceiverControl {
     /// Subscribes to the highest peer epoch superseding this runtime.
-    // Binary-only API.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn superseding_epochs(&self) -> watch::Receiver<u64> {
         self.core.superseding_epoch.subscribe()
     }
 
     /// Stops heartbeat acknowledgements before durable takeover. Ship admission
     /// remains enabled.
-    #[allow(dead_code)] // Called by the binary-only failover supervisor.
     pub(crate) async fn quiesce_heartbeat_acks(&self) {
         let mut phase = self.core.phase.lock().await;
         if let ReceiverPhase::Standby(standby) = &mut *phase {
@@ -266,7 +264,6 @@ impl ReceiverControl {
     }
 
     /// Rearms heartbeat acknowledgements after returning to role election.
-    #[allow(dead_code)] // Called by the binary-only failover supervisor.
     pub(crate) async fn resume_heartbeat_acks(&self) {
         let mut phase = self.core.phase.lock().await;
         if let ReceiverPhase::Standby(standby) = &mut *phase {
@@ -275,7 +272,6 @@ impl ReceiverControl {
     }
 
     /// Attaches the serving lease and applies previously observed supersession.
-    #[allow(dead_code)]
     pub(crate) fn attach_serving_lease(
         &self,
         writer_epoch: u64,
@@ -375,7 +371,7 @@ impl ReceiverControl {
     }
 
     /// Demotes an unexposed local leader to an empty, quiesced standby.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn demote_leader(
         &self,
         writer_epoch: u64,
@@ -985,7 +981,6 @@ fn decode_hello_answer(resp: HelloResponse) -> anyhow::Result<HelloAnswer> {
 }
 
 /// Returns whether Hello completed with a protocol-version mismatch.
-#[allow(dead_code)] // Used by the binary CLI; the library target has no role election.
 pub(crate) fn hello_protocol_incompatible(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -1011,7 +1006,6 @@ pub async fn hello_peer(endpoint: String) -> anyhow::Result<HelloAnswer> {
 /// Sends epoch-acknowledged heartbeats at `interval`. Transport failures
 /// reconnect; missing base coverage and protocol incompatibility return
 /// terminal session results to the caller.
-#[allow(dead_code)] // Used by the binary CLI; library tests exercise it directly.
 pub(crate) async fn run_heartbeat_sender(
     endpoint: String,
     epoch: WriterEpoch,

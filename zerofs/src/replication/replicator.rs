@@ -30,21 +30,17 @@ pub enum ShipOutcome<'a> {
 
 enum ReplicationState {
     Solo,
-    // The library target does not compile the binary-only reconnect driver.
-    #[allow(dead_code)]
     Connected(Box<ReplicationSender>),
 }
 
 /// Ship RPC timeout before transition to Solo.
 const SHIP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Solo reconnect interval.
-#[allow(dead_code)] // Used by the binary CLI, which owns the reconnect task.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Cloneable control plane for reconnect, watermark, and deposal tasks. Mutation
 /// shipping remains on the non-cloneable [`Replicator`].
 pub(crate) struct ReplicationControl {
-    #[allow(dead_code)] // Used by the binary CLI's reconnect task.
     peer_endpoint: String,
     /// Writer term this control plane and its heartbeat ACK channel belong to.
     writer_epoch: WriterEpoch,
@@ -53,7 +49,6 @@ pub(crate) struct ReplicationControl {
     durability: StdMutex<DurabilityTracker>,
     /// Coverage-valid heartbeat acknowledgements for this writer epoch.
     heartbeat_acks: watch::Sender<Option<HeartbeatAck>>,
-    #[allow(dead_code)] // Sent by the binary-only heartbeat supervisor.
     repair_sender: mpsc::UnboundedSender<BaseRepairRequest>,
 }
 
@@ -95,7 +90,6 @@ struct DurabilityTracker {
 }
 
 impl DurabilityTracker {
-    #[allow(dead_code)] // Driven by the binary CLI's SlateDB status subscription.
     fn observe_durable(&mut self, durable: SlateDbSeqno) {
         self.observed_durable = self.observed_durable.max(durable.get());
         self.advance();
@@ -135,19 +129,16 @@ impl DurabilityTracker {
 
 impl ReplicationControl {
     /// Stops shipping and reconnect after observing a newer writer epoch.
-    #[allow(dead_code)] // Called by the binary CLI's leadership supervisor.
     pub(crate) async fn depose(&self) {
         self.deposed.cancel();
         // Reconnect and ship recheck `deposed` while holding `state`.
         *self.state.lock().await = ReplicationState::Solo;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn deposal_token(&self) -> CancellationToken {
         self.deposed.clone()
     }
 
-    #[allow(dead_code)] // Awaited by the binary-only heartbeat supervisor.
     pub(crate) async fn deposed(&self) {
         self.deposed.cancelled().await;
     }
@@ -159,7 +150,6 @@ impl ReplicationControl {
             .record_applied(ship, local);
     }
 
-    #[allow(dead_code)] // Driven by the binary CLI's SlateDB status subscription.
     fn observe_durable(&self, durable: SlateDbSeqno) {
         self.durability
             .lock()
@@ -183,7 +173,6 @@ impl ReplicationControl {
     }
 
     /// Subscribe to epoch-validated heartbeat acknowledgements from the peer.
-    #[allow(dead_code)] // Consumed by the binary-only authority supervisor.
     pub(crate) fn heartbeat_acks(&self) -> watch::Receiver<Option<HeartbeatAck>> {
         self.heartbeat_acks.subscribe()
     }
@@ -208,7 +197,6 @@ impl ReplicationControl {
 
     /// Flushes all applications ordered before this request and advances the
     /// durability watermark before completion.
-    #[allow(dead_code)] // Called by the binary-only heartbeat supervisor.
     pub(crate) async fn repair_base(&self) -> anyhow::Result<()> {
         let (completion, completed) = oneshot::channel();
         self.repair_sender
@@ -348,7 +336,6 @@ impl BaseFlushRequired<'_> {
 
 impl Replicator {
     /// Starts in Solo and returns its background-task control plane.
-    #[allow(dead_code)] // Constructed by the binary CLI; unit tests use it too.
     pub(crate) fn new(
         peer_endpoint: String,
         writer_epoch: WriterEpoch,
@@ -568,7 +555,6 @@ impl ReplicationControl {
 }
 
 /// Reconnects a Solo writer to its standby until drop or deposal.
-#[allow(dead_code)] // Spawned only by the binary CLI.
 pub(crate) async fn run_reconnect(replicator: Weak<ReplicationControl>) {
     let mut ticker = tokio::time::interval(RECONNECT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -599,7 +585,6 @@ pub(crate) async fn run_reconnect(replicator: Weak<ReplicationControl>) {
 }
 
 /// Advances the prune watermark from the data database's `durable_seq`.
-#[allow(dead_code)] // Spawned only by the binary CLI.
 pub(crate) async fn run_watermark(
     replicator: Arc<ReplicationControl>,
     mut durable: tokio::sync::watch::Receiver<slatedb::DbStatus>,

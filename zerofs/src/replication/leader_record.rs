@@ -463,7 +463,6 @@ pub async fn inspect(
 }
 
 /// Last active writer from the ownership record or bootstrap marker.
-#[allow(dead_code)] // Retains the released read API.
 pub async fn read(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,

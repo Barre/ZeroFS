@@ -34,7 +34,6 @@ type Reply = oneshot::Sender<Result<(), FsError>>;
 enum Request {
     Commit(Transaction, Reply),
     #[cfg(any(test, dst))]
-    #[allow(dead_code)]
     Barrier(Reply),
 }
 
@@ -109,7 +108,6 @@ impl WriteCoordinator {
     /// Wait until every commit submitted before this call has finished,
     /// including publication of its in-memory statistics.
     #[cfg(any(test, dst))]
-    #[allow(dead_code)]
     pub async fn barrier(&self) -> Result<(), FsError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
