@@ -28,7 +28,6 @@ enum SizeAuthorization {
 impl ZeroFS {
     /// Persist an automatic access-time update without changing ctime or
     /// requiring the reader to own the file.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn record_access_time_idempotent(
         &self,
         id: InodeId,
@@ -106,7 +105,6 @@ impl ZeroFS {
     /// Idempotent setattr through a fid whose write access was authorized at
     /// open. Only the mutable mode-bit check for a size change is skipped;
     /// ownership and timestamp authorization remain enforced.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn setattr_opened_idempotent(
         &self,
         creds: &Credentials,

@@ -47,7 +47,6 @@ impl ZeroFS {
     /// Remove with `unlinkat(2)`'s expected target kind enforced after the
     /// directory entry and target inode have been revalidated under their
     /// mutation locks.
-    #[allow(dead_code)] // Used by the binary-only 9P handler.
     pub(crate) async fn remove_idempotent_checked(
         &self,
         auth: &AuthContext,

@@ -20,9 +20,7 @@ pub use failover::watch_heartbeats_until_takeover_hint;
 pub use lease::{AuthoritySupervisor, Lease, activate_lease_from_ownership};
 #[doc(hidden)]
 pub use replay::{LineageProof, PromotionRetryGraceProof, ReconcileOutcome};
-#[allow(unused_imports)]
 pub use replicator::{Replicator, ShipOutcome};
-#[allow(unused_imports)]
 pub use tail::{ReplOp, TailBuffer};
 
 use crate::config::ReplicationRole;

@@ -66,8 +66,6 @@ impl ZeroFS {
     /// `lock_manager.acquire(id)` together with the inode-liveness `get`, so
     /// that the increment and the "is the inode alive" check are serialized
     /// against `remove`/`rename`'s defer-vs-delete decision on the same id.
-    // Public for library integration and DST harnesses.
-    #[allow(dead_code)]
     pub fn open_handle_inc(&self, id: InodeId) {
         *self.open_handles.entry(id).or_insert(0) += 1;
     }
@@ -95,8 +93,6 @@ impl ZeroFS {
     /// drop; the caller stores it in the fid slot. Like `open_handle_inc`, must
     /// be called under `lock_manager.acquire(id)` alongside the liveness `get`,
     /// so the increment is ordered against `remove`/`rename`'s defer decision.
-    // Called by external library harnesses.
-    #[allow(dead_code)]
     pub fn new_open_handle(&self, id: InodeId) -> OpenHandle {
         self.open_handle_inc(id);
         OpenHandle {

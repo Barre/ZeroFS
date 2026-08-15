@@ -34,7 +34,6 @@ pub const RECLAIM_HOLDING_LOCK_BEFORE_DELETE: &str = "reclaim_holding_lock_befor
 
 /// HA startup orphan drain, immediately before initializing the durable orphan
 /// scan. Return-style: `fail::cfg(STARTUP_ORPHAN_LIST_INIT, "return")`.
-#[allow(dead_code)]
 pub const STARTUP_ORPHAN_LIST_INIT: &str = "startup_orphan_list_init";
 
 pub const RENAME_AFTER_TARGET_DELETE: &str = "rename_after_target_delete";
