@@ -91,6 +91,16 @@ impl FlushCoordinator {
                     None => db.flush().await.map_err(|_| FsError::IoError),
                 };
 
+                // Drain requests covered by this flush before releasing the barrier.
+                // A queued close keeps the barrier through db.close().
+                while closer.is_none() {
+                    match receiver.try_recv() {
+                        Ok(Request::Flush(sender)) => pending_senders.push(sender),
+                        Ok(Request::Close(sender)) => closer = Some(sender),
+                        Err(_) => break,
+                    }
+                }
+
                 let close_result = if closer.is_some() && result.is_ok() {
                     db.mark_closing();
                     db.close().await.map_err(|_| FsError::IoError)
@@ -181,5 +191,69 @@ impl FlushCoordinator {
             .map_err(|_| FsError::ShuttingDown)?;
 
         rx.await.map_err(|_| FsError::ShuttingDown)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slatedb::object_store::memory::InMemory;
+    use slatedb::object_store::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::{Notify, oneshot};
+
+    async fn coordinator_with_blocked_seal(
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        seal_calls: Arc<AtomicU64>,
+    ) -> FlushCoordinator {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let raw = Arc::new(
+            slatedb::DbBuilder::new(Path::from("flush-coordinator-test"), store)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let coordinator = FlushCoordinator::new(Arc::new(Db::new(raw, None)));
+        coordinator.set_sealer(Arc::new(move || {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let seal_calls = Arc::clone(&seal_calls);
+            Box::pin(async move {
+                seal_calls.fetch_add(1, Ordering::Relaxed);
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        }));
+        coordinator
+    }
+
+    #[tokio::test]
+    async fn fsync_arriving_during_flush_joins_inflight_cycle() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let seal_calls = Arc::new(AtomicU64::new(0));
+        let coordinator = coordinator_with_blocked_seal(
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&seal_calls),
+        )
+        .await;
+
+        let first = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.flush().await }
+        });
+        entered.notified().await;
+
+        let (second_tx, second_rx) = oneshot::channel();
+        coordinator.sender.send(Request::Flush(second_tx)).unwrap();
+        release.notify_one();
+
+        first.await.unwrap().unwrap();
+        second_rx.await.unwrap().unwrap();
+        assert_eq!(seal_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.completed_flush_count(), 1);
     }
 }
