@@ -88,48 +88,6 @@ impl<'de> Deserialize<'de> for CompressionConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct WalConfig {
-    #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub url: String,
-    /// Object storage class/tier for WAL writes.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_expandable_string"
-    )]
-    pub storage_class: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aws: Option<AwsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub azure: Option<AzureConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp: Option<GcsConfig>,
-}
-
-impl WalConfig {
-    pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
-        let mut env_vars = Vec::new();
-        if let Some(aws) = &self.aws {
-            for (k, v) in &aws.0 {
-                env_vars.push((format!("aws_{}", k.to_lowercase()), v.clone()));
-            }
-        }
-        if let Some(azure) = &self.azure {
-            for (k, v) in &azure.0 {
-                env_vars.push((format!("azure_{}", k.to_lowercase()), v.clone()));
-            }
-        }
-        if let Some(gcp) = &self.gcp {
-            for (k, v) in &gcp.0 {
-                env_vars.push((format!("google_{}", k.to_lowercase()), v.clone()));
-            }
-        }
-        env_vars
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub cache: CacheConfig,
     pub storage: StorageConfig,
@@ -146,9 +104,6 @@ pub struct Settings {
     pub azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcp: Option<GcsConfig>,
-    /// Location of a pre-2.0 volume's separate WAL store.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub wal: Option<WalConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default = "default_telemetry")]
     pub telemetry: Option<TelemetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -405,14 +360,6 @@ pub struct LsmConfig {
     /// buffered until the next flush.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sync_writes: Option<bool>,
-    /// Deprecated, ignored: the WAL is permanently off (sealing correctness
-    /// requires it). Accepted so pre-2.0 configs still parse; never re-emitted.
-    #[serde(default, skip_serializing)]
-    pub wal_enabled: Option<bool>,
-    /// Deprecated, ignored: unflushed-data budgeting went away with the WAL.
-    /// Accepted so pre-2.0 configs still parse; never re-emitted.
-    #[serde(default, skip_serializing)]
-    pub max_unflushed_gb: Option<f64>,
 }
 
 impl LsmConfig {
@@ -997,23 +944,6 @@ impl Settings {
             );
         }
 
-        // Deprecated [lsm] keys still parse (an upgrade must not brick startup
-        // on an old config) but no longer do anything; nudge the operator to
-        // drop them.
-        if let Some(lsm) = &self.lsm {
-            if lsm.wal_enabled.is_some() {
-                tracing::warn!(
-                    "[lsm] wal_enabled is deprecated and ignored (the WAL is permanently off); \
-                     remove it from the config"
-                );
-            }
-            if lsm.max_unflushed_gb.is_some() {
-                tracing::warn!(
-                    "[lsm] max_unflushed_gb is deprecated and ignored (it tuned the removed WAL); \
-                     remove it from the config"
-                );
-            }
-        }
         Ok(())
     }
 
@@ -1088,7 +1018,6 @@ impl Settings {
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
-            wal: None,
             telemetry: None,
             prometheus: None,
             replication: None,
@@ -1752,74 +1681,15 @@ tail_scrub_min_dead_percent = 10"#,
         assert_eq!(gc.tail_scrub_min_dead_percent(), Some(10));
     }
 
-    // Pre-2.0 configs set the removed [lsm] wal_enabled / max_unflushed_gb
-    // keys; they must still parse (ignored, with a warning) so an upgrade
-    // doesn't brick startup, and must be dropped on re-serialization.
-    #[test]
-    fn test_deprecated_lsm_keys_parse_and_round_trip() {
-        let content = base_config_with_replication(
-            r#"[lsm]
-wal_enabled = true
-max_unflushed_gb = 2.0
-flush_interval_secs = 30"#,
-        );
-        let settings = write_and_load(&content).unwrap();
-        let lsm = settings.lsm.as_ref().unwrap();
-        assert_eq!(lsm.wal_enabled, Some(true));
-        assert_eq!(lsm.max_unflushed_gb, Some(2.0));
-        assert_eq!(lsm.flush_interval_secs, Some(30));
-
-        // Round-trip: the deprecated keys are never re-emitted, and the
-        // result still parses.
-        let serialized = toml::to_string(&settings).unwrap();
-        assert!(!serialized.contains("wal_enabled"), "got: {serialized}");
-        assert!(
-            !serialized.contains("max_unflushed_gb"),
-            "got: {serialized}"
-        );
-        let reparsed: Settings = toml::from_str(&serialized).unwrap();
-        let lsm = reparsed.lsm.unwrap();
-        assert!(lsm.wal_enabled.is_none());
-        assert!(lsm.max_unflushed_gb.is_none());
-        assert_eq!(lsm.flush_interval_secs, Some(30));
-    }
-
-    // deny_unknown_fields still catches typos: only the two deprecated keys
-    // get a pass.
+    // deny_unknown_fields catches misspelled LSM settings.
     #[test]
     fn test_unknown_lsm_key_still_rejected() {
         let content = base_config_with_replication(
             r#"[lsm]
-wal_enable = true"#,
+flush_interval_sec = 30"#,
         );
         let err = format!("{:#}", write_and_load(&content).unwrap_err());
         assert!(err.contains("unknown field"), "got: {err}");
-    }
-
-    // The generated config must not resurrect the deprecated keys, nor
-    // advertise the [wal] section (accepted only for upgraded 1.x volumes;
-    // new volumes never write a WAL).
-    #[test]
-    fn test_generated_config_omits_deprecated_lsm_keys() {
-        let rendered = Settings::render_default_config().unwrap();
-        assert!(!rendered.contains("wal_enabled"));
-        assert!(!rendered.contains("max_unflushed_gb"));
-        assert!(!rendered.contains("[wal]"));
-    }
-
-    // A pre-2.0 config with a custom [wal] location must keep parsing: the
-    // upgraded volume needs it to open (WAL replay / checkpoint references).
-    #[test]
-    fn test_wal_section_still_parses() {
-        let content = base_config_with_replication(
-            r#"[wal]
-url = "file:///mnt/nvme/zerofs-wal""#,
-        );
-        let settings = write_and_load(&content).unwrap();
-        assert_eq!(
-            settings.wal.as_ref().map(|w| w.url.as_str()),
-            Some("file:///mnt/nvme/zerofs-wal")
-        );
     }
 
     #[test]

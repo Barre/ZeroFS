@@ -2,7 +2,7 @@
 //!
 //! [`TracingObjectStore`] wraps the raw S3/GCS/Azure/local store at the bottom
 //! of the wrapper stack, so it sees the requests that actually leave the
-//! process: cache misses, prefetch reads, compaction, WAL writes, deletes.
+//! process: cache misses, prefetch reads, compaction, and deletes.
 //! Reads served from the prefetch cache make no backend request and so produce
 //! no event, which is exactly what a request trace should show.
 //!
@@ -69,8 +69,6 @@ impl Display for ObjectOperation {
 #[derive(Clone, Debug)]
 pub struct ObjectAccessEvent {
     pub timestamp: u64,
-    /// Which backend the request hit: `"data"` or `"wal"`.
-    pub store: &'static str,
     pub operation: ObjectOperation,
     pub path: String,
     /// How long the request took. `None` for stream-shaped ops (list, delete)
@@ -81,8 +79,8 @@ pub struct ObjectAccessEvent {
 
 /// Traces object-store requests and broadcasts them to subscribers.
 ///
-/// Cloning is cheap (a shared broadcast sender); the same tracer is handed to
-/// every store wrapper and to the RPC server.
+/// Cloning is cheap (a shared broadcast sender); the tracer is shared by the
+/// object-store wrapper and the RPC server.
 #[derive(Clone)]
 pub struct ObjectTracer {
     sender: broadcast::Sender<ObjectAccessEvent>,
@@ -106,7 +104,6 @@ impl ObjectTracer {
 
     fn emit(
         &self,
-        store: &'static str,
         operation: ObjectOperation,
         path: String,
         duration: Option<Duration>,
@@ -118,7 +115,6 @@ impl ObjectTracer {
             .unwrap_or(0);
         let _ = self.sender.send(ObjectAccessEvent {
             timestamp,
-            store,
             operation,
             path,
             duration_us: duration.map(|d| d.as_micros() as u64),
@@ -138,16 +134,11 @@ impl Default for ObjectTracer {
 pub struct TracingObjectStore {
     inner: Arc<dyn ObjectStore>,
     tracer: ObjectTracer,
-    store: &'static str,
 }
 
 impl TracingObjectStore {
-    pub fn new(inner: Arc<dyn ObjectStore>, tracer: ObjectTracer, store: &'static str) -> Self {
-        Self {
-            inner,
-            tracer,
-            store,
-        }
+    pub fn new(inner: Arc<dyn ObjectStore>, tracer: ObjectTracer) -> Self {
+        Self { inner, tracer }
     }
 }
 
@@ -155,7 +146,6 @@ impl Debug for TracingObjectStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TracingObjectStore")
             .field("inner", &self.inner)
-            .field("store", &self.store)
             .finish()
     }
 }
@@ -205,7 +195,6 @@ impl ObjectStore for TracingObjectStore {
         let start = Instant::now();
         let result = self.inner.get_opts(location, options).await;
         self.tracer.emit(
-            self.store,
             op,
             location.to_string(),
             Some(start.elapsed()),
@@ -227,7 +216,6 @@ impl ObjectStore for TracingObjectStore {
         let start = Instant::now();
         let result = self.inner.put_opts(location, payload, opts).await;
         self.tracer.emit(
-            self.store,
             ObjectOperation::Put { size },
             location.to_string(),
             Some(start.elapsed()),
@@ -248,7 +236,6 @@ impl ObjectStore for TracingObjectStore {
         let result = self.inner.put_multipart_opts(location, opts).await;
         // Records the open; the per-part uploads happen on the returned handle.
         self.tracer.emit(
-            self.store,
             ObjectOperation::PutMultipart,
             location.to_string(),
             Some(start.elapsed()),
@@ -265,21 +252,12 @@ impl ObjectStore for TracingObjectStore {
             return self.inner.delete_stream(locations);
         }
         let tracer = self.tracer.clone();
-        let store = self.store;
         self.inner
             .delete_stream(locations)
             .map(move |res| {
                 match &res {
-                    Ok(path) => tracer.emit(
-                        store,
-                        ObjectOperation::Delete,
-                        path.to_string(),
-                        None,
-                        false,
-                    ),
-                    Err(_) => {
-                        tracer.emit(store, ObjectOperation::Delete, String::new(), None, true)
-                    }
+                    Ok(path) => tracer.emit(ObjectOperation::Delete, path.to_string(), None, false),
+                    Err(_) => tracer.emit(ObjectOperation::Delete, String::new(), None, true),
                 }
                 res
             })
@@ -289,7 +267,6 @@ impl ObjectStore for TracingObjectStore {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         if self.tracer.has_subscribers() {
             self.tracer.emit(
-                self.store,
                 ObjectOperation::List,
                 prefix.map(|p| p.to_string()).unwrap_or_default(),
                 None,
@@ -306,7 +283,6 @@ impl ObjectStore for TracingObjectStore {
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         if self.tracer.has_subscribers() {
             self.tracer.emit(
-                self.store,
                 ObjectOperation::List,
                 prefix.map(|p| p.to_string()).unwrap_or_default(),
                 None,
@@ -324,7 +300,6 @@ impl ObjectStore for TracingObjectStore {
         let start = Instant::now();
         let result = self.inner.list_with_delimiter(prefix).await;
         self.tracer.emit(
-            self.store,
             ObjectOperation::List,
             path,
             Some(start.elapsed()),
@@ -345,7 +320,6 @@ impl ObjectStore for TracingObjectStore {
         let start = Instant::now();
         let result = self.inner.copy_opts(from, to, options).await;
         self.tracer.emit(
-            self.store,
             ObjectOperation::Copy { to: to.to_string() },
             from.to_string(),
             Some(start.elapsed()),
@@ -366,7 +340,6 @@ impl ObjectStore for TracingObjectStore {
         let start = Instant::now();
         let result = self.inner.rename_opts(from, to, options).await;
         self.tracer.emit(
-            self.store,
             ObjectOperation::Rename { to: to.to_string() },
             from.to_string(),
             Some(start.elapsed()),
@@ -385,10 +358,7 @@ mod tests {
     fn traced() -> (TracingObjectStore, ObjectTracer) {
         let tracer = ObjectTracer::new();
         let inner = Arc::new(InMemory::new());
-        (
-            TracingObjectStore::new(inner, tracer.clone(), "data"),
-            tracer,
-        )
+        (TracingObjectStore::new(inner, tracer.clone()), tracer)
     }
 
     #[tokio::test]
@@ -406,7 +376,6 @@ mod tests {
         store.delete(&path).await.unwrap();
 
         let put = rx.recv().await.unwrap();
-        assert_eq!(put.store, "data");
         assert_eq!(put.path, "a/b");
         assert!(!put.error);
         assert!(matches!(put.operation, ObjectOperation::Put { size: 5 }));

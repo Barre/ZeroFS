@@ -30,24 +30,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-/// Parse a WAL config into an object store rooted at the full URL path.
-pub(crate) fn parse_wal_object_store(
-    wal_config: &crate::config::WalConfig,
-) -> Result<Arc<dyn object_store::ObjectStore>> {
-    let env_vars = wal_config.cloud_provider_env_vars();
-    let (store, path) = parse_url_opts(&wal_config.url.parse()?, env_vars)?;
-    let path_str: &str = path.as_ref();
-    let store: Arc<dyn object_store::ObjectStore> = if path_str.is_empty() {
-        Arc::from(store)
-    } else {
-        Arc::new(object_store::prefix::PrefixStore::new(store, path))
-    };
-    Ok(with_storage_class(
-        store,
-        wal_config.storage_class.as_deref(),
-    ))
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum DatabaseMode {
     ReadWrite,
@@ -70,11 +52,7 @@ async fn resolve_checkpoint_name(settings: &Settings, name: &str) -> Result<uuid
     );
     let db_path = Path::from(path_from_url.to_string());
 
-    let mut admin_builder = AdminBuilder::new(db_path, object_store);
-    if let Some(wal_config) = &settings.wal {
-        admin_builder = admin_builder.with_wal_object_store(parse_wal_object_store(wal_config)?);
-    }
-    let admin = admin_builder.build();
+    let admin = AdminBuilder::new(db_path, object_store).build();
 
     let checkpoints = admin
         .list_checkpoints(Some(name))
@@ -530,7 +508,6 @@ fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
 const BARRIER_CONTROLLED_L0_SST_SIZE_BYTES: usize = usize::MAX - 1;
 const BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES: usize = usize::MAX;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
     cache_config: &CacheConfig,
@@ -538,7 +515,6 @@ pub async fn build_slatedb(
     db_mode: DatabaseMode,
     lsm_config: Option<crate::config::LsmConfig>,
     block_transformer: Arc<dyn BlockTransformer>,
-    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     replication: Option<&crate::replication::ReplicationParams>,
 ) -> Result<SlateDbOpen> {
     let total_disk_cache_gb = cache_config.max_cache_size_gb;
@@ -593,10 +569,8 @@ pub async fn build_slatedb(
     // the un-PUT open buffer (a dangling pointer after a crash). With it off,
     // the barrier-gated flush — which seals the open segment first — is the
     // only path that makes metadata durable.
-    let wal_enabled = false;
-
     let settings = slatedb::config::Settings {
-        wal_enabled,
+        wal_enabled: false,
         l0_max_ssts,
         l0_max_ssts_per_key: l0_max_ssts,
         // Disable SlateDB's write-path memtable size-freeze (`flush_interval:
@@ -618,11 +592,7 @@ pub async fn build_slatedb(
         l0_flush_parallelism: 16,
         min_filter_keys: 10,
         garbage_collector_options: Some(GarbageCollectorOptions {
-            wal_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(1)),
-                min_age: Duration::from_mins(1),
-                dry_run: false,
-            }),
+            wal_options: None,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(1)),
                 min_age: Duration::from_mins(1),
@@ -639,8 +609,7 @@ pub async fn build_slatedb(
                 dry_run: false,
             }),
             detach_options: None,
-            // Disable WAL fence GC: it defaults to a dry-run that does nothing
-            // but logs a conservative-setting warning every interval. See #352.
+            // The WAL and its fence GC are disabled together.
             wal_fence_options: None,
             ..Default::default()
         }),
@@ -672,8 +641,6 @@ pub async fn build_slatedb(
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(LengthCheckedObjectStore::new(object_store));
     let compactor_object_store = object_store.clone();
-    let wal_object_store = wal_object_store
-        .map(|s| Arc::new(LengthCheckedObjectStore::new(s)) as Arc<dyn object_store::ObjectStore>);
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(PrefetchingObjectStore::new(
         object_store,
         parts_cache.clone(),
@@ -696,10 +663,6 @@ pub async fn build_slatedb(
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_metrics_recorder(metrics_recorder.clone())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
-
-            if let Some(wal_store) = wal_object_store {
-                builder = builder.with_wal_object_store(wal_store);
-            }
 
             // The compaction coordinator is bound to the read-write DB, so it
             // runs only on the current leader. SlateDB holds only metadata, so
@@ -754,13 +717,10 @@ pub async fn build_slatedb(
         DatabaseMode::ReadOnly => {
             info!("Opening database in read-only mode");
 
-            let mut reader_builder = DbReader::builder(db_path, object_store)
+            let reader_builder = DbReader::builder(db_path, object_store)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
-            if let Some(wal_store) = wal_object_store {
-                reader_builder = reader_builder.with_wal_object_store(wal_store);
-            }
             let reader = Arc::new(
                 reader_builder
                     .build()
@@ -777,14 +737,11 @@ pub async fn build_slatedb(
         DatabaseMode::Checkpoint(checkpoint_id) => {
             info!("Opening database from checkpoint ID: {}", checkpoint_id);
 
-            let mut reader_builder = DbReader::builder(db_path, object_store)
+            let reader_builder = DbReader::builder(db_path, object_store)
                 .with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id))
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor));
-            if let Some(wal_store) = wal_object_store {
-                reader_builder = reader_builder.with_wal_object_store(wal_store);
-            }
             let reader = Arc::new(
                 reader_builder
                     .build()
@@ -804,7 +761,6 @@ pub async fn build_slatedb(
 pub struct InitResult {
     pub fs: Arc<ZeroFS>,
     pub object_store: Arc<dyn object_store::ObjectStore>,
-    pub wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
     /// HA authority monitors retained through database close.
@@ -980,7 +936,6 @@ pub async fn run_server(
         init_result.db_handle,
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
-        init_result.wal_object_store.clone(),
     ));
     // Checkpoints must not durably publish a FrameLoc whose segment is still in
     // the RAM open buffer: seal + flush under the barrier first (see

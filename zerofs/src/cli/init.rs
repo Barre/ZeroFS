@@ -8,9 +8,7 @@
 
 use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
-use crate::cli::server::{
-    DatabaseMode, InitResult, SlateDbOpen, build_slatedb, parse_wal_object_store,
-};
+use crate::cli::server::{DatabaseMode, InitResult, SlateDbOpen, build_slatedb};
 use crate::config::Settings;
 use crate::db::SlateDbHandle;
 use crate::fs::{CacheConfig, ZeroFS};
@@ -33,9 +31,8 @@ struct StartupContext {
     object_store: Arc<dyn object_store::ObjectStore>,
     /// Retrying store for direct ZeroFS I/O, including pre-serving HA ownership.
     retrying_object_store: Arc<dyn object_store::ObjectStore>,
-    wal_object_store: Option<Arc<dyn object_store::ObjectStore>>,
-    /// Shared by the data and WAL `TracingObjectStore` wrappers and handed to
-    /// the filesystem so the RPC server can stream backend requests (`otrace`).
+    /// Handed to the filesystem so the RPC server can stream backend requests
+    /// (`otrace`).
     object_tracer: ObjectTracer,
     actual_db_path: String,
     block_transformer: Arc<dyn BlockTransformer>,
@@ -190,17 +187,6 @@ impl StartupContext {
         let block_transformer: Arc<dyn BlockTransformer> =
             ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
 
-        let wal_object_store: Option<Arc<dyn object_store::ObjectStore>> =
-            if let Some(wal_config) = &settings.wal {
-                info!("Using separate WAL object store: {}", wal_config.url);
-                Some(
-                    parse_wal_object_store(wal_config)
-                        .context("Failed to connect to WAL object store")?,
-                )
-            } else {
-                None
-            };
-
         let replication_params = settings
             .replication
             .as_ref()
@@ -213,25 +199,17 @@ impl StartupContext {
 
         // Trace at the bottom of the stack so otrace sees the requests that
         // actually leave the process. Everything above (length-check, prefetch,
-        // compactor) reads through these wrappers; cache hits make no backend
+        // compactor) reads through this wrapper; cache hits make no backend
         // request and so produce no event.
         let object_tracer = ObjectTracer::new();
-        let object_store = Arc::new(TracingObjectStore::new(
-            object_store,
-            object_tracer.clone(),
-            "data",
-        )) as Arc<dyn object_store::ObjectStore>;
-        let wal_object_store = wal_object_store.map(|s| {
-            Arc::new(TracingObjectStore::new(s, object_tracer.clone(), "wal"))
-                as Arc<dyn object_store::ObjectStore>
-        });
+        let object_store = Arc::new(TracingObjectStore::new(object_store, object_tracer.clone()))
+            as Arc<dyn object_store::ObjectStore>;
 
         Ok(Self {
             retrying_object_store: Arc::new(
                 crate::retrying_object_store::RetryingObjectStore::new(object_store.clone()),
             ),
             object_store,
-            wal_object_store,
             object_tracer,
             actual_db_path,
             block_transformer,
@@ -628,7 +606,6 @@ impl StartupContext {
             self.db_mode,
             settings.lsm,
             self.block_transformer.clone(),
-            self.wal_object_store.clone(),
             self.replication_params.as_ref(),
         )
         .await
@@ -841,7 +818,6 @@ impl ReconciledDb {
         let StartupContext {
             object_store,
             retrying_object_store,
-            wal_object_store,
             object_tracer,
             actual_db_path,
             block_transformer: _,
@@ -1060,7 +1036,6 @@ impl ReconciledDb {
             // admin and the checkpoint manager), whose listings would otherwise
             // fail on one transient backend error.
             object_store: retrying_object_store,
-            wal_object_store,
             db_path: actual_db_path,
             db_handle,
             authority,
@@ -1136,7 +1111,6 @@ mod role_decision_tests {
         let mut startup = StartupContext {
             object_store: store.clone(),
             retrying_object_store: store.clone(),
-            wal_object_store: None,
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),
             block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
