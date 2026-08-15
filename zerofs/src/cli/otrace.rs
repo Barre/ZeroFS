@@ -44,17 +44,7 @@ fn print_event(event: &ObjectAccessEvent) {
         .map(|us| format!("  {}", format_duration(us)))
         .unwrap_or_default();
     let err = if event.error { "  ERR" } else { "" };
-    // Only tag the non-default store: with no separate WAL configured every
-    // request hits "data", so the label would just repeat on every line.
-    let store = if event.store == "data" {
-        String::new()
-    } else {
-        format!("{} ", event.store)
-    };
-    println!(
-        "{} | {}{}{}{}{}",
-        op, store, event.path, params, timing, err
-    );
+    println!("{} | {}{}{}{}", op, event.path, params, timing, err);
 }
 
 fn format_params(params: Option<&ObjectParams>, op: i32) -> String {

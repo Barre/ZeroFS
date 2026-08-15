@@ -126,17 +126,15 @@ message WatchObjectAccessRequest {}
 
 message ObjectAccessEvent {
     google.protobuf.Timestamp timestamp = 1;
-    // Which backend store the request hit: "data" or "wal".
-    string store = 2;
-    ObjectOperation operation = 3;
+    ObjectOperation operation = 2;
     // Object key (the location passed to the backend).
-    string path = 4;
-    ObjectParams params = 5;
+    string path = 3;
+    ObjectParams params = 4;
     // Wall-clock time the backend request took. Absent for stream-shaped ops
     // (list, delete) where there is no single request to time.
-    optional uint64 duration_us = 6;
+    optional uint64 duration_us = 5;
     // True when the backend returned an error.
-    bool error = 7;
+    bool error = 6;
 }
 
 enum ObjectOperation {

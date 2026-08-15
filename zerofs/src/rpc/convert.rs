@@ -250,7 +250,6 @@ impl From<ObjectAccessEvent> for proto::ObjectAccessEvent {
                 seconds: event.timestamp as i64,
                 nanos: 0,
             }),
-            store: event.store.to_string(),
             operation,
             path: event.path,
             params: Some(params),

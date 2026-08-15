@@ -803,12 +803,7 @@ mod tests {
             .unwrap(),
         );
         fs.start_reclaim_drainer();
-        let checkpoint_manager = Arc::new(CheckpointManager::new(
-            db_handle,
-            db_path,
-            object_store,
-            None,
-        ));
+        let checkpoint_manager = Arc::new(CheckpointManager::new(db_handle, db_path, object_store));
         {
             let fc = fs.flush_coordinator.clone();
             checkpoint_manager.set_pre_flush(Arc::new(move || {
