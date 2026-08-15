@@ -105,8 +105,8 @@ async fn join_with_timeout<T>(
 }
 
 pub enum Transport {
-    Tcp(SocketAddr),
-    Unix(PathBuf),
+    Tcp(TcpListener),
+    Unix(UnixListener),
 }
 
 pub struct NinePServer {
@@ -116,20 +116,33 @@ pub struct NinePServer {
 }
 
 impl NinePServer {
-    pub fn new(filesystem: Arc<ZeroFS>, addr: SocketAddr) -> Self {
-        Self {
+    pub async fn new(filesystem: Arc<ZeroFS>, addr: SocketAddr) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| crate::net_util::tcp_bind_error("9P", addr, &e))?;
+
+        Ok(Self {
             filesystem,
-            transport: Transport::Tcp(addr),
+            transport: Transport::Tcp(listener),
             lock_manager: Arc::new(FileLockManager::new()),
-        }
+        })
     }
 
-    pub fn new_unix(filesystem: Arc<ZeroFS>, path: PathBuf) -> Self {
-        Self {
+    pub fn new_unix(filesystem: Arc<ZeroFS>, path: PathBuf) -> std::io::Result<Self> {
+        let _ = std::fs::remove_file(&path);
+
+        let listener = UnixListener::bind(&path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Failed to bind Unix socket at {:?}: {}", path, e),
+            )
+        })?;
+
+        Ok(Self {
             filesystem,
-            transport: Transport::Unix(path),
+            transport: Transport::Unix(listener),
             lock_manager: Arc::new(FileLockManager::new()),
-        }
+        })
     }
 
     fn spawn_client_handler<R, W>(
@@ -166,23 +179,23 @@ impl NinePServer {
         let mut clients = FuturesUnordered::new();
         let clients_shutdown = shutdown.child_token();
         let serve_result = match &self.transport {
-            Transport::Tcp(addr) => {
-                let listener = TcpListener::bind(addr)
-                    .await
-                    .map_err(|e| crate::net_util::tcp_bind_error("9P", addr, &e))?;
-                info!("9P server listening on TCP {}", addr);
+
+        match &self.transport {
+            Transport::Tcp(listener) => {
+                info!("9P server listening on TCP {}", listener.local_addr()?);
 
                 loop {
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => {
-                            info!("9P TCP server shutting down on {}", addr);
+                            info!("9P TCP server shutting down on {}", listener.local_addr()?);
                             break Ok(());
                         }
                         finished = clients.next(), if !clients.is_empty() => {
                             if let Some(Err(e)) = finished {
                                 warn!("9P client task failed: {e}");
                             }
+                            break;
                         }
                         result = listener.accept() => {
                             let (stream, peer_addr) = match result {
@@ -207,22 +220,17 @@ impl NinePServer {
                     }
                 }
             }
-            Transport::Unix(path) => {
-                let _ = std::fs::remove_file(path);
-
-                let listener = UnixListener::bind(path).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to bind Unix socket at {:?}: {}", path, e),
-                    )
-                })?;
-                info!("9P server listening on Unix socket {:?}", path);
+            Transport::Unix(listener) => {
+                info!(
+                    "9P server listening on Unix socket {:?}",
+                    listener.local_addr()?
+                );
 
                 loop {
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => {
-                            info!("9P Unix socket server shutting down at {:?}", path);
+                            info!("9P Unix socket server shutting down at {:?}", listener.local_addr()?);
                             break Ok(());
                         }
                         finished = clients.next(), if !clients.is_empty() => {
