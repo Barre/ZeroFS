@@ -31,19 +31,26 @@ pub struct ZeroFsBlockTransformer {
 }
 
 impl ZeroFsBlockTransformer {
-    /// Create a new block transformer with the given master key and compression config.
-    ///
-    /// The encryption key is derived from the master key using HKDF-SHA256 with
-    /// the info string "zerofs-v1-encryption".
-    pub fn new(master_key: &[u8; 32], compression: CompressionConfig) -> Self {
-        Self {
-            codec: Arc::new(FrameCodec::new(master_key, ENCRYPTION_INFO, compression)),
-        }
+    /// Create a block transformer, returning an error if its key cannot be locked.
+    pub fn try_new(
+        master_key: &[u8; 32],
+        compression: CompressionConfig,
+    ) -> Result<Self, CodecError> {
+        Ok(Self {
+            codec: Arc::new(FrameCodec::try_new(
+                master_key,
+                ENCRYPTION_INFO,
+                compression,
+            )?),
+        })
     }
 
-    /// Create a shareable Arc-wrapped transformer.
-    pub fn new_arc(master_key: &[u8; 32], compression: CompressionConfig) -> Arc<Self> {
-        Arc::new(Self::new(master_key, compression))
+    /// Create a shareable transformer, returning an error if its key cannot be locked.
+    pub fn try_new_arc(
+        master_key: &[u8; 32],
+        compression: CompressionConfig,
+    ) -> Result<Arc<Self>, CodecError> {
+        Ok(Arc::new(Self::try_new(master_key, compression)?))
     }
 }
 
@@ -104,7 +111,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_roundtrip_lz4() {
-        let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Lz4);
+        let transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let data = Bytes::from(vec![42u8; 4096]);
 
         let encoded = transformer.encode(data.clone()).await.unwrap();
@@ -115,7 +123,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_roundtrip_zstd() {
-        let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Zstd(3));
+        let transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Zstd(3))
+            .expect("test key should be lockable");
         let data = Bytes::from(vec![42u8; 4096]);
 
         let encoded = transformer.encode(data.clone()).await.unwrap();
@@ -127,8 +136,11 @@ mod tests {
     #[tokio::test]
     async fn test_cross_algorithm_lz4_to_zstd() {
         // Encode with LZ4, decode with Zstd configured (should auto-detect LZ4)
-        let lz4_transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Lz4);
-        let zstd_transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Zstd(3));
+        let lz4_transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Lz4)
+            .expect("test key should be lockable");
+        let zstd_transformer =
+            ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Zstd(3))
+                .expect("test key should be lockable");
 
         let data = Bytes::from(vec![1u8; 2048]);
         let encoded = lz4_transformer.encode(data.clone()).await.unwrap();
@@ -140,8 +152,11 @@ mod tests {
     #[tokio::test]
     async fn test_cross_algorithm_zstd_to_lz4() {
         // Encode with Zstd, decode with LZ4 configured (should auto-detect Zstd)
-        let zstd_transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Zstd(5));
-        let lz4_transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Lz4);
+        let zstd_transformer =
+            ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Zstd(5))
+                .expect("test key should be lockable");
+        let lz4_transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Lz4)
+            .expect("test key should be lockable");
 
         let data = Bytes::from(vec![2u8; 2048]);
         let encoded = zstd_transformer.encode(data.clone()).await.unwrap();
@@ -152,8 +167,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_different_keys_fail_decrypt() {
-        let transformer1 = ZeroFsBlockTransformer::new(&[1u8; 32], CompressionConfig::Lz4);
-        let transformer2 = ZeroFsBlockTransformer::new(&[2u8; 32], CompressionConfig::Lz4);
+        let transformer1 = ZeroFsBlockTransformer::try_new(&[1u8; 32], CompressionConfig::Lz4)
+            .expect("test key should be lockable");
+        let transformer2 = ZeroFsBlockTransformer::try_new(&[2u8; 32], CompressionConfig::Lz4)
+            .expect("test key should be lockable");
 
         let data = Bytes::from(vec![42u8; 1024]);
         let encoded = transformer1.encode(data).await.unwrap();
@@ -164,7 +181,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_data() {
-        let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Lz4);
+        let transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let data = Bytes::new();
 
         let encoded = transformer.encode(data.clone()).await.unwrap();
@@ -175,7 +193,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_data() {
-        let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Zstd(3));
+        let transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Zstd(3))
+            .expect("test key should be lockable");
         let data = Bytes::from(vec![0xABu8; 1024 * 1024]);
 
         let encoded = transformer.encode(data.clone()).await.unwrap();
@@ -186,7 +205,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncated_ciphertext_fails() {
-        let transformer = ZeroFsBlockTransformer::new(&test_key(), CompressionConfig::Lz4);
+        let transformer = ZeroFsBlockTransformer::try_new(&test_key(), CompressionConfig::Lz4)
+            .expect("test key should be lockable");
 
         // Less than nonce size
         let short_data = Bytes::from(vec![0u8; 10]);
@@ -244,7 +264,7 @@ mod prop_tests {
         fn encode_decode_roundtrips(data in payload(), cfg in compression()) {
             let key = [7u8; 32];
             let out = block_on(async {
-                let t = ZeroFsBlockTransformer::new(&key, cfg);
+                let t = ZeroFsBlockTransformer::try_new(&key, cfg).expect("test key should be lockable");
                 let enc = t.encode(Bytes::from(data.clone())).await?;
                 t.decode(enc).await
             });
@@ -266,10 +286,10 @@ mod prop_tests {
         fn decode_is_algorithm_agnostic(data in payload(), level in 1i32..=19) {
             let key = [9u8; 32];
             let out = block_on(async {
-                let enc = ZeroFsBlockTransformer::new(&key, CompressionConfig::Lz4)
+                let enc = ZeroFsBlockTransformer::try_new(&key, CompressionConfig::Lz4).expect("test key should be lockable")
                     .encode(Bytes::from(data.clone()))
                     .await?;
-                ZeroFsBlockTransformer::new(&key, CompressionConfig::Zstd(level))
+                ZeroFsBlockTransformer::try_new(&key, CompressionConfig::Zstd(level)).expect("test key should be lockable")
                     .decode(enc)
                     .await
             });
@@ -288,11 +308,11 @@ mod prop_tests {
         ) {
             prop_assume!(k1 != k2);
             let out = block_on(async {
-                let enc = ZeroFsBlockTransformer::new(&k1, CompressionConfig::Lz4)
+                let enc = ZeroFsBlockTransformer::try_new(&k1, CompressionConfig::Lz4).expect("test key should be lockable")
                     .encode(Bytes::from(data.clone()))
                     .await
                     .unwrap();
-                ZeroFsBlockTransformer::new(&k2, CompressionConfig::Lz4)
+                ZeroFsBlockTransformer::try_new(&k2, CompressionConfig::Lz4).expect("test key should be lockable")
                     .decode(enc)
                     .await
             });

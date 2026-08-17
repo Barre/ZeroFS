@@ -1096,7 +1096,8 @@ mod tests {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
         let raw_db = Arc::new(
             slatedb::DbBuilder::new(
                 slatedb::object_store::path::Path::from("ha-apply-failure"),
@@ -1109,13 +1110,14 @@ mod tests {
             .await
             .unwrap(),
         );
-        let segment_codec = crate::frame_codec::FrameCodec::new(
+        let segment_codec = crate::frame_codec::FrameCodec::try_new(
             &test_key,
             crate::segment::SEGMENT_INFO,
             CompressionConfig::default(),
-        );
+        )
+        .expect("test key should be lockable");
 
-        let fs = ZeroFS::new_with_slatedb_and_lease(
+        let fs = ZeroFS::try_new(
             crate::db::SlateDbHandle::ReadWrite(raw_db.clone()),
             u64::MAX,
             None,

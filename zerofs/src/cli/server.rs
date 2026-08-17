@@ -817,7 +817,7 @@ pub async fn run_server(
 
     info!("ZeroFS v{}", env!("CARGO_PKG_VERSION"));
 
-    let settings = Settings::from_file(&config_path)
+    let (settings, password) = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let db_mode = match (read_only, &checkpoint_name) {
@@ -843,7 +843,7 @@ pub async fn run_server(
 
     crate::telemetry::send_startup_event(&settings);
 
-    let init_result = crate::cli::init::initialize_filesystem(&settings, db_mode).await?;
+    let init_result = crate::cli::init::initialize_filesystem(&settings, password, db_mode).await?;
     let fs = init_result.fs;
     let authority = init_result.authority;
     let leadership_deposed = authority

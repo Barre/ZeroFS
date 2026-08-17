@@ -604,7 +604,8 @@ mod tests {
 
     fn store() -> SegmentStore {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         SegmentStore::new(os, codec, 5, None)
     }
 
@@ -921,7 +922,8 @@ mod tests {
     #[tokio::test]
     async fn multipart_seal_roundtrips() {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let store = SegmentStore::new(os.clone(), codec, 5, None);
         let frames: Vec<(u64, u64, Bytes)> =
             (0..4u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
@@ -945,7 +947,8 @@ mod tests {
     #[tokio::test]
     async fn failed_multipart_part_aborts_the_upload() {
         let (os, aborted) = MultipartFaultStore::new(Some(1), false);
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let store = SegmentStore::new(os, codec, 5, None);
         let res = store
             .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
@@ -962,7 +965,8 @@ mod tests {
     #[tokio::test]
     async fn failed_multipart_complete_aborts_the_upload() {
         let (os, aborted) = MultipartFaultStore::new(None, true);
-        let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let store = SegmentStore::new(os, codec, 5, None);
         let res = store
             .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
@@ -1002,7 +1006,10 @@ mod tests {
         use slatedb::object_store::prefix::PrefixStore;
 
         let bucket: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let codec = || FrameCodec::new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = || {
+            FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+                .expect("test key should be lockable")
+        };
         let store_a: Arc<dyn ObjectStore> =
             Arc::new(PrefixStore::new(bucket.clone(), Path::from("db_a")));
         let store_b: Arc<dyn ObjectStore> =
@@ -1041,7 +1048,8 @@ mod tests {
     #[tokio::test]
     async fn materialization_propagates_create_errors() {
         let object_store: Arc<dyn ObjectStore> = MultipartFaultStore::with_create_failure(false);
-        let codec = FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::try_new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let segid = Segid::new(9, 1);
         let frames = [ReconFrame {
             frame_index: 0,
@@ -1067,7 +1075,10 @@ mod tests {
     // makes a repeat call a verified no-op.
     #[tokio::test]
     async fn shipped_frames_reconstruct_a_readable_segment() {
-        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = || {
+            FrameCodec::try_new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+                .expect("test key should be lockable")
+        };
 
         // Leader: seal frames into store A; that object's bytes are what's shipped.
         let store_a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1117,7 +1128,10 @@ mod tests {
     // the partial object it prepared before discovering the winner.
     #[tokio::test]
     async fn concurrent_full_seal_wins_over_partial_takeover_reconstruction() {
-        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = || {
+            FrameCodec::try_new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+                .expect("test key should be lockable")
+        };
         let leader_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let leader = SegmentStore::new(leader_os.clone(), codec(), 9, None);
         let frames = vec![
@@ -1167,7 +1181,10 @@ mod tests {
     // that ambiguous response into success without a second overwrite.
     #[tokio::test]
     async fn lost_create_response_is_verified_as_success() {
-        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = || {
+            FrameCodec::try_new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+                .expect("test key should be lockable")
+        };
         let source_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let source = SegmentStore::new(source_os.clone(), codec(), 9, None);
         let frames = vec![(5u64, 0u64, Bytes::from(vec![1u8; 1000]))];
@@ -1199,7 +1216,10 @@ mod tests {
 
     #[tokio::test]
     async fn existing_segment_mismatch_aborts_takeover() {
-        let codec = || FrameCodec::new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = || {
+            FrameCodec::try_new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+                .expect("test key should be lockable")
+        };
         let wanted_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let wanted = SegmentStore::new(wanted_os.clone(), codec(), 9, None);
         let wanted_frames = vec![(5u64, 0u64, Bytes::from(vec![1u8; 1000]))];

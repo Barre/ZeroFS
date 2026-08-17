@@ -30,7 +30,7 @@ members = [
 # same release, so the version the driver reports (GetPluginInfo) must not
 # drift from zerofs's.
 [workspace.package]
-version = "2.2.3"
+version = "2.3.0"
 
 [profile.release]
 lto = true
@@ -112,7 +112,9 @@ lz4_flex = "0.12"
 zstd = "0.13"
 anyhow = "1.0"
 arc-swap = "1.7"
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
+region = "3.0"
+zeroize = "1.8"
 url = "2.5"
 deku = "0.20"
 thiserror = "2.0"

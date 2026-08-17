@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 impl ZeroFS {
     /// Thin no-lease wrapper retained for the single-node constructors and tests;
-    /// the replication-aware server path calls `new_with_slatedb_and_lease`.
+    /// the replication-aware server path calls `try_new`.
     #[cfg(test)]
     pub async fn new_with_slatedb(
         slatedb: SlateDbHandle,
@@ -34,7 +34,7 @@ impl ZeroFS {
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
     ) -> anyhow::Result<Self> {
-        Self::new_with_slatedb_and_lease(
+        Self::try_new(
             slatedb,
             max_bytes,
             metrics_recorder,
@@ -53,10 +53,10 @@ impl ZeroFS {
         .await
     }
 
-    /// Like [`new_with_slatedb`](Self::new_with_slatedb), with HA lease,
-    /// replication, and takeover-lineage state.
+    /// Construct the filesystem over an opened slatedb handle, with optional
+    /// HA lease, replication, and takeover-lineage state.
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_slatedb_and_lease(
+    pub async fn try_new(
         slatedb: SlateDbHandle,
         max_bytes: u64,
         metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
@@ -347,7 +347,8 @@ impl ZeroFS {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(object_store);
 
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
@@ -359,11 +360,12 @@ impl ZeroFS {
                 .await?,
         );
 
-        let segment_codec = crate::frame_codec::FrameCodec::new(
+        let segment_codec = crate::frame_codec::FrameCodec::try_new(
             &test_key,
             crate::segment::SEGMENT_INFO,
             CompressionConfig::default(),
-        );
+        )
+        .expect("test key should be lockable");
         Self::new_with_slatedb(
             SlateDbHandle::ReadWrite(slatedb),
             u64::MAX,
@@ -388,7 +390,8 @@ impl ZeroFS {
 
         let test_key = [0u8; 32];
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let db_path = Path::from("test_slatedb");
         let reader = Arc::new(
@@ -406,11 +409,12 @@ impl ZeroFS {
             None,
             false,
             object_store,
-            crate::frame_codec::FrameCodec::new(
+            crate::frame_codec::FrameCodec::try_new(
                 &test_key,
                 crate::segment::SEGMENT_INFO,
                 CompressionConfig::default(),
-            ),
+            )
+            .expect("test key should be lockable"),
         )
         .await
     }
@@ -465,7 +469,8 @@ mod tests {
 
         let test_key = [0u8; 32];
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let db_path = Path::from("test_slatedb");
         let slatedb = Arc::new(
@@ -484,11 +489,12 @@ mod tests {
             None,
             false,
             object_store.clone(),
-            crate::frame_codec::FrameCodec::new(
+            crate::frame_codec::FrameCodec::try_new(
                 &test_key,
                 crate::segment::SEGMENT_INFO,
                 CompressionConfig::default(),
-            ),
+            )
+            .expect("test key should be lockable"),
         )
         .await
         .unwrap();

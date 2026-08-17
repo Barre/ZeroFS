@@ -17,6 +17,7 @@ use crate::object_trace::{ObjectTracer, TracingObjectStore};
 use crate::parse_object_store::parse_url_opts;
 use crate::replication::transport::{PromotionSnapshot, ReceiverControl};
 use crate::replication::{LineageProof, PromotionRetryGraceProof, ReplicationParams};
+use crate::secrets::EncryptionPassword;
 use crate::storage_class_object_store::with_storage_class;
 use anyhow::{Context, Result};
 use slatedb::BlockTransformer;
@@ -118,7 +119,11 @@ enum ReconcileOutcome {
 }
 
 impl StartupContext {
-    async fn prepare(settings: &Settings, db_mode: DatabaseMode) -> Result<Self> {
+    async fn prepare(
+        settings: &Settings,
+        db_mode: DatabaseMode,
+        password: EncryptionPassword,
+    ) -> Result<Self> {
         let url = settings.storage.url.clone();
 
         let cache_config = CacheConfig {
@@ -170,22 +175,33 @@ impl StartupContext {
                 .await?;
         }
 
-        let password = settings.storage.encryption_password.clone();
-        crate::cli::password::validate_password(&password).context("Password validation failed")?;
+        crate::cli::password::validate_password(password.expose_secret())
+            .context("Password validation failed")?;
 
         info!("Loading or initializing encryption key from object store");
         let db_path = Path::from(actual_db_path.clone());
         let encryption_key = key_management::load_or_init_encryption_key(
             &object_store,
             &db_path,
-            &password,
+            password,
             db_mode.is_read_only(),
         )
         .await
         .context("Failed to load or initialize encryption key")?;
 
-        let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
+        let block_transformer: Arc<dyn BlockTransformer> = ZeroFsBlockTransformer::try_new_arc(
+            encryption_key.expose_secret(),
+            settings.compression(),
+        )
+        .context("Failed to protect metadata encryption key in memory")?;
+
+        let segment_codec = crate::frame_codec::FrameCodec::try_new(
+            encryption_key.expose_secret(),
+            crate::segment::SEGMENT_INFO,
+            settings.compression(),
+        )
+        .context("Failed to protect segment encryption key in memory")?;
+        drop(encryption_key);
 
         let replication_params = settings
             .replication
@@ -213,11 +229,7 @@ impl StartupContext {
             object_tracer,
             actual_db_path,
             block_transformer,
-            segment_codec: crate::frame_codec::FrameCodec::new(
-                &encryption_key,
-                crate::segment::SEGMENT_INFO,
-                settings.compression(),
-            ),
+            segment_codec,
             cache_config,
             dedup,
             replication_params,
@@ -997,7 +1009,7 @@ impl ReconciledDb {
         }
 
         let db_handle = slatedb.clone();
-        let fs = ZeroFS::new_with_slatedb_and_lease(
+        let fs = ZeroFS::try_new(
             slatedb,
             settings.max_bytes(),
             metrics_recorder,
@@ -1046,11 +1058,11 @@ impl ReconciledDb {
 /// Run role election, database open, reconciliation, and activation.
 pub async fn initialize_filesystem(
     settings: &Settings,
+    password: EncryptionPassword,
     db_mode: DatabaseMode,
 ) -> Result<InitResult> {
-    let mut startup = StartupContext::prepare(settings, db_mode)
-        .await?
-        .start_receiver()?;
+    let prepared = StartupContext::prepare(settings, db_mode, password).await?;
+    let mut startup = prepared.start_receiver()?;
     'role_election: loop {
         startup.become_writer().await?;
         startup.opening = match startup.claim_opening().await? {
@@ -1113,15 +1125,17 @@ mod role_decision_tests {
             retrying_object_store: store.clone(),
             object_tracer: crate::object_trace::ObjectTracer::new(),
             actual_db_path: "db".into(),
-            block_transformer: crate::block_transformer::ZeroFsBlockTransformer::new_arc(
+            block_transformer: crate::block_transformer::ZeroFsBlockTransformer::try_new_arc(
                 &[0; 32],
                 CompressionConfig::default(),
-            ),
-            segment_codec: crate::frame_codec::FrameCodec::new(
+            )
+            .expect("test key should be lockable"),
+            segment_codec: crate::frame_codec::FrameCodec::try_new(
                 &[0; 32],
                 crate::segment::SEGMENT_INFO,
                 CompressionConfig::default(),
-            ),
+            )
+            .expect("test key should be lockable"),
             cache_config: crate::fs::CacheConfig {
                 root_folder: std::env::temp_dir(),
                 max_cache_size_gb: 0.0,

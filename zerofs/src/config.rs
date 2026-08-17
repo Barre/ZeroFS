@@ -1,3 +1,4 @@
+use crate::secrets::{CapturedPassword, EncryptionPassword};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashSet;
@@ -5,6 +6,7 @@ use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 /// Compression algorithm configuration for extent data.
 /// Supports lz4 and zstd.
@@ -86,7 +88,7 @@ impl<'de> Deserialize<'de> for CompressionConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub cache: CacheConfig,
@@ -98,11 +100,11 @@ pub struct Settings {
     pub lsm: Option<LsmConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub gc: Option<GcConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub aws: Option<AwsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub azure: Option<AzureConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub gcp: Option<GcsConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default = "default_telemetry")]
     pub telemetry: Option<TelemetryConfig>,
@@ -293,13 +295,18 @@ pub struct CacheConfig {
     pub warm_metadata: WarmMetadata,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub url: String,
-    #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub encryption_password: String,
+    /// Serde needs a field to deserialize into; `from_file` immediately moves
+    /// the value out, so this is always `None` outside `from_file`.
+    #[serde(
+        deserialize_with = "deserialize_captured_encryption_password",
+        skip_serializing
+    )]
+    encryption_password: Option<CapturedPassword>,
     /// Object storage class/tier for data writes, passed through verbatim as the
     /// per-backend tiering header.
     #[serde(
@@ -678,8 +685,13 @@ pub struct PrometheusConfig {
     pub addresses: HashSet<SocketAddr>,
 }
 
-#[derive(Debug, Serialize, Clone)]
 pub struct AwsConfig(pub std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for AwsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AwsConfig([REDACTED])")
+    }
+}
 
 impl<'de> Deserialize<'de> for AwsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -690,8 +702,13 @@ impl<'de> Deserialize<'de> for AwsConfig {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
 pub struct AzureConfig(pub std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for AzureConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AzureConfig([REDACTED])")
+    }
+}
 
 impl<'de> Deserialize<'de> for AzureConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -702,8 +719,13 @@ impl<'de> Deserialize<'de> for AzureConfig {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
 pub struct GcsConfig(pub std::collections::HashMap<String, String>);
+
+impl std::fmt::Debug for GcsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GcsConfig([REDACTED])")
+    }
+}
 
 impl<'de> Deserialize<'de> for GcsConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -771,6 +793,38 @@ where
             e
         ))),
     }
+}
+
+fn deserialize_captured_encryption_password<'de, D>(
+    deserializer: D,
+) -> Result<Option<CapturedPassword>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CaptureVisitor;
+
+    impl de::Visitor<'_> for CaptureVisitor {
+        type Value = CapturedPassword;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string")
+        }
+
+        // For a plain TOML literal, `v` borrows from the locked config buffer,
+        // so the password goes locked-to-locked with no unprotected stop.
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(CapturedPassword::capture(v))
+        }
+
+        // Escaped TOML strings arrive as an owned copy; wipe it after capture.
+        fn visit_string<E: de::Error>(self, mut v: String) -> Result<Self::Value, E> {
+            let captured = CapturedPassword::capture(&v);
+            v.zeroize();
+            Ok(captured)
+        }
+    }
+
+    deserializer.deserialize_str(CaptureVisitor).map(Some)
 }
 
 fn deserialize_optional_expandable_string<'de, D>(
@@ -913,17 +967,33 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
+    /// Load the config and move the encryption password straight into locked
+    /// memory.
+    pub(crate) fn from_file(
+        config_path: impl AsRef<std::path::Path>,
+    ) -> Result<(Self, EncryptionPassword)> {
         let path = config_path.as_ref();
-        let content = fs::read_to_string(path)
+        let content = crate::secrets::read_file_locked(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let settings: Settings = toml::from_str(&content)
+        let mut settings: Settings = toml::from_str(content.expose_secret())
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        let password = match settings
+            .storage
+            .encryption_password
+            .take()
+            .context("Missing required field `storage.encryption_password`")?
+        {
+            CapturedPassword::Locked(password) => password.expand_environment()?,
+            CapturedPassword::Failed(error) => {
+                return Err(error).context("Failed to protect encryption password in memory");
+            }
+        };
 
         settings.validate()?;
 
-        Ok(settings)
+        Ok((settings, password))
     }
 
     /// Cross-section validation applied after deserialization.
@@ -968,16 +1038,6 @@ impl Settings {
     }
 
     pub fn generate_default() -> Self {
-        let mut aws_config = std::collections::HashMap::new();
-        aws_config.insert(
-            "access_key_id".to_string(),
-            "${AWS_ACCESS_KEY_ID}".to_string(),
-        );
-        aws_config.insert(
-            "secret_access_key".to_string(),
-            "${AWS_SECRET_ACCESS_KEY}".to_string(),
-        );
-
         Settings {
             cache: CacheConfig {
                 dir: PathBuf::from("${HOME}/.cache/zerofs"),
@@ -987,7 +1047,7 @@ impl Settings {
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/zerofs-data".to_string(),
-                encryption_password: "${ZEROFS_PASSWORD}".to_string(),
+                encryption_password: None,
                 storage_class: None,
             },
             servers: ServerConfig {
@@ -1015,7 +1075,7 @@ impl Settings {
             filesystem: None,
             lsm: None,
             gc: None,
-            aws: Some(AwsConfig(aws_config)),
+            aws: None,
             azure: None,
             gcp: None,
             telemetry: None,
@@ -1028,13 +1088,17 @@ impl Settings {
         let default = Self::generate_default();
         let mut toml_string = toml::to_string_pretty(&default)?;
 
-        // Inject a commented storage_class hint into the [storage] section. It
-        // can't be appended like the others below because [storage] is not the
-        // last table in the serialized output.
         toml_string = toml_string.replace(
-            "encryption_password = \"${ZEROFS_PASSWORD}\"\n",
-            "encryption_password = \"${ZEROFS_PASSWORD}\"\n\
+            "url = \"s3://your-bucket/zerofs-data\"\n",
+            "url = \"s3://your-bucket/zerofs-data\"\n\
+             encryption_password = \"${ZEROFS_PASSWORD}\"\n\
              # storage_class = \"...\"   # Optional object storage class/tier for all writes (provider-specific value).\n"
+        );
+
+        toml_string.push_str(
+            "\n[aws]\n\
+             access_key_id = \"${AWS_ACCESS_KEY_ID}\"\n\
+             secret_access_key = \"${AWS_SECRET_ACCESS_KEY}\"\n",
         );
 
         // Document warm_metadata in place (the [cache] table is not last, so the
@@ -1264,9 +1328,13 @@ encryption_password = "${ZEROFS_TEST_PASSWORD}"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, password) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
         assert_eq!(settings.storage.url, "s3://my-bucket/data");
-        assert_eq!(settings.storage.encryption_password, "secret123");
+        assert_eq!(password.expose_secret(), "secret123");
+        assert!(!format!("{settings:?}").contains("secret123"));
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("secret123"));
+        assert!(!serialized.contains("encryption_password"));
     }
 
     #[test]
@@ -1294,7 +1362,7 @@ unix_socket = "${ZEROFS_TEST_HOME}/zerofs.sock"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, _) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
 
         assert_eq!(settings.cache.dir, home_dir.join("test-cache"));
         assert_eq!(
@@ -1310,6 +1378,7 @@ unix_socket = "${ZEROFS_TEST_HOME}/zerofs.sock"
 
     #[test]
     fn test_undefined_env_var_error() {
+        const LITERAL_PREFIX: &str = "must-not-appear-in-error";
         let config_content = r#"
 [cache]
 dir = "/tmp/cache"
@@ -1317,7 +1386,7 @@ disk_size_gb = 1.0
 
 [storage]
 url = "s3://bucket/data"
-encryption_password = "${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
+encryption_password = "must-not-appear-in-error-${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
 
 [servers]
 "#;
@@ -1333,6 +1402,38 @@ encryption_password = "${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
             "Error was: {}",
             error
         );
+        assert!(
+            !error.contains(LITERAL_PREFIX),
+            "Error leaked config: {error}"
+        );
+        assert!(
+            !error.contains("encryption_password ="),
+            "Error leaked the TOML source line: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_encryption_password_has_an_accurate_error() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers]
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let error = format!("{:#}", Settings::from_file(temp_file.path()).unwrap_err());
+        assert!(
+            error.contains("missing field `encryption_password`"),
+            "Error was: {error}"
+        );
+        assert!(!error.contains("already been consumed"));
     }
 
     #[test]
@@ -1358,7 +1459,7 @@ encryption_password = "test"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, _) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
         assert_eq!(settings.cache.dir, home_dir.join("mydir/cache"));
     }
 
@@ -1392,7 +1493,16 @@ storage_account_key = "${ZEROFS_TEST_AZURE_KEY}"
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), config_content).unwrap();
 
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+        let (settings, _) = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
+
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("aws_secret"));
+        assert!(!debug.contains("azure456"));
+        let serialized = toml::to_string(&settings).unwrap();
+        assert!(!serialized.contains("aws_secret"));
+        assert!(!serialized.contains("azure456"));
+        assert!(!serialized.contains("[aws]"));
+        assert!(!serialized.contains("[azure]"));
 
         let aws = settings.aws.unwrap();
         assert_eq!(aws.0.get("access_key_id").unwrap(), "aws123");
@@ -1447,7 +1557,7 @@ allow_http = "true"
         std::fs::write(temp_file.path(), config_with_string).unwrap();
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         assert!(result.is_ok());
-        let settings = result.unwrap();
+        let (settings, _) = result.unwrap();
         assert_eq!(settings.aws.unwrap().0.get("allow_http").unwrap(), "true");
     }
 
@@ -1472,7 +1582,7 @@ encryption_password = "test"
     fn write_and_load(content: &str) -> Result<Settings> {
         let temp_file = NamedTempFile::new().unwrap();
         std::fs::write(temp_file.path(), content).unwrap();
-        Settings::from_file(temp_file.path().to_str().unwrap())
+        Settings::from_file(temp_file.path().to_str().unwrap()).map(|(settings, _)| settings)
     }
 
     #[test]

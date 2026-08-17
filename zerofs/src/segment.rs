@@ -711,7 +711,8 @@ mod tests {
     use crate::config::CompressionConfig;
 
     fn codec() -> FrameCodec {
-        FrameCodec::new(&[5u8; 32], SEGMENT_INFO, CompressionConfig::Zstd(3))
+        FrameCodec::try_new(&[5u8; 32], SEGMENT_INFO, CompressionConfig::Zstd(3))
+            .expect("test key should be lockable")
     }
 
     // A run past PARALLEL_CRYPTO_MIN_BYTES decodes on rayon and must roundtrip with
@@ -1002,7 +1003,7 @@ mod prop_tests {
         // Build -> parse -> contiguous read returns every frame's plaintext exactly.
         #[test]
         fn build_parse_read_roundtrips(frames in frames_strategy(), epoch in 0u64..1000, counter in 0u64..1000) {
-            let c = FrameCodec::new(&[2u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+            let c = FrameCodec::try_new(&[2u8; 32], SEGMENT_INFO, CompressionConfig::Lz4).expect("test key should be lockable");
             let segid = Segid::new(epoch, counter);
             let mut b = SegmentBuilder::new(&c, segid);
             for (ino, extent, data) in &frames {
@@ -1025,7 +1026,7 @@ mod prop_tests {
             frames in frames_strategy(),
             seed in any::<u64>(),
         ) {
-            let c = FrameCodec::new(&[2u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+            let c = FrameCodec::try_new(&[2u8; 32], SEGMENT_INFO, CompressionConfig::Lz4).expect("test key should be lockable");
             let mut b = SegmentBuilder::new(&c, Segid::new(1, 1));
             for (ino, extent, data) in &frames {
                 b.add_frame(*ino, *extent, data).unwrap();
