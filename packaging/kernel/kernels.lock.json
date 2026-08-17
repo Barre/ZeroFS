@@ -52,6 +52,13 @@
             "source_version": "7.0.0-28.28~24.04.1",
             "snapshot": "20260727T000000Z",
             "source_name": "linux-hwe-7.0"
+          },
+          {
+            "kernel": "7.0.0-29-generic",
+            "version": "7.0.0-29.29~24.04.2",
+            "source_version": "7.0.0-29.29~24.04.2",
+            "snapshot": "20260817T130742Z",
+            "source_name": "linux-hwe-7.0"
           }
         ],
         "aarch64": [
@@ -60,6 +67,13 @@
             "version": "7.0.0-28.28~24.04.1",
             "source_version": "7.0.0-28.28~24.04.1",
             "snapshot": "20260727T000000Z",
+            "source_name": "linux-hwe-7.0"
+          },
+          {
+            "kernel": "7.0.0-29-generic",
+            "version": "7.0.0-29.29~24.04.2",
+            "source_version": "7.0.0-29.29~24.04.2",
+            "snapshot": "20260817T130742Z",
             "source_name": "linux-hwe-7.0"
           }
         ]
