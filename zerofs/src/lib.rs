@@ -31,6 +31,7 @@ mod parse_object_store;
 mod prometheus;
 mod redis_conditional_store;
 mod rpc;
+mod secrets;
 mod storage_compatibility;
 mod telemetry;
 #[cfg(feature = "webui")]

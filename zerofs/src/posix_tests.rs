@@ -1415,7 +1415,8 @@ mod tests {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let fs = Arc::new(
             ZeroFS::new_with_slatedb(
@@ -1437,11 +1438,12 @@ mod tests {
                 None,
                 false,
                 object_store,
-                crate::frame_codec::FrameCodec::new(
+                crate::frame_codec::FrameCodec::try_new(
                     &test_key,
                     crate::segment::SEGMENT_INFO,
                     CompressionConfig::default(),
-                ),
+                )
+                .expect("test key should be lockable"),
             )
             .await
             .unwrap(),
@@ -1487,7 +1489,8 @@ mod tests {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let fs = Arc::new(
             ZeroFS::new_with_slatedb(
@@ -1509,11 +1512,12 @@ mod tests {
                 None,
                 false,
                 object_store,
-                crate::frame_codec::FrameCodec::new(
+                crate::frame_codec::FrameCodec::try_new(
                     &test_key,
                     crate::segment::SEGMENT_INFO,
                     CompressionConfig::default(),
-                ),
+                )
+                .expect("test key should be lockable"),
             )
             .await
             .unwrap(),
@@ -1554,7 +1558,8 @@ mod tests {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let block_transformer: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&test_key, CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
 
         let fs = Arc::new(
             ZeroFS::new_with_slatedb(
@@ -1576,11 +1581,12 @@ mod tests {
                 None,
                 false,
                 object_store,
-                crate::frame_codec::FrameCodec::new(
+                crate::frame_codec::FrameCodec::try_new(
                     &test_key,
                     crate::segment::SEGMENT_INFO,
                     CompressionConfig::default(),
-                ),
+                )
+                .expect("test key should be lockable"),
             )
             .await
             .unwrap(),

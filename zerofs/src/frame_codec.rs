@@ -23,6 +23,7 @@ use rand::{RngCore, thread_rng};
 use sha2::Sha256;
 
 use crate::config::CompressionConfig;
+use crate::secrets::SecretBytes;
 
 const NONCE_SIZE: usize = 24;
 const TAG_SIZE: usize = 16;
@@ -40,6 +41,8 @@ pub enum CodecError {
     TooShort(usize),
     #[error("decryption failed (wrong key, AAD mismatch, or corrupt frame)")]
     Decrypt,
+    #[error("failed to protect encryption key in memory: {0}")]
+    LockedMemory(String),
 }
 
 /// A frame's compressed (but not encrypted) payload: what sits between
@@ -63,21 +66,26 @@ impl Compressed {
 /// Holds a derived XChaCha20-Poly1305 subkey and a compression config. Cheap to
 /// `seal`/`open`; the async / `spawn_blocking` policy lives in the callers.
 pub struct FrameCodec {
-    cipher: XChaCha20Poly1305,
+    subkey: SecretBytes<32>,
     compression: CompressionConfig,
 }
 
 impl FrameCodec {
     /// Derive a subkey from `master_key` via HKDF-SHA256 with `info` and build a codec.
-    pub fn new(master_key: &[u8; 32], info: &[u8], compression: CompressionConfig) -> Self {
+    pub fn try_new(
+        master_key: &[u8; 32],
+        info: &[u8],
+        compression: CompressionConfig,
+    ) -> Result<Self, CodecError> {
         let hk = Hkdf::<Sha256>::new(None, master_key);
-        let mut subkey = [0u8; 32];
-        hk.expand(info, &mut subkey)
+        let mut subkey = SecretBytes::<32>::zeroed()
+            .map_err(|error| CodecError::LockedMemory(error.to_string()))?;
+        hk.expand(info, subkey.expose_secret_mut())
             .expect("valid HKDF output length");
-        Self {
-            cipher: XChaCha20Poly1305::new(Key::from_slice(&subkey)),
+        Ok(Self {
+            subkey,
             compression,
-        }
+        })
     }
 
     /// Whether encoding is cheap enough to run inline rather than on a blocking thread.
@@ -110,8 +118,10 @@ impl FrameCodec {
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&compressed);
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let tag = self
-            .cipher
+        // The long-lived subkey stays in locked memory. The RustCrypto cipher
+        // is an operation-local copy whose destructor zeroizes its key.
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(self.subkey.expose_secret()));
+        let tag = cipher
             .encrypt_in_place_detached(nonce, aad, &mut out[NONCE_SIZE..])
             .map_err(|_| CodecError::Encrypt)?;
         out.extend_from_slice(tag.as_slice());
@@ -134,7 +144,10 @@ impl FrameCodec {
         }
         let (nonce_bytes, ciphertext) = frame.split_at(NONCE_SIZE);
         let nonce = XNonce::from_slice(nonce_bytes);
-        self.cipher
+        // See `seal_compressed`: only the persistent key is required to remain
+        // in locked memory; this operation-local cipher zeroizes on drop.
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(self.subkey.expose_secret()));
+        cipher
             .decrypt(
                 nonce,
                 Payload {
@@ -207,7 +220,8 @@ mod tests {
     use super::*;
 
     fn codec() -> FrameCodec {
-        FrameCodec::new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Lz4)
+        FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Lz4)
+            .expect("test key should be lockable")
     }
 
     // seal() must remain exactly seal_compressed(compress(..)): the write path
@@ -216,7 +230,8 @@ mod tests {
     fn split_seal_roundtrips_like_fused_seal() {
         for c in [
             codec(),
-            FrameCodec::new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Zstd(3)),
+            FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Zstd(3))
+                .expect("test key should be lockable"),
         ] {
             let plain = vec![9u8; 40_000];
             let sealed = c
@@ -234,8 +249,10 @@ mod tests {
     // producing output the (level-agnostic) decompressor accepts.
     #[test]
     fn zstd_context_reuse_survives_level_changes() {
-        let a = FrameCodec::new(&[7u8; 32], b"t", CompressionConfig::Zstd(1));
-        let b = FrameCodec::new(&[7u8; 32], b"t", CompressionConfig::Zstd(19));
+        let a = FrameCodec::try_new(&[7u8; 32], b"t", CompressionConfig::Zstd(1))
+            .expect("test key should be lockable");
+        let b = FrameCodec::try_new(&[7u8; 32], b"t", CompressionConfig::Zstd(19))
+            .expect("test key should be lockable");
         let plain = vec![5u8; 10_000];
         for c in [&a, &b, &a] {
             let sealed = c.seal(&plain, b"aad").unwrap();
@@ -264,8 +281,10 @@ mod tests {
 
     #[test]
     fn wrong_subkey_fails() {
-        let a = FrameCodec::new(&[1u8; 32], b"info-a", CompressionConfig::Lz4);
-        let b = FrameCodec::new(&[1u8; 32], b"info-b", CompressionConfig::Lz4);
+        let a = FrameCodec::try_new(&[1u8; 32], b"info-a", CompressionConfig::Lz4)
+            .expect("test key should be lockable");
+        let b = FrameCodec::try_new(&[1u8; 32], b"info-b", CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let sealed = a.seal(b"payload", b"aad").unwrap();
         // Same master key, different HKDF label -> different subkey -> must not open.
         assert!(matches!(b.open(&sealed, b"aad"), Err(CodecError::Decrypt)));

@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::key_management;
+use crate::secrets::EncryptionPassword;
 use crate::storage_class_object_store::with_storage_class;
 use slatedb::object_store::path::Path;
 use std::sync::Arc;
@@ -39,14 +40,13 @@ pub fn validate_password(password: &str) -> Result<(), PasswordError> {
 /// to open the database to change the password.
 pub async fn change_password(
     settings: &Settings,
-    new_password: String,
+    current_password: EncryptionPassword,
+    new_password: EncryptionPassword,
 ) -> Result<(), PasswordError> {
-    let current_password = &settings.storage.encryption_password;
-
-    if current_password == "CHANGEME" {
+    if current_password.expose_secret() == "CHANGEME" {
         return Err(PasswordError::CurrentPasswordIsDefault);
     }
-    validate_password(&new_password)?;
+    validate_password(new_password.expose_secret())?;
 
     let env_vars = settings.cloud_provider_env_vars();
 
@@ -70,7 +70,7 @@ pub async fn change_password(
         &object_store,
         &db_path,
         current_password,
-        &new_password,
+        new_password,
     )
     .await
     .map_err(|e| PasswordError::EncryptionError(e.to_string()))?;

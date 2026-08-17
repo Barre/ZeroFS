@@ -97,7 +97,7 @@ impl CrashTestContext {
         );
 
         Arc::new(
-            ZeroFS::new_with_slatedb_and_lease(
+            ZeroFS::try_new(
                 SlateDbHandle::ReadWrite(slatedb),
                 u64::MAX,
                 None,
@@ -109,11 +109,12 @@ impl CrashTestContext {
                 None,
                 zerofs::object_trace::ObjectTracer::new(),
                 Arc::clone(&self.object_store),
-                zerofs::frame_codec::FrameCodec::new(
+                zerofs::frame_codec::FrameCodec::try_new(
                     &[7u8; 32],
                     zerofs::segment::SEGMENT_INFO,
                     zerofs::config::CompressionConfig::default(),
-                ),
+                )
+                .expect("test key should be lockable"),
                 None,
                 None,
             )

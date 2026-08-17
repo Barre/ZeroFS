@@ -95,7 +95,7 @@ fn decode_payload(codec: &KeyCodec, prefix: KeyPrefix, key: &[u8]) -> Option<Str
 }
 
 pub async fn list_keys(config_path: PathBuf) -> Result<()> {
-    let settings = Settings::from_file(&config_path)
+    let (settings, password) = Settings::from_file(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
     let url = settings.storage.url.clone();
@@ -125,18 +125,18 @@ pub async fn list_keys(config_path: PathBuf) -> Result<()> {
         ..cache_config
     };
 
-    let password = settings.storage.encryption_password.clone();
-
-    crate::cli::password::validate_password(&password)
+    crate::cli::password::validate_password(password.expose_secret())
         .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
 
     let db_path = Path::from(actual_db_path.clone());
     let encryption_key =
-        key_management::load_or_init_encryption_key(&object_store, &db_path, &password, false)
+        key_management::load_or_init_encryption_key(&object_store, &db_path, password, false)
             .await?;
 
     let block_transformer: Arc<dyn BlockTransformer> =
-        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
+        ZeroFsBlockTransformer::try_new_arc(encryption_key.expose_secret(), settings.compression())
+            .context("Failed to protect metadata encryption key in memory")?;
+    drop(encryption_key);
 
     let opened = super::server::build_slatedb(
         object_store,

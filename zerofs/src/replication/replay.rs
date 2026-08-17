@@ -928,7 +928,8 @@ mod tests {
             Vec::new(),
         );
 
-        let codec = FrameCodec::new(&[7u8; 32], SEGMENT_INFO, CompressionConfig::Lz4);
+        let codec = FrameCodec::try_new(&[7u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
+            .expect("test key should be lockable");
         let outcome = promotion
             .reconcile_into(&stale, &store, &codec)
             .await

@@ -28,7 +28,8 @@ pub(super) async fn make_with_compression(
 ) -> (ExtentStore, Arc<Db>, Arc<dyn ObjectStore>) {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let bt: Arc<dyn BlockTransformer> =
-        ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+        ZeroFsBlockTransformer::try_new_arc(&[0u8; 32], CompressionConfig::default())
+            .expect("test key should be lockable");
     let slatedb = Arc::new(
         DbBuilder::new(Path::from("t"), object_store.clone())
             .with_block_transformer(bt)
@@ -51,7 +52,8 @@ pub(super) fn make_store(
     epoch: u64,
 ) -> ExtentStore {
     let key_codec = Arc::new(KeyCodec::new());
-    let codec = FrameCodec::new(&[1u8; 32], SEGMENT_INFO, compression);
+    let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, compression)
+        .expect("test key should be lockable");
     let segments = Arc::new(SegmentStore::new(object_store, codec, epoch, None));
     ExtentStore::new(
         db,

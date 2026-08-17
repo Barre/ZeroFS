@@ -1,9 +1,7 @@
+use crate::secrets::{EncryptionPassword, SecretBytes, SecretVec};
 use crate::task::spawn_blocking_named;
-use anyhow::Result;
-use argon2::{
-    Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHasher, SaltString},
-};
+use anyhow::{Context, Result};
+use argon2::{Algorithm, Argon2, Params, Version, password_hash::SaltString};
 use bytes::Bytes;
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
@@ -49,27 +47,25 @@ impl KeyManager {
     }
 
     /// Derive a key encryption key (KEK) from a password
-    fn derive_kek(&self, password: &str, salt: &SaltString) -> Result<[u8; 32]> {
-        let password_hash = self
-            .argon2
-            .hash_password(password.as_bytes(), salt)
+    fn derive_kek(&self, password: &str, salt: &SaltString) -> Result<SecretBytes<32>> {
+        // Match PasswordHasher's salt decoding, but derive directly into a
+        // locked output instead of creating a copyable PasswordHash value.
+        let mut salt_bytes = [0u8; 64];
+        let salt_bytes = salt
+            .decode_b64(&mut salt_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to decode salt: {}", e))?;
+        let mut kek = SecretBytes::zeroed().context("Failed to protect derived key in memory")?;
+        self.argon2
+            .hash_password_into(password.as_bytes(), salt_bytes, kek.expose_secret_mut())
             .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
-
-        // Extract the hash bytes
-        let hash_bytes = password_hash
-            .hash
-            .ok_or_else(|| anyhow::anyhow!("No hash in password hash"))?;
-
-        let mut kek = [0u8; 32];
-        kek.copy_from_slice(&hash_bytes.as_bytes()[..32]);
         Ok(kek)
     }
 
     /// Generate a new data encryption key and wrap it with a password
-    pub fn generate_and_wrap_key(&self, password: &str) -> Result<(WrappedDataKey, [u8; 32])> {
+    fn generate_and_wrap_key(&self, password: &str) -> Result<(WrappedDataKey, SecretBytes<32>)> {
         // Generate random DEK
-        let mut dek = [0u8; 32];
-        thread_rng().fill_bytes(&mut dek);
+        let mut dek = SecretBytes::zeroed().context("Failed to protect data key in memory")?;
+        thread_rng().fill_bytes(dek.expose_secret_mut());
 
         // Generate random salt for password KDF
         let salt = SaltString::generate(&mut thread_rng());
@@ -83,9 +79,9 @@ impl KeyManager {
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Encrypt DEK with KEK
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.expose_secret()));
         let wrapped_dek = cipher
-            .encrypt(nonce, dek.as_ref())
+            .encrypt(nonce, dek.expose_secret().as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to wrap DEK: {}", e))?;
 
         let wrapped_key = WrappedDataKey {
@@ -99,7 +95,7 @@ impl KeyManager {
     }
 
     /// Unwrap a data encryption key using a password
-    pub fn unwrap_key(&self, password: &str, wrapped_key: &WrappedDataKey) -> Result<[u8; 32]> {
+    fn unwrap_key(&self, password: &str, wrapped_key: &WrappedDataKey) -> Result<SecretBytes<32>> {
         if wrapped_key.version != 1 {
             return Err(anyhow::anyhow!(
                 "Unsupported wrapped key version: {}",
@@ -115,22 +111,25 @@ impl KeyManager {
         let kek = self.derive_kek(password, &salt)?;
 
         // Decrypt DEK with KEK
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.expose_secret()));
         let nonce = XNonce::from_slice(&wrapped_key.nonce);
 
-        let dek_vec = cipher
-            .decrypt(nonce, wrapped_key.wrapped_dek.as_ref())
-            .map_err(|_| {
-                anyhow::anyhow!("Failed to unwrap DEK: Invalid password or corrupted key")
-            })?;
+        let dek_vec = SecretVec::new(
+            cipher
+                .decrypt(nonce, wrapped_key.wrapped_dek.as_ref())
+                .map_err(|_| {
+                    anyhow::anyhow!("Failed to unwrap DEK: Invalid password or corrupted key")
+                })?,
+        );
 
-        let mut dek = [0u8; 32];
-        dek.copy_from_slice(&dek_vec);
+        let mut dek = SecretBytes::zeroed().context("Failed to protect data key in memory")?;
+        dek.expose_secret_mut()
+            .copy_from_slice(dek_vec.expose_secret());
         Ok(dek)
     }
 
     /// Re-wrap a DEK with a new password (for password changes)
-    pub fn rewrap_key(
+    fn rewrap_key(
         &self,
         old_password: &str,
         new_password: &str,
@@ -147,9 +146,9 @@ impl KeyManager {
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&kek));
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(kek.expose_secret()));
         let wrapped_dek = cipher
-            .encrypt(nonce, dek.as_ref())
+            .encrypt(nonce, dek.expose_secret().as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to rewrap DEK: {}", e))?;
 
         Ok(WrappedDataKey {
@@ -214,9 +213,9 @@ pub async fn save_wrapped_key_to_object_store(
 pub async fn load_or_init_encryption_key(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
-    password: &str,
+    password: EncryptionPassword,
     read_only: bool,
-) -> Result<[u8; 32]> {
+) -> Result<SecretBytes<32>> {
     if let Some(wrapped_key) = load_wrapped_key_from_object_store(object_store, db_path).await? {
         return unwrap_key_blocking(password, wrapped_key).await;
     }
@@ -231,13 +230,14 @@ pub async fn load_or_init_encryption_key(
     // only ONE concurrent initializer wins. Nodes sharing a store MUST share one key
     // (else blocks written by one node can't be decrypted by the other); if we lose
     // the race, adopt the winner's key instead of keeping our own.
-    let pw = password.to_string();
-    let (wrapped_key, dek) = spawn_blocking_named("argon2-generate", move || {
-        KeyManager::new().generate_and_wrap_key(&pw)
+    let (password, generated) = spawn_blocking_named("argon2-generate", move || {
+        let generated = KeyManager::new().generate_and_wrap_key(password.expose_secret());
+        (password, generated)
     })
     .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
     .await
-    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+    .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?;
+    let (wrapped_key, dek) = generated?;
 
     if save_wrapped_key_if_absent(object_store, db_path, &wrapped_key).await? {
         return Ok(dek);
@@ -252,10 +252,12 @@ pub async fn load_or_init_encryption_key(
 }
 
 /// Unwrap a wrapped DEK off the runtime (argon2 is CPU-heavy).
-async fn unwrap_key_blocking(password: &str, wrapped_key: WrappedDataKey) -> Result<[u8; 32]> {
-    let password = password.to_string();
+async fn unwrap_key_blocking(
+    password: EncryptionPassword,
+    wrapped_key: WrappedDataKey,
+) -> Result<SecretBytes<32>> {
     spawn_blocking_named("argon2-unwrap", move || {
-        KeyManager::new().unwrap_key(&password, &wrapped_key)
+        KeyManager::new().unwrap_key(password.expose_secret(), &wrapped_key)
     })
     .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
     .await
@@ -290,8 +292,8 @@ async fn save_wrapped_key_if_absent(
 pub async fn change_encryption_password(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &Path,
-    old_password: &str,
-    new_password: &str,
+    old_password: EncryptionPassword,
+    new_password: EncryptionPassword,
 ) -> Result<()> {
     let key_manager = KeyManager::new();
 
@@ -299,10 +301,12 @@ pub async fn change_encryption_password(
         .await?
         .ok_or_else(|| anyhow::anyhow!("No encryption key found"))?;
 
-    let old_password = old_password.to_string();
-    let new_password = new_password.to_string();
     let new_wrapped_key = spawn_blocking_named("argon2-rewrap", move || {
-        key_manager.rewrap_key(&old_password, &new_password, &wrapped_key)
+        key_manager.rewrap_key(
+            old_password.expose_secret(),
+            new_password.expose_secret(),
+            &wrapped_key,
+        )
     })
     .map_err(|e| anyhow::anyhow!("Failed to spawn task: {}", e))?
     .await
@@ -316,6 +320,24 @@ pub async fn change_encryption_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::password_hash::PasswordHasher;
+
+    #[test]
+    fn direct_kdf_matches_the_legacy_password_hash_path() {
+        let key_manager = KeyManager::new();
+        let password = "existing-volume-password";
+        let salt = SaltString::encode_b64(b"fixed-salt-bytes").unwrap();
+
+        let direct = key_manager.derive_kek(password, &salt).unwrap();
+        let legacy = key_manager
+            .argon2
+            .hash_password(password.as_bytes(), &salt)
+            .unwrap()
+            .hash
+            .unwrap();
+
+        assert_eq!(direct.expose_secret(), legacy.as_bytes());
+    }
 
     #[test]
     fn test_key_wrap_unwrap() {
@@ -332,7 +354,7 @@ mod tests {
             .unwrap_key(password, &wrapped_key)
             .expect("Failed to unwrap key");
 
-        assert_eq!(original_dek, unwrapped_dek);
+        assert_eq!(original_dek.expose_secret(), unwrapped_dek.expose_secret());
     }
 
     #[test]
@@ -380,7 +402,7 @@ mod tests {
             .unwrap_key(new_password, &new_wrapped_key)
             .expect("Failed to unwrap with new password");
 
-        assert_eq!(original_dek, unwrapped_dek);
+        assert_eq!(original_dek.expose_secret(), unwrapped_dek.expose_secret());
     }
 
     /// Two nodes initializing the same store concurrently must converge on ONE key.
@@ -393,22 +415,34 @@ mod tests {
         let pw = "shared-cluster-password";
 
         let (ka, kb) = tokio::join!(
-            load_or_init_encryption_key(&store, &db_path, pw, false),
-            load_or_init_encryption_key(&store, &db_path, pw, false),
+            load_or_init_encryption_key(&store, &db_path, password(pw), false),
+            load_or_init_encryption_key(&store, &db_path, password(pw), false),
         );
         let ka = ka.expect("node A init");
         let kb = kb.expect("node B init");
-        assert_eq!(ka, kb, "concurrent initializers must converge on one key");
+        assert_eq!(
+            ka.expose_secret(),
+            kb.expose_secret(),
+            "concurrent initializers must converge on one key"
+        );
 
         // A later loader gets that same committed key.
-        let kc = load_or_init_encryption_key(&store, &db_path, pw, false)
+        let kc = load_or_init_encryption_key(&store, &db_path, password(pw), false)
             .await
             .expect("later load");
-        assert_eq!(ka, kc, "a later load must return the committed key");
+        assert_eq!(
+            ka.expose_secret(),
+            kc.expose_secret(),
+            "a later load must return the committed key"
+        );
     }
 
     fn store() -> Arc<dyn ObjectStore> {
         Arc::new(object_store::memory::InMemory::new())
+    }
+
+    fn password(value: &str) -> EncryptionPassword {
+        EncryptionPassword::try_new(value).unwrap()
     }
 
     // Password rotation must preserve the DEK (data stays decryptable) and the old
@@ -419,31 +453,35 @@ mod tests {
         let db_path = Path::from("data");
         let (old_pw, new_pw) = ("old-pw-123", "new-pw-456");
 
-        let dek = load_or_init_encryption_key(&store, &db_path, old_pw, false)
+        let dek = load_or_init_encryption_key(&store, &db_path, password(old_pw), false)
             .await
             .unwrap();
 
-        change_encryption_password(&store, &db_path, old_pw, new_pw)
+        change_encryption_password(&store, &db_path, password(old_pw), password(new_pw))
             .await
             .unwrap();
 
         assert!(
-            load_or_init_encryption_key(&store, &db_path, old_pw, false)
+            load_or_init_encryption_key(&store, &db_path, password(old_pw), false)
                 .await
                 .is_err(),
             "the old password must stop unwrapping the key"
         );
-        let dek2 = load_or_init_encryption_key(&store, &db_path, new_pw, false)
+        let dek2 = load_or_init_encryption_key(&store, &db_path, password(new_pw), false)
             .await
             .unwrap();
-        assert_eq!(dek, dek2, "rotation must preserve the data key");
+        assert_eq!(
+            dek.expose_secret(),
+            dek2.expose_secret(),
+            "rotation must preserve the data key"
+        );
     }
 
     #[tokio::test]
     async fn change_password_without_a_key_errors() {
         let store = store();
         assert!(
-            change_encryption_password(&store, &Path::from("data"), "a", "b")
+            change_encryption_password(&store, &Path::from("data"), password("a"), password("b"),)
                 .await
                 .is_err()
         );
@@ -452,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_init_without_a_key_errors() {
         let store = store();
-        let err = load_or_init_encryption_key(&store, &Path::from("data"), "pw", true)
+        let err = load_or_init_encryption_key(&store, &Path::from("data"), password("pw"), true)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("read-only"), "got: {err:#}");
@@ -462,11 +500,11 @@ mod tests {
     async fn reload_with_wrong_password_errors() {
         let store = store();
         let db_path = Path::from("data");
-        load_or_init_encryption_key(&store, &db_path, "right", false)
+        load_or_init_encryption_key(&store, &db_path, password("right"), false)
             .await
             .unwrap();
         assert!(
-            load_or_init_encryption_key(&store, &db_path, "wrong", false)
+            load_or_init_encryption_key(&store, &db_path, password("wrong"), false)
                 .await
                 .is_err()
         );

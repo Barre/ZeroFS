@@ -1109,7 +1109,8 @@ mod tests {
     {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let bt: Arc<dyn BlockTransformer> =
-            ZeroFsBlockTransformer::new_arc(&[0u8; 32], CompressionConfig::default());
+            ZeroFsBlockTransformer::try_new_arc(&[0u8; 32], CompressionConfig::default())
+                .expect("test key should be lockable");
         let settings = slatedb::config::Settings {
             wal_enabled: false,
             // Match production's barrier-controlled flush configuration while

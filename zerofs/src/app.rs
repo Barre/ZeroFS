@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::io::BufRead;
 
 pub(crate) async fn run() -> Result<()> {
     let cli = crate::cli::Cli::parse_args();
@@ -18,8 +17,8 @@ pub(crate) async fn run() -> Result<()> {
             }
         }
         crate::cli::Commands::ChangePassword { config } => {
-            let settings = match crate::config::Settings::from_file(&config) {
-                Ok(s) => s,
+            let (settings, current_password) = match crate::config::Settings::from_file(&config) {
+                Ok(loaded) => loaded,
                 Err(e) => {
                     eprintln!("✗ Failed to load config: {e:#}");
                     std::process::exit(1);
@@ -27,16 +26,14 @@ pub(crate) async fn run() -> Result<()> {
             };
 
             eprintln!("Reading new password from stdin...");
-            let mut new_password = String::new();
-            std::io::stdin()
-                .lock()
-                .read_line(&mut new_password)
-                .context("Failed to read password from stdin")?;
-            let new_password = new_password.trim().to_string();
+            let new_password = crate::secrets::EncryptionPassword::read_line_from_stdin()
+                .context("Failed to read new password from stdin")?;
             eprintln!("New password read successfully.");
 
             eprintln!("Changing encryption password...");
-            match crate::cli::password::change_password(&settings, new_password).await {
+            match crate::cli::password::change_password(&settings, current_password, new_password)
+                .await
+            {
                 Ok(()) => {
                     println!("✓ Encryption password changed successfully!");
                     println!(
