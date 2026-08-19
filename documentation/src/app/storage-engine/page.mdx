@@ -55,7 +55,7 @@ graph TB
         SST[Metadata SSTs]
     end
 
-    BUF -->|"seal: one multipart PUT"| SEG
+    BUF -->|"seal: one PUT"| SEG
     MEM -->|"flush, gated on seal barrier"| SST
     `} />
 
@@ -105,7 +105,7 @@ The CRC32C is a keyless torn-write detector for the directory and footer only; f
 
 1. A file write splits into 32 KiB extents. Partially overwritten extents are read back first, up to 20 in parallel; full overwrites and writes beyond EOF skip the read. A 32 MiB tail cache holds each inode's most recently written extent, so sequential appends do not re-read the tail. All-zero extents become key deletions (holes).
 2. Each non-zero extent is sealed (compressed, encrypted) and appended to an in-RAM open segment buffer. The FrameLoc put and the segment live-byte credits and debits commit in the same transaction as the inode update. No object-store request is issued on the write path.
-3. When the open buffer crosses 256 MiB, it rotates and uploads in the background as one multipart PUT with 8 concurrent parts. At most 4 seals run in flight; this bounds un-uploaded segment RAM to 4 × 256 MiB and backpressures writers. A failed background upload is retried at the next flush.
+3. When the open buffer crosses 256 MiB, it rotates and uploads in the background as one PUT. At most 4 seals run in flight; this bounds un-uploaded segment RAM to 4 × 256 MiB and backpressures writers. A failed background upload is retried at the next flush.
 
 ### The fsync barrier
 
@@ -159,7 +159,7 @@ Apart from the configurable `[gc]` fields ([Configuration](/configuration)), the
 | FrameLoc size | 32 bytes |
 | Segment seal threshold | 256 MiB |
 | Max in-flight seals | 4 |
-| Segment upload concurrency | 8 multipart parts |
+| Segment upload method | Single PUT |
 | Parallel extent reads per operation | 20 |
 | Tail cache | 32 MiB |
 | Logical read-ahead window | 8 MiB, after 2 sequential reads, 16 fetches max |

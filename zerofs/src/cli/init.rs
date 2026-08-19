@@ -68,10 +68,6 @@ struct DbOpen {
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     /// Prefetch-wrapped object store for the segment data plane (cold read-ahead).
     segment_object_store: Arc<dyn object_store::ObjectStore>,
-    /// Warms the parts cache with a just-sealed segment (multipart uploads bypass
-    /// the prefetcher's own write-through). Applies the same db-path prefix as
-    /// `segment_object_store` so the cache key matches the read path.
-    segment_warm: Option<crate::segment_store::SegmentWarmHook>,
 }
 
 /// Open database with a reconciled replication tail.
@@ -703,31 +699,20 @@ impl StartupContext {
         // Retries sit under the prefetcher, so a single-flight window GET rides
         // out a transient error before failing every waiting reader, and above
         // the tracing layer, so each attempt is visible to otrace.
-        let prefetch = Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
-            self.retrying_object_store.clone(),
-            parts_cache,
-        ));
+        let prefetch: Arc<dyn object_store::ObjectStore> =
+            Arc::new(crate::object_store_prefetch::PrefetchingObjectStore::new(
+                self.retrying_object_store.clone(),
+                parts_cache,
+            ));
         let db_prefix = Path::from(self.actual_db_path.clone());
         let segment_object_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::prefix::PrefixStore::new(
-                Arc::clone(&prefetch) as Arc<dyn object_store::ObjectStore>,
-                db_prefix.clone(),
-            ));
-        // Warm the parts cache at seal time. `put_segment` passes the unprefixed
-        // object path, so prepend the db prefix exactly as PrefixStore would, giving
-        // the same cache key the read path derives.
-        let segment_warm: Option<crate::segment_store::SegmentWarmHook> =
-            Some(Arc::new(move |loc: &Path, bytes: bytes::Bytes| {
-                let full: Path = db_prefix.parts().chain(loc.parts()).collect();
-                prefetch.warm_object(&full, bytes);
-            }));
+            Arc::new(object_store::prefix::PrefixStore::new(prefetch, db_prefix));
 
         Ok(OpenOutcome::Opened(DbOpen {
             promotion,
             slatedb,
             metrics_recorder,
             segment_object_store,
-            segment_warm,
         }))
     }
 }
@@ -806,7 +791,6 @@ impl ReconciledDb {
             slatedb,
             metrics_recorder,
             segment_object_store,
-            segment_warm,
         } = open;
         // Activation requires the Opening token and a reconciled tail.
         let ownership = match startup.opening.take() {
@@ -1022,7 +1006,6 @@ impl ReconciledDb {
             object_tracer.clone(),
             segment_object_store,
             segment_codec,
-            segment_warm,
             None,
         )
         .await

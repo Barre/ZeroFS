@@ -202,7 +202,6 @@ impl Storage {
                     zerofs::config::CompressionConfig::default(),
                 )
                 .expect("test key should be lockable"),
-                None,
                 Some(scale.seal_threshold),
             )
             .await

@@ -13,8 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
-    GetOptions, GetRange, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    path::Path,
+    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
@@ -44,22 +43,9 @@ type Result<T> = std::result::Result<T, SegmentStoreError>;
 /// layer below buffers at once.
 const LIST_SHARD_CONCURRENCY: usize = 16;
 
-/// Concurrent multipart part uploads per sealing segment. Higher than the
-/// throughput-saturating default of 8 because per-seal wall time is fsync tail
-/// latency (the durability barrier waits out in-flight seals). Parts are
-/// zero-copy slices of the seal bytes, so extra concurrency costs requests in
-/// flight, not buffer copies.
-const SEAL_UPLOAD_CONCURRENCY: usize = 16;
-
-/// Multipart part size, and the seal size at which `put_segment` switches from
-/// a single PUT to multipart.
-const SEAL_PART_SIZE: usize = 10 * 1024 * 1024;
-
-/// Warm a just-written segment into the read (parts) cache: the multipart
-/// upload bypasses the store's single-PUT write-through, so `put_segment`
-/// calls this with the bytes it already holds. The hook applies any
-/// object-store prefix itself. `None` when there is no such cache (tests).
-pub type SegmentWarmHook = Arc<dyn Fn(&Path, Bytes) + Send + Sync>;
+/// Concurrent frame comparisons when verifying an existing reconstructed
+/// segment after a conditional-create race.
+const VERIFY_FRAME_CONCURRENCY: usize = 16;
 
 /// Writes and reads `segments/` objects against an object store.
 pub struct SegmentStore {
@@ -69,25 +55,16 @@ pub struct SegmentStore {
     counter: AtomicU64,
     /// Count of ranged segment GETs issued (a read-amplification metric).
     read_calls: AtomicU64,
-    /// Warms the parts cache with a just-written segment (see
-    /// [`SegmentWarmHook`]); that cache is the only segment cache.
-    warm: Option<SegmentWarmHook>,
 }
 
 impl SegmentStore {
-    pub fn new(
-        object_store: Arc<dyn ObjectStore>,
-        codec: FrameCodec,
-        epoch: u64,
-        warm: Option<SegmentWarmHook>,
-    ) -> Self {
+    pub fn new(object_store: Arc<dyn ObjectStore>, codec: FrameCodec, epoch: u64) -> Self {
         Self {
             object_store,
             codec: Arc::new(codec),
             epoch,
             counter: AtomicU64::new(0),
             read_calls: AtomicU64::new(0),
-            warm,
         }
     }
 
@@ -105,71 +82,11 @@ impl SegmentStore {
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
     /// `assemble_segment`.
     pub async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
-        // A small (partial-fsync) seal goes up as a single PUT (which still
-        // writes through the parts cache) but a full 256 MiB seal streams as
-        // concurrent multipart, so the fsync-path PUT latency stays bounded
-        // instead of serializing 256 MiB on one stream.
         let path = Path::from(segid.object_key());
-        if bytes.len() < SEAL_PART_SIZE {
-            self.object_store
-                .put(&path, bytes.clone().into())
-                .await
-                .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        } else {
-            self.put_segment_multipart(&path, &bytes).await?;
-        }
-        // The multipart path doesn't write through the parts cache; warm it
-        // with the bytes in hand, after the upload commits (mirroring the
-        // single-PUT path).
-        if let Some(warm) = &self.warm {
-            warm(&path, bytes);
-        }
-        Ok(())
-    }
-
-    /// Multipart PUT of `bytes` in `SEAL_PART_SIZE` parts, at most
-    /// `SEAL_UPLOAD_CONCURRENCY` in flight. Any failure aborts the upload before
-    /// the error propagates: parts of an unfinished multipart upload are
-    /// invisible to LIST — and so to the orphan sweep — yet billed until
-    /// aborted, and each retried seal targets a fresh upload, so leaks would
-    /// accrete per failure.
-    async fn put_segment_multipart(&self, path: &Path, bytes: &Bytes) -> Result<()> {
-        let mut upload = self
-            .object_store
-            .put_multipart(path)
+        self.object_store
+            .put(&path, bytes.into())
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
-        // Parts run as spawned tasks, so upload progress never waits on this
-        // future being polled.
-        let mut parts = tokio::task::JoinSet::new();
-        let uploaded = async {
-            let mut rest = bytes.clone();
-            while !rest.is_empty() {
-                while parts.len() >= SEAL_UPLOAD_CONCURRENCY {
-                    parts
-                        .join_next()
-                        .await
-                        .expect("parts is non-empty")
-                        .expect("part upload panicked")?;
-                }
-                let part = rest.split_to(rest.len().min(SEAL_PART_SIZE));
-                parts.spawn(upload.put_part(part.into()));
-            }
-            while let Some(part) = parts.join_next().await {
-                part.expect("part upload panicked")?;
-            }
-            upload.complete().await
-        }
-        .await;
-        if let Err(e) = uploaded {
-            // Best-effort cleanup: surface the seal error even if the abort
-            // itself fails (leaving the parts to the backend's lifecycle rule).
-            parts.shutdown().await;
-            if let Err(abort_err) = upload.abort().await {
-                tracing::warn!("segment seal: aborting failed upload of {path}: {abort_err}");
-            }
-            return Err(SegmentStoreError::ObjectStore(e.to_string()));
-        }
         Ok(())
     }
 
@@ -509,7 +426,7 @@ async fn verify_existing_recon_segment(
                 Ok(())
             }
         })
-        .buffer_unordered(SEAL_UPLOAD_CONCURRENCY)
+        .buffer_unordered(VERIFY_FRAME_CONCURRENCY)
         .try_collect::<Vec<()>>()
         .await?;
     Ok(())
@@ -596,8 +513,8 @@ mod tests {
     use futures::stream::BoxStream;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::{
-        CopyOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
-        PutPayload, PutResult, Result as OsResult, UploadPart,
+        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as OsResult,
     };
     use std::sync::atomic::AtomicBool;
     use tokio::sync::Notify;
@@ -606,22 +523,7 @@ mod tests {
         let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
             .expect("test key should be lockable");
-        SegmentStore::new(os, codec, 5, None)
-    }
-
-    /// `len` bytes of keyed xorshift noise: incompressible, so a seal built
-    /// from it stays past the single-PUT threshold.
-    fn noise(seed: u64, len: usize) -> Bytes {
-        let mut x = seed | 1;
-        let mut v = Vec::with_capacity(len + 8);
-        while v.len() < len {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            v.extend_from_slice(&x.to_le_bytes());
-        }
-        v.truncate(len);
-        Bytes::from(v)
+        SegmentStore::new(os, codec, 5)
     }
 
     fn recon_frames(
@@ -647,94 +549,39 @@ mod tests {
             .collect()
     }
 
-    /// Wraps `InMemory` to inject multipart or create failures and record the
-    /// resulting cleanup behavior.
+    /// Wraps `InMemory` to inject conditional-create failures.
     #[derive(Debug)]
-    struct MultipartFaultStore {
+    struct PutFaultStore {
         inner: Arc<dyn ObjectStore>,
-        fail_part: Option<usize>,
-        fail_complete: bool,
         fail_put: bool,
         fail_after_create: AtomicBool,
-        aborted: Arc<AtomicBool>,
     }
 
-    impl MultipartFaultStore {
-        fn new(fail_part: Option<usize>, fail_complete: bool) -> (Arc<Self>, Arc<AtomicBool>) {
-            let aborted = Arc::new(AtomicBool::new(false));
-            (
-                Arc::new(Self {
-                    inner: Arc::new(InMemory::new()),
-                    fail_part,
-                    fail_complete,
-                    fail_put: false,
-                    fail_after_create: AtomicBool::new(false),
-                    aborted: aborted.clone(),
-                }),
-                aborted,
-            )
-        }
-
+    impl PutFaultStore {
         fn with_create_failure(fail_after_create: bool) -> Arc<Self> {
             Arc::new(Self {
                 inner: Arc::new(InMemory::new()),
-                fail_part: None,
-                fail_complete: false,
                 fail_put: !fail_after_create,
                 fail_after_create: AtomicBool::new(fail_after_create),
-                aborted: Arc::new(AtomicBool::new(false)),
             })
         }
 
         fn injected() -> slatedb::object_store::Error {
             slatedb::object_store::Error::Generic {
-                store: "MultipartFaultStore",
+                store: "PutFaultStore",
                 source: "injected object-store fault".into(),
             }
         }
     }
 
-    impl std::fmt::Display for MultipartFaultStore {
+    impl std::fmt::Display for PutFaultStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "MultipartFaultStore({})", self.inner)
-        }
-    }
-
-    #[derive(Debug)]
-    struct FaultUpload {
-        inner: Box<dyn MultipartUpload>,
-        fail_part: Option<usize>,
-        fail_complete: bool,
-        next_part: usize,
-        aborted: Arc<AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl MultipartUpload for FaultUpload {
-        fn put_part(&mut self, data: PutPayload) -> UploadPart {
-            let idx = self.next_part;
-            self.next_part += 1;
-            if self.fail_part == Some(idx) {
-                return Box::pin(futures::future::ready(Err(MultipartFaultStore::injected())));
-            }
-            self.inner.put_part(data)
-        }
-
-        async fn complete(&mut self) -> OsResult<PutResult> {
-            if self.fail_complete {
-                return Err(MultipartFaultStore::injected());
-            }
-            self.inner.complete().await
-        }
-
-        async fn abort(&mut self) -> OsResult<()> {
-            self.aborted.store(true, Ordering::SeqCst);
-            self.inner.abort().await
+            write!(f, "PutFaultStore({})", self.inner)
         }
     }
 
     #[async_trait::async_trait]
-    impl ObjectStore for MultipartFaultStore {
+    impl ObjectStore for PutFaultStore {
         async fn put_opts(
             &self,
             location: &Path,
@@ -757,14 +604,7 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> OsResult<Box<dyn MultipartUpload>> {
-            let inner = self.inner.put_multipart_opts(location, opts).await?;
-            Ok(Box::new(FaultUpload {
-                inner,
-                fail_part: self.fail_part,
-                fail_complete: self.fail_complete,
-                next_part: 0,
-                aborted: self.aborted.clone(),
-            }))
+            self.inner.put_multipart_opts(location, opts).await
         }
 
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
@@ -917,67 +757,6 @@ mod tests {
         );
     }
 
-    // A seal past the single-PUT threshold streams as concurrent multipart and
-    // must read back byte-identically.
-    #[tokio::test]
-    async fn multipart_seal_roundtrips() {
-        let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
-            .expect("test key should be lockable");
-        let store = SegmentStore::new(os.clone(), codec, 5, None);
-        let frames: Vec<(u64, u64, Bytes)> =
-            (0..4u64).map(|i| (30, i, noise(i + 1, 4 << 20))).collect();
-        let locs = store.seal(&frames).await.unwrap();
-        let segid = locs[0].2.segid;
-        let size = os.head(&Path::from(segid.object_key())).await.unwrap().size;
-        assert!(
-            size as usize > SEAL_PART_SIZE,
-            "seal must take the multipart path"
-        );
-        for ((id, extent, data), (_, _, loc)) in frames.iter().zip(&locs) {
-            let got = store.read_extent(*loc, *id, *extent).await.unwrap();
-            assert_eq!(&got, data);
-        }
-    }
-
-    // A part failing mid-multipart must abort the upload on the way out: an
-    // unaborted upload's parts are invisible to LIST — and so to the orphan
-    // sweep — yet billed until aborted, and every retried seal would strand a
-    // fresh batch.
-    #[tokio::test]
-    async fn failed_multipart_part_aborts_the_upload() {
-        let (os, aborted) = MultipartFaultStore::new(Some(1), false);
-        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
-            .expect("test key should be lockable");
-        let store = SegmentStore::new(os, codec, 5, None);
-        let res = store
-            .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
-            .await;
-        assert!(res.is_err(), "the seal error must surface");
-        assert!(
-            aborted.load(Ordering::SeqCst),
-            "failed seal must abort its multipart upload"
-        );
-    }
-
-    // COMPLETE failing after every part landed must abort too: those parts are
-    // already durable on the backend, just as invisible and billed.
-    #[tokio::test]
-    async fn failed_multipart_complete_aborts_the_upload() {
-        let (os, aborted) = MultipartFaultStore::new(None, true);
-        let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
-            .expect("test key should be lockable");
-        let store = SegmentStore::new(os, codec, 5, None);
-        let res = store
-            .put_segment(store.next_segid(), noise(1, 2 * SEAL_PART_SIZE + 1024))
-            .await;
-        assert!(res.is_err(), "the seal error must surface");
-        assert!(
-            aborted.load(Ordering::SeqCst),
-            "failed COMPLETE must abort its multipart upload"
-        );
-    }
-
     // The listing fans out one LIST per shard prefix; every sealed segment must
     // come back exactly once, whichever of the 256 shards its counter lands in.
     #[tokio::test]
@@ -1014,8 +793,8 @@ mod tests {
             Arc::new(PrefixStore::new(bucket.clone(), Path::from("db_a")));
         let store_b: Arc<dyn ObjectStore> =
             Arc::new(PrefixStore::new(bucket.clone(), Path::from("db_b")));
-        let seg_a = SegmentStore::new(store_a, codec(), 5, None);
-        let seg_b = SegmentStore::new(store_b, codec(), 5, None);
+        let seg_a = SegmentStore::new(store_a, codec(), 5);
+        let seg_b = SegmentStore::new(store_b, codec(), 5);
 
         let a = seg_a
             .seal(&[(1, 0, Bytes::from_static(b"aaaa"))])
@@ -1047,7 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn materialization_propagates_create_errors() {
-        let object_store: Arc<dyn ObjectStore> = MultipartFaultStore::with_create_failure(false);
+        let object_store: Arc<dyn ObjectStore> = PutFaultStore::with_create_failure(false);
         let codec = FrameCodec::try_new(&[3u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
             .expect("test key should be lockable");
         let segid = Segid::new(9, 1);
@@ -1082,7 +861,7 @@ mod tests {
 
         // Leader: seal frames into store A; that object's bytes are what's shipped.
         let store_a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let seg_a = SegmentStore::new(store_a.clone(), codec(), 9, None);
+        let seg_a = SegmentStore::new(store_a.clone(), codec(), 9);
         let frames = vec![
             (5u64, 0u64, Bytes::from(vec![1u8; 1000])),
             (5, 1, Bytes::from(vec![2u8; 2000])),
@@ -1115,7 +894,7 @@ mod tests {
             "verified existing object -> no-op"
         );
 
-        let seg_b = SegmentStore::new(store_b, codec(), 9, None);
+        let seg_b = SegmentStore::new(store_b, codec(), 9);
         for ((inode, extent, data), (_, _, loc)) in frames.iter().zip(&locs) {
             let got = seg_b.read_extent(*loc, *inode, *extent).await.unwrap();
             assert_eq!(&got, data, "reconstructed frame reads back identically");
@@ -1133,7 +912,7 @@ mod tests {
                 .expect("test key should be lockable")
         };
         let leader_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let leader = SegmentStore::new(leader_os.clone(), codec(), 9, None);
+        let leader = SegmentStore::new(leader_os.clone(), codec(), 9);
         let frames = vec![
             (5u64, 0u64, Bytes::from(vec![1u8; 1000])),
             (5, 1, Bytes::from(vec![2u8; 2000])),
@@ -1167,7 +946,7 @@ mod tests {
             "takeover must not replace the full seal with its partial reconstruction"
         );
 
-        let reader = SegmentStore::new(shared, codec(), 9, None);
+        let reader = SegmentStore::new(shared, codec(), 9);
         for ((inode, extent, expected), (_, _, loc)) in frames.iter().zip(&locs) {
             assert_eq!(
                 reader.read_extent(*loc, *inode, *extent).await.unwrap(),
@@ -1186,7 +965,7 @@ mod tests {
                 .expect("test key should be lockable")
         };
         let source_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let source = SegmentStore::new(source_os.clone(), codec(), 9, None);
+        let source = SegmentStore::new(source_os.clone(), codec(), 9);
         let frames = vec![(5u64, 0u64, Bytes::from(vec![1u8; 1000]))];
         let locs = source.seal(&frames).await.unwrap();
         let segid = locs[0].2.segid;
@@ -1194,7 +973,7 @@ mod tests {
         let segment = source_os.get(&path).await.unwrap().bytes().await.unwrap();
         let recon = recon_frames(&frames, &locs, &segment);
 
-        let fault = MultipartFaultStore::with_create_failure(true);
+        let fault = PutFaultStore::with_create_failure(true);
         let retrying: Arc<dyn ObjectStore> = Arc::new(
             crate::retrying_object_store::RetryingObjectStore::new(fault.clone()),
         );
@@ -1204,7 +983,7 @@ mod tests {
                 .unwrap(),
             "the retry observes the object created by the attempt whose response was lost"
         );
-        let reader = SegmentStore::new(fault.inner.clone(), codec(), 9, None);
+        let reader = SegmentStore::new(fault.inner.clone(), codec(), 9);
         assert_eq!(
             reader
                 .read_extent(locs[0].2, frames[0].0, frames[0].1)
@@ -1221,7 +1000,7 @@ mod tests {
                 .expect("test key should be lockable")
         };
         let wanted_os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let wanted = SegmentStore::new(wanted_os.clone(), codec(), 9, None);
+        let wanted = SegmentStore::new(wanted_os.clone(), codec(), 9);
         let wanted_frames = vec![(5u64, 0u64, Bytes::from(vec![1u8; 1000]))];
         let wanted_locs = wanted.seal(&wanted_frames).await.unwrap();
         let segid = wanted_locs[0].2.segid;
@@ -1233,7 +1012,7 @@ mod tests {
         // different sealed bytes. Create must not overwrite it, and verification
         // must not let replay publish a pointer into the conflicting object.
         let existing: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let conflicting = SegmentStore::new(existing.clone(), codec(), 9, None);
+        let conflicting = SegmentStore::new(existing.clone(), codec(), 9);
         let conflicting_frames = vec![(5u64, 0u64, Bytes::from(vec![9u8; 1000]))];
         let conflicting_locs = conflicting.seal(&conflicting_frames).await.unwrap();
         assert_eq!(conflicting_locs[0].2.segid, segid);

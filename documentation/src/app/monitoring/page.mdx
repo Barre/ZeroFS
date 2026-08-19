@@ -110,7 +110,7 @@ Events pass through a broadcast channel that buffers 1,024 events. When a subscr
 
     The trace sits at the bottom of the storage stack, so it shows requests leaving the process rather than logical filesystem operations. Reads served from the [cache](/caching) and writes still buffered in RAM produce no line.
 
-    File data appears under `segments/<shard>/<epoch>/<counter>`. A seal is a `put` when it fits the 10 MiB upload buffer and `mpart` when it uses multipart upload. Cold reads are ranged `get` requests. Segment GC reads segment metadata and deletes dead objects; the daily orphan sweep also lists `segments/`.
+    File data appears under `segments/<shard>/<epoch>/<counter>`. Every seal is one `put`; cold reads are ranged `get` requests. Segment GC reads segment metadata and deletes dead objects; the daily orphan sweep also lists `segments/`.
 
     Metadata traffic appears as SST and manifest requests, including compaction. The traced operations are get, head, put, mpart, delete, list, copy, and rename.
 
@@ -127,7 +127,7 @@ Events pass through a broadcast channel that buffers 1,024 events. When a subscr
     $ zerofs otrace -c zerofs.toml
     Tracing object store requests (Ctrl+C to stop)...
     get    | .../manifest/00000000000000000010.manifest  118µs
-    mpart  | .../segments/2a/0000000000000007/000000000000012a  1.2ms
+    put    | .../segments/2a/0000000000000007/000000000000012a size=256.0 MB  1.2s
     get    | .../segments/2a/0000000000000007/000000000000012a off=131072 len=128.0 KB  9.7ms
     put    | .../compacted/01J9X...sst size=4.0 MB  21.4ms
     list   | .../segments
@@ -149,7 +149,7 @@ Like `fatrace`, the object tracer checks the subscriber count first: with no cli
 
     `zerofs flush` asks the running server to persist all buffered writes to durable storage. The command returns after the flush completes. The server coalesces concurrent flush requests into a single flush.
 
-    Between `fsync` calls, file data lives in the server's in-RAM open segment buffer and metadata in the memtable (see [Durability & Consistency](/durability)). A flush first seals the open segment and uploads it as an immutable segment object (a single PUT for small seals, streamed as one multipart upload for larger ones, up to 256 MiB), then flushes metadata. If the segment upload fails, the flush returns an error without flushing metadata, so metadata never becomes durable ahead of the data it points to.
+    Between `fsync` calls, file data lives in the server's in-RAM open segment buffer and metadata in the memtable (see [Durability & Consistency](/durability)). A flush first seals the open segment and uploads it as one immutable segment object with a single PUT, then flushes metadata. If the segment upload fails, the flush returns an error without flushing metadata, so metadata never becomes durable ahead of the data it points to.
 
     The same flush runs automatically on every client `fsync`, every `[lsm] flush_interval_secs` (default 30 s), and at the start of each segment garbage-collection pass. `zerofs flush` creates a durability point on demand without requiring clients to call `fsync`, for example before stopping the server or before creating a [checkpoint](/checkpoints).
 

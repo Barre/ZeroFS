@@ -196,13 +196,11 @@ impl ObjectStore for SimStore {
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.latency("putm", location).await?;
         // A pass-through MultipartUpload would bypass latency, digest, and the
-        // crash isolation for every part. Nothing in the DST world reaches the
-        // multipart threshold today; fail loudly rather than simulate it wrong.
+        // crash isolation for every part. ZeroFS does not issue multipart
+        // uploads today; fail loudly rather than simulate one incorrectly.
         Err(object_store::Error::Generic {
             store: "SimStore",
-            source: "multipart is not simulated; wrap MultipartUpload before \
-                     raising segment sizes past SEAL_PART_SIZE"
-                .into(),
+            source: "multipart upload is not simulated".into(),
         })
     }
 
