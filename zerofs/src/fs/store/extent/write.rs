@@ -26,9 +26,7 @@ const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
 pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Seal (PUT) the open segment once its packed frames reach this size, bounding
-/// the in-RAM buffer between flushes. The seal PUT is concurrent multipart
-/// (`SegmentStore::put_segment`), so its fsync-path latency stays bounded
-/// despite the size.
+/// the in-RAM buffer between flushes.
 pub(crate) const SEAL_THRESHOLD: usize = 256 * 1024 * 1024;
 
 /// Max segments sealing (PUT in flight) concurrently. Bounds the un-PUT RAM in

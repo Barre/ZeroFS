@@ -48,7 +48,6 @@ impl ZeroFS {
             object_store,
             segment_codec,
             None,
-            None,
         )
         .await
     }
@@ -70,7 +69,6 @@ impl ZeroFS {
         object_tracer: ObjectTracer,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
         segment_codec: FrameCodec,
-        segment_warm: Option<crate::segment_store::SegmentWarmHook>,
         seal_threshold_override: Option<usize>,
     ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
@@ -159,12 +157,7 @@ impl ZeroFS {
 
         let flush_coordinator = FlushCoordinator::new(db.clone());
         let stats = Arc::new(FileSystemStats::new());
-        let segment_store = Arc::new(SegmentStore::new(
-            object_store,
-            segment_codec,
-            writer_epoch,
-            segment_warm,
-        ));
+        let segment_store = Arc::new(SegmentStore::new(object_store, segment_codec, writer_epoch));
         let extent_store = ExtentStore::new(
             db.clone(),
             key_codec.clone(),

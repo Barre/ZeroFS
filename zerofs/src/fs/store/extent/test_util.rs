@@ -54,7 +54,7 @@ pub(super) fn make_store(
     let key_codec = Arc::new(KeyCodec::new());
     let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, compression)
         .expect("test key should be lockable");
-    let segments = Arc::new(SegmentStore::new(object_store, codec, epoch, None));
+    let segments = Arc::new(SegmentStore::new(object_store, codec, epoch));
     ExtentStore::new(
         db,
         key_codec,

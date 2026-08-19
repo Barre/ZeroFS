@@ -116,7 +116,6 @@ impl CrashTestContext {
                 )
                 .expect("test key should be lockable"),
                 None,
-                None,
             )
             .await
             .unwrap(),

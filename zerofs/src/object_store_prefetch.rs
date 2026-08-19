@@ -843,9 +843,8 @@ impl PrefetchingObjectStore {
     }
 
     /// Warm the parts cache with an object's full bytes, sliced into
-    /// part-sized entries keyed as the read path expects. For callers that
-    /// hold the bytes but upload via multipart, which doesn't write through.
-    pub fn warm_object(&self, location: &Path, bytes: Bytes) {
+    /// part-sized entries keyed as the read path expects.
+    fn warm_object(&self, location: &Path, bytes: Bytes) {
         let ps = self.part_size_bytes;
         let mut off = 0usize;
         let mut part_id: PartId = 0;
@@ -1573,7 +1572,7 @@ mod tests {
         let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
         let path = Path::from("segments/3b/seg");
         // 2.5 parts: parts 0 and 1 full, part 2 partial (512). No object-store
-        // put: warm_object caches bytes held in hand (the multipart-seal case).
+        // put: exercise the cache-population helper directly.
         let body: Vec<u8> = (0..2560u32).map(|i| i as u8).collect();
         store.warm_object(&path, body.clone().into());
 
