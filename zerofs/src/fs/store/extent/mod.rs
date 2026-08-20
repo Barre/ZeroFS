@@ -292,13 +292,7 @@ impl ExtentStore {
         let (_, footprint_delta) =
             crate::fs::write_coordinator::stage_seg_deltas(&self.db, deltas, &mut batch).await?;
         self.db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
+            .write_with_options(batch, &WriteOptions::default())
             .await
             .map_err(|_| FsError::IoError)?;
         // Committed: fold the batch's net footprint into the monitor gauges,

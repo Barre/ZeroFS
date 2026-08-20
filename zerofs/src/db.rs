@@ -824,7 +824,7 @@ impl Db {
                 segment
                     .compacted()
                     .iter()
-                    .flat_map(|run| run.sst_views.iter()),
+                    .flat_map(|run| run.sst_views().iter()),
             )
             .map(|view| view.sst.id)
             .collect();
@@ -896,7 +896,7 @@ impl Db {
                                 segment
                                     .compacted()
                                     .iter()
-                                    .flat_map(|run| run.sst_views.iter()),
+                                    .flat_map(|run| run.sst_views().iter()),
                             )
                             .map(|view| view.sst.id);
                         tracker.plan(manifest.id(), live)
@@ -1218,10 +1218,7 @@ mod scan_error_tests {
                     &key,
                     &value,
                     &PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                        ..Default::default()
-                    },
+                    &WriteOptions::default(),
                 )
                 .await
                 .unwrap();

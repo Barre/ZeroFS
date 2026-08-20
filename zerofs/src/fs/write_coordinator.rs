@@ -471,10 +471,7 @@ async fn worker_loop(
                     &ctx.key_codec.taint_key(),
                     &KeyCodec::encode_u64(ctx.lineage_token),
                     &slatedb::config::PutOptions::default(),
-                    &WriteOptions {
-                        await_durable: false,
-                        ..Default::default()
-                    },
+                    &WriteOptions::default(),
                 )
                 .await
             {
@@ -501,13 +498,7 @@ async fn worker_loop(
                         .invalidate_cache(directory_entry_cache_invalidations.iter().cloned());
 
                     let write_result = permit
-                        .write_with_options(
-                            merged,
-                            &WriteOptions {
-                                await_durable: false,
-                                ..Default::default()
-                            },
-                        )
+                        .write_with_options(merged, &WriteOptions::default())
                         .await;
 
                     drop(directory_cache_guard);

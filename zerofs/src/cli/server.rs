@@ -1385,15 +1385,9 @@ mod tests {
                         let id = extent * (INODES / 4) + i;
                         batch.put_bytes(codec.inode_key(id), Bytes::from(vec![id as u8; 64]));
                     }
-                    raw.write_with_options(
-                        batch,
-                        &WriteOptions {
-                            await_durable: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .unwrap();
+                    raw.write_with_options(batch, &WriteOptions::default())
+                        .await
+                        .unwrap();
                     raw.flush().await.unwrap();
                 }
                 raw.close().await.unwrap();
