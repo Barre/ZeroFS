@@ -2521,6 +2521,11 @@ impl NinePClient {
     /// Verifies fsync for all fids associated with one inode. `primary` carries
     /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
     pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
+        self.fsync_fids(fids, primary, datasync | P9_FSYNC_INODE)
+            .await
+    }
+
+    async fn fsync_fids(&self, fids: &[u32], primary: u32, flags: u32) -> ClientResult<()> {
         self.validate_fids(fids.iter().copied())?;
         // Generations prevent the result from clearing writes concurrent with fsync.
         let mut token: Option<u64> = None;
@@ -2535,7 +2540,7 @@ impl NinePClient {
         match self
             .rpc(Message::Tfsyncdur(Tfsyncdur {
                 fid: primary,
-                datasync,
+                datasync: flags,
                 token: token.unwrap_or(0),
             }))
             .await
@@ -2572,7 +2577,7 @@ impl NinePClient {
                 fids.push(fid);
             }
         }
-        self.fsync_inode(&fids, primary, datasync).await
+        self.fsync_fids(&fids, primary, datasync).await
     }
 
     pub async fn statfs(&self, fid: u32) -> ClientResult<Rstatfs> {

@@ -44,6 +44,14 @@ pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
 pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
 pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 
+/// `Tfsyncdur.datasync` requests data-only durability.
+pub const P9_FSYNC_DATASYNC: u32 = 1 << 0;
+/// `Tfsyncdur.datasync` limits the verified barrier to the inode named by its fid.
+/// Without this flag the barrier is filesystem-wide, preserving compatibility
+/// with clients that predate scoped verified fsync.
+pub const P9_FSYNC_INODE: u32 = 1 << 1;
+pub const P9_FSYNC_KNOWN_FLAGS: u32 = P9_FSYNC_DATASYNC | P9_FSYNC_INODE;
+
 pub const P9_ENOTLEADER: u32 = 108;
 pub const P9_ENOTLEADER_CLEAN: u32 = 107;
 pub const P9_EOPIDSTALE: u32 = 116;
