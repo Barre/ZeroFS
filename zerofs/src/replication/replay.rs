@@ -305,13 +305,7 @@ async fn write_tail_batches(
             }
         }
         raw_db
-            .write_with_options(
-                batch,
-                &slatedb::config::WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
+            .write_with_options(batch, &slatedb::config::WriteOptions::default())
             .await
             .context("HA takeover tail replay failed")?;
     }
@@ -427,10 +421,7 @@ mod tests {
             &key_codec.ha_seqno_key(),
             &stamp,
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..Default::default()
-            },
+            &WriteOptions::default(),
         )
         .await
         .unwrap();
@@ -449,10 +440,7 @@ mod tests {
             &Bytes::from_static(b"shared-key"),
             &Bytes::from_static(b"newer-solo-value"),
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..Default::default()
-            },
+            &WriteOptions::default(),
         )
         .await
         .unwrap();
@@ -593,10 +581,7 @@ mod tests {
             &Bytes::from_static(b"solo-base"),
             &Bytes::from_static(b"durable"),
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..Default::default()
-            },
+            &WriteOptions::default(),
         )
         .await
         .unwrap();
@@ -692,10 +677,7 @@ mod tests {
             &key_codec.ha_seqno_key(),
             &Bytes::from_static(b"not-a-valid-ha-stamp"),
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..Default::default()
-            },
+            &WriteOptions::default(),
         )
         .await
         .unwrap();
@@ -890,10 +872,7 @@ mod tests {
                 &Bytes::from_static(b"volatile"),
                 &Bytes::from_static(b"old"),
                 &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
+                &WriteOptions::default(),
             )
             .await
             .unwrap();

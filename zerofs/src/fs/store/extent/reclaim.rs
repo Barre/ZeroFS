@@ -925,13 +925,7 @@ impl ExtentStore {
             KeyCodec::encode_u64(now.timestamp() as u64),
         );
         self.db
-            .write_with_options(
-                txn.into_inner(),
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
+            .write_with_options(txn.into_inner(), &WriteOptions::default())
             .await
             .map_err(|_| FsError::IoError)?;
         Ok(Some(deleted))

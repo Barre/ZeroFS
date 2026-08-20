@@ -137,10 +137,7 @@ impl ZeroFS {
                 &root_inode_key,
                 &serialized,
                 &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
+                &WriteOptions::default(),
             )
             .await?;
         }
@@ -286,10 +283,7 @@ impl ZeroFS {
             &key_codec.lineage_key(),
             &KeyCodec::encode_u64(token),
             &PutOptions::default(),
-            &WriteOptions {
-                await_durable: false,
-                ..Default::default()
-            },
+            &WriteOptions::default(),
         )
         .await?;
         // The lineage token is durable before serving starts.

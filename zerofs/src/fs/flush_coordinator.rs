@@ -336,13 +336,7 @@ mod tests {
         let mut batch = WriteBatch::new();
         batch.put_bytes(Bytes::from_static(key), Bytes::from_static(b"value"));
         let generation = db
-            .write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
-            )
+            .write_with_options(batch, &WriteOptions::default())
             .await
             .unwrap();
         coordinator.mark_dirty_inodes([inode_id], generation);

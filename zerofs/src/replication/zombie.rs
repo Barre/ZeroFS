@@ -136,10 +136,7 @@ mod tests {
     }
 
     fn no_wait() -> WriteOptions {
-        WriteOptions {
-            await_durable: false,
-            ..Default::default()
-        }
+        WriteOptions::default()
     }
 
     // A deposed leader cannot corrupt shared data: a newer writer has bumped the

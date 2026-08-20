@@ -639,13 +639,7 @@ impl GarbageCollector {
                 }
 
                 self.db
-                    .write_with_options(
-                        txn.into_inner(),
-                        &WriteOptions {
-                            await_durable: false,
-                            ..Default::default()
-                        },
-                    )
+                    .write_with_options(txn.into_inner(), &WriteOptions::default())
                     .await
                     .map_err(|_| FsError::IoError)?;
 
@@ -688,10 +682,7 @@ mod tests {
     use crate::fs::store::tombstone::TombstoneEntry;
 
     fn no_wait() -> WriteOptions {
-        WriteOptions {
-            await_durable: false,
-            ..Default::default()
-        }
+        WriteOptions::default()
     }
 
     /// A completed pass with the given saturation, dead%, and deferred-seam
