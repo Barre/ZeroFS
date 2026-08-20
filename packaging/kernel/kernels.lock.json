@@ -87,30 +87,30 @@
       "architectures": {
         "x86_64": [
           {
-            "kernel": "7.0.13+deb13-amd64",
-            "version": "7.0.13-1~bpo13+1",
-            "source_version": "7.0.13-1~bpo13+1",
-            "snapshot": "20260727T000000Z"
-          },
-          {
             "kernel": "7.1.3+deb13-amd64",
             "version": "7.1.3-1~bpo13+1",
             "source_version": "7.1.3-1~bpo13+1",
             "snapshot": "20260731T193826Z"
+          },
+          {
+            "kernel": "7.1.7+deb13-amd64",
+            "version": "7.1.7-1~bpo13+1",
+            "source_version": "7.1.7-1~bpo13+1",
+            "snapshot": "20260820T105107Z"
           }
         ],
         "aarch64": [
-          {
-            "kernel": "7.0.13+deb13-arm64",
-            "version": "7.0.13-1~bpo13+1",
-            "source_version": "7.0.13-1~bpo13+1",
-            "snapshot": "20260727T000000Z"
-          },
           {
             "kernel": "7.1.3+deb13-arm64",
             "version": "7.1.3-1~bpo13+1",
             "source_version": "7.1.3-1~bpo13+1",
             "snapshot": "20260731T193826Z"
+          },
+          {
+            "kernel": "7.1.7+deb13-arm64",
+            "version": "7.1.7-1~bpo13+1",
+            "source_version": "7.1.7-1~bpo13+1",
+            "snapshot": "20260820T105107Z"
           }
         ]
       }
