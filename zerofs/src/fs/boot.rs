@@ -3,8 +3,9 @@
 
 use crate::db::{Db, SlateDbHandle};
 use crate::frame_codec::FrameCodec;
+use crate::fs::errors::FsError;
 use crate::fs::flush_coordinator::FlushCoordinator;
-use crate::fs::inode::{DirectoryInode, Inode};
+use crate::fs::inode::{DirectoryInode, Inode, InodeId};
 use crate::fs::key_codec::KeyCodec;
 use crate::fs::lock_manager::KeyedLockManager;
 use crate::fs::metrics::FileSystemStats;
@@ -303,29 +304,53 @@ impl ZeroFS {
         Ok(token)
     }
 
-    /// Client durability barrier (9P `Tfsync`, NFS COMMIT, NBD flush). A no-op when
-    /// `ignore_fsync` is set.
-    pub async fn client_fsync(&self) -> Result<(), crate::fs::errors::FsError> {
+    /// Global client durability barrier (NFS COMMIT, NBD flush, and internal
+    /// callers). A no-op when `ignore_fsync` is set.
+    pub async fn client_fsync(&self) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());
         }
         self.flush_coordinator.flush().await
     }
 
+    /// Per-inode client durability barrier used by 9P. The underlying flush is
+    /// still global, but it can be skipped when an earlier flush already covered
+    /// this inode's most recent committed mutation.
+    pub async fn client_fsync_inode(&self, inode_id: InodeId) -> Result<(), FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
+        self.flush_coordinator.flush_inode(inode_id).await
+    }
+
     /// Flush and verify the client's oldest unflushed-write lineage token.
     /// Token zero means no unflushed write. A mismatched token returns `ESTALE`.
-    pub async fn client_fsync_verified(
-        &self,
-        client_token: u64,
-    ) -> Result<(), crate::fs::errors::FsError> {
+    pub async fn client_fsync_verified(&self, client_token: u64) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());
         }
         self.flush_coordinator.flush().await?;
+        self.verify_fsync_lineage(client_token)
+    }
+
+    /// Per-inode form of [`Self::client_fsync_verified`] for 9P `Tfsyncdur`.
+    pub async fn client_fsync_inode_verified(
+        &self,
+        inode_id: InodeId,
+        client_token: u64,
+    ) -> Result<(), FsError> {
+        if self.ignore_fsync {
+            return Ok(());
+        }
+        self.flush_coordinator.flush_inode(inode_id).await?;
+        self.verify_fsync_lineage(client_token)
+    }
+
+    fn verify_fsync_lineage(&self, client_token: u64) -> Result<(), FsError> {
         if client_token == 0 || client_token == self.lineage_token {
             Ok(())
         } else {
-            Err(crate::fs::errors::FsError::StaleHandle)
+            Err(FsError::StaleHandle)
         }
     }
 
@@ -453,6 +478,19 @@ mod tests {
         fs.client_fsync_verified(fs.lineage_token.wrapping_add(1))
             .await
             .expect("the explicit ignore_fsync opt-out bypasses lineage verification");
+        fs.client_fsync_inode_verified(0, fs.lineage_token.wrapping_add(1))
+            .await
+            .expect("the per-inode barrier preserves the same explicit opt-out");
+    }
+
+    #[tokio::test]
+    async fn clean_inode_fsync_still_verifies_lineage() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        assert_eq!(
+            fs.client_fsync_inode_verified(0, fs.lineage_token.wrapping_add(1))
+                .await,
+            Err(FsError::StaleHandle)
+        );
     }
 
     #[tokio::test]

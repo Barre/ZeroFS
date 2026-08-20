@@ -523,6 +523,8 @@ async fn worker_loop(
                     if let Some(permit) = apply_permit.take() {
                         permit.applied(SlateDbSeqno::new(slatedb_seq));
                     }
+                    ctx.flush_coordinator
+                        .mark_dirty_inodes(inode_cache_invalidations.iter().copied(), slatedb_seq);
                 }
                 Err(_) => result = Err(FsError::IoError),
             }
