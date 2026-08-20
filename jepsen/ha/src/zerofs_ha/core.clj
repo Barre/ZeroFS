@@ -370,9 +370,7 @@
 (defn add-file!
   "Create value v with content \"v\\n\": write a temp then atomically rename it into
   place (so v appears only fully-written, and the rename path is exercised). The
-  caller fsyncs AFTER this (a ZeroFS fsync is a global flush, so it must run after
-  the rename to make the rename durable; fsyncing only the temp would leave the
-  rename un-flushed and losable on a partition)."
+  caller fsyncs the resulting file and its parent directory after this."
   [dir v]
   (let [sd  (subdir dir v)
         tmp (io/file sd (str ".tmp-" v))
@@ -387,19 +385,22 @@
 
 (defn remove-file!
   "Delete value v (idempotent: a missing file still leaves v absent, the intent).
-  The caller fsyncs after, so the deletion is durable (else a partition could lose
-  the delete and resurrect v)."
+  The caller fsyncs the parent directory after, so the deletion is durable."
   [dir v]
   (java.nio.file.Files/deleteIfExists (.toPath (io/file (subdir dir v) (str v)))))
 
-(defn fsync-sentinel!
-  "Fsync the sentinel file. A ZeroFS fsync is a GLOBAL flush, so calling it after a
-  rename/delete makes that mutation durable on the shared store, so an :ok add or
-  remove genuinely survives a failover (a partition included), not just the store's
-  periodic flush or replication."
-  [dir]
-  (with-open [raf (java.io.RandomAccessFile. (io/file dir ".sync") "rw")]
+(defn fsync-file!
+  [file]
+  (with-open [raf (java.io.RandomAccessFile. file "rw")]
     (.sync (.getFD raf))))
+
+(defn fsync-directory!
+  [dir]
+  (with-open [ch (java.nio.channels.FileChannel/open
+                  (.toPath dir)
+                  (into-array java.nio.file.OpenOption
+                              [java.nio.file.StandardOpenOption/READ]))]
+    (.force ch true)))
 
 (defn integer-files
   "All integer-named regular files under dir (recursive), as [file name-long]."
@@ -431,16 +432,16 @@
   (into (sorted-set) (map second) (integer-files dir)))
 
 (defn count-all-inodes
-  "Every inode the tree holds: all directories + regular files, temps and the sync
-  sentinel included. This is what the usage stats count, so comparing its growth to
-  the statfs used-inode growth stays exact even when an interrupted-rename temp
-  survives (a real inode `read-set`, being integer-names only, deliberately skips)."
+  "Every inode the tree holds: all directories, regular files, and temps. This is
+  what the usage stats count, so comparing its growth to the statfs used-inode
+  growth stays exact even when an interrupted-rename temp survives (a real inode
+  `read-set`, being integer-names only, deliberately skips)."
   [dir]
   (count (file-seq (io/file dir))))
 
 (defn non-integer-files
-  "Names of regular files that aren't integer-named (leftover .tmp-* temps, the sync
-  sentinel): surfaced on a statfs mismatch so the extra inode is identifiable."
+  "Names of leftover .tmp-* files, surfaced on a statfs mismatch so an extra inode
+  is identifiable."
   [dir]
   (->> (file-seq (io/file dir))
        (filter #(.isFile %))
@@ -522,10 +523,9 @@
   client/Client
   (open! [this _test _node] this)
   (setup! [_ _test]
-    ;; Pre-create the subdirs + the fsync sentinel BEFORE the baseline read, so the
-    ;; statfs baseline already counts them and final-minus-baseline growth is files.
-    (dotimes [i ndirs] (.mkdirs (io/file dir (str "d" i))))
-    (.createNewFile (io/file dir ".sync")))
+    ;; Pre-create the subdirs before the baseline read, so final-minus-baseline
+    ;; inode growth is the number of set files.
+    (dotimes [i ndirs] (.mkdirs (io/file dir (str "d" i)))))
   (invoke! [_ _test op]
     ;; Reads happen only at the baseline (empty fs) and the final read, both outside
     ;; any fault window, so they get NO timeout: the final read must enumerate the
@@ -536,7 +536,7 @@
       ;; read carries several signals on one op so the set checker only sees :add/
       ;; :remove/:read: :value = the live name set; :used-inodes = statfs accounting;
       ;; :all-inodes = the real inode census (for the statfs check, robust to a leftover
-      ;; temp); :non-integer = those temps/sentinel by name (diagnostic); :corrupt =
+      ;; temp); :non-integer = those temps by name (diagnostic); :corrupt =
       ;; files whose content != name.
       (try (let [used-inodes (statfs-used-inodes dir)
                  all-inodes  (count-all-inodes dir)
@@ -562,7 +562,11 @@
                (util/timeout 30000 (assoc op :type :info :value v :error :timeout)
                  (try
                    (add-file! dir v)
-                   (when fsync? (fsync-sentinel! dir))
+                   (when fsync?
+                     ;; Persist both sides of the POSIX create/rename contract:
+                     ;; contents on the file, then its name in the directory.
+                     (fsync-file! f)
+                     (fsync-directory! (.getParentFile f)))
                    ;; Re-verify on the CURRENT node by READING v back: the add is
                    ;; multi-step (write tmp, rename, fsync) and over the failover mount a
                    ;; reroute can land those steps on different nodes, so :ok must mean
@@ -582,7 +586,8 @@
                     (util/timeout 30000 (assoc op :type :info :value v :error :timeout)
                       (try
                         (remove-file! dir v)
-                        (when fsync? (fsync-sentinel! dir))
+                        (when fsync?
+                          (fsync-directory! (.getParentFile f)))
                         ;; Re-verify absence on the CURRENT node (a reroute can split
                         ;; the delete and the fsync): :ok must mean v is really gone
                         ;; here. If a fresh open still finds it, the delete's durability
@@ -608,13 +613,6 @@
                        (assoc op :type :info :value v :error :content-not-here))
                      (catch java.io.IOException e
                        (assoc op :type :info :value v :error (str (.getMessage e)))))))
-        ;; A global fsync durability barrier. :ok = the barrier held; an error
-        ;; (after the fix, a fsync that spans a recovery which dropped this
-        ;; client's un-fsync'd writes) surfaces here as :fail.
-        :fsync (util/timeout 30000 (assoc op :type :info :error :timeout)
-                 (try (fsync-sentinel! dir) (assoc op :type :ok)
-                      (catch java.io.IOException e
-                        (assoc op :type :fail :error (str (.getMessage e))))))
         ;; Remove interrupted-rename temps, then wait for replay-protected orphans.
         :cleanup (util/timeout (+ inode-accounting-timeout-ms 30000)
                    (assoc op :type :info :error :timeout)
