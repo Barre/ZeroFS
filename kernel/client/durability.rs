@@ -1,11 +1,13 @@
 use kernel::{prelude::*, sync::CondVarTimeoutResult};
 
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, P9_FSYNC_INODE};
 
-use super::Client;
 use super::registry::FidSlot;
 use super::reply::OwnedFrame;
-use super::session::{CompletedBarrier, Session, SessionState, SessionStatus};
+use super::session::{
+    CompletedBarrier, FsyncScope, InFlightBarrier, Session, SessionState, SessionStatus,
+};
+use super::Client;
 
 /// One remote inode's outstanding durability obligation.
 ///
@@ -28,7 +30,7 @@ impl UnsyncedEntry {
     /// A mutation acknowledged after the snapshot took a higher stamp, so a
     /// flush it did not precede says nothing about it.
     fn answered_by(&self, scope: FsyncScope, snapshot: u64) -> bool {
-        scope.covers(self.inode) && self.generation <= snapshot
+        scope.covers_inode(self.inode) && self.generation <= snapshot
     }
 }
 
@@ -43,21 +45,26 @@ pub(super) struct OrphanUnsynced {
     pub(super) reported: bool,
 }
 
-/// Which durability obligations one barrier covers.
-///
-/// The mount-wide obligation is covered by both, so this selects only the
-/// per-inode entries.
-#[derive(Clone, Copy)]
-enum FsyncScope {
-    Inode(u64),
-    All,
-}
-
 impl FsyncScope {
-    fn covers(self, inode: u64) -> bool {
+    fn covers_inode(self, inode: u64) -> bool {
         match self {
             Self::Inode(target) => target == inode,
             Self::All => true,
+        }
+    }
+
+    fn covers_scope(self, requested: Self) -> bool {
+        match (self, requested) {
+            (Self::All, _) => true,
+            (Self::Inode(covered), Self::Inode(requested)) => covered == requested,
+            (Self::Inode(_), Self::All) => false,
+        }
+    }
+
+    fn wire_flag(self) -> u32 {
+        match self {
+            Self::Inode(_) => P9_FSYNC_INODE,
+            Self::All => 0,
         }
     }
 }
@@ -71,8 +78,8 @@ impl Client {
     /// the inode so the barrier covers all of them, whichever fid ran the
     /// mutation.
     ///
-    /// `primary` carries the request. `Tfsyncdur` flushes the whole server
-    /// whatever fid it names, so one round trip discharges the whole set.
+    /// `primary` carries the request. The server resolves it to the same remote
+    /// inode and limits the verified barrier to that inode.
     pub(crate) fn fsync_inode(&self, inode: u64, primary: u32, datasync: bool) -> Result<()> {
         self.fsync_scope(FsyncScope::Inode(inode), primary, datasync)
     }
@@ -90,8 +97,8 @@ impl Client {
     /// everything since that point is durable. A successor writer that cannot
     /// prove it answers `ESTALE`, which is this fsync's answer for the inodes
     /// it covers and not the session's.
-    fn fsync_scope(&self, scope: FsyncScope, primary: u32, datasync: bool) -> Result<()> {
-        let (token, snapshot) = self.session().fsync_snapshot(scope)?;
+    fn fsync_scope(&self, requested: FsyncScope, primary: u32, datasync: bool) -> Result<()> {
+        let (scope, token, snapshot) = self.session().fsync_snapshot(requested)?;
         let wire_fid = self.route_fid(primary)?;
         // The connection's own lineage, which is what the server compares a
         // token against. Recording the token this caller happens to send would
@@ -99,11 +106,10 @@ impl Client {
         let dispatch = self.session().dispatch_or_wait(usize::MAX)?;
         let (epoch, lineage) = (dispatch.epoch, dispatch.token);
 
-        // A barrier that already covers this snapshot on this connection makes
-        // the round trip redundant: the server's flush is unconditional and
-        // filesystem-wide, so the only thing left is the lineage equality the
-        // server would have checked, which is checkable here.
-        if let Some(lineage) = self.session().claim_barrier(epoch, snapshot)? {
+        // A completed barrier makes this round trip redundant only when it
+        // covers both this mutation snapshot and this scope. The lineage
+        // equality the server would check is then checkable locally.
+        if let Some(lineage) = self.session().claim_barrier(epoch, scope, snapshot)? {
             if token != 0 && token != lineage {
                 self.session().report_unsynced(scope, snapshot);
                 return Err(errno!(ESTALE));
@@ -115,10 +121,10 @@ impl Client {
         let outcome = (|| {
             let frame = self.transact(|| Request::Tfsyncdur {
                 fid: wire_fid,
-                datasync: u32::from(datasync),
-                // Token zero still performs the server-wide flush fsync and
-                // syncfs require, and correctly states that this client has no
-                // unverified lineage obligation here.
+                datasync: u32::from(datasync) | scope.wire_flag(),
+                // Token zero still performs the requested inode or mount-wide
+                // barrier and states that this client has no unverified
+                // lineage obligation in that scope.
                 token,
             })?;
             let response = self.decode(&frame)?;
@@ -131,14 +137,14 @@ impl Client {
         match outcome {
             Ok(()) => {
                 self.session()
-                    .finish_barrier(epoch, snapshot, Some(lineage));
+                    .finish_barrier(epoch, scope, snapshot, Some(lineage));
                 self.session().clear_unsynced(scope, snapshot);
                 Ok(())
             }
             Err(error) => {
                 // Nothing is published, so anyone waiting on this barrier runs
                 // its own rather than adopting an outcome that never happened.
-                self.session().finish_barrier(epoch, snapshot, None);
+                self.session().finish_barrier(epoch, scope, snapshot, None);
                 if error == errno!(ESTALE) {
                     // Keep the obligations outstanding and marked reported, so
                     // every later fsync covering them keeps failing until a
@@ -241,11 +247,12 @@ impl Session {
     /// The token is the numerically smallest covered one: that is the earliest
     /// and riskiest lineage point, and a server still matching it never broke
     /// lineage at all, so every later obligation is durable too. Zero says this
-    /// client has nothing to verify, and still asks for the filesystem-wide
-    /// flush that fsync and syncfs require.
+    /// client has nothing to verify, and still asks for the inode or mount-wide
+    /// barrier the caller requires.
     ///
-    /// The mount-wide obligation is covered whatever the scope, because it
-    /// exists precisely when the mutation could not be attributed to an inode.
+    /// An unattributed obligation escalates an inode request to mount-wide: it
+    /// may belong to the requested inode, so an inode-only barrier could not
+    /// safely answer the call.
     /// Claim the right to run a barrier, or wait for one that already covers
     /// this caller.
     ///
@@ -253,7 +260,7 @@ impl Session {
     /// round trip is needed. Anything the caller cannot prove from a completed
     /// barrier on the current connection makes it the issuer instead, so an
     /// extra flush is the worst outcome and a false success is unreachable.
-    fn claim_barrier(&self, epoch: u64, stamp: u64) -> Result<Option<u64>> {
+    fn claim_barrier(&self, epoch: u64, scope: FsyncScope, stamp: u64) -> Result<Option<u64>> {
         let mut remaining = self.timeout_jiffies;
         loop {
             let mut state = self.state.lock();
@@ -262,17 +269,23 @@ impl Session {
             }
             // A flush that started after this snapshot was taken covers it.
             if let Some(done) = state.barrier_done {
-                if done.epoch == epoch && done.stamp >= stamp {
+                if done.epoch == epoch && done.stamp >= stamp && done.scope.covers_scope(scope) {
                     return Ok(Some(done.lineage));
                 }
             }
             match state.barrier_in_flight {
                 // Someone else's barrier will cover this caller once it lands.
-                Some((flight_epoch, flight_stamp))
-                    if flight_epoch == epoch && flight_stamp >= stamp => {}
+                Some(flight)
+                    if flight.epoch == epoch
+                        && flight.stamp >= stamp
+                        && flight.scope.covers_scope(scope) => {}
                 // Nothing in flight covers this snapshot, so run one.
                 _ => {
-                    state.barrier_in_flight = Some((epoch, stamp));
+                    state.barrier_in_flight = Some(InFlightBarrier {
+                        epoch,
+                        stamp,
+                        scope,
+                    });
                     return Ok(None);
                 }
             }
@@ -287,7 +300,11 @@ impl Session {
                 CondVarTimeoutResult::Timeout => {
                     // The wait returns holding the lock, so reuse that guard:
                     // re-locking here would deadlock against this task.
-                    state.barrier_in_flight = Some((epoch, stamp));
+                    state.barrier_in_flight = Some(InFlightBarrier {
+                        epoch,
+                        stamp,
+                        scope,
+                    });
                     return Ok(None);
                 }
             }
@@ -302,10 +319,15 @@ impl Session {
     /// would let a later caller adopt a verdict the server never gave. A failed,
     /// abandoned or rerouted barrier leaves `barrier_done` alone, so its waiters
     /// issue their own.
-    fn finish_barrier(&self, epoch: u64, stamp: u64, lineage: Option<u64>) {
+    fn finish_barrier(&self, epoch: u64, scope: FsyncScope, stamp: u64, lineage: Option<u64>) {
         {
             let mut state = self.state.lock();
-            if state.barrier_in_flight == Some((epoch, stamp)) {
+            let completed = InFlightBarrier {
+                epoch,
+                stamp,
+                scope,
+            };
+            if state.barrier_in_flight == Some(completed) {
                 state.barrier_in_flight = None;
             }
             if let Some(lineage) = lineage.filter(|_| state.connection_epoch == epoch) {
@@ -316,6 +338,7 @@ impl Session {
                     state.barrier_done = Some(CompletedBarrier {
                         epoch,
                         stamp,
+                        scope,
                         lineage,
                     });
                 }
@@ -324,15 +347,20 @@ impl Session {
         self.changed.notify_all();
     }
 
-    fn fsync_snapshot(&self, scope: FsyncScope) -> Result<(u64, u64)> {
+    fn fsync_snapshot(&self, requested: FsyncScope) -> Result<(FsyncScope, u64, u64)> {
         let state = self.state.lock();
         if let SessionStatus::Dead(status) = state.status {
             return Err(Error::from_errno(status));
         }
+        let scope = if state.orphan.oldest.is_some() {
+            FsyncScope::All
+        } else {
+            requested
+        };
         let oldest_per_inode = state
             .unsynced
             .iter()
-            .filter(|entry| scope.covers(entry.inode))
+            .filter(|entry| scope.covers_inode(entry.inode))
             .map(|entry| entry.oldest)
             .min();
         let token = [state.orphan.oldest, oldest_per_inode]
@@ -340,7 +368,7 @@ impl Session {
             .flatten()
             .min()
             .unwrap_or(0);
-        Ok((token, state.mutation_stamp))
+        Ok((scope, token, state.mutation_stamp))
     }
 
     /// Discharge every covered obligation this barrier verified.

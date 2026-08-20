@@ -173,12 +173,26 @@ pub(super) struct SessionState {
     /// Set if `mutation_stamp` ever exhausts u64. Past that point a stamp no
     /// longer separates two windows, so nothing is ever discharged again.
     pub(super) mutation_stamp_exhausted: bool,
-    /// A barrier this connection is running right now, and the stamp it was
-    /// issued with. Another caller whose snapshot it covers waits for it rather
-    /// than issuing a second filesystem-wide flush.
-    pub(super) barrier_in_flight: Option<(u64, u64)>,
+    /// A barrier this connection is running right now. Another caller waits for
+    /// it only when its scope and mutation snapshot are covered.
+    pub(super) barrier_in_flight: Option<InFlightBarrier>,
     /// The newest barrier that completed successfully.
     pub(super) barrier_done: Option<CompletedBarrier>,
+}
+
+/// Durability obligations covered by one verified fsync.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FsyncScope {
+    Inode(u64),
+    All,
+}
+
+/// A verified fsync currently running on one connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct InFlightBarrier {
+    pub(super) epoch: u64,
+    pub(super) stamp: u64,
+    pub(super) scope: FsyncScope,
 }
 
 /// Two distinct failure levels.
@@ -197,11 +211,9 @@ pub(super) enum SessionStatus {
 
 /// A durability barrier that completed on one connection.
 ///
-/// The server's flush is unconditional and covers the whole filesystem, so a
-/// barrier issued after a mutation was acknowledged proves that mutation
-/// durable. The token it carried is only a lineage equality check, which a
-/// later caller can evaluate itself against the same connection's lineage.
-/// That is what lets a second fsync adopt this one instead of flushing again.
+/// A later caller can adopt this result only when both its mutation snapshot
+/// and requested scope are covered. The token is a lineage equality check that
+/// the caller can evaluate locally on the same connection.
 #[derive(Clone, Copy)]
 pub(super) struct CompletedBarrier {
     /// Connection the flush ran on. A barrier on a retired connection proves
@@ -210,6 +222,8 @@ pub(super) struct CompletedBarrier {
     /// `mutation_stamp` when the barrier was issued. Any snapshot at or below
     /// this was taken before the flush started, so the flush covers it.
     pub(super) stamp: u64,
+    /// Inodes whose durability the server verified.
+    pub(super) scope: FsyncScope,
     /// Lineage the connection reported, for the local token verdict.
     pub(super) lineage: u64,
 }

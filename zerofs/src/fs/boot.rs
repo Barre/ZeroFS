@@ -326,7 +326,7 @@ impl ZeroFS {
         self.verify_fsync_lineage(client_token)
     }
 
-    /// Per-inode form of [`Self::client_fsync_verified`] for 9P `Tfsyncdur`.
+    /// Per-inode form of [`Self::client_fsync_verified`] for scoped 9P `Tfsyncdur`.
     pub async fn client_fsync_inode_verified(
         &self,
         inode_id: InodeId,

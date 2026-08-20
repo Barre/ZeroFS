@@ -2195,14 +2195,22 @@ impl NinePHandler {
     }
 
     /// Flush and verify the client's oldest unflushed-write lineage token.
-    /// Token zero means no unflushed write; a broken lineage returns `ESTALE`.
+    /// New clients explicitly request inode scope; an unscoped request remains
+    /// global for compatibility with clients that coalesce verified barriers.
     async fn fsyncdur(&self, tf: Tfsyncdur) -> P9Result<Message> {
         let fid = self.get_fid(tf.fid)?;
         let fid_path = fid.path.clone();
 
-        self.filesystem
-            .client_fsync_inode_verified(fid.inode_id, tf.token)
-            .await?;
+        if tf.datasync & !P9_FSYNC_KNOWN_FLAGS != 0 {
+            return Err(P9Error::InvalidArgument);
+        }
+        if tf.datasync & P9_FSYNC_INODE != 0 {
+            self.filesystem
+                .client_fsync_inode_verified(fid.inode_id, tf.token)
+                .await?;
+        } else {
+            self.filesystem.client_fsync_verified(tf.token).await?;
+        }
 
         {
             let path = if fid_path.is_empty() {
