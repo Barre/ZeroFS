@@ -693,6 +693,7 @@ pub async fn build_slatedb(
                         poll_interval: std::time::Duration::from_secs(5),
                         commit_compacted_interval: std::time::Duration::from_secs(5),
                         max_concurrent_compactions,
+                        enable_trivial_move: true,
                         scheduler_options,
                         worker,
                         ..Default::default()
