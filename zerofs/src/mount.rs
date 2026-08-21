@@ -1089,23 +1089,23 @@ impl Filesystem for Fuse9P {
     fn fsync(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
-        datasync: bool,
+        _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.fsync_inner(ino.0, fh, datasync, reply);
+        self.fsync_inner(fh, reply);
     }
 
     fn fsyncdir(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
-        datasync: bool,
+        _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.fsync_inner(ino.0, fh, datasync, reply);
+        self.fsync_inner(fh, reply);
     }
 
     fn release(
@@ -1780,24 +1780,11 @@ impl Fuse9P {
         });
     }
 
-    fn fsync_inner(&self, ino: u64, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+    fn fsync_inner(&self, fh: FileHandle, reply: ReplyEmpty) {
         let client = Arc::clone(&self.client);
-        let inodes = Arc::clone(&self.inodes);
         let primary = fh.0 as u32;
         self.rt.spawn(async move {
-            // Mutations for one inode may use its per-user fid or any open handle.
-            let mut fids = vec![primary];
-            if let Some(entry) = inodes.get(&ino) {
-                fids.extend(
-                    entry
-                        .fids
-                        .values()
-                        .chain(entry.handles.keys())
-                        .copied()
-                        .filter(|&fid| fid != primary),
-                );
-            }
-            match client.fsync_inode(&fids, primary, datasync as u32).await {
+            match client.fsync(primary).await {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(errno(&e)),
             }

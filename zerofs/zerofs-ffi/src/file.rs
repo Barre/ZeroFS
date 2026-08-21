@@ -51,7 +51,8 @@ impl File {
         Ok(())
     }
 
-    /// Flush file data only.
+    /// Flush file data to durable storage. ZeroFS currently uses the same full
+    /// durability barrier as [`Self::sync_all`].
     pub async fn sync_data(&self) -> Result<(), ZeroFsError> {
         self.inner.sync_data().await?;
         Ok(())
