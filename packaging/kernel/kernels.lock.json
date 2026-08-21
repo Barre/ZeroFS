@@ -47,33 +47,33 @@
       "architectures": {
         "x86_64": [
           {
-            "kernel": "7.0.0-28-generic",
-            "version": "7.0.0-28.28~24.04.1",
-            "source_version": "7.0.0-28.28~24.04.1",
-            "snapshot": "20260727T000000Z",
-            "source_name": "linux-hwe-7.0"
-          },
-          {
             "kernel": "7.0.0-29-generic",
             "version": "7.0.0-29.29~24.04.2",
             "source_version": "7.0.0-29.29~24.04.2",
             "snapshot": "20260817T130742Z",
+            "source_name": "linux-hwe-7.0"
+          },
+          {
+            "kernel": "7.0.0-30-generic",
+            "version": "7.0.0-30.30~24.04.1",
+            "source_version": "7.0.0-30.30~24.04.1",
+            "snapshot": "20260821T072458Z",
             "source_name": "linux-hwe-7.0"
           }
         ],
         "aarch64": [
           {
-            "kernel": "7.0.0-28-generic",
-            "version": "7.0.0-28.28~24.04.1",
-            "source_version": "7.0.0-28.28~24.04.1",
-            "snapshot": "20260727T000000Z",
-            "source_name": "linux-hwe-7.0"
-          },
-          {
             "kernel": "7.0.0-29-generic",
             "version": "7.0.0-29.29~24.04.2",
             "source_version": "7.0.0-29.29~24.04.2",
             "snapshot": "20260817T130742Z",
+            "source_name": "linux-hwe-7.0"
+          },
+          {
+            "kernel": "7.0.0-30-generic",
+            "version": "7.0.0-30.30~24.04.1",
+            "source_version": "7.0.0-30.30~24.04.1",
+            "snapshot": "20260821T072458Z",
             "source_name": "linux-hwe-7.0"
           }
         ]
@@ -87,30 +87,30 @@
       "architectures": {
         "x86_64": [
           {
-            "kernel": "7.1.3+deb13-amd64",
-            "version": "7.1.3-1~bpo13+1",
-            "source_version": "7.1.3-1~bpo13+1",
-            "snapshot": "20260731T193826Z"
-          },
-          {
             "kernel": "7.1.7+deb13-amd64",
             "version": "7.1.7-1~bpo13+1",
             "source_version": "7.1.7-1~bpo13+1",
             "snapshot": "20260820T105107Z"
+          },
+          {
+            "kernel": "7.1.8+deb13-amd64",
+            "version": "7.1.8-1~bpo13+1",
+            "source_version": "7.1.8-1~bpo13+1",
+            "snapshot": "20260821T072458Z"
           }
         ],
         "aarch64": [
-          {
-            "kernel": "7.1.3+deb13-arm64",
-            "version": "7.1.3-1~bpo13+1",
-            "source_version": "7.1.3-1~bpo13+1",
-            "snapshot": "20260731T193826Z"
-          },
           {
             "kernel": "7.1.7+deb13-arm64",
             "version": "7.1.7-1~bpo13+1",
             "source_version": "7.1.7-1~bpo13+1",
             "snapshot": "20260820T105107Z"
+          },
+          {
+            "kernel": "7.1.8+deb13-arm64",
+            "version": "7.1.8-1~bpo13+1",
+            "source_version": "7.1.8-1~bpo13+1",
+            "snapshot": "20260821T072458Z"
           }
         ]
       }
