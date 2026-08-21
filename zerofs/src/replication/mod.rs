@@ -44,7 +44,7 @@ pub const TAKEOVER_HINT_AFTER: Duration = Duration::from_secs(2);
 pub const FINAL_OWNERSHIP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound for protocol and serving shutdown after authority loss.
 pub const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Runtime replication endpoints and recovery policy.
+/// Runtime replication identity and endpoints.
 #[derive(Debug, Clone)]
 pub struct ReplicationParams {
     pub node_id: String,
@@ -53,8 +53,6 @@ pub struct ReplicationParams {
     pub peers: Vec<String>,
     /// Local replication listener address.
     pub replication_listen: Option<String>,
-    /// One-shot operator authorization to skip stale-handoff observation.
-    pub force_recovery: bool,
 }
 
 impl ReplicationParams {
@@ -64,7 +62,6 @@ impl ReplicationParams {
             role: cfg.role,
             peers: cfg.peers.clone(),
             replication_listen: cfg.replication_listen.clone(),
-            force_recovery: cfg.force_recovery,
         }
     }
 

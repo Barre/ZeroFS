@@ -486,15 +486,9 @@ impl StartupContext {
             .replication_params
             .as_ref()
             .filter(|_| !self.db_mode.is_read_only())
-            .map(|params| {
-                (
-                    params.node_id.clone(),
-                    params.force_recovery,
-                    self.recovering_handoff,
-                )
-            });
+            .map(|params| (params.node_id.clone(), self.recovering_handoff));
 
-        let Some((node_id, force, recovering_handoff)) = claim_request else {
+        let Some((node_id, recovering_handoff)) = claim_request else {
             return Ok(ClaimOutcome::Claimed(None));
         };
 
@@ -503,7 +497,7 @@ impl StartupContext {
         if let Some(receiver) = &self.ha {
             receiver.control.quiesce_heartbeat_acks().await;
         }
-        let claim_result = if recovering_handoff && !force {
+        let claim_result = if recovering_handoff {
             crate::replication::leader_record::recover_handoff(
                 &self.retrying_object_store,
                 &self.actual_db_path,
@@ -515,7 +509,6 @@ impl StartupContext {
                 &self.retrying_object_store,
                 &self.actual_db_path,
                 &node_id,
-                force,
             )
             .await
         };
@@ -526,12 +519,6 @@ impl StartupContext {
                     .downcast_ref::<crate::replication::leader_record::ClaimRejected>()
                     .is_some() =>
             {
-                if force {
-                    return Err(error).context(
-                        "HA: forced solo recovery raced another initializer; verify no \
-                         other process is using this database before retrying",
-                    );
-                }
                 tracing::warn!(
                     "HA: another initializer owns the durable pre-open claim \
                      ({error}); returning to role election"
@@ -1130,7 +1117,6 @@ mod role_decision_tests {
                 role: ReplicationRole::Leader,
                 peers: vec!["http://[invalid".into()],
                 replication_listen: None,
-                force_recovery: false,
             }),
             configured_replication_role: Some(ReplicationRole::Leader),
             db_mode: super::DatabaseMode::ReadWrite,
@@ -1155,7 +1141,7 @@ mod role_decision_tests {
         .await
         .expect("role election must inspect the initial ownership record");
 
-        let abandoned = crate::replication::leader_record::claim(&store, "db", "node-b", false)
+        let abandoned = crate::replication::leader_record::claim(&store, "db", "node-b")
             .await
             .unwrap();
         drop(abandoned);

@@ -843,17 +843,16 @@ impl ActiveOwnership {
     }
 }
 
-/// Installs a Claiming record by conditional write. Without `force`, an
-/// unchanged Claiming/Opening record is recoverable after
-/// [`HANDOFF_STALE_AFTER`]. Force skips that observation interval. A failed CAS
-/// returns [`ClaimRejected`] without retrying against the observed generation.
+/// Installs a Claiming record by conditional write. An unchanged
+/// Claiming/Opening record is recoverable after [`HANDOFF_STALE_AFTER`]. A
+/// failed CAS returns [`ClaimRejected`] without retrying against the observed
+/// generation.
 pub async fn claim(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
     node_id: &str,
-    force: bool,
 ) -> anyhow::Result<ClaimToken> {
-    claim_inner(object_store, db_path, node_id, force, false).await
+    claim_inner(object_store, db_path, node_id, false).await
 }
 
 /// Recovers only a Claiming or Opening record. Active and absent records return
@@ -863,17 +862,15 @@ pub async fn recover_handoff(
     db_path: &str,
     node_id: &str,
 ) -> anyhow::Result<ClaimToken> {
-    claim_inner(object_store, db_path, node_id, false, true).await
+    claim_inner(object_store, db_path, node_id, true).await
 }
 
 async fn claim_inner(
     object_store: &Arc<dyn ObjectStore>,
     db_path: &str,
     node_id: &str,
-    force: bool,
     recovery_only: bool,
 ) -> anyhow::Result<ClaimToken> {
-    debug_assert!(!(force && recovery_only));
     let path = ownership_path(db_path);
     let mut current = read_snapshot(object_store, &path).await?;
     let leader_marker = if current.is_none() {
@@ -900,7 +897,7 @@ async fn claim_inner(
         return Err(rejected.into());
     }
 
-    if !force && handoff_in_progress {
+    if handoff_in_progress {
         let observed = current
             .as_ref()
             .expect("phase check requires an in-progress snapshot")
@@ -1171,7 +1168,7 @@ mod tests {
         let store = store();
         seed_leader_marker(&store, "db", 7, "node-a").await;
 
-        let claim = claim(&store, "db", "node-b", false).await.unwrap();
+        let claim = claim(&store, "db", "node-b").await.unwrap();
         assert_eq!(claim.generation(), 8);
         let inspection = inspect(&store, "db").await.unwrap();
         assert_eq!(inspection.phase(), Some(OwnershipPhase::Claiming));
@@ -1215,9 +1212,9 @@ mod tests {
     #[tokio::test]
     async fn simultaneous_claim_loser_does_not_leapfrog() {
         let store = store();
-        let first = claim(&store, "db", "node-a", false).await.unwrap();
+        let first = claim(&store, "db", "node-a").await.unwrap();
 
-        let error = claim(&store, "db", "node-b", false)
+        let error = claim(&store, "db", "node-b")
             .await
             .err()
             .expect("second claim must be rejected");
@@ -1240,7 +1237,7 @@ mod tests {
 
         faults.fail_gets(1);
         faults.fail_puts(1);
-        let claim = claim(&store, "db", "node-a", false)
+        let claim = claim(&store, "db", "node-a")
             .await
             .expect("transient ownership errors must not abort the claim");
         assert_eq!(claim.generation(), 1);
@@ -1255,7 +1252,7 @@ mod tests {
         let (store, faults) = retrying_fault_store();
         faults.fail_puts_after_apply(1);
 
-        let claim = claim(&store, "db", "node-a", false)
+        let claim = claim(&store, "db", "node-a")
             .await
             .expect("the exact applied claim must survive a lost response");
         assert_eq!(claim.generation(), 1);
@@ -1274,7 +1271,7 @@ mod tests {
             tokio::time::Instant::now(),
             crate::replication::AUTHORITY_TTL,
         ));
-        let claim = claim(&store, "db", "node-b", false).await.unwrap();
+        let claim = claim(&store, "db", "node-b").await.unwrap();
         let opening = tokio::spawn(begin_open(claim));
         tokio::task::yield_now().await;
 
@@ -1299,44 +1296,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_opening_renews_and_force_recovery_can_supersede_it() {
+    async fn live_opening_rejects_a_competing_claim() {
         let store = store();
         seed_leader_marker(&store, "db", 7, "node-a").await;
-        let old_opening = open_now(claim(&store, "db", "node-b", false).await.unwrap()).await;
+        let old_opening = open_now(claim(&store, "db", "node-b").await.unwrap()).await;
         assert!(validate_opening(&old_opening).await.unwrap());
 
-        let error = claim(&store, "db", "node-c", false)
+        let error = claim(&store, "db", "node-c")
             .await
             .err()
             .expect("Opening must reject a normal claim");
         let rejected = error.downcast_ref::<ClaimRejected>().unwrap();
         assert_eq!(rejected.phase, Some(OwnershipPhase::Opening));
         assert_eq!(rejected.owner.as_deref(), Some("node-b"));
-
-        let recovery = claim(&store, "db", "node-c", true).await.unwrap();
-        assert!(!validate_opening(&old_opening).await.unwrap());
-        assert_eq!(recovery.generation(), 9);
-        assert_eq!(
-            inspect(&store, "db").await.unwrap().startup_blockers(),
-            vec!["node-c".to_string(), "node-a".to_string()]
-        );
-
-        let error = activate(old_opening, 8).await.unwrap_err();
-        assert!(error.downcast_ref::<OwnershipLost>().is_some());
-
-        let recovered_opening = open_now(recovery).await;
-        let error = activate(recovered_opening, 7).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not advance the recorded floor 7")
-        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn abandoned_claiming_is_replaced_after_exact_stale_observation() {
         let store = store();
-        let abandoned = claim(&store, "db", "node-a", false).await.unwrap();
+        let abandoned = claim(&store, "db", "node-a").await.unwrap();
         let abandoned_generation = abandoned.generation();
         drop(abandoned);
         tokio::task::yield_now().await;
@@ -1359,7 +1337,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn only_one_contender_can_recover_an_abandoned_handoff_snapshot() {
         let (store, faults) = retrying_fault_store();
-        drop(claim(&store, "db", "node-a", false).await.unwrap());
+        drop(claim(&store, "db", "node-a").await.unwrap());
         tokio::task::yield_now().await;
 
         let first_store = Arc::clone(&store);
@@ -1395,7 +1373,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn abandoned_opening_is_replaced_after_exact_stale_observation() {
         let store = store();
-        let abandoned = open_now(claim(&store, "db", "node-a", false).await.unwrap()).await;
+        seed_leader_marker(&store, "db", 7, "node-z").await;
+        let abandoned = open_now(claim(&store, "db", "node-a").await.unwrap()).await;
         let abandoned_generation = abandoned.generation();
         drop(abandoned);
         tokio::task::yield_now().await;
@@ -1413,12 +1392,20 @@ mod tests {
             .expect("an abandoned exact Opening snapshot must be recoverable");
         assert_eq!(replacement.generation(), abandoned_generation + 1);
         assert_eq!(replacement.node_id(), "node-b");
+
+        let recovered_opening = open_now(replacement).await;
+        let error = activate(recovered_opening, 7).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not advance the recorded floor 7")
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn handoff_recovery_cannot_replace_an_active_record() {
         let store = store();
-        let original = claim(&store, "db", "node-a", false).await.unwrap();
+        let original = claim(&store, "db", "node-a").await.unwrap();
 
         let contender_store = Arc::clone(&store);
         let recovery =
@@ -1445,7 +1432,7 @@ mod tests {
     async fn exact_active_validation_rejects_every_other_state_or_identity() {
         let store = store();
         let active = activate(
-            open_now(claim(&store, "db", "node-a", false).await.unwrap()).await,
+            open_now(claim(&store, "db", "node-a").await.unwrap()).await,
             1,
         )
         .await
@@ -1461,24 +1448,7 @@ mod tests {
         assert!(!validate_active(&store, "db", &wrong).await.unwrap());
         assert!(!validate_active(&store, "other-db", &active).await.unwrap());
 
-        let _claim = claim(&store, "db", "node-b", false).await.unwrap();
+        let _claim = claim(&store, "db", "node-b").await.unwrap();
         assert!(!validate_active(&store, "db", &active).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn stale_claim_token_cannot_enter_opening_after_force_recovery() {
-        let store = store();
-        let stale = claim(&store, "db", "node-a", false).await.unwrap();
-        let replacement = claim(&store, "db", "node-b", true).await.unwrap();
-
-        let error = begin_open_after(stale, Duration::ZERO)
-            .await
-            .err()
-            .expect("stale token must not enter Opening");
-        assert!(error.downcast_ref::<OwnershipLost>().is_some());
-        assert_eq!(
-            inspect(&store, "db").await.unwrap().startup_blockers(),
-            [replacement.node_id().to_string()]
-        );
     }
 }

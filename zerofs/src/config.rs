@@ -173,10 +173,6 @@ pub struct ReplicationConfig {
         default
     )]
     pub replication_listen: Option<String>,
-    /// One-startup authorization to replace durable HA ownership.
-    /// All former participants must be stopped before this is enabled.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub force_recovery: bool,
 }
 
 impl ReplicationConfig {
@@ -234,26 +230,9 @@ impl ReplicationConfig {
             );
         }
 
-        if self.force_recovery {
-            if self.role != ReplicationRole::Leader {
-                anyhow::bail!("[replication] force_recovery = true requires role = \"leader\"");
-            }
-            if !self.peers.is_empty() {
-                anyhow::bail!(
-                    "[replication] force_recovery = true requires peers = []; verify every \
-                     former peer is down before removing it from the configuration"
-                );
-            }
-            tracing::warn!(
-                "[replication] force_recovery is enabled for node {:?}; this may fence a live \
-                 partitioned writer. Remove force_recovery after this recovery startup succeeds",
-                self.node_id
-            );
-        }
-
         // Automatic role swaps require both a local endpoint and a peer.
         let (has_peers, has_listen) = (!self.peers.is_empty(), self.replication_listen.is_some());
-        if !self.force_recovery && has_peers != has_listen {
+        if has_peers != has_listen {
             anyhow::bail!(
                 "[replication] automatic HA requires peers and replication_listen together; \
                  configure both for role swaps, or neither for a standalone node"
@@ -1202,9 +1181,6 @@ impl Settings {
         toml_string.push_str(
             "# peers = [\"10.0.0.2:9000\"]             # the other node's replication_listen\n",
         );
-        toml_string.push_str(
-            "# force_recovery = false                   # break-glass override; see HA recovery docs\n",
-        );
 
         toml_string.push_str("\n# Optional Prometheus metrics endpoint\n");
         toml_string.push_str("# Exposes filesystem, LSM, and cache metrics in Prometheus format\n");
@@ -1910,45 +1886,6 @@ replication_listen = "127.0.0.1:5599""#,
             err.contains("requires peers and replication_listen together"),
             "got: {err}"
         );
-    }
-
-    #[test]
-    fn replication_force_recovery_requires_leader() {
-        let content = base_config_with_replication(
-            r#"[replication]
-node_id = "n1"
-role = "standby"
-replication_listen = "127.0.0.1:5599"
-force_recovery = true"#,
-        );
-        let err = format!("{:#}", write_and_load(&content).unwrap_err());
-        assert!(err.contains("requires role = \"leader\""), "got: {err}");
-    }
-
-    #[test]
-    fn replication_force_recovery_requires_no_peers() {
-        let content = base_config_with_replication(
-            r#"[replication]
-node_id = "n1"
-role = "leader"
-peers = ["127.0.0.1:5600"]
-force_recovery = true"#,
-        );
-        let err = format!("{:#}", write_and_load(&content).unwrap_err());
-        assert!(err.contains("requires peers = []"), "got: {err}");
-    }
-
-    #[test]
-    fn replication_force_recovery_is_explicit_and_valid_for_solo_leader() {
-        let content = base_config_with_replication(
-            r#"[replication]
-node_id = "n1"
-role = "leader"
-replication_listen = "127.0.0.1:5599"
-force_recovery = true"#,
-        );
-        let repl = write_and_load(&content).unwrap().replication.unwrap();
-        assert!(repl.force_recovery);
     }
 
     #[test]
