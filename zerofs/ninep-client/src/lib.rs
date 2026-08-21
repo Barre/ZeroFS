@@ -578,12 +578,12 @@ pub struct NinePClient {
     stale_fids: DashSet<u32>,
     /// Orders stateful response settlement against snapshot/replay/install.
     session_transition: tokio::sync::Mutex<()>,
-    /// Per-fid durability obligations carried across reconnects.
-    unsynced: DashMap<u32, Unsynced>,
+    /// Per-inode durability obligations carried across reconnects.
+    unsynced: DashMap<u64, Unsynced>,
     counters: Arc<TrafficCounters>,
 }
 
-/// One fid's durability obligation. `generation` prevents an fsync from clearing
+/// One inode's durability obligation. `generation` prevents an fsync from clearing
 /// a concurrent write. `reported` keeps `ESTALE` visible until a replacement write.
 #[derive(Default)]
 struct Unsynced {
@@ -592,12 +592,29 @@ struct Unsynced {
     reported: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FsyncScope {
+    Inode(u64),
+    All,
+}
+
+impl FsyncScope {
+    fn wire_flag(self) -> u32 {
+        match self {
+            Self::Inode(_) => P9_FSYNC_INODE,
+            Self::All => 0,
+        }
+    }
+}
+
 impl Unsynced {
     /// Records a write, preserving the oldest unreported lineage token.
     fn note(&mut self, token: u64) {
-        if self.reported || self.oldest.is_none() {
+        if self.reported {
             self.oldest = Some(token);
             self.reported = false;
+        } else {
+            self.oldest = Some(self.oldest.map_or(token, |oldest| oldest.min(token)));
         }
         self.generation = self.generation.wrapping_add(1);
     }
@@ -1195,35 +1212,69 @@ impl NinePClient {
         }
     }
 
-    /// Records an acknowledged mutation under its connection lineage.
-    fn note_unsynced(&self, fid: u32, token: u64) {
-        self.unsynced.entry(fid).or_default().note(token);
+    /// Resolve every inode a mutation will make responsible for durability.
+    ///
+    /// This runs before dispatch, while state still describes the request's
+    /// input fids. That matters for `Tlcreate`, which changes its fid from the
+    /// parent directory to the new child after the reply.
+    fn mutation_inodes(&self, body: &Message) -> ClientResult<Vec<u64>> {
+        if !body.is_mutation() {
+            return Ok(Vec::new());
+        }
+        self.validate_fids(body.durability_fids())?;
+        let state = self.state.lock().unwrap();
+        let mut inodes = Vec::with_capacity(2);
+        for fid in body.durability_fids() {
+            let inode = state
+                .fids
+                .get(&fid)
+                .map(|record| record.inode_id)
+                .ok_or(ClientError::Errno(linux::EBADF))?;
+            if !inodes.contains(&inode) {
+                inodes.push(inode);
+            }
+        }
+        Ok(inodes)
     }
 
-    /// Snapshot `(oldest token, generation)` of `fid` for a verified fsync.
-    fn snapshot_unsynced(&self, fid: u32) -> (Option<u64>, u64) {
-        self.unsynced.get(&fid).map_or((None, 0), |u| u.snapshot())
+    /// Records an acknowledged mutation under its connection lineage.
+    fn note_unsynced(&self, inode: u64, token: u64) {
+        self.unsynced.entry(inode).or_default().note(token);
+    }
+
+    /// Resolve a live fid to the stable inode identity used for durability.
+    fn fid_inode(&self, fid: u32) -> ClientResult<u64> {
+        self.validate_fids([fid])?;
+        self.state
+            .lock()
+            .unwrap()
+            .fids
+            .get(&fid)
+            .map(|record| record.inode_id)
+            .ok_or(ClientError::Errno(linux::EBADF))
+    }
+
+    /// Snapshot `(oldest token, generation)` of `inode` for a verified fsync.
+    fn snapshot_unsynced(&self, inode: u64) -> (Option<u64>, u64) {
+        self.unsynced
+            .get(&inode)
+            .map_or((None, 0), |u| u.snapshot())
     }
 
     /// Clears an unchanged obligation after verified fsync. `remove_if` rechecks
     /// under the shard lock before deleting the empty entry.
-    fn clear_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
-        if let Some(mut u) = self.unsynced.get_mut(&fid) {
+    fn clear_unsynced_if_unchanged(&self, inode: u64, generation: u64) {
+        if let Some(mut u) = self.unsynced.get_mut(&inode) {
             u.clear_if_unchanged(generation);
         }
-        self.unsynced.remove_if(&fid, |_, u| u.oldest.is_none());
+        self.unsynced.remove_if(&inode, |_, u| u.oldest.is_none());
     }
 
     /// Marks an unchanged obligation reported after `ESTALE`.
-    fn report_unsynced_if_unchanged(&self, fid: u32, generation: u64) {
-        if let Some(mut u) = self.unsynced.get_mut(&fid) {
+    fn report_unsynced_if_unchanged(&self, inode: u64, generation: u64) {
+        if let Some(mut u) = self.unsynced.get_mut(&inode) {
             u.report_if_unchanged(generation);
         }
-    }
-
-    /// Removes durability state before a fid number is reused.
-    fn forget_unsynced(&self, fid: u32) {
-        self.unsynced.remove(&fid);
     }
 
     /// Maximum data a single Tread/Treaddir response (Rread/Rreaddir) can carry
@@ -1252,7 +1303,6 @@ impl NinePClient {
 
     /// Return a fid to the free list. The caller must have clunked it already.
     pub fn free_fid(&self, fid: u32) {
-        self.forget_unsynced(fid);
         self.stale_fids.remove(&fid);
         self.fid_free.lock().unwrap().push(fid);
     }
@@ -1346,6 +1396,10 @@ impl NinePClient {
         attempt: &mut OpAttemptState,
         stateful_dispatched_conn: Option<&Mutex<Option<Arc<Conn>>>>,
     ) -> ClientResult<(Message, Arc<Conn>)> {
+        // Resolve before anything reaches the wire. Successful stateful
+        // mutations may change a fid's binding before their public method
+        // settles the response into replay state.
+        let mutation_inodes = self.mutation_inodes(body)?;
         'resend: loop {
             self.validate_fids(body.request_fids())?;
             await_resend_bounded(attempt, self.wait_until_live()).await??;
@@ -1457,11 +1511,11 @@ impl NinePClient {
                 runtime::yield_now().await;
                 continue;
             }
-            // Successful mutations create per-fid durability obligations.
+            // Successful mutations create per-inode durability obligations.
             if !matches!(msg.body, Message::Rlerror(_)) {
                 let token = conn.lineage_token.load(Ordering::Relaxed);
-                for fid in body.durability_fids() {
-                    self.note_unsynced(fid, token);
+                for &inode in &mutation_inodes {
+                    self.note_unsynced(inode, token);
                 }
             }
             return Ok((msg.body, conn));
@@ -2518,44 +2572,47 @@ impl NinePClient {
         }
     }
 
-    /// Verifies fsync for all fids associated with one inode. `primary` carries
-    /// `Tfsyncdur`; the oldest recorded lineage token determines the result.
-    pub async fn fsync_inode(&self, fids: &[u32], primary: u32, datasync: u32) -> ClientResult<()> {
-        self.fsync_fids(fids, primary, datasync | P9_FSYNC_INODE)
-            .await
-    }
-
-    async fn fsync_fids(&self, fids: &[u32], primary: u32, flags: u32) -> ClientResult<()> {
-        self.validate_fids(fids.iter().copied())?;
+    async fn fsync_scope(&self, primary: u32, scope: FsyncScope) -> ClientResult<()> {
+        self.validate_fids([primary])?;
         // Generations prevent the result from clearing writes concurrent with fsync.
         let mut token: Option<u64> = None;
-        let mut snaps: Vec<(u32, u64)> = Vec::with_capacity(fids.len());
-        for &fid in fids {
-            let (oldest, generation) = self.snapshot_unsynced(fid);
-            if let Some(t) = oldest {
-                token = Some(token.map_or(t, |w| w.min(t)));
+        let mut snaps: Vec<(u64, u64)> = Vec::new();
+        match scope {
+            FsyncScope::Inode(inode) => {
+                let (oldest, generation) = self.snapshot_unsynced(inode);
+                token = oldest;
+                snaps.push((inode, generation));
             }
-            snaps.push((fid, generation));
+            FsyncScope::All => {
+                for entry in &self.unsynced {
+                    let inode = *entry.key();
+                    let (oldest, generation) = entry.snapshot();
+                    if let Some(t) = oldest {
+                        token = Some(token.map_or(t, |current| current.min(t)));
+                    }
+                    snaps.push((inode, generation));
+                }
+            }
         }
         match self
             .rpc(Message::Tfsyncdur(Tfsyncdur {
                 fid: primary,
-                datasync: flags,
+                datasync: scope.wire_flag(),
                 token: token.unwrap_or(0),
             }))
             .await
         {
             Ok(Message::Rfsync(_)) => {
-                for (fid, generation) in snaps {
-                    self.clear_unsynced_if_unchanged(fid, generation);
+                for (inode, generation) in snaps {
+                    self.clear_unsynced_if_unchanged(inode, generation);
                 }
                 Ok(())
             }
             Ok(_) => Err(ClientError::Unexpected("fsync")),
             Err(ClientError::Errno(e)) if e == linux::ESTALE => {
                 // Preserve stale obligations until replacement writes arrive.
-                for (fid, generation) in snaps {
-                    self.report_unsynced_if_unchanged(fid, generation);
+                for (inode, generation) in snaps {
+                    self.report_unsynced_if_unchanged(inode, generation);
                 }
                 Err(ClientError::Errno(e))
             }
@@ -2563,21 +2620,15 @@ impl NinePClient {
         }
     }
 
-    /// Verified fsync for one fid. Multi-fid inode users call [`Self::fsync_inode`].
-    pub async fn fsync(&self, fid: u32, datasync: u32) -> ClientResult<()> {
-        self.fsync_inode(&[fid], fid, datasync).await
+    /// Verified fsync for the inode named by `fid`, across every handle.
+    pub async fn fsync(&self, fid: u32) -> ClientResult<()> {
+        let inode = self.fid_inode(fid)?;
+        self.fsync_scope(fid, FsyncScope::Inode(inode)).await
     }
 
     /// Filesystem-wide barrier for this client's outstanding durability obligations.
-    pub async fn fsync_all(&self, primary: u32, datasync: u32) -> ClientResult<()> {
-        let mut fids = vec![primary];
-        for entry in &self.unsynced {
-            let fid = *entry.key();
-            if fid != primary {
-                fids.push(fid);
-            }
-        }
-        self.fsync_fids(&fids, primary, datasync).await
+    pub async fn fsync_all(&self, primary: u32) -> ClientResult<()> {
+        self.fsync_scope(primary, FsyncScope::All).await
     }
 
     pub async fn statfs(&self, fid: u32) -> ClientResult<Rstatfs> {
@@ -3089,7 +3140,13 @@ mod lock_range_tests {
 
 #[cfg(test)]
 mod durability_tracking_tests {
-    use super::Unsynced;
+    use super::{FsyncScope, P9_FSYNC_INODE, Unsynced};
+
+    #[test]
+    fn fsync_scope_owns_the_wire_scope_bit() {
+        assert_eq!(FsyncScope::All.wire_flag(), 0);
+        assert_eq!(FsyncScope::Inode(7).wire_flag(), P9_FSYNC_INODE);
+    }
 
     #[test]
     fn fsync_clears_the_obligation_when_quiescent() {
@@ -3102,7 +3159,7 @@ mod durability_tracking_tests {
     }
 
     #[test]
-    fn a_repeated_fsync_on_one_fid_keeps_failing_until_a_redo() {
+    fn a_repeated_fsync_on_one_inode_keeps_failing_until_a_redo() {
         let mut u = Unsynced::default();
         u.note(1);
         let (oldest, generation) = u.snapshot();
@@ -3125,7 +3182,7 @@ mod durability_tracking_tests {
     }
 
     #[test]
-    fn an_estale_and_redo_on_one_fid_does_not_discharge_a_sibling_fid() {
+    fn an_estale_and_redo_on_one_inode_does_not_discharge_a_sibling_inode() {
         use std::collections::HashMap;
         let mut map: HashMap<u32, Unsynced> = HashMap::new();
         map.entry(10).or_default().note(1);
@@ -3141,7 +3198,7 @@ mod durability_tracking_tests {
         assert_eq!(
             map.get(&20).unwrap().snapshot().0,
             Some(1),
-            "fid 10's ESTALE+redo+success cycle must not touch fid 20"
+            "inode 10's ESTALE+redo+success cycle must not touch inode 20"
         );
     }
 
@@ -3162,8 +3219,8 @@ mod durability_tracking_tests {
     #[test]
     fn oldest_token_is_kept_across_a_lineage_change() {
         let mut u = Unsynced::default();
-        u.note(5);
         u.note(9);
+        u.note(5);
         assert_eq!(u.snapshot().0, Some(5), "the oldest (riskiest) token wins");
     }
 
@@ -3224,6 +3281,52 @@ mod session_transition_tests {
             unsynced: DashMap::new(),
             counters: Arc::new(TrafficCounters::default()),
         })
+    }
+
+    fn track_test_fid(client: &NinePClient, fid: u32) {
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(fid, inode_fid(u64::from(fid), 0, 0, None));
+    }
+
+    #[test]
+    fn mutation_obligations_are_derived_from_stable_inode_ids() {
+        let client = test_client(test_conn());
+        {
+            let mut state = client.state.lock().unwrap();
+            state.fids.insert(7, inode_fid(70, 0, 0, None));
+            state.fids.insert(8, inode_fid(80, 0, 0, None));
+        }
+        let rename = Message::Trenameat(Trenameat {
+            olddirfid: 7,
+            oldname: P9String::new(b"old".to_vec()),
+            newdirfid: 8,
+            newname: P9String::new(b"new".to_vec()),
+        });
+        assert_eq!(client.mutation_inodes(&rename).unwrap(), vec![80, 70]);
+
+        client
+            .state
+            .lock()
+            .unwrap()
+            .fids
+            .insert(8, inode_fid(70, 0, 0, None));
+        assert_eq!(
+            client.mutation_inodes(&rename).unwrap(),
+            vec![70],
+            "aliases of one inode must create one durability obligation"
+        );
+    }
+
+    #[test]
+    fn recycling_a_fid_does_not_discard_its_inode_obligation() {
+        let client = test_client(test_conn());
+        client.note_unsynced(70, 5);
+        client.free_fid(7);
+        assert_eq!(client.snapshot_unsynced(70).0, Some(5));
     }
 
     async fn next_request(requests: &mut TestRequests) -> Option<P9Message> {
@@ -4405,6 +4508,7 @@ mod session_transition_tests {
         let (old_conn, mut old_requests) = test_conn_with_receiver();
         old_conn.writer_epoch.store(7, Ordering::Relaxed);
         let client = test_client(Arc::clone(&old_conn));
+        track_test_fid(&client, 7);
 
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move { request_client.write(7, 0, b"x").await });
@@ -4473,6 +4577,7 @@ mod session_transition_tests {
     async fn write_bytes_chunks_at_the_msize_boundary() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let max = client.max_write_payload();
         assert_eq!(
             max,
@@ -4537,6 +4642,7 @@ mod session_transition_tests {
     async fn write_chunk_rejects_a_count_larger_than_attempted() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
 
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
@@ -4561,6 +4667,7 @@ mod session_transition_tests {
     async fn ambiguous_reply_loss_marks_the_next_frame_as_retry() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
 
         let responder_conn = Arc::clone(&conn);
         let responder = tokio::spawn(async move {
@@ -4694,6 +4801,7 @@ mod session_transition_tests {
             .await
             .expect("test writer queue should accept its first frame");
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move {
             request_client
@@ -4718,6 +4826,7 @@ mod session_transition_tests {
     async fn cancelling_a_dispatched_request_quarantines_its_tag() {
         let (conn, mut requests) = test_conn_with_receiver();
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move { request_client.write(7, 0, b"x").await });
 
@@ -4766,6 +4875,7 @@ mod session_transition_tests {
             .expect("test writer queue should accept its first frame");
 
         let client = test_client(Arc::clone(&conn));
+        track_test_fid(&client, 7);
         let request_client = Arc::clone(&client);
         let request = tokio::spawn(async move { request_client.write(7, 0, b"x").await });
         for _ in 0..4 {

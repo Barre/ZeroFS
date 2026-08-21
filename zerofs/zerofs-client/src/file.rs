@@ -96,20 +96,14 @@ impl File {
     /// Success verifies durability of earlier acknowledged writes on this
     /// handle. Broken lineage returns [`ZeroFsError::Stale`].
     pub async fn sync_all(&self) -> Result<(), ZeroFsError> {
-        self.session
-            .client
-            .fsync(self.fid()?, 0)
-            .await
-            .ctx(&self.path)
+        self.session.client.fsync(self.fid()?).await.ctx(&self.path)
     }
 
-    /// Flush file data only. Broken write lineage returns [`ZeroFsError::Stale`].
+    /// Flush file data to durable storage. ZeroFS currently uses the same full
+    /// durability barrier as [`Self::sync_all`]. Broken write lineage returns
+    /// [`ZeroFsError::Stale`].
     pub async fn sync_data(&self) -> Result<(), ZeroFsError> {
-        self.session
-            .client
-            .fsync(self.fid()?, 1)
-            .await
-            .ctx(&self.path)
+        self.session.client.fsync(self.fid()?).await.ctx(&self.path)
     }
 
     /// Marks the handle closed. Drop schedules its fid for release. This call is

@@ -1271,10 +1271,10 @@ async fn make_durable_state(client: &ninep_client::NinePClient) {
         .await
         .expect("create A");
     client.write(10, 0, b"A").await.expect("write A");
-    client.fsync(10, 0).await.expect("fsync A");
+    client.fsync(10).await.expect("fsync A");
     client.clunk(10).await.ok();
 
-    // B: create a temp, rename it into place, fsync (a ZeroFS fsync is global).
+    // B: create a temp, rename it into place, then fsync the parent directory.
     client.walk(1, 11, &[]).await.expect("clone root for B.tmp");
     client
         .lcreate(11, b"B.tmp", O_CREAT_RDWR, 0o644, 0)
@@ -1286,7 +1286,7 @@ async fn make_durable_state(client: &ninep_client::NinePClient) {
         .renameat(1, b"B.tmp", 1, b"B")
         .await
         .expect("rename B.tmp -> B");
-    client.fsync(1, 0).await.expect("fsync after rename");
+    client.fsync(1).await.expect("fsync after rename");
 
     // C: create + fsync (durable), then unlink + fsync (durable delete).
     client.walk(1, 12, &[]).await.expect("clone root for C");
@@ -1295,10 +1295,10 @@ async fn make_durable_state(client: &ninep_client::NinePClient) {
         .await
         .expect("create C");
     client.write(12, 0, b"C").await.expect("write C");
-    client.fsync(12, 0).await.expect("fsync C");
+    client.fsync(12).await.expect("fsync C");
     client.clunk(12).await.ok();
     client.unlinkat(1, b"C", 0).await.expect("unlink C");
-    client.fsync(1, 0).await.expect("fsync after unlink");
+    client.fsync(1).await.expect("fsync after unlink");
 }
 
 /// Returns (A content, B present, B.tmp present, C present).

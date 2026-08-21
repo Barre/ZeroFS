@@ -432,7 +432,7 @@ impl Client {
         self.session.check_open()?;
         self.session
             .client
-            .fsync_all(self.session.root_fid, 0)
+            .fsync_all(self.session.root_fid)
             .await
             .ctx("/")
     }
