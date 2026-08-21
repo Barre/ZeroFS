@@ -221,15 +221,6 @@ const MAX_LOCK_RECORDS: usize = 1024;
 /// Bytes in the per-mount lock owner identity: `zerofs-` plus a hex UUID.
 const CLIENT_ID_LEN: usize = 7 + 2 * 16;
 
-/// Inodes that may hold a distinct durability obligation at once.
-///
-/// Fixed at session creation because a mutation is recorded from netfslib
-/// writeback context, where a `GFP_KERNEL` allocation can enter reclaim and
-/// re-enter this filesystem, and the kernel allocator flags exposed to Rust
-/// have no `GFP_NOFS`. Overflow folds into the mount-wide obligation, which is
-/// more conservative, never less.
-const UNSYNCED_CAPACITY: usize = 256;
-
 const IO_TASK_NAME: &[u8] = b"zerofs-io\0";
 
 /// A started kthread and the extra task reference that keeps it joinable.

@@ -1,13 +1,10 @@
-use kernel::{prelude::*, sync::CondVarTimeoutResult};
+use kernel::{alloc::flags::GFP_NOWAIT, prelude::*};
 
-use crate::protocol::{Request, Response, P9_FSYNC_INODE};
+use crate::protocol::{P9_FSYNC_INODE, Request, Response};
 
-use super::registry::FidSlot;
-use super::reply::OwnedFrame;
-use super::session::{
-    CompletedBarrier, FsyncScope, InFlightBarrier, Session, SessionState, SessionStatus,
-};
 use super::Client;
+use super::registry::FidSlot;
+use super::session::{FsyncScope, Session, SessionState, SessionStatus};
 
 /// One remote inode's outstanding durability obligation.
 ///
@@ -34,30 +31,11 @@ impl UnsyncedEntry {
     }
 }
 
-/// Obligations that could not be attributed to an inode.
-///
-/// Every fid that reaches the wire is recorded, so this is only reached if the
-/// obligation table is full. Folding rather than dropping keeps the mutation
-/// provable; the cost is that it is then only provable mount-wide.
-pub(super) struct OrphanUnsynced {
-    pub(super) oldest: Option<u64>,
-    pub(super) generation: u64,
-    pub(super) reported: bool,
-}
-
 impl FsyncScope {
     fn covers_inode(self, inode: u64) -> bool {
         match self {
             Self::Inode(target) => target == inode,
             Self::All => true,
-        }
-    }
-
-    fn covers_scope(self, requested: Self) -> bool {
-        match (self, requested) {
-            (Self::All, _) => true,
-            (Self::Inode(covered), Self::Inode(requested)) => covered == requested,
-            (Self::Inode(_), Self::All) => false,
         }
     }
 
@@ -80,16 +58,16 @@ impl Client {
     ///
     /// `primary` carries the request. The server resolves it to the same remote
     /// inode and limits the verified barrier to that inode.
-    pub(crate) fn fsync_inode(&self, inode: u64, primary: u32, datasync: bool) -> Result<()> {
-        self.fsync_scope(FsyncScope::Inode(inode), primary, datasync)
+    pub(crate) fn fsync_inode(&self, inode: u64, primary: u32) -> Result<()> {
+        self.fsync_scope(FsyncScope::Inode(inode), primary)
     }
 
     /// Mount-wide barrier: verify every obligation this client still holds.
     ///
     /// syncfs promises the whole mount, so it must answer for the oldest
     /// outstanding lineage across all inodes and not just the root's.
-    pub(crate) fn fsync_all(&self, primary: u32, datasync: bool) -> Result<()> {
-        self.fsync_scope(FsyncScope::All, primary, datasync)
+    pub(crate) fn fsync_all(&self, primary: u32) -> Result<()> {
+        self.fsync_scope(FsyncScope::All, primary)
     }
 
     /// The token sent is the lineage of the OLDEST covered mutation this client
@@ -97,31 +75,14 @@ impl Client {
     /// everything since that point is durable. A successor writer that cannot
     /// prove it answers `ESTALE`, which is this fsync's answer for the inodes
     /// it covers and not the session's.
-    fn fsync_scope(&self, requested: FsyncScope, primary: u32, datasync: bool) -> Result<()> {
-        let (scope, token, snapshot) = self.session().fsync_snapshot(requested)?;
+    fn fsync_scope(&self, scope: FsyncScope, primary: u32) -> Result<()> {
+        let (token, snapshot) = self.session().fsync_snapshot(scope, primary)?;
         let wire_fid = self.route_fid(primary)?;
-        // The connection's own lineage, which is what the server compares a
-        // token against. Recording the token this caller happens to send would
-        // make a later adopter with a different token wrongly see ESTALE.
-        let dispatch = self.session().dispatch_or_wait(usize::MAX)?;
-        let (epoch, lineage) = (dispatch.epoch, dispatch.token);
-
-        // A completed barrier makes this round trip redundant only when it
-        // covers both this mutation snapshot and this scope. The lineage
-        // equality the server would check is then checkable locally.
-        if let Some(lineage) = self.session().claim_barrier(epoch, scope, snapshot)? {
-            if token != 0 && token != lineage {
-                self.session().report_unsynced(scope, snapshot);
-                return Err(errno!(ESTALE));
-            }
-            self.session().clear_unsynced(scope, snapshot);
-            return Ok(());
-        }
 
         let outcome = (|| {
             let frame = self.transact(|| Request::Tfsyncdur {
                 fid: wire_fid,
-                datasync: u32::from(datasync) | scope.wire_flag(),
+                datasync: scope.wire_flag(),
                 // Token zero still performs the requested inode or mount-wide
                 // barrier and states that this client has no unverified
                 // lineage obligation in that scope.
@@ -136,15 +97,10 @@ impl Client {
 
         match outcome {
             Ok(()) => {
-                self.session()
-                    .finish_barrier(epoch, scope, snapshot, Some(lineage));
                 self.session().clear_unsynced(scope, snapshot);
                 Ok(())
             }
             Err(error) => {
-                // Nothing is published, so anyone waiting on this barrier runs
-                // its own rather than adopting an outcome that never happened.
-                self.session().finish_barrier(epoch, scope, snapshot, None);
                 if error == errno!(ESTALE) {
                     // Keep the obligations outstanding and marked reported, so
                     // every later fsync covering them keeps failing until a
@@ -157,88 +113,55 @@ impl Client {
         }
     }
 
-    /// Record an acknowledged mutation against the lineage that answered it.
-    ///
-    /// `fids` are the fids the mutation actually changed, which for a create,
-    /// unlink or rename is the DIRECTORY and never the new child: only an
-    /// fsync covering the parent can verify a namespace change. `Trenameat`
-    /// changes two directories and names both. Each is resolved to the inode
-    /// it names, which is what the obligation is filed under.
-    ///
-    /// The token comes from the frame, so it is the lineage of the connection
-    /// that carried the reply rather than whichever connection is current now.
-    /// Recording a newer one would let a post-failover fsync match and report
-    /// success for a mutation the new lineage may never have received.
-    pub(super) fn note_mutation(&self, frame: &OwnedFrame<'_>, fids: &[u32]) {
-        for fid in fids {
-            self.session().note_unsynced(*fid, frame.lineage_token);
-        }
+    /// Reserve enough bookkeeping capacity before a mutation can reach the wire.
+    pub(super) fn reserve_mutation(&self, fids: &[u32]) -> Result<UnsyncedClaim<'_>> {
+        self.session().reserve_unsynced(fids)
     }
 }
 
 impl Session {
-    /// Record one acknowledged mutation on `fid` against `token`, the lineage
-    /// of the connection that answered it.
+    /// Claim one spare entry per inode a mutation may affect.
     ///
-    /// The obligation is filed under the remote inode `fid` names rather than
-    /// under the fid itself. See [`FsyncScope`] for why.
-    fn note_unsynced(&self, fid: u32, token: u64) {
+    /// Claims include inodes already present in the table because a concurrent
+    /// fsync may remove their entries before the mutation is acknowledged. The
+    /// table retains grown capacity: this runs under the session mutex and may
+    /// be called from netfs writeback. Failure therefore happens before anything
+    /// reaches the server.
+    fn reserve_unsynced(&self, fids: &[u32]) -> Result<UnsyncedClaim<'_>> {
+        if fids.len() > 2 {
+            return Err(EINVAL);
+        }
         let mut state = self.state.lock();
-        let stamp = match state.mutation_stamp.checked_add(1) {
-            Some(next) => {
-                state.mutation_stamp = next;
-                next
-            }
-            None => {
-                // Never turn an acknowledged remote mutation into a local
-                // error. Past exhaustion nothing is discharged again.
-                state.mutation_stamp_exhausted = true;
-                state.mutation_stamp
-            }
-        };
-        let named = match state.records.get(fid as usize) {
-            Some(FidSlot::Live(record)) => Some(record.inode_id),
-            _ => None,
-        };
-        // Every fid that reaches the wire is recorded, so an unattributable
-        // mutation should be unreachable. If it happens the obligation still
-        // has to survive, so it becomes mount-wide rather than disappearing.
-        let Some(inode) = named else {
-            fold_orphan_locked(&mut state, token, stamp);
-            return;
-        };
-        if let Some(entry) = state.unsynced.iter_mut().find(|entry| entry.inode == inode) {
-            if entry.reported {
-                // The caller of the fsync that failed already has that answer,
-                // so this mutation's lineage replaces it. Without this an inode
-                // that once lost a write could never report durable again.
-                entry.oldest = token;
-                entry.reported = false;
-            } else {
-                // Keep the OLDEST lineage point. Asking about a newer one
-                // after a failover would let the server answer for a mutation
-                // this client still cannot prove durable. The userspace client
-                // keeps the first token rather than the smallest; here two
-                // mutations on one inode can be acknowledged over different
-                // connections out of lineage order, so first-wins could keep
-                // the newer of the two.
-                entry.oldest = core::cmp::min(entry.oldest, token);
-            }
-            entry.generation = stamp;
-            return;
+        if let SessionStatus::Dead(status) = state.status {
+            return Err(Error::from_errno(status));
         }
-        let overflowed = state
-            .unsynced
-            .push_within_capacity(UnsyncedEntry {
-                inode,
-                oldest: token,
-                generation: stamp,
-                reported: false,
-            })
-            .is_err();
-        if overflowed {
-            fold_orphan_locked(&mut state, token, stamp);
+
+        let mut inodes = [0u64; 2];
+        let mut inode_count = 0usize;
+        for &fid in fids {
+            let inode = match state.records.get(fid as usize) {
+                Some(FidSlot::Live(record)) => record.inode_id,
+                Some(FidSlot::Stale) => return Err(errno!(ESTALE)),
+                _ => return Err(EBADF),
+            };
+            if !inodes[..inode_count].contains(&inode) {
+                inodes[inode_count] = inode;
+                inode_count += 1;
+            }
         }
+
+        let required_spares = state
+            .unsynced_slots_claimed
+            .checked_add(inode_count)
+            .ok_or_else(|| EOVERFLOW)?;
+        state.unsynced.reserve(required_spares, GFP_NOWAIT)?;
+        state.unsynced_slots_claimed = required_spares;
+
+        Ok(UnsyncedClaim {
+            session: self,
+            inodes,
+            inode_count,
+        })
     }
 
     /// Snapshot the lineage one barrier must verify and the mutation window it
@@ -249,126 +172,27 @@ impl Session {
     /// lineage at all, so every later obligation is durable too. Zero says this
     /// client has nothing to verify, and still asks for the inode or mount-wide
     /// barrier the caller requires.
-    ///
-    /// An unattributed obligation escalates an inode request to mount-wide: it
-    /// may belong to the requested inode, so an inode-only barrier could not
-    /// safely answer the call.
-    /// Claim the right to run a barrier, or wait for one that already covers
-    /// this caller.
-    ///
-    /// `Ok(None)` means a completed barrier proved this snapshot durable and no
-    /// round trip is needed. Anything the caller cannot prove from a completed
-    /// barrier on the current connection makes it the issuer instead, so an
-    /// extra flush is the worst outcome and a false success is unreachable.
-    fn claim_barrier(&self, epoch: u64, scope: FsyncScope, stamp: u64) -> Result<Option<u64>> {
-        let mut remaining = self.timeout_jiffies;
-        loop {
-            let mut state = self.state.lock();
-            if let SessionStatus::Dead(status) = state.status {
-                return Err(Error::from_errno(status));
-            }
-            // A flush that started after this snapshot was taken covers it.
-            if let Some(done) = state.barrier_done {
-                if done.epoch == epoch && done.stamp >= stamp && done.scope.covers_scope(scope) {
-                    return Ok(Some(done.lineage));
-                }
-            }
-            match state.barrier_in_flight {
-                // Someone else's barrier will cover this caller once it lands.
-                Some(flight)
-                    if flight.epoch == epoch
-                        && flight.stamp >= stamp
-                        && flight.scope.covers_scope(scope) => {}
-                // Nothing in flight covers this snapshot, so run one.
-                _ => {
-                    state.barrier_in_flight = Some(InFlightBarrier {
-                        epoch,
-                        stamp,
-                        scope,
-                    });
-                    return Ok(None);
-                }
-            }
-            match self
-                .changed
-                .wait_interruptible_timeout(&mut state, remaining)
-            {
-                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { .. } => return Err(EINTR),
-                // Waiting cost more than issuing would have. Fall through to
-                // running one rather than failing a barrier that may be fine.
-                CondVarTimeoutResult::Timeout => {
-                    // The wait returns holding the lock, so reuse that guard:
-                    // re-locking here would deadlock against this task.
-                    state.barrier_in_flight = Some(InFlightBarrier {
-                        epoch,
-                        stamp,
-                        scope,
-                    });
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    /// Publish a barrier's outcome and release everyone waiting on it.
-    ///
-    /// Only a successful flush on the connection it was claimed for is
-    /// recorded. A resend can carry the request onto a replacement whose
-    /// lineage differs, and publishing that under the old connection's lineage
-    /// would let a later caller adopt a verdict the server never gave. A failed,
-    /// abandoned or rerouted barrier leaves `barrier_done` alone, so its waiters
-    /// issue their own.
-    fn finish_barrier(&self, epoch: u64, scope: FsyncScope, stamp: u64, lineage: Option<u64>) {
-        {
-            let mut state = self.state.lock();
-            let completed = InFlightBarrier {
-                epoch,
-                stamp,
-                scope,
-            };
-            if state.barrier_in_flight == Some(completed) {
-                state.barrier_in_flight = None;
-            }
-            if let Some(lineage) = lineage.filter(|_| state.connection_epoch == epoch) {
-                let newer = state
-                    .barrier_done
-                    .is_none_or(|done| done.epoch != epoch || done.stamp < stamp);
-                if newer {
-                    state.barrier_done = Some(CompletedBarrier {
-                        epoch,
-                        stamp,
-                        scope,
-                        lineage,
-                    });
-                }
-            }
-        }
-        self.changed.notify_all();
-    }
-
-    fn fsync_snapshot(&self, requested: FsyncScope) -> Result<(FsyncScope, u64, u64)> {
+    fn fsync_snapshot(&self, scope: FsyncScope, primary: u32) -> Result<(u64, u64)> {
         let state = self.state.lock();
         if let SessionStatus::Dead(status) = state.status {
             return Err(Error::from_errno(status));
         }
-        let scope = if state.orphan.oldest.is_some() {
-            FsyncScope::All
-        } else {
-            requested
-        };
-        let oldest_per_inode = state
+        if let FsyncScope::Inode(inode) = scope {
+            match state.records.get(primary as usize) {
+                Some(FidSlot::Live(record)) if record.inode_id == inode => {}
+                Some(FidSlot::Live(_)) => return Err(EINVAL),
+                Some(FidSlot::Stale) => return Err(errno!(ESTALE)),
+                _ => return Err(EBADF),
+            }
+        }
+        let token = state
             .unsynced
             .iter()
             .filter(|entry| scope.covers_inode(entry.inode))
             .map(|entry| entry.oldest)
-            .min();
-        let token = [state.orphan.oldest, oldest_per_inode]
-            .into_iter()
-            .flatten()
             .min()
             .unwrap_or(0);
-        Ok((scope, token, state.mutation_stamp))
+        Ok((token, state.mutation_stamp))
     }
 
     /// Discharge every covered obligation this barrier verified.
@@ -384,10 +208,6 @@ impl Session {
         state
             .unsynced
             .retain(|entry| !entry.answered_by(scope, snapshot));
-        if state.orphan.generation <= snapshot {
-            state.orphan.oldest = None;
-            state.orphan.reported = false;
-        }
     }
 
     /// The current writer could not satisfy a covered obligation.
@@ -407,25 +227,93 @@ impl Session {
                 entry.reported = true;
             }
         }
-        if state.orphan.oldest.is_some() && state.orphan.generation <= snapshot {
-            state.orphan.reported = true;
-        }
     }
 }
 
-/// Merge one unattributable obligation into the mount-wide one.
+/// Capacity reserved before a mutation reaches the wire.
 ///
-/// A reported obligation is replaced rather than merged, for the reason
-/// `note_unsynced` gives for a reported per-inode entry: otherwise nothing that
-/// folded in here could ever report durable again.
-fn fold_orphan_locked(state: &mut SessionState, oldest: u64, generation: u64) {
-    let orphan = &mut state.orphan;
-    match orphan.oldest {
-        Some(current) if !orphan.reported => orphan.oldest = Some(core::cmp::min(current, oldest)),
-        _ => {
-            orphan.oldest = Some(oldest);
-            orphan.reported = false;
+/// Dropping an unsettled claim returns its spare slots. Recording consumes the
+/// claim only after every affected inode has an allocation-free table entry.
+pub(super) struct UnsyncedClaim<'a> {
+    session: &'a Session,
+    inodes: [u64; 2],
+    /// Number of affected inodes and, until `record`, claimed spare entries.
+    inode_count: usize,
+}
+
+impl UnsyncedClaim<'_> {
+    /// Record the lineage of the connection that acknowledged the mutation.
+    pub(super) fn record(&mut self, token: u64) -> Result<()> {
+        let inode_count = self.inode_count;
+        let stored = {
+            let mut state = self.session.state.lock();
+            let mut stored = true;
+            for index in 0..inode_count {
+                if !note_unsynced_locked(&mut state, self.inodes[index], token) {
+                    stored = false;
+                    break;
+                }
+            }
+            state.unsynced_slots_claimed = state.unsynced_slots_claimed.saturating_sub(inode_count);
+            stored
+        };
+        self.inode_count = 0;
+        if stored {
+            return Ok(());
         }
+        let error = EOVERFLOW;
+        self.session.terminate(error);
+        Err(error)
     }
-    orphan.generation = core::cmp::max(orphan.generation, generation);
+}
+
+impl Drop for UnsyncedClaim<'_> {
+    fn drop(&mut self) {
+        if self.inode_count == 0 {
+            return;
+        }
+        let mut state = self.session.state.lock();
+        state.unsynced_slots_claimed = state
+            .unsynced_slots_claimed
+            .saturating_sub(self.inode_count);
+    }
+}
+
+/// Store one acknowledged mutation without allocating.
+fn note_unsynced_locked(state: &mut SessionState, inode: u64, token: u64) -> bool {
+    let stamp = match state.mutation_stamp.checked_add(1) {
+        Some(next) => {
+            state.mutation_stamp = next;
+            next
+        }
+        None => {
+            // Never turn an acknowledged remote mutation into a local error.
+            // Past exhaustion nothing is discharged again.
+            state.mutation_stamp_exhausted = true;
+            state.mutation_stamp
+        }
+    };
+    if let Some(entry) = state.unsynced.iter_mut().find(|entry| entry.inode == inode) {
+        if entry.reported {
+            // The caller of the fsync that failed already has that answer, so
+            // this mutation's lineage replaces it.
+            entry.oldest = token;
+            entry.reported = false;
+        } else {
+            // Replies can settle out of connection order, so preserve the
+            // numerically oldest lineage rather than the first one observed.
+            entry.oldest = core::cmp::min(entry.oldest, token);
+        }
+        entry.generation = stamp;
+        return true;
+    }
+    state
+        .unsynced
+        .push_within_capacity(UnsyncedEntry {
+            inode,
+            oldest: token,
+            generation: stamp,
+            reported: false,
+        })
+        .is_ok()
 }

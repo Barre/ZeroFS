@@ -905,10 +905,10 @@ pub(super) unsafe extern "C" fn zerofs_fsync(
     file: *mut bindings::file,
     start: bindings::loff_t,
     end: bindings::loff_t,
-    datasync: ffi::c_int,
+    _datasync: ffi::c_int,
 ) -> ffi::c_int {
     from_result(|| {
-        if start < 0 || end < start || (datasync != 0 && datasync != 1) {
+        if start < 0 || end < start {
             return Err(EINVAL);
         }
 
@@ -923,7 +923,7 @@ pub(super) unsafe extern "C" fn zerofs_fsync(
         // generation.
         let upload_status = file.write_and_wait_range(start, end);
         let remote_status = if upload_status == 0 {
-            remote_fsync_locked(state, file.inode(), fid, datasync != 0)
+            remote_fsync_locked(state, file.inode(), fid)
         } else {
             Ok(())
         };
@@ -1037,8 +1037,7 @@ pub(super) unsafe extern "C" fn zerofs_fallocate(
         // retain i_rwsem so no later mutation can pass this operation's barrier.
         let _inode_guard = coherent.into_inode_guard();
         if flags & bindings::O_DSYNC != 0 {
-            let datasync = flags & bindings::O_SYNC != bindings::O_SYNC;
-            remote_fsync_locked(state, file.inode(), fid, datasync)?;
+            remote_fsync_locked(state, file.inode(), fid)?;
         }
         Ok(0)
     })

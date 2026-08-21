@@ -218,7 +218,7 @@ pub(super) unsafe extern "C" fn zerofs_sync_fs(
         let state = super_block.mount()?;
         // A mount-wide barrier must answer for every fid's outstanding
         // lineage, not just the root's.
-        state.client.fsync_all(state.client.root_fid(), false)?;
+        state.client.fsync_all(state.client.root_fid())?;
         Ok(0)
     })
 }
