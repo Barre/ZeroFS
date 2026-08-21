@@ -27,11 +27,10 @@ The **single source of truth** for that version is the `version` field of
   `stamp.mjs` stamps it into every `package.json`.
 
 `ninep-proto` and `ninep-client` are a separate concern: they are
-**independently versioned** on their own pre-1.0 line (their own
-`Cargo.toml` `version`, currently `0.1.0`), distinct from both the server's
-workspace version and the client-family version. They are published as part of
-the crates.io chain only because `zerofs-client` depends on them; bump their
-version by hand when the transport itself changes.
+**independently versioned** on their own pre-1.0 line, distinct from both the
+server's workspace version and the client-family version. They are published as
+part of the crates.io chain only because `zerofs-client` depends on them; bump
+their `Cargo.toml` versions by hand when the transport itself changes.
 
 ## One-command release flow
 
