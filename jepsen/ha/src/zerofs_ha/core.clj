@@ -197,7 +197,7 @@
 
 (defn node-cfg-str
   ([c node-key role] (node-cfg-str c node-key role false))
-  ([c node-key role force-recovery?]
+  ([c node-key role solo?]
    (let [n (get-in c [:nodes node-key])]
      (str "[cache]\n"
           "dir = \"" (:cache n) "\"\n"
@@ -212,10 +212,10 @@
           "[replication]\n"
           "node_id = \"" (name node-key) "\"\n"
           "role = \"" role "\"\n"
-          "replication_listen = \"127.0.0.1:" (:repl-port n) "\"\n"
-          (if force-recovery?
-            "peers = []\nforce_recovery = true\n\n"
-            (str "peers = [\"127.0.0.1:" (:peer-port n) "\"]\n\n"))
+          (if solo?
+            "\n"
+            (str "replication_listen = \"127.0.0.1:" (:repl-port n) "\"\n"
+                 "peers = [\"127.0.0.1:" (:peer-port n) "\"]\n\n"))
           "[aws]\n"
           "access_key_id = \"" (:access-key c) "\"\n"
           "secret_access_key = \"" (:secret-key c) "\"\n"
@@ -230,11 +230,11 @@
 
 (defn start-node!
   ([c node-key role] (start-node! c node-key role false))
-  ([c node-key role force-recovery?]
+  ([c node-key role solo?]
    (let [n    (get-in c [:nodes node-key])
          path (node-cfg-path c node-key)]
      (info "Starting ZeroFS node" node-key "as" role)
-     (spit path (node-cfg-str c node-key role force-recovery?))
+     (spit path (node-cfg-str c node-key role solo?))
      (daemon-start! (:pid n) (:log n) {} (:zerofs c) ["run" "-c" path]))))
 
 (defn node-9p-up? [c node-key]
@@ -753,7 +753,7 @@
   (close! [_ _test] (close-durability-handles! handles)))
 
 ;; Nemesis: process loss, object-store pauses, replication partitions, blocked
-;; survivor restart, forced recovery, and cluster repair.
+;; survivor restart, solo recovery, and cluster repair.
 
 (defn heal-restart!
   "Clean full restart to canonical leader=:a, standby=:b. Works from any state
@@ -878,10 +878,10 @@
                                     (Thread/sleep 500)
                                     (start-node! c s "leader" true)
                                     (await-fn (fn [] (or (node-9p-up? c s)
-                                                         (throw+ {:type ::no-forced-recovery})))
+                                                         (throw+ {:type ::no-solo-recovery})))
                                               {:retry-interval 500 :log-interval 5000 :timeout 60000
-                                               :log-message "recovery: waiting for forced startup"})
-                                    ;; Do not leave force_recovery enabled after startup.
+                                               :log-message "recovery: waiting for solo startup"})
+                                    ;; Restore the paired config after the one-node startup.
                                     (spit (node-cfg-path c s) (node-cfg-str c s "leader"))
                                     (str "blocked-then-recovered-" (name s)))
                  :heal-rejoin  (do (heal-rejoin! c) :healed-rejoin)

@@ -393,13 +393,10 @@ peers = ["10.0.0.2:9000"]             # the other node's replication_listen
 | `role` | yes | `"leader"` or `"standby"`. The running role is decided at startup by asking the peer; this is the bootstrap hint. |
 | `replication_listen` | automatic HA | `host:port` this node receives the leader's ships and heartbeats on. |
 | `peers` | automatic HA | The other node's `replication_listen`. |
-| `force_recovery` | no | Break-glass, one-startup replacement of the durable leader marker. Requires `role = "leader"` and `peers = []`; never leave it enabled. |
 
-Set both `replication_listen` and `peers` on every node so either can lead after a role swap. ZeroFS rejects a configuration that sets only one. A standalone node may omit both; the forced-recovery procedure can temporarily remove `peers` as described below.
+Set both `replication_listen` and `peers` on every node so either can lead after a role swap. ZeroFS rejects a configuration that sets only one. A standalone leader may omit both.
 
 While the pair is Connected, the leader ships writes before acknowledging them, so unflushed acknowledged writes survive one node failure. In Solo mode, they have the standalone durability window. Setting `[filesystem] ignore_fsync = true` makes `fsync` a no-op and provides neither an object-store barrier nor a lineage check.
-
-`force_recovery` is only for a handoff that cannot recover normally after every former participant is known dead. A live or partitioned peer may hold the only copy of an acknowledged tail or an in-flight writer-open request. Quiesce that host and its object-store requests first, then remove `force_recovery` after the recovery startup succeeds.
 
 ## S3-Compatible Examples
 
