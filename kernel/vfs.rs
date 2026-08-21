@@ -1763,16 +1763,11 @@ unsafe extern "C" fn zerofs_free_inode(inode: *mut bindings::inode) {
 /// fid per identity that reached it. A namespace mutation in particular runs on
 /// the parent's bound fid, so a barrier scoped to whatever fid the caller holds
 /// would verify nothing after a rename.
-fn remote_fsync_locked(
-    state: &MountState,
-    inode: &InodeRef<'_>,
-    fid: u32,
-    datasync: bool,
-) -> Result<()> {
+fn remote_fsync_locked(state: &MountState, inode: &InodeRef<'_>, fid: u32) -> Result<()> {
     match inode.remote_id() {
-        Ok(remote_inode) => state.client.fsync_inode(remote_inode, fid, datasync),
+        Ok(remote_inode) => state.client.fsync_inode(remote_inode, fid),
         // Without an identity to scope by, answer for everything outstanding
         // rather than for nothing.
-        Err(_) => state.client.fsync_all(fid, datasync),
+        Err(_) => state.client.fsync_all(fid),
     }
 }

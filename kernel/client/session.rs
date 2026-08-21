@@ -15,7 +15,7 @@ use kernel::{
 
 use crate::{protocol::Rgetlineage, transport::SocketTransport};
 
-use super::durability::{OrphanUnsynced, UnsyncedEntry};
+use super::durability::UnsyncedEntry;
 use super::endpoint::Endpoint;
 use super::errors::{is_internal_restart_status, not_connected_errno};
 use super::receive::ReceiveState;
@@ -25,7 +25,7 @@ use super::slots::{PendingSlot, PendingState};
 use super::{
     CLIENT_ID_LEN, FIRST_NORMAL_TAG, INITIAL_PENDING_TAGS, LIVENESS_WINDOW_MS, MAX_REPLY_WAITERS,
     NORMAL_TAG_COUNT, RECEIVE_BATCH_BYTES, ROOT_FID, SLOT_SHARDS, SMALL_REPLY_BUFFERS,
-    SMALL_REPLY_BYTES, UNSYNCED_CAPACITY, elapsed_ms, jiffies_for_ms, monotonic_ns,
+    SMALL_REPLY_BYTES, elapsed_ms, jiffies_for_ms, monotonic_ns,
 };
 
 #[pin_data]
@@ -155,29 +155,24 @@ pub(super) struct SessionState {
     /// free slot.
     pub(super) lock_slots_claimed: usize,
     /// Durability obligations, one entry per remote inode holding an
-    /// acknowledged mutation no fsync has verified. Preallocated to
-    /// `UNSYNCED_CAPACITY` and never grown; the scan length is the number of
-    /// live obligations, since a discharged entry is removed.
+    /// acknowledged mutation no fsync has verified. Capacity grows before a
+    /// mutation is dispatched and retains its high-water allocation.
     pub(super) unsynced: KVVec<UnsyncedEntry>,
-    pub(super) orphan: OrphanUnsynced,
+    /// Spare entries promised to mutations that may already be on the wire.
+    pub(super) unsynced_slots_claimed: usize,
     /// Monotonic mutation counter. Every note takes the next value and stamps
     /// it into its entry, so `entry.generation <= snapshot` says exactly "no
     /// mutation touched this inode after that snapshot", including for an inode
     /// that had no entry at snapshot time.
     ///
     /// The userspace client keeps a counter per obligation. That cannot work
-    /// here: a fixed table forces entries to be removed, and a removed then
-    /// recreated entry restarts its counter, so a stale fsync could clear a
-    /// live obligation carrying the same value.
+    /// here: discharged entries are removed, and recreating one would restart
+    /// its counter, allowing a stale fsync to clear a live obligation carrying
+    /// the same value.
     pub(super) mutation_stamp: u64,
     /// Set if `mutation_stamp` ever exhausts u64. Past that point a stamp no
     /// longer separates two windows, so nothing is ever discharged again.
     pub(super) mutation_stamp_exhausted: bool,
-    /// A barrier this connection is running right now. Another caller waits for
-    /// it only when its scope and mutation snapshot are covered.
-    pub(super) barrier_in_flight: Option<InFlightBarrier>,
-    /// The newest barrier that completed successfully.
-    pub(super) barrier_done: Option<CompletedBarrier>,
 }
 
 /// Durability obligations covered by one verified fsync.
@@ -185,14 +180,6 @@ pub(super) struct SessionState {
 pub(super) enum FsyncScope {
     Inode(u64),
     All,
-}
-
-/// A verified fsync currently running on one connection.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct InFlightBarrier {
-    pub(super) epoch: u64,
-    pub(super) stamp: u64,
-    pub(super) scope: FsyncScope,
 }
 
 /// Two distinct failure levels.
@@ -207,25 +194,6 @@ pub(super) enum SessionStatus {
     Lost,
     /// Permanent. The first cause wins and is replayed to every later caller.
     Dead(ffi::c_int),
-}
-
-/// A durability barrier that completed on one connection.
-///
-/// A later caller can adopt this result only when both its mutation snapshot
-/// and requested scope are covered. The token is a lineage equality check that
-/// the caller can evaluate locally on the same connection.
-#[derive(Clone, Copy)]
-pub(super) struct CompletedBarrier {
-    /// Connection the flush ran on. A barrier on a retired connection proves
-    /// nothing about its replacement.
-    pub(super) epoch: u64,
-    /// `mutation_stamp` when the barrier was issued. Any snapshot at or below
-    /// this was taken before the flush started, so the flush covers it.
-    pub(super) stamp: u64,
-    /// Inodes whose durability the server verified.
-    pub(super) scope: FsyncScope,
-    /// Lineage the connection reported, for the local token verdict.
-    pub(super) lineage: u64,
 }
 
 /// The connection one dispatch attempt is bound to.
@@ -268,10 +236,6 @@ impl Session {
         let slot_shards = vacant_slot_shards(slot_count)?;
         let reply_waiters = reply_waiter_queues(slot_count)?;
         let normal_tags = BitmapVec::new(NORMAL_TAG_COUNT, GFP_KERNEL)?;
-
-        // Preallocated here because a mutation is noted from writeback
-        // context, where growing this table could re-enter the filesystem.
-        let unsynced = KVVec::with_capacity(UNSYNCED_CAPACITY, GFP_KERNEL)?;
 
         let timeout_jiffies = msecs_to_jiffies(timeout_ms) as usize;
         // Endpoint::validate already rejected a zero timeout, but a small
@@ -331,16 +295,10 @@ impl Session {
                     credentials: KVVec::new(),
                     locks: KVVec::new(),
                     lock_slots_claimed: 0,
-                    unsynced,
-                    orphan: OrphanUnsynced {
-                        oldest: None,
-                        generation: 0,
-                        reported: false,
-                    },
+                    unsynced: KVVec::new(),
+                    unsynced_slots_claimed: 0,
                     mutation_stamp: 0,
                     mutation_stamp_exhausted: false,
-                    barrier_in_flight: None,
-                    barrier_done: None,
                 }),
                 changed <- new_condvar!(),
                 live_changed <- new_condvar!(),

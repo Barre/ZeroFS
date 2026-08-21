@@ -278,6 +278,7 @@ impl Client {
     /// Persist the server-selected atime for a VFS access.
     pub(crate) fn record_access_time(&self, fid: u32) -> Result<Stat> {
         let wire_fid = self.route_fid(fid)?;
+        let mut durability = self.reserve_mutation(&[fid])?;
         let frame = self.transact_mutation(|envelope| Request::Tsetattrattr {
             envelope,
             fid: wire_fid,
@@ -292,7 +293,7 @@ impl Client {
             mtime_nsec: 0,
         })?;
         let stat = expect_body!(self, &frame, Response::Rsetattrattr(stat) => stat)?;
-        self.note_mutation(&frame, &[fid]);
+        durability.record(frame.lineage_token)?;
         Ok(stat)
     }
 
@@ -417,6 +418,7 @@ impl Client {
         let mtime = attributes.mtime.wire();
 
         let wire_fid = self.route_fid(fid)?;
+        let mut durability = self.reserve_mutation(&[fid])?;
         let frame = self.transact_mutation(|envelope| Request::Tsetattrattr {
             envelope,
             fid: wire_fid,
@@ -431,7 +433,7 @@ impl Client {
             mtime_nsec: mtime.nsec,
         })?;
         let stat = expect_body!(self, &frame, Response::Rsetattrattr(stat) => stat)?;
-        self.note_mutation(&frame, &[fid]);
+        durability.record(frame.lineage_token)?;
         Ok(stat)
     }
 
@@ -445,6 +447,7 @@ impl Client {
         }
 
         let wire_fid = self.route_fid(fid)?;
+        let mut durability = self.reserve_mutation(&[fid])?;
         let frame = self.transact_mutation(|envelope| Request::Tfallocate {
             envelope,
             fid: wire_fid,
@@ -453,7 +456,7 @@ impl Client {
             mode,
         })?;
         expect_body!(self, &frame, Response::Rfallocate => ())?;
-        self.note_mutation(&frame, &[fid]);
+        durability.record(frame.lineage_token)?;
         Ok(())
     }
 
@@ -568,6 +571,7 @@ impl Client {
         validate_name(name)?;
         let wire_dfid = self.route_fid(dfid)?;
         let wire_newfid = self.route_fid(newfid)?;
+        let mut durability = self.reserve_mutation(&[dfid])?;
         // Reopening with the create flags would either re-truncate a file that
         // has since been written or fail the whole replay with EEXIST.
         let reopen = flags & !(bindings::O_CREAT | bindings::O_EXCL | bindings::O_TRUNC);
@@ -604,7 +608,7 @@ impl Client {
                 continue;
             }
             // Record the mutation against the connection that returned this reply.
-            self.note_mutation(&frame, &[dfid]);
+            durability.record(frame.lineage_token)?;
             return Ok(created);
         }
     }
@@ -613,6 +617,7 @@ impl Client {
     pub(crate) fn mkdirattr(&self, dfid: u32, name: &[u8], mode: u32, gid: u32) -> Result<Stat> {
         validate_name(name)?;
         let wire_dfid = self.route_fid(dfid)?;
+        let mut durability = self.reserve_mutation(&[dfid])?;
         let frame = self.transact_mutation(|envelope| Request::Tmkdirattr {
             envelope,
             dfid: wire_dfid,
@@ -621,7 +626,7 @@ impl Client {
             gid,
         })?;
         let stat = expect_body!(self, &frame, Response::Rmkdirattr(stat) => stat)?;
-        self.note_mutation(&frame, &[dfid]);
+        durability.record(frame.lineage_token)?;
         Ok(stat)
     }
 
@@ -635,6 +640,7 @@ impl Client {
     ) -> Result<Stat> {
         validate_name(name)?;
         let wire_dfid = self.route_fid(dfid)?;
+        let mut durability = self.reserve_mutation(&[dfid])?;
         let frame = self.transact_mutation(|envelope| Request::Tsymlinkattr {
             envelope,
             dfid: wire_dfid,
@@ -643,7 +649,7 @@ impl Client {
             gid,
         })?;
         let stat = expect_body!(self, &frame, Response::Rsymlinkattr(stat) => stat)?;
-        self.note_mutation(&frame, &[dfid]);
+        durability.record(frame.lineage_token)?;
         Ok(stat)
     }
 
@@ -658,6 +664,7 @@ impl Client {
     ) -> Result<Stat> {
         validate_name(name)?;
         let wire_dfid = self.route_fid(dfid)?;
+        let mut durability = self.reserve_mutation(&[dfid])?;
         let frame = self.transact_mutation(|envelope| Request::Tmknodattr {
             envelope,
             dfid: wire_dfid,
@@ -668,7 +675,7 @@ impl Client {
             gid,
         })?;
         let stat = expect_body!(self, &frame, Response::Rmknodattr(stat) => stat)?;
-        self.note_mutation(&frame, &[dfid]);
+        durability.record(frame.lineage_token)?;
         Ok(stat)
     }
 
@@ -677,6 +684,7 @@ impl Client {
         validate_name(name)?;
         let wire_dfid = self.route_fid(dfid)?;
         let wire_fid = self.route_fid(fid)?;
+        let mut durability = self.reserve_mutation(&[dfid])?;
         let frame = self.transact_mutation(|envelope| Request::Tlinkattr {
             envelope,
             dfid: wire_dfid,
@@ -684,7 +692,7 @@ impl Client {
             name,
         })?;
         let stat = expect_body!(self, &frame, Response::Rlinkattr(stat) => stat)?;
-        self.note_mutation(&frame, &[dfid]);
+        durability.record(frame.lineage_token)?;
         Ok(stat)
     }
 
@@ -700,6 +708,7 @@ impl Client {
         validate_name(newname)?;
         let wire_olddirfid = self.route_fid(olddirfid)?;
         let wire_newdirfid = self.route_fid(newdirfid)?;
+        let mut durability = self.reserve_mutation(&[newdirfid, olddirfid])?;
         let frame = self.transact_mutation(|envelope| Request::Trenameat {
             envelope,
             olddirfid: wire_olddirfid,
@@ -708,7 +717,7 @@ impl Client {
             newname,
         })?;
         expect_body!(self, &frame, Response::Rrenameat => ())?;
-        self.note_mutation(&frame, &[newdirfid, olddirfid]);
+        durability.record(frame.lineage_token)?;
         Ok(())
     }
 
@@ -719,6 +728,7 @@ impl Client {
             return Err(EINVAL);
         }
         let wire_dirfid = self.route_fid(dirfid)?;
+        let mut durability = self.reserve_mutation(&[dirfid])?;
         let frame = self.transact_mutation(|envelope| Request::Tunlinkat {
             envelope,
             dirfid: wire_dirfid,
@@ -726,7 +736,7 @@ impl Client {
             flags,
         })?;
         expect_body!(self, &frame, Response::Runlinkat => ())?;
-        self.note_mutation(&frame, &[dirfid]);
+        durability.record(frame.lineage_token)?;
         Ok(())
     }
 
@@ -749,6 +759,11 @@ impl Client {
         }
 
         let wire_fid = self.route_fid(fid)?;
+        let mut durability = if length == 0 {
+            None
+        } else {
+            Some(self.reserve_mutation(&[fid])?)
+        };
         let frame = self.transact_write(wire_fid, offset, &payload)?;
         let count = expect_body!(self, &frame, Response::Rwrite(write)
             if write.count as usize <= length => write.count as usize)?;
@@ -756,7 +771,10 @@ impl Client {
             return Err(EIO);
         }
         if count != 0 {
-            self.note_mutation(&frame, &[fid]);
+            let Some(durability) = durability.as_mut() else {
+                return self.invariant_failure();
+            };
+            durability.record(frame.lineage_token)?;
         }
         Ok(count)
     }
