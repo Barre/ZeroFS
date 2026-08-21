@@ -870,7 +870,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_zerofs_ffi_checksum_method_file_sync_data()
 		})
-		if checksum != 22245 {
+		if checksum != 15136 {
 			// If this happens try cleaning and rebuilding your project
 			panic("zerofs_ffi: uniffi_zerofs_ffi_checksum_method_file_sync_data: UniFFI API checksum mismatch")
 		}
@@ -3157,7 +3157,8 @@ type FileInterface interface {
 	SetLen(size uint64) error
 	// Flush data and metadata to durable (S3-backed) storage.
 	SyncAll() error
-	// Flush file data only.
+	// Flush file data to durable storage. ZeroFS currently uses the same full
+	// durability barrier as [`Self::sync_all`].
 	SyncData() error
 	// Write all of `data` at `offset` (any size, chunked internally).
 	WriteAt(offset uint64, data []byte) error
@@ -3367,7 +3368,8 @@ func (_self *File) SyncAll() error {
 	return err
 }
 
-// Flush file data only.
+// Flush file data to durable storage. ZeroFS currently uses the same full
+// durability barrier as [`Self::sync_all`].
 func (_self *File) SyncData() error {
 	_pointer := _self.ffiObject.incrementPointer("*File")
 	defer _self.ffiObject.decrementPointer()
