@@ -310,8 +310,8 @@ impl ZeroFS {
         self.flush_coordinator.flush_inode(inode_id).await
     }
 
-    /// Flush and verify the client's oldest unflushed-write lineage token.
-    /// Token zero means no unflushed write. A mismatched token returns `ESTALE`.
+    /// Flush and verify the client's oldest unverified lineage token.
+    /// Token zero means no unverified mutation. A mismatch returns `ESTALE`.
     pub async fn client_fsync_verified(&self, client_token: u64) -> Result<(), FsError> {
         if self.ignore_fsync {
             return Ok(());

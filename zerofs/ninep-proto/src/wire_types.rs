@@ -44,7 +44,8 @@ pub const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
 pub const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
 pub const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
 
-/// `Tfsyncdur.datasync` requests data-only durability.
+/// Standard data-only durability request bit. ZeroFS currently performs the
+/// same full durability barrier whether this compatibility bit is set or not.
 pub const P9_FSYNC_DATASYNC: u32 = 1 << 0;
 /// `Tfsyncdur.datasync` limits the verified barrier to the inode named by its fid.
 /// Without this flag the barrier is filesystem-wide, preserving compatibility

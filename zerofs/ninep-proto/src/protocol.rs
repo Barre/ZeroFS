@@ -690,10 +690,10 @@ pub struct Rfsync;
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 pub struct Tgetlineage;
 
-/// Durability-verified fsync carrying the oldest unsynced lineage token.
+/// Durability-verified fsync carrying the oldest unverified lineage token.
 /// `datasync` contains `P9_FSYNC_*` flags; without `P9_FSYNC_INODE` the barrier
-/// is filesystem-wide. Token zero denotes no pending write. A lineage mismatch
-/// returns `ESTALE`.
+/// is filesystem-wide. Token zero denotes no pending mutation in that scope. A
+/// lineage mismatch returns `ESTALE`.
 #[derive(Debug, Clone, DekuRead, DekuWrite)]
 #[deku(endian = "little")]
 pub struct Tfsyncdur {

@@ -65,11 +65,11 @@ There is no independent memtable-capacity flush. Applications that require a par
 
 ## Verified fsync
 
-A successful `fsync` is verified: it means every write the descriptor acknowledged before it is durable on object storage. Acknowledged file data lives in the in-RAM open segment buffer, and its metadata in the memtable, until the next flush, so a crash before that flush loses them. ZeroFS does not let that loss pass silently. A `fsync` issued after a restart, over writes made before it, returns a stale-handle error (`ESTALE`) rather than a false success.
+A successful `fsync` is verified: it means every mutation recorded for the target inode before it is durable on object storage, including mutations issued through another handle for the same inode. Acknowledged file data lives in the in-RAM open segment buffer, and its metadata in the memtable, until the next flush, so a crash before that flush loses them. ZeroFS does not let that loss pass silently. A `fsync` issued after a restart, over writes made before it, returns a stale-handle error (`ESTALE`) rather than a false success.
 
 Each acknowledged write is tagged with a durability *lineage token* naming the current unbroken durable lineage. A restart reopens the database and, with no way to prove it inherited the un-flushed buffers, regenerates the token. A `fsync` presents the token its writes were made under; if the database has since regenerated, the tokens differ and the `fsync` fails. The first `fsync` after a write is the durability boundary, so a failure reports real loss: redo the writes and `fsync` again.
 
-This holds on a single node and under replication alike. With a replicated standby a clean failover can prove it inherited the writes (the standby receives un-flushed extent frames over replication and materializes their segments at takeover) and keeps the token, so the `fsync` succeeds transparently; the failover cases are diagrammed in [High availability](/high-availability). The check is per descriptor and matches POSIX: it covers the whole file across every open handle, speaks for no other file, and verifies data, metadata, directory entries, and `rename`.
+This holds on a single node and under replication alike. With a replicated standby a clean failover can prove it inherited the writes (the standby receives un-flushed extent frames over replication and materializes their segments at takeover) and keeps the token, so the `fsync` succeeds transparently; the failover cases are diagrammed in [High availability](/high-availability). The check is per inode and matches POSIX: a file fsync covers that file's data and metadata across every handle, while a directory fsync covers its directory-entry mutations, including links, unlinks, and renames. `syncfs` uses a filesystem-wide scope.
 
 ## Eliminating the Durability Window
 
@@ -99,8 +99,8 @@ The durability guarantees available to applications depend on the access protoco
 
     The 9P protocol provides direct mapping of POSIX synchronization semantics:
 
-    - `fsync()` issues a durability-verified flush (`Tfsyncdur`, a ZeroFS 9P extension negotiated by `zerofs mount` and the client libraries)
-    - ZeroFS flushes all buffered data to object storage, then verifies the writes' lineage; the call returns success only when durability is confirmed, otherwise `ESTALE` (see [Verified fsync](#verified-fsync))
+    - `fsync()` issues an inode-scoped durability-verified barrier (`Tfsyncdur`, a ZeroFS 9P extension negotiated by `zerofs mount` and the client libraries); `syncfs` uses its filesystem-wide form
+    - If the inode's latest generation is already durable, the server skips the physical flush. Otherwise the shared flush persists all buffered data to object storage. In both cases the client discharges only the requested logical scope after the server verifies its lineage; a mismatch returns `ESTALE` (see [Verified fsync](#verified-fsync))
     - Plain 9P2000.L clients (e.g. the Linux kernel v9fs client) issue `Tfsync`: a durable but unverified flush. With `ignore_fsync`, both standard and durability-verified fsync requests return without forcing a flush; selecting that option explicitly opts out of the guarantee.
 
   </Col>

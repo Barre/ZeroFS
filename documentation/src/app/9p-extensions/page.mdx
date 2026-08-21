@@ -140,16 +140,18 @@ An open-unlinked handle therefore belongs to its current connection. It continue
 
 A plain 9P `Tfsync` returns `Rfsync` once the server has flushed, but it says nothing about whether the connection's writes are still the live durable copy. After a failover, an old leader can flush and report success for writes that a new leader has already superseded. The private dialect closes that gap by tying fsync to a durability lineage token.
 
-At connect time, the client asks for the connection's lineage with `Tgetlineage`, off the hot path. `Rgetlineage` returns both the durability token and the current HA writer epoch. The client tracks the token of its oldest un-fsync'd write and presents it on `Tfsyncdur`; it copies the writer epoch into the operation envelopes described above. The server flushes and replies `Rfsync` only if the token is still the live durable lineage; otherwise it returns `Rlerror(ESTALE)`. A successful fsync therefore implies that every write the client acknowledged before it is durable and will survive a crash or failover. A `0` token means the client has nothing un-fsync'd, and a `0` writer epoch identifies a standalone server.
+At connect time, the client asks for the connection's lineage with `Tgetlineage`, off the hot path. `Rgetlineage` returns both the durability token and the current HA writer epoch. The client tracks the oldest un-fsync'd token for each inode and presents the token covered by `Tfsyncdur`; it copies the writer epoch into the operation envelopes described above. The server replies `Rfsync` only after the requested scope is durable and the token is still the live lineage; otherwise it returns `Rlerror(ESTALE)`. A successful fsync therefore implies that every mutation covered by its inode or filesystem scope will survive a crash or failover. A `0` token means the client has no unverified mutation in that scope, and a `0` writer epoch identifies a standalone server.
 
 ```text {{ title: 'Durability-verified fsync' }}
 Tgetlineage                          (empty body)
 Rgetlineage  token[8] writer_epoch[8]
 
-Tfsyncdur    fid[4] datasync[4] token[8]
-             -> Rfsync            if token is the live durable lineage
+Tfsyncdur    fid[4] datasync_flags[4] token[8]
+             -> Rfsync            if the scope is durable and token is live
              -> Rlerror(ESTALE)   otherwise
 ```
+
+`datasync_flags` retains the standard 9P field width but is a bitmask in the private request. Bit 0 is the standard data-only request; ZeroFS accepts it for compatibility but currently performs the same full durability operation either way. Bit 1 (`P9_FSYNC_INODE`) limits the logical barrier to the inode named by `fid`. Without bit 1 the barrier covers the whole filesystem. An inode barrier is skipped when the server's durable generation already covers that inode; when a flush is needed, the underlying segment and SlateDB flush still persists all buffered mutations together.
 
 This is the protocol-level half of the [durability and consistency](/durability) guarantee, and it lets ZeroFS clients verify fsync durability through a [high-availability](/high-availability) failover. With `ignore_fsync`, the administrator deliberately disables the barrier: `Tfsyncdur` returns success without flushing or checking lineage.
 
