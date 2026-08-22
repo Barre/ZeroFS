@@ -875,7 +875,7 @@ impl NinePClient {
                         Ok(()) => {
                             this.live.store(true, Ordering::Release);
                             this.live_notify.notify_waiters();
-                            info!("9P session reconnected and restored");
+                            info!("9P session reconnected; replay complete");
                             break;
                         }
                         Err(e) => {
@@ -1613,10 +1613,17 @@ impl NinePClient {
         if conn.heard_within(LIVENESS_WINDOW) {
             return true;
         }
-        matches!(
-            runtime::timeout(PROBE_TIMEOUT, query_lineage_token(conn)).await,
-            Ok(Ok(()))
-        )
+        match runtime::timeout(PROBE_TIMEOUT, query_lineage_token(conn)).await {
+            Ok(Ok(())) => true,
+            // The probe uses the same response queue and stream as normal
+            // traffic. A response backlog can delay Rgetlineage past its own
+            // deadline while other valid frames still prove this connection
+            // is alive. The timed-out RPC keeps its dispatched registration
+            // until its late reply is drained, so accepting that passive
+            // evidence neither reuses its tag nor desynchronizes the stream.
+            Err(_) => !conn.dead.load(Ordering::Acquire) && conn.heard_within(LIVENESS_WINDOW),
+            Ok(Err(_)) => false,
+        }
     }
 
     /// Tears down `conn` and wakes the reconnect supervisor.
