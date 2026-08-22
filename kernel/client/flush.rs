@@ -4,13 +4,14 @@ use kernel::{alloc::KVVec, ffi, prelude::*, sync::CondVarTimeoutResult};
 
 use crate::protocol::{self, HEADER_SIZE, Request, Response};
 
+use super::MAX_LIVENESS_EXTENSIONS;
 use super::errors::{
-    codec_errno, is_protocol_error, protocol_errno, server_errno,
+    codec_errno, is_protocol_error, not_connected_errno, protocol_errno, server_errno,
 };
 use super::session::{
     OrphanedTransports, Session, SessionState, SessionStatus, shutdown_transports,
 };
-use super::signals::{SendSignalMask, sleep_uninterruptible_tick};
+use super::signals::sleep_uninterruptible_tick;
 use super::slots::{ExpectedResponse, PendingState};
 use super::tag_space::{FIRST_NORMAL_TAG, FLUSH_SLOTS, normal_tag_index};
 
@@ -20,14 +21,18 @@ pub(super) enum FlushOutcome {
     /// No cancellation tag became available. The original request is still
     /// outstanding and still owns its tag, so the caller must wait it out.
     NotCancelled,
-    /// Rflush completed without an original reply, so the operation was
-    /// retired and its syscall should report EINTR.
-    Interrupted,
+    /// Rflush completed without an original reply, proving cancellation and
+    /// making it safe for the syscall to follow kernel restart semantics.
+    Cancelled,
+    /// Cancellation was not proved before this connection became unusable.
+    /// The caller must preserve the logical operation and resolve it on a
+    /// replacement connection rather than reporting an interrupt.
+    ConnectionLost,
 }
 
 /// What claiming one of the cancellation tags produced.
 enum ControlTag {
-    /// The tag is `Reserved` and its reply credit charged to the caller.
+    /// The tag is `Reserved` with response storage attached.
     Reserved(usize),
     /// Nothing was reserved because the flush already has its answer.
     Decided(FlushOutcome),
@@ -43,12 +48,12 @@ enum FlushedOriginalState {
 }
 
 impl Session {
-    /// Retire an interrupted request with a standard 9P flush barrier.
+    /// Resolve an interrupted request with a standard 9P flush barrier.
     ///
-    /// Signals remain pending after the first interruptible wait returns, so
-    /// the cancellation path polls in uninterruptible one-jiffy sleeps. The
-    /// polling is bounded by the same per-phase timeout as normal admission
-    /// and reply waits.
+    /// The caller masks signals after the first interruptible wait returns, so
+    /// the cancellation path polls in uninterruptible one-jiffy sleeps. Each
+    /// quiet phase is bounded like a normal reply wait; a finite number of
+    /// other decoded frames can prove the connection active and extend it.
     pub(super) fn flush_interrupted_request(
         &self,
         oldtag: usize,
@@ -59,13 +64,6 @@ impl Session {
             self.terminate(error);
             return Err(error);
         }
-
-        let _signal_mask = match SendSignalMask::block() {
-            Ok(mask) => mask,
-            Err(error) => {
-                return self.fail_flush_preserving_original(oldtag, None, error, epoch);
-            }
-        };
 
         let maximum_frame = match ExpectedResponse::Flush.maximum_frame_size(self.msize) {
             Ok(size) => size,
@@ -99,13 +97,22 @@ impl Session {
         maximum_frame: usize,
         epoch: u64,
     ) -> Result<ControlTag> {
+        // Rflush is a fixed, tiny response. Allocate it before assigning a
+        // control tag so a sent cancellation always has receive storage. If
+        // even this allocation fails, leave the original request outstanding
+        // and wait for its authoritative reply.
+        let mut reply_buffer = match self.reply_buffer(maximum_frame) {
+            Ok(buffer) => Some(buffer),
+            Err(_) => return Ok(ControlTag::Decided(FlushOutcome::NotCancelled)),
+        };
         let mut remaining = self.timeout_jiffies;
         loop {
             let mut state = self.state.lock();
             if let Some(error) = self.flush_band_lost(&state, epoch) {
                 drop(state);
-                self.release_slot(oldtag);
-                return Err(error);
+                return self
+                    .fail_flush_preserving_original(oldtag, None, error, epoch)
+                    .map(ControlTag::Decided);
             }
             match self.observed_slot_state(oldtag)? {
                 FlushedOriginalState::Completed => {
@@ -133,7 +140,7 @@ impl Session {
                 slot.state = PendingState::Reserved;
                 slot.expected = Some(ExpectedResponse::Flush);
                 slot.maximum_frame = maximum_frame;
-                state.used_reply_credit = state.used_reply_credit.saturating_add(maximum_frame);
+                slot.reply_buffer = reply_buffer.take();
                 return Ok(ControlTag::Reserved(candidate));
             }
 
@@ -184,6 +191,7 @@ impl Session {
         epoch: u64,
     ) -> Result<FlushOutcome> {
         let mut remaining = self.timeout_jiffies;
+        let mut liveness_extensions = 0u32;
         loop {
             let state = self.state.lock();
             let original_ready = matches!(
@@ -193,12 +201,11 @@ impl Session {
 
             if let Some(error) = self.flush_band_lost(&state, epoch) {
                 drop(state);
-                self.release_slot(flush_tag);
                 if original_ready {
+                    self.release_slot(flush_tag);
                     return Ok(FlushOutcome::OriginalReady);
                 }
-                self.release_slot(oldtag);
-                return Err(error);
+                return self.fail_flush_preserving_original(oldtag, Some(flush_tag), error, epoch);
             }
 
             match self.observed_slot_state(flush_tag)? {
@@ -232,7 +239,7 @@ impl Session {
                     }
 
                     let outcome = self.finish_successful_flush(oldtag, flush_tag);
-                    drop(bytes);
+                    self.recycle_reply_buffer(bytes);
                     return outcome;
                 }
                 FlushedOriginalState::Sent => {
@@ -251,6 +258,16 @@ impl Session {
             }
 
             if !sleep_uninterruptible_tick(&mut remaining) {
+                // An Rflush is a receive barrier: starting another in-band
+                // probe here can put its reply behind an Rflush the receiver
+                // has already published and deliberately stopped at. Passive
+                // traffic is still sufficient to avoid retiring a busy, live
+                // connection under load.
+                if liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.heard_recently() {
+                    liveness_extensions += 1;
+                    remaining = self.timeout_jiffies;
+                    continue;
+                }
                 let error = ETIMEDOUT;
                 return self.fail_flush_preserving_original(oldtag, Some(flush_tag), error, epoch);
             }
@@ -265,7 +282,7 @@ impl Session {
     /// unless the original response is already complete. The connection is
     /// always retired because a failed flush leaves tag reuse unsafe; only a
     /// protocol fault ends the session.
-    fn fail_flush_preserving_original(
+    pub(super) fn fail_flush_preserving_original(
         &self,
         oldtag: usize,
         owned_flush_tag: Option<usize>,
@@ -287,13 +304,13 @@ impl Session {
             // its replacement would turn one cancelled syscall into a reconnect.
             false
         };
-        // Read back the durable status after retire_locked() has normalized any
-        // kernel-private ERESTART* value to ENOTCONN.
-        let outcome_error = match state.status {
-            SessionStatus::Dead(status) => Error::from_errno(status),
-            // The flushed request died with its connection, and this caller was
-            // already asking to cancel it.
-            _ => EINTR,
+        // Read back a terminal status after retire_locked() has normalized any
+        // kernel-private ERESTART* value. A recoverable connection loss is not
+        // cancellation: without Rflush, the original operation is ambiguous
+        // and has to retain its operation ID across replay.
+        let terminal_error = match state.status {
+            SessionStatus::Dead(status) => Some(Error::from_errno(status)),
+            _ => None,
         };
 
         let orphaned = self.vacate_flush_tags_locked(
@@ -304,12 +321,29 @@ impl Session {
             transitioned,
         );
         drop(state);
+        if transitioned {
+            if terminal {
+                pr_err!(
+                    "zerofs: Tflush failed for tag {} (errno={}); ending session\n",
+                    oldtag,
+                    error.to_errno()
+                );
+            } else {
+                pr_warn!(
+                    "zerofs: Tflush unresolved for tag {} (errno={}); reconnecting and replaying\n",
+                    oldtag,
+                    error.to_errno()
+                );
+            }
+        }
         self.publish_flush_release(orphaned);
 
         if original_ready {
             Ok(FlushOutcome::OriginalReady)
+        } else if let Some(error) = terminal_error {
+            Err(error)
         } else {
-            Err(outcome_error)
+            Ok(FlushOutcome::ConnectionLost)
         }
     }
 
@@ -342,25 +376,21 @@ impl Session {
             };
         }
 
-        let flush_credit = self.vacate_tag_locked(&mut state, flush_tag)?;
-        let (result, old_credit) = match original_state {
-            FlushedOriginalState::Completed => (Ok(FlushOutcome::OriginalReady), 0),
+        self.vacate_tag_locked(&mut state, flush_tag)?;
+        let result = match original_state {
+            FlushedOriginalState::Completed => Ok(FlushOutcome::OriginalReady),
             FlushedOriginalState::Sent => {
-                let credit = self.vacate_tag_locked(&mut state, oldtag)?;
+                self.vacate_tag_locked(&mut state, oldtag)?;
                 self.decrement_sent_count();
-                (Ok(FlushOutcome::Interrupted), credit)
+                Ok(FlushOutcome::Cancelled)
             }
             FlushedOriginalState::Failed(status) => {
-                let credit = self.vacate_tag_locked(&mut state, oldtag)?;
-                (Err(Error::from_errno(status)), credit)
+                self.vacate_tag_locked(&mut state, oldtag)?;
+                Err(Error::from_errno(status))
             }
             // Handled by the invariant-failure branch above.
-            FlushedOriginalState::Invalid => (Err(protocol_errno()), 0),
+            FlushedOriginalState::Invalid => Err(protocol_errno()),
         };
-        state.used_reply_credit = state
-            .used_reply_credit
-            .saturating_sub(flush_credit)
-            .saturating_sub(old_credit);
         drop(state);
         self.changed.notify_all();
         result
@@ -408,10 +438,10 @@ impl Session {
         if let SessionStatus::Dead(status) = state.status {
             return Some(Error::from_errno(status));
         }
-        // A Tflush names a tag on one connection. Once that connection is
-        // retired the flushed request died with it, and this caller was already
-        // asking to cancel it.
-        (state.connection_epoch != epoch).then_some(EINTR)
+        // A Tflush names a tag on one connection. Losing that connection does
+        // not prove cancellation; the logical operation remains ambiguous and
+        // must be resolved by the ordinary reconnect-and-retry path.
+        (state.connection_epoch != epoch).then_some(not_connected_errno())
     }
 
     fn slot_consuming(&self, tag: usize) -> Result<bool> {
@@ -451,7 +481,7 @@ impl Session {
         )
     }
 
-    /// Give back this flush transaction's tags and refund their credit.
+    /// Give back this flush transaction's tags and unused response storage.
     fn vacate_flush_tags_locked(
         &self,
         state: &mut SessionState,
@@ -460,18 +490,12 @@ impl Session {
         original_ready: bool,
         transitioned: bool,
     ) -> Option<OrphanedTransports> {
-        let flush_credit = owned_flush_tag
-            .and_then(|tag| self.vacate_tag_locked(state, tag).ok())
-            .unwrap_or(0);
-        let old_credit = if original_ready {
-            0
-        } else {
-            self.vacate_tag_locked(state, oldtag).unwrap_or(0)
-        };
-        state.used_reply_credit = state
-            .used_reply_credit
-            .saturating_sub(flush_credit)
-            .saturating_sub(old_credit);
+        if let Some(tag) = owned_flush_tag {
+            let _ = self.vacate_tag_locked(state, tag);
+        }
+        if !original_ready {
+            let _ = self.vacate_tag_locked(state, oldtag);
+        }
         transitioned.then(|| (state.transport.clone(), state.candidate.clone()))
     }
 }

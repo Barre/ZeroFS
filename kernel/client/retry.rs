@@ -18,7 +18,10 @@ use super::receive::rlerror_code;
 use super::registry::request_fids;
 use super::reply::OwnedFrame;
 use super::session::{Dispatch, Session};
-use super::slots::{DestinationGuard, ExpectedResponse, FrameSend, SlotDestination};
+use super::signals::{SendSignalMask, sleep_uninterruptible_tick};
+use super::slots::{
+    DestinationGuard, ExpectedResponse, FrameSend, SlotDestination, SlotReservation,
+};
 use super::{
     Client, MUTATION_RETRY_HORIZON_MS, STACK_REQUEST_BYTES, elapsed_ms, jiffies_for_ms,
     monotonic_ns,
@@ -64,12 +67,13 @@ impl Client {
     /// The wait is bounded by whichever of the retry horizon and the reconnect
     /// grace runs out first, so an operation cannot sleep through its horizon
     /// and then put a frame on the wire the server can no longer recognise as
-    /// a retry. `None` means the connection went away again between the gate
-    /// and the snapshot, which is one more pass rather than an error.
-    fn await_resend_bounded(&self, attempt: &OpAttempt) -> Result<Dispatch> {
+    /// a retry. Once recovery starts, its clock spans every replacement attempt
+    /// so a flapping peer cannot keep one operation alive forever.
+    fn await_resend_bounded(&self, attempt: &mut OpAttempt) -> Result<Dispatch> {
         let session = self.session();
         let budget = attempt.resend_budget(session.grace_ms)?;
-        match session.dispatch_or_wait(budget) {
+        attempt.prepare_resolution_wait();
+        match session.dispatch_or_wait(budget, attempt.is_resolving_ambiguity()) {
             Ok(dispatch) => Ok(dispatch),
             Err(error) => {
                 // The budget may have been the horizon rather than the grace, in
@@ -141,8 +145,21 @@ impl Client {
     ) -> Result<Option<OwnedFrame<'a>>> {
         let session = self.session();
         match outcome {
-            // Nothing reached the wire, so nothing about this operation is
-            // ambiguous and the connection is not implicated.
+            // A zero-progress failure is normally safe to return. Once an
+            // older mutation attempt is ambiguous, however, an interrupted
+            // local retry must stay under the same operation ID. Keep this as
+            // the final guard even though the individual dispatch, admission
+            // and send paths suppress this escape themselves.
+            AttemptOutcome::Rejected(error)
+                if attempt.is_resolving_ambiguity() && is_interrupted_error(error) =>
+            {
+                let mut remaining = 1;
+                let _ = sleep_uninterruptible_tick(&mut remaining);
+                attempt.note_recovery_started();
+                Ok(None)
+            }
+            // Nothing reached the wire, so nothing about a non-ambiguous
+            // operation is uncertain and the connection is not implicated.
             AttemptOutcome::Rejected(error) => Err(error),
             AttemptOutcome::Retry(error) => {
                 // A tag that is not the one this attempt reserved is a local
@@ -152,10 +169,15 @@ impl Client {
                     session.terminate(error);
                     return Err(error);
                 }
+                attempt.note_recovery_started();
                 Ok(None)
             }
             AttemptOutcome::Failed(error) => {
                 if is_interrupted_error(error) {
+                    // Connection retirement normalizes EINTR/ERESTART* to
+                    // ENOTCONN before publishing a failed slot. The only
+                    // interrupted reply-wait result is therefore a completed
+                    // Rflush, which proved that restarting is safe.
                     return Err(error);
                 }
                 if is_protocol_error(error) {
@@ -163,6 +185,7 @@ impl Client {
                     return Err(error);
                 }
                 session.retire_connection(error, dispatch.epoch);
+                attempt.note_recovery_started();
                 Ok(None)
             }
             AttemptOutcome::Reply(frame) => match self.reroute_code(&frame) {
@@ -178,6 +201,7 @@ impl Client {
                     }
                     drop(frame);
                     session.retire_connection(not_connected_errno(), dispatch.epoch);
+                    attempt.note_recovery_started();
                     Ok(None)
                 }
                 // wait_for_reply already stamped this connection's lineage on
@@ -262,12 +286,18 @@ impl Client {
             write.maximum_response,
             None,
             admission_jiffies,
+            attempt.is_resolving_ambiguity(),
             &[write.wire_fid],
         );
         let tag = match reserved {
-            Ok(tag) => tag,
+            Ok(SlotReservation::Reserved(tag)) => tag,
+            Ok(SlotReservation::Retry(error)) => return AttemptOutcome::Retry(error),
             Err(error) => return AttemptOutcome::Rejected(error),
         };
+        if let Err(error) = attempt.resend_budget(session.grace_ms) {
+            session.release_slot(tag);
+            return AttemptOutcome::Rejected(error);
+        }
         let mut request_prefix = [0u8; protocol::TWRITE_OVERHEAD];
         let encoded = protocol::encode_twrite_prefix(
             &mut request_prefix,
@@ -299,8 +329,7 @@ impl Client {
         self.resolve_send(tag, dispatch, attempt, envelope, sent)
     }
 
-    /// The reply expectation, encoded request size and reply credit `request`
-    /// needs.
+    /// The reply expectation and encoded request and maximum response sizes.
     ///
     /// Every failure here predates the reservation, so each one is a rejection
     /// that leaves nothing on the wire and nothing to release.
@@ -340,16 +369,22 @@ impl Client {
             maximum_response,
             destination,
             admission_jiffies,
+            attempt.is_resolving_ambiguity(),
             &fids[..fid_count],
         );
         let tag = match reserved {
-            Ok(tag) => tag,
+            Ok(SlotReservation::Reserved(tag)) => tag,
+            Ok(SlotReservation::Retry(error)) => return AttemptOutcome::Retry(error),
             Err(error) => return AttemptOutcome::Rejected(error),
         };
         // Every later return, including both of resolve_send's reply waits,
         // drops this before the frame reaches the caller, so deregistration
         // always precedes the caller touching its iterator again.
         let _destination = registered.then(|| DestinationGuard { session, tag });
+        if let Err(error) = attempt.resend_budget(session.grace_ms) {
+            session.release_slot(tag);
+            return AttemptOutcome::Rejected(error);
+        }
         let sent = self.send_request(session, tag, request, request_size, dispatch);
         self.resolve_send(tag, dispatch, attempt, envelope, sent)
     }
@@ -428,15 +463,28 @@ impl Client {
         match sent {
             SendOutcome::Sent => {
                 attempt.note_dispatched(envelope);
-                session.reply_outcome(session.wait_for_reply(tag, dispatch))
+                session.reply_outcome(session.wait_for_reply(tag, dispatch, attempt))
             }
             SendOutcome::Released(error) => AttemptOutcome::Rejected(error),
+            SendOutcome::Interrupted(error) => {
+                if attempt.is_resolving_ambiguity() {
+                    // An older frame with this operation ID may have applied.
+                    // Keep the same logical operation instead of escaping to a
+                    // transparent restart with a fresh ID. The one-jiffy pace
+                    // prevents an unmaskable pending signal from spinning.
+                    let mut remaining = 1;
+                    let _ = sleep_uninterruptible_tick(&mut remaining);
+                    AttemptOutcome::Retry(error)
+                } else {
+                    AttemptOutcome::Rejected(error)
+                }
+            }
             SendOutcome::Stale(error) => AttemptOutcome::Retry(error),
             SendOutcome::Failed(error) => {
                 // A broken send may still have put a prefix on the wire.
                 attempt.note_dispatched(envelope);
                 session.retire_connection(error, dispatch.epoch);
-                session.reply_outcome(session.wait_for_reply(tag, dispatch))
+                session.reply_outcome(session.wait_for_reply(tag, dispatch, attempt))
             }
         }
     }
@@ -497,8 +545,16 @@ pub(super) struct OpAttempt {
     origin_epoch: Option<u64>,
     /// Monotonic nanoseconds at the first dispatched frame.
     started_ns: Option<u64>,
-    /// Monotonic nanoseconds when this operation entered its resend loop.
-    entered_ns: u64,
+    /// Monotonic nanoseconds when this operation first needed a replacement
+    /// connection. It is deliberately never reset between replacement
+    /// attempts: the reconnect grace bounds the complete recovery episode.
+    recovery_started_ns: Option<u64>,
+    /// A dispatched mutation must not escape through ERESTARTSYS until an
+    /// authoritative reply resolves whether its original frame applied.
+    resolution_required: bool,
+    /// When available, blocks the signal that made a flush ambiguous while the
+    /// replacement attempt resolves the same operation ID.
+    resolution_signal_mask: Option<SendSignalMask>,
 }
 
 impl OpAttempt {
@@ -519,8 +575,48 @@ impl OpAttempt {
             op_id,
             origin_epoch: None,
             started_ns: None,
-            entered_ns: monotonic_ns(),
+            recovery_started_ns: None,
+            resolution_required: false,
+            resolution_signal_mask: None,
         }
+    }
+
+    fn note_recovery_started(&mut self) {
+        if self.has_op_id() && self.origin_epoch.is_some() {
+            self.resolution_required = true;
+        }
+        if self.recovery_started_ns.is_none() {
+            self.recovery_started_ns = Some(monotonic_ns());
+        }
+    }
+
+    /// Best-effort signal masking for an ambiguity-resolution pass.
+    ///
+    /// Even if sigprocmask unexpectedly fails, dispatch and reply waits remain
+    /// uninterruptible and an interrupted zero-progress resend stays inside the
+    /// same operation. The mask is an efficiency aid, not the safety invariant.
+    fn prepare_resolution_wait(&mut self) {
+        if self.resolution_required && self.resolution_signal_mask.is_none() {
+            if let Ok(signal_mask) = SendSignalMask::block() {
+                self.resolution_signal_mask = Some(signal_mask);
+            }
+        }
+    }
+
+    pub(super) fn resolve_uncertain_flush(&mut self, signal_mask: Option<SendSignalMask>) {
+        // Idempotent operations can safely remain cancellable on replacement;
+        // only mutations need to protect a stable operation ID.
+        if !self.has_op_id() {
+            return;
+        }
+        self.resolution_required = true;
+        if self.resolution_signal_mask.is_none() {
+            self.resolution_signal_mask = signal_mask;
+        }
+    }
+
+    pub(super) fn is_resolving_ambiguity(&self) -> bool {
+        self.resolution_required
     }
 
     fn has_op_id(&self) -> bool {
@@ -601,10 +697,15 @@ impl OpAttempt {
             // An operation with nothing on the wire has no ambiguity to bound.
             None => None,
         };
-        let mut remaining = grace_ms
-            .checked_sub(elapsed_ms(self.entered_ns, now))
-            .filter(|remaining| *remaining != 0)
-            .ok_or(ETIMEDOUT)?;
+        let mut remaining = match self.recovery_started_ns {
+            Some(started) => grace_ms
+                .checked_sub(elapsed_ms(started, now))
+                .filter(|remaining| *remaining != 0)
+                .ok_or(ETIMEDOUT)?,
+            // The first dispatch, or a caller that arrived while replay was
+            // already in progress, has not yet spent any recovery budget.
+            None => grace_ms,
+        };
         if let Some(horizon_ms) = horizon_ms {
             remaining = remaining.min(horizon_ms);
         }
@@ -622,6 +723,9 @@ enum SendOutcome {
     /// The attempt failed before anything was transmitted and its slot has
     /// already been released.
     Released(Error),
+    /// This frame wrote no bytes, but an older attempt of the same logical
+    /// operation may still be ambiguous.
+    Interrupted(Error),
     /// Nothing was transmitted because the target connection was replaced, and
     /// the slot has already been released.
     Stale(Error),
@@ -639,6 +743,10 @@ impl SendOutcome {
             FrameSend::Rejected(error) => {
                 session.release_slot(tag);
                 Self::Stale(error)
+            }
+            FrameSend::Interrupted(error) => {
+                session.release_slot(tag);
+                Self::Interrupted(error)
             }
             FrameSend::Broken(error) => Self::Failed(error),
         }
