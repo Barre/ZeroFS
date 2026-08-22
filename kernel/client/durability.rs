@@ -79,15 +79,19 @@ impl Client {
         let (token, snapshot) = self.session().fsync_snapshot(scope, primary)?;
         let wire_fid = self.route_fid(primary)?;
 
+        // Keep transport/local admission failures outside `outcome`. In
+        // particular, guarded-fid validation may return ESTALE after replay
+        // tombstones a fid; only an Rlerror decoded below means the server
+        // actually rejected this durability token.
+        let frame = self.transact(|| Request::Tfsyncdur {
+            fid: wire_fid,
+            datasync: scope.wire_flag(),
+            // Token zero still performs the requested inode or mount-wide
+            // barrier and states that this client has no unverified lineage
+            // obligation in that scope.
+            token,
+        })?;
         let outcome = (|| {
-            let frame = self.transact(|| Request::Tfsyncdur {
-                fid: wire_fid,
-                datasync: scope.wire_flag(),
-                // Token zero still performs the requested inode or mount-wide
-                // barrier and states that this client has no unverified
-                // lineage obligation in that scope.
-                token,
-            })?;
             let response = self.decode(&frame)?;
             if !matches!(response.body, Response::Rfsync) {
                 return self.invariant_failure();
@@ -102,6 +106,17 @@ impl Client {
             }
             Err(error) => {
                 if error == errno!(ESTALE) {
+                    match scope {
+                        FsyncScope::Inode(inode) => pr_warn!(
+                            "zerofs: inode {} fsync durability lineage {} was rejected\n",
+                            inode,
+                            token
+                        ),
+                        FsyncScope::All => pr_warn!(
+                            "zerofs: mount fsync durability lineage {} was rejected\n",
+                            token
+                        ),
+                    }
                     // Keep the obligations outstanding and marked reported, so
                     // every later fsync covering them keeps failing until a
                     // replacement mutation records a lineage the current writer

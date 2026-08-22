@@ -26,6 +26,28 @@ const TCP_NODELAY: ffi::c_int = 1;
 const UNIX_PATH_MAX: usize = 108;
 const SOCKADDR_UN_PATH_OFFSET: usize = size_of::<u16>();
 
+/// A stream-send failure together with whether this frame entered the stream.
+///
+/// A local interruption before the first byte is harmless: the request still
+/// owns no server state and its tag can be released. Once any byte was accepted,
+/// the stream framing is ambiguous and the connection has to be retired.
+pub(crate) struct SendFailure {
+    error: Error,
+    started: bool,
+}
+
+impl SendFailure {
+    pub(crate) fn error(&self) -> Error {
+        self.error
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        self.started
+    }
+}
+
+pub(crate) type SendResult = core::result::Result<(), SendFailure>;
+
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     fn sock_setsockopt(
@@ -503,7 +525,8 @@ impl SocketTransport {
 
     /// Send the complete buffer or return the first socket error.
     pub(crate) fn send_all(&self, bytes: &[u8]) -> Result<()> {
-        self.send_buffer(bytes, 0, &mut |error| Err(error))
+        self.send_buffer(bytes, 0, false, &mut |error| Err(error))
+            .map_err(|failure| failure.error())
     }
 
     /// Send the complete buffer, giving `on_error` a chance to resume it.
@@ -515,8 +538,8 @@ impl SocketTransport {
         &self,
         bytes: &[u8],
         on_error: &mut dyn FnMut(Error) -> Result<()>,
-    ) -> Result<()> {
-        self.send_buffer(bytes, 0, on_error)
+    ) -> SendResult {
+        self.send_buffer(bytes, 0, false, on_error)
     }
 
     /// Send a complete request whose payload streams out of an iterator.
@@ -530,10 +553,11 @@ impl SocketTransport {
         prefix: &[u8],
         mut payload: PayloadIter<'_>,
         on_error: &mut dyn FnMut(Error) -> Result<()>,
-    ) -> Result<()> {
+    ) -> SendResult {
         let mut unsent = payload.len();
         let prefix_flags = if unsent == 0 { 0 } else { bindings::MSG_MORE };
-        self.send_buffer(prefix, prefix_flags, on_error)?;
+        self.send_buffer(prefix, prefix_flags, false, on_error)?;
+        let mut started = !prefix.is_empty();
 
         while unsent != 0 {
             // SAFETY: The owned socket remains live for this blocking call.
@@ -547,24 +571,39 @@ impl SocketTransport {
                 // Resuming is only exact while the iterator still holds every
                 // byte the frame header already declared.
                 if payload.remaining() != unsent {
-                    return Err(EIO);
+                    return Err(SendFailure {
+                        error: EIO,
+                        started: true,
+                    });
                 }
-                on_error(Error::from_errno(sent))?;
+                if let Err(error) = on_error(Error::from_errno(sent)) {
+                    return Err(SendFailure { error, started });
+                }
                 continue;
             }
             if sent == 0 {
-                return Err(errno!(ECONNRESET));
+                return Err(SendFailure {
+                    error: errno!(ECONNRESET),
+                    started,
+                });
             }
 
             let sent = sent as usize;
             if sent > unsent {
-                return Err(EIO);
+                return Err(SendFailure {
+                    error: EIO,
+                    started: true,
+                });
             }
+            started = true;
             unsent -= sent;
             // skb_splice_from_iter can consume iterator bytes it does not
             // report as sent, which leaves the declared length unreachable.
             if payload.remaining() != unsent {
-                return Err(EIO);
+                return Err(SendFailure {
+                    error: EIO,
+                    started: true,
+                });
             }
         }
 
@@ -580,8 +619,9 @@ impl SocketTransport {
         &self,
         mut bytes: &[u8],
         flags: u32,
+        mut started: bool,
         on_error: &mut dyn FnMut(Error) -> Result<()>,
-    ) -> Result<()> {
+    ) -> SendResult {
         while !bytes.is_empty() {
             let mut message = bindings::msghdr::default();
             message.msg_flags = bindings::MSG_NOSIGNAL | flags;
@@ -602,14 +642,23 @@ impl SocketTransport {
                 )
             };
             if sent < 0 {
-                on_error(Error::from_errno(sent))?;
+                if let Err(error) = on_error(Error::from_errno(sent)) {
+                    return Err(SendFailure { error, started });
+                }
                 continue;
             }
             if sent == 0 {
-                return Err(errno!(ECONNRESET));
+                return Err(SendFailure {
+                    error: errno!(ECONNRESET),
+                    started,
+                });
             }
 
-            bytes = bytes.get(sent as usize..).ok_or(EIO)?;
+            started = true;
+            bytes = bytes.get(sent as usize..).ok_or(SendFailure {
+                error: EIO,
+                started,
+            })?;
         }
 
         Ok(())

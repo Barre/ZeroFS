@@ -4,7 +4,7 @@ zerofs-y := self_contained/zerofs_main.o
 else
 zerofs-y := zerofs_main.o
 endif
-zerofs-y += netfs/compat_helpers.o vfs/compat_helpers.o
+zerofs-y += client/compat_helpers.o netfs/compat_helpers.o vfs/compat_helpers.o
 
 # Rust's include! paths must follow the module object directory selected by
 # Kbuild.

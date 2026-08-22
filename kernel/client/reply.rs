@@ -4,20 +4,23 @@ use core::sync::atomic::Ordering;
 use kernel::{
     alloc::KVVec,
     bindings,
+    error::code::ERESTARTSYS,
     prelude::*,
     sync::{CondVar, CondVarTimeoutResult},
 };
 
 use crate::protocol::{self, Request, Response};
 
-use super::errors::{codec_errno, protocol_errno};
+use super::errors::{codec_errno, not_connected_errno, protocol_errno};
 use super::flush::FlushOutcome;
 use super::receive::validate_response_frame;
-use super::retry::AttemptOutcome;
+use super::retry::{AttemptOutcome, OpAttempt};
 use super::session::{Dispatch, Session};
-use super::signals::{SendSignalMask, sleep_uninterruptible_tick};
-use super::slots::{ExpectedResponse, FrameSend, PendingSlot, PendingState, vacate_slot};
-use super::{MAX_PROBE_EXTENSIONS, PROBE_TIMEOUT_MS, jiffies_for_ms};
+use super::signals::{sleep_uninterruptible_tick, SendSignalMask};
+use super::slots::{
+    vacate_slot, ExpectedResponse, FrameSend, PendingSlot, PendingState, SlotReservation,
+};
+use super::{jiffies_for_ms, MAX_LIVENESS_EXTENSIONS, PROBE_TIMEOUT_MS};
 
 pub(super) struct OwnedFrame<'a> {
     pub(super) bytes: ReplyBytes<'a>,
@@ -30,7 +33,6 @@ pub(super) struct OwnedFrame<'a> {
     /// Identity of that connection, so replay bookkeeping can tell whether it
     /// is still the session's.
     pub(super) connection_epoch: u64,
-    pub(super) _credit: ReplyCredit<'a>,
 }
 
 /// Reply storage that returns small allocations to the per-mount pool.
@@ -53,23 +55,6 @@ impl Drop for ReplyBytes<'_> {
     fn drop(&mut self) {
         let bytes = mem::replace(&mut self.bytes, KVVec::new());
         self.session.recycle_reply_buffer(bytes);
-    }
-}
-
-/// Keeps conservative reply-memory accounting charged while an owned frame is
-/// queued, decoded, copied to userspace, or consumed by a directory actor.
-pub(super) enum ReplyCredit<'a> {
-    Multiplexed(SessionReplyCredit<'a>),
-}
-
-pub(super) struct SessionReplyCredit<'a> {
-    session: &'a Session,
-    bytes: usize,
-}
-
-impl Drop for SessionReplyCredit<'_> {
-    fn drop(&mut self) {
-        self.session.release_reply_credit(self.bytes);
     }
 }
 
@@ -109,7 +94,7 @@ impl Session {
         }
     }
 
-    /// Hand a taken reply to its caller, still charged for its reply credit.
+    /// Hand a taken preallocated reply frame to its caller.
     fn own_completed_reply(
         &self,
         tag: usize,
@@ -125,10 +110,6 @@ impl Session {
             delivered: reply.delivered,
             lineage_token: dispatch.token,
             connection_epoch: dispatch.epoch,
-            _credit: ReplyCredit::Multiplexed(SessionReplyCredit {
-                session: self,
-                bytes: reply.reply_credit,
-            }),
         };
         // A directly delivered frame carries no payload to decode.
         // check_incoming_header() already bound its tag, its type and its
@@ -142,7 +123,12 @@ impl Session {
         Ok(frame)
     }
 
-    pub(super) fn wait_for_reply(&self, tag: usize, dispatch: &Dispatch) -> Result<OwnedFrame<'_>> {
+    pub(super) fn wait_for_reply(
+        &self,
+        tag: usize,
+        dispatch: &Dispatch,
+        attempt: &mut OpAttempt,
+    ) -> Result<OwnedFrame<'_>> {
         let reply_waiter = self.reply_waiter(tag)?;
         let (shard, local_tag) = self.slot_shard(tag)?;
         let mut remaining = self.timeout_jiffies;
@@ -150,7 +136,7 @@ impl Session {
         // signals; the loop paces the two unmaskable ones against the same
         // reply deadline.
         let mut uncancellable: Option<SendSignalMask> = None;
-        let mut probe_extensions = 0u32;
+        let mut liveness_extensions = 0u32;
         loop {
             let mut slots = shard.lock();
             let Some(slot) = slots.get_mut(local_tag) else {
@@ -180,7 +166,7 @@ impl Session {
                 }
             }
 
-            if uncancellable.is_some() {
+            if uncancellable.is_some() || attempt.is_resolving_ambiguity() {
                 // SIGKILL and SIGSTOP cannot be masked. Pace their immediate
                 // wakeups without abandoning the tag that still owns the
                 // eventual reply.
@@ -188,7 +174,7 @@ impl Session {
                 if sleep_uninterruptible_tick(&mut remaining) {
                     continue;
                 }
-                self.handle_reply_deadline(tag, dispatch, &mut probe_extensions)?;
+                self.handle_reply_deadline(tag, dispatch, &mut liveness_extensions)?;
                 remaining = self.timeout_jiffies;
                 continue;
             }
@@ -205,11 +191,11 @@ impl Session {
                         continue;
                     }
                     drop(slots);
-                    self.try_cancel_on_signal(tag, dispatch, &mut uncancellable)?;
+                    self.try_cancel_on_signal(tag, dispatch, attempt, &mut uncancellable)?;
                 }
                 CondVarTimeoutResult::Timeout => {
                     drop(slots);
-                    self.handle_reply_deadline(tag, dispatch, &mut probe_extensions)?;
+                    self.handle_reply_deadline(tag, dispatch, &mut liveness_extensions)?;
                     remaining = self.timeout_jiffies;
                 }
             }
@@ -221,24 +207,37 @@ impl Session {
         &self,
         tag: usize,
         dispatch: &Dispatch,
-        probe_extensions: &mut u32,
+        liveness_extensions: &mut u32,
     ) -> Result<()> {
         let (shard, local_tag) = self.slot_shard(tag)?;
         let slots = shard.lock();
         if slot_completed(&slots, local_tag) {
             return Ok(());
         }
-        // Other replies prove the connection is still alive.
-        if self.heard_recently() {
+        let request_name = slots
+            .get(local_tag)
+            .and_then(|slot| slot.expected)
+            .map(ExpectedResponse::name)
+            .unwrap_or("unknown request");
+        // Other replies prove the connection is still alive, but only for a
+        // finite number of windows: peer liveness is not proof that this tag
+        // will ever receive its terminal response.
+        if *liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.heard_recently() {
+            *liveness_extensions += 1;
             return Ok(());
         }
         drop(slots);
         // Tgetlineage remains available during a backend stall and verifies
         // that this peer still has serving authority.
-        if *probe_extensions < MAX_PROBE_EXTENSIONS && self.probe_peer(dispatch) {
-            *probe_extensions += 1;
+        if *liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.probe_peer(dispatch) {
+            *liveness_extensions += 1;
             return Ok(());
         }
+        pr_warn!(
+            "zerofs: {} tag {} remained unresolved after liveness probe; retiring connection\n",
+            request_name,
+            tag
+        );
         let error = ETIMEDOUT;
         self.retire_connection(error, dispatch.epoch);
         self.release_slot(tag);
@@ -266,7 +265,9 @@ impl Session {
             return false;
         };
         // Do not wait for capacity that only an incoming reply can free.
-        let Ok(tag) = self.reserve_slot(expected, maximum_response, None, 1, &[]) else {
+        let Ok(SlotReservation::Reserved(tag)) =
+            self.reserve_slot(expected, maximum_response, None, 1, false, &[])
+        else {
             return false;
         };
         let mut frame = [0u8; protocol::HEADER_SIZE];
@@ -282,6 +283,13 @@ impl Session {
         match self.send_frame(tag, request_frame, dispatch) {
             FrameSend::Sent => self.wait_for_probe_reply(tag, dispatch),
             FrameSend::Rejected(_) => {
+                self.release_slot(tag);
+                false
+            }
+            FrameSend::Interrupted(_) => {
+                // The probe never entered the stream, so it says nothing about
+                // peer health. Let the unresolved request retire the connection
+                // once it has exhausted its actual liveness evidence.
                 self.release_slot(tag);
                 false
             }
@@ -301,6 +309,7 @@ impl Session {
         let mut remaining = jiffies_for_ms(u64::from(PROBE_TIMEOUT_MS))
             .min(self.timeout_jiffies)
             .max(1);
+        let mut liveness_extensions = 0u32;
         loop {
             let Ok((shard, local_tag)) = self.slot_shard(tag) else {
                 self.terminate(protocol_errno());
@@ -332,7 +341,6 @@ impl Session {
                         tag as u16,
                         reply.expected,
                     );
-                    self.release_reply_credit(reply.reply_credit);
                     self.recycle_reply_buffer(reply.bytes);
                     return match verdict {
                         Ok(alive) => alive,
@@ -356,6 +364,23 @@ impl Session {
             }
             drop(slots);
             if !sleep_uninterruptible_tick(&mut remaining) {
+                // The probe shares the server's response queue and this
+                // connection's byte stream with ordinary replies. Under load
+                // its Rgetlineage can therefore sit behind data responses
+                // even while those responses prove the peer is alive. Keep
+                // owning the sent probe tag and give it another quiet phase;
+                // abandoning it would let its eventual reply hit a reused tag.
+                if liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.heard_recently() {
+                    liveness_extensions += 1;
+                    remaining = jiffies_for_ms(u64::from(PROBE_TIMEOUT_MS))
+                        .min(self.timeout_jiffies)
+                        .max(1);
+                    continue;
+                }
+                pr_warn!(
+                    "zerofs: Tgetlineage tag {} timed out without intervening traffic\n",
+                    tag
+                );
                 // Retire before vacating so the receiver cannot publish here.
                 self.retire_connection(ETIMEDOUT, dispatch.epoch);
                 self.release_slot(tag);
@@ -372,18 +397,56 @@ impl Session {
         &self,
         tag: usize,
         dispatch: &Dispatch,
+        attempt: &mut OpAttempt,
         uncancellable: &mut Option<SendSignalMask>,
     ) -> Result<()> {
+        // Keep the exact task mask alive until the cancellation outcome is
+        // known. If the flush becomes ambiguous, ownership moves to OpAttempt
+        // so reconnect and replay cannot be interrupted by the same signal.
+        let signal_mask = match SendSignalMask::block() {
+            Ok(signal_mask) => signal_mask,
+            Err(error) => {
+                // Do not leave the original Sent tag registered if signal-mask
+                // setup itself fails. Retiring the stream is conservative but
+                // preserves the tag and frame-ownership invariants.
+                return match self.fail_flush_preserving_original(
+                    tag,
+                    None,
+                    error,
+                    dispatch.epoch,
+                )? {
+                    FlushOutcome::OriginalReady => Ok(()),
+                    FlushOutcome::ConnectionLost => {
+                        attempt.resolve_uncertain_flush(None);
+                        Err(not_connected_errno())
+                    }
+                    // fail_flush_preserving_original cannot manufacture either
+                    // of these outcomes without reserving and completing a
+                    // flush, which did not happen on this path.
+                    FlushOutcome::Cancelled | FlushOutcome::NotCancelled => Err(protocol_errno()),
+                };
+            }
+        };
         match self.flush_interrupted_request(tag, dispatch.epoch)? {
             FlushOutcome::OriginalReady => Ok(()),
-            FlushOutcome::Interrupted => Err(EINTR),
+            // Rflush is the protocol cancellation boundary.
+            // Signal disposition decides whether userspace ultimately sees
+            // EINTR or the syscall is transparently restarted.
+            FlushOutcome::Cancelled => Err(ERESTARTSYS),
             FlushOutcome::NotCancelled => {
                 // Cancellation capacity is exhausted. Abandoning the tag here
-                // would leak it and its reply credit, because the reply still
-                // arrives and still needs an owner, so complete the operation
-                // instead of interrupting it.
-                *uncancellable = Some(SendSignalMask::block()?);
+                // would leak it and its preallocated reply buffer, because the
+                // reply still arrives and still needs an owner, so complete
+                // the operation instead of interrupting it.
+                *uncancellable = Some(signal_mask);
                 Ok(())
+            }
+            FlushOutcome::ConnectionLost => {
+                attempt.resolve_uncertain_flush(Some(signal_mask));
+                // The failure that made Tflush ambiguous may itself have been
+                // EINTR (for example from an unmaskable signal during socket
+                // I/O).
+                Err(not_connected_errno())
             }
         }
     }
@@ -410,8 +473,6 @@ fn validate_probe_response(
 struct CompletedReply {
     bytes: KVVec<u8>,
     expected: ExpectedResponse,
-    /// Reply credit the slot was charged, now owed by the owned frame.
-    reply_credit: usize,
     delivered: Option<usize>,
 }
 
@@ -426,7 +487,7 @@ fn take_completed_reply(slot: &mut PendingSlot) -> Option<CompletedReply> {
         .destination
         .as_ref()
         .and_then(|destination| destination.delivered);
-    let reply_credit = vacate_slot(slot);
+    drop(vacate_slot(slot));
     let PendingState::Completed(bytes) = previous else {
         return None;
     };
@@ -434,7 +495,6 @@ fn take_completed_reply(slot: &mut PendingSlot) -> Option<CompletedReply> {
     Some(CompletedReply {
         bytes,
         expected,
-        reply_credit,
         delivered,
     })
 }

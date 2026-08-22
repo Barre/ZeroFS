@@ -52,7 +52,7 @@ impl Session {
             }
             match self.reconnect_once() {
                 Ok(()) => {
-                    pr_info!("zerofs: session reconnected and restored\n");
+                    pr_info!("zerofs: session reconnected; replay complete\n");
                     return None;
                 }
                 Err(error) => {
@@ -166,6 +166,7 @@ impl Session {
     fn replay_session(&self, transport: &SocketTransport) -> Result<()> {
         let mut io = [0u8; REPLAY_FRAME_BYTES];
         let mut gone: KVec<(u32, bool)> = KVec::new();
+        let mut first_gone: Option<(u32, u64, bool, ffi::c_int)> = None;
 
         // Attach roots must exist before descendants resolve against them.
         for roots in [true, false] {
@@ -175,22 +176,46 @@ impl Session {
                 let fid = index as u32;
                 match self.replay_fid(transport, &mut io, fid, &record, &credentials)? {
                     ReplayOutcome::Restored => {}
-                    // A fid that no longer resolves only fails its own
-                    // operations, so it becomes a tombstone and the session
-                    // survives. A fid that held a lock is different: the
-                    // exclusion the application is relying on is gone and
-                    // nothing else would ever report it.
-                    ReplayOutcome::Gone if self.fid_has_recorded_lock(fid) => {
-                        return Err(
-                            self.replay_state_lost("fid with a held lock could not be rebound")
-                        );
+                    ReplayOutcome::Gone(error) => {
+                        // A fid that no longer resolves only fails its own
+                        // operations, so it becomes a tombstone and the session
+                        // survives. A fid that held a lock is different: the
+                        // exclusion the application is relying on is gone and
+                        // nothing else would ever report it.
+                        if self.fid_has_recorded_lock(fid) {
+                            pr_warn!(
+                                "zerofs: replay could not restore locked fid {} (inode={}, errno={})\n",
+                                fid,
+                                record.inode_id,
+                                error.to_errno()
+                            );
+                            return Err(
+                                self.replay_state_lost("fid with a held lock could not be rebound")
+                            );
+                        }
+                        if first_gone.is_none() {
+                            first_gone =
+                                Some((fid, record.inode_id, record.opened, error.to_errno()));
+                        }
+                        gone.push((fid, record.opened), GFP_KERNEL)?;
                     }
-                    ReplayOutcome::Gone => gone.push((fid, record.opened), GFP_KERNEL)?,
                 }
             }
         }
 
         if !gone.is_empty() {
+            let opened = gone.iter().filter(|(_, opened)| *opened).count();
+            if let Some((fid, inode, was_opened, errno)) = first_gone {
+                pr_warn!(
+                    "zerofs: replay left {} fids unrestored ({} opened; first fid={}, inode={}, opened={}, errno={}); affected opened handles will return ESTALE\n",
+                    gone.len(),
+                    opened,
+                    fid,
+                    inode,
+                    was_opened,
+                    errno
+                );
+            }
             let mut state = self.state.lock();
             for &(fid, opened) in gone.iter() {
                 // An open handle whose inode is gone must report ESTALE to its
@@ -230,11 +255,7 @@ impl Session {
     /// an edge case, because the server keys conflicts on the connection and the
     /// one that just died still holds these same ranges until its guard runs, so
     /// the whole set is rolled back and retried with backoff.
-    fn replay_locks(
-        &self,
-        transport: &SocketTransport,
-        io: &mut [u8],
-    ) -> Result<()> {
+    fn replay_locks(&self, transport: &SocketTransport, io: &mut [u8]) -> Result<()> {
         // Declared out here so it keeps growing across attempts rather than
         // restarting at the minimum on every retry.
         let mut backoff_ms = RECONNECT_BACKOFF_MIN_MS;
@@ -380,10 +401,9 @@ impl Session {
         if let SessionStatus::Dead(status) = state.status {
             return Err(Error::from_errno(status));
         }
-        let _ = self.live_changed.wait_interruptible_timeout(
-            &mut state,
-            jiffies_for_ms(backoff_ms).max(1),
-        );
+        let _ = self
+            .live_changed
+            .wait_interruptible_timeout(&mut state, jiffies_for_ms(backoff_ms).max(1));
         // A session that ended while this waited has already shut the candidate
         // down, so the next Tlock would only wait out a request timeout.
         match state.status {
@@ -485,7 +505,7 @@ impl Session {
         };
         match self.replay_step(transport, io, rebind)? {
             ReplayOutcome::Restored => {}
-            ReplayOutcome::Gone => return Ok(ReplayOutcome::Gone),
+            gone @ ReplayOutcome::Gone(_) => return Ok(gone),
         }
         if !record.opened {
             return Ok(ReplayOutcome::Restored);
@@ -502,11 +522,11 @@ impl Session {
         };
         match self.replay_step(transport, io, reopen)? {
             ReplayOutcome::Restored => Ok(ReplayOutcome::Restored),
-            ReplayOutcome::Gone => {
+            gone @ ReplayOutcome::Gone(_) => {
                 // Rebind installed a fid even though reopen failed. Leaving it
                 // behind would desynchronize the client and server fid tables.
                 self.replay_transact(transport, io, Request::Tclunk { fid })?;
-                Ok(ReplayOutcome::Gone)
+                Ok(gone)
             }
         }
     }
@@ -522,7 +542,7 @@ impl Session {
             Ok(()) => Ok(ReplayOutcome::Restored),
             // Only these two mean the object is gone. Any other failure is
             // operational, so preserving the record retries it next attempt.
-            Err(error) if is_replay_state_lost(error) => Ok(ReplayOutcome::Gone),
+            Err(error) if is_replay_state_lost(error) => Ok(ReplayOutcome::Gone(error)),
             Err(error) => Err(error),
         }
     }
@@ -552,7 +572,7 @@ impl Session {
 /// Whether a replayed fid, or one step of its replay, was restored or is gone.
 enum ReplayOutcome {
     Restored,
-    Gone,
+    Gone(Error),
 }
 
 /// What one replayed lock produced.
@@ -657,10 +677,7 @@ fn probe_target(
     io: &mut [u8],
     session: Option<&Session>,
 ) -> Result<ProbedCandidate> {
-    let target = endpoint
-        .targets
-        .get(index)
-        .ok_or_else(|| EINVAL)?;
+    let target = endpoint.targets.get(index).ok_or_else(|| EINVAL)?;
     let transport = Arc::new(endpoint.dial(target)?, GFP_KERNEL)?;
     let (negotiated_msize, lineage) = (|| -> Result<(u32, Rgetlineage)> {
         if let Some(session) = session {
