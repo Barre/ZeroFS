@@ -12,7 +12,7 @@ use crate::{
 
 use super::errors::{message_size_errno, protocol_errno};
 use super::registry::{FidRecord, LockRecord, LockRecorded, LockSlotClaim, RebindCredentials};
-use super::reply::{OwnedFrame, ReplyBytes, ReplyCredit};
+use super::reply::{OwnedFrame, ReplyBytes};
 use super::retry::OpAttempt;
 use super::{Client, READ_PAYLOAD_OFFSET, ROOT_INODE_ID};
 
@@ -44,7 +44,6 @@ pub(crate) struct OwnedPayload<'a> {
     frame: ReplyBytes<'a>,
     offset: usize,
     length: usize,
-    _credit: ReplyCredit<'a>,
 }
 
 impl OwnedPayload<'_> {
@@ -740,7 +739,7 @@ impl Client {
         Ok(())
     }
 
-    /// Fetch one symlink target into a response-credit-owned frame.
+    /// Fetch one symlink target into its preallocated response frame.
     pub(crate) fn readlink(&self, fid: u32) -> Result<OwnedPayload<'_>> {
         let wire_fid = self.route_fid(fid)?;
         let frame = self.transact(|| Request::Treadlink { fid: wire_fid })?;
@@ -1115,7 +1114,6 @@ fn payload_from_frame<'a>(
         frame: frame.bytes,
         offset,
         length,
-        _credit: frame._credit,
     })
 }
 

@@ -67,7 +67,7 @@ use kernel::{
     alloc::KBox, bindings, ffi, prelude::*, sync::aref::ARef, task::Task, time::msecs_to_jiffies,
 };
 
-use crate::protocol::{self, Qid, HEADER_SIZE};
+use crate::protocol::{self, HEADER_SIZE, Qid};
 
 use self::errors::not_connected_errno;
 use self::reconnect::bootstrap_connection;
@@ -93,31 +93,25 @@ pub(crate) const REBIND_CREDENTIAL_IDENTITY_WORDS: usize =
 /// Byte offset of an `Rread` payload inside its frame: header plus count.
 const READ_PAYLOAD_OFFSET: usize = HEADER_SIZE + mem::size_of::<u32>();
 
-/// Aggregate maximum response bytes reserved by in-flight requests.
-///
-/// This is accounting credit, not a preallocation. Small metadata requests can
-/// still occupy every default tag, while large reads share this 64-MiB ceiling
-/// instead of allowing `pending tags * msize` reply growth.
-const MAX_REPLY_CREDIT_BYTES: usize = 64 * 1024 * 1024;
-
 /// Persistent receive accumulator for small responses.
 ///
-/// Frames larger than this retain the direct-to-allocation path after their
+/// Larger frames take the response allocation attached to their tag after the
 /// buffered prefix, so a large negotiated msize does not permanently consume
-/// that much memory per mount.
+/// that much accumulator memory per mount.
 const RECEIVE_BATCH_BYTES: usize = 64 * 1024;
 
 /// Reusable allocation size for ordinary metadata replies.
 ///
 /// This covers every fixed metadata response, including a full ZeroFS stat.
-/// Variable walk, readlink, readdir and data replies spill to exact-sized
-/// allocations when their actual frame is larger.
+/// Variable walk, readlink, readdir and data replies use request-sized
+/// allocations when their maximum frame is larger.
 const SMALL_REPLY_BYTES: usize = 256;
 
 /// Per-mount buffers kept hot for concurrently owned metadata replies.
 ///
-/// The pool is deliberately independent of the pending-tag table: reply
-/// buffers are retained only for actual concurrent consumers.
+/// The pool is deliberately independent of the pending-tag table. A fixed hot
+/// set stays resident; concurrent requests beyond it allocate on demand and
+/// return compatible buffers as the pool has room.
 const SMALL_REPLY_BUFFERS: usize = 64;
 
 /// Largest request encoded without touching the allocator.
@@ -170,8 +164,11 @@ const MUTATION_RETRY_HORIZON_MS: u64 = protocol::retry::MUTATION_RETRY_HORIZON.a
 /// always fresher than the wait that consumed it.
 const LIVENESS_WINDOW_MS: u64 = 3_000;
 
-/// Maximum liveness-probe extensions for one reply wait.
-const MAX_PROBE_EXTENSIONS: u32 = 7;
+/// Maximum liveness extensions for one unresolved control or request reply.
+///
+/// Both passive traffic and an explicit probe consume this same finite budget,
+/// so a selectively unresponsive peer cannot keep a caller unkillable forever.
+const MAX_LIVENESS_EXTENSIONS: u32 = 7;
 
 /// Most server addresses one mount will rotate through.
 ///
@@ -300,7 +297,7 @@ impl Client {
         // the socket wait, while ordinary callers enforce response deadlines
         // and shut the transport down when one expires.
         bootstrapped.candidate.transport.set_blocking_receive()?;
-        let session = Session::new(endpoint, bootstrapped.candidate, MAX_REPLY_CREDIT_BYTES)?;
+        let session = Session::new(endpoint, bootstrapped.candidate)?;
         // Failing here drops the transport, so the server's connection guard
         // releases the root fid installed by the bootstrap Trebind.
         session.record_root_fid(ROOT_FID, credentials)?;

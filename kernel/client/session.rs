@@ -7,6 +7,7 @@ use kernel::{
     alloc::{KBox, KVVec, KVec, flags::GFP_KERNEL},
     bindings,
     bitmap::BitmapVec,
+    error::code::ERESTARTSYS,
     ffi, new_condvar, new_mutex,
     prelude::*,
     sync::{Arc, CondVar, CondVarTimeoutResult, Mutex},
@@ -21,6 +22,7 @@ use super::errors::{is_internal_restart_status, not_connected_errno};
 use super::receive::ReceiveState;
 use super::reconnect::ProbedCandidate;
 use super::registry::{CredentialSlot, FidSlot, LockRecord};
+use super::signals::sleep_uninterruptible_tick;
 use super::slots::{PendingSlot, PendingState};
 use super::{
     CLIENT_ID_LEN, FIRST_NORMAL_TAG, INITIAL_PENDING_TAGS, LIVENESS_WINDOW_MS, MAX_REPLY_WAITERS,
@@ -37,7 +39,6 @@ pub(super) struct Session {
     /// Age of a decoded frame still accepted as proof a peer is alive. This is
     /// shorter than a reply deadline so only recent traffic extends that wait.
     liveness_window_ms: u64,
-    pub(super) reply_credit_limit: usize,
     /// Lock owner identity sent with every `Tlock` and `Tgetlock`.
     ///
     /// Fixed for the mount because replay has to resend the same bytes, and
@@ -136,7 +137,6 @@ pub(super) struct SessionState {
     pub(super) resident_normal_tags: usize,
     /// Next ordinary bitmap index considered by the cyclic allocator.
     pub(super) next_tag: usize,
-    pub(super) used_reply_credit: usize,
     pub(super) next_fid: u32,
     pub(super) recycled_fids: KVec<u32>,
     /// Replay records indexed by fid.
@@ -218,11 +218,7 @@ pub(super) struct ReceiveLink {
 pub(super) type OrphanedTransports = (Arc<SocketTransport>, Option<Arc<SocketTransport>>);
 
 impl Session {
-    pub(super) fn new(
-        endpoint: Endpoint,
-        candidate: ProbedCandidate,
-        reply_credit_limit: usize,
-    ) -> Result<Pin<KBox<Self>>> {
+    pub(super) fn new(endpoint: Endpoint, candidate: ProbedCandidate) -> Result<Pin<KBox<Self>>> {
         let timeout_ms = endpoint.timeout_ms;
         let ProbedCandidate {
             transport,
@@ -244,11 +240,6 @@ impl Session {
         if timeout_jiffies == 0 {
             return Err(EINVAL);
         }
-        // reserve_slot refuses a request whose maximum reply exceeds the credit
-        // pool, so a limit under msize would make a full-size reply unsendable.
-        if reply_credit_limit < msize as usize {
-            return Err(EINVAL);
-        }
         let receive_capacity = (msize as usize).min(RECEIVE_BATCH_BYTES);
         let receive_buffer = KVVec::from_elem(0u8, receive_capacity, GFP_KERNEL)?;
         let reply_pool = small_reply_pool()?;
@@ -262,7 +253,6 @@ impl Session {
                 // A liveness proof older than the wait it justifies extending
                 // would let a dead peer keep earning windows.
                 liveness_window_ms: LIVENESS_WINDOW_MS.min((timeout_ms as u64 / 2).max(1)),
-                reply_credit_limit,
                 client_id: generate_client_id(),
                 preferred_target: AtomicU32::new(target as u32),
                 msize_mismatch_warned: AtomicBool::new(false),
@@ -287,7 +277,6 @@ impl Session {
                     normal_tags,
                     resident_normal_tags: INITIAL_PENDING_TAGS,
                     next_tag: 0,
-                    used_reply_credit: 0,
                     next_fid: ROOT_FID + 1,
                     recycled_fids: KVec::new(),
                     // Client::connect reserves the root slot and records it.
@@ -325,7 +314,11 @@ impl Session {
     /// wait is interruptible because a caller may hold `i_rwsem`, and bounded
     /// because a netfslib worker running on a shared workqueue must not park
     /// there indefinitely.
-    pub(super) fn dispatch_or_wait(&self, budget_jiffies: usize) -> Result<Dispatch> {
+    pub(super) fn dispatch_or_wait(
+        &self,
+        budget_jiffies: usize,
+        resolve_ambiguity: bool,
+    ) -> Result<Dispatch> {
         let mut remaining = budget_jiffies.min(self.grace_jiffies());
         loop {
             let mut state = self.state.lock();
@@ -346,7 +339,23 @@ impl Session {
                 .wait_interruptible_timeout(&mut state, remaining)
             {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { .. } => return Err(EINTR),
+                CondVarTimeoutResult::Signal { jiffies } => {
+                    remaining = jiffies;
+                    if !resolve_ambiguity {
+                        // Nothing from this logical operation is ambiguous.
+                        // Preserve normal restart semantics for a signal that
+                        // interrupts its initial dispatch gate.
+                        return Err(ERESTARTSYS);
+                    }
+                    // A prior attempt of this mutation may already have been
+                    // applied. Letting ERESTARTSYS escape would mint a new
+                    // operation ID on transparent syscall restart, so pace the
+                    // pending signal and keep resolving the original ID.
+                    drop(state);
+                    if !sleep_uninterruptible_tick(&mut remaining) {
+                        return Err(ETIMEDOUT);
+                    }
+                }
                 CondVarTimeoutResult::Timeout => return Err(ETIMEDOUT),
             }
         }
@@ -572,9 +581,7 @@ fn vacant_slot_shards(count: usize) -> Result<KVVec<Pin<KBox<Mutex<KVVec<Pending
                 .map_err(|_| ENOMEM)?;
         }
         let shard = KBox::pin_init(new_mutex!(slots), GFP_KERNEL)?;
-        shards
-            .push_within_capacity(shard)
-            .map_err(|_| ENOMEM)?;
+        shards.push_within_capacity(shard).map_err(|_| ENOMEM)?;
     }
     Ok(shards)
 }
@@ -584,8 +591,7 @@ fn small_reply_pool() -> Result<KVVec<KVVec<u8>>> {
     let mut pool = KVVec::with_capacity(SMALL_REPLY_BUFFERS, GFP_KERNEL)?;
     for _ in 0..SMALL_REPLY_BUFFERS {
         let buffer = KVVec::with_capacity(SMALL_REPLY_BYTES, GFP_KERNEL)?;
-        pool.push_within_capacity(buffer)
-            .map_err(|_| ENOMEM)?;
+        pool.push_within_capacity(buffer).map_err(|_| ENOMEM)?;
     }
     Ok(pool)
 }
@@ -598,9 +604,7 @@ fn reply_waiter_queues(slot_count: usize) -> Result<KVVec<Pin<KBox<CondVar>>>> {
     let mut waiters = KVVec::with_capacity(count, GFP_KERNEL)?;
     for _ in 0..count {
         let waiter = KBox::pin_init(new_condvar!(), GFP_KERNEL)?;
-        waiters
-            .push_within_capacity(waiter)
-            .map_err(|_| ENOMEM)?;
+        waiters.push_within_capacity(waiter).map_err(|_| ENOMEM)?;
     }
     Ok(waiters)
 }
