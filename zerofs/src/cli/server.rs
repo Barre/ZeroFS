@@ -1103,12 +1103,17 @@ pub async fn run_server(
     let drain = async move {
         info!("Waiting for background tasks to exit...");
         if let Some(gc_handles) = gc_handle {
-            for handle in gc_handles {
+            const GC_TASK_NAMES: [&str; 2] = ["segment GC", "tombstone GC"];
+            for (index, handle) in gc_handles.into_iter().enumerate() {
                 if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
                     .await
                     .is_err()
                 {
-                    info!("a GC task is still mid-pass after 15s; proceeding to the final flush");
+                    let task = GC_TASK_NAMES.get(index).copied().unwrap_or("unnamed GC");
+                    tracing::warn!(
+                        "{task} did not stop within 15s; detaching it and proceeding with final \
+                         database close"
+                    );
                 }
             }
         }
