@@ -1134,7 +1134,17 @@ pub async fn run_server(
         _ = drain => {}
     }
 
-    // Flush remains lease-gated while background tasks drain.
+    // Deferred reclaim mutates metadata, so drain it while authority is still
+    // valid and before the final flush closes the database.
+    info!("Waiting for deferred orphan reclaims to finish...");
+    tokio::select! {
+        biased;
+        _ = leadership_deposed.cancelled() => {
+            return Err(leadership_lost_error());
+        }
+        _ = fs.shutdown_reclaim_drainer() => {}
+    }
+
     if leadership_deposed.is_cancelled() {
         return Err(leadership_lost_error());
     }

@@ -229,6 +229,8 @@ impl ZeroFS {
             open_handles: Arc::new(DashMap::new()),
             reclaim_tx,
             reclaim_rx: Arc::new(Mutex::new(Some(reclaim_rx))),
+            reclaim_shutdown: tokio_util::sync::CancellationToken::new(),
+            reclaim_task: Arc::new(Mutex::new(None)),
             lock_manager,
             stats,
             global_stats,
