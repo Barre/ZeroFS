@@ -32,6 +32,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 pub use self::gc::GarbageCollector;
 pub use handle::OpenHandle;
@@ -108,6 +110,10 @@ pub struct ZeroFS {
     /// start the drainer just let sends buffer). `Arc<Mutex<..>>` keeps the
     /// vestigial `ZeroFS: Clone` derive working.
     reclaim_rx: Arc<Mutex<Option<UnboundedReceiver<InodeId>>>>,
+    /// Stops the reclaimer after closing and draining its inode queue.
+    reclaim_shutdown: CancellationToken,
+    /// Join handle retained so database shutdown can wait for the final drain.
+    reclaim_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub lock_manager: Arc<KeyedLockManager<InodeId>>,
     pub stats: Arc<FileSystemStats>,
     pub global_stats: Arc<FileSystemGlobalStats>,
