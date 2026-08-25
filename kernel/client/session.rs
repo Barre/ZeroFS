@@ -23,11 +23,12 @@ use super::receive::ReceiveState;
 use super::reconnect::ProbedCandidate;
 use super::registry::{CredentialSlot, FidSlot, LockRecord};
 use super::signals::sleep_uninterruptible_tick;
-use super::slots::{PendingSlot, PendingState};
+use super::slots::{PendingSlot, PendingState, vacate_slot};
+use super::tag_space::normal_tag_index;
 use super::{
-    CLIENT_ID_LEN, FIRST_NORMAL_TAG, INITIAL_PENDING_TAGS, LIVENESS_WINDOW_MS, MAX_REPLY_WAITERS,
+    CLIENT_ID_LEN, FIRST_NORMAL_TAG, INITIAL_PENDING_TAGS, MAX_REPLY_WAITERS, NO_PROBE_TAG,
     NORMAL_TAG_COUNT, RECEIVE_BATCH_BYTES, ROOT_FID, SLOT_SHARDS, SMALL_REPLY_BUFFERS,
-    SMALL_REPLY_BYTES, elapsed_ms, jiffies_for_ms, monotonic_ns,
+    SMALL_REPLY_BYTES, jiffies_for_ms,
 };
 
 #[pin_data]
@@ -36,9 +37,6 @@ pub(super) struct Session {
     pub(super) timeout_jiffies: usize,
     /// Longest a request blocks waiting for reconnect and replay.
     pub(super) grace_ms: u64,
-    /// Age of a decoded frame still accepted as proof a peer is alive. This is
-    /// shorter than a reply deadline so only recent traffic extends that wait.
-    liveness_window_ms: u64,
     /// Lock owner identity sent with every `Tlock` and `Tgetlock`.
     ///
     /// Fixed for the mount because replay has to resend the same bytes, and
@@ -55,10 +53,16 @@ pub(super) struct Session {
     /// peer is re-probed on every reconnect round, so an unthrottled warning
     /// would be one log line per round forever.
     pub(super) msize_mismatch_warned: AtomicBool,
-    /// Monotonic nanoseconds when a frame was last decoded on any connection.
-    pub(super) last_frame_ns: AtomicU64,
+    /// Number of complete replies published on the installed connection.
+    ///
+    /// Ordinary request deadlines compare snapshots of this counter. Progress
+    /// on any tag proves the shared TCP stream is alive; one delayed tag does
+    /// not by itself justify retiring the connection.
+    pub(super) receive_generation: AtomicU64,
     /// Set while an in-band liveness probe is active.
     pub(super) probe_in_flight: AtomicBool,
+    /// Receiver-owned normal tag of the one outstanding liveness probe.
+    pub(super) liveness_probe_tag: AtomicU32,
     /// Lock-free mirror of `SessionState::connection_epoch`.
     ///
     /// A receiver checks this before and after taking a tag shard. Retirement
@@ -271,14 +275,12 @@ impl Session {
                 msize,
                 timeout_jiffies,
                 grace_ms: endpoint.grace_ms as u64,
-                // A liveness proof older than the wait it justifies extending
-                // would let a dead peer keep earning windows.
-                liveness_window_ms: LIVENESS_WINDOW_MS.min((timeout_ms as u64 / 2).max(1)),
                 client_id: generate_client_id(),
                 preferred_target: AtomicU32::new(target as u32),
                 msize_mismatch_warned: AtomicBool::new(false),
-                last_frame_ns: AtomicU64::new(monotonic_ns()),
+                receive_generation: AtomicU64::new(0),
                 probe_in_flight: AtomicBool::new(false),
+                liveness_probe_tag: AtomicU32::new(NO_PROBE_TAG),
                 active_epoch: AtomicU64::new(0),
                 sent_count: AtomicUsize::new(0),
                 bulk_reads: AtomicU32::new(0),
@@ -407,10 +409,14 @@ impl Session {
         jiffies_for_ms(self.grace_ms).max(1)
     }
 
-    /// Whether a frame was decoded recently enough to prove a peer is alive.
-    pub(super) fn heard_recently(&self) -> bool {
-        elapsed_ms(self.last_frame_ns.load(Ordering::Relaxed), monotonic_ns())
-            < self.liveness_window_ms
+    /// Snapshot global receive progress for one installed connection.
+    pub(super) fn receive_generation(&self) -> u64 {
+        self.receive_generation.load(Ordering::Acquire)
+    }
+
+    /// Record one complete, tag-validated reply from the installed stream.
+    pub(super) fn note_received_frame(&self) {
+        self.receive_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Retire the connection identified by `epoch`, leaving the session alive.
@@ -514,6 +520,37 @@ impl Session {
                 }
             }
         }
+        let liveness_probe = self.liveness_probe_tag.load(Ordering::Acquire);
+        if liveness_probe != NO_PROBE_TAG {
+            let tag = liveness_probe as usize;
+            if let Ok((shard, local_tag)) = self.slot_shard(tag) {
+                let mut slots = shard.lock();
+                if let Some(slot) = slots.get_mut(local_tag) {
+                    // A reply that reached Completed won the epoch boundary.
+                    // The receiver is about to validate and release it; only
+                    // an unresolved probe belongs to the retirement sweep.
+                    if !matches!(slot.state, PendingState::Completed(_))
+                        && self
+                            .liveness_probe_tag
+                            .compare_exchange(
+                                liveness_probe,
+                                NO_PROBE_TAG,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        drop(vacate_slot(slot));
+                        if let Some(index) = normal_tag_index(tag) {
+                            state.normal_tags.clear_bit(index);
+                        }
+                        self.probe_in_flight.store(false, Ordering::Release);
+                    }
+                }
+            }
+        } else {
+            self.probe_in_flight.store(false, Ordering::Release);
+        }
         true
     }
 
@@ -547,8 +584,9 @@ impl Session {
         lineage: Rgetlineage,
     ) -> Result<()> {
         // Replay still needs bounded receives. Once this transport is visible
-        // to the session, request waiters own response timeouts and retire it
-        // by shutdown, so the sole receiver may block here while idle.
+        // to the session, request waiters test connection-global receive
+        // progress before retiring it, so the sole receiver may block here
+        // while idle.
         transport.set_blocking_receive()?;
         let _send = self.send_lock.lock();
         let mut receive = self.receive.lock();
@@ -570,7 +608,6 @@ impl Session {
         state.lineage = lineage;
         state.status = SessionStatus::Connected;
         state.next_tag = 0;
-        self.last_frame_ns.store(monotonic_ns(), Ordering::Relaxed);
         drop(state);
         drop(receive);
 

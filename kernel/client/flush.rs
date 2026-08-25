@@ -4,7 +4,6 @@ use kernel::{alloc::KVVec, ffi, prelude::*, sync::CondVarTimeoutResult};
 
 use crate::protocol::{self, HEADER_SIZE, Request, Response};
 
-use super::MAX_LIVENESS_EXTENSIONS;
 use super::errors::{
     codec_errno, is_protocol_error, not_connected_errno, protocol_errno, server_errno,
 };
@@ -51,9 +50,9 @@ impl Session {
     /// Resolve an interrupted request with a standard 9P flush barrier.
     ///
     /// The caller masks signals after the first interruptible wait returns, so
-    /// the cancellation path polls in uninterruptible one-jiffy sleeps. Each
-    /// quiet phase is bounded like a normal reply wait; a finite number of
-    /// other decoded frames can prove the connection active and extend it.
+    /// the cancellation path polls in uninterruptible one-jiffy sleeps. Its
+    /// single bounded wait is a cancellation deadline, not a peer-health test:
+    /// unrelated replies cannot prove that this barrier will complete.
     pub(super) fn flush_interrupted_request(
         &self,
         oldtag: usize,
@@ -191,7 +190,6 @@ impl Session {
         epoch: u64,
     ) -> Result<FlushOutcome> {
         let mut remaining = self.timeout_jiffies;
-        let mut liveness_extensions = 0u32;
         loop {
             let state = self.state.lock();
             let original_ready = matches!(
@@ -260,14 +258,8 @@ impl Session {
             if !sleep_uninterruptible_tick(&mut remaining) {
                 // An Rflush is a receive barrier: starting another in-band
                 // probe here can put its reply behind an Rflush the receiver
-                // has already published and deliberately stopped at. Passive
-                // traffic is still sufficient to avoid retiring a busy, live
-                // connection under load.
-                if liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.heard_recently() {
-                    liveness_extensions += 1;
-                    remaining = self.timeout_jiffies;
-                    continue;
-                }
+                // has already published and deliberately stopped at. Other
+                // traffic says nothing about whether cancellation completed.
                 let error = ETIMEDOUT;
                 return self.fail_flush_preserving_original(oldtag, Some(flush_tag), error, epoch);
             }

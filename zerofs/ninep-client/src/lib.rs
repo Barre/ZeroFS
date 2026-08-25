@@ -73,15 +73,8 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Reply timeout before liveness checks begin.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-/// Maximum age of a decoded frame accepted as proof of liveness.
-const LIVENESS_WINDOW: Duration = Duration::from_secs(3);
-/// Additional reply windows allowed while the connection remains live.
-const MAX_LIVENESS_EXTRA_WINDOWS: u32 = 7;
-
-const _: () = assert!(
-    LIVENESS_WINDOW.as_nanos() < REQUEST_TIMEOUT.as_nanos(),
-    "the liveness window must be shorter than the request timeout"
-);
+/// Sentinel stored while no receiver-owned liveness probe has a tag.
+const NO_LIVENESS_PROBE_TAG: u32 = u32::MAX;
 
 /// FIRST/RETRY state for one request future.
 #[derive(Default)]
@@ -422,10 +415,13 @@ struct Conn {
     writer_epoch: AtomicU64,
     /// Set by whichever of the reader/writer tasks first sees the socket fail.
     dead: AtomicBool,
-    /// Monotonic base for [`Conn::last_alive`].
-    base: runtime::Clock,
-    /// Milliseconds since `base` when the last frame was decoded.
-    last_alive: AtomicU64,
+    /// Number of complete framed replies received on this stream.
+    ///
+    /// A request snapshots this counter at the start of each reply window.
+    /// Progress on any tag proves the shared byte stream is still moving.
+    receive_generation: AtomicU64,
+    /// Tag retained until the one outstanding Tgetlineage response is drained.
+    liveness_probe_tag: AtomicU32,
     /// Serializes explicit liveness probes.
     probe_lock: tokio::sync::Mutex<()>,
     /// Signals the (possibly idle) writer task to stop when the reader exits.
@@ -449,36 +445,26 @@ impl Conn {
     /// Stops both transport tasks.
     fn shutdown(&self) {
         self.dead.store(true, Ordering::Release);
+        self.liveness_probe_tag
+            .store(NO_LIVENESS_PROBE_TAG, Ordering::Release);
         self.pending.clear();
         self.reader_shutdown.notify_one();
         self.writer_shutdown.notify_one();
     }
 
-    /// Records receipt of a frame.
-    fn mark_alive(&self) {
-        self.last_alive
-            .store(self.base.elapsed_millis(), Ordering::Relaxed);
+    /// Records receipt of one complete framed reply.
+    fn note_received_frame(&self) {
+        self.receive_generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Saturating strict-window comparison.
-    fn within(now_ms: u64, last_ms: u64, window: Duration) -> bool {
-        now_ms.saturating_sub(last_ms) < window.as_millis() as u64
-    }
-
-    /// Whether a frame was decoded within `window`.
-    fn heard_within(&self, window: Duration) -> bool {
-        Self::within(
-            self.base.elapsed_millis(),
-            self.last_alive.load(Ordering::Relaxed),
-            window,
-        )
+    fn receive_generation(&self) -> u64 {
+        self.receive_generation.load(Ordering::Acquire)
     }
 
     fn deliver(&self, frame: Bytes) {
         self.counters
             .bytes_received
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
-        self.mark_alive();
         if frame.len() < P9_HEADER_SIZE {
             warn!(
                 "9P client: response frame too short ({} bytes)",
@@ -486,7 +472,14 @@ impl Conn {
             );
             return;
         }
+        self.note_received_frame();
         let tag = u16::from_le_bytes([frame[5], frame[6]]);
+        let _ = self.liveness_probe_tag.compare_exchange(
+            u32::from(tag),
+            NO_LIVENESS_PROBE_TAG,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         if let Some((_, pending)) = self.pending.remove(&tag) {
             let _ = pending.reply.send(frame);
         } else {
@@ -748,8 +741,8 @@ impl NinePClient {
             lineage_token: AtomicU64::new(0),
             writer_epoch: AtomicU64::new(0),
             dead: AtomicBool::new(false),
-            base: runtime::Clock::now(),
-            last_alive: AtomicU64::new(0),
+            receive_generation: AtomicU64::new(0),
+            liveness_probe_tag: AtomicU32::new(NO_LIVENESS_PROBE_TAG),
             probe_lock: tokio::sync::Mutex::new(()),
             writer_shutdown: Notify::new(),
             reader_shutdown: Notify::new(),
@@ -1494,8 +1487,9 @@ impl NinePClient {
                     permit.send(bytes);
                     Ok(())
                 })?;
-            // Preserve the in-flight request while bounded liveness checks succeed.
-            let mut extra_windows = 0u32;
+            // A later reply on this TCP stream proves that this request's
+            // response was not lost; it may still be queued or executing.
+            let mut observed_receive_generation = conn.receive_generation();
             let frame = loop {
                 match runtime::timeout(REQUEST_TIMEOUT, &mut orx).await {
                     Ok(Ok(frame)) => break frame,
@@ -1505,10 +1499,13 @@ impl NinePClient {
                         continue 'resend;
                     }
                     Err(_) => {
-                        if extra_windows < MAX_LIVENESS_EXTRA_WINDOWS
-                            && Self::conn_alive(&conn).await
-                        {
-                            extra_windows += 1;
+                        let current_generation = conn.receive_generation();
+                        if current_generation != observed_receive_generation {
+                            observed_receive_generation = current_generation;
+                            continue;
+                        }
+                        if Self::probe_connection(&conn, current_generation).await {
+                            observed_receive_generation = conn.receive_generation();
                             continue;
                         }
                         self.force_reprobe(&conn);
@@ -1638,22 +1635,36 @@ impl NinePClient {
         result
     }
 
-    /// Tests recent traffic, then performs a single-flight lease-gated probe.
-    async fn conn_alive(conn: &Conn) -> bool {
+    /// Rechecks global receive progress, then runs one lease-gated probe.
+    async fn probe_connection(conn: &Conn, observed_generation: u64) -> bool {
+        Self::probe_connection_with_timeout(conn, observed_generation, PROBE_TIMEOUT).await
+    }
+
+    async fn probe_connection_with_timeout(
+        conn: &Conn,
+        observed_generation: u64,
+        probe_timeout: Duration,
+    ) -> bool {
         if conn.dead.load(Ordering::Acquire) {
             return false;
         }
-        if conn.heard_within(LIVENESS_WINDOW) {
+        if conn.receive_generation() != observed_generation {
             return true;
         }
         let _guard = conn.probe_lock.lock().await;
         if conn.dead.load(Ordering::Acquire) {
             return false;
         }
-        if conn.heard_within(LIVENESS_WINDOW) {
+        if conn.receive_generation() != observed_generation {
             return true;
         }
-        match runtime::timeout(PROBE_TIMEOUT, query_lineage_token(conn)).await {
+        // A previous probe whose response has not arrived is already the
+        // strongest request we can put on this stream. Do not accumulate
+        // another quarantined tag behind it.
+        if conn.liveness_probe_tag.load(Ordering::Acquire) != NO_LIVENESS_PROBE_TAG {
+            return false;
+        }
+        match runtime::timeout(probe_timeout, query_lineage_token(conn)).await {
             Ok(Ok(())) => true,
             // The probe uses the same response queue and stream as normal
             // traffic. A response backlog can delay Rgetlineage past its own
@@ -1661,7 +1672,10 @@ impl NinePClient {
             // is alive. The timed-out RPC keeps its dispatched registration
             // until its late reply is drained, so accepting that passive
             // evidence neither reuses its tag nor desynchronizes the stream.
-            Err(_) => !conn.dead.load(Ordering::Acquire) && conn.heard_within(LIVENESS_WINDOW),
+            Err(_) => {
+                !conn.dead.load(Ordering::Acquire)
+                    && conn.receive_generation() != observed_generation
+            }
             Ok(Err(_)) => false,
         }
     }
@@ -1675,7 +1689,8 @@ impl NinePClient {
     /// A one-shot send on a specific connection, bypassing the live-gate and
     /// state recording. Used during reconnect to replay the session.
     async fn send_raw(conn: &Conn, body: Message) -> ClientResult<Message> {
-        Self::send_raw_at_tag(conn, None, body).await
+        let track_liveness_probe = matches!(&body, Message::Tgetlineage(_));
+        Self::send_raw_at_tag(conn, None, body, track_liveness_probe).await
     }
 
     /// Sends on a specific connection with an allocated or exact tag.
@@ -1683,6 +1698,7 @@ impl NinePClient {
         conn: &Conn,
         exact_tag: Option<u16>,
         body: Message,
+        track_liveness_probe: bool,
     ) -> ClientResult<Message> {
         let permit = conn
             .writer_tx
@@ -1719,6 +1735,19 @@ impl NinePClient {
             Ok(b) => b,
             Err(e) => return Err(ClientError::Codec(e)),
         };
+        if track_liveness_probe
+            && conn
+                .liveness_probe_tag
+                .compare_exchange(
+                    NO_LIVENESS_PROBE_TAG,
+                    u32::from(tag),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(ClientError::Unexpected("liveness probe already pending"));
+        }
         pending.mark_dispatched();
         permit.send(bytes);
         let frame = orx.await.map_err(|_| ClientError::Disconnected)?;
@@ -3000,6 +3029,7 @@ async fn version_on(conn: &Conn, requested: u32) -> ClientResult<u32> {
             msize: requested,
             version: P9String::new(VERSION_9P2000L_ZEROFS.to_vec()),
         }),
+        false,
     )
     .await?
     {
@@ -3288,8 +3318,8 @@ fn test_conn_with_receiver() -> (Arc<Conn>, mpsc::Receiver<Vec<u8>>) {
         lineage_token: AtomicU64::new(0),
         writer_epoch: AtomicU64::new(0),
         dead: AtomicBool::new(false),
-        base: runtime::Clock::now(),
-        last_alive: AtomicU64::new(0),
+        receive_generation: AtomicU64::new(0),
+        liveness_probe_tag: AtomicU32::new(NO_LIVENESS_PROBE_TAG),
         probe_lock: tokio::sync::Mutex::new(()),
         writer_shutdown: Notify::new(),
         reader_shutdown: Notify::new(),
@@ -5116,23 +5146,103 @@ mod liveness_tests {
     }
 
     #[test]
-    fn within_is_strict_and_saturates() {
-        let w = Duration::from_millis(300);
-        assert!(Conn::within(1000, 800, w), "200ms ago is within 300ms");
-        assert!(
-            !Conn::within(1000, 700, w),
-            "exactly at the window is NOT within (strict <)"
+    fn valid_frames_advance_connection_progress() {
+        let conn = test_conn();
+        assert_eq!(conn.receive_generation(), 0);
+        conn.deliver(
+            P9Message::new(17, Message::Rflush(Rflush))
+                .to_bytes()
+                .unwrap()
+                .into(),
         );
-        assert!(!Conn::within(1000, 500, w), "500ms ago is past 300ms");
-        assert!(Conn::within(500, 1000, w));
+        assert_eq!(conn.receive_generation(), 1);
     }
 
     #[test]
-    fn a_just_marked_conn_is_heard() {
+    fn malformed_frames_do_not_prove_liveness() {
         let conn = test_conn();
-        assert!(conn.heard_within(Duration::from_secs(60)));
-        conn.mark_alive();
-        assert!(conn.heard_within(Duration::from_secs(60)));
-        assert!(!conn.heard_within(Duration::from_millis(0)));
+        conn.deliver(Bytes::from_static(&[0; P9_HEADER_SIZE - 1]));
+        assert_eq!(conn.receive_generation(), 0);
+    }
+
+    fn response(tag: u16, body: Message) -> Bytes {
+        P9Message::new(tag, body).to_bytes().unwrap().into()
+    }
+
+    fn request_tag(frame: &[u8]) -> u16 {
+        u16::from_le_bytes([frame[5], frame[6]])
+    }
+
+    #[tokio::test]
+    async fn a_quiet_probe_timeout_does_not_claim_liveness() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let observed = conn.receive_generation();
+        let probe =
+            NinePClient::probe_connection_with_timeout(&conn, observed, Duration::from_millis(5));
+        let (alive, request) = tokio::join!(probe, requests.recv());
+        let request = request.expect("probe request");
+        let tag = request_tag(&request);
+
+        assert!(!alive);
+        assert!(conn.pending.contains_key(&tag));
+        assert!(
+            !NinePClient::probe_connection_with_timeout(
+                &conn,
+                conn.receive_generation(),
+                Duration::from_millis(5),
+            )
+            .await
+        );
+        assert!(
+            runtime::timeout(Duration::from_millis(1), requests.recv())
+                .await
+                .is_err(),
+            "an outstanding probe must suppress another probe"
+        );
+
+        conn.deliver(response(
+            tag,
+            Message::Rgetlineage(Rgetlineage {
+                token: 1,
+                writer_epoch: 1,
+            }),
+        ));
+        assert!(conn.pending.is_empty());
+        assert_eq!(
+            conn.liveness_probe_tag.load(Ordering::Acquire),
+            NO_LIVENESS_PROBE_TAG
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_reply_proves_a_probe_connection_is_moving() {
+        let (conn, mut requests) = test_conn_with_receiver();
+        let observed = conn.receive_generation();
+        let probe =
+            NinePClient::probe_connection_with_timeout(&conn, observed, Duration::from_millis(5));
+        let server = async {
+            let request = requests.recv().await.expect("probe request");
+            let tag = request_tag(&request);
+            let other_tag = if tag == 0 { 1 } else { 0 };
+            conn.deliver(response(other_tag, Message::Rflush(Rflush)));
+            tag
+        };
+        let (alive, tag) = tokio::join!(probe, server);
+
+        assert!(alive);
+        assert!(conn.pending.contains_key(&tag));
+
+        conn.deliver(response(
+            tag,
+            Message::Rgetlineage(Rgetlineage {
+                token: 1,
+                writer_epoch: 1,
+            }),
+        ));
+        assert!(conn.pending.is_empty());
+        assert_eq!(
+            conn.liveness_probe_tag.load(Ordering::Acquire),
+            NO_LIVENESS_PROBE_TAG
+        );
     }
 }

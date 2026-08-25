@@ -42,7 +42,7 @@ The module parameters are load-time-only:
 | `server_ipv4` | `0x7f000001` | IPv4 address used by `none`/`tcp` sources (`127.0.0.1`); `0` disables it |
 | `server_ipv4_peer` | `0` | The HA peer for `none`/`tcp` sources; `0` disables it |
 | `server_port` | `5564` | TCP port used by `none`/`tcp` sources and by targets that omit one |
-| `request_timeout_ms` | `5000` | Send, admission, reply-wait, and handshake timeout |
+| `request_timeout_ms` | `5000` | Send, admission, handshake, and quiet receive-progress timeout |
 | `reconnect_grace_ms` | `120000` | Longest a request waits for reconnect and session replay |
 
 Module parameters carry integers only, so the `none`/`tcp` source expresses two

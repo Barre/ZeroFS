@@ -177,7 +177,7 @@ pub(crate) struct Endpoint {
     network_namespace: NetworkNamespace,
     /// Peers to probe for the serving leader, in the order they were given.
     pub(super) targets: KVec<EndpointAddress>,
-    /// Per-phase socket, admission, and reply-wait timeout.
+    /// Per-phase socket, admission, and quiet receive-progress timeout.
     pub(crate) timeout_ms: u32,
     /// Longest a request blocks waiting for reconnect and replay.
     pub(crate) grace_ms: u32,

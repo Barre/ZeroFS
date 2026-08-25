@@ -20,7 +20,7 @@ use super::signals::{sleep_uninterruptible_tick, SendSignalMask};
 use super::slots::{
     vacate_slot, ExpectedResponse, FrameSend, PendingSlot, PendingState, SlotReservation,
 };
-use super::{jiffies_for_ms, MAX_LIVENESS_EXTENSIONS, PROBE_TIMEOUT_MS};
+use super::{jiffies_for_ms, NO_PROBE_TAG, PROBE_TIMEOUT_MS};
 
 pub(super) struct OwnedFrame<'a> {
     pub(super) bytes: ReplyBytes<'a>,
@@ -136,7 +136,7 @@ impl Session {
         // signals; the loop paces the two unmaskable ones against the same
         // reply deadline.
         let mut uncancellable: Option<SendSignalMask> = None;
-        let mut liveness_extensions = 0u32;
+        let mut observed_receive_generation = self.receive_generation();
         loop {
             let mut slots = shard.lock();
             let Some(slot) = slots.get_mut(local_tag) else {
@@ -174,7 +174,11 @@ impl Session {
                 if sleep_uninterruptible_tick(&mut remaining) {
                     continue;
                 }
-                self.handle_reply_deadline(tag, dispatch, &mut liveness_extensions)?;
+                self.handle_quiet_reply_window(
+                    tag,
+                    dispatch,
+                    &mut observed_receive_generation,
+                )?;
                 remaining = self.timeout_jiffies;
                 continue;
             }
@@ -195,19 +199,23 @@ impl Session {
                 }
                 CondVarTimeoutResult::Timeout => {
                     drop(slots);
-                    self.handle_reply_deadline(tag, dispatch, &mut liveness_extensions)?;
+                    self.handle_quiet_reply_window(
+                        tag,
+                        dispatch,
+                        &mut observed_receive_generation,
+                    )?;
                     remaining = self.timeout_jiffies;
                 }
             }
         }
     }
 
-    /// Recheck an expired reply and either extend its deadline or retire it.
-    fn handle_reply_deadline(
+    /// Recheck a quiet reply window against connection-global progress.
+    fn handle_quiet_reply_window(
         &self,
         tag: usize,
         dispatch: &Dispatch,
-        liveness_extensions: &mut u32,
+        observed_receive_generation: &mut u64,
     ) -> Result<()> {
         let (shard, local_tag) = self.slot_shard(tag)?;
         let slots = shard.lock();
@@ -219,22 +227,24 @@ impl Session {
             .and_then(|slot| slot.expected)
             .map(ExpectedResponse::name)
             .unwrap_or("unknown request");
-        // Other replies prove the connection is still alive, but only for a
-        // finite number of windows: peer liveness is not proof that this tag
-        // will ever receive its terminal response.
-        if *liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.heard_recently() {
-            *liveness_extensions += 1;
+        // TCP cannot lose this reply's bytes while delivering later bytes on
+        // the same stream. Another completed reply therefore proves the
+        // connection is alive even if this server-side operation is delayed.
+        let current_generation = self.receive_generation();
+        if current_generation != *observed_receive_generation {
+            *observed_receive_generation = current_generation;
             return Ok(());
         }
         drop(slots);
-        // Tgetlineage remains available during a backend stall and verifies
-        // that this peer still has serving authority.
-        if *liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.probe_peer(dispatch) {
-            *liveness_extensions += 1;
+        // No reply moved during the complete request window. Tgetlineage is
+        // independent of backend work and verifies both stream progress and
+        // serving authority before the connection is retired.
+        if self.probe_peer(dispatch, current_generation) {
+            *observed_receive_generation = self.receive_generation();
             return Ok(());
         }
         pr_warn!(
-            "zerofs: {} tag {} remained unresolved after liveness probe; retiring connection\n",
+            "zerofs: {} tag {} remained unresolved while the connection made no receive progress; retiring connection\n",
             request_name,
             tag
         );
@@ -245,146 +255,148 @@ impl Session {
     }
 
     /// Run or coalesce an in-band liveness probe.
-    fn probe_peer(&self, dispatch: &Dispatch) -> bool {
+    fn probe_peer(&self, dispatch: &Dispatch, observed_generation: u64) -> bool {
         if self.probe_in_flight.swap(true, Ordering::Acquire) {
-            // The active probe will refresh liveness or retire the connection.
-            return true;
+            return self.wait_for_probe_progress(dispatch, observed_generation);
         }
-        let alive = self.exchange_probe(dispatch);
-        self.probe_in_flight.store(false, Ordering::Release);
-        alive
+        self.exchange_probe(dispatch, observed_generation)
     }
 
-    /// Run one bounded Tgetlineage round trip.
-    fn exchange_probe(&self, dispatch: &Dispatch) -> bool {
+    /// Wait for any receive progress while one probe is outstanding.
+    fn wait_for_probe_progress(&self, dispatch: &Dispatch, observed_generation: u64) -> bool {
+        let mut remaining = jiffies_for_ms(u64::from(PROBE_TIMEOUT_MS))
+            .min(self.timeout_jiffies)
+            .max(1);
+        loop {
+            if self.active_epoch.load(Ordering::Acquire) != dispatch.epoch {
+                return false;
+            }
+            if self.receive_generation() != observed_generation {
+                return true;
+            }
+            if !self.probe_in_flight.load(Ordering::Acquire) {
+                // The receiver publishes progress before clearing the probe.
+                // Recheck after observing that release so a completed probe
+                // cannot be mistaken for a quiet failure.
+                return self.receive_generation() != observed_generation;
+            }
+            if !sleep_uninterruptible_tick(&mut remaining) {
+                return false;
+            }
+        }
+    }
+
+    /// Send one Tgetlineage and wait for any frame to advance the stream.
+    fn exchange_probe(&self, dispatch: &Dispatch, observed_generation: u64) -> bool {
         let request = Request::Tgetlineage;
         let Ok(expected) = ExpectedResponse::for_request(&request) else {
+            self.probe_in_flight.store(false, Ordering::Release);
             return false;
         };
         let Ok(maximum_response) = expected.maximum_frame_size(self.msize) else {
+            self.probe_in_flight.store(false, Ordering::Release);
             return false;
         };
         // Do not wait for capacity that only an incoming reply can free.
         let Ok(SlotReservation::Reserved(tag)) =
             self.reserve_slot(expected, maximum_response, None, 1, false, &[])
         else {
+            self.probe_in_flight.store(false, Ordering::Release);
             return false;
         };
         let mut frame = [0u8; protocol::HEADER_SIZE];
         let Ok(encoded) = protocol::encode_request(&mut frame, self.msize, tag as u16, request)
         else {
             self.release_slot(tag);
+            self.probe_in_flight.store(false, Ordering::Release);
             return false;
         };
         let Some(request_frame) = frame.get(..encoded) else {
             self.release_slot(tag);
+            self.probe_in_flight.store(false, Ordering::Release);
             return false;
         };
+
+        // Publish receiver ownership before the frame can enter the stream.
+        // The receiver validates and releases this tag whether its reply is
+        // first or follows unrelated traffic.
+        self.liveness_probe_tag.store(tag as u32, Ordering::Release);
         match self.send_frame(tag, request_frame, dispatch) {
-            FrameSend::Sent => self.wait_for_probe_reply(tag, dispatch),
+            FrameSend::Sent => self.wait_for_probe_progress(dispatch, observed_generation),
             FrameSend::Rejected(_) => {
+                self.liveness_probe_tag
+                    .store(NO_PROBE_TAG, Ordering::Release);
                 self.release_slot(tag);
+                self.probe_in_flight.store(false, Ordering::Release);
                 false
             }
             FrameSend::Interrupted(_) => {
                 // The probe never entered the stream, so it says nothing about
-                // peer health. Let the unresolved request retire the connection
-                // once it has exhausted its actual liveness evidence.
+                // peer health.
+                self.liveness_probe_tag
+                    .store(NO_PROBE_TAG, Ordering::Release);
                 self.release_slot(tag);
+                self.probe_in_flight.store(false, Ordering::Release);
                 false
             }
             FrameSend::Broken(error) => {
                 // The frame may be partially sent, so retire before reuse.
                 self.retire_connection(error, dispatch.epoch);
-                self.release_slot(tag);
                 false
             }
         }
     }
 
-    /// Wait uninterruptibly for a probe response within its timeout.
-    ///
-    /// A sent tag cannot be abandoned while its reply may still arrive.
-    fn wait_for_probe_reply(&self, tag: usize, dispatch: &Dispatch) -> bool {
-        let mut remaining = jiffies_for_ms(u64::from(PROBE_TIMEOUT_MS))
-            .min(self.timeout_jiffies)
-            .max(1);
-        let mut liveness_extensions = 0u32;
-        loop {
-            let Ok((shard, local_tag)) = self.slot_shard(tag) else {
-                self.terminate(protocol_errno());
-                return false;
-            };
-            let mut slots = shard.lock();
-            let Some(slot) = slots.get_mut(local_tag) else {
-                drop(slots);
-                self.terminate(protocol_errno());
-                return false;
-            };
-            match &slot.state {
-                PendingState::Completed(_) => {
-                    let reply = take_completed_reply(slot);
-                    drop(slots);
-                    match self.release_normal_tag_if_idle(tag) {
-                        Ok(_) => self.changed.notify_all(),
-                        Err(error) => {
-                            self.terminate(error);
-                            return false;
-                        }
-                    }
-                    let Some(reply) = reply else {
-                        return false;
-                    };
-                    let verdict = validate_probe_response(
-                        reply.bytes.as_slice(),
-                        self.msize,
-                        tag as u16,
-                        reply.expected,
-                    );
-                    self.recycle_reply_buffer(reply.bytes);
-                    return match verdict {
-                        Ok(alive) => alive,
-                        Err(error) => {
-                            self.terminate(error);
-                            false
-                        }
-                    };
-                }
-                PendingState::Failed(_) => {
-                    drop(slots);
-                    self.release_slot(tag);
-                    return false;
-                }
-                PendingState::Sent => {}
-                PendingState::Reserved | PendingState::Consuming | PendingState::Vacant => {
-                    drop(slots);
-                    self.terminate(protocol_errno());
-                    return false;
-                }
+    /// Consume the receiver-owned liveness probe response.
+    pub(super) fn finish_liveness_probe(&self, tag: usize, epoch: u64) -> Result<bool> {
+        if self
+            .liveness_probe_tag
+            .compare_exchange(
+                tag as u32,
+                NO_PROBE_TAG,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        let (shard, local_tag) = self.slot_shard(tag)?;
+        let mut slots = shard.lock();
+        let reply = slots.get_mut(local_tag).and_then(take_completed_reply);
+        drop(slots);
+        self.release_normal_tag_if_idle(tag)?;
+        self.changed.notify_all();
+
+        let Some(reply) = reply else {
+            let error = protocol_errno();
+            self.probe_in_flight.store(false, Ordering::Release);
+            self.terminate(error);
+            return Err(error);
+        };
+        let verdict = validate_probe_response(
+            reply.bytes.as_slice(),
+            self.msize,
+            tag as u16,
+            reply.expected,
+        );
+        self.recycle_reply_buffer(reply.bytes);
+        match verdict {
+            Ok(true) => {
+                self.note_received_frame();
+                self.probe_in_flight.store(false, Ordering::Release);
+                Ok(true)
             }
-            drop(slots);
-            if !sleep_uninterruptible_tick(&mut remaining) {
-                // The probe shares the server's response queue and this
-                // connection's byte stream with ordinary replies. Under load
-                // its Rgetlineage can therefore sit behind data responses
-                // even while those responses prove the peer is alive. Keep
-                // owning the sent probe tag and give it another quiet phase;
-                // abandoning it would let its eventual reply hit a reused tag.
-                if liveness_extensions < MAX_LIVENESS_EXTENSIONS && self.heard_recently() {
-                    liveness_extensions += 1;
-                    remaining = jiffies_for_ms(u64::from(PROBE_TIMEOUT_MS))
-                        .min(self.timeout_jiffies)
-                        .max(1);
-                    continue;
-                }
-                pr_warn!(
-                    "zerofs: Tgetlineage tag {} timed out without intervening traffic\n",
-                    tag
-                );
-                // Retire before vacating so the receiver cannot publish here.
-                self.retire_connection(ETIMEDOUT, dispatch.epoch);
-                self.release_slot(tag);
-                return false;
+            Ok(false) => {
+                self.probe_in_flight.store(false, Ordering::Release);
+                self.retire_connection(not_connected_errno(), epoch);
+                Ok(true)
+            }
+            Err(error) => {
+                self.probe_in_flight.store(false, Ordering::Release);
+                self.terminate(error);
+                Err(error)
             }
         }
     }
