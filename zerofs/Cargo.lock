@@ -6158,7 +6158,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6268,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-csi"
-version = "2.3.1"
+version = "2.3.2"
 dependencies = [
  "anyhow",
  "clap",
