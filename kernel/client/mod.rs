@@ -77,6 +77,9 @@ use self::tag_space::{FIRST_NORMAL_TAG, NORMAL_TAG_COUNT};
 /// Smallest useful 9P message size accepted by this client.
 pub(crate) const MIN_MSIZE: u32 = 4096;
 
+const MAX_INFLIGHT_REQUESTS: usize = 1024;
+const _: () = assert!(MAX_INFLIGHT_REQUESTS < NORMAL_TAG_COUNT);
+
 /// Fid installed for the root during synchronous bootstrap.
 pub(crate) const ROOT_FID: u32 = 1;
 
@@ -319,7 +322,7 @@ impl Client {
     }
 
     pub(crate) fn pending_tag_capacity(&self) -> usize {
-        self.session().slot_count()
+        self.session().slot_count().min(MAX_INFLIGHT_REQUESTS)
     }
 
     pub(crate) fn root_qid(&self) -> Qid {

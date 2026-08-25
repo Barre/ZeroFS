@@ -81,6 +81,12 @@ pub(super) struct Session {
     pub(super) bulk_reads: AtomicU32,
     #[pin]
     pub(super) send_lock: Mutex<()>,
+    /// Filesystem RPCs admitted by this mount. A permit remains held across
+    /// resends until the request settles.
+    #[pin]
+    request_in_flight: Mutex<usize>,
+    #[pin]
+    request_admission_changed: CondVar,
     #[pin]
     pub(super) receive: Mutex<ReceiveState>,
     /// Reusable frames for allocation-free metadata replies.
@@ -217,6 +223,21 @@ pub(super) struct ReceiveLink {
 /// dialing.
 pub(super) type OrphanedTransports = (Arc<SocketTransport>, Option<Arc<SocketTransport>>);
 
+/// One slot in the mount's filesystem-RPC dispatch window.
+pub(super) struct RequestPermit<'a> {
+    session: &'a Session,
+}
+
+impl Drop for RequestPermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.session.request_in_flight.lock();
+        debug_assert!(*in_flight > 0);
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        self.session.request_admission_changed.notify_one();
+    }
+}
+
 impl Session {
     pub(super) fn new(endpoint: Endpoint, candidate: ProbedCandidate) -> Result<Pin<KBox<Self>>> {
         let timeout_ms = endpoint.timeout_ms;
@@ -262,6 +283,8 @@ impl Session {
                 sent_count: AtomicUsize::new(0),
                 bulk_reads: AtomicU32::new(0),
                 send_lock <- new_mutex!(()),
+                request_in_flight <- new_mutex!(0usize),
+                request_admission_changed <- new_condvar!(),
                 receive <- new_mutex!(ReceiveState {
                     buffer: receive_buffer,
                     buffered: 0,
@@ -299,6 +322,21 @@ impl Session {
 
     pub(super) fn client_id(&self) -> &[u8] {
         &self.client_id
+    }
+
+    /// Enter the local filesystem-RPC dispatch window.
+    pub(super) fn acquire_request(&self) -> Result<RequestPermit<'_>> {
+        let mut in_flight = self.request_in_flight.lock();
+        while *in_flight >= super::MAX_INFLIGHT_REQUESTS {
+            if self
+                .request_admission_changed
+                .wait_interruptible(&mut in_flight)
+            {
+                return Err(ERESTARTSYS);
+            }
+        }
+        *in_flight += 1;
+        Ok(RequestPermit { session: self })
     }
 
     /// Wait for a live connection and snapshot it under one acquisition.
