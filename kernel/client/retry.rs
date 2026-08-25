@@ -101,6 +101,7 @@ impl Client {
         attempt: &mut OpAttempt,
         send: impl Fn(&Dispatch, MutationEnvelope, &mut OpAttempt) -> Result<AttemptOutcome<'a>>,
     ) -> Result<OwnedFrame<'a>> {
+        let _admission = self.session().acquire_request()?;
         loop {
             let dispatch = self.await_resend_bounded(attempt)?;
             let envelope = attempt.envelope_for(dispatch.writer_epoch);
