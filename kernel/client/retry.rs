@@ -72,8 +72,8 @@ impl Client {
     fn await_resend_bounded(&self, attempt: &mut OpAttempt) -> Result<Dispatch> {
         let session = self.session();
         let budget = attempt.resend_budget(session.grace_ms)?;
-        attempt.prepare_resolution_wait();
-        match session.dispatch_or_wait(budget, attempt.is_resolving_ambiguity()) {
+        attempt.ensure_signal_mask();
+        match session.dispatch_or_wait(budget, attempt.must_complete()) {
             Ok(dispatch) => Ok(dispatch),
             Err(error) => {
                 // The budget may have been the horizon rather than the grace, in
@@ -146,13 +146,12 @@ impl Client {
     ) -> Result<Option<OwnedFrame<'a>>> {
         let session = self.session();
         match outcome {
-            // A zero-progress failure is normally safe to return. Once an
-            // older mutation attempt is ambiguous, however, an interrupted
-            // local retry must stay under the same operation ID. Keep this as
-            // the final guard even though the individual dispatch, admission
-            // and send paths suppress this escape themselves.
+            // A zero-progress failure is normally safe to return. Once this
+            // operation has to complete, an interrupted local retry must stay
+            // under the same operation ownership. Keep this as the final guard
+            // even though dispatch, admission and send suppress it themselves.
             AttemptOutcome::Rejected(error)
-                if attempt.is_resolving_ambiguity() && is_interrupted_error(error) =>
+                if attempt.must_complete() && is_interrupted_error(error) =>
             {
                 let mut remaining = 1;
                 let _ = sleep_uninterruptible_tick(&mut remaining);
@@ -174,13 +173,6 @@ impl Client {
                 Ok(None)
             }
             AttemptOutcome::Failed(error) => {
-                if is_interrupted_error(error) {
-                    // Connection retirement normalizes EINTR/ERESTART* to
-                    // ENOTCONN before publishing a failed slot. The only
-                    // interrupted reply-wait result is therefore a completed
-                    // Rflush, which proved that restarting is safe.
-                    return Err(error);
-                }
                 if is_protocol_error(error) {
                     session.terminate(error);
                     return Err(error);
@@ -287,7 +279,7 @@ impl Client {
             write.maximum_response,
             None,
             admission_jiffies,
-            attempt.is_resolving_ambiguity(),
+            attempt.must_complete(),
             &[write.wire_fid],
         );
         let tag = match reserved {
@@ -370,7 +362,7 @@ impl Client {
             maximum_response,
             destination,
             admission_jiffies,
-            attempt.is_resolving_ambiguity(),
+            attempt.must_complete(),
             &fids[..fid_count],
         );
         let tag = match reserved {
@@ -469,11 +461,11 @@ impl Client {
             }
             SendOutcome::Released(error) => AttemptOutcome::Rejected(error),
             SendOutcome::Interrupted(error) => {
-                if attempt.is_resolving_ambiguity() {
-                    // An older frame with this operation ID may have applied.
+                if attempt.must_complete() {
+                    // An older frame may still need an authoritative outcome.
                     // Keep the same logical operation instead of escaping to a
-                    // transparent restart with a fresh ID. The one-jiffy pace
-                    // prevents an unmaskable pending signal from spinning.
+                    // transparent restart. The one-jiffy pace prevents an
+                    // unmaskable pending signal from spinning.
                     let mut remaining = 1;
                     let _ = sleep_uninterruptible_tick(&mut remaining);
                     AttemptOutcome::Retry(error)
@@ -485,6 +477,9 @@ impl Client {
             SendOutcome::Failed(error) => {
                 // A broken send may still have put a prefix on the wire.
                 attempt.note_dispatched(envelope);
+                if is_interrupted_error(error) {
+                    attempt.defer_signal();
+                }
                 session.retire_connection(error, dispatch.epoch);
                 session.reply_outcome(session.wait_for_reply(tag, dispatch, attempt))
             }
@@ -551,12 +546,14 @@ pub(super) struct OpAttempt {
     /// connection. It is deliberately never reset between replacement
     /// attempts: the reconnect grace bounds the complete recovery episode.
     recovery_started_ns: Option<u64>,
-    /// A dispatched mutation must not escape through ERESTARTSYS until an
-    /// authoritative reply resolves whether its original frame applied.
-    resolution_required: bool,
-    /// When available, blocks the signal that made a flush ambiguous while the
-    /// replacement attempt resolves the same operation ID.
-    resolution_signal_mask: Option<SendSignalMask>,
+    /// This logical operation must not escape through ERESTARTSYS before its
+    /// authoritative outcome. Set for an ambiguous mutation or when a signal
+    /// arrives after any request has been dispatched.
+    must_complete: bool,
+    /// Best-effort mask held while `must_complete` is set. Keeping the
+    /// signal pending avoids busy wakeups; uninterruptible waits enforce the
+    /// ownership invariant even if installing the mask fails.
+    signal_mask: Option<SendSignalMask>,
 }
 
 impl OpAttempt {
@@ -578,47 +575,41 @@ impl OpAttempt {
             origin_epoch: None,
             started_ns: None,
             recovery_started_ns: None,
-            resolution_required: false,
-            resolution_signal_mask: None,
+            must_complete: false,
+            signal_mask: None,
         }
     }
 
     fn note_recovery_started(&mut self) {
         if self.has_op_id() && self.origin_epoch.is_some() {
-            self.resolution_required = true;
+            self.must_complete = true;
         }
         if self.recovery_started_ns.is_none() {
             self.recovery_started_ns = Some(monotonic_ns());
         }
     }
 
-    /// Best-effort signal masking for an ambiguity-resolution pass.
+    /// Best-effort signal masking while an operation must complete.
     ///
     /// Even if sigprocmask unexpectedly fails, dispatch and reply waits remain
     /// uninterruptible and an interrupted zero-progress resend stays inside the
     /// same operation. The mask is an efficiency aid, not the safety invariant.
-    fn prepare_resolution_wait(&mut self) {
-        if self.resolution_required && self.resolution_signal_mask.is_none() {
+    fn ensure_signal_mask(&mut self) {
+        if self.must_complete && self.signal_mask.is_none() {
             if let Ok(signal_mask) = SendSignalMask::block() {
-                self.resolution_signal_mask = Some(signal_mask);
+                self.signal_mask = Some(signal_mask);
             }
         }
     }
 
-    pub(super) fn resolve_uncertain_flush(&mut self, signal_mask: Option<SendSignalMask>) {
-        // Idempotent operations can safely remain cancellable on replacement;
-        // only mutations need to protect a stable operation ID.
-        if !self.has_op_id() {
-            return;
-        }
-        self.resolution_required = true;
-        if self.resolution_signal_mask.is_none() {
-            self.resolution_signal_mask = signal_mask;
-        }
+    /// Defer a signal observed after dispatch until the operation settles.
+    pub(super) fn defer_signal(&mut self) {
+        self.must_complete = true;
+        self.ensure_signal_mask();
     }
 
-    pub(super) fn is_resolving_ambiguity(&self) -> bool {
-        self.resolution_required
+    pub(super) fn must_complete(&self) -> bool {
+        self.must_complete
     }
 
     fn has_op_id(&self) -> bool {
@@ -672,6 +663,10 @@ impl OpAttempt {
         if envelope.flags & protocol::OP_FLAG_RETRY == 0 {
             self.origin_epoch = None;
             self.started_ns = None;
+            // The rejection is authoritative, so a deferred signal may
+            // interrupt before the next dispatch.
+            self.must_complete = false;
+            self.signal_mask = None;
         }
     }
 
@@ -724,8 +719,8 @@ enum SendOutcome {
     /// The attempt failed before anything was transmitted and its slot has
     /// already been released.
     Released(Error),
-    /// This frame wrote no bytes, but an older attempt of the same logical
-    /// operation may still be ambiguous.
+    /// This frame wrote no bytes, but the logical operation may still be bound
+    /// to an earlier attempt.
     Interrupted(Error),
     /// Nothing was transmitted because the target connection was replaced, and
     /// the slot has already been released.

@@ -32,7 +32,7 @@ pub(super) fn acquire_bound_fid(
     let rebound = match client.rebind(fid, inode_id, credentials) {
         Ok(rebound) => rebound,
         Err(error) => {
-            // Even a resolved Tflush does not prove that a mutating request
+            // An error after dispatch does not prove that a mutating request
             // lacked side effects. Tclunk is idempotent for an absent fid and
             // is the only safe point at which the number can be recycled.
             let _ = client.clunk(fid);

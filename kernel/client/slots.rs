@@ -20,10 +20,7 @@ use super::errors::{
 use super::registry::is_tombstoned_locked;
 use super::session::{Dispatch, Session, SessionState, SessionStatus};
 use super::signals::{SendSignalMask, resume_interrupted_send, sleep_uninterruptible_tick};
-use super::tag_space::{
-    FIRST_NORMAL_TAG, NORMAL_TAG_COUNT, next_free_resident_tag, next_normal_index,
-    next_resident_count, normal_tag_index, normal_wire_tag,
-};
+use super::tag_space::{TAG_COUNT, next_free_resident_index, next_resident_count, next_tag_index};
 
 /// Outcome of one transmission on the session's current transport.
 pub(super) enum FrameSend {
@@ -115,7 +112,6 @@ pub(super) enum PendingState {
     Reserved,
     Sent,
     Completed(KVVec<u8>),
-    Consuming,
     Failed(ffi::c_int),
 }
 
@@ -131,12 +127,12 @@ pub(super) enum SlotReservation {
 
 impl Session {
     pub(super) fn slot_count(&self) -> usize {
-        NORMAL_TAG_COUNT
+        TAG_COUNT
     }
 
     /// Locate a wire tag in the interleaved shard table.
     ///
-    /// The numeric range is fixed by the protocol. A high ordinary tag whose
+    /// The numeric range is fixed by the protocol. A high tag whose
     /// slot has not become resident yet maps to a valid shard but no element;
     /// callers reject that through their subsequent `get`.
     pub(super) fn slot_shard(&self, tag: usize) -> Result<(&Mutex<KVVec<PendingSlot>>, usize)> {
@@ -163,7 +159,7 @@ impl Session {
         maximum_frame: usize,
         destination: Option<SlotDestination>,
         admission_jiffies: usize,
-        resolve_ambiguity: bool,
+        must_complete: bool,
         guarded_fids: &[u32],
     ) -> Result<SlotReservation> {
         let direct_read =
@@ -200,12 +196,12 @@ impl Session {
                 return Err(errno!(ESTALE));
             }
 
-            let resident = state.resident_normal_tags;
+            let resident = state.resident_tags;
             let cursor = state.next_tag;
-            if let Some(index) = next_free_resident_tag(resident, cursor, |start| {
-                state.normal_tags.next_zero_bit(start)
-            }) {
-                let candidate = normal_wire_tag(index).ok_or_else(protocol_errno)?;
+            if let Some(index) =
+                next_free_resident_index(resident, cursor, |start| state.tags.next_zero_bit(start))
+            {
+                let candidate = index;
                 let (shard, local_tag) = self.slot_shard(candidate)?;
                 let mut slots = shard.lock();
                 let slot = slots.get_mut(local_tag).ok_or_else(protocol_errno)?;
@@ -219,11 +215,11 @@ impl Session {
                     return Err(protocol_errno());
                 }
 
-                state.normal_tags.set_bit(index);
+                state.tags.set_bit(index);
                 slot.state = PendingState::Reserved;
                 slot.expected = Some(expected);
                 slot.maximum_frame = maximum_frame;
-                state.next_tag = next_normal_index(index, state.resident_normal_tags);
+                state.next_tag = next_tag_index(index, state.resident_tags);
                 drop(slots);
                 drop(state);
 
@@ -322,15 +318,14 @@ impl Session {
                 }
                 CondVarTimeoutResult::Signal { jiffies } => {
                     remaining = jiffies;
-                    if !resolve_ambiguity {
-                        // No earlier frame from this logical operation is
-                        // ambiguous, so a restart from the VFS entry point is
-                        // still safe.
+                    if !must_complete {
+                        // No earlier outcome requires this operation to stay
+                        // owned by the current syscall task.
                         return Err(ERESTARTSYS);
                     }
-                    // An ambiguous mutation must keep its operation ID even
-                    // while waiting for a tag. Pace an unmaskable pending
-                    // signal and stay inside the bounded recovery episode.
+                    // Keep the logical operation intact while waiting for a
+                    // tag. Pace an unmaskable pending signal and stay inside
+                    // the bounded recovery episode.
                     drop(state);
                     if !sleep_uninterruptible_tick(&mut remaining) {
                         return Err(ETIMEDOUT);
@@ -374,8 +369,8 @@ impl Session {
     /// Blocking them only then still keeps a started frame from being
     /// abandoned mid-stream, because the retry resumes at the exact cursor,
     /// and it saves two sigprocmask calls on every uninterrupted request. The
-    /// reply wait afterward observes the pending signal and retires the
-    /// request through Tflush.
+    /// reply wait afterward observes the pending signal and keeps ownership of
+    /// the request until its response is authoritative.
     fn transmit(
         &self,
         tag: usize,
@@ -393,7 +388,6 @@ impl Session {
             Err(failure) if !failure.started() && is_interrupted_error(failure.error()) => {
                 // mark_sent accounted for this tag, but a zero-progress send is
                 // still safe to release and return to the interrupted caller.
-                self.decrement_sent_count();
                 FrameSend::Interrupted(ERESTARTSYS)
             }
             Err(failure) => FrameSend::Broken(failure.error()),
@@ -424,7 +418,6 @@ impl Session {
             return Err(protocol_errno());
         }
         slot.state = PendingState::Sent;
-        self.sent_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -443,29 +436,14 @@ impl Session {
             return;
         };
         let unused_buffer = vacate_slot(slot);
-        clear_normal_tag_if_idle(&mut state, tag, slot);
+        clear_tag_if_idle(&mut state, tag, slot);
         drop(slots);
         drop(state);
         if let Some(buffer) = unused_buffer {
             self.recycle_reply_buffer(buffer);
         }
-        // Control tags live outside the ordinary bitmap, but releasing one can
-        // still unblock reserve_flush_tag(). Waking unconditionally also keeps
-        // allocation changes visible under the same release contract.
+        // Keep allocation changes visible under the same release contract.
         self.changed.notify_all();
-    }
-
-    /// Vacate one tag while the caller holds the session-state mutex.
-    ///
-    /// Flush completion uses this to retire its control tag and the original
-    /// request atomically.
-    pub(super) fn vacate_tag_locked(&self, state: &mut SessionState, tag: usize) -> Result<()> {
-        let (shard, local_tag) = self.slot_shard(tag)?;
-        let mut slots = shard.lock();
-        let slot = slots.get_mut(local_tag).ok_or_else(protocol_errno)?;
-        drop(vacate_slot(slot));
-        clear_normal_tag_if_idle(state, tag, slot);
-        Ok(())
     }
 
     /// Retire a tag's direct-delivery registration once no receiver holds it.
@@ -499,7 +477,7 @@ impl Session {
                 }
                 slot.destination = None;
                 drop(slots);
-                match self.release_normal_tag_if_idle(tag) {
+                match self.release_tag_if_idle(tag) {
                     Ok(_) => self.changed.notify_all(),
                     Err(error) => self.terminate(error),
                 }
@@ -526,21 +504,21 @@ impl Session {
         }
     }
 
-    /// Return an ordinary wire tag to the allocator once neither its request
+    /// Return a wire tag to the allocator once neither its request
     /// state nor a direct-read destination still owns it.
     ///
     /// Reply consumption vacates the slot under the shard lock alone. Taking
     /// `state` afterward and rechecking the slot preserves the global
     /// `state -> shard` order used by allocation.
-    pub(super) fn release_normal_tag_if_idle(&self, tag: usize) -> Result<bool> {
+    pub(super) fn release_tag_if_idle(&self, tag: usize) -> Result<bool> {
         let mut state = self.state.lock();
         let (shard, local_tag) = self.slot_shard(tag)?;
         let slots = shard.lock();
         let slot = slots.get(local_tag).ok_or_else(protocol_errno)?;
-        Ok(clear_normal_tag_if_idle(&mut state, tag, slot))
+        Ok(clear_tag_if_idle(&mut state, tag, slot))
     }
 
-    /// Extend every shard before publishing a larger ordinary-tag high-water
+    /// Extend every shard before publishing a larger tag high-water
     /// mark.
     ///
     /// Capacity is reserved without reclaim in a first pass because admission
@@ -552,14 +530,12 @@ impl Session {
     /// failure leaves the high-water mark unchanged, so the partially appended
     /// tail remains unreachable and a later attempt can finish it safely.
     fn grow_resident_slots(&self, state: &mut SessionState) -> Result<bool> {
-        let old = state.resident_normal_tags;
-        if old >= NORMAL_TAG_COUNT {
+        let old = state.resident_tags;
+        if old >= TAG_COUNT {
             return Ok(false);
         }
         let new = next_resident_count(old);
-        let total = FIRST_NORMAL_TAG
-            .checked_add(new)
-            .ok_or_else(protocol_errno)?;
+        let total = new;
         let shard_count = self.slot_shards.len();
         if shard_count == 0 {
             return Err(protocol_errno());
@@ -584,19 +560,19 @@ impl Session {
             }
         }
 
-        state.resident_normal_tags = new;
+        state.resident_tags = new;
         Ok(true)
     }
 }
 
-fn clear_normal_tag_if_idle(state: &mut SessionState, tag: usize, slot: &PendingSlot) -> bool {
-    let Some(index) = normal_tag_index(tag) else {
+fn clear_tag_if_idle(state: &mut SessionState, tag: usize, slot: &PendingSlot) -> bool {
+    if tag >= TAG_COUNT {
         return false;
-    };
+    }
     if !matches!(slot.state, PendingState::Vacant) || slot.destination.is_some() {
         return false;
     }
-    state.normal_tags.clear_bit(index);
+    state.tags.clear_bit(tag);
     true
 }
 
@@ -632,7 +608,6 @@ pub(super) enum ExpectedResponse {
     Renameat,
     Unlinkat,
     Readlink,
-    Flush,
     Read { maximum: usize },
     Write { maximum: usize },
     Fsync,
@@ -663,7 +638,6 @@ impl ExpectedResponse {
             Self::Renameat => "Trenameat",
             Self::Unlinkat => "Tunlinkat",
             Self::Readlink => "Treadlink",
-            Self::Flush => "Tflush",
             Self::Read { .. } => "Tread",
             Self::Write { .. } => "Twrite",
             Self::Fsync => "Tfsyncdur",
@@ -701,7 +675,9 @@ impl ExpectedResponse {
             Request::Trenameat { .. } => Self::Renameat,
             Request::Tunlinkat { .. } => Self::Unlinkat,
             Request::Treadlink { .. } => Self::Readlink,
-            Request::Tflush { .. } => Self::Flush,
+            // The native client resolves dispatched requests by retaining
+            // their original tag; it never sends an in-band cancellation.
+            Request::Tflush { .. } => return Err(protocol_errno()),
             Request::Tread { count, .. } => Self::Read {
                 maximum: *count as usize,
             },
@@ -720,7 +696,7 @@ impl ExpectedResponse {
     }
 
     pub(super) fn maximum_frame_size(self, msize: u32) -> Result<usize> {
-        let normal = match self {
+        let response = match self {
             Self::Version => msize as usize,
             Self::Lineage => HEADER_SIZE + 2 * 8,
             Self::Rebind => HEADER_SIZE + protocol::QID_WIRE_SIZE,
@@ -745,7 +721,6 @@ impl ExpectedResponse {
             Self::Readlink => {
                 (msize as usize).min(HEADER_SIZE + core::mem::size_of::<u16>() + u16::MAX as usize)
             }
-            Self::Flush => HEADER_SIZE,
             Self::Read { maximum } | Self::Readdirattr { maximum } => (HEADER_SIZE + 4)
                 .checked_add(maximum)
                 .ok_or_else(message_size_errno)?,
@@ -759,7 +734,7 @@ impl ExpectedResponse {
             Self::Getlock => (msize as usize)
                 .min(HEADER_SIZE + 1 + 8 + 8 + 4 + core::mem::size_of::<u16>() + u16::MAX as usize),
         };
-        let maximum = normal.max(HEADER_SIZE + 4);
+        let maximum = response.max(HEADER_SIZE + 4);
         if maximum > msize as usize {
             Err(message_size_errno())
         } else {
@@ -790,7 +765,6 @@ impl ExpectedResponse {
             Self::Renameat => protocol::message_type::RRENAMEAT,
             Self::Unlinkat => protocol::message_type::RUNLINKAT,
             Self::Readlink => protocol::message_type::RREADLINK,
-            Self::Flush => protocol::message_type::RFLUSH,
             Self::Read { .. } => protocol::message_type::RREAD,
             Self::Write { .. } => protocol::message_type::RWRITE,
             Self::Fsync => protocol::message_type::RFSYNC,
@@ -823,7 +797,6 @@ impl ExpectedResponse {
                 | (Self::Renameat, Response::Rrenameat)
                 | (Self::Unlinkat, Response::Runlinkat)
                 | (Self::Readlink, Response::Rreadlink(_))
-                | (Self::Flush, Response::Rflush)
                 | (Self::Fsync, Response::Rfsync)
                 | (Self::Clunk, Response::Rclunk)
                 | (Self::Statfs, Response::Rstatfs(_))

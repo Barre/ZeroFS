@@ -1,6 +1,6 @@
 use core::{
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 use kernel::{
@@ -24,11 +24,9 @@ use super::reconnect::ProbedCandidate;
 use super::registry::{CredentialSlot, FidSlot, LockRecord};
 use super::signals::sleep_uninterruptible_tick;
 use super::slots::{PendingSlot, PendingState, vacate_slot};
-use super::tag_space::normal_tag_index;
 use super::{
-    CLIENT_ID_LEN, FIRST_NORMAL_TAG, INITIAL_PENDING_TAGS, MAX_REPLY_WAITERS, NO_PROBE_TAG,
-    NORMAL_TAG_COUNT, RECEIVE_BATCH_BYTES, ROOT_FID, SLOT_SHARDS, SMALL_REPLY_BUFFERS,
-    SMALL_REPLY_BYTES, jiffies_for_ms,
+    CLIENT_ID_LEN, INITIAL_PENDING_TAGS, MAX_REPLY_WAITERS, NO_PROBE_TAG, RECEIVE_BATCH_BYTES,
+    ROOT_FID, SLOT_SHARDS, SMALL_REPLY_BUFFERS, SMALL_REPLY_BYTES, TAG_COUNT, jiffies_for_ms,
 };
 
 #[pin_data]
@@ -61,7 +59,7 @@ pub(super) struct Session {
     pub(super) receive_generation: AtomicU64,
     /// Set while an in-band liveness probe is active.
     pub(super) probe_in_flight: AtomicBool,
-    /// Receiver-owned normal tag of the one outstanding liveness probe.
+    /// Receiver-owned tag of the one outstanding liveness probe.
     pub(super) liveness_probe_tag: AtomicU32,
     /// Lock-free mirror of `SessionState::connection_epoch`.
     ///
@@ -70,10 +68,6 @@ pub(super) struct Session {
     /// wins its tag lock and is published, or observes that its stream has
     /// already been retired.
     pub(super) active_epoch: AtomicU64,
-    /// Frames written to the current connection whose reply is not published
-    /// yet. Kept outside `state` because the receiver updates it for every
-    /// frame; Tflush is the only other reader or writer.
-    pub(super) sent_count: AtomicUsize,
     /// Outstanding registered reads whose payload cannot fit the accumulator.
     ///
     /// Nonzero means the next frame is likely a bulk read, so an empty
@@ -131,21 +125,20 @@ pub(super) struct SessionState {
     /// published so termination can shut it down instead of waiting it out.
     pub(super) candidate: Option<Arc<SocketTransport>>,
     /// Bumped whenever the tag namespace is invalidated, which is exactly when
-    /// a connection is retired. A reply, a failure or a Tflush that names an
-    /// older epoch belongs to a connection nobody can answer on any more.
+    /// a connection is retired. A reply or failure that names an older epoch
+    /// belongs to a connection nobody can answer on any more.
     pub(super) connection_epoch: u64,
     /// Durability lineage of the current connection.
     lineage: Rgetlineage,
-    /// Ordinary tag ownership, indexed independently of the four low control
-    /// tags. A bit stays set through reply consumption until any direct-read
-    /// destination has also been released.
-    pub(super) normal_tags: BitmapVec,
-    /// Prefix of `normal_tags` whose backing slots are resident.
+    /// Wire-tag ownership. A bit stays set through reply consumption until any
+    /// direct-read destination has also been released.
+    pub(super) tags: BitmapVec,
+    /// Prefix of `tags` whose backing slots are resident.
     ///
     /// The high-water mark only grows. It is published after every shard has
     /// been extended, so a resident numeric tag is always addressable.
-    pub(super) resident_normal_tags: usize,
-    /// Next ordinary bitmap index considered by the cyclic allocator.
+    pub(super) resident_tags: usize,
+    /// Next bitmap index considered by the cyclic allocator.
     pub(super) next_tag: usize,
     pub(super) next_fid: u32,
     pub(super) recycled_fids: KVec<u32>,
@@ -251,12 +244,10 @@ impl Session {
             lineage,
             target,
         } = candidate;
-        let slot_count = INITIAL_PENDING_TAGS
-            .checked_add(FIRST_NORMAL_TAG)
-            .ok_or_else(|| EOVERFLOW)?;
+        let slot_count = INITIAL_PENDING_TAGS;
         let slot_shards = vacant_slot_shards(slot_count)?;
         let reply_waiters = reply_waiter_queues(slot_count)?;
-        let normal_tags = BitmapVec::new(NORMAL_TAG_COUNT, GFP_KERNEL)?;
+        let tags = BitmapVec::new(TAG_COUNT, GFP_KERNEL)?;
 
         let timeout_jiffies = msecs_to_jiffies(timeout_ms) as usize;
         // Endpoint::validate already rejected a zero timeout, but a small
@@ -282,7 +273,6 @@ impl Session {
                 probe_in_flight: AtomicBool::new(false),
                 liveness_probe_tag: AtomicU32::new(NO_PROBE_TAG),
                 active_epoch: AtomicU64::new(0),
-                sent_count: AtomicUsize::new(0),
                 bulk_reads: AtomicU32::new(0),
                 send_lock <- new_mutex!(()),
                 request_in_flight <- new_mutex!(0usize),
@@ -299,8 +289,8 @@ impl Session {
                     candidate: None,
                     connection_epoch: 0,
                     lineage,
-                    normal_tags,
-                    resident_normal_tags: INITIAL_PENDING_TAGS,
+                    tags,
+                    resident_tags: INITIAL_PENDING_TAGS,
                     next_tag: 0,
                     next_fid: ROOT_FID + 1,
                     recycled_fids: KVec::new(),
@@ -357,7 +347,7 @@ impl Session {
     pub(super) fn dispatch_or_wait(
         &self,
         budget_jiffies: usize,
-        resolve_ambiguity: bool,
+        must_complete: bool,
     ) -> Result<Dispatch> {
         let mut remaining = budget_jiffies.min(self.grace_jiffies());
         loop {
@@ -381,16 +371,14 @@ impl Session {
                 CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
                 CondVarTimeoutResult::Signal { jiffies } => {
                     remaining = jiffies;
-                    if !resolve_ambiguity {
-                        // Nothing from this logical operation is ambiguous.
-                        // Preserve normal restart semantics for a signal that
-                        // interrupts its initial dispatch gate.
+                    if !must_complete {
+                        // Nothing requires this logical operation to remain
+                        // owned by the current syscall task.
                         return Err(ERESTARTSYS);
                     }
-                    // A prior attempt of this mutation may already have been
-                    // applied. Letting ERESTARTSYS escape would mint a new
-                    // operation ID on transparent syscall restart, so pace the
-                    // pending signal and keep resolving the original ID.
+                    // A prior mutation may already have applied, or a signal
+                    // may have arrived after dispatch. Keep resolving the same
+                    // operation instead of escaping through ERESTARTSYS.
                     drop(state);
                     if !sleep_uninterruptible_tick(&mut remaining) {
                         return Err(ETIMEDOUT);
@@ -511,7 +499,6 @@ impl Session {
         state.connection_epoch = state.connection_epoch.wrapping_add(1);
         self.active_epoch
             .store(state.connection_epoch, Ordering::Release);
-        self.sent_count.store(0, Ordering::Relaxed);
         for shard in self.slot_shards.iter() {
             let mut slots = shard.as_ref().get_ref().lock();
             for slot in slots.iter_mut() {
@@ -541,8 +528,8 @@ impl Session {
                             .is_ok()
                     {
                         drop(vacate_slot(slot));
-                        if let Some(index) = normal_tag_index(tag) {
-                            state.normal_tags.clear_bit(index);
+                        if tag < TAG_COUNT {
+                            state.tags.clear_bit(tag);
                         }
                         self.probe_in_flight.store(false, Ordering::Release);
                     }
@@ -552,16 +539,6 @@ impl Session {
             self.probe_in_flight.store(false, Ordering::Release);
         }
         true
-    }
-
-    pub(super) fn decrement_sent_count(&self) {
-        // Retirement may reset this advisory count while a reply that already
-        // won its tag lock finishes.
-        let _ = self
-            .sent_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                Some(count.saturating_sub(1))
-            });
     }
 
     /// Wake every wait that observes `SessionStatus`.
@@ -593,13 +570,6 @@ impl Session {
         let mut state = self.state.lock();
         if let SessionStatus::Dead(status) = state.status {
             return Err(Error::from_errno(status));
-        }
-        // A completed Rflush is a stream-consumption barrier owned by an
-        // interrupted caller. Vacating it here would make that caller's
-        // completion path see a slot it never consumed, so let the owner
-        // finish and dial again.
-        if self.flush_reply_pending() {
-            return Err(EAGAIN);
         }
         // The retired stream's bytes went with its socket.
         receive.buffered = 0;
