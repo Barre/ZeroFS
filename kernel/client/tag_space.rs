@@ -1,38 +1,9 @@
 //! Pure wire-tag layout and cursor arithmetic.
 
-/// Cancellation tags that remain available even when every ordinary tag is
-/// occupied.
-pub(crate) const FLUSH_SLOTS: usize = 4;
+/// Every usable `u16` tag. `NOTAG` remains reserved by 9P.
+pub(crate) const TAG_COUNT: usize = u16::MAX as usize;
 
-/// First wire tag available to ordinary requests.
-pub(crate) const FIRST_NORMAL_TAG: usize = FLUSH_SLOTS;
-
-/// Every usable `u16` tag other than the cancellation band.
-pub(crate) const NORMAL_TAG_COUNT: usize = u16::MAX as usize - FLUSH_SLOTS;
-
-/// Convert an ordinary wire tag to its allocation-bitmap index.
-pub(crate) const fn normal_tag_index(tag: usize) -> Option<usize> {
-    if tag >= FIRST_NORMAL_TAG && tag < u16::MAX as usize {
-        Some(tag - FIRST_NORMAL_TAG)
-    } else {
-        None
-    }
-}
-
-/// Convert an allocation-bitmap index to its ordinary wire tag.
-pub(crate) const fn normal_wire_tag(index: usize) -> Option<usize> {
-    if index < NORMAL_TAG_COUNT {
-        Some(index + FIRST_NORMAL_TAG)
-    } else {
-        None
-    }
-}
-
-pub(crate) const fn is_flush_tag(tag: usize) -> bool {
-    tag < FIRST_NORMAL_TAG
-}
-
-pub(crate) const fn next_normal_index(index: usize, resident: usize) -> usize {
+pub(crate) const fn next_tag_index(index: usize, resident: usize) -> usize {
     if index + 1 < resident { index + 1 } else { 0 }
 }
 
@@ -42,12 +13,12 @@ pub(crate) const fn next_normal_index(index: usize, resident: usize) -> usize {
 /// `next_zero` is the backing bitmap's "find next clear bit" operation. Keeping
 /// the range and wrap policy here makes the production allocator independently
 /// testable without emulating the kernel bitmap type.
-pub(crate) fn next_free_resident_tag(
+pub(crate) fn next_free_resident_index(
     resident: usize,
     cursor: usize,
     mut next_zero: impl FnMut(usize) -> Option<usize>,
 ) -> Option<usize> {
-    let resident = resident.min(NORMAL_TAG_COUNT);
+    let resident = resident.min(TAG_COUNT);
     if resident == 0 {
         return None;
     }
@@ -67,14 +38,14 @@ pub(crate) fn next_free_resident_tag(
     None
 }
 
-/// Geometric high-water growth, capped by the complete ordinary namespace.
+/// Geometric high-water growth, capped by the complete wire namespace.
 pub(crate) fn next_resident_count(current: usize) -> usize {
-    if current >= NORMAL_TAG_COUNT {
-        return NORMAL_TAG_COUNT;
+    if current >= TAG_COUNT {
+        return TAG_COUNT;
     }
     current
         .checked_mul(2)
-        .unwrap_or(NORMAL_TAG_COUNT)
+        .unwrap_or(TAG_COUNT)
         .max(current.saturating_add(1))
-        .min(NORMAL_TAG_COUNT)
+        .min(TAG_COUNT)
 }

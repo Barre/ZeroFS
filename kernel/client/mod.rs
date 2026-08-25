@@ -28,8 +28,8 @@
 //!
 //! [`session`] holds connection state, [`slots`] the tag table, [`retry`] request
 //! transmission, [`receive`] socket reads and reply routing, and [`reply`] each
-//! caller's tag wait. [`flush`] cancels interrupted requests; [`signals`] owns
-//! the task signal masks used while sending and cancelling.
+//! caller's tag wait. [`signals`] owns the task signal masks used to finish
+//! dispatched stream operations without abandoning their replies.
 //!
 //! [`registry`] records fid and lock replay state and interns credentials,
 //! [`durability`] tracks the obligations an `fsync` has to cover, [`retry`]
@@ -42,7 +42,6 @@
 mod durability;
 mod endpoint;
 mod errors;
-mod flush;
 mod ops;
 mod receive;
 mod reconnect;
@@ -72,13 +71,13 @@ use crate::protocol::{self, HEADER_SIZE, Qid};
 use self::errors::not_connected_errno;
 use self::reconnect::bootstrap_connection;
 use self::session::Session;
-use self::tag_space::{FIRST_NORMAL_TAG, NORMAL_TAG_COUNT};
+use self::tag_space::TAG_COUNT;
 
 /// Smallest useful 9P message size accepted by this client.
 pub(crate) const MIN_MSIZE: u32 = 4096;
 
 const MAX_INFLIGHT_REQUESTS: usize = 1024;
-const _: () = assert!(MAX_INFLIGHT_REQUESTS < NORMAL_TAG_COUNT);
+const _: () = assert!(MAX_INFLIGHT_REQUESTS < TAG_COUNT);
 
 /// Fid installed for the root during synchronous bootstrap.
 pub(crate) const ROOT_FID: u32 = 1;
@@ -138,8 +137,8 @@ const _: () = assert!(
 const INITIAL_PENDING_TAGS: usize = 1024;
 const _: () = assert!(
     INITIAL_PENDING_TAGS >= 2
-        && INITIAL_PENDING_TAGS <= NORMAL_TAG_COUNT
-        && FIRST_NORMAL_TAG + NORMAL_TAG_COUNT == protocol::NOTAG as usize
+        && INITIAL_PENDING_TAGS <= TAG_COUNT
+        && TAG_COUNT == protocol::NOTAG as usize
 );
 
 /// Bound the fixed waiter set while the tag table grows.
@@ -161,7 +160,7 @@ const SLOT_SHARDS: usize = 64;
 /// pair with the server's result retention, not a client tuning knob.
 const MUTATION_RETRY_HORIZON_MS: u64 = protocol::retry::MUTATION_RETRY_HORIZON.as_millis() as u64;
 
-/// Sentinel stored while no receiver-owned liveness probe has a normal tag.
+/// Sentinel stored while no receiver-owned liveness probe has a tag.
 const NO_PROBE_TAG: u32 = u32::MAX;
 
 /// Most server addresses one mount will rotate through.

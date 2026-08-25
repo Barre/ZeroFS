@@ -18,7 +18,6 @@ use super::errors::{codec_errno, not_connected_errno, protocol_errno};
 use super::reply::OwnedFrame;
 use super::session::{ReceiveLink, Session, SessionStatus};
 use super::slots::{PendingSlot, PendingState};
-use super::tag_space::{is_flush_tag, normal_tag_index};
 use super::{READ_PAYLOAD_OFFSET, SMALL_REPLY_BYTES};
 
 unsafe extern "C" {
@@ -93,9 +92,9 @@ impl Session {
                 frame.clear();
                 return Ok(frame);
             }
-            // Keep fallback allocations pool-compatible. Otherwise one flush
-            // that discards an unused pooled frame would permanently shrink
-            // the pool because its exact-sized replacement could not return.
+            // Keep fallback allocations pool-compatible. Otherwise dropping
+            // an unused pooled frame would permanently shrink the pool because
+            // its exact-sized replacement could not return.
             let _nofs = NoFsAllocation::enter();
             return Ok(KVVec::with_capacity(SMALL_REPLY_BYTES, GFP_KERNEL)?);
         }
@@ -119,33 +118,19 @@ impl Session {
     ///
     /// A connected idle session deliberately passes this gate and sleeps in
     /// `recvmsg`: request waiters probe only when the entire connection stops
-    /// making receive progress. Only a completed Rflush pauses consumption,
-    /// because its owner must decide the fate of the request it cancelled
-    /// before any following stream bytes are interpreted.
+    /// making receive progress.
     fn next_io_phase(&self) -> IoPhase {
-        let mut state = self.state.lock();
-        loop {
-            if let SessionStatus::Dead(status) = state.status {
-                return IoPhase::Exit(status);
-            }
-            // SAFETY: This is the connection kthread created by Client.
-            if unsafe { bindings::kthread_should_stop() } {
-                return IoPhase::Exit(0);
-            }
-            match state.status {
-                SessionStatus::Lost => return IoPhase::Reconnect,
-                SessionStatus::Connected if !self.flush_reply_pending() => {
-                    return IoPhase::Receive(ReceiveLink {
-                        transport: state.transport.clone(),
-                        epoch: state.connection_epoch,
-                    });
-                }
-                SessionStatus::Connected | SessionStatus::Dead(_) => {}
-            }
-            // The timeout exists only to recheck kthread_should_stop().
-            let _ = self
-                .changed
-                .wait_interruptible_timeout(&mut state, self.timeout_jiffies);
+        let state = self.state.lock();
+        // SAFETY: This is the connection kthread created by Client.
+        let should_stop = unsafe { bindings::kthread_should_stop() };
+        match state.status {
+            SessionStatus::Dead(status) => IoPhase::Exit(status),
+            _ if should_stop => IoPhase::Exit(0),
+            SessionStatus::Connected => IoPhase::Receive(ReceiveLink {
+                transport: state.transport.clone(),
+                epoch: state.connection_epoch,
+            }),
+            SessionStatus::Lost => IoPhase::Reconnect,
         }
     }
 
@@ -171,8 +156,7 @@ impl Session {
                     loop {
                         let ReceiveState { buffer, buffered } = &mut *receive;
                         match self.receive_available(&link, buffer.as_mut_slice(), buffered) {
-                            Ok(false) => {}
-                            Ok(true) => break,
+                            Ok(()) => {}
                             Err(error) => {
                                 drop(receive);
                                 // An earlier caller retirement has already
@@ -332,7 +316,7 @@ impl Session {
         link: &ReceiveLink,
         buffer: &mut [u8],
         buffered: &mut usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         if *buffered > buffer.len() {
             return Err(protocol_errno());
         }
@@ -341,7 +325,6 @@ impl Session {
         loop {
             let mut offset = 0usize;
             let mut published = false;
-            let mut flush_barrier = false;
             while buffered.saturating_sub(offset) >= HEADER_SIZE {
                 let header_end = offset.checked_add(HEADER_SIZE).ok_or_else(protocol_errno)?;
                 let header_bytes = buffer.get(offset..header_end).ok_or_else(protocol_errno)?;
@@ -350,9 +333,6 @@ impl Session {
                 let frame_size = header.size as usize;
                 let available = buffered.saturating_sub(offset);
 
-                // An Rread can never use a reserved cancellation tag, whose
-                // slots only expect Rflush, so taking this path cannot
-                // step over the Tflush consumption barrier below.
                 if header.type_ == protocol::message_type::RREAD {
                     if frame_size < READ_PAYLOAD_OFFSET {
                         return Err(protocol_errno());
@@ -411,17 +391,8 @@ impl Session {
                 let frame_bytes = buffer.get(offset..frame_end).ok_or_else(protocol_errno)?;
                 let frame = self.frame_with_prefix(link, header, frame_bytes)?;
                 offset = frame_end;
-                let tag =
-                    self.publish_incoming_frame(link, header, PublishedPayload::Frame(frame))?;
+                self.publish_incoming_frame(link, header, PublishedPayload::Frame(frame))?;
                 published = true;
-
-                // Preserve the existing Tflush consumption barrier. Bytes
-                // already received after Rflush stay buffered until its owner
-                // vacates its cancellation slot.
-                if is_flush_tag(tag) {
-                    flush_barrier = true;
-                    break;
-                }
             }
 
             let remaining = buffered.checked_sub(offset).ok_or_else(protocol_errno)?;
@@ -431,12 +402,12 @@ impl Session {
             *buffered = remaining;
 
             if published {
-                return Ok(flush_barrier);
+                return Ok(());
             }
             if received {
                 // An incomplete buffered frame necessarily belongs to an
                 // outstanding request.
-                return Ok(false);
+                return Ok(());
             }
 
             let mut destination = buffer.get_mut(*buffered..).ok_or_else(protocol_errno)?;
@@ -490,7 +461,7 @@ impl Session {
         link: &ReceiveLink,
         header: protocol::Header,
         payload: PublishedPayload,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         if let PublishedPayload::Frame(frame) = &payload {
             if frame.len() != header.size as usize {
                 return Err(protocol_errno());
@@ -529,17 +500,14 @@ impl Session {
         }
         drop(slots);
 
-        self.decrement_sent_count();
         if self.finish_liveness_probe(tag, link.epoch)? {
-            return Ok(tag);
+            return Ok(());
         }
         // Keep liveness accounting outside the tag critical section. No
         // waiter needs it in order to consume a reply already marked complete.
         self.note_received_frame();
-        if normal_tag_index(tag).is_some() {
-            self.wake_reply_waiter(tag)?;
-        }
-        Ok(tag)
+        self.wake_reply_waiter(tag)?;
+        Ok(())
     }
 
     /// Fill the preallocated frame with its accumulated prefix.

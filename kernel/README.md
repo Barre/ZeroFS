@@ -16,6 +16,14 @@ durability barriers, and remote `statfs`. One connection per mount carries
 tagged requests whose replies may complete out of order; a dedicated receiver
 routes each reply to its waiting VFS caller.
 
+Signals may interrupt an operation before its request enters the stream. Once
+dispatched, the client retains the tag and defers the signal until an
+authoritative reply settles the operation. A transport failure resends the same
+logical operation after replay; the native client does not send `Tflush`.
+A signal received after dispatch, including a fatal signal, may therefore
+remain pending through reply deadlines and the reconnect grace period. This
+applies to reads as well as mutations.
+
 ## Connection parameters
 
 The mount source selects the transport:

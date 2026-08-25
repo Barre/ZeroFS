@@ -4,7 +4,6 @@ use core::sync::atomic::Ordering;
 use kernel::{
     alloc::KVVec,
     bindings,
-    error::code::ERESTARTSYS,
     prelude::*,
     sync::{CondVar, CondVarTimeoutResult},
 };
@@ -12,15 +11,14 @@ use kernel::{
 use crate::protocol::{self, Request, Response};
 
 use super::errors::{codec_errno, not_connected_errno, protocol_errno};
-use super::flush::FlushOutcome;
 use super::receive::validate_response_frame;
 use super::retry::{AttemptOutcome, OpAttempt};
 use super::session::{Dispatch, Session};
-use super::signals::{sleep_uninterruptible_tick, SendSignalMask};
+use super::signals::sleep_uninterruptible_tick;
 use super::slots::{
-    vacate_slot, ExpectedResponse, FrameSend, PendingSlot, PendingState, SlotReservation,
+    ExpectedResponse, FrameSend, PendingSlot, PendingState, SlotReservation, vacate_slot,
 };
-use super::{jiffies_for_ms, NO_PROBE_TAG, PROBE_TIMEOUT_MS};
+use super::{NO_PROBE_TAG, PROBE_TIMEOUT_MS, jiffies_for_ms};
 
 pub(super) struct OwnedFrame<'a> {
     pub(super) bytes: ReplyBytes<'a>,
@@ -132,10 +130,6 @@ impl Session {
         let reply_waiter = self.reply_waiter(tag)?;
         let (shard, local_tag) = self.slot_shard(tag)?;
         let mut remaining = self.timeout_jiffies;
-        // Set once cancellation has been declined. The guard blocks ordinary
-        // signals; the loop paces the two unmaskable ones against the same
-        // reply deadline.
-        let mut uncancellable: Option<SendSignalMask> = None;
         let mut observed_receive_generation = self.receive_generation();
         loop {
             let mut slots = shard.lock();
@@ -147,7 +141,7 @@ impl Session {
                 PendingState::Completed(_) => {
                     let reply = take_completed_reply(slot);
                     drop(slots);
-                    self.release_normal_tag_if_idle(tag)?;
+                    self.release_tag_if_idle(tag)?;
                     self.changed.notify_all();
                     let Some(reply) = reply else {
                         return Err(protocol_errno());
@@ -161,26 +155,9 @@ impl Session {
                     return Err(error);
                 }
                 PendingState::Reserved | PendingState::Sent => {}
-                PendingState::Consuming | PendingState::Vacant => {
+                PendingState::Vacant => {
                     return Err(protocol_errno());
                 }
-            }
-
-            if uncancellable.is_some() || attempt.is_resolving_ambiguity() {
-                // SIGKILL and SIGSTOP cannot be masked. Pace their immediate
-                // wakeups without abandoning the tag that still owns the
-                // eventual reply.
-                drop(slots);
-                if sleep_uninterruptible_tick(&mut remaining) {
-                    continue;
-                }
-                self.handle_quiet_reply_window(
-                    tag,
-                    dispatch,
-                    &mut observed_receive_generation,
-                )?;
-                remaining = self.timeout_jiffies;
-                continue;
             }
 
             match reply_waiter.wait_interruptible_timeout(&mut slots, remaining) {
@@ -195,7 +172,25 @@ impl Session {
                         continue;
                     }
                     drop(slots);
-                    self.try_cancel_on_signal(tag, dispatch, attempt, &mut uncancellable)?;
+                    if attempt.must_complete() {
+                        // An unmaskable signal, or a failed mask installation,
+                        // can wake the interruptible condvar immediately. Pace
+                        // only that case; masked waits remain event-driven.
+                        if !sleep_uninterruptible_tick(&mut remaining) {
+                            self.handle_quiet_reply_window(
+                                tag,
+                                dispatch,
+                                &mut observed_receive_generation,
+                            )?;
+                            remaining = self.timeout_jiffies;
+                        }
+                    } else {
+                        // ZeroFS does not abort dispatched work. Keep this tag
+                        // and logical operation until its terminal reply,
+                        // including across a connection replacement. The
+                        // signal remains pending until the operation settles.
+                        attempt.defer_signal();
+                    }
                 }
                 CondVarTimeoutResult::Timeout => {
                     drop(slots);
@@ -366,7 +361,7 @@ impl Session {
         let mut slots = shard.lock();
         let reply = slots.get_mut(local_tag).and_then(take_completed_reply);
         drop(slots);
-        self.release_normal_tag_if_idle(tag)?;
+        self.release_tag_if_idle(tag)?;
         self.changed.notify_all();
 
         let Some(reply) = reply else {
@@ -397,68 +392,6 @@ impl Session {
                 self.probe_in_flight.store(false, Ordering::Release);
                 self.terminate(error);
                 Err(error)
-            }
-        }
-    }
-
-    /// Act on a signal that interrupted a wait for `tag` while its slot was
-    /// still unresolved.
-    ///
-    /// Runs with the session lock dropped, because cancellation takes it again.
-    fn try_cancel_on_signal(
-        &self,
-        tag: usize,
-        dispatch: &Dispatch,
-        attempt: &mut OpAttempt,
-        uncancellable: &mut Option<SendSignalMask>,
-    ) -> Result<()> {
-        // Keep the exact task mask alive until the cancellation outcome is
-        // known. If the flush becomes ambiguous, ownership moves to OpAttempt
-        // so reconnect and replay cannot be interrupted by the same signal.
-        let signal_mask = match SendSignalMask::block() {
-            Ok(signal_mask) => signal_mask,
-            Err(error) => {
-                // Do not leave the original Sent tag registered if signal-mask
-                // setup itself fails. Retiring the stream is conservative but
-                // preserves the tag and frame-ownership invariants.
-                return match self.fail_flush_preserving_original(
-                    tag,
-                    None,
-                    error,
-                    dispatch.epoch,
-                )? {
-                    FlushOutcome::OriginalReady => Ok(()),
-                    FlushOutcome::ConnectionLost => {
-                        attempt.resolve_uncertain_flush(None);
-                        Err(not_connected_errno())
-                    }
-                    // fail_flush_preserving_original cannot manufacture either
-                    // of these outcomes without reserving and completing a
-                    // flush, which did not happen on this path.
-                    FlushOutcome::Cancelled | FlushOutcome::NotCancelled => Err(protocol_errno()),
-                };
-            }
-        };
-        match self.flush_interrupted_request(tag, dispatch.epoch)? {
-            FlushOutcome::OriginalReady => Ok(()),
-            // Rflush is the protocol cancellation boundary.
-            // Signal disposition decides whether userspace ultimately sees
-            // EINTR or the syscall is transparently restarted.
-            FlushOutcome::Cancelled => Err(ERESTARTSYS),
-            FlushOutcome::NotCancelled => {
-                // Cancellation capacity is exhausted. Abandoning the tag here
-                // would leak it and its preallocated reply buffer, because the
-                // reply still arrives and still needs an owner, so complete
-                // the operation instead of interrupting it.
-                *uncancellable = Some(signal_mask);
-                Ok(())
-            }
-            FlushOutcome::ConnectionLost => {
-                attempt.resolve_uncertain_flush(Some(signal_mask));
-                // The failure that made Tflush ambiguous may itself have been
-                // EINTR (for example from an unmaskable signal during socket
-                // I/O).
-                Err(not_connected_errno())
             }
         }
     }
