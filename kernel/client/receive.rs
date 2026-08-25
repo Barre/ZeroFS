@@ -19,7 +19,7 @@ use super::reply::OwnedFrame;
 use super::session::{ReceiveLink, Session, SessionStatus};
 use super::slots::{PendingSlot, PendingState};
 use super::tag_space::{is_flush_tag, normal_tag_index};
-use super::{READ_PAYLOAD_OFFSET, SMALL_REPLY_BYTES, monotonic_ns};
+use super::{READ_PAYLOAD_OFFSET, SMALL_REPLY_BYTES};
 
 unsafe extern "C" {
     fn zerofs_client_memalloc_nofs_save() -> ffi::c_uint;
@@ -118,8 +118,8 @@ impl Session {
     /// Select the connection task's next phase.
     ///
     /// A connected idle session deliberately passes this gate and sleeps in
-    /// `recvmsg`: request waiters own response deadlines and shut the socket
-    /// down when one expires. Only a completed Rflush pauses consumption,
+    /// `recvmsg`: request waiters probe only when the entire connection stops
+    /// making receive progress. Only a completed Rflush pauses consumption,
     /// because its owner must decide the fate of the request it cancelled
     /// before any following stream bytes are interpreted.
     fn next_io_phase(&self) -> IoPhase {
@@ -530,10 +530,12 @@ impl Session {
         drop(slots);
 
         self.decrement_sent_count();
-        // Keep the clocksource read outside the tag critical section. On KVM
-        // this is visible in profiles, and no waiter needs the timestamp to
-        // consume a reply that is already complete.
-        self.last_frame_ns.store(monotonic_ns(), Ordering::Relaxed);
+        if self.finish_liveness_probe(tag, link.epoch)? {
+            return Ok(tag);
+        }
+        // Keep liveness accounting outside the tag critical section. No
+        // waiter needs it in order to consume a reply already marked complete.
+        self.note_received_frame();
         if normal_tag_index(tag).is_some() {
             self.wake_reply_waiter(tag)?;
         }

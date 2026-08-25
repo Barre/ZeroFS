@@ -118,7 +118,7 @@ module_parameter!(
 module_parameter!(
     request_timeout_ms: u32 = 5_000,
     ops: param_ops_uint,
-    description: "Per-phase ZeroFS I/O and wait timeout in milliseconds"
+    description: "Per-phase ZeroFS I/O, admission, and receive-silence timeout in milliseconds"
 );
 module_parameter!(
     reconnect_grace_ms: u32 = 120_000,

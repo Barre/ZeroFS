@@ -451,7 +451,8 @@ impl Client {
     ///
     /// `attempt` is marked as dispatched at the send and not once the reply
     /// wait ends: the retry horizon bounds the age of the frame that created
-    /// the ambiguity, and the wait that follows is bounded only by liveness.
+    /// the ambiguity. The reply wait itself may remain open while the shared
+    /// connection keeps making receive progress.
     fn resolve_send<'a>(
         &'a self,
         tag: usize,
@@ -648,9 +649,8 @@ impl OpAttempt {
     ///
     /// Called at the send rather than once the outcome is known, so the horizon
     /// runs from the frame that created the ambiguity. Stamping it after the
-    /// reply wait would extend the effective window by that wait, which the
-    /// liveness extensions can stretch well past the margin the server's
-    /// result retention leaves beyond the horizon.
+    /// reply wait would extend the effective window by that wait, which may
+    /// remain open as long as the connection keeps making receive progress.
     fn note_dispatched(&mut self, envelope: MutationEnvelope) {
         if !self.has_op_id() {
             return;

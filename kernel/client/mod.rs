@@ -161,17 +161,8 @@ const SLOT_SHARDS: usize = 64;
 /// pair with the server's result retention, not a client tuning knob.
 const MUTATION_RETRY_HORIZON_MS: u64 = protocol::retry::MUTATION_RETRY_HORIZON.as_millis() as u64;
 
-/// Maximum age of a decoded frame accepted as proof that a peer is alive.
-///
-/// Clamped below the reply timeout in [`Session::new`] so the evidence is
-/// always fresher than the wait that consumed it.
-const LIVENESS_WINDOW_MS: u64 = 3_000;
-
-/// Maximum liveness extensions for one unresolved control or request reply.
-///
-/// Both passive traffic and an explicit probe consume this same finite budget,
-/// so a selectively unresponsive peer cannot keep a caller unkillable forever.
-const MAX_LIVENESS_EXTENSIONS: u32 = 7;
+/// Sentinel stored while no receiver-owned liveness probe has a normal tag.
+const NO_PROBE_TAG: u32 = u32::MAX;
 
 /// Most server addresses one mount will rotate through.
 ///
@@ -297,8 +288,8 @@ impl Client {
         let negotiated_msize = bootstrapped.candidate.negotiated_msize;
         // Bootstrap needs a finite receive deadline because no request waiter
         // can retire a silent candidate. From here the session receiver owns
-        // the socket wait, while ordinary callers enforce response deadlines
-        // and shut the transport down when one expires.
+        // the socket wait, while ordinary callers detect connection-wide
+        // receive silence and retire the transport after a failed probe.
         bootstrapped.candidate.transport.set_blocking_receive()?;
         let session = Session::new(endpoint, bootstrapped.candidate)?;
         // Failing here drops the transport, so the server's connection guard

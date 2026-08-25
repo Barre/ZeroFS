@@ -684,8 +684,8 @@ fn probe_target(
             session.publish_candidate(transport.clone())?;
         }
         let negotiated = negotiate_candidate(endpoint, &transport, required, io)?;
-        // The winner carries ordinary requests from here on, whose reply wait
-        // is the session's own timeout and not the probe's.
+        // The winner carries ordinary requests from here on. Their quiet
+        // receive window uses the session timeout, not the dial deadline.
         transport.set_io_timeout(endpoint.timeout_ms)?;
         Ok(negotiated)
     })()
