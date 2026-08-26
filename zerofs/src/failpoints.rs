@@ -69,6 +69,10 @@ pub const RMDIR_AFTER_DIR_CLEANUP: &str = "rmdir_after_dir_cleanup";
 
 pub const FLUSH_AFTER_COMPLETE: &str = "flush_after_complete";
 
+/// A SlateDB manifest PUT is blocked until the current ZeroFS segment PUT
+/// succeeds.
+pub const MANIFEST_PUBLICATION_WAITING: &str = "manifest_publication_waiting";
+
 // Data plane (extent-over-segments).
 
 /// Flush path, after the open segment is sealed + PUT but before the metadata

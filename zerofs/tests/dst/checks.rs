@@ -3,11 +3,37 @@
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use zerofs::fs::ZeroFS;
 use zerofs::fs::key_codec::{KeyCodec, KeyPrefix};
 use zerofs::fs::metrics::SegmentFootprint;
 use zerofs::segment::{FrameLoc, Segid};
+use zerofs::segment_store::SegmentStore;
+
+/// Verify that every segment referenced by recovered metadata can be opened.
+/// `read_directory` checks that the object exists, its footer and checksum are
+/// valid, and its encrypted frame-to-extent index authenticates and decrypts.
+pub(crate) async fn verify_referenced_segments(
+    fs: &ZeroFS,
+    backing: Arc<dyn object_store::ObjectStore>,
+    seed: u64,
+    round: usize,
+) {
+    let accounting = SegmentAccounting::load(fs).await;
+    let segments = SegmentStore::new(backing, crate::segment_codec(), 0);
+    for segid in accounting.referenced_bytes.keys().copied() {
+        segments
+            .read_directory(segid)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "recovered FrameLoc references a missing or invalid segment {segid:?} \
+                 (seed {seed}, round {round}): {error}"
+                )
+            });
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SegmentCounter {

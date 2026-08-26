@@ -12,6 +12,9 @@ use zerofs::fs::ZeroFS;
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::store::ExtentStore;
 use zerofs::fs::types::{AuthContext, SetAttributes};
+use zerofs::manifest_publication::{
+    COORDINATED_L0_SST_SIZE_BYTES, COORDINATED_MAX_UNFLUSHED_BYTES,
+};
 use zerofs::segment::Segid;
 
 use consistency::verify_consistency;
@@ -72,16 +75,13 @@ impl CrashTestContext {
     /// Create a new filesystem instance
     async fn create_fs(&self) -> Arc<ZeroFS> {
         let db_path = Path::from("slatedb");
-        // Mirror the production durability-critical SlateDB config (see
-        // cli/server.rs): WAL off + effectively disabled size thresholds mean the
-        // only path to a durable manifest is our seal-gated flush. Without this the
-        // harness would use SlateDB's default WAL recovery, which resurrects
-        // un-flushed writes on restart and so never exercises the barrier the data
-        // plane relies on. SlateDB requires max_unflushed_bytes > l0_sst_size_bytes.
+        // Match production: keep the WAL off and prevent size-triggered
+        // memtable flushes so only FlushCoordinator makes metadata durable.
+        // SlateDB requires max_unflushed_bytes > l0_sst_size_bytes.
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            l0_sst_size_bytes: usize::MAX - 1,
-            max_unflushed_bytes: usize::MAX,
+            l0_sst_size_bytes: COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: COORDINATED_MAX_UNFLUSHED_BYTES,
             l0_max_ssts: 256,
             l0_max_ssts_per_key: 256,
             ..Default::default()
@@ -3342,14 +3342,11 @@ async fn test_seal_error_preserves_open_buffer() {
     assert_eq!(&after[..], &payload[..], "retried seal lost the data");
 }
 
-/// With the WAL off and l0_sst_size_bytes at MAX (the production config this
-/// harness mirrors), the only path to a durable manifest is the seal-gated
-/// flush, which PUTs the open segment before committing. So an un-flushed write is
-/// lost cleanly on a crash rather than leaving a durable FrameLoc pointing at a
-/// segment that was never PUT (a dangling 404 -> EIO). A durably-flushed file is
-/// unaffected. This is a consistency check of the un-flushed-write path under the
-/// real config; the seal-before-flush barrier that makes an *explicit* flush safe
-/// is covered by the `*_persists_after_flush` tests.
+/// Production disables the WAL and size-triggered memtable flushes, so only
+/// FlushCoordinator can make new FrameLocs durable. An unflushed write must
+/// therefore disappear after a crash instead of leaving recovered metadata that
+/// references a segment that was never PUT. The `*_persists_after_flush` tests
+/// cover the explicit-flush path.
 #[tokio::test]
 async fn test_unflushed_write_leaves_no_dangling_frameloc() {
     let (
