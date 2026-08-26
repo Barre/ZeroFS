@@ -1,4 +1,4 @@
-use crate::secrets::{CapturedPassword, EncryptionPassword};
+use crate::secrets::{CapturedPassword, EncryptionPassword, expand_environment};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::HashSet;
@@ -765,13 +765,16 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    match shellexpand::env(&s) {
-        Ok(expanded) => Ok(expanded.into_owned()),
-        Err(e) => Err(serde::de::Error::custom(format!(
-            "Failed to expand environment variable: {}",
-            e
-        ))),
-    }
+    expand_config_value(&s)
+}
+
+fn expand_config_value<E>(value: &str) -> Result<String, E>
+where
+    E: de::Error,
+{
+    expand_environment(value).map_err(|error| {
+        de::Error::custom(format!("Failed to expand environment variable: {error}"))
+    })
 }
 
 fn deserialize_captured_encryption_password<'de, D>(
@@ -813,14 +816,7 @@ where
     D: Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| match shellexpand::env(&s) {
-        Ok(expanded) => Ok(expanded.into_owned()),
-        Err(e) => Err(serde::de::Error::custom(format!(
-            "Failed to expand environment variable: {}",
-            e
-        ))),
-    })
-    .transpose()
+    opt.map(|s| expand_config_value(&s)).transpose()
 }
 
 fn deserialize_expandable_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -828,16 +824,7 @@ where
     D: Deserializer<'de>,
 {
     let items = Vec::<String>::deserialize(deserializer)?;
-    items
-        .into_iter()
-        .map(|s| match shellexpand::env(&s) {
-            Ok(expanded) => Ok(expanded.into_owned()),
-            Err(e) => Err(serde::de::Error::custom(format!(
-                "Failed to expand environment variable: {}",
-                e
-            ))),
-        })
-        .collect()
+    items.into_iter().map(|s| expand_config_value(&s)).collect()
 }
 
 /// Expand `${VAR}` in each entry, then parse to a `SocketAddr`. Bind addresses
@@ -849,9 +836,7 @@ where
 {
     let mut set = HashSet::with_capacity(raw.len());
     for s in raw {
-        let expanded = shellexpand::env(&s).map_err(|e| {
-            de::Error::custom(format!("Failed to expand environment variable: {}", e))
-        })?;
+        let expanded = expand_config_value::<E>(&s)?;
         let addr = expanded.parse::<SocketAddr>().map_err(|e| {
             de::Error::custom(format!(
                 "invalid socket address {expanded:?} (expected host:port): {e}"
@@ -887,13 +872,7 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    match shellexpand::env(&s) {
-        Ok(expanded) => Ok(PathBuf::from(expanded.into_owned())),
-        Err(e) => Err(serde::de::Error::custom(format!(
-            "Failed to expand environment variable: {}",
-            e
-        ))),
-    }
+    expand_config_value(&s).map(PathBuf::from)
 }
 
 fn deserialize_optional_expandable_path<'de, D>(
@@ -903,14 +882,8 @@ where
     D: Deserializer<'de>,
 {
     let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| match shellexpand::env(&s) {
-        Ok(expanded) => Ok(PathBuf::from(expanded.into_owned())),
-        Err(e) => Err(serde::de::Error::custom(format!(
-            "Failed to expand environment variable: {}",
-            e
-        ))),
-    })
-    .transpose()
+    opt.map(|s| expand_config_value(&s).map(PathBuf::from))
+        .transpose()
 }
 
 fn deserialize_expandable_hashmap<'de, D>(
@@ -921,13 +894,7 @@ where
 {
     let map = std::collections::HashMap::<String, String>::deserialize(deserializer)?;
     map.into_iter()
-        .map(|(k, v)| match shellexpand::env(&v) {
-            Ok(expanded) => Ok((k, expanded.into_owned())),
-            Err(e) => Err(serde::de::Error::custom(format!(
-                "Failed to expand environment variable: {}",
-                e
-            ))),
-        })
+        .map(|(key, value)| expand_config_value(&value).map(|value| (key, value)))
         .collect()
 }
 
@@ -955,8 +922,21 @@ impl Settings {
         let content = crate::secrets::read_file_locked(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let mut settings: Settings = toml::from_str(content.expose_secret())
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        let mut settings: Settings = toml::from_str(content.expose_secret()).map_err(|error| {
+            if error
+                .message()
+                .starts_with("Failed to expand environment variable")
+            {
+                anyhow::anyhow!(
+                    "Failed to parse config file: {}: {}",
+                    path.display(),
+                    error.message()
+                )
+            } else {
+                anyhow::Error::new(error)
+                    .context(format!("Failed to parse config file: {}", path.display()))
+            }
+        })?;
 
         let password = match settings
             .storage
@@ -1233,10 +1213,22 @@ impl Settings {
              #   access_key_id = \"${{AWS_ACCESS_KEY_ID}}\"\n\
              #   peers = [\"${{PEER_A_ADDR}}\", \"${{PEER_B_ADDR}}\"]\n\
              # \n\
+             # If VAR is unset and VAR_FILE is set, ZeroFS reads the UTF-8 value from\n\
+             # the file named by VAR_FILE. VAR takes precedence when both are set, and\n\
+             # terminal LF/CRLF line endings are removed from file-backed values.\n\
+             #\n\
+             # Expandable fields are storage url/encryption_password/storage_class; cache\n\
+             # dir; server unix_socket/addresses; prometheus addresses; all aws/azure/gcp\n\
+             # values; and replication node_id/replication_listen/peers.\n\
+             #\n\
+             # systemd credential example:\n\
+             #   LoadCredentialEncrypted=zerofs-password:/etc/credstore.encrypted/zerofs-password\n\
+             #   Environment=ZEROFS_PASSWORD_FILE=%d/zerofs-password\n\
+             #\n\
              # In array values (e.g. [replication] peers) each entry is expanded on\n\
              # its own; a single variable is not split into multiple entries.\n\
              #\n\
-             # All referenced environment variables must be set, or the config will fail to load.\n\
+             # Each reference needs VAR or VAR_FILE, or the config will fail to load.\n\
              #\n\
              # ============================================================================\n\
              # SERVER CONFIGURATION\n\
@@ -1311,6 +1303,194 @@ encryption_password = "${ZEROFS_TEST_PASSWORD}"
         let serialized = toml::to_string(&settings).unwrap();
         assert!(!serialized.contains("secret123"));
         assert!(!serialized.contains("encryption_password"));
+    }
+
+    #[test]
+    fn test_file_backed_config_secrets() {
+        let password_file = NamedTempFile::new().unwrap();
+        let access_key_file = NamedTempFile::new().unwrap();
+        let secret_key_file = NamedTempFile::new().unwrap();
+        std::fs::write(password_file.path(), "  file password  \r\n").unwrap();
+        std::fs::write(access_key_file.path(), "file-access-key\n").unwrap();
+        std::fs::write(secret_key_file.path(), "file secret\nkey\r\n").unwrap();
+
+        unsafe {
+            env::remove_var("ZEROFS_TEST_FILE_PASSWORD");
+            env::remove_var("ZEROFS_TEST_FILE_ACCESS_KEY");
+            env::remove_var("ZEROFS_TEST_FILE_SECRET_KEY");
+            env::set_var("ZEROFS_TEST_FILE_PASSWORD_FILE", password_file.path());
+            env::set_var("ZEROFS_TEST_FILE_ACCESS_KEY_FILE", access_key_file.path());
+            env::set_var("ZEROFS_TEST_FILE_SECRET_KEY_FILE", secret_key_file.path());
+        }
+
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "${ZEROFS_TEST_FILE_PASSWORD}"
+
+[servers]
+
+[aws]
+access_key_id = "${ZEROFS_TEST_FILE_ACCESS_KEY}"
+secret_access_key = "${ZEROFS_TEST_FILE_SECRET_KEY}"
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+        let (settings, password) = Settings::from_file(temp_file.path()).unwrap();
+
+        assert_eq!(password.expose_secret(), "  file password  ");
+        let aws = settings.aws.unwrap();
+        assert_eq!(aws.0.get("access_key_id").unwrap(), "file-access-key");
+        assert_eq!(aws.0.get("secret_access_key").unwrap(), "file secret\nkey");
+    }
+
+    #[test]
+    fn direct_environment_value_precedes_file_fallback() {
+        let password_file = NamedTempFile::new().unwrap();
+        let access_key_file = NamedTempFile::new().unwrap();
+        std::fs::write(password_file.path(), b"ignored-\xff").unwrap();
+        std::fs::write(access_key_file.path(), b"ignored-\xff").unwrap();
+
+        unsafe {
+            env::set_var("ZEROFS_TEST_PRECEDENCE_PASSWORD", "direct-password");
+            env::set_var("ZEROFS_TEST_PRECEDENCE_ACCESS_KEY", "direct-access-key");
+            env::set_var("ZEROFS_TEST_PRECEDENCE_PASSWORD_FILE", password_file.path());
+            env::set_var(
+                "ZEROFS_TEST_PRECEDENCE_ACCESS_KEY_FILE",
+                access_key_file.path(),
+            );
+        }
+
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+encryption_password = "$ZEROFS_TEST_PRECEDENCE_PASSWORD"
+
+[servers]
+
+[aws]
+access_key_id = "${ZEROFS_TEST_PRECEDENCE_ACCESS_KEY}"
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+        let (settings, password) = Settings::from_file(temp_file.path()).unwrap();
+
+        assert_eq!(password.expose_secret(), "direct-password");
+        assert_eq!(
+            settings.aws.unwrap().0.get("access_key_id").unwrap(),
+            "direct-access-key"
+        );
+    }
+
+    #[test]
+    fn file_backed_variable_errors_are_contextual_and_redacted() {
+        let invalid_utf8 = NamedTempFile::new().unwrap();
+        std::fs::write(invalid_utf8.path(), b"must-not-appear-\xff").unwrap();
+        unsafe {
+            env::remove_var("ZEROFS_TEST_INVALID_FILE_SECRET");
+            env::set_var("ZEROFS_TEST_INVALID_FILE_SECRET_FILE", invalid_utf8.path());
+        }
+
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/must-not-appear-in-error"
+encryption_password = "test"
+
+[servers]
+
+[aws]
+secret_access_key = "${ZEROFS_TEST_INVALID_FILE_SECRET}"
+"#;
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+        let error = format!("{:#}", Settings::from_file(temp_file.path()).unwrap_err());
+
+        assert!(error.contains("ZEROFS_TEST_INVALID_FILE_SECRET_FILE"));
+        assert!(error.contains(&invalid_utf8.path().display().to_string()));
+        assert!(error.contains("UTF-8"));
+        assert!(
+            !error.contains("must-not-appear"),
+            "Error leaked secret/config: {error}"
+        );
+    }
+
+    #[test]
+    fn unreadable_file_backed_password_error_is_contextual_and_redacted() {
+        let unreadable = tempfile::tempdir().unwrap();
+        unsafe {
+            env::remove_var("ZEROFS_TEST_UNREADABLE_PASSWORD");
+            env::set_var("ZEROFS_TEST_UNREADABLE_PASSWORD_FILE", unreadable.path());
+        }
+
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/must-not-appear-in-error"
+encryption_password = "prefix-${ZEROFS_TEST_UNREADABLE_PASSWORD}"
+
+[servers]
+"#;
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+        let error = format!("{:#}", Settings::from_file(temp_file.path()).unwrap_err());
+
+        assert!(error.contains("ZEROFS_TEST_UNREADABLE_PASSWORD_FILE"));
+        assert!(error.contains(&unreadable.path().display().to_string()));
+        assert!(!error.contains("prefix-"), "Error leaked password: {error}");
+        assert!(
+            !error.contains("must-not-appear-in-error"),
+            "Error leaked config: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_file_backed_password_error_is_contextual_and_redacted() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-credential");
+        unsafe {
+            env::remove_var("ZEROFS_TEST_MISSING_FILE_PASSWORD");
+            env::set_var("ZEROFS_TEST_MISSING_FILE_PASSWORD_FILE", &missing);
+        }
+
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/must-not-appear-in-error"
+encryption_password = "prefix-${ZEROFS_TEST_MISSING_FILE_PASSWORD}"
+
+[servers]
+"#;
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+        let error = format!("{:#}", Settings::from_file(temp_file.path()).unwrap_err());
+
+        assert!(error.contains("ZEROFS_TEST_MISSING_FILE_PASSWORD_FILE"));
+        assert!(error.contains(&missing.display().to_string()));
+        assert!(!error.contains("prefix-"), "Error leaked password: {error}");
+        assert!(
+            !error.contains("must-not-appear-in-error"),
+            "Error leaked config: {error}"
+        );
     }
 
     #[test]
@@ -2066,6 +2246,8 @@ addresses = ["${ZEROFS_TEST_BAD_ADDR}"]
             env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
         }
         let rendered = Settings::render_default_config().unwrap();
+        assert!(rendered.contains("If VAR is unset and VAR_FILE is set"));
+        assert!(rendered.contains("LoadCredentialEncrypted=zerofs-password"));
         let settings = write_and_load(&rendered).unwrap();
         assert!(
             settings
