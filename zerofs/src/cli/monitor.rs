@@ -378,19 +378,27 @@ fn render_storage_gauge(f: &mut Frame, app: &MonitorApp, area: Rect) {
         Some(s) => (s.used_bytes, s.max_bytes),
         None => (0, 0),
     };
+    let inode_label = app
+        .current
+        .as_ref()
+        .map(|s| {
+            format!(
+                "{} inode{}",
+                s.used_inodes.to_formatted_string(&Locale::en),
+                plural_suffix(s.used_inodes)
+            )
+        })
+        .unwrap_or_default();
     let ratio = if max > 0 {
         (used as f64 / max as f64).min(1.0)
     } else {
         0.0
     };
     let label = format!(
-        "{} / {} ({} inodes)",
+        "{} / {} ({})",
         format_bytes_human(used),
         format_bytes_human(max),
-        app.current
-            .as_ref()
-            .map(|s| s.used_inodes.to_formatted_string(&Locale::en))
-            .unwrap_or_default()
+        inode_label
     );
     let color = if ratio > 0.9 {
         Color::Red
@@ -461,6 +469,15 @@ fn render_operations(f: &mut Frame, app: &MonitorApp, area: Rect) {
 
 fn render_gc_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let s = app.current.as_ref();
+    let gc_runs = s
+        .map(|s| {
+            format!(
+                "{} GC run{}",
+                s.gc_runs.to_formatted_string(&Locale::en),
+                plural_suffix(s.gc_runs)
+            )
+        })
+        .unwrap_or_default();
     let lines = vec![
         Line::from(format!(
             "Tombstones: {} created / {} processed",
@@ -470,11 +487,10 @@ fn render_gc_stats(f: &mut Frame, app: &MonitorApp, area: Rect) {
                 .unwrap_or_default(),
         )),
         Line::from(format!(
-            "Extents deleted: {} ({} GC runs)",
+            "Extents deleted: {} ({})",
             s.map(|s| s.gc_extents_deleted.to_formatted_string(&Locale::en))
                 .unwrap_or_default(),
-            s.map(|s| s.gc_runs.to_formatted_string(&Locale::en))
-                .unwrap_or_default(),
+            gc_runs,
         )),
     ];
     let para = Paragraph::new(lines).block(
@@ -547,8 +563,9 @@ fn render_segment_space(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let mut totals = vec![
         Span::styled(
             format!(
-                "{} segs",
-                seg.segment_count.to_formatted_string(&Locale::en)
+                "{} segment{}",
+                seg.segment_count.to_formatted_string(&Locale::en),
+                plural_suffix(seg.segment_count)
             ),
             Style::default().fg(Color::White),
         ),
@@ -625,8 +642,9 @@ fn segment_activity_line(seg: &proto::SegmentGcStatus) -> Line<'static> {
     if seg.last_deleted > 0 {
         parts.push(Span::styled(
             format!(
-                "reclaimed {} seg (~{})",
+                "reclaimed {} segment{} (~{})",
                 seg.last_deleted,
+                plural_suffix(seg.last_deleted),
                 format_bytes_human(seg.last_deleted_bytes)
             ),
             Style::default().fg(Color::Green),
@@ -635,8 +653,10 @@ fn segment_activity_line(seg: &proto::SegmentGcStatus) -> Line<'static> {
     if seg.last_chains_assembled > 0 && seg.last_chains_packed > 0 {
         parts.push(Span::styled(
             format!(
-                "merged {}/{} seams",
-                seg.last_chains_packed, seg.last_chains_assembled
+                "merged {}/{} seam{}",
+                seg.last_chains_packed,
+                seg.last_chains_assembled,
+                plural_suffix(seg.last_chains_assembled)
             ),
             Style::default().fg(Color::Cyan),
         ));
@@ -644,8 +664,9 @@ fn segment_activity_line(seg: &proto::SegmentGcStatus) -> Line<'static> {
     if seg.last_frames_relocated > 0 {
         parts.push(Span::styled(
             format!(
-                "compacted {} frames",
-                seg.last_frames_relocated.to_formatted_string(&Locale::en)
+                "compacted {} frame{}",
+                seg.last_frames_relocated.to_formatted_string(&Locale::en),
+                plural_suffix(seg.last_frames_relocated)
             ),
             Style::default().fg(Color::Blue),
         ));
@@ -658,11 +679,16 @@ fn segment_activity_line(seg: &proto::SegmentGcStatus) -> Line<'static> {
     // stays short and the reason line above already frames the backlog.
     if parts.is_empty() {
         let note = if seg.candidate_backlog > 0 {
-            format!("{} segments queued for compaction", seg.candidate_backlog)
+            format!(
+                "{} segment{} queued for compaction",
+                seg.candidate_backlog,
+                plural_suffix(seg.candidate_backlog)
+            )
         } else if seg.awaiting_delete > 0 {
             format!(
-                "{} segments deleting after the safety window",
-                seg.awaiting_delete
+                "{} segment{} deleting after the safety window",
+                seg.awaiting_delete,
+                plural_suffix(seg.awaiting_delete)
             )
         } else {
             "nothing to reclaim".to_string()
@@ -767,6 +793,10 @@ fn format_ops(ops: f64) -> String {
     }
 }
 
+fn plural_suffix(count: u64) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,9 +883,9 @@ mod tests {
             reason: "23% dead + 3 seams deferred, store active".to_string(),
             ..Default::default()
         });
-        assert!(out.contains("412 segs"), "{out}");
+        assert!(out.contains("412 segments"), "{out}");
         assert!(out.contains("DRAIN"), "{out}");
-        assert!(out.contains("reclaimed 3 seg"), "{out}");
+        assert!(out.contains("reclaimed 3 segments"), "{out}");
         assert!(out.contains("merged 2/5 seams"), "{out}");
         assert!(out.contains("compacted 12,000 frames"), "{out}");
         // Active pass shows work done, not the backlog note (keeps it short).
