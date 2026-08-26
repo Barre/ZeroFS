@@ -65,6 +65,7 @@ struct HaReceiver {
 struct DbOpen {
     promotion: Option<PromotionSnapshot>,
     slatedb: SlateDbHandle,
+    manifest_publication: Option<crate::manifest_publication::ManifestPublication>,
     metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     /// Prefetch-wrapped object store for the segment data plane (cold read-ahead).
     segment_object_store: Arc<dyn object_store::ObjectStore>,
@@ -608,6 +609,7 @@ impl StartupContext {
 
         let SlateDbOpen {
             data: slatedb,
+            manifest_publication,
             metrics_recorder,
             parts_cache,
         } = opened;
@@ -698,6 +700,7 @@ impl StartupContext {
         Ok(OpenOutcome::Opened(DbOpen {
             promotion,
             slatedb,
+            manifest_publication,
             metrics_recorder,
             segment_object_store,
         }))
@@ -776,6 +779,7 @@ impl ReconciledDb {
         let DbOpen {
             promotion: _,
             slatedb,
+            manifest_publication,
             metrics_recorder,
             segment_object_store,
         } = open;
@@ -997,6 +1001,11 @@ impl ReconciledDb {
         )
         .await
         .context("Failed to initialize filesystem")?;
+
+        if let Some(manifest_publication) = manifest_publication {
+            fs.flush_coordinator
+                .set_manifest_publication(manifest_publication);
+        }
 
         let fs = Arc::new(fs);
         // Reclaims open-unlinked inodes once their last open handle is dropped.

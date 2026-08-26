@@ -28,6 +28,10 @@ use zerofs::db::SlateDbHandle;
 use zerofs::fs::inode::InodeId;
 use zerofs::fs::types::{SetAttributes, SetSize};
 use zerofs::fs::{EXTENT_SIZE, ZeroFS};
+use zerofs::manifest_publication::{
+    COORDINATED_L0_SST_SIZE_BYTES, COORDINATED_MAX_UNFLUSHED_BYTES,
+};
+use zerofs::manifest_publication::{ManifestPublication, ManifestPublicationStore};
 
 const ORPHAN_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const ORPHAN_DRAIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -163,16 +167,23 @@ impl Storage {
             Arc::new(zerofs::retrying_object_store::RetryingObjectStore::new(sim));
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            // Match production's barrier-controlled flush configuration while
-            // satisfying SlateDB's strict threshold ordering.
-            l0_sst_size_bytes: usize::MAX - 1,
-            max_unflushed_bytes: usize::MAX,
+            // Match production: prevent size-triggered memtable flushes and
+            // satisfy SlateDB's strict threshold ordering.
+            l0_sst_size_bytes: COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: COORDINATED_MAX_UNFLUSHED_BYTES,
             l0_max_ssts: 256,
             l0_max_ssts_per_key: 256,
             ..Default::default()
         };
+        let db_path = ObjPath::from("slatedb");
+        let manifest_publication = ManifestPublication::new();
+        let slatedb_object_store: Arc<dyn ObjectStore> = Arc::new(ManifestPublicationStore::new(
+            Arc::clone(&object_store),
+            db_path.clone(),
+            manifest_publication.clone(),
+        ));
         let slatedb = Arc::new(
-            DbBuilder::new(ObjPath::from("slatedb"), Arc::clone(&object_store))
+            DbBuilder::new(db_path, slatedb_object_store)
                 .with_settings(settings)
                 .with_seed(seed)
                 .with_system_clock(clock)
@@ -183,30 +194,26 @@ impl Storage {
                 .await
                 .expect("slatedb open"),
         );
-        let fs = Arc::new(
-            ZeroFS::try_new(
-                SlateDbHandle::ReadWrite(slatedb),
-                u64::MAX,
-                None,
-                false,
-                false,
-                None,
-                None,
-                Arc::new(zerofs::dedup::DedupCache::new()),
-                None,
-                zerofs::object_trace::ObjectTracer::new(),
-                object_store,
-                zerofs::frame_codec::FrameCodec::try_new(
-                    &[7u8; 32],
-                    zerofs::segment::SEGMENT_INFO,
-                    zerofs::config::CompressionConfig::default(),
-                )
-                .expect("test key should be lockable"),
-                Some(scale.seal_threshold),
-            )
-            .await
-            .expect("zerofs open"),
-        );
+        let fs = ZeroFS::try_new(
+            SlateDbHandle::ReadWrite(slatedb),
+            u64::MAX,
+            None,
+            false,
+            false,
+            None,
+            None,
+            Arc::new(zerofs::dedup::DedupCache::new()),
+            None,
+            zerofs::object_trace::ObjectTracer::new(),
+            object_store,
+            crate::segment_codec(),
+            Some(scale.seal_threshold),
+        )
+        .await
+        .expect("zerofs open");
+        fs.flush_coordinator
+            .set_manifest_publication(manifest_publication);
+        let fs = Arc::new(fs);
         fs.start_reclaim_drainer();
         fs.extent_store.enable_nominations();
         fs
@@ -728,6 +735,14 @@ impl WorldHarness {
             .await;
         self.digest.event(("crashed", round));
         let fs = self.storage.fs().clone();
+
+        crate::checks::verify_referenced_segments(
+            &fs,
+            Arc::clone(&self.storage.backing),
+            self.config.seed,
+            round,
+        )
+        .await;
 
         fs.extent_store
             .sweep_orphans(Utc::now() + chrono::Duration::days(1))

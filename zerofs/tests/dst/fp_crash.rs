@@ -5,7 +5,9 @@
 use std::sync::Mutex;
 
 pub(crate) const POINTS: &[&str] = &[
+    zerofs::failpoints::MANIFEST_PUBLICATION_WAITING,
     zerofs::failpoints::FLUSH_AFTER_SEAL_BEFORE_MANIFEST,
+    zerofs::failpoints::FLUSH_AFTER_COMPLETE,
     zerofs::failpoints::COMPACT_AFTER_SEAL_BEFORE_REPOINT,
     zerofs::failpoints::COMPACT_BETWEEN_REPOINTS,
     zerofs::failpoints::RECLAIM_AFTER_BARRIER_BEFORE_SCAN,

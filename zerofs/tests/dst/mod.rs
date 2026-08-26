@@ -2,8 +2,8 @@
 //!
 //! One seed = one world: a current-thread runtime with paused (virtual) time,
 //! a seeded latency-injecting object store over a persistent `InMemory`, and
-//! seeded writer/GC actors driving the real `ZeroFS` stack in its production
-//! durability shape (WAL off, durable state only via the seal-gated flush).
+//! seeded writer/GC actors driving the real `ZeroFS` stack with the WAL off and
+//! metadata made durable only by a ZeroFS segment PUT plus a SlateDB flush.
 //! Under `start_paused` every sleep is virtual, so the store's seeded per-op
 //! latencies decide task wake order: one seed is one schedule, and the same
 //! seed replays the same run (asserted by `same_seed_same_digest`).
@@ -52,6 +52,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zerofs::config::CompressionConfig;
+use zerofs::frame_codec::FrameCodec;
 use zerofs::fs::EXTENT_SIZE;
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::types::AuthContext;
@@ -62,6 +64,15 @@ const FILE_CAP: usize = 16 * EXTENT_SIZE;
 pub(crate) const FILES: usize = 3;
 /// Small segments so the background-seal and reclaim paths run at test scale.
 const SEAL_THRESHOLD: usize = 96 * 1024;
+
+pub(crate) fn segment_codec() -> FrameCodec {
+    FrameCodec::try_new(
+        &[7u8; 32],
+        zerofs::segment::SEGMENT_INFO,
+        CompressionConfig::default(),
+    )
+    .expect("DST segment codec")
+}
 
 /// World scale. Most seeds run small and fast; every fourth runs at chain
 /// scale, with segments above `SMALL_SEGMENT_BYTES` (1 MiB) so they are not

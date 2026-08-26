@@ -1107,10 +1107,8 @@ mod tests {
                 .expect("test key should be lockable");
         let settings = slatedb::config::Settings {
             wal_enabled: false,
-            // Match production's barrier-controlled flush configuration while
-            // satisfying SlateDB's strict threshold ordering.
-            l0_sst_size_bytes: usize::MAX - 1,
-            max_unflushed_bytes: usize::MAX,
+            l0_sst_size_bytes: crate::manifest_publication::COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: crate::manifest_publication::COORDINATED_MAX_UNFLUSHED_BYTES,
             ..Default::default()
         };
         let slatedb = Arc::new(

@@ -167,8 +167,8 @@ impl ZeroFS {
         // segments before any write; from here they are maintained incrementally
         // off the commit path, so the panel never scans to stay current.
         extent_store.seed_footprint().await?;
-        // The flush path seals the open data-plane segment before flushing the
-        // manifest, so a durable manifest never references an un-PUT segment.
+        // A flush blocks SlateDB's manifest PUT until this hook has PUT the open
+        // ZeroFS segment.
         flush_coordinator.set_sealer({
             let es = extent_store.clone();
             Arc::new(move || {

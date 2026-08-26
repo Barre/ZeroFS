@@ -5,6 +5,10 @@ use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
 use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
+use crate::manifest_publication::{
+    COORDINATED_L0_SST_SIZE_BYTES, COORDINATED_MAX_UNFLUSHED_BYTES, ManifestPublication,
+    ManifestPublicationStore,
+};
 use crate::nbd::NBDServer;
 use crate::object_store_prefetch::PrefetchingObjectStore;
 use crate::parse_object_store::parse_url_opts;
@@ -482,6 +486,9 @@ pub(crate) fn split_memory_budget(total_memory_bytes: usize) -> (usize, usize) {
 /// Result of opening the ZeroFS database.
 pub struct SlateDbOpen {
     pub data: SlateDbHandle,
+    /// State shared by the writer and compactor wrappers that intercept
+    /// manifest PUTs.
+    pub manifest_publication: Option<ManifestPublication>,
     pub metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
     /// The raw-parts prefetch cache, returned so the segment store reuses it
     /// (one budget; segment objects and SST objects share it, keyed by path).
@@ -502,11 +509,19 @@ fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
         .handle()
 }
 
-// SlateDB 0.15 validates that max_unflushed_bytes is strictly greater than
-// l0_sst_size_bytes. ZeroFS must effectively disable both thresholds because
-// only a seal-barrier-controlled flush may make metadata durable.
-const BARRIER_CONTROLLED_L0_SST_SIZE_BYTES: usize = usize::MAX - 1;
-const BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES: usize = usize::MAX;
+// SlateDB 0.15 requires max_unflushed_bytes > l0_sst_size_bytes. Both values
+// are set near usize::MAX so only FlushCoordinator freezes the memtable.
+fn intercept_manifest_puts(
+    store: Arc<dyn object_store::ObjectStore>,
+    db_path: &Path,
+    publication: &ManifestPublication,
+) -> Arc<dyn object_store::ObjectStore> {
+    Arc::new(ManifestPublicationStore::new(
+        store,
+        db_path.clone(),
+        publication.clone(),
+    ))
+}
 
 pub async fn build_slatedb(
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -563,31 +578,25 @@ pub async fn build_slatedb(
         }
     }
 
-    // The WAL is permanently off, a correctness requirement: with it on,
-    // SlateDB flushes durably on the write path without taking our seal
-    // barrier, so a FrameLoc could become durable while its segment is still
-    // the un-PUT open buffer (a dangling pointer after a crash). With it off,
-    // the barrier-gated flush — which seals the open segment first — is the
-    // only path that makes metadata durable.
+    // Keep the WAL off: otherwise SlateDB could make a FrameLoc durable before
+    // ZeroFS PUTs the segment containing that frame. With the WAL off and the
+    // size-triggered flushes effectively disabled, only FlushCoordinator makes
+    // new metadata durable. It uploads SSTs and the segment concurrently, then
+    // allows the manifest PUT after the segment PUT succeeds.
     let settings = slatedb::config::Settings {
         wal_enabled: false,
         l0_max_ssts,
         l0_max_ssts_per_key: l0_max_ssts,
-        // Disable SlateDB's write-path memtable size-freeze (`flush_interval:
-        // None` does not — that only kills the WAL timer). Left finite, the
-        // size check would dispatch a durable L0 flush from a background task
-        // that never takes our seal barrier, publishing FrameLocs for a
-        // still-un-PUT segment. Keep both size thresholds effectively disabled
-        // so the memtable freezes only on our barrier-gated `db.flush()`, which
-        // also drains it (RAM-bounded) on every flush. SlateDB requires the
-        // backpressure threshold to be strictly greater than the freeze
-        // threshold, hence MAX - 1 and MAX rather than MAX for both.
-        l0_sst_size_bytes: BARRIER_CONTROLLED_L0_SST_SIZE_BYTES,
+        // `flush_interval: None` disables only the WAL timer, not size-triggered
+        // memtable freezing. Set both size thresholds near usize::MAX so only
+        // FlushCoordinator calls db.flush(). SlateDB requires
+        // max_unflushed_bytes > l0_sst_size_bytes, hence MAX and MAX - 1.
+        l0_sst_size_bytes: COORDINATED_L0_SST_SIZE_BYTES,
         compactor_options: None,
         flush_interval: None,
         // Independent of HA authority checks.
         manifest_poll_interval: std::time::Duration::from_secs(5),
-        max_unflushed_bytes: BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES,
+        max_unflushed_bytes: COORDINATED_MAX_UNFLUSHED_BYTES,
         compression_codec: None, // Disable compression as we handle it in encryption layer
         l0_flush_parallelism: 16,
         min_filter_keys: 10,
@@ -653,8 +662,15 @@ pub async fn build_slatedb(
             info!("Opening database in read-write mode");
 
             let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+            let manifest_publication = ManifestPublication::new();
+            let writer_object_store =
+                intercept_manifest_puts(object_store.clone(), &db_path, &manifest_publication);
+            // The embedded compactor also PUTs manifests, so its wrapper uses
+            // the same state even though its store bypasses the prefetcher.
+            let compactor_object_store =
+                intercept_manifest_puts(compactor_object_store, &db_path, &manifest_publication);
 
-            let mut builder = DbBuilder::new(db_path.clone(), object_store.clone())
+            let mut builder = DbBuilder::new(db_path.clone(), writer_object_store)
                 .with_settings(settings)
                 .with_gc_runtime(maintenance_runtime.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
@@ -711,6 +727,7 @@ pub async fn build_slatedb(
 
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadWrite(slatedb),
+                manifest_publication: Some(manifest_publication),
                 metrics_recorder: Some(metrics_recorder),
                 parts_cache: parts_cache.clone(),
             })
@@ -731,6 +748,7 @@ pub async fn build_slatedb(
 
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+                manifest_publication: None,
                 metrics_recorder: None,
                 parts_cache: parts_cache.clone(),
             })
@@ -752,6 +770,7 @@ pub async fn build_slatedb(
 
             Ok(SlateDbOpen {
                 data: SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
+                manifest_publication: None,
                 metrics_recorder: None,
                 parts_cache: parts_cache.clone(),
             })
@@ -1197,16 +1216,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn barrier_controlled_flush_thresholds_are_valid() {
+    fn coordinated_flush_thresholds_are_valid() {
         let settings = slatedb::config::Settings {
-            l0_sst_size_bytes: BARRIER_CONTROLLED_L0_SST_SIZE_BYTES,
-            max_unflushed_bytes: BARRIER_CONTROLLED_MAX_UNFLUSHED_BYTES,
+            l0_sst_size_bytes: COORDINATED_L0_SST_SIZE_BYTES,
+            max_unflushed_bytes: COORDINATED_MAX_UNFLUSHED_BYTES,
             ..Default::default()
         };
 
         settings
             .validate()
-            .expect("barrier-controlled flush thresholds must satisfy SlateDB validation");
+            .expect("coordinated flush thresholds must satisfy SlateDB validation");
     }
 
     #[test]
