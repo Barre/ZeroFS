@@ -593,18 +593,22 @@ pub async fn build_slatedb(
         min_filter_keys: 10,
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: None,
+            // Each GC cycle re-derives garbage from scratch and the compactor
+            // pins the SSTs it removes behind a 15-minute checkpoint before
+            // every commit. Cycling faster than that reclaims nothing and
+            // only burns object-store requests.
             manifest_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(1)),
+                interval: Some(Duration::from_mins(30)),
                 min_age: Duration::from_mins(1),
                 dry_run: false,
             }),
             compacted_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(1)),
+                interval: Some(Duration::from_mins(30)),
                 min_age: Duration::from_mins(1),
                 dry_run: false,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
-                interval: Some(Duration::from_mins(1)),
+                interval: Some(Duration::from_mins(30)),
                 min_age: Duration::from_mins(1),
                 dry_run: false,
             }),
@@ -659,6 +663,13 @@ pub async fn build_slatedb(
                 .with_gc_runtime(maintenance_runtime.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
                 .with_db_cache(cache)
+                .with_block_cache_policy(
+                    slatedb::BlockCachePolicy::default().with_compaction_output_targets(&[
+                        slatedb::CacheTarget::data::<&[u8], _>(..),
+                        slatedb::CacheTarget::Index,
+                        slatedb::CacheTarget::Filters,
+                    ]),
+                )
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_metrics_recorder(metrics_recorder.clone())
