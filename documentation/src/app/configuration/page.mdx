@@ -495,9 +495,11 @@ Substitution applies to these keys only; all other values are taken literally:
 
 For array values (`peers` and the `addresses` lists) each entry is expanded independently, so `peers = ["${PEER_A}", "${PEER_B}"]` substitutes each element on its own; a single variable is not split into multiple entries. Expansion runs on the whole string before an `addresses` entry is parsed as a socket address, so the host, the port, or the entire value may come from a variable: `addresses = ["${POD_IP}:2049"]` and `addresses = ["${BIND_ADDR}"]` are both valid.
 
-If a referenced variable is unset, the configuration fails to load with `Failed to expand environment variable`. A literal `$` in an expandable value (an encryption password, for example) must be written `$$`.
+If a referenced variable is unset, ZeroFS looks for the same name with a `_FILE` suffix. For example, `${ZEROFS_PASSWORD}` reads the UTF-8 contents of the file named by `ZEROFS_PASSWORD_FILE` when `ZEROFS_PASSWORD` is unset. A directly set variable always takes precedence over its `_FILE` fallback. Terminal LF and CRLF line endings are removed from file-backed values; other whitespace, including leading and trailing spaces, is preserved.
 
-This keeps secrets out of configuration files and lets the same file serve several environments.
+If neither `VAR` nor `VAR_FILE` is set, the configuration fails to load with `Failed to expand environment variable`. Missing or unreadable credential files and files that are not valid UTF-8 also fail configuration loading with the variable name and path in the error. A literal `$` in an expandable value (an encryption password, for example) must be written `$$`.
+
+This keeps secrets out of configuration files, supports file-based secret stores such as systemd credentials, and lets the same file serve several environments.
 
 ## System Integration
 
@@ -518,6 +520,13 @@ Restart=always
 RestartSec=5
 # Optional: Load environment variables for substitution
 EnvironmentFile=-/etc/zerofs/zerofs.env
+# Optional: Load encrypted file-backed credentials
+LoadCredentialEncrypted=zerofs-password:/etc/credstore.encrypted/zerofs-password
+LoadCredentialEncrypted=aws-access-key-id:/etc/credstore.encrypted/aws-access-key-id
+LoadCredentialEncrypted=aws-secret-access-key:/etc/credstore.encrypted/aws-secret-access-key
+Environment=ZEROFS_PASSWORD_FILE=%d/zerofs-password
+Environment=AWS_ACCESS_KEY_ID_FILE=%d/aws-access-key-id
+Environment=AWS_SECRET_ACCESS_KEY_FILE=%d/aws-secret-access-key
 
 [Install]
 WantedBy=multi-user.target
@@ -529,6 +538,17 @@ If using environment variable substitution, create `/etc/zerofs/zerofs.env`:
 ZEROFS_PASSWORD=your-secure-password
 AWS_ACCESS_KEY_ID=your-key
 AWS_SECRET_ACCESS_KEY=your-secret
+```
+
+The `LoadCredentialEncrypted` directives decrypt each credential into systemd's protected credentials directory. The matching `_FILE` variables point ZeroFS at those files through systemd's `%d` credentials-directory specifier. The configuration still references the unsuffixed names:
+
+```toml
+[storage]
+encryption_password = "${ZEROFS_PASSWORD}"
+
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
 ```
 
 ### Docker
@@ -563,7 +583,7 @@ docker run -d \
   ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
 ```
 
-Configuration files can contain the encryption password and storage credentials. Restrict their file permissions and do not commit secrets to version control. Environment-variable substitution is available when the deployment's secret-management mechanism supplies values that way.
+Configuration files can contain the encryption password and storage credentials. Restrict their file permissions and do not commit secrets to version control. Environment-variable substitution accepts either direct values or `_FILE` paths when the deployment's secret-management mechanism supplies credentials that way.
 
 ## Logging Configuration
 
