@@ -104,7 +104,7 @@ supports x86-64 and little-endian arm64. See the
 - **[ZFS](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a ZFS pool on ZeroFS block devices; kernel source extraction, then a scrub.
 - **[Jepsen local-fs](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: random operation histories against a 9P mount, checked against a reference model ([local-fs](https://github.com/jepsen-io/local-fs)). A crash mode kills the server mid-run and verifies recovery matches the last fsync.
 - **[Jepsen HA](https://github.com/Barre/ZeroFS/actions/workflows/ci.yml)**: a Connected leader/standby pair over MinIO under a nemesis that kills or pauses nodes; no acknowledged write may be lost, resurrected, or corrupted across the tested failovers. The local-fs model checker also runs with failovers injected.
-- **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: data, namespace, segment-GC, and compaction paths run in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies and transient faults, and crashes at arbitrary await points or narrow failpoint windows. Recovery is checked against byte-level and namespace reference models, a full metadata consistency scan, segment-accounting reconciliation, and an authoritative footprint scan. One seed is one exact schedule, so a failure reproduces identically.
+- **[Deterministic simulation](https://github.com/Barre/ZeroFS/actions/workflows/rust.yml)**: data, namespace, segment-reclamation, and repack paths run in a simulated world ([`zerofs/tests/dst`](https://github.com/Barre/ZeroFS/tree/main/zerofs/tests/dst)): virtual time, seeded storage latencies and transient faults, and crashes at arbitrary await points or narrow failpoint windows. Recovery is checked against byte-level and namespace reference models, a full metadata consistency scan, segment-accounting reconciliation, and an authoritative footprint scan. One seed is one exact schedule, so a failure reproduces identically.
 
 ## Web UI
 
@@ -321,7 +321,7 @@ mount -o discard /dev/nbd0 /mnt/block  # Automatic (filesystems)
 zpool set autotrim=on mypool         # Automatic (ZFS)
 ```
 
-TRIM deletes extent pointers and debits each segment's live-byte counter; a GC pass every 60 seconds deletes dead segments and repacks fragmented ones, reclaiming the space in S3.
+TRIM deletes extent pointers and debits each segment's live-byte counter; segment reclamation deletes dead segments and repacks fragmented ones, reclaiming the space in S3.
 
 ## Limits
 

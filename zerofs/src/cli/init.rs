@@ -1023,9 +1023,9 @@ impl ReconciledDb {
 
         Ok(InitResult {
             fs,
-            // Retry-wrapped for the consumers downstream (the GC's checkpoint-gate
-            // admin and the checkpoint manager), whose listings would otherwise
-            // fail on one transient backend error.
+            // Retry-wrapped for downstream consumers (the segment reclaimer's
+            // checkpoint-gate admin and the checkpoint manager), whose listings
+            // would otherwise fail on one transient backend error.
             object_store: retrying_object_store,
             db_path: actual_db_path,
             db_handle,

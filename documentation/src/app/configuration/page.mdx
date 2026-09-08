@@ -300,12 +300,12 @@ You can change the compression algorithm at any time without migration:
 - **New writes** use the currently configured algorithm
 - **Existing data** remains readable regardless of how it was compressed
 - Compression format is auto-detected per-frame when reading
-- **Existing data is never re-encoded**: compaction relocates frames byte-for-byte without recompressing, so changing the algorithm or level does not rewrite or shrink data already stored; old and new encodings coexist indefinitely until the data is overwritten or removed
+- **Existing data is never re-encoded**: repacking relocates frames byte-for-byte without recompressing, so changing the algorithm or level does not rewrite or shrink data already stored; old and new encodings coexist indefinitely until the data is overwritten or removed
 
 
 ## LSM Tree Performance Tuning
 
-ZeroFS keeps metadata (inodes, directory entries, and the per-extent frame pointers) in an LSM (Log-Structured Merge) tree database that sits in the object store. File contents live in immutable segment objects written directly to the object store; this data path has no user-facing tuning keys, though the `[gc]` section described below tunes the loop that reclaims segment space. The `[lsm]` section tunes the metadata store, though `flush_interval_secs` and `sync_writes` also govern when buffered file data is sealed and uploaded. See [Architecture](/architecture).
+ZeroFS keeps metadata (inodes, directory entries, and the per-extent frame pointers) in an LSM (Log-Structured Merge) tree database that sits in the object store. File contents live in immutable segment objects written directly to the object store; the `[reclaim]` section below tunes how their space is reclaimed. The `[lsm]` section tunes the metadata store, though `flush_interval_secs` and `sync_writes` also govern when buffered file data is sealed and uploaded. See [Architecture](/architecture).
 
 ```toml
 [lsm]
@@ -337,39 +337,23 @@ Consider tuning these parameters if you're experiencing:
 - **CPU / Network underutilization**: Increase `max_concurrent_compactions` on high-core systems
 - **Too-frequent background flushes**: Increase `flush_interval_secs`; the crash-loss window for un-`fsync`'d writes grows accordingly
 
-## Segment Garbage Collection
+## Segment Reclamation
 
-The `[gc]` section tunes the segment reclamation loop described under [Garbage Collection](/garbage-collection) and not the tombstone sweep, the orphan sweep, or the metadata compaction above.
+The `[reclaim]` section tunes the segment-reclamation loop described under [Space Reclamation](/space-reclamation), not tombstone cleanup, the orphan sweep, or metadata compaction.
 
 ```toml
-[gc]
-interval_secs = 60               # Pass interval while the store is active
-idle_interval_secs = 5           # Pass interval while draining backlog on an idle store
-busy_backlog_interval_secs = 15  # Pass interval while active with a large dead backlog
-busy_backlog_dead_percent = 20   # Dead-space % at/above which the busy-backlog interval applies
-min_batches_per_pass = 4         # Compaction batches a busy pass runs before yielding to load
-compact_round_max_mib = 256      # Per-round compaction budget (selection cap, reserve, gather RAM)
-read_directed = true             # Reads steer compaction (nominations, seams, chains)
-tail_scrub_min_dead_percent = 5  # Repack write-cold segments above this % dead (0 = off)
+[reclaim]
+max_concurrent_repacks = 4       # Independent segment-repack jobs (range 1-16)
+repack_min_dead_percent = 10     # Repack non-small segments above this % dead (range 1-99)
 ```
 
 ### Parameters
 
-- **`interval_secs`** (default: 60, min: 5): Base delay between segment GC passes and the maximum delay used by the adaptive cadence. It affects reclamation speed, not deletion safety. Setting it below the normal flush cadence can create more small sealed segments.
+- **`max_concurrent_repacks`** (default: 4, range: 1–16): Maximum number of independent source sets gathered, packed, PUT, and repointed at once. Foreground traffic does not reduce this job limit. Each job can issue bounded payload I/O, while metadata point work shares a separate global bound. Lower it to reduce object-store fan-out and memory reservations; raise it when the backend and host can sustain more parallel work.
 
-- **`idle_interval_secs`** (default: 5, min: 1, capped at `interval_secs`): Delay used when the previous pass exhausted its budget, actionable work remains, and the store has stayed idle. A pass can run up to 32 batches while it remains idle. Setting this equal to `interval_secs` disables the idle acceleration tier.
+- **`repack_min_dead_percent`** (default: 10, range: 1–99): Minimum dead percentage for repacking a segment at least 1 MiB large. Smaller segments remain candidates for consolidation. Lower values recover more space but rewrite more live data; raise it on request-billed or rewrite-sensitive backends.
 
-- **`busy_backlog_interval_secs`** (default: 15, min: 5, capped at `interval_secs`): Delay used while the store is active and either dead space reaches `busy_backlog_dead_percent` or reserve-deferred hot seams remain. Setting it equal to `interval_secs` disables this middle cadence tier.
-
-- **`busy_backlog_dead_percent`** (default: 20): Dead-space percentage that activates the busy-backlog cadence. It is a ratio, so absolute garbage volume alone does not activate the tier.
-
-- **`min_batches_per_pass`** (default: 4, min: 1): Batches completed before a pass starts yielding to foreground activity. Batches are sequential, so raising the floor increases work per pass without multiplying peak gather memory.
-
-- **`compact_round_max_mib`** (default: 256, range: 64–4096): Per-round live-data budget and approximate gather-memory limit. Raising it increases reclamation work per batch and allows larger [read-directed](/read-directed-compaction) chains to be packed, at the cost of more memory.
-
-- **`read_directed`** (default: `true`): Whether reads steer compaction: the nomination priority, seam statistics, and chain repacks described under [Read-Directed Compaction](/read-directed-compaction). Turning it off stops all read-side recording; counter-driven reclamation and the tail scrub are unaffected.
-
-- **`tail_scrub_min_dead_percent`** (default: 5, range: 1–50; 0 disables it): Minimum dead percentage for repacking a write-cold segment with leftover pass budget. Lower values recover more space but rewrite more live data per byte reclaimed. Raise it on request-billed or rewrite-sensitive backends.
+Each job uses a fixed nominal selection and gather budget of 256 MiB of stored live frame data. At the default concurrency of four jobs, the aggregate budget is 1 GiB. A job may exceed its soft budget for the first source to ensure progress; the complete encoded output is limited to 1 GiB. Buffers and metadata consume additional memory. Segment uploads use one PUT rather than multipart.
 
 ## Multiple Instances
 

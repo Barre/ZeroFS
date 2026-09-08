@@ -57,7 +57,7 @@ Downloading a folder reads every file into browser memory and zips it client-sid
 
 ![ZeroFS Web UI Dashboard](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/webui/dashboard.png)
 
-Streams live stats over gRPC-web: I/O throughput, IOPS, storage usage, operation counters, GC activity, and a file access tracer showing recent operations.
+Streams live stats over gRPC-web: I/O throughput, IOPS, storage usage, operation counters, tombstone-cleanup activity, and a file access tracer showing recent operations.
 
 The tracer keeps the most recent 1000 events. Pausing discards events that arrive while paused rather than buffering them.
 

@@ -21,8 +21,6 @@ use fuser::{
     SessionACL, TimeOrNow,
 };
 use ninep_client::{ClientError, NinePClient, ReaddirState, SetattrBuilder, SetattrTime, Target};
-#[cfg(test)]
-use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 use ninep_proto::{
     GETATTR_ALL, LockStatus, LockType, P9_LOCK_FLAGS_BLOCK, Stat, classify_fallocate_mode,
 };
@@ -2008,6 +2006,7 @@ pub async fn run(target: String, mountpoint: PathBuf, opts: MountOptions) -> Res
 #[cfg(test)]
 mod consistency_tests {
     use super::*;
+    use ninep_proto::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE};
 
     #[test]
     fn open_flags_precedence() {

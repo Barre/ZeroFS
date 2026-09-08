@@ -2,7 +2,8 @@
 //!
 //! [`TracingObjectStore`] wraps the raw S3/GCS/Azure/local store at the bottom
 //! of the wrapper stack, so it sees the requests that actually leave the
-//! process: cache misses, prefetch reads, compaction, and deletes.
+//! process: cache misses, prefetch reads, metadata compaction, segment repacks,
+//! and deletes.
 //! Reads served from the prefetch cache make no backend request and so produce
 //! no event, which is exactly what a request trace should show.
 //!

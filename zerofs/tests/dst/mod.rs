@@ -2,19 +2,27 @@
 //!
 //! One seed = one world: a current-thread runtime with paused (virtual) time,
 //! a seeded latency-injecting object store over a persistent `InMemory`, and
-//! seeded writer/GC actors driving the real `ZeroFS` stack with the WAL off and
+//! seeded writer/reclamation actors driving the real `ZeroFS` stack with the WAL off and
 //! metadata made durable only by a ZeroFS segment PUT plus a SlateDB flush.
 //! Under `start_paused` every sleep is virtual, so the store's seeded per-op
 //! latencies decide task wake order: one seed is one schedule, and the same
 //! seed replays the same run (asserted by `same_seed_same_digest`).
 //!
 //! Each round races ordinary file writers, two disjoint-region writers on one
-//! shared inode, a namespace mutation actor, and full GC/reclaim passes. A
+//! shared inode, a namespace mutation actor, tombstone cleanup, reclamation
+//! cycles, and same-writer-epoch orphan sweeps. Namespace files can exceed the
+//! inline-deletion threshold, so cleanup races repacking real deferred extents. A
 //! round then quiesces or drops the filesystem without flushing and reopens it
 //! over the surviving store. Recovery must match the data and namespace models
 //! at operation prefixes no older than the last acknowledged fsync; every
 //! extent must remain readable, segment counters and footprint gauges must
 //! reconcile with authoritative scans, and the metadata invariants must hold.
+//!
+//! Targeted reclamation cases force cancellation and crash windows, verify
+//! multi-batch tombstone progress, and use actual checkpoint-backed readers.
+//! Managed readers renew and replace their checkpoints on the simulated clock;
+//! permanent checkpoints pin old contents until explicitly removed. Cold
+//! segment reads check that reclamation has not deleted referenced contents.
 //!
 //! Env knobs: `DST_SEEDS=3,17` (explicit seeds, for reproduction),
 //! `DST_WALL_CLOCK_SECS` (soak: fresh random seeds until the budget elapses;
@@ -38,8 +46,8 @@ mod data;
 mod digest;
 #[cfg(feature = "failpoints")]
 mod fp_crash;
-mod gc;
 mod namespace;
+mod reclamation;
 mod sim;
 mod world;
 
@@ -58,7 +66,7 @@ use zerofs::fs::EXTENT_SIZE;
 use zerofs::fs::permissions::Credentials;
 use zerofs::fs::types::AuthContext;
 
-/// Logical file size cap: enough extents that reclaim/compaction have real
+/// Logical file size cap: enough extents that reclamation/repacking have real
 /// material, small enough that a run stays cheap.
 const FILE_CAP: usize = 16 * EXTENT_SIZE;
 pub(crate) const FILES: usize = 3;
@@ -74,10 +82,8 @@ pub(crate) fn segment_codec() -> FrameCodec {
     .expect("DST segment codec")
 }
 
-/// World scale. Most seeds run small and fast; every fourth runs at chain
-/// scale, with segments above `SMALL_SEGMENT_BYTES` (1 MiB) so they are not
-/// unconditional compaction candidates and the dense-segment paths (pair
-/// heat, chain assembly) are reachable.
+/// World scale. Most seeds run small and fast; every fourth exercises
+/// non-small-segment reclaim paths.
 #[derive(Clone, Copy)]
 pub(crate) struct Scale {
     pub(crate) file_cap: usize,

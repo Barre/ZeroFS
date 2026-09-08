@@ -12,6 +12,7 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky
 use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{
     EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
 };
@@ -162,7 +163,7 @@ impl ZeroFS {
             all_inodes_to_lock.push(target_id);
         }
 
-        let _guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
+        let inode_guards = self.lock_manager.acquire_multi(all_inodes_to_lock).await;
 
         // Recheck replay state after waiting for inode locks.
         if self
@@ -251,7 +252,8 @@ impl ZeroFS {
             if crate::dedup::has_op_id(&op_id) {
                 let mut txn = self.db.new_transaction()?;
                 txn.set_dedup_result(op_id, DedupResult::Rename);
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guards);
+                self.write_coordinator.commit_locked(mutation).await?;
             }
             return Ok(());
         }
@@ -617,7 +619,8 @@ impl ZeroFS {
             }
         }
 
-        self.write_coordinator.commit(txn).await?;
+        let mutation = LockedMutation::new(txn, inode_guards);
+        self.write_coordinator.commit_locked(mutation).await?;
 
         if let Some(target_id) = deferred_target_id {
             self.schedule_deferred_orphan_reclaim(target_id);

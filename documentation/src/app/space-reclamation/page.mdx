@@ -1,0 +1,172 @@
+export const metadata = {
+  title: 'Space Reclamation',
+  description:
+    'How ZeroFS reclaims space after deletion: tombstone cleanup removes extent pointers, segment reclamation deletes and repacks segment objects, and metadata compaction cleans the LSM.',
+}
+
+# Space Reclamation
+
+Deleting a file removes it from the filesystem namespace immediately. Its bytes are reclaimed later by background stages. File contents live in immutable objects under `segments/`; storage usage decreases when segment reclamation deletes objects that are no longer needed. {{ className: 'lead' }}
+
+## What Deletion Does
+
+<Row>
+  <Col>
+
+    Unlink removes the inode in a single transaction. What happens to the file's extents depends on the file's size:
+
+    - Files of 10 extents or fewer (320 KiB at the 32 KiB extent size) have their extent keys deleted in the same transaction.
+    - Larger files leave a **tombstone**, a record of the file's remaining size. The extents stay in place until the tombstone cleaner processes it.
+
+    If the file is still open, the unlink only detaches the inode from the namespace and records it as an orphan; the same small-file/tombstone decision runs when the last handle closes.
+
+    Deleting an extent key removes a 32-byte pointer (a FrameLoc) from the metadata store and debits the live-byte counter of the segment that holds the extent's frame. It does not touch the segment object; the data bytes remain in object storage until segment reclamation removes or repacks the segment.
+
+    Renaming over an existing file deletes the replaced file through the same path. Neither operation waits for object-store space reclamation.
+
+  </Col>
+  <Col>
+
+    ```text {{ title: 'Deletion decision' }}
+    file size <= 10 extents (320 KiB)
+      -> extent keys deleted in the
+         unlink transaction
+
+    file size  > 10 extents
+      -> tombstone written;
+         extents remain until cleanup
+
+    file still open at unlink
+      -> inode orphaned; decision
+         deferred to last close
+    ```
+
+  </Col>
+</Row>
+
+## The Reclamation Pipeline
+
+File contents are packed as encrypted frames into immutable segment objects; the metadata LSM holds one 32-byte pointer per extent and a live-byte counter per segment. Background cleanup has three stages:
+
+1. **Tombstone cleanup** deletes the file's extent pointer keys and debits each source segment's live-byte counter. No object is deleted; the segment objects still hold the frames.
+2. **Segment reclamation** deletes segment objects whose live-byte counter has reached zero and repacks fragmented ones. This is where billed object-store usage for file data decreases.
+3. **Metadata compaction and object GC** rewrite and delete metadata SSTs. The SSTs hold only metadata (inodes, directories, extent pointers, counters), so this stage reclaims metadata space, not file data.
+
+<Note>
+  A delay between deleting files and object-store usage decreasing is normal,
+  not a fault. Each stage runs in the background on its own schedule.
+</Note>
+
+## Stage 1: Tombstone cleanup
+
+<Row>
+  <Col>
+
+    The read-write instance runs a continuous background task that drains the tombstone queue. It processes up to 10,000 extents across up to 10,000 tombstones at a time, continuing immediately until the queue is empty and then sleeping for 10 seconds.
+
+    Large files are collected tail-first: each step deletes extents from the end of the file and updates the tombstone's remaining size. A partially collected file is a valid intermediate state, and interrupted work resumes from that recorded size.
+
+    Each cleanup chunk runs under the per-inode write lock. Its extent deletes, source-segment live-byte counter debits, and tombstone progress update commit in one transaction, so progress cannot lag behind committed deletes. Those counters are how the next stage finds dead and fragmented segments. Already-empty tombstones are removed in batches.
+
+    After this stage, the extent pointers are gone from the metadata store. The object store still holds the same segment objects.
+
+  </Col>
+  <Col>
+
+    ```text {{ title: 'Tombstone collection' }}
+    loop:
+      process up to 10,000 tombstones
+      delete up to 10,000 extent keys
+      (tail-first per file)
+      debit segment live-byte counters
+      if queue empty: sleep 10 s
+    ```
+
+  </Col>
+</Row>
+
+## Stage 2: Segment reclamation
+
+The writer runs a reclamation cycle at startup, then schedules another when a committed counter update creates dead bytes, a sub-1-MiB segment is sealed, or a pending deletion reaches its deadline. Activity is coalesced to the configured metadata flush interval. Changes recorded during a scan remain pending for the next cycle; an idle store performs no scans.
+
+Each scan collects the complete set of eligible segments. Deletions and repacks run with bounded concurrency; a repack failure stops new repack admissions, and shutdown stops all new admissions. Admitted jobs finish. Failed cycles and work blocked by a persistent checkpoint retry after 60 seconds.
+
+Each cycle seals the open segment buffer, flushes metadata, and captures a segment cutoff under the publication barriers, then checks checkpoints. It scans durable segment counters; only segments sealed before the cutoff are eligible. Counter scans do not list the object store.
+
+Up to `max_concurrent_repacks` repack jobs run at once, four by default. Each job gathers live frames into one output segment, uploads it, and updates the extent pointers. The nominal gather budget is fixed at 256 MiB per job, or 1 GiB across four jobs. A job may exceed its soft budget for the first source to ensure progress; the complete encoded output is limited to 1 GiB.
+
+The two kinds of work are:
+
+**Dead-segment deletion.** A segment with zero live bytes is a delete candidate. After its deletion deadline, the reclaimer reads its directory and verifies that neither current nor durable extent pointers reference it. A read error keeps the segment and preserves its deadline for the next cycle. Deleting the object releases its storage.
+
+**Segment repacking.** Segments above `repack_min_dead_percent` dead (10% by default), or smaller than 1 MiB, become candidates. A selection must free at least 1 MiB or combine multiple sources with at least 1 MiB of live data, avoiding repeated rewrites of tiny outputs. Each job fetches up to 20 coalesced frame runs at once; metadata lookups and repoint transactions share a global 20-operation limit. Live frames are sorted by inode and extent. The output upload completes before any extent is repointed.
+
+Drained source segments become dead but are not deleted by the cycle that selected them, so in-flight reads of their old locations remain valid. A later cycle's counter scan observes and ages them for deletion. Candidates are selected most-fragmented-first.
+
+| Parameter | Value |
+|-----------|-------|
+| Scan triggers | Startup; reclaim-relevant activity coalesced to `flush_interval_secs`; pending deletion deadline |
+| Delete-horizon floor | now + 60 s |
+| Repack threshold | tracked dead frame bytes > 10% of tracked appended frame bytes by default; configurable from 1–99% |
+| Small-segment threshold | < 1 MiB of tracked appended frame bytes |
+| Usual repack output | Up to the nominal 256 MiB per-job budget; smaller when fewer live frames are selected |
+| Maximum segment object | 1 GiB encoded, enforced before every single PUT; multipart is not used |
+| Concurrent repack jobs | 4 by default, configurable from 1–16 with `max_concurrent_repacks` |
+| Per-job repack budget | Internal constant: nominally 256 MiB of stored live bytes |
+| Minimum payoff to repack | 1 MiB freed, or at least 1 MiB of live bytes in a multi-source pack |
+| Concurrent dead-segment jobs | Up to 8 reference-check/delete jobs in flight; every due candidate is considered |
+| Orphan sweep interval | 24 h monotonic; persisted timestamp sets a startup delay capped at 24 h |
+
+A cycle's counter scan reads the keyspace sequentially. For each segment the cycle verifies or repacks, it also issues a 64-byte footer GET plus a directory GET; dead segments add one DELETE, and repack jobs add coalesced ranged GETs for live frames plus one PUT per repack output.
+
+**Orphan sweep.** A crash can leave a segment object without a live-byte counter, making it invisible to the normal scan. Once every 24 hours, the sweep lists `segments/` by shard and checks whether each object has a counter. At startup, the last completed sweep's persisted timestamp determines a delay between zero and 24 hours. A future timestamp cannot postpone startup longer than one interval; a missing or invalid timestamp makes the sweep immediately due. After startup, sweeps are scheduled with monotonic time, so wall-clock adjustments cannot move their deadlines. Only completed sweeps update the persisted timestamp.
+
+Counter-less objects pass the same directory verification as dead segments. An object is kept if its directory cannot be read or any extent still references it. Each sweep considers the complete eligible listing, so a repeatedly unverifiable object cannot starve later orphans. This is the only path that lists the segment namespace.
+
+### Checkpoints Delay Reclamation
+
+[Checkpoints](/checkpoints) pin segment objects:
+
+- For an ephemeral checkpoint (including a read replica's auto-renewed reader checkpoint), the cycle waits its full recorded span (`expire_time - create_time`) plus 30 seconds of grace from the checkpoint-list observation, never below the 60-second floor. The longest span in the list determines the horizon.
+- A persistent checkpoint cannot be timed out. While one exists, segment deletion and repacking are paused entirely; the counters keep tracking dead space and reclamation catches up once the checkpoint is deleted. The orphan sweep is unaffected, because no manifest, and therefore no checkpoint, ever references an orphan.
+- If the checkpoint list cannot be read or a checkpoint has an invalid retention span, that cycle does no reclamation and retries after 60 seconds.
+
+Both timestamps come from the checkpoint, so the calculation does not compare a reader's expiry with the writer's wall clock. The resulting deadlines use monotonic time; later wall-clock adjustments do not shorten or extend them. This deliberately retains segments conservatively: renewal updates expiry without changing creation time, so a long-lived, repeatedly renewed checkpoint can produce a wait longer than its renewal lifetime. Later renewals do not extend a segment's already recorded deadline.
+
+## Stage 3: Metadata Compaction and Object GC
+
+The metadata LSM holds only inodes, directory entries, tombstones, extent pointers, and segment counters. Its compaction merges metadata SSTs; a coordinator in the writer process polls every 5 seconds and schedules work size-tiered, executed by an embedded worker. There is no standalone compactor process; metadata compaction always runs inside `zerofs run`.
+
+The metadata store's object garbage collector, also in the writer process, scans its manifest, compacted-SST, and compaction-state objects every 30 minutes, and deletes objects that the current manifest no longer references and that are at least 1 minute old. These deletions reclaim metadata space only; file data is reclaimed by segment reclamation.
+
+## Where Reclamation Runs
+
+| Instance | Tombstone cleanup | Segment reclamation | Metadata compaction + object GC |
+|----------|--------------|------------|---------------------------------|
+| Read-write | yes | yes | yes |
+| Read-only mount | no | no | no |
+| Checkpoint mount | no | no | no |
+
+All reclamation runs in the writer process. [Read-only mounts](/read-replicas) and [checkpoint mounts](/checkpoints) open the database through a reader and run no stage, but their checkpoints delay segment reclamation as described above. Object-store usage can decrease only while the read-write instance is running.
+
+## Crash Safety
+
+- A crash after a repack seal but before the repoint leaves the source segments in place and readable; the packed segment is an orphan with no references, and the orphan sweep later deletes it.
+- A crash between a segment DELETE and the drop of its counter key leaves one temporary stale counter; a later cycle's scan sees the object's `NotFound` and drops it.
+- If a counter under-counts, directory verification finds the live reference and skips the delete.
+
+These paths are exercised by failpoint crash tests that abort the operation at each injection point, reopen the filesystem, and verify consistency.
+
+## Observability
+
+The terminal monitor shows segment footprint and live executor state. The [Prometheus reference](/prometheus) lists the segment-reclamation and tombstone-cleanup series and their units; the [web UI](/web-ui) also shows tombstone-cleanup activity.
+
+Each cycle also emits an info-level summary with its deletes, repacks, and relocated frames. The object count and total size under `segments/` show the resulting change at the backend.
+
+## NBD TRIM
+
+TRIM on an [NBD device](/nbd-devices) skips tombstones: the discard transaction deletes the pointer keys of fully covered extents and zeroes the covered portion of partially covered extents (an extent that becomes all zeroes is also deleted). The same transaction debits the source segments' live-byte counters; segment reclamation then reclaims the space on its own schedule.
+
+## Configuration
+
+Values configurable through the `[reclaim]` section are the concurrent-job limit and minimum dead percentage; see [Configuration](/configuration).

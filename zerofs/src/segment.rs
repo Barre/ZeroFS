@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! [frame_0][frame_1]...[frame_{k-1}]   packed, no padding
-//! [directory]                          AEAD-sealed reverse map (GC/recovery only)
+//! [directory]                          AEAD-sealed reverse map (reclamation/recovery only)
 //! [footer]                             64 bytes, plaintext, last
 //! ```
 //!
@@ -24,9 +24,6 @@
 //! Note: "segment" here means a data-plane object, unrelated to SlateDB's
 //! key-domain [`segment_extractor`](crate::segment_extractor).
 
-#[cfg(test)]
-use bytes::Bytes;
-
 use crate::frame_codec::{CodecError, Compressed, FrameCodec};
 
 /// HKDF info label for the data-plane segment subkey. Domain-separated from the
@@ -34,6 +31,9 @@ use crate::frame_codec::{CodecError, Compressed, FrameCodec};
 pub const SEGMENT_INFO: &[u8] = b"zerofs-v1-segment";
 
 pub(crate) const FOOTER_LEN: usize = 64;
+/// Hard limit for a complete segment object. Segment writes deliberately use
+/// one PUT; multipart upload is not part of the data-plane protocol.
+pub(crate) const MAX_SEGMENT_OBJECT_BYTES: u64 = 1 << 30; // 1 GiB
 const MAGIC: &[u8; 4] = b"ZSEG";
 const VERSION: u32 = 1;
 const DIR_ENTRY_LEN: usize = 28; // byte_offset(8) + len(4) + inode(8) + extent(8)
@@ -51,6 +51,24 @@ const F_SEALED_SEQNO: usize = 40; // 8
 const F_TOTAL_LEN: usize = 48; // 8
 const F_CRC: usize = 56; // 4 (crc32c over bytes[dir_offset .. total_len - 8]: the directory + footer)
 const F_RESERVED: usize = 60; // 4 (must be zero)
+
+/// Upper bound for a segment with an already-sealed frame region.
+pub(crate) fn max_segment_object_size(
+    codec: &FrameCodec,
+    frame_bytes: u64,
+    frame_count: u64,
+) -> u64 {
+    let directory_plain = frame_count.saturating_mul(DIR_ENTRY_LEN as u64);
+    if directory_plain > MAX_SEGMENT_OBJECT_BYTES {
+        return u64::MAX;
+    }
+    let Ok(directory_plain) = usize::try_from(directory_plain) else {
+        return u64::MAX;
+    };
+    frame_bytes
+        .saturating_add(codec.max_sealed_size(directory_plain))
+        .saturating_add(FOOTER_LEN as u64)
+}
 
 /// Logical segment identity. Epoch-namespaced so two leader terms can never
 /// target the same object key. Stored as two u64s, never bit-packed.
@@ -280,7 +298,7 @@ pub(crate) fn seal_frame(
 /// [`seal_frame`] over an already-compressed payload. The write path compresses
 /// outside the open-segment lock (compression is the expensive half of the codec
 /// and is independent of the AAD) and binds `(segid, frame_index)` here, under
-/// the lock that assigns them. Compaction feeds it [`open_compressed_frame`]'s
+/// the lock that assigns them. Repacking feeds it [`open_compressed_frame`]'s
 /// output to relocate a frame without a decompress/recompress round trip.
 pub(crate) fn seal_compressed_frame(
     codec: &FrameCodec,
@@ -490,7 +508,7 @@ pub struct Segment {
     pub dir_offset: u64,
     pub dir_len: u32,
     pub sealed_seqno: u64,
-    bytes: Bytes,
+    bytes: bytes::Bytes,
 }
 
 #[cfg(test)]
@@ -498,7 +516,7 @@ impl Segment {
     /// Parse the footer, verify magic/version/total_len, and verify the CRC over
     /// the metadata tail. The CRC is a keyless torn-write detector; per-frame
     /// AEAD remains the integrity authority on read.
-    pub fn parse(bytes: Bytes) -> Result<Segment, SegmentError> {
+    pub fn parse(bytes: bytes::Bytes) -> Result<Segment, SegmentError> {
         let n = bytes.len();
         if n < FOOTER_LEN {
             return Err(SegmentError::TooSmall(n));
@@ -552,7 +570,7 @@ impl Segment {
         )
     }
 
-    /// Open and parse the AEAD-sealed directory (GC/coalescer/recovery path).
+    /// Open and parse the AEAD-sealed directory (repack/reclamation/recovery path).
     pub fn directory(&self, codec: &FrameCodec) -> Result<Vec<DirEntry>, SegmentError> {
         let start = self.dir_offset as usize;
         let end = start + self.dir_len as usize;
@@ -647,7 +665,7 @@ pub(crate) fn read_frames_from_region(
 }
 
 /// As [`read_frames_from_region`] but AEAD-verify only, returning each frame's
-/// still-compressed payload. The relocation (compaction) read: the payloads
+/// still-compressed payload. The relocation (repack) read: the payloads
 /// re-seal under their new slots' AADs without a decompress/recompress round
 /// trip, so gather memory tracks stored size, not the compression ratio.
 pub(crate) fn read_compressed_frames_from_region(
@@ -709,6 +727,7 @@ pub(crate) fn seal_compressed_batch(
 mod tests {
     use super::*;
     use crate::config::CompressionConfig;
+    use bytes::Bytes;
 
     fn codec() -> FrameCodec {
         FrameCodec::try_new(&[5u8; 32], SEGMENT_INFO, CompressionConfig::Zstd(3))
@@ -984,6 +1003,7 @@ mod tests {
 mod prop_tests {
     use super::*;
     use crate::config::CompressionConfig;
+    use bytes::Bytes;
     use proptest::prelude::*;
 
     fn frames_strategy() -> impl Strategy<Value = Vec<(u64, u64, Vec<u8>)>> {

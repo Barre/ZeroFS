@@ -99,7 +99,7 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lsm: Option<LsmConfig>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub gc: Option<GcConfig>,
+    pub reclaim: Option<ReclaimConfig>,
     #[serde(skip_serializing)]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing)]
@@ -392,152 +392,32 @@ impl LsmConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default)]
 #[serde(deny_unknown_fields)]
-pub struct GcConfig {
-    /// Seconds between segment-GC passes while the filesystem is active. The
-    /// ceiling of the adaptive cadence: the loop never sleeps longer. Values
-    /// below the ~30 s flush cadence make a busy pass's barrier seal real
-    /// sub-1-MiB segments — each itself future GC work.
+pub struct ReclaimConfig {
+    /// Repack non-small segments above this dead percentage.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub interval_secs: Option<u64>,
-    /// Seconds between passes while a saturated backlog meets an idle store
-    /// (no reads, no writes since the previous pass). A fast pass performs a
-    /// full reclamation round plus roughly two small bookkeeping PUTs of
-    /// fixed overhead (the previous pass's own commits flushing); total
-    /// fast-mode work is bounded by the backlog. Setting it equal to
-    /// interval_secs disables the idle acceleration tier only; the
-    /// busy-backlog drain tier is independent.
+    pub repack_min_dead_percent: Option<u64>,
+    /// Independent segment-repack jobs driven from one reclaim cycle.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub idle_interval_secs: Option<u64>,
-    /// Whether reads steer compaction (nominations, seam heat, chain repacks).
-    /// The counter-driven policy and the tail scrub are unaffected.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub read_directed: Option<bool>,
-    /// Tail-scrub floor: a write-cold segment more than this percent dead —
-    /// but not dead enough for normal compaction candidacy — is repacked with
-    /// leftover pass budget. The space-amplification dial: worst-case overhead
-    /// on write-cold data is 1/(1 - floor/100) of live bytes, bought at up to
-    /// (100 - floor)/floor bytes rewritten per byte reclaimed. 0 disables the
-    /// scrub; 50 empties the band, same effect.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tail_scrub_min_dead_percent: Option<u64>,
-    /// Compaction batches a pass runs before it yields to foreground load:
-    /// below the floor it drains regardless of client activity, above it a
-    /// client op ends the pass. Idle stores always drain to the internal
-    /// per-pass cap. 1 restores the historical single-batch busy pass.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub min_batches_per_pass: Option<usize>,
-    /// Pass interval while the store is active but its dead backlog is large
-    /// (dead space >= busy_backlog_dead_percent). Clamped to
-    /// [MIN_INTERVAL_SECS, interval_secs], so a loaded store keeps draining
-    /// without waiting the full base interval. >= interval_secs disables the tier.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub busy_backlog_interval_secs: Option<u64>,
-    /// Store dead-space percent at or above which busy_backlog_interval_secs
-    /// applies. Below it a busy store uses interval_secs.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub busy_backlog_dead_percent: Option<u64>,
-    /// Per-round compaction budget in MiB: the live-byte selection cap, the
-    /// heat reserve (half), and the stored-byte gather cap. Raising it packs
-    /// hot seams whose cheapest pair exceeds half the default round (the
-    /// "over-reserve" chains) and lifts per-batch dead-space throughput, at
-    /// ~this much peak gather RAM per batch (more when the leading seam
-    /// chain alone exceeds it, gathered whole). Default 256.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub compact_round_max_mib: Option<u64>,
+    pub max_concurrent_repacks: Option<usize>,
 }
 
-impl GcConfig {
-    /// Default interval_secs: 60 seconds, the historical fixed cadence.
-    pub const DEFAULT_INTERVAL_SECS: u64 = 60;
-    /// Default idle_interval_secs: 5 seconds (~12x drain while idle).
-    pub const DEFAULT_IDLE_INTERVAL_SECS: u64 = 5;
-    /// Default read_directed: true.
-    pub const DEFAULT_READ_DIRECTED: bool = true;
-    /// Default tail_scrub_min_dead_percent: 5 (1.053x worst-case space
-    /// amplification at up to 19x rewrite per reclaimed byte; the request-cost
-    /// break-even on S3 is near 1.5%, so 5 is the write-amplification choice).
-    pub const DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT: u64 = 5;
-    /// Default min_batches_per_pass: 4 (~4x the single-batch reclaim rate under
-    /// load; 1 restores single-batch passes).
-    pub const DEFAULT_MIN_BATCHES_PER_PASS: usize = 4;
-    /// Default busy_backlog_interval_secs: 15 (a loaded, dirty store drains
-    /// ~4x more often than the base interval).
-    pub const DEFAULT_BUSY_BACKLOG_INTERVAL_SECS: u64 = 15;
-    /// Default busy_backlog_dead_percent: 20.
-    pub const DEFAULT_BUSY_BACKLOG_DEAD_PERCENT: u64 = 20;
-    /// Default compact_round_max_mib: 256 (the historical fixed round budget).
-    pub const DEFAULT_COMPACT_ROUND_MAX_MIB: u64 = 256;
-    /// Min compact_round_max_mib: below the pack target a round can't hold one
-    /// output segment.
-    pub const MIN_COMPACT_ROUND_MAX_MIB: u64 = 64;
-    /// Max compact_round_max_mib: a hard ceiling on per-batch gather RAM.
-    pub const MAX_COMPACT_ROUND_MAX_MIB: u64 = 4096;
+impl ReclaimConfig {
+    pub const DEFAULT_REPACK_MIN_DEAD_PERCENT: u64 = 10;
+    pub const DEFAULT_MAX_CONCURRENT_REPACKS: usize = 4;
+    /// Hard ceiling on concurrent jobs. Combined with the per-job byte budget,
+    /// this bounds the normal gather reservation and object-store fan-out.
+    pub const MAX_CONCURRENT_REPACKS: usize = 16;
 
-    /// Minimum interval_secs: each pass runs a flush barrier, so the LSM
-    /// flush floor applies.
-    pub const MIN_INTERVAL_SECS: u64 = LsmConfig::MIN_FLUSH_INTERVAL_SECS;
-    /// Minimum idle_interval_secs: below ~1 s the pass's barrier round-trips
-    /// stop amortizing.
-    pub const MIN_IDLE_INTERVAL_SECS: u64 = 1;
-
-    pub fn interval_secs(&self) -> u64 {
-        self.interval_secs
-            .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
-            .max(Self::MIN_INTERVAL_SECS)
+    pub fn repack_min_dead_percent(&self) -> u64 {
+        self.repack_min_dead_percent
+            .unwrap_or(Self::DEFAULT_REPACK_MIN_DEAD_PERCENT)
+            .clamp(1, 99)
     }
 
-    pub fn idle_interval_secs(&self) -> u64 {
-        self.idle_interval_secs
-            .unwrap_or(Self::DEFAULT_IDLE_INTERVAL_SECS)
-            .max(Self::MIN_IDLE_INTERVAL_SECS)
-            .min(self.interval_secs())
-    }
-
-    pub fn read_directed(&self) -> bool {
-        self.read_directed.unwrap_or(Self::DEFAULT_READ_DIRECTED)
-    }
-
-    /// `None` = scrub disabled (configured 0).
-    pub fn tail_scrub_min_dead_percent(&self) -> Option<u64> {
-        match self.tail_scrub_min_dead_percent {
-            Some(0) => None,
-            v => Some(
-                v.unwrap_or(Self::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT)
-                    .clamp(1, 50),
-            ),
-        }
-    }
-
-    pub fn min_batches_per_pass(&self) -> usize {
-        self.min_batches_per_pass
-            .unwrap_or(Self::DEFAULT_MIN_BATCHES_PER_PASS)
-            .max(1)
-    }
-
-    /// Clamped to [MIN_INTERVAL_SECS, interval_secs]; equal to interval_secs
-    /// disables the busy-backlog tier.
-    pub fn busy_backlog_interval_secs(&self) -> u64 {
-        self.busy_backlog_interval_secs
-            .unwrap_or(Self::DEFAULT_BUSY_BACKLOG_INTERVAL_SECS)
-            .max(Self::MIN_INTERVAL_SECS)
-            .min(self.interval_secs())
-    }
-
-    pub fn busy_backlog_dead_percent(&self) -> u64 {
-        self.busy_backlog_dead_percent
-            .unwrap_or(Self::DEFAULT_BUSY_BACKLOG_DEAD_PERCENT)
-            .min(100)
-    }
-
-    /// Per-round compaction budget in bytes (MiB config, clamped).
-    pub fn compact_round_bytes(&self) -> u64 {
-        self.compact_round_max_mib
-            .unwrap_or(Self::DEFAULT_COMPACT_ROUND_MAX_MIB)
-            .clamp(
-                Self::MIN_COMPACT_ROUND_MAX_MIB,
-                Self::MAX_COMPACT_ROUND_MAX_MIB,
-            )
-            << 20
+    pub fn max_concurrent_repacks(&self) -> usize {
+        self.max_concurrent_repacks
+            .unwrap_or(Self::DEFAULT_MAX_CONCURRENT_REPACKS)
+            .clamp(1, Self::MAX_CONCURRENT_REPACKS)
     }
 }
 
@@ -1053,7 +933,7 @@ impl Settings {
             },
             filesystem: None,
             lsm: None,
-            gc: None,
+            reclaim: None,
             aws: None,
             azure: None,
             gcp: None,
@@ -1136,35 +1016,10 @@ impl Settings {
         toml_string.push_str("                                   # they become durable on return instead of buffered until the next periodic flush.\n");
         toml_string.push_str("                                   # Expensive: the WAL is off, so each write forces a full seal + memtable flush.\n");
 
-        toml_string
-            .push_str("\n# Optional segment garbage-collection tuning. Governs the segment\n");
-        toml_string.push_str("# reclamation loop.\n");
-        toml_string.push_str("\n# [gc]\n");
-        toml_string.push_str("# interval_secs = 60               # Pass interval while the store is active (default: 60, min: 5).\n");
-        toml_string.push_str("#                                  # Below the ~30 s flush cadence, busy passes seal sub-1-MiB segments.\n");
-        toml_string.push_str("# idle_interval_secs = 5           # Pass interval while a saturated backlog meets an idle store\n");
-        toml_string.push_str("#                                  # (default: 5, min: 1, capped at interval_secs; equal = adaptation off).\n");
-        toml_string.push_str("#                                  # A fast pass runs a full reclamation round plus ~2 small PUTs of\n");
-        toml_string.push_str("#                                  # overhead; total fast-mode work is bounded by the backlog.\n");
-        toml_string.push_str("# read_directed = true             # Reads steer compaction: nominations, seam heat, chain repacks\n");
-        toml_string.push_str("#                                  # (default: true). Counter-driven reclamation is unaffected.\n");
-        toml_string.push_str("# tail_scrub_min_dead_percent = 5  # Repack write-cold segments more than this % dead that normal\n");
-        toml_string.push_str("#                                  # candidacy would strand forever (default: 5, range 1-50; 0 disables\n");
-        toml_string.push_str("#                                  # the scrub).\n");
-        toml_string.push_str("#                                  # Space overhead on write-cold data is capped at 1/(1 - floor/100)\n");
-        toml_string.push_str("#                                  # of live bytes, paid with up to (100-floor)/floor bytes rewritten\n");
-        toml_string.push_str("#                                  # per byte reclaimed, using leftover pass budget only.\n");
-        toml_string.push_str("# min_batches_per_pass = 4         # Compaction batches a busy pass runs before yielding to load\n");
-        toml_string.push_str("#                                  # (default: 4, min: 1); each drains one round budget. 1 restores\n");
-        toml_string.push_str("#                                  # single-batch busy passes. Idle stores always drain the per-pass cap.\n");
-        toml_string.push_str("# busy_backlog_interval_secs = 15  # Pass interval while busy AND dead space >= busy_backlog_dead_percent\n");
-        toml_string.push_str("#                                  # (default: 15, min: 5, capped at interval_secs; equal disables).\n");
-        toml_string.push_str("# busy_backlog_dead_percent = 20   # Dead-space percent at/above which busy_backlog_interval_secs\n");
-        toml_string.push_str("#                                  # applies while the store is active (default: 20).\n");
-        toml_string.push_str("# compact_round_max_mib = 256      # Per-round compaction budget in MiB (default: 256, range 64-4096):\n");
-        toml_string.push_str("#                                  # live-byte selection cap, heat reserve (half), and stored-byte gather\n");
-        toml_string.push_str("#                                  # RAM cap. Raise to pack over-reserve hot seams and lift dead-space\n");
-        toml_string.push_str("#                                  # throughput per batch, at up to this many MiB peak gather RAM.\n");
+        toml_string.push_str("\n# Optional segment-reclamation tuning\n");
+        toml_string.push_str("\n# [reclaim]\n");
+        toml_string.push_str("# repack_min_dead_percent = 10     # Repack segments above this dead percentage (default: 10, range 1-99).\n");
+        toml_string.push_str("# max_concurrent_repacks = 4       # Independent repack jobs in flight (default: 4, range 1-16).\n");
 
         toml_string.push_str(
             "\n# Optional HA replication: a leader + standby pair over one object store, with\n",
@@ -1690,81 +1545,35 @@ ignore_fsync = true"#,
     }
 
     #[test]
-    fn gc_section_parses_defaults_and_clamps() {
-        // Absent section: every accessor returns the historical behavior.
-        let gc: GcConfig = toml::from_str("").unwrap();
-        assert_eq!(gc.interval_secs(), GcConfig::DEFAULT_INTERVAL_SECS);
+    fn reclaim_defaults_and_clamps() {
+        let reclaim: ReclaimConfig = toml::from_str("").unwrap();
         assert_eq!(
-            gc.idle_interval_secs(),
-            GcConfig::DEFAULT_IDLE_INTERVAL_SECS
-        );
-        assert!(gc.read_directed());
-        assert_eq!(
-            gc.tail_scrub_min_dead_percent(),
-            Some(GcConfig::DEFAULT_TAIL_SCRUB_MIN_DEAD_PERCENT)
+            reclaim.max_concurrent_repacks(),
+            ReclaimConfig::DEFAULT_MAX_CONCURRENT_REPACKS
         );
         assert_eq!(
-            gc.min_batches_per_pass(),
-            GcConfig::DEFAULT_MIN_BATCHES_PER_PASS
+            reclaim.repack_min_dead_percent(),
+            ReclaimConfig::DEFAULT_REPACK_MIN_DEAD_PERCENT
         );
-        assert_eq!(
-            gc.busy_backlog_interval_secs(),
-            GcConfig::DEFAULT_BUSY_BACKLOG_INTERVAL_SECS
-        );
-        assert_eq!(
-            gc.busy_backlog_dead_percent(),
-            GcConfig::DEFAULT_BUSY_BACKLOG_DEAD_PERCENT
-        );
-        assert_eq!(
-            gc.compact_round_bytes(),
-            GcConfig::DEFAULT_COMPACT_ROUND_MAX_MIB << 20
-        );
-
-        // Out-of-range values clamp silently
-        let gc: GcConfig = toml::from_str(
-            "interval_secs = 2\nidle_interval_secs = 30\n\
-             tail_scrub_min_dead_percent = 90\nread_directed = false\n\
-             min_batches_per_pass = 0\nbusy_backlog_interval_secs = 999\n\
-             compact_round_max_mib = 999999\n",
+        // Upper clamps.
+        let reclaim: ReclaimConfig = toml::from_str(
+            "max_concurrent_repacks = 999\n\
+             repack_min_dead_percent = 999\n",
         )
         .unwrap();
-        assert_eq!(gc.interval_secs(), GcConfig::MIN_INTERVAL_SECS);
-        assert_eq!(gc.idle_interval_secs(), GcConfig::MIN_INTERVAL_SECS);
-        assert_eq!(gc.tail_scrub_min_dead_percent(), Some(50));
-        assert!(!gc.read_directed());
-        // min_batches floors at 1; busy-backlog caps at interval_secs; round
-        // budget caps at the RAM ceiling.
-        assert_eq!(gc.min_batches_per_pass(), 1);
-        assert_eq!(gc.busy_backlog_interval_secs(), gc.interval_secs());
         assert_eq!(
-            gc.compact_round_bytes(),
-            GcConfig::MAX_COMPACT_ROUND_MAX_MIB << 20
+            reclaim.max_concurrent_repacks(),
+            ReclaimConfig::MAX_CONCURRENT_REPACKS
         );
-
-        // Lower clamps: round budget floors at 64 MiB, busy-backlog interval at
-        // the flush floor (MIN_INTERVAL_SECS).
-        let gc: GcConfig =
-            toml::from_str("compact_round_max_mib = 1\nbusy_backlog_interval_secs = 1\n").unwrap();
-        assert_eq!(
-            gc.compact_round_bytes(),
-            GcConfig::MIN_COMPACT_ROUND_MAX_MIB << 20
-        );
-        assert_eq!(gc.busy_backlog_interval_secs(), GcConfig::MIN_INTERVAL_SECS);
-
-        // 0 is off, not a clamp to the most aggressive floor.
-        let gc: GcConfig = toml::from_str("tail_scrub_min_dead_percent = 0").unwrap();
-        assert_eq!(gc.tail_scrub_min_dead_percent(), None);
-
-        // A [gc] table parses as part of Settings.
-        let content = base_config_with_replication(
-            r#"[gc]
-interval_secs = 120
-tail_scrub_min_dead_percent = 10"#,
-        );
-        let settings = write_and_load(&content).unwrap();
-        let gc = settings.gc.unwrap();
-        assert_eq!(gc.interval_secs(), 120);
-        assert_eq!(gc.tail_scrub_min_dead_percent(), Some(10));
+        assert_eq!(reclaim.repack_min_dead_percent(), 99);
+        // Lower clamps.
+        let reclaim: ReclaimConfig = toml::from_str(
+            "max_concurrent_repacks = 0\n\
+             repack_min_dead_percent = 0\n",
+        )
+        .unwrap();
+        assert_eq!(reclaim.max_concurrent_repacks(), 1);
+        assert_eq!(reclaim.repack_min_dead_percent(), 1);
     }
 
     // deny_unknown_fields catches misspelled LSM settings.
@@ -2066,6 +1875,13 @@ addresses = ["${ZEROFS_TEST_BAD_ADDR}"]
             env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
         }
         let rendered = Settings::render_default_config().unwrap();
+        for canonical in [
+            "# [reclaim]",
+            "# repack_min_dead_percent = 10",
+            "# max_concurrent_repacks = 4",
+        ] {
+            assert!(rendered.contains(canonical), "missing {canonical}");
+        }
         let settings = write_and_load(&rendered).unwrap();
         assert!(
             settings

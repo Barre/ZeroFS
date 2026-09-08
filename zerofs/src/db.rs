@@ -5,6 +5,7 @@
 //! just passes through operations.
 
 use crate::fs::errors::FsError;
+use crate::fs::metrics::SegmentFootprintDelta;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -115,10 +116,10 @@ enum TxOp {
 /// Usage-stats adjustment riding along with a transaction. Deltas commute, so
 /// the commit worker can aggregate them per shard across a whole batch and
 /// persist one absolute shard value, without any per-operation locking.
-pub struct StatsDelta {
-    pub inode_id: u64,
-    pub bytes: i64,
-    pub inodes: i64,
+pub(crate) struct StatsDelta {
+    pub(crate) inode_id: u64,
+    pub(crate) bytes: i64,
+    pub(crate) inodes: i64,
 }
 
 /// Transaction for batching database writes.
@@ -134,6 +135,8 @@ pub struct Transaction {
     /// aggregated by the commit worker into one absolute `(live, total)` per
     /// segment. Same lock-free pattern as `stats_deltas`.
     seg_deltas: Vec<(Bytes, (i64, i64))>,
+    /// Footprint debit for raw segment-counter rows deleted by this transaction.
+    segcount_delete_delta: SegmentFootprintDelta,
     /// Pins FrameLoc publication from assignment through commit.
     extent_ref_guard: Option<ExtentRefGuard>,
     dedup_entry: Option<crate::dedup::DedupEntry>,
@@ -150,6 +153,7 @@ impl Transaction {
             directory_entry_cache_invalidations: Vec::new(),
             stats_deltas: Vec::new(),
             seg_deltas: Vec::new(),
+            segcount_delete_delta: SegmentFootprintDelta::default(),
             extent_ref_guard: None,
             dedup_entry: None,
         }
@@ -181,7 +185,7 @@ impl Transaction {
             crate::dedup::has_op_id(&op_id).then_some(crate::dedup::DedupEntry { op_id, result });
     }
 
-    pub fn take_dedup_entry(&mut self) -> Option<crate::dedup::DedupEntry> {
+    pub(crate) fn take_dedup_entry(&mut self) -> Option<crate::dedup::DedupEntry> {
         self.dedup_entry.take()
     }
 
@@ -191,6 +195,17 @@ impl Transaction {
 
     pub fn delete_bytes(&mut self, key: &Bytes) {
         self.ops.push(TxOp::Delete(key.clone()));
+    }
+
+    /// Delete one raw segment-counter row and publish the matching footprint
+    /// debit after the transaction applies.
+    pub(crate) fn delete_segcount(&mut self, key: &Bytes, live: u64, total: u64) {
+        self.delete_bytes(key);
+        self.segcount_delete_delta.merge(SegmentFootprintDelta::new(
+            -1,
+            -i64::try_from(total).unwrap_or(i64::MAX),
+            -i64::try_from(live).unwrap_or(i64::MAX),
+        ));
     }
 
     pub(crate) fn invalidate_cached_inode(&mut self, inode_id: u64) {
@@ -223,7 +238,7 @@ impl Transaction {
         }
     }
 
-    pub fn take_stats_deltas(&mut self) -> Vec<StatsDelta> {
+    pub(crate) fn take_stats_deltas(&mut self) -> Vec<StatsDelta> {
         std::mem::take(&mut self.stats_deltas)
     }
 
@@ -238,11 +253,15 @@ impl Transaction {
         }
     }
 
-    pub fn take_seg_deltas(&mut self) -> Vec<(Bytes, (i64, i64))> {
+    pub(crate) fn take_seg_deltas(&mut self) -> Vec<(Bytes, (i64, i64))> {
         std::mem::take(&mut self.seg_deltas)
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn take_segcount_delete_delta(&mut self) -> SegmentFootprintDelta {
+        std::mem::take(&mut self.segcount_delete_delta)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
@@ -251,7 +270,7 @@ impl Transaction {
     /// produces one merged batch with last-write-wins per key.
     ///
     /// Side channels must be drained by the write coordinator first.
-    pub fn apply_to(self, target: &mut WriteBatch) {
+    pub(crate) fn apply_to(self, target: &mut WriteBatch) {
         self.assert_side_channels_drained();
         for op in self.ops {
             match op {
@@ -280,7 +299,12 @@ impl Transaction {
         assert!(
             self.seg_deltas.is_empty(),
             "seg_deltas would be dropped: commit a seg_delta-bearing txn through the \
-             WriteCoordinator, not into_inner/apply_to"
+             WriteCoordinator"
+        );
+        assert_eq!(
+            self.segcount_delete_delta,
+            SegmentFootprintDelta::default(),
+            "segment footprint delta would be dropped: commit through the WriteCoordinator"
         );
         assert!(
             self.extent_ref_guard.is_none(),
@@ -296,7 +320,10 @@ impl Transaction {
     /// Like [`apply_to`](Self::apply_to) but also returns the ops as `ReplOp`s
     /// for shipping. In apply order; replaying in seqno-then-op order on the
     /// standby reproduces the merged batch's last-write-wins result.
-    pub fn apply_to_collecting(self, target: &mut WriteBatch) -> Vec<crate::replication::ReplOp> {
+    pub(crate) fn apply_to_collecting(
+        self,
+        target: &mut WriteBatch,
+    ) -> Vec<crate::replication::ReplOp> {
         use crate::replication::ReplOp;
         self.assert_side_channels_drained();
         let mut ops = Vec::with_capacity(self.ops.len());
@@ -313,12 +340,6 @@ impl Transaction {
             }
         }
         ops
-    }
-
-    pub fn into_inner(self) -> WriteBatch {
-        let mut batch = WriteBatch::new();
-        self.apply_to(&mut batch);
-        batch
     }
 }
 

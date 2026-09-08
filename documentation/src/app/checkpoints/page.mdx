@@ -63,13 +63,13 @@ There is no in-place restore command. To recover selected data, open the checkpo
 zerofs checkpoint delete -c zerofs.toml before-migration
 ```
 
-Persistent checkpoints pin the storage objects needed to read their state. While any persistent checkpoint exists, segment deletion and segment compaction pause; metadata reclamation is pinned as well. Delete checkpoints that are no longer needed so [garbage collection](/garbage-collection#checkpoints-delay-reclamation) can resume reclaiming space.
+Persistent checkpoints pin the storage objects needed to read their state. While any persistent checkpoint exists, segment deletion and segment repacking pause; metadata reclamation is pinned as well. Delete checkpoints that are no longer needed so [space reclamation](/space-reclamation#checkpoints-delay-reclamation) can resume.
 
 Deleting a checkpoint removes the reference, not current filesystem data. A checkpoint server using that reference should be stopped before deletion.
 
 <div className="not-prose mt-6 flex gap-3">
-  <Button href="/garbage-collection" variant="outline">
-    Garbage collection
+  <Button href="/space-reclamation" variant="outline">
+    Space reclamation
   </Button>
   <Button href="/configuration" variant="outline">
     RPC configuration

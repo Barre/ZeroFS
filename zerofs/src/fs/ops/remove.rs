@@ -12,6 +12,7 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access, check_sticky
 use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{
     EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS, get_current_time, validate_filename,
 };
@@ -112,7 +113,7 @@ impl ZeroFS {
             }
         };
 
-        let _guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
+        let inode_guards = self.lock_manager.acquire_multi(vec![dirid, file_id]).await;
 
         // Recheck replay state after waiting for inode locks.
         if self
@@ -363,7 +364,8 @@ impl ZeroFS {
                     txn.add_stats_delta(file_id, stats::size_delta(file_size.unwrap_or(0), 0), -1);
                 }
 
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guards);
+                self.write_coordinator.commit_locked(mutation).await?;
 
                 if deferred {
                     self.schedule_deferred_orphan_reclaim(file_id);

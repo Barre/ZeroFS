@@ -19,8 +19,8 @@ use slatedb::object_store::{
 use crate::frame_codec::{Compressed, FrameCodec};
 use crate::fs::inode::InodeId;
 use crate::segment::{
-    DirEntry, FOOTER_LEN, FrameLoc, LEN_PREFIX, Segid, SegmentBuilder, SegmentError,
-    seal_compressed_batch,
+    DirEntry, FOOTER_LEN, FrameLoc, LEN_PREFIX, MAX_SEGMENT_OBJECT_BYTES, Segid, SegmentBuilder,
+    SegmentError, seal_compressed_batch,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -28,15 +28,28 @@ pub enum SegmentStoreError {
     #[error("segment object store error: {0}")]
     ObjectStore(String),
     /// The segment object does not exist. Distinguished from a transient
-    /// `ObjectStore` error so reclamation can tell "the object is genuinely gone"
-    /// (trivially dead) from "the store is momentarily unreachable" (fail-closed).
+    /// `ObjectStore` error so reclamation can retire a missing object while
+    /// keeping one whose state could not be read.
     #[error("segment object not found")]
     NotFound,
+    #[error("segment object is {size} bytes; maximum is {max} bytes")]
+    TooLarge { size: u64, max: u64 },
     #[error(transparent)]
     Segment(#[from] SegmentError),
 }
 
 type Result<T> = std::result::Result<T, SegmentStoreError>;
+
+fn validate_segment_size(size: usize) -> Result<()> {
+    let size = u64::try_from(size).unwrap_or(u64::MAX);
+    if size > MAX_SEGMENT_OBJECT_BYTES {
+        return Err(SegmentStoreError::TooLarge {
+            size,
+            max: MAX_SEGMENT_OBJECT_BYTES,
+        });
+    }
+    Ok(())
+}
 
 /// Concurrent per-shard LIST chains inside [`SegmentStore::list_segments_stream`].
 /// Bounds in-flight LIST requests and, with them, how much listing a retrying
@@ -82,6 +95,7 @@ impl SegmentStore {
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
     /// `assemble_segment`.
     pub async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
+        validate_segment_size(bytes.len())?;
         let path = Path::from(segid.object_key());
         self.object_store
             .put(&path, bytes.into())
@@ -109,7 +123,7 @@ impl SegmentStore {
 
     /// As [`Self::seal`] for already-compressed payloads (relocated frames read
     /// via [`Self::read_compressed_run`]): each re-seals under its new slot's
-    /// AAD, never decompressed, so compaction's memory tracks stored size. A
+    /// AAD, never decompressed, so repack memory tracks stored size. A
     /// large batch's seals fan out on rayon ([`seal_compressed_batch`]); the
     /// appends assign offsets in the same order.
     pub async fn seal_compressed(
@@ -215,7 +229,7 @@ impl SegmentStore {
     }
 }
 
-/// GC/maintenance primitives.
+/// Segment-reclamation primitives.
 impl SegmentStore {
     /// This writer's epoch (segids it produces are namespaced under it).
     pub fn epoch(&self) -> u64 {
@@ -234,32 +248,19 @@ impl SegmentStore {
     #[cfg(test)]
     pub async fn list_segments(&self) -> Result<Vec<Segid>> {
         use futures::TryStreamExt;
-        self.list_segments_stream()
-            .map_ok(|(segid, _, _)| segid)
-            .try_collect()
-            .await
+        self.list_segments_stream().try_collect().await
     }
 
-    /// Stream `(Segid, size, last_modified)` for every segment object, so the GC
-    /// can classify on the fly instead of buffering the whole listing
-    /// (O(#segments)) in RAM. `last_modified` is the object's creation time
-    /// (segments are immutable), used to protect anything that could predate a
-    /// persistent checkpoint.
-    pub fn list_segments_stream(
-        &self,
-    ) -> impl futures::Stream<Item = Result<(Segid, u64, chrono::DateTime<chrono::Utc>)>> + '_ {
-        // One listing per shard prefix (segments/00 .. segments/ff), flattened
-        // with bounded concurrency. Paged LISTs are sequential within a prefix,
-        // so per-shard chains parallelize the scan and shrink the unit a
-        // retrying layer must buffer per attempt to 1/256th of the keyspace.
-        // Shard streams interleave: consumers must not assume key order.
+    /// Stream every segment ID with bounded concurrency across shard prefixes.
+    pub fn list_segments_stream(&self) -> impl futures::Stream<Item = Result<Segid>> + '_ {
+        // Pages are sequential within each shard, but shards interleave;
+        // consumers must not assume key order.
         futures::stream::iter((0..=0xffu8).map(|shard| Path::from(format!("segments/{shard:02x}"))))
             .map(move |prefix| self.object_store.list(Some(&prefix)))
             .flatten_unordered(LIST_SHARD_CONCURRENCY)
             .filter_map(|meta| {
                 futures::future::ready(match meta {
-                    Ok(m) => Segid::from_object_key(m.location.as_ref())
-                        .map(|s| Ok((s, m.size, m.last_modified))),
+                    Ok(m) => Segid::from_object_key(m.location.as_ref()).map(Ok),
                     Err(e) => Some(Err(SegmentStoreError::ObjectStore(e.to_string()))),
                 })
             })
@@ -273,8 +274,7 @@ impl SegmentStore {
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))
     }
 
-    /// Read and decrypt a segment's reverse-map directory (which frame backs
-    /// which logical block), for the coalescer.
+    /// Read and decrypt the directory mapping frames to logical extents.
     pub async fn read_directory(&self, segid: Segid) -> Result<Vec<DirEntry>> {
         let path = Path::from(segid.object_key());
         // Fetch just the footer (last FOOTER_LEN bytes) to locate the directory,
@@ -299,9 +299,7 @@ impl SegmentStore {
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         let meta = crate::segment::parse_footer(&footer, object_size)?;
-        // Defense-in-depth: a misdirected read returning a different
-        // (self-consistent) segment would feed the wrong directory into the
-        // coalescer.
+        // Reject a valid directory belonging to a different segment.
         if meta.segid != segid {
             return Err(crate::segment::SegmentError::SegidMismatch {
                 expected: segid,
@@ -488,6 +486,7 @@ pub async fn materialize_segment_if_absent(
         })
         .collect();
     let bytes = crate::segment::finalize_segment(codec, segid, buf, &dir, segid.counter)?;
+    validate_segment_size(bytes.len())?;
     match object_store
         .put_opts(
             &path,
@@ -524,6 +523,18 @@ mod tests {
         let codec = FrameCodec::try_new(&[1u8; 32], SEGMENT_INFO, CompressionConfig::Lz4)
             .expect("test key should be lockable");
         SegmentStore::new(os, codec, 5)
+    }
+
+    #[test]
+    fn segment_object_size_limit_is_inclusive() {
+        validate_segment_size(MAX_SEGMENT_OBJECT_BYTES as usize).unwrap();
+        assert!(matches!(
+            validate_segment_size(MAX_SEGMENT_OBJECT_BYTES as usize + 1),
+            Err(SegmentStoreError::TooLarge {
+                size,
+                max: MAX_SEGMENT_OBJECT_BYTES,
+            }) if size == MAX_SEGMENT_OBJECT_BYTES + 1
+        ));
     }
 
     fn recon_frames(

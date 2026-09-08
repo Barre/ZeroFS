@@ -250,11 +250,7 @@ export const navigation: Array<NavGroup> = [
       { title: 'Checkpoints', href: '/checkpoints' },
       { title: 'Read Replicas', href: '/read-replicas' },
       { title: 'High Availability', href: '/high-availability' },
-      { title: 'Garbage Collection', href: '/garbage-collection' },
-      {
-        title: 'Read-Directed Compaction',
-        href: '/read-directed-compaction',
-      },
+      { title: 'Space Reclamation', href: '/space-reclamation' },
       { title: 'Monitoring & Tracing', href: '/monitoring' },
       { title: 'Prometheus Metrics', href: '/prometheus' },
       { title: 'Telemetry', href: '/telemetry' },

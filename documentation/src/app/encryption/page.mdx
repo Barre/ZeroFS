@@ -73,7 +73,7 @@ There are two encryption domains.
         Each 32 KiB extent is sealed as its own frame with a unique 24-byte nonce and an AAD naming its segment, frame slot, inode, and extent index. Segment objects hold file data only as ciphertext frames.
       </Property>
       <Property name="Segment Directory" type="encrypted">
-        Each segment ends with a reverse-map directory (inode and extent index per frame, used by GC). It is sealed as one AEAD frame, so the file-to-frame mapping is not readable from the object store.
+        Each segment ends with a reverse-map directory (inode and extent index per frame, used by reclamation). It is sealed as one AEAD frame, so the file-to-frame mapping is not readable from the object store.
       </Property>
       <Property name="File Metadata" type="encrypted">
         Permissions, timestamps, ownership, directory-entry payloads, symlink targets, and other inode data

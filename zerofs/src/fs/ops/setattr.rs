@@ -16,6 +16,7 @@ use crate::fs::tracing::FileOperation;
 use crate::fs::types::{
     FileAttributes, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid,
 };
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time};
 use ::tracing::debug;
 use std::sync::atomic::Ordering;
@@ -37,7 +38,7 @@ impl ZeroFS {
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
-        let _guard = self.lock_manager.acquire(id).await;
+        let inode_guard = self.lock_manager.acquire(id).await;
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
             return Ok(result);
         }
@@ -71,7 +72,8 @@ impl ZeroFS {
                 attrs: post_attrs.clone(),
             },
         );
-        self.write_coordinator.commit(txn).await?;
+        let mutation = LockedMutation::new(txn, inode_guard);
+        self.write_coordinator.commit_locked(mutation).await?;
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
         Ok(post_attrs)
     }
@@ -141,7 +143,7 @@ impl ZeroFS {
             creds.gid,
             &creds.groups[..creds.groups_count]
         );
-        let _guard = self.lock_manager.acquire(id).await;
+        let inode_guard = self.lock_manager.acquire(id).await;
         // A same-id call may have completed while this one waited for the inode
         // lock (direct filesystem callers do not pass through the 9P single-flight).
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_setattr)? {
@@ -355,7 +357,8 @@ impl ZeroFS {
                     );
                     txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
-                    self.write_coordinator.commit(txn).await?;
+                    let mutation = LockedMutation::new(txn, inode_guard);
+                    self.write_coordinator.commit_locked(mutation).await?;
 
                     #[cfg(feature = "failpoints")]
                     fail_point!(fp::TRUNCATE_AFTER_COMMIT);
@@ -588,7 +591,8 @@ impl ZeroFS {
             },
         );
 
-        self.write_coordinator.commit(txn).await?;
+        let mutation = LockedMutation::new(txn, inode_guard);
+        self.write_coordinator.commit_locked(mutation).await?;
 
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 

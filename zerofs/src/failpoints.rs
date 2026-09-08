@@ -41,8 +41,10 @@ pub const RENAME_AFTER_SOURCE_UNLINK: &str = "rename_after_source_unlink";
 pub const RENAME_AFTER_NEW_ENTRY: &str = "rename_after_new_entry";
 pub const RENAME_AFTER_COMMIT: &str = "rename_after_commit";
 
-pub const GC_AFTER_EXTENT_DELETE: &str = "gc_after_extent_delete";
-pub const GC_AFTER_TOMBSTONE_UPDATE: &str = "gc_after_tombstone_update";
+/// Extent deletes, counter debits, and tombstone progress are staged, not committed.
+pub const TOMBSTONE_CLEANUP_BEFORE_COMMIT: &str = "tombstone_cleanup_before_commit";
+/// A cleanup chunk (or batch of empty tombstones) has committed atomically.
+pub const TOMBSTONE_CLEANUP_AFTER_COMMIT: &str = "tombstone_cleanup_after_commit";
 
 pub const LINK_AFTER_DIR_ENTRY: &str = "link_after_dir_entry";
 pub const LINK_AFTER_INODE: &str = "link_after_inode";
@@ -81,17 +83,14 @@ pub const MANIFEST_PUBLICATION_WAITING: &str = "manifest_publication_waiting";
 /// so it is reclaimable), and never a durable FrameLoc pointing at a missing one.
 pub const FLUSH_AFTER_SEAL_BEFORE_MANIFEST: &str = "flush_after_seal_before_manifest";
 
-/// Compaction, after the packed segment is sealed + PUT but before any extent is
+/// Segment repack, after the packed segment is sealed + PUT but before any extent is
 /// repointed to it. A crash here must keep every source frame readable (the repoint
 /// never committed), so no relocated data is lost; the packed segment is orphaned.
-pub const COMPACT_AFTER_SEAL_BEFORE_REPOINT: &str = "compact_after_seal_before_repoint";
+pub const REPACK_AFTER_SEAL_BEFORE_REPOINT: &str = "repack_after_seal_before_repoint";
 
-/// Segment reclaim, after a dead segment's object is deleted but before its
-/// `segcount` counter key is dropped. A crash here must not dangle (the segment was
-/// directory-verified dead before deletion); the stale counter is a benign leak.
-/// `reclaim_segments_gated`, after the durable barrier and gate, before the
+/// A reclamation cycle, after the durable barrier and gate, before the
 /// segcount scan. A crash here lands between "everything committed so far is
-/// durable" and "the pass acted on it".
+/// durable" and "the scan acted on it".
 pub const RECLAIM_AFTER_BARRIER_BEFORE_SCAN: &str = "reclaim_after_barrier_before_scan";
 
 /// DST window widening: `(point, arming thread, virtual millis)`. The named
@@ -123,9 +122,9 @@ pub async fn widen(point: &'static str) {
 /// here leaves the pack partially repointed: some inodes point at it, the
 /// rest still point at their source segments; widening it maximizes the
 /// overwrites the repoint CAS must reject.
-pub const COMPACT_BETWEEN_REPOINTS: &str = "compact_between_repoints";
+pub const REPACK_BETWEEN_REPOINTS: &str = "repack_between_repoints";
 
-/// `reclaim_segments_gated`, after the directory verify and before the
+/// A reclamation cycle, after the directory verify and before the
 /// irreversible object delete. Widening it tests the "no frame points here
 /// is a permanent verdict" claim the delete rests on.
 pub const RECLAIM_AFTER_VERIFY_BEFORE_DELETE: &str = "reclaim_after_verify_before_delete";
@@ -135,6 +134,9 @@ pub const RECLAIM_AFTER_VERIFY_BEFORE_DELETE: &str = "reclaim_after_verify_befor
 /// forcing the per-extent re-resolve fallback.
 pub const READ_AFTER_RESOLVE_BEFORE_FETCH: &str = "read_after_resolve_before_fetch";
 
+/// Segment reclaim, after a dead segment's object is deleted but before its
+/// `segcount` counter key is dropped. A crash here must not dangle (the segment
+/// was reference-checked before deletion); the stale counter is a benign leak.
 pub const RECLAIM_AFTER_SEGMENT_DELETE: &str = "reclaim_after_segment_delete";
 
 /// Synchronous open-segment seal (the flush/fsync path), forcing the directory
