@@ -2,7 +2,10 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [jepsen.db :as db]
+            [jepsen.generator.interpreter :as interpreter]
+            [jepsen.nemesis :as nemesis]
             [jepsen.util :as util]
             [slingshot.slingshot :refer [try+]]
             [zerofs-ha.core :as core])
@@ -13,6 +16,19 @@
 
 (defn- check [history]
   (checker/check (core/set-checker) {} history {}))
+
+(deftest nemesis-errors-invalidate-the-experiment
+  (let [check #(checker/check (core/nemesis-checker) {} % {})
+        history [{:type :info :process :nemesis :f :partition :value :partitioned}
+                 {:type :info :process 0 :f :write :error "Stale file handle"}]]
+    (is (:valid? (check history)))
+    (doseq [error [{:error :timeout}
+                  {:exception {:class "clojure.lang.ExceptionInfo"}}]]
+      (let [op (merge {:type :info :process :nemesis :f :await-serving} error)
+            result (check (conj history op))]
+        (is (false? (:valid? result)))
+        (is (= 1 (:error-count result)))
+        (is (= [(dissoc op :type :process)] (:errors result)))))))
 
 (deftest mount-client-config-defaults-to-fuse
   (is (= "fuse" (:mount-client (core/cfg {:work-dir "/tmp/zerofs-ha"}))))
@@ -73,6 +89,102 @@
     (is (= {} @handles))
     (is (= #{:file :dir} (set @closed)))
     (is (= 2 (count @closed)))))
+
+(deftest durability-handles-survive-indeterminate-operations-and-worker-close
+  (doseq [operation [:write :truncate]]
+    (let [dir (.toFile (Files/createTempDirectory "zerofs-ha-test"
+                                                (make-array FileAttribute 0)))
+          file (io/file dir "h")
+          fail? (atom true)
+          closed (atom 0)
+          raf (proxy [java.io.RandomAccessFile] [file "rw"]
+                (write [data]
+                  (if (compare-and-set! fail? true false)
+                    (throw (java.io.IOException. "Stale file handle"))
+                    (proxy-super write data)))
+                (setLength [length]
+                  (if (compare-and-set! fail? true false)
+                    (throw (java.io.IOException. "Stale file handle"))
+                    (proxy-super setLength length)))
+                (close [] (swap! closed inc) (proxy-super close)))
+          handles (atom {"alias" {:raf raf :file "h"}})
+          c (core/->DurabilityClient (.getPath dir) handles (atom 0))
+          test {:nodes ["n1"] :client c}
+          worker (interpreter/open (interpreter/client-nemesis-worker) test 0)
+          other (interpreter/open (interpreter/client-nemesis-worker) test 1)]
+      (try
+        (let [failed (interpreter/invoke! worker test
+                                          {:type :invoke :f operation :as "alias"
+                                           :to 7 :process 0})]
+          (is (= {:type :info :file "h" :error "Stale file handle"
+                  :value (if (= :write operation) 1 7)}
+                 (select-keys failed [:type :file :error :value]))))
+        ;; Jepsen advances the process after :info, including timeout results.
+        ;; Use its actual ClientWorker so this exercises client replacement.
+        (is (= :ok
+               (:type (interpreter/invoke! worker test
+                                          {:type :invoke :f :write :as "alias"
+                                           :process 2}))))
+        (is (= :ok
+               (:type (interpreter/invoke! other test
+                                          {:type :invoke :f :fsync :as "alias"
+                                           :process 1}))))
+        (interpreter/close! worker test)
+        (is (zero? @closed) "one worker cannot close the shared handles")
+        (is (= :ok
+               (:type (interpreter/invoke! other test
+                                          {:type :invoke :f :write :as "alias"
+                                           :process 1}))))
+        (is (= :ok
+               (:type (interpreter/invoke! other test
+                                          {:type :invoke :f :fsync :as "alias"
+                                           :process 1}))))
+        (let [result (interpreter/invoke! other test
+                                           {:type :invoke :f :read :process 1})]
+          (is (= #{"h"} (set (keys (:value result))))))
+        (client/teardown! c test)
+        (client/teardown! c test)
+        (is (empty? @handles))
+        (is (= 1 @closed) "test teardown closes each handle once")
+        (finally
+          (interpreter/close! worker test)
+          (interpreter/close! other test)
+          (client/teardown! c test)
+          (.delete file)
+          (.delete dir))))))
+
+(deftest await-serving-requires-the-targets-new-writer-epoch
+  (doseq [[leader standby] [[:a :b] [:b :a]]
+          fault [:partition :kill-leader]]
+    (let [epochs (atom {leader 7 standby nil})
+          probes (atom [])
+          cuts (atom 0)
+          n (core/ha-nemesis)
+          invoke (fn [f] (nemesis/invoke! n {} {:type :info :f f}))]
+      (with-redefs [core/cfg (constantly {})
+                    core/cluster-roles (atom {leader :leader standby :standby})
+                    core/relays (atom {:to-a {:cut! #(swap! cuts inc)}
+                                      :to-b {:cut! #(swap! cuts inc)}})
+                    core/kill-pid! (fn [_])
+                    core/node-writer-epoch
+                    (fn [_ node] (swap! probes conj node) (get @epochs node))
+                    ;; Even a listening old leader must not satisfy the wait.
+                    core/node-9p-up? (constantly true)
+                    util/await-fn
+                    (fn [ready? _]
+                      (is (thrown? clojure.lang.ExceptionInfo (ready?)))
+                      (swap! epochs assoc standby 7)
+                      (is (thrown? clojure.lang.ExceptionInfo (ready?))
+                          "the previous epoch is not a promotion")
+                      (swap! epochs assoc standby 8)
+                      (is (true? (ready?))))]
+        (invoke fault)
+        (is (= (if (= :partition fault) 2 0) @cuts))
+        (is (= [leader] @probes) "capture the writer before injecting the fault")
+        (reset! probes [])
+        (is (= :serving (:value (invoke :await-serving))))
+        (is (= [standby standby standby] @probes))
+        (is (= standby (core/leader-node)))))))
 
 (deftest unmount-dispatches-to-the-selected-client
   (let [commands (atom [])
