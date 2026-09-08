@@ -309,45 +309,59 @@
       (is (= ["alias" "mb" "stat" "alias" "mb" "stat"]
              (mapv second @commands))))))
 
-(deftest heal-restart-starts-the-standby-before-waiting-for-the-leader
-  (let [events        (atom [])
-        standby-ready (atom 4)]
-    (with-redefs [core/cluster-roles (atom {})
-                  core/minio-up? (constantly true)
-                  core/node-pid (fn [_ node-key] node-key)
-                  core/kill-pid! (fn [_])
-                  core/standby-ready-count
-                  (fn [_ node-key]
-                    (swap! events conj [:standby-count node-key @standby-ready])
-                    @standby-ready)
-                  core/start-node!
-                  (fn [_ node-key role]
-                    (swap! events conj [:start node-key role]))
-                  core/node-9p-up? (fn [_ _] true)
-                  core/mounted? (fn [_] true)
-                  util/await-fn
-                  (fn [ready? options]
-                    (let [message (:log-message options)]
-                      (swap! events conj [:await message])
-                      (case message
-                        "heal: waiting for leader" (is (true? (ready?)))
-                        "Waiting for standby b" (do
-                                                   (is (thrown? clojure.lang.ExceptionInfo
-                                                                (ready?)))
-                                                   (swap! standby-ready inc)
-                                                   (is (true? (ready?))))
-                        "heal: waiting for mount" (is (true? (ready?))))))]
-      (core/heal-restart! {})
-      (is (= [[:standby-count :b 4]
-              [:start :b "standby"]
-              [:start :a "leader"]
-              [:await "heal: waiting for leader"]
-              [:await "Waiting for standby b"]
-              [:standby-count :b 4]
-              [:standby-count :b 5]
-              [:await "heal: waiting for mount"]]
-             @events))
-      (is (= {:a :leader :b :standby} @core/cluster-roles)))))
+(deftest heal-restart-discovers-either-leader-and-waits-for-its-standby
+  (doseq [[leader standby] [[:a :b] [:b :a]]]
+    (let [started (atom [])
+          killed (atom [])
+          counted (atom #{})
+          counts (atom {:a 4 :b 7})
+          epochs (atom {})
+          roles {:a :dead :b :dead}
+          awaits (atom 0)]
+      (with-redefs [core/cfg (constantly {})
+                    core/cluster-roles (atom roles)
+                    core/minio-up? (constantly true)
+                    core/node-pid (fn [_ node] node)
+                    core/kill-pid! #(swap! killed conj %)
+                    core/standby-ready-count
+                    (fn [_ node]
+                      (swap! counted conj node)
+                      (get @counts node))
+                    core/start-node!
+                    (fn [_ node role]
+                      (is (= #{:a :b} @counted)
+                          "capture both standby baselines before either startup")
+                      (swap! started conj [node role]))
+                    core/node-writer-epoch (fn [_ node] (get @epochs node))
+                    ;; A listening but non-authoritative node must not be chosen.
+                    core/node-9p-up? (constantly true)
+                    core/mounted? (constantly true)
+                    util/await-fn
+                    (fn [ready? _]
+                      (is (= roles @core/cluster-roles)
+                          "publish roles only after the pair is ready")
+                      (case (swap! awaits inc)
+                        1 (do
+                            (is (= [[:b "standby"] [:a "leader"]] @started)
+                                "both receivers must start before waiting")
+                            (is (thrown? clojure.lang.ExceptionInfo (ready?)))
+                            (swap! epochs assoc leader 11)
+                            (let [selected (ready?)]
+                              (is (= leader selected))
+                              selected))
+                        2 (do
+                            (is (thrown? clojure.lang.ExceptionInfo (ready?))
+                                "old standby log entries cannot satisfy recovery")
+                            (swap! counts update standby inc)
+                            (is (true? (ready?))))
+                        3 (is (true? (ready?)))))]
+        (core/heal-restart! {})
+        (is (= [:a :b] @killed))
+        (is (= {leader :leader standby :standby} @core/cluster-roles))
+        ;; The next fault must target the elected writer, including when b won.
+        (reset! killed [])
+        (nemesis/invoke! (core/ha-nemesis) {} {:type :info :f :kill-leader})
+        (is (= [leader] @killed))))))
 
 (deftest set-checker-flags-lost-and-resurrected
   (testing "catches a lost add (present per ops, missing from the final read) and a

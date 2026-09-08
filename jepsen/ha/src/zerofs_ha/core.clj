@@ -789,24 +789,32 @@
 ;; survivor restart, solo recovery, and cluster repair.
 
 (defn heal-restart!
-  "Clean full restart to canonical leader=:a, standby=:b. Works from any state
-  (incl. kill-both); the multi-target client re-routes."
+  "Restart both nodes and discover the elected leader/standby roles. Works from
+  any state (incl. kill-both); the multi-target client re-routes."
   [c]
   (when-not (minio-up? c) (start-minio! c))
   (kill-pid! (node-pid c :a))
   (kill-pid! (node-pid c :b))
   (Thread/sleep 1000)
-  (let [standby-base (standby-ready-count c :b)]
+  (let [standby-bases (into {} (for [node [:a :b]]
+                               [node (standby-ready-count c node)]))]
     ;; Start both receivers before waiting; the recorded latest writer may block
     ;; until its peer answers Hello.
     (start-node! c :b "standby")
     (start-node! c :a "leader")
-    (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
-              {:retry-interval 200 :log-interval 5000 :log-message "heal: waiting for leader"})
-    (await-standby-ready! c :b standby-base))
-  (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
-            {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
-  (reset! cluster-roles {:a :leader :b :standby}))
+    ;; Configured roles do not override the durable election. Either node can
+    ;; become the writer, and a listening socket alone does not prove authority.
+    (let [leader (await-fn
+                  (fn [] (or (some #(when (node-writer-epoch c %) %) [:a :b])
+                             (throw+ {:type ::leader-down})))
+                  {:retry-interval 200 :log-interval 5000
+                   :log-message "heal: waiting for elected leader"})
+          standby (if (= :a leader) :b :a)]
+      (await-standby-ready! c standby (get standby-bases standby))
+      (await-fn (fn [] (or (mounted? c) (throw+ {:type ::not-mounted})))
+                {:retry-interval 500 :log-interval 5000 :log-message "heal: waiting for mount"})
+      (info "heal: elected leader" leader "with standby" standby)
+      (reset! cluster-roles {leader :leader standby :standby}))))
 
 (defn heal-rejoin!
   "Heal with no outage: bring the dead node back as STANDBY under the live leader
@@ -945,7 +953,7 @@
                :heal-partition (let [r @relays]
                                  ((:heal! (:to-b r)))
                                  ((:heal! (:to-a r)))
-                                 (heal-restart! c) ; restore canonical topology
+                                 (heal-restart! c)
                                  :healed-partition)
                :heal-restart (do (heal-restart! c) :healed-restart)))))
   (teardown! [_ _test]))
@@ -1474,7 +1482,7 @@
    (gen/clients (gen/once {:f :write :file "h"}))
    (gen/clients (gen/once {:f :fsync :file "h"}))
    (gen/sleep 2)
-   ;; Heal (restores connectivity + canonical roles) so teardown + final read are clean.
+   ;; Heal the pair so teardown + final read are clean.
    (gen/nemesis (gen/once {:type :info :f :heal-partition}))
    (gen/sleep 3)
    (gen/clients (gen/once {:f :read}))))
