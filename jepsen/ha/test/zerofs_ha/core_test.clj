@@ -2,6 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [jepsen.checker :as checker]
+            [jepsen.db :as db]
             [jepsen.util :as util]
             [slingshot.slingshot :refer [try+]]
             [zerofs-ha.core :as core])
@@ -119,6 +120,60 @@
       (is (= 2 (core/standby-ready-count c :b)))
       (finally
         (.delete log)))))
+
+(deftest node-replication-up-requires-a-listener
+  (let [server (java.net.ServerSocket. 0 1 (java.net.InetAddress/getLoopbackAddress))
+        c      {:nodes {:b {:repl-port (.getLocalPort server)}}}]
+    (try
+      (is (true? (core/node-replication-up? c :b)))
+      (finally
+        (.close server)))
+    (is (false? (core/node-replication-up? c :b)))))
+
+(deftest setup-waits-for-the-standby-receiver-before-starting-the-leader
+  (let [started        (atom {})
+        receiver-ready (atom false)
+        standby-ready  (atom 4)
+        mounted        (atom false)]
+    (with-redefs [core/cluster-roles (atom {})
+                  core/relays (atom nil)
+                  core/cluster-down! (fn [_])
+                  core/sh! (fn [& _] {:exit 0})
+                  core/start-minio! (fn [_])
+                  core/make-bucket! (fn [_])
+                  core/start-relay! (fn [& _] {})
+                  core/standby-ready-count (fn [_ _] @standby-ready)
+                  core/start-node!
+                  (fn [_ node-key role]
+                    (when (= :a node-key)
+                      (is @receiver-ready
+                          "leader background writes must have a reachable standby"))
+                    (swap! started assoc node-key role))
+                  core/node-replication-up?
+                  (fn [_ node-key]
+                    (is (= :b node-key))
+                    (is (= {:b "standby"} @started))
+                    @receiver-ready)
+                  core/node-9p-up? (fn [_ _] (= "leader" (:a @started)))
+                  core/mount!
+                  (fn [_]
+                    (is (= 5 @standby-ready) "mount must wait for this standby startup")
+                    (reset! mounted true))
+                  util/await-fn
+                  (fn [ready? options]
+                    (case (:log-message options)
+                      "Waiting for standby replication listener"
+                      (do (is (thrown? clojure.lang.ExceptionInfo (ready?)))
+                          (reset! receiver-ready true))
+                      "Waiting for standby b"
+                      (do (is (= {:a "leader" :b "standby"} @started))
+                          (is (thrown? clojure.lang.ExceptionInfo (ready?)))
+                          (swap! standby-ready inc))
+                      nil)
+                    (is (true? (ready?))))]
+      (db/setup! (core/db) {:work-dir "/tmp/zerofs-ha-test"} "n1")
+      (is @mounted)
+      (is (= {:a :leader :b :standby} @core/cluster-roles)))))
 
 (deftest make-bucket-waits-for-a-readable-bucket
   (let [commands (atom [])

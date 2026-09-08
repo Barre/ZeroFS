@@ -246,6 +246,16 @@
     true
     (catch Exception _ false)))
 
+(defn node-replication-up? [c node-key]
+  (try
+    (with-open [socket (java.net.Socket.)]
+      (.connect socket
+                (java.net.InetSocketAddress. "127.0.0.1"
+                                             (int (get-in c [:nodes node-key :repl-port])))
+                200))
+    true
+    (catch Exception _ false)))
+
 (defn standby-ready-count [c node-key]
   (try
     (let [marker (str "HA standby " (name node-key)
@@ -338,10 +348,19 @@
           (reset! relays
                   {:to-b (start-relay! (get-in rs [:to-b :listen]) (get-in rs [:to-b :target]))
                    :to-a (start-relay! (get-in rs [:to-a :listen]) (get-in rs [:to-a :target]))}))
-        (start-node! c :a "leader")
-        (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
-                  {:retry-interval 200 :log-interval 5000 :log-message "Waiting for leader 9P"})
-        (start-standby! c :b)
+        (let [standby-base (standby-ready-count c :b)]
+          (start-node! c :b "standby")
+          ;; Background writes start with the leader and can taint its lineage
+          ;; if replication is unavailable. Wait for the standby's receiver,
+          ;; not its elected role: role election needs the leader's Hello.
+          (await-fn (fn [] (or (node-replication-up? c :b)
+                              (throw+ {:type ::standby-receiver-down})))
+                    {:retry-interval 200 :log-interval 5000 :timeout 120000
+                     :log-message "Waiting for standby replication listener"})
+          (start-node! c :a "leader")
+          (await-fn (fn [] (or (node-9p-up? c :a) (throw+ {:type ::leader-down})))
+                    {:retry-interval 200 :log-interval 5000 :log-message "Waiting for leader 9P"})
+          (await-standby-ready! c :b standby-base))
         (mount! c)
         (reset! cluster-roles {:a :leader :b :standby})
         (info "ZeroFS HA cluster ready")))
