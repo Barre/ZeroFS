@@ -181,7 +181,7 @@ The engine responds to these configuration keys:
 | `[lsm] flush_interval_secs` | `30` (min 5) | Interval of the periodic barrier-gated flush: seal the open segment, then flush metadata. |
 | `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive because each batch waits for a full seal plus memtable flush. |
 | `[lsm] l0_max_ssts` | `256` (min 4) | Level-0 SST backlog for the metadata LSM; also applied per key. |
-| `[lsm] max_concurrent_compactions` | `2` (min 1) | Concurrency of the embedded metadata compactor. |
+| `[lsm] max_concurrent_compactions` | `64` (min 1) | Concurrency of the embedded metadata compactor. |
 | `[reclaim] max_concurrent_repacks` | `4` (1–16) | Independent segment source sets gathered, packed, PUT, and repointed concurrently. |
 | `[reclaim] repack_min_dead_percent` | `10` (1–99) | Minimum dead percentage for repacking a segment at least 1 MiB large. |
 
