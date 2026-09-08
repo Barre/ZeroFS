@@ -7,7 +7,9 @@ use fp::fail_point;
 
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
+use crate::fs::lock_manager::KeyedLockGuard;
 use crate::fs::stats;
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{EXTENT_SIZE, SMALL_FILE_TOMBSTONE_THRESHOLD, ZeroFS};
 use ::tracing::{error, warn};
 use dashmap::DashMap;
@@ -189,7 +191,7 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_BEFORE_LOCK);
 
-        let _guard = self.lock_manager.acquire(id).await;
+        let inode_guard = self.lock_manager.acquire(id).await;
 
         if self.open_handle_count(id) > 0 {
             return;
@@ -201,7 +203,7 @@ impl ZeroFS {
         #[cfg(feature = "failpoints")]
         fail_point!(fp::RECLAIM_HOLDING_LOCK_BEFORE_DELETE);
 
-        if let Err(e) = self.reclaim_orphan_inode(id).await {
+        if let Err(e) = self.reclaim_orphan_inode(id, inode_guard).await {
             error!("Deferred reclaim of orphan inode {} failed: {:?}", id, e);
         }
     }
@@ -209,7 +211,11 @@ impl ZeroFS {
     /// Reclaim a single deferred-orphan inode `id`: delete its inode record,
     /// its extents (small files) or add a tombstone (large files), subtract its
     /// stats, and remove its orphan-set entry.
-    async fn reclaim_orphan_inode(&self, id: InodeId) -> Result<(), FsError> {
+    async fn reclaim_orphan_inode(
+        &self,
+        id: InodeId,
+        inode_guard: KeyedLockGuard<InodeId>,
+    ) -> Result<(), FsError> {
         match self.inode_store.get(id).await {
             Ok(Inode::File(file)) if file.nlink == 0 => {
                 let mut txn = self.db.new_transaction()?;
@@ -231,7 +237,8 @@ impl ZeroFS {
 
                 txn.add_stats_delta(id, stats::size_delta(file.size, 0), -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
                 self.stats.files_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -245,7 +252,8 @@ impl ZeroFS {
 
                 txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
                 self.stats.links_deleted.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -268,7 +276,8 @@ impl ZeroFS {
 
                 txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
                 self.stats
                     .directories_deleted
                     .fetch_add(1, Ordering::Relaxed);
@@ -289,7 +298,8 @@ impl ZeroFS {
 
                 txn.add_stats_delta(id, stats::size_delta(0, 0), -1);
                 self.orphan_store.remove(&mut txn, id);
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
                 Ok(())
             }
             Ok(_) | Err(FsError::NotFound) => {
@@ -300,7 +310,8 @@ impl ZeroFS {
                 if self.orphan_store.contains(id).await? {
                     let mut txn = self.db.new_transaction()?;
                     self.orphan_store.remove(&mut txn, id);
-                    self.write_coordinator.commit(txn).await?;
+                    let mutation = LockedMutation::new(txn, inode_guard);
+                    self.write_coordinator.commit_locked(mutation).await?;
                 }
                 Ok(())
             }

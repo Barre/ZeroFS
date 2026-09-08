@@ -12,6 +12,7 @@ use crate::fs::permissions::{AccessMode, Credentials, check_access};
 use crate::fs::stats;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time};
 use ::tracing::{debug, error};
 use bytes::Bytes;
@@ -83,7 +84,7 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        let _guard = self.lock_manager.acquire(id).await;
+        let inode_guard = self.lock_manager.acquire(id).await;
         // Direct filesystem callers do not pass through the 9P single-flight,
         // so re-check after waiting for the inode lock.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_write)? {
@@ -116,7 +117,8 @@ impl ZeroFS {
                         attrs: post_attrs.clone(),
                     },
                 );
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
             }
             return Ok(post_attrs);
         }
@@ -144,8 +146,7 @@ impl ZeroFS {
 
                 let mut txn = self.db.new_transaction()?;
 
-                let tail_update = self
-                    .extent_store
+                self.extent_store
                     .write(&mut txn, id, offset, data, old_size)
                     .await?;
 
@@ -187,12 +188,9 @@ impl ZeroFS {
                 txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
                 let db_write_start = std::time::Instant::now();
-                self.write_coordinator.commit(txn).await?;
+                let mutation = LockedMutation::new(txn, inode_guard);
+                self.write_coordinator.commit_locked(mutation).await?;
                 debug!("DB write took: {:?}", db_write_start.elapsed());
-
-                // Only after the commit is durable: a cache ahead of the store
-                // would splice later writes onto bytes that never landed.
-                self.extent_store.apply_tail_update(id, tail_update);
 
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::WRITE_AFTER_COMMIT);
@@ -316,7 +314,7 @@ impl ZeroFS {
             id, offset, length
         );
 
-        let _guard = self.lock_manager.acquire(id).await;
+        let inode_guard = self.lock_manager.acquire(id).await;
         let inode = self.inode_store.get(id).await?;
         let creds = Credentials::from_auth_context(auth);
 
@@ -338,9 +336,13 @@ impl ZeroFS {
         self.extent_store
             .zero_range(&mut txn, id, offset, length, file_size)
             .await?;
-        self.write_coordinator.commit(txn).await.inspect_err(|e| {
-            error!("Failed to commit trim batch: {}", e);
-        })?;
+        let mutation = LockedMutation::new(txn, inode_guard);
+        self.write_coordinator
+            .commit_locked(mutation)
+            .await
+            .inspect_err(|e| {
+                error!("Failed to commit trim batch: {}", e);
+            })?;
 
         self.stats.write_operations.fetch_add(1, Ordering::Relaxed);
         self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
@@ -407,7 +409,7 @@ impl ZeroFS {
         }
         let end = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
 
-        let _guard = self.lock_manager.acquire(id).await;
+        let inode_guard = self.lock_manager.acquire(id).await;
         // Direct filesystem callers do not pass through the 9P single-flight.
         if let Some(result) = self.replay_dedup_result(&op_id, DedupResult::into_fallocate)? {
             return Ok(result);
@@ -486,9 +488,13 @@ impl ZeroFS {
         );
         txn.add_stats_delta(id, stats::size_delta(old_size, new_size), 0);
 
-        self.write_coordinator.commit(txn).await.inspect_err(|e| {
-            error!("Failed to commit fallocate batch: {}", e);
-        })?;
+        let mutation = LockedMutation::new(txn, inode_guard);
+        self.write_coordinator
+            .commit_locked(mutation)
+            .await
+            .inspect_err(|e| {
+                error!("Failed to commit fallocate batch: {}", e);
+            })?;
 
         #[cfg(feature = "failpoints")]
         fail_point!(fp::FALLOCATE_AFTER_COMMIT);
@@ -522,7 +528,6 @@ mod tests {
     use crate::fs::tracing::FileOperation;
     use crate::fs::*;
     use crate::test_helpers::test_helpers_mod::test_auth;
-    #[cfg(feature = "failpoints")]
     use std::sync::Arc;
 
     use crate::fs::types::{
@@ -572,6 +577,69 @@ mod tests {
 
         assert_eq!(read_data.as_ref(), data);
         assert!(eof);
+    }
+
+    #[tokio::test]
+    async fn cancelled_foreground_write_keeps_inode_locked_until_apply() {
+        let fs = Arc::new(ZeroFS::new_in_memory().await.unwrap());
+        let (file_id, _) = fs
+            .create(
+                &test_creds(),
+                0,
+                b"cancelled-write.txt",
+                &SetAttributes::default(),
+            )
+            .await
+            .unwrap();
+        let write_barrier = fs.db.flush_barrier().write_owned().await;
+        let writer_fs = Arc::clone(&fs);
+        let writer = tokio::spawn(async move {
+            writer_fs
+                .write(
+                    &(&test_auth()).into(),
+                    file_id,
+                    0,
+                    &Bytes::from_static(b"new"),
+                )
+                .await
+        });
+
+        // A barrier queued behind the write stops replying once the worker has
+        // taken that write and blocked on database admission.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::task::yield_now().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    fs.write_coordinator.barrier(),
+                )
+                .await
+                {
+                    Ok(result) => result.unwrap(),
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("write did not reach the commit queue");
+
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+        let mut reacquire = Box::pin(fs.lock_manager.acquire(file_id));
+        assert!(
+            futures::poll!(reacquire.as_mut()).is_pending(),
+            "cancellation released the inode lock before the queued write applied"
+        );
+
+        drop(write_barrier);
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(5), reacquire)
+            .await
+            .expect("inode lock was not returned after the queued write applied");
+        let (data, _) = fs
+            .read_file(&(&test_auth()).into(), file_id, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(data.as_ref(), b"new");
     }
 
     #[tokio::test]
@@ -1123,7 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tail_cache_sequential_append_matches() {
+    async fn test_small_sequential_appends_match() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (file_id, _) = fs
             .create(&test_creds(), 0, b"seq.txt", &SetAttributes::default())
@@ -1131,8 +1199,8 @@ mod tests {
             .unwrap();
 
         // Small sequential appends that cross extent boundaries, so the tail extent
-        // fills and rolls over repeatedly: every append into a partially-filled
-        // extent takes the cached-tail splice path instead of re-reading.
+        // fills and rolls over repeatedly and each append splices into a partially
+        // filled extent.
         let step = 5000usize;
         let total = EXTENT_SIZE * 3 + 1234;
         let mut expected = Vec::with_capacity(total);
@@ -1162,14 +1230,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tail_cache_invalidated_by_truncate() {
+    async fn test_append_after_truncate_sees_the_truncated_extent() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (file_id, _) = fs
             .create(&test_creds(), 0, b"trunc.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        // Build a partial tail extent; this populates the tail cache.
+        // Build a partial tail extent.
         let a = vec![b'A'; 1000];
         fs.write(
             &(&test_auth()).into(),
@@ -1180,8 +1248,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Shrink into that extent. truncate must drop the cache, else the next
-        // append splices onto the stale pre-truncate bytes.
+        // Shrink into that extent.
         fs.setattr(
             &test_creds(),
             file_id,
@@ -1194,7 +1261,7 @@ mod tests {
         .unwrap();
 
         // Append past the hole the truncate left. Bytes 800..900 must read back as
-        // zeros, not the 'A's a non-invalidated cache would carry forward.
+        // zeros, not the pre-truncate 'A's.
         let b = vec![b'B'; 100];
         fs.write(
             &(&test_auth()).into(),
@@ -1209,11 +1276,7 @@ mod tests {
             .read_file(&(&test_auth()).into(), file_id, 800, 100)
             .await
             .unwrap();
-        assert_eq!(
-            gap,
-            vec![0u8; 100],
-            "truncate must invalidate the tail cache"
-        );
+        assert_eq!(gap, vec![0u8; 100]);
 
         let (tail, _) = fs
             .read_file(&(&test_auth()).into(), file_id, 900, 100)
@@ -1223,14 +1286,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tail_cache_sparse_write_creates_hole_without_corruption() {
+    async fn test_sparse_write_creates_hole_without_corruption() {
         let fs = ZeroFS::new_in_memory().await.unwrap();
         let (file_id, _) = fs
             .create(&test_creds(), 0, b"sparse.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        // Partial tail in extent 0 -> cache holds extent 0.
+        // Partial tail in extent 0.
         let a = vec![b'A'; 1000];
         fs.write(
             &(&test_auth()).into(),

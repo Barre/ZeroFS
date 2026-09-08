@@ -50,11 +50,11 @@ pub enum CodecError {
 /// [`FrameCodec::open_compressed`]. A distinct type so plaintext can't be sealed
 /// as if pre-compressed (double compression on read) nor a compressed payload
 /// served as plaintext; the only ways out are `seal_compressed` (re-encrypt
-/// as-is, the compaction passthrough) and `decompress`.
+/// as-is, the segment-repack passthrough) and `decompress`.
 pub struct Compressed(Vec<u8>);
 
 impl Compressed {
-    /// Stored payload size, the unit of compaction's gather accounting.
+    /// Compressed payload size.
     #[allow(clippy::len_without_is_empty)] // a compressed payload is never empty
     pub fn len(&self) -> usize {
         self.0.len()
@@ -94,6 +94,19 @@ impl FrameCodec {
             CompressionConfig::Lz4 => true,
             CompressionConfig::Zstd(level) => level <= 12,
         }
+    }
+
+    /// Maximum sealed size for a plaintext payload under this codec.
+    pub(crate) fn max_sealed_size(&self, payload_size: usize) -> u64 {
+        let compressed = match self.compression {
+            CompressionConfig::Lz4 => lz4_flex::block::get_maximum_output_size(payload_size)
+                .saturating_add(std::mem::size_of::<u32>()),
+            CompressionConfig::Zstd(_) => zstd::zstd_safe::compress_bound(payload_size)
+                .saturating_add(std::mem::size_of::<u32>()),
+        };
+        u64::try_from(compressed)
+            .unwrap_or(u64::MAX)
+            .saturating_add((NONCE_SIZE + TAG_SIZE) as u64)
     }
 
     /// Compress then encrypt `plain`, binding `aad`. Returns `[nonce][ct+tag]`.
@@ -237,6 +250,7 @@ mod tests {
             let sealed = c
                 .seal_compressed(c.compress(&plain).unwrap(), b"aad")
                 .unwrap();
+            assert!(sealed.len() as u64 <= c.max_sealed_size(plain.len()));
             assert_eq!(c.open(&sealed, b"aad").unwrap(), plain);
             assert!(matches!(
                 c.open(&sealed, b"other"),

@@ -22,7 +22,7 @@ ZeroFS stores file contents in immutable segment objects written directly to the
 
 ## Overview {{ id: 'overview' }}
 
-File data is split into 32 KiB **extents**. Each extent is compressed, then encrypted into a self-describing **frame**. Frames are packed into **segments**: immutable objects written once to the object store and removed only by garbage collection. The two stores divide the work:
+File data is split into 32 KiB **extents**. Each extent is compressed, then encrypted into a self-describing **frame**. Frames are packed into **segments**: immutable objects written once to the object store and removed only by segment reclamation. The two stores divide the work:
 
 | Store | Holds |
 |-------|-------|
@@ -67,7 +67,7 @@ A segment has three parts, written in order:
 
 ```
 [frame_0][frame_1]...[frame_k-1]   packed, no padding
-[directory]                        AEAD-sealed reverse map (GC and recovery only)
+[directory]                        AEAD-sealed reverse map (reclamation and recovery only)
 [footer]                           64 bytes, plaintext, written last
 ```
 
@@ -99,17 +99,17 @@ The **footer** is 64 bytes, fixed layout:
 | 56 | 4 | CRC32C over directory and footer prefix |
 | 60 | 4 | Reserved, zero |
 
-The CRC32C is a keyless torn-write detector for the directory and footer only; frames carry their own AEAD tags. The directory is a reverse map, one 28-byte entry per frame (byte offset, length, inode, extent index), sealed as a single AEAD frame. Normal reads never touch it; only garbage collection, segment packing, and standby recovery do.
+The CRC32C is a keyless torn-write detector for the directory and footer only; frames carry their own AEAD tags. The directory is a reverse map, one 28-byte entry per frame (byte offset, length, inode, extent index), sealed as a single AEAD frame. Normal reads never touch it; only segment reclamation, repacking, and standby recovery do.
 
 ## Write Path {{ id: 'write-path' }}
 
-1. A file write splits into 32 KiB extents. Partially overwritten extents are read back first, up to 20 in parallel; full overwrites and writes beyond EOF skip the read. A 32 MiB tail cache holds each inode's most recently written extent, so sequential appends do not re-read the tail. All-zero extents become key deletions (holes).
+1. A file write splits into 32 KiB extents. Partially overwritten extents are read back first, up to 20 in parallel; full overwrites and writes beyond EOF skip the read. All-zero extents become key deletions (holes).
 2. Each non-zero extent is sealed (compressed, encrypted) and appended to an in-RAM open segment buffer. The FrameLoc put and the segment live-byte credits and debits commit in the same transaction as the inode update. No object-store request is issued on the write path.
 3. When the open buffer crosses 256 MiB, it rotates and uploads in the background as one PUT. At most 4 seals run in flight; this bounds un-uploaded segment RAM to 4 × 256 MiB and backpressures writers. A failed background upload is retried at the next flush.
 
 ### The fsync barrier
 
-`fsync` (and every other flush) runs a fixed sequence: drain in-flight seals, re-upload any failed seal, seal the current open buffer, then flush the metadata LSM. If sealing fails, the metadata flush does not run. The invariant: **a durable metadata manifest never references an un-uploaded segment**. A crash between segment upload and metadata flush leaves an orphaned segment object, which garbage collection reclaims, never a durable pointer to a missing object. This invariant is exercised by failpoint crash tests.
+`fsync` (and every other flush) runs a fixed sequence: drain in-flight seals, re-upload any failed seal, seal the current open buffer, then flush the metadata LSM. If sealing fails, the metadata flush does not run. The invariant: **a durable metadata manifest never references an un-uploaded segment**. A crash between segment upload and metadata flush leaves an orphaned segment object, which the orphan sweep reclaims, never a durable pointer to a missing object. This invariant is exercised by failpoint crash tests.
 
 Metadata becomes durable only through this coordinated barrier, so no metadata persistence path can bypass segment upload.
 
@@ -118,7 +118,7 @@ Flushes are triggered by:
 - Client `fsync`, NFS COMMIT, NBD flush
 - The periodic flush every `flush_interval_secs` (default 30 s)
 - Every commit batch when `sync_writes = true`
-- Each segment garbage-collection pass
+- Each segment-reclamation cycle
 - Shutdown
 
 Between flushes, up to 256 MiB of committed writes exist only in the open RAM buffer, plus up to 4 × 256 MiB in sealing buffers. Under [replication](/high-availability), the standby also holds these writes: a frame still in leader RAM ships with the replicated operation, and a promoted standby rebuilds any missing segment objects at takeover. See [Durability & Consistency](/durability) for the guarantee model.
@@ -127,7 +127,7 @@ Between flushes, up to 256 MiB of committed writes exist only in the open RAM bu
 
 A point read looks up the extent key, decodes the FrameLoc, and checks the open buffer and sealing map first (read-your-writes without a network round trip). On a miss it issues one ranged GET of exactly the frame's byte span, then decrypts and decompresses. Frames are self-describing; the segment directory is never consulted on reads.
 
-Multi-extent reads scan the extent keyspace and coalesce every maximal run that is contiguous in one segment (same segment, consecutive frame indices, adjacent byte ranges) into a single ranged GET. Missing extents are holes and return zeros. Segment packing re-sorts a file's live extents by (inode, extent index), so a whole-file read of a packed file can be one GET.
+Multi-extent reads scan the extent keyspace and coalesce every maximal run that is contiguous in one segment (same segment, consecutive frame indices, adjacent byte ranges) into a single ranged GET. Missing extents are holes and return zeros. Segment repacking re-sorts a file's live extents by (inode, extent index), so a whole-file read of a packed file can be one GET.
 
 Two prefetch layers apply:
 
@@ -140,18 +140,18 @@ The parts cache stores raw object bytes: extent data is compressed and encrypted
 
 The metadata LSM tracks live bytes per segment. Transactions carry signed deltas; the single-writer commit worker folds them into absolute counters. Overwriting or deleting an extent debits the segment that held its old frame.
 
-A garbage-collection task runs only on the writer. Its cadence adapts between the configured base, busy-backlog, and idle intervals:
+A continuous segment-reclamation task runs only on the writer. It performs these steps:
 
 1. **Seal and flush** under the barrier, so the durable view matches memory.
-2. **Scan** the per-segment counters: O(number of segments), not extents. No pass lists the object store; the only listing is the daily orphan sweep.
-3. **Delete dead segments** after a safety horizon and a fail-closed check that no extent still references them. [Checkpoints](/checkpoints) extend or pause deletion.
-4. **Repack fragmented or small segments** into larger objects, then repoint their live extents atomically. Tail scrubbing and [read-directed compaction](/read-directed-compaction) handle candidates outside the ordinary fragmentation threshold.
+2. **Scan** the per-segment counters: O(number of segments), not extents. Reclaim scans do not list the object store; the only listing is the daily orphan sweep.
+3. **Delete dead segments in parallel** after a safety horizon and a check that no extent still references them. A read or decode error keeps the segment. [Checkpoints](/checkpoints) extend or pause deletion.
+4. **Repack dead-space or small-segment candidates in parallel** into larger objects, then conditionally repoint extents that still reference the source frames. Up to four independent jobs run at once by default.
 
-The [Garbage Collection](/garbage-collection) page documents the cadence, thresholds, request costs, crash safety, checkpoint interaction, and metrics. File data does not participate in LSM compaction; the embedded compactor rewrites metadata SSTs only.
+The task feeds each complete candidate snapshot to bounded executors until no economic repack selection remains, an error occurs, or shutdown begins. It scans once at startup, then only when a committed counter update creates dead bytes, a sub-1-MiB segment is sealed, or a pending deletion reaches its deadline. Activity is coalesced to the configured flush cadence; an idle store performs no counter scans. The [Space Reclamation](/space-reclamation) page documents concurrency, thresholds, request costs, crash safety, checkpoint interaction, and metrics. File data does not participate in LSM compaction; the embedded compactor rewrites metadata SSTs only.
 
 ## Design Constants {{ id: 'design-constants' }}
 
-Apart from the configurable `[gc]` fields ([Configuration](/configuration)), these values are compile-time constants:
+These values are compile-time constants:
 
 | Constant | Value |
 |----------|-------|
@@ -161,16 +161,14 @@ Apart from the configurable `[gc]` fields ([Configuration](/configuration)), the
 | Max in-flight seals | 4 |
 | Segment upload method | Single PUT |
 | Parallel extent reads per operation | 20 |
-| Tail cache | 32 MiB |
 | Logical read-ahead window | 8 MiB, after 2 sequential reads, 16 fetches max |
 | Physical part size | 128 KiB |
 | Physical fetch window | 128 KiB to 8 MiB, 4 windows deep |
-| Segment GC interval | adaptive: 60 s base / 5 s saturated-and-idle (configurable) |
-| Dead-segment delete horizon | ≥ 60 s; checkpoint expiry + 30 s; persistent checkpoint margin 300 s |
-| Segment deletes per GC pass | ≤ 1024 |
-| Packing candidates | live < 50%, or size < 1 MiB |
-| Tail-scrub band | dead > floor (default 5%, configurable) and write-cold |
-| Packing target / per-round cap | 256 MiB / 64 segments, 256 MiB |
+| Dead-segment delete horizon | ≥ 60 s; full recorded ephemeral-checkpoint span + 30 s from observation, measured monotonically; persistent checkpoints block reclamation indefinitely |
+| Dead-segment concurrency | Complete due set, with 8 reference-check/delete jobs in flight |
+| Small-segment threshold | 1 MiB |
+| Per-job repack budget | Nominally 256 MiB of stored live frame data; the first source may exceed it |
+| Maximum encoded segment object | 1 GiB |
 
 ## Configuration {{ id: 'configuration' }}
 
@@ -184,10 +182,8 @@ The engine responds to these configuration keys:
 | `[lsm] sync_writes` | `false` | Forces a segment seal and metadata flush after every coalesced commit batch. Expensive because each batch waits for a full seal plus memtable flush. |
 | `[lsm] l0_max_ssts` | `256` (min 4) | Level-0 SST backlog for the metadata LSM; also applied per key. |
 | `[lsm] max_concurrent_compactions` | `2` (min 1) | Concurrency of the embedded metadata compactor. |
-| `[gc] interval_secs` | `60` (min 5) | Segment GC pass interval while the store is active; the ceiling of the adaptive cadence. |
-| `[gc] idle_interval_secs` | `5` (min 1, ≤ interval) | Pass interval while a saturated backlog meets an idle store; equal to `interval_secs` disables adaptation. |
-| `[gc] read_directed` | `true` | Reads steer compaction: nominations, seam heat, chain repacks ([Read-Directed Compaction](/read-directed-compaction)). |
-| `[gc] tail_scrub_min_dead_percent` | `5` (1–50) | Tail-scrub floor; caps write-cold space overhead at 1/(1 − floor/100). 50 disables the scrub. |
+| `[reclaim] max_concurrent_repacks` | `4` (1–16) | Independent segment source sets gathered, packed, PUT, and repointed concurrently. |
+| `[reclaim] repack_min_dead_percent` | `10` (1–99) | Minimum dead percentage for repacking a segment at least 1 MiB large. |
 
 Cache sizing (`[cache] disk_size_gb`, `memory_size_gb`, `warm_metadata`) is covered on the [Caching](/caching) page.
 

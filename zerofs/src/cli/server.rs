@@ -3,7 +3,7 @@ use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::db::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
-use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
+use crate::fs::{CacheConfig, TombstoneCleaner, ZeroFS};
 use crate::length_checked_object_store::LengthCheckedObjectStore;
 use crate::manifest_publication::{
     COORDINATED_L0_SST_SIZE_BYTES, COORDINATED_MAX_UNFLUSHED_BYTES, ManifestPublication,
@@ -495,7 +495,7 @@ pub struct SlateDbOpen {
     pub parts_cache: foyer::HybridCache<crate::object_store_prefetch::PartKey, bytes::Bytes>,
 }
 
-/// Process-wide runtime for cache, database, and GC maintenance.
+/// Process-wide runtime for cache, database, and background maintenance.
 fn shared_maintenance_runtime() -> &'static tokio::runtime::Handle {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME
@@ -602,10 +602,8 @@ pub async fn build_slatedb(
         min_filter_keys: 10,
         garbage_collector_options: Some(GarbageCollectorOptions {
             wal_options: None,
-            // Each GC cycle re-derives garbage from scratch and the compactor
-            // pins the SSTs it removes behind a 15-minute checkpoint before
-            // every commit. Cycling faster than that reclaims nothing and
-            // only burns object-store requests.
+            // The compactor pins removed SSTs behind a 15-minute checkpoint.
+            // More frequent metadata GC would repeat scans while they are pinned.
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 interval: Some(Duration::from_mins(30)),
                 min_age: Duration::from_mins(1),
@@ -903,7 +901,7 @@ pub async fn run_server(
             prometheus_config,
             Arc::clone(&fs.stats),
             Arc::clone(&fs.global_stats),
-            fs.extent_store.segment_gc_stats(),
+            fs.extent_store.segment_reclaim_stats(),
             Arc::clone(&fs.dedup),
             slatedb_registry,
             shutdown.clone(),
@@ -949,9 +947,9 @@ pub async fn run_server(
     )
     .await;
 
-    // A read-only admin over the same store for the GC's checkpoint gate; built
-    // before the store/path are moved into the checkpoint manager below.
-    let gc_admin = if !db_mode.is_read_only() {
+    // Build reclamation's checkpoint admin before moving the store and path
+    // into the checkpoint manager.
+    let reclaim_admin = if !db_mode.is_read_only() {
         Some(
             AdminBuilder::new(
                 slatedb::object_store::path::Path::from(init_result.db_path.clone()),
@@ -1016,26 +1014,32 @@ pub async fn run_server(
         }
     }
 
-    let gc_handle = if !db_mode.is_read_only() {
-        let tuning = crate::fs::gc::GcTuning::from(settings.gc.unwrap_or_default());
-        let gc = Arc::new(GarbageCollector::new(
-            Arc::clone(&fs.db),
+    let flush_interval_secs = settings
+        .lsm
+        .map(|c| c.flush_interval_secs())
+        .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
+    let reclamation_handles = if !db_mode.is_read_only() {
+        let segment_reclaimer = crate::fs::store::extent::reclaim::driver::start_reclaimer(
+            fs.extent_store.clone(),
+            reclaim_admin.map(Arc::new),
+            settings.reclaim.unwrap_or_default(),
+            std::time::Duration::from_secs(flush_interval_secs),
+            shutdown.clone(),
+            maintenance_runtime.clone(),
+        );
+        let tombstone_cleaner = TombstoneCleaner::new(
             fs.tombstone_store.clone(),
             fs.extent_store.clone(),
             Arc::clone(&fs.stats),
-            gc_admin,
-            tuning,
-        ));
-        Some(gc.start(shutdown.clone(), maintenance_runtime.clone()))
+        );
+        let tombstone_cleanup =
+            tombstone_cleaner.start(shutdown.clone(), maintenance_runtime.clone());
+        Some([segment_reclaimer, tombstone_cleanup])
     } else {
         None
     };
     let stats_handle = start_stats_reporting(Arc::clone(&fs), shutdown.clone());
     let flush_handle = if !db_mode.is_read_only() {
-        let flush_interval_secs = settings
-            .lsm
-            .map(|c| c.flush_interval_secs())
-            .unwrap_or(crate::config::LsmConfig::DEFAULT_FLUSH_INTERVAL_SECS);
         Some(start_periodic_flush(
             Arc::clone(&fs),
             flush_interval_secs,
@@ -1132,14 +1136,15 @@ pub async fn run_server(
 
     let drain = async move {
         info!("Waiting for background tasks to exit...");
-        if let Some(gc_handles) = gc_handle {
-            const GC_TASK_NAMES: [&str; 2] = ["segment GC", "tombstone GC"];
-            for (index, handle) in gc_handles.into_iter().enumerate() {
+        if let Some(reclamation_handles) = reclamation_handles {
+            for (task, handle) in ["segment reclaimer", "tombstone cleanup"]
+                .into_iter()
+                .zip(reclamation_handles)
+            {
                 if tokio::time::timeout(std::time::Duration::from_secs(15), handle)
                     .await
                     .is_err()
                 {
-                    let task = GC_TASK_NAMES.get(index).copied().unwrap_or("unnamed GC");
                     tracing::warn!(
                         "{task} did not stop within 15s; detaching it and proceeding with final \
                          database close"

@@ -1,7 +1,6 @@
 pub mod errors;
 pub mod filter_policy;
 pub mod flush_coordinator;
-pub mod gc;
 pub mod inode;
 pub mod key_codec;
 pub mod lock_manager;
@@ -9,6 +8,7 @@ pub mod metrics;
 pub mod permissions;
 pub mod stats;
 pub mod store;
+mod tombstone_cleanup;
 pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
@@ -35,7 +35,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub use self::gc::GarbageCollector;
+pub use self::tombstone_cleanup::TombstoneCleaner;
 pub use handle::OpenHandle;
 
 use self::errors::FsError;

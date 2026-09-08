@@ -8,10 +8,12 @@ pub(crate) const POINTS: &[&str] = &[
     zerofs::failpoints::MANIFEST_PUBLICATION_WAITING,
     zerofs::failpoints::FLUSH_AFTER_SEAL_BEFORE_MANIFEST,
     zerofs::failpoints::FLUSH_AFTER_COMPLETE,
-    zerofs::failpoints::COMPACT_AFTER_SEAL_BEFORE_REPOINT,
-    zerofs::failpoints::COMPACT_BETWEEN_REPOINTS,
+    zerofs::failpoints::REPACK_AFTER_SEAL_BEFORE_REPOINT,
+    zerofs::failpoints::REPACK_BETWEEN_REPOINTS,
     zerofs::failpoints::RECLAIM_AFTER_BARRIER_BEFORE_SCAN,
     zerofs::failpoints::RECLAIM_AFTER_SEGMENT_DELETE,
+    zerofs::failpoints::TOMBSTONE_CLEANUP_BEFORE_COMMIT,
+    zerofs::failpoints::TOMBSTONE_CLEANUP_AFTER_COMMIT,
     // Foreground mutation commit sites. Each op is a single atomic
     // transaction (one write_coordinator.commit), so a crash placed at any
     // of these leaves either the whole op or none of it; the *_AFTER_INODE /
@@ -64,7 +66,8 @@ pub(crate) const POINTS: &[&str] = &[
 pub(crate) const WIDEN_POINTS: &[&str] = &[
     zerofs::failpoints::RECLAIM_AFTER_BARRIER_BEFORE_SCAN,
     zerofs::failpoints::RECLAIM_AFTER_VERIFY_BEFORE_DELETE,
-    zerofs::failpoints::COMPACT_BETWEEN_REPOINTS,
+    zerofs::failpoints::REPACK_AFTER_SEAL_BEFORE_REPOINT,
+    zerofs::failpoints::REPACK_BETWEEN_REPOINTS,
     zerofs::failpoints::READ_AFTER_RESOLVE_BEFORE_FETCH,
 ];
 
@@ -79,15 +82,11 @@ pub(crate) struct Armed {
 
 pub(crate) static ARMED: Mutex<Option<Armed>> = Mutex::new(None);
 
-/// Register the pass-through callbacks once per process; arming happens
-/// per round via `ARMED`.
+/// Register callbacks for this FailScenario; teardown removes them again.
 pub(crate) fn register_callbacks() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        for point in POINTS {
-            fail::cfg_callback(*point, move || trip(point)).expect("cfg_callback");
-        }
-    });
+    for point in POINTS {
+        fail::cfg_callback(*point, move || trip(point)).expect("cfg_callback");
+    }
 }
 
 fn trip(point: &'static str) {

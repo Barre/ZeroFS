@@ -1,15 +1,17 @@
 //! Write path: read-modify-write over full extents staged into the in-RAM
 //! open segment, background and synchronous sealing (the durability
 //! barrier), delete/truncate/zero-range staging with segment-counter
-//! debits, and the tail cache for sequential appends.
+//! debits.
 
 #[cfg(feature = "failpoints")]
 use crate::failpoints::{self as fp, fail_point};
 
-use super::{ExtentStore, PARALLEL_EXTENT_OPS, TailUpdate, ZERO_EXTENT};
+use super::reclaim::SMALL_SEGMENT_BYTES;
+use super::{ExtentStore, PARALLEL_EXTENT_OPS, ZERO_EXTENT};
 use crate::db::Transaction;
 use crate::frame_codec::Compressed;
 use crate::fs::inode::InodeId;
+use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
 use crate::segment::{DirEntry, FrameLoc, Segid};
@@ -22,8 +24,6 @@ use tracing::error;
 /// Frames per write batch before pre-compression fans out on rayon; below
 /// this the dispatch overhead outweighs the parallelism.
 const PARALLEL_COMPRESS_MIN_FRAMES: usize = 8;
-
-pub(super) const TAIL_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Seal (PUT) the open segment once its packed frames reach this size, bounding
 /// the in-RAM buffer between flushes.
@@ -44,25 +44,6 @@ pub(super) struct OpenSegment {
 }
 
 impl ExtentStore {
-    fn tail_get(&self, id: InodeId) -> Option<(u64, Bytes)> {
-        self.tail_cache.get(&id).map(|e| (*e).clone())
-    }
-    fn tail_set(&self, id: InodeId, extent_idx: u64, data: Bytes) {
-        self.tail_cache.insert(id, (extent_idx, data));
-    }
-    fn tail_invalidate(&self, id: InodeId) {
-        self.tail_cache.remove(&id);
-    }
-
-    /// Apply a `write`'s tail-cache effect. Call only after its commit succeeds.
-    pub fn apply_tail_update(&self, id: InodeId, update: TailUpdate) {
-        match update {
-            TailUpdate::Set { extent_idx, data } => self.tail_set(id, extent_idx, data),
-            TailUpdate::Clear => self.tail_invalidate(id),
-            TailUpdate::Keep => {}
-        }
-    }
-
     /// Raw `[len][sealed]` bytes of a frame still resident in RAM (the open buffer
     /// or an in-flight seal), or `None` once its segment is PUT (the standby reads
     /// the shared store directly). Used to ship un-PUT segments' bytes for HA.
@@ -139,7 +120,6 @@ impl ExtentStore {
         start: u64,
         end: u64,
     ) -> Result<(), FsError> {
-        self.tail_invalidate(id);
         if start >= end {
             return Ok(());
         }
@@ -335,6 +315,7 @@ impl ExtentStore {
                     .map_err(|_| FsError::IoError)?;
                 let k = open.dir.len() as u32;
                 let buf = std::mem::take(&mut open.buf);
+                let small = (buf.len() as u64) < SMALL_SEGMENT_BYTES;
                 open.dir.clear();
                 open.segid = self.segments.next_segid();
                 debug_assert_ne!(
@@ -349,10 +330,13 @@ impl ExtentStore {
                     segid.counter,
                 ));
                 self.sealing.lock().unwrap().insert(segid, bytes.clone());
-                Some((segid, bytes))
+                Some((segid, bytes, small))
             }
         };
-        if let Some((segid, bytes)) = current {
+        if let Some((segid, bytes, small)) = current {
+            if small {
+                self.record_reclaim_activity();
+            }
             self.segments
                 .put_segment(segid, bytes)
                 .await
@@ -371,7 +355,7 @@ impl ExtentStore {
             Ok(p) => p,
             Err(_) => return,
         };
-        let prepared = {
+        let (segid, bytes, small) = {
             let mut open = self.open.lock().unwrap();
             if open.dir.is_empty() {
                 return;
@@ -388,6 +372,7 @@ impl ExtentStore {
             };
             let k = open.dir.len() as u32;
             let buf = std::mem::take(&mut open.buf);
+            let small = (buf.len() as u64) < SMALL_SEGMENT_BYTES;
             open.dir.clear();
             open.segid = self.segments.next_segid();
             debug_assert_ne!(
@@ -404,11 +389,11 @@ impl ExtentStore {
             // Insert into `sealing` while still holding `open`, so the segid is
             // never absent from both maps (a concurrent read would miss it).
             self.sealing.lock().unwrap().insert(segid, bytes.clone());
-            Some((segid, bytes))
+            (segid, bytes, small)
         };
-        let Some((segid, bytes)) = prepared else {
-            return;
-        };
+        if small {
+            self.record_reclaim_activity();
+        }
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
         crate::task::spawn_named("segment-seal", async move {
@@ -428,8 +413,7 @@ impl ExtentStore {
     }
 
     /// Stage a write at `offset` as read-modify-write over full extents;
-    /// all-zero extents become holes. Commits nothing itself: the returned
-    /// [`TailUpdate`] must be applied only after the txn commits.
+    /// all-zero extents become holes. Commits nothing itself.
     pub async fn write(
         &self,
         txn: &mut Transaction,
@@ -437,17 +421,15 @@ impl ExtentStore {
         offset: u64,
         data: &Bytes,
         old_size: u64,
-    ) -> Result<TailUpdate, FsError> {
+    ) -> Result<(), FsError> {
         if data.is_empty() {
-            return Ok(TailUpdate::Keep);
+            return Ok(());
         }
         let end_offset = offset
             .checked_add(data.len() as u64)
             .ok_or(FsError::InvalidArgument)?;
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end_offset - 1) / EXTENT_SIZE as u64;
-
-        let cached = self.tail_get(id);
 
         // Read the existing content of any partially-overwritten extent (full
         // overwrites and extents past EOF need no read).
@@ -458,12 +440,9 @@ impl ExtentStore {
                 let will_overwrite_fully = offset <= extent_start && end_offset >= extent_end;
                 let beyond_eof = extent_start >= old_size;
                 let store = self.clone();
-                let cached = cached.clone();
                 async move {
                     let data = if will_overwrite_fully || beyond_eof {
                         Bytes::from_static(ZERO_EXTENT)
-                    } else if let Some((_, bytes)) = cached.filter(|(ci, _)| *ci == extent_idx) {
-                        bytes
                     } else {
                         store
                             .get(id, extent_idx)
@@ -477,12 +456,9 @@ impl ExtentStore {
             .try_collect()
             .await?;
 
-        let cache_tail = end_offset >= old_size && !end_offset.is_multiple_of(EXTENT_SIZE as u64);
-
         let mut data_offset = 0usize;
         let mut edits: Vec<(u64, Option<Bytes>)> =
             Vec::with_capacity((end_extent - start_extent + 1) as usize);
-        let mut tail: Option<Bytes> = None;
         for extent_idx in start_extent..=end_extent {
             let extent_start = extent_idx * EXTENT_SIZE as u64;
             let extent_end = extent_start + EXTENT_SIZE as u64;
@@ -510,22 +486,11 @@ impl ExtentStore {
             if extent.as_ref() == ZERO_EXTENT {
                 edits.push((extent_idx, None));
             } else {
-                if extent_idx == end_extent && cache_tail {
-                    tail = Some(extent.clone());
-                }
                 edits.push((extent_idx, Some(extent)));
             }
         }
 
-        self.stage_edits(txn, id, &edits).await?;
-
-        Ok(match tail {
-            Some(data) => TailUpdate::Set {
-                extent_idx: end_extent,
-                data,
-            },
-            None => TailUpdate::Clear,
-        })
+        self.stage_edits(txn, id, &edits).await
     }
 
     /// Stage a shrink to `new_size` (growth is a no-op: extension is sparse):
@@ -578,7 +543,6 @@ impl ExtentStore {
             return Ok(());
         }
         let end_offset = offset.checked_add(length).ok_or(FsError::InvalidArgument)?;
-        self.tail_invalidate(id);
 
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end_offset - 1) / EXTENT_SIZE as u64;
@@ -615,24 +579,23 @@ impl ExtentStore {
         self.stage_edits(txn, id, &edits).await
     }
 
-    /// Delete an extent range under the inode's write lock, in its own transaction.
-    /// The tombstone GC calls this so its deletes serialize with the compaction
-    /// repoint, which takes the same lock: otherwise a repoint that read an extent
-    /// live, then lost the race to a concurrent tombstone delete, would re-commit
-    /// the extent last-writer-wins (the LSM has no CAS), resurrecting a deleted
-    /// inode's extent and pinning the repacked segment forever.
-    pub async fn delete_extents(
+    /// Commit extent deletes, counter debits, and the supplied tombstone update
+    /// under the inode lock. The lock prevents a concurrent repack from
+    /// restoring a deleted extent and stays with the transaction until apply.
+    pub(crate) async fn delete_extents_and_commit(
         &self,
+        mut txn: Transaction,
         inode: InodeId,
         start_extent: u64,
-        total_extents: u64,
+        end_extent: u64,
     ) -> Result<(), FsError> {
-        let _guard = self.lock_manager.acquire(inode).await;
-        let mut txn = self.db.new_transaction()?;
-        self.delete_range(&mut txn, inode, start_extent, total_extents)
+        let inode_guard = self.lock_manager.acquire(inode).await;
+        self.delete_range(&mut txn, inode, start_extent, end_extent)
             .await?;
-        self.commit_via_coordinator(txn).await?;
-        Ok(())
+        #[cfg(feature = "failpoints")]
+        fail_point!(fp::TOMBSTONE_CLEANUP_BEFORE_COMMIT);
+        let mutation = LockedMutation::new(txn, inode_guard);
+        self.commit_locked_transaction(mutation).await
     }
 }
 
@@ -641,6 +604,83 @@ mod tests {
     use super::super::test_util::*;
     use super::*;
     use crate::config::CompressionConfig;
+    use crate::fs::{TombstoneCleaner, ZeroFS};
+
+    #[tokio::test]
+    async fn cancelled_tombstone_cleanup_retains_lock_and_applies_progress() {
+        const INODE: InodeId = 41;
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+        let store = fs.extent_store.clone();
+        let mut txn = fs.db.new_transaction().unwrap();
+        store
+            .write(&mut txn, INODE, 0, &Bytes::from_static(b"live"), 0)
+            .await
+            .unwrap();
+        fs.tombstone_store.add(&mut txn, INODE, 4);
+        fs.write_coordinator.commit(txn).await.unwrap();
+        let tombstone = fs
+            .tombstone_store
+            .list()
+            .await
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Hold coordinator apply after submission. A test barrier queued after
+        // the delete identifies when the delete has reached the commit queue.
+        let write_barrier = fs.db.flush_barrier().write_owned().await;
+        let cleaner = TombstoneCleaner::new(
+            fs.tombstone_store.clone(),
+            store.clone(),
+            Arc::clone(&fs.stats),
+        );
+        let delete = tokio::spawn(async move { cleaner.run().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::task::yield_now().await;
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    fs.write_coordinator.barrier(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        result.unwrap();
+                        assert!(!delete.is_finished(), "delete failed before submission");
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("delete did not reach the commit queue");
+
+        delete.abort();
+        assert!(delete.await.unwrap_err().is_cancelled());
+        let mut reacquire = Box::pin(store.lock_manager.acquire(INODE));
+        assert!(
+            futures::poll!(reacquire.as_mut()).is_pending(),
+            "cancellation released the inode lock before queued delete apply"
+        );
+        assert!(store.get(INODE, 0).await.unwrap().is_some());
+        assert!(fs.db.get_bytes(&tombstone.key).await.unwrap().is_some());
+
+        drop(write_barrier);
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(5), reacquire)
+            .await
+            .expect("inode lock was not released after queued delete apply");
+        assert!(store.get(INODE, 0).await.unwrap().is_none());
+        assert!(fs.db.get_bytes(&tombstone.key).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .segment_reclaim_stats()
+                .live_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+    }
 
     #[tokio::test]
     async fn segcount_tracks_live_bytes_across_overwrite_and_delete() {
@@ -704,7 +744,7 @@ mod tests {
 
     // The debit scan must find and debit *every* prior frame of a multi-extent
     // overwrite, not just the range endpoints: a missed debit over-counts live
-    // bytes (a space leak), a double debit under-counts (GC could drop a live
+    // bytes (a space leak), a double debit under-counts (reclamation could drop a live
     // segment). Fresh-write and single-extent-overwrite tests never make the
     // scan return more than one key, so cover the multi-key case explicitly.
     #[tokio::test]
@@ -873,6 +913,9 @@ mod tests {
     #[tokio::test]
     async fn writes_buffer_until_seal_with_read_your_writes() {
         let (store, db) = make().await;
+        store
+            .reclaim_activity
+            .acknowledge(store.reclaim_activity.generation());
         let mut model = Vec::new();
         // A write commits its extent but issues no PUT and serves reads from RAM.
         write_and_check(&store, &db, &mut model, 0, &[7u8; 100]).await;
@@ -886,11 +929,13 @@ mod tests {
             0,
             "the read was served from the open buffer"
         );
+        assert!(!store.reclaim_activity.pending());
 
         // Sealing PUTs exactly one segment. With no in-RAM segment cache, the read
         // after seal is a ranged GET (in production the object store's parts cache,
         // warmed at seal time, absorbs it; these tests wire up no such cache).
         store.seal_open().await.unwrap();
+        assert!(store.reclaim_activity.pending());
         assert_eq!(store.segments.list_segments().await.unwrap().len(), 1);
         assert_eq!(store.read(1, 0, 100).await.unwrap().as_ref(), &model[..]);
         assert_eq!(
@@ -923,12 +968,11 @@ mod tests {
                 let mut size = 0u64;
                 for i in 0..(total / chunk) {
                     let mut txn = db.new_transaction().unwrap();
-                    let tu = store
+                    store
                         .write(&mut txn, 1, (i * chunk) as u64, &payload, size)
                         .await
                         .unwrap();
                     commit(&store, txn).await;
-                    store.apply_tail_update(1, tu);
                     size += chunk as u64;
                 }
                 let secs = start.elapsed().as_secs_f64();
@@ -1050,11 +1094,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_append_via_tail_cache() {
+    async fn small_sequential_appends_splice_into_the_partial_extent() {
         let (store, db) = make().await;
         let mut model = Vec::new();
-        // Many small appends into the same tail extent: exercises the tail cache
-        // (each append RMWs the cached tail rather than re-fetching the frame).
+        // Each append reads the partial tail extent back and splices into it.
         for _ in 0..50 {
             let off = model.len();
             write_and_check(&store, &db, &mut model, off, b"0123456789").await;

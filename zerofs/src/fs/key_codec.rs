@@ -10,7 +10,7 @@ use bytes::Bytes;
 // The leading domain prefix is what slatedb's segment extractor routes on:
 // all metadata kinds land in the `b"meta"` segment, bulk extent pointers in
 // `b"extent"`. Each segment is an independent LSM tree, so metadata churn and
-// bulk-data compaction never share an L0 list or compaction lifecycle.
+// metadata compaction and bulk-data repacking never share an L0 list or lifecycle.
 // Metadata/extent isolation is structural, not lexicographic.
 //
 // Within the meta segment, kind-byte values determine block-level adjacency.
@@ -27,9 +27,9 @@ use bytes::Bytes;
 //   0x04 DIR_COOKIE    per-directory cookie counter
 //   0x05 STATS         shard-keyed fs-wide counters
 //   0x06 SYSTEM        rare config (e.g. next-inode counter)
-//   0x07 TOMBSTONE     deferred-deletion entries, scanned only by GC
+//   0x07 TOMBSTONE     deferred-deletion entries, scanned only by tombstone cleanup
 //   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
-//   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment GC reclaim
+//   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment reclamation
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -60,8 +60,7 @@ const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
 // Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
 const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
 // Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
-// orphan sweep. Persisted (not process-uptime) so the daily sweep cadence holds
-// across restarts (see gc.rs maybe_sweep_orphans).
+// orphan sweep.
 const SYSTEM_ORPHAN_SWEEP_SUBTYPE: u8 = 0x05;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
@@ -424,9 +423,9 @@ impl KeyCodec {
     }
 
     /// Encode a segment counter value: `live` bytes (decrements as frames die) and
-    /// `total` bytes (cumulative frame bytes ever appended, monotonic). The GC reads
+    /// `total` bytes (cumulative frame bytes ever appended, monotonic). Reclamation reads
     /// `live/total` as the segment's live fraction straight from this value, so the
-    /// fast reclaim path never has to list the object to get its size.
+    /// counter-based reclaim never has to list the object to get its size.
     pub fn encode_segcount(live: u64, total: u64) -> Bytes {
         let mut b = [0u8; U64_SIZE * 2];
         b[..U64_SIZE].copy_from_slice(&live.to_le_bytes());
@@ -876,7 +875,7 @@ mod prop_tests {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         // Big-endian id encoding is the reason lexicographic key order matches
-        // numeric order; every range scan (extent reads, dir listing, GC) leans on
+        // numeric order; every range scan (extent reads, dir listing, reclamation) leans on
         // it. The prose comments assert this layout; nothing tested it until now.
         #[test]
         fn extent_key_roundtrips_and_orders(
@@ -903,7 +902,7 @@ mod prop_tests {
                 ParsedKey::Tombstone { inode_id } => prop_assert_eq!(inode_id, a.1),
                 other => prop_assert!(false, "expected Tombstone, got {:?}", other),
             }
-            // Ordered by (timestamp, inode_id): GC scans tombstones in time order.
+            // Ordered by (timestamp, inode_id): cleanup scans tombstones in time order.
             prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
         }
 
@@ -984,7 +983,7 @@ mod prop_tests {
         }
 
         // The half-open prefix range must contain every extent key and no metadata
-        // key, so an extent-domain scan can never read (or GC) metadata.
+        // key, so an extent-domain scan can never read or remove metadata.
         #[test]
         fn prefix_range_isolates_extents(ino in any::<u64>(), idx in any::<u64>(), x in any::<u64>()) {
             let codec = KeyCodec::new();

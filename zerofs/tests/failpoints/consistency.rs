@@ -82,7 +82,7 @@ pub enum ConsistencyError {
         expected_extents: u64,
         found_extents: u64,
     },
-    /// An extent key exists at or beyond EOF: a truncate or GC repoint left a
+    /// An extent key exists at or beyond EOF: a truncate or repack repoint left a
     /// stale key that would resurrect old bytes if the file regrows.
     ExtentsBeyondEof {
         inode_id: InodeId,

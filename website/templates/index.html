@@ -540,7 +540,7 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
             <img id="shot-files" class="active" src="assets/webui_file_manager.webp"
               alt="ZeroFS web file manager browsing the Linux 6.17 source tree with an inline file preview">
             <img id="shot-dash" src="assets/webui_dashboard.webp"
-              alt="ZeroFS dashboard with live throughput, IOPS, operation counters, and garbage-collection stats"
+              alt="ZeroFS dashboard with live throughput, IOPS, operation counters, and tombstone-cleanup stats"
               loading="lazy">
             <img id="shot-term" src="assets/webui_terminal.webp"
               alt="Linux VM booting in the browser with its root filesystem mounted from ZeroFS" loading="lazy">
@@ -614,7 +614,7 @@ nbd-client 127.0.0.1 10809 /dev/nbd0 -N vol1</pre>
     renderInstall("apt");
     const captions = {
       files: "<b>The file manager speaks 9P over WebSocket.</b> Drag-and-drop uploads work, including entire folders.",
-      dash: "<b>Throughput, IOPS, storage usage, operation counters, and GC stats</b> stream over gRPC-web, updated once a second.",
+      dash: "<b>Throughput, IOPS, storage usage, operation counters, and tombstone-cleanup stats</b> stream over gRPC-web, updated once a second.",
       term: "<b>The terminal boots a Linux VM via v86</b>, filesystem served over the same 9P WebSocket. The guest has no network device.",
     };
     const tabs = document.querySelectorAll(".shots .tabs button");

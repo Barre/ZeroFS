@@ -180,8 +180,8 @@ message StatsSnapshot {
     uint64 bytes_written = 14;
     uint64 tombstones_created = 15;
     uint64 tombstones_processed = 16;
-    uint64 gc_extents_deleted = 17;
-    uint64 gc_runs = 18;
+    uint64 tombstone_cleanup_extents_deleted = 17;
+    uint64 tombstone_cleanup_runs = 18;
     uint64 total_operations = 19;
     uint64 used_bytes = 20;
     uint64 used_inodes = 21;
@@ -192,33 +192,27 @@ message StatsSnapshot {
     uint64 jemalloc_mapped = 25;
     uint64 jemalloc_retained = 26;
     uint64 jemalloc_metadata = 27;
-    // Extent segment-store footprint + GC posture (empty until the first pass).
-    SegmentGcStatus segment_gc = 28;
+    // Extent segment-store footprint and segment-reclamation state.
+    SegmentReclaimStatus segment_reclaim = 28;
 }
 
-message SegmentGcStatus {
-    bool has_run = 1;
-    // Whole-store footprint from the last reclaim pass's scan.
-    uint64 segment_count = 2;
-    uint64 appended_bytes = 3;
-    uint64 live_bytes = 4;
-    uint64 reclaimable_bytes = 5;
-    uint64 awaiting_delete = 6;
-    uint64 awaiting_delete_bytes = 7;
-    uint64 candidate_backlog = 8;
-    uint64 chains_deferred = 9;
-    bool saturated = 10;
-    // What the last pass did.
-    uint64 last_deleted = 11;
-    uint64 last_deleted_bytes = 12;
-    uint64 last_frames_relocated = 13;
-    uint64 last_chains_packed = 14;
-    uint64 last_chains_assembled = 15;
-    uint64 last_hot_seams = 16;
-    bool pinned = 17;
-    // Cadence posture: tier (0 none, 1 base, 2 drain, 3 fast) + the GC's reason.
-    uint32 tier = 18;
-    bool read_directed = 19;
-    string reason = 20;
-    uint64 unflushed_bytes = 21;
+message SegmentReclaimStatus {
+    // Tracked segment-frame footprint, seeded at open and maintained by commits.
+    uint64 segment_count = 1;
+    uint64 appended_bytes = 2;
+    uint64 live_bytes = 3;
+    uint64 reclaimable_bytes = 4;
+    uint64 awaiting_delete = 5;
+    uint64 awaiting_delete_bytes = 6;
+    bool checkpoint_pinned = 7;
+    // Raw open/sealing write-buffer bytes. May include superseded frames and
+    // must not be subtracted from live_bytes.
+    uint64 unflushed_bytes = 8;
+    // Segment-reclamation executor state.
+    uint64 active_repacks = 9;
+    uint64 active_fetches = 10;
+    uint64 active_puts = 11;
+    uint64 active_deletes = 12;
+    uint64 repack_memory_reserved_bytes = 13;
+    uint64 repack_memory_budget_bytes = 14;
 }

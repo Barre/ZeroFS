@@ -6,7 +6,7 @@ import { StatCard } from "../components/dashboard/StatCard";
 import { IOChart } from "../components/dashboard/IOChart";
 import { IOPSChart } from "../components/dashboard/IOPSChart";
 import { OperationCounters } from "../components/dashboard/OperationCounters";
-import { GCStats } from "../components/dashboard/GCStats";
+import { TombstoneCleanupStats } from "../components/dashboard/TombstoneCleanupStats";
 import { FileAccessTracer } from "../components/dashboard/FileAccessTracer";
 
 export function DashboardPage() {
@@ -75,42 +75,9 @@ export function DashboardPage() {
       <IOChart history={history} />
       <IOPSChart history={history} />
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
         <OperationCounters snapshot={snapshot} />
-        <GCStats snapshot={snapshot} />
-        <div className="card-surface rounded-lg p-5">
-          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground mb-3">Properties</p>
-          <dl className="space-y-2 text-sm">
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Files created</dt>
-              <dd className="font-mono tabular-nums">{snapshot.filesCreated.toLocaleString()}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Files deleted</dt>
-              <dd className="font-mono tabular-nums">{snapshot.filesDeleted.toLocaleString()}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Files renamed</dt>
-              <dd className="font-mono tabular-nums">{snapshot.filesRenamed.toLocaleString()}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Dirs created</dt>
-              <dd className="font-mono tabular-nums">{snapshot.directoriesCreated.toLocaleString()}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Dirs deleted</dt>
-              <dd className="font-mono tabular-nums">{snapshot.directoriesDeleted.toLocaleString()}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Links created</dt>
-              <dd className="font-mono tabular-nums">{snapshot.linksCreated.toLocaleString()}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-muted-foreground">Tombstones</dt>
-              <dd className="font-mono tabular-nums">{snapshot.tombstonesCreated.toLocaleString()} / {snapshot.tombstonesProcessed.toLocaleString()}</dd>
-            </div>
-          </dl>
-        </div>
+        <TombstoneCleanupStats snapshot={snapshot} />
       </div>
 
       <FileAccessTracer />

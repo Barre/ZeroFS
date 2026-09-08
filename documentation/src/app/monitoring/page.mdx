@@ -24,8 +24,6 @@ Each command takes `-c` with the same configuration file and reads the connectio
 
 ## zerofs monitor
 
-![The zerofs monitor dashboard](https://raw.githubusercontent.com/Barre/ZeroFS/refs/heads/main/assets/monitor_command.png)
-
 <Row>
   <Col>
 
@@ -34,9 +32,9 @@ Each command takes `-c` with the same configuration file and reads the connectio
     - **I/O throughput and IOPS charts**: separate read and write series; rates are computed over windows of one second or one refresh interval, whichever is longer, and the latest 120 samples are kept
     - **Total operations sparkline**: operations per second across all operation types
     - **Storage gauge**: used bytes against the configured capacity, plus the inode count
-    - **Segment space**: the extent segment store's footprint, as a bar and figures. Live data splits into the part durable on the object store and the part still buffered in RAM (unflushed), shown next to dead bytes, bytes in fully-dead segments being deleted, the segment count, and the reclaimable percentage. A status line reports the reclamation GC's cadence tier (base, drain, or fast), the reason for it, and what the last pass did or has queued
+    - **Segment space**: tracked live and dead frame bytes, plus fully dead bytes pending deletion. Raw write-buffer bytes are shown separately because superseded buffered frames are not necessarily live. The panel also shows active repack jobs and object-store operations, actual gather reservations against the nominal budget, and the latest reclamation-cycle result
     - **Operation counters**: files, directories, and links created, deleted, and renamed since server start
-    - **Garbage collection counters**: tombstones created and processed, extents deleted, and GC runs since server start
+    - **Tombstone-cleanup counters**: tombstones created and processed, extents deleted, and cleanup runs since server start
     - **jemalloc memory**: allocated, resident, retained, and metadata bytes of the server process, plus a fragmentation percentage (resident minus allocated, relative to allocated)
 
     Press `q` or `Ctrl+C` to quit.
@@ -110,7 +108,7 @@ Events pass through a broadcast channel that buffers 1,024 events. When a subscr
 
     The trace sits at the bottom of the storage stack, so it shows requests leaving the process rather than logical filesystem operations. Reads served from the [cache](/caching) and writes still buffered in RAM produce no line.
 
-    File data appears under `segments/<shard>/<epoch>/<counter>`. Every seal is one `put`; cold reads are ranged `get` requests. Segment GC reads segment metadata and deletes dead objects; the daily orphan sweep also lists `segments/`.
+    File data appears under `segments/<shard>/<epoch>/<counter>`. Every seal is one `put`; cold reads are ranged `get` requests. Segment reclamation reads segment metadata and deletes dead objects; the daily orphan sweep also lists `segments/`.
 
     Metadata traffic appears as SST and manifest requests, including compaction. The traced operations are get, head, put, mpart, delete, list, copy, and rename.
 
@@ -151,7 +149,7 @@ Like `fatrace`, the object tracer checks the subscriber count first: with no cli
 
     Between `fsync` calls, file data lives in the server's in-RAM open segment buffer and metadata in the memtable (see [Durability & Consistency](/durability)). A flush first seals the open segment and uploads it as one immutable segment object with a single PUT, then flushes metadata. If the segment upload fails, the flush returns an error without flushing metadata, so metadata never becomes durable ahead of the data it points to.
 
-    The same flush runs automatically on every client `fsync`, every `[lsm] flush_interval_secs` (default 30 s), and at the start of each segment garbage-collection pass. `zerofs flush` creates a durability point on demand without requiring clients to call `fsync`, for example before stopping the server or before creating a [checkpoint](/checkpoints).
+    The same flush runs automatically on every client `fsync`, every `[lsm] flush_interval_secs` (default 30 s), and at the start of each segment-reclamation cycle. `zerofs flush` creates a durability point on demand without requiring clients to call `fsync`, for example before stopping the server or before creating a [checkpoint](/checkpoints).
 
   </Col>
   <Col>
@@ -215,7 +213,7 @@ grpcurl -plaintext \
   127.0.0.1:7000 zerofs.admin.AdminService/StreamStats
 ```
 
-This prints one JSON `StatsSnapshot` per second: operation counters, bytes read and written, GC activity, used bytes and inodes against the configured maximum, jemalloc memory statistics, and a `segment_gc` message carrying the extent segment footprint (segment count, live, dead, and unflushed bytes) and reclamation-GC status. For consumers that read `StatsSnapshot` by field name, the GC deletion counter is `gc_extents_deleted` (field 17, formerly `gc_chunks_deleted`).
+This prints one JSON `StatsSnapshot` per second: operation counters, bytes read and written, reclamation activity, used bytes and inodes against the configured maximum, jemalloc memory statistics, and a `segmentReclaim` message carrying tracked segment bytes, pending deletion, cycle state, active repacks and object-store operations, and actual versus nominal gather memory.
 
 <div className="not-prose">
   <Button href="/prometheus" variant="text" arrow="right">

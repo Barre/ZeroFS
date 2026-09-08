@@ -144,9 +144,8 @@ impl FileState {
         let mut crashed = context.crashed.clone();
         let auth = auth();
         let creds = creds();
-        // Half the reads concentrate on one window so the same cross-segment
-        // seams are re-read repeatedly, which is what accrues pair heat.
-        let hot_base = rng.gen_range(0..cap - 3 * EXTENT_SIZE);
+        // Half the point reads use one fixed window; the rest are uniform.
+        let cluster_base = rng.gen_range(0..cap - 3 * EXTENT_SIZE);
         for op_no in 0..ops {
             if *crashed.borrow() {
                 break;
@@ -230,54 +229,35 @@ impl FileState {
                     _ = crashed.changed() => return self,
                 }
             } else if dice < mix.read_end {
-                // Verified read: a sequential whole-file scan (crosses every
-                // segment seam, heating pairs for chain compaction) or a point
-                // read, uniform or clustered on the hot window.
+                // Verified read: a whole-file scan or a point read, uniform or
+                // clustered in one window.
                 if rng.gen_bool(0.3) {
-                    // One call per pass over the whole file: seams are detected
-                    // per read call, so chunked scans would miss most of them.
-                    let chunk = self.cur.len().max(EXTENT_SIZE);
-                    let mut at = 0usize;
-                    let mut interrupted = false;
-                    while at < self.cur.len() {
+                    if !self.cur.is_empty() {
                         tokio::select! {
                             biased;
-                            r = fs.read_file(&auth, self.id, at as u64, chunk as u32) => {
+                            r = fs.read_file(&auth, self.id, 0, self.cur.len() as u32) => {
                                 let (got, _eof) = match r {
                                     Ok(v) => v,
-                                    Err(_) if *crashed.borrow() => {
-                                        interrupted = true;
-                                        break;
-                                    }
-                                    Err(e) => panic!("scan({}, {at}): {e:?}", self.id),
+                                    Err(_) if *crashed.borrow() => return self,
+                                    Err(e) => panic!("scan({}): {e:?}", self.id),
                                 };
-                                let end = (at + chunk).min(self.cur.len());
                                 assert_eq!(
                                     got.as_ref(),
-                                    &self.cur[at..end],
-                                    "scan mismatch: file {} at {at}",
+                                    self.cur.as_slice(),
+                                    "scan mismatch: file {}",
                                     self.id
                                 );
-                                at = end;
                             }
-                            _ = crashed.changed() => { interrupted = true; break; }
+                            _ = crashed.changed() => return self,
                         }
                     }
-                    if interrupted {
-                        // No digest event on the cancellation path: the crash
-                        // signal wakes every waiter at the same instant and their
-                        // relative poll order is not a defined ordering, so an
-                        // emission here would put an order-free race into the
-                        // trace the replay check requires to be total.
-                        return self;
-                    }
-                    digest.event(("s", self.id, op_no, at));
+                    digest.event(("s", self.id, op_no, self.cur.len()));
                     let pause = rng.gen_range(1..=3);
                     tokio::time::sleep(Duration::from_millis(pause)).await;
                     continue;
                 }
                 let offset = if rng.gen_bool(0.5) {
-                    hot_base + rng.gen_range(0..EXTENT_SIZE)
+                    cluster_base + rng.gen_range(0..EXTENT_SIZE)
                 } else {
                     rng.gen_range(0..cap)
                 };

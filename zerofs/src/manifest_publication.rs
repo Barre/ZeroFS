@@ -13,11 +13,7 @@ use object_store::{
 };
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
-use tokio::sync::Notify;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 #[cfg(feature = "failpoints")]
@@ -43,9 +39,9 @@ struct PublicationState {
     access: Arc<RwLock<()>>,
     disabled: AtomicBool,
     #[cfg(test)]
-    waiting_manifest_writes: AtomicU64,
+    waiting_manifest_writes: std::sync::atomic::AtomicU64,
     #[cfg(test)]
-    waiting_notify: Notify,
+    waiting_notify: tokio::sync::Notify,
 }
 
 /// Coordinates manifest PUTs made through writer and compactor
@@ -66,9 +62,9 @@ impl ManifestPublication {
                 access: Arc::new(RwLock::new(())),
                 disabled: AtomicBool::new(false),
                 #[cfg(test)]
-                waiting_manifest_writes: AtomicU64::new(0),
+                waiting_manifest_writes: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
-                waiting_notify: Notify::new(),
+                waiting_notify: tokio::sync::Notify::new(),
             }),
         }
     }
