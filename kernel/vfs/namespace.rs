@@ -685,7 +685,6 @@ pub(super) unsafe extern "C" fn zerofs_create(
     parent: *mut bindings::inode,
     dentry: *mut bindings::dentry,
     mode: bindings::umode_t,
-    _exclusive: bindings::bool_,
 ) -> ffi::c_int {
     from_result(|| {
         // SAFETY: VFS retains the locked parent and negative child dentry.
