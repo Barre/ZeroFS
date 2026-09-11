@@ -266,16 +266,6 @@
       "architectures": {
         "x86_64": [
           {
-            "snapshot": "20260825",
-            "packages": {
-              "kernel-default": "7.2.0-1.1",
-              "kernel-default-devel": "7.2.0-1.1",
-              "kernel-devel": "7.2.0-1.1",
-              "kernel-source": "7.2.0-1.1",
-              "kernel-syms": "7.2.0-1.2"
-            }
-          },
-          {
             "snapshot": "20260908",
             "packages": {
               "kernel-default": "7.2.3-1.1",
@@ -283,6 +273,16 @@
               "kernel-devel": "7.2.3-1.1",
               "kernel-source": "7.2.3-1.1",
               "kernel-syms": "7.2.3-1.1"
+            }
+          },
+          {
+            "snapshot": "20260909",
+            "packages": {
+              "kernel-default": "7.2.4-1.1",
+              "kernel-default-devel": "7.2.4-1.1",
+              "kernel-devel": "7.2.4-1.1",
+              "kernel-source": "7.2.4-1.1",
+              "kernel-syms": "7.2.4-1.1"
             }
           }
         ]
