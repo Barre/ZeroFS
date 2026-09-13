@@ -265,6 +265,12 @@ impl Transaction {
         self.ops.is_empty()
     }
 
+    /// Number of staged key operations (puts and deletes).
+    #[cfg(test)]
+    pub fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+
     /// Replay this transaction's ops into `target`. SlateDB's `WriteBatch`
     /// already dedupes per key, so calling this on multiple transactions
     /// produces one merged batch with last-write-wins per key.
