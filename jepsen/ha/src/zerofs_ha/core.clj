@@ -1,7 +1,7 @@
 (ns zerofs-ha.core
-  "Jepsen HA test for ZeroFS: local MinIO + a ZeroFS leader/standby pair over it +
+  "Jepsen HA test for ZeroFS: local SeaweedFS + a ZeroFS leader/standby pair over it +
   a multi-target FUSE or native-kernel mount. Nemesis kills
-  leader/standby/both/MinIO then heals.
+  leader/standby/both/SeaweedFS then heals.
   Workload is a grow-only set (add = create+fsync a uniquely-named file, fsync
   being a global durability barrier; read = ls); set-full checker asserts no
   acked add is lost. All-local: one logical node, dummy SSH, process management
@@ -51,17 +51,16 @@
   (let [work (:work-dir opts)]
     {:work        work
      :zerofs      (:zerofs-bin opts)
-     :minio       (:minio-bin opts)
-     :mc          (:mc-bin opts)
+     :weed        (:weed-bin opts)
      :mount       (str work "/mnt")
      :mount-client (or (:mount-client opts) "fuse")
-     :minio-data  (str work "/minio-data")
-     :minio-addr  "127.0.0.1:9000"
-     :minio-log   (str work "/minio.log")
-     :minio-pid   (str work "/minio.pid")
+     :store-data  (str work "/store-data")
+     :s3-addr     "127.0.0.1:9000"
+     :store-log   (str work "/seaweedfs.log")
+     :store-pid   (str work "/seaweedfs.pid")
      :bucket      "zerofs-jepsen"
-     :access-key  "minioadmin"
-     :secret-key  "minioadmin"
+     :access-key  "zerofsadmin"
+     :secret-key  "zerofsadmin"
      :password    "jepsen-ha"
      ;; Symmetric replication: each node listens on its repl-port and ships to a
      ;; RELAY (peer-port) that forwards to the peer's repl-port, so the partition
@@ -115,7 +114,7 @@
 ;; The leader<->standby replication (ship, heartbeat, Hello) all dial one TCP
 ;; port, so routing it through a relay we control and cutting the relay is a true
 ;; partition: both nodes stay up, keep serving clients (unix sockets) and reach
-;; MinIO, but cannot reach each other. A transparent byte-pump, so gRPC passes.
+;; SeaweedFS, but cannot reach each other. A transparent byte-pump, so gRPC passes.
 
 (defn close-quietly! [^java.io.Closeable s] (try (.close s) (catch Exception _ nil)))
 
@@ -172,29 +171,34 @@
 ;; Started in setup!: {:to-b <relay> :to-a <relay>}; the nemesis cuts/heals them.
 (def relays (atom nil))
 
-(defn minio-up? [c]
-  (zero? (:exit (sh! :curl :-fsS (str "http://" (:minio-addr c) "/minio/health/live")))))
+(defn bucket-probe [c]
+  ;; Signed HEAD checks both S3 authentication and the bucket created by mini.
+  [:curl :-fsSI :--connect-timeout 1 :--max-time 2
+   :--aws-sigv4 "aws:amz:us-east-1:s3"
+   :--user (str (:access-key c) ":" (:secret-key c))
+   (str "http://" (:s3-addr c) "/" (:bucket c))])
 
-(defn start-minio! [c]
-  (info "Starting MinIO")
-  (daemon-start! (:minio-pid c) (:minio-log c)
-                 {"MINIO_ROOT_USER" (:access-key c)
-                  "MINIO_ROOT_PASSWORD" (:secret-key c)}
-                 (:minio c)
-                 ["server" (:minio-data c) "--address" (:minio-addr c)
-                  "--console-address" "127.0.0.1:9001"])
-  (await-fn (fn [] (or (minio-up? c) (throw+ {:type ::minio-down})))
-            {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO"}))
+(defn store-up? [c]
+  (zero? (:exit (apply sh! (bucket-probe c)))))
 
-(defn make-bucket! [c]
-  ;; The liveness endpoint can precede S3 readiness. Require alias setup,
-  ;; idempotent creation, and a successful bucket stat before starting ZeroFS.
-  (await-fn (fn []
-              (sh-ok! (:mc c) "alias" "set" "j" (str "http://" (:minio-addr c))
-                      (:access-key c) (:secret-key c))
-              (sh-ok! (:mc c) "mb" "--ignore-existing" (str "j/" (:bucket c)))
-              (sh-ok! (:mc c) "stat" (str "j/" (:bucket c))))
-            {:retry-interval 200 :log-interval 5000 :log-message "Waiting for MinIO bucket"}))
+(defn await-bucket! [c]
+  ;; mini pre-creates the bucket. Do not start ZeroFS until S3 can read it.
+  (await-fn (fn [] (apply sh-ok! (bucket-probe c)))
+            {:timeout 120000 :retry-interval 200 :log-interval 5000
+             :log-message "Waiting for SeaweedFS bucket"}))
+
+(defn start-store! [c]
+  (info "Starting SeaweedFS")
+  (daemon-start! (:store-pid c) (:store-log c)
+                 {"AWS_ACCESS_KEY_ID" (:access-key c)
+                  "AWS_SECRET_ACCESS_KEY" (:secret-key c)}
+                 (:weed c)
+                 ["mini" (str "-dir=" (:store-data c))
+                  "-ip=127.0.0.1" "-ip.bind=127.0.0.1" "-s3.port=9000"
+                  "-admin.ui=false" "-webdav=false"
+                  "-s3.port.iceberg=0" "-s3.port.lance=0"
+                  "-master.volumeSizeLimitMB=128" (str "-bucket=" (:bucket c))])
+  (await-bucket! c))
 
 (defn node-cfg-str
   ([c node-key role] (node-cfg-str c node-key role false))
@@ -220,7 +224,7 @@
           "[aws]\n"
           "access_key_id = \"" (:access-key c) "\"\n"
           "secret_access_key = \"" (:secret-key c) "\"\n"
-          "endpoint = \"http://" (:minio-addr c) "\"\n"
+          "endpoint = \"http://" (:s3-addr c) "\"\n"
           "region = \"us-east-1\"\n"
           "allow_http = \"true\"\n"
           "conditional_put = \"etag\"\n\n"
@@ -320,7 +324,7 @@
   (kill-pid! (str (:work c) "/mount.pid"))
   (kill-pid! (get-in c [:nodes :a :pid]))
   (kill-pid! (get-in c [:nodes :b :pid]))
-  (kill-pid! (:minio-pid c)))
+  (kill-pid! (:store-pid c)))
 
 ;; Live role tracking; the nemesis updates it as it kills/heals so :kill-leader
 ;; always targets the *current* leader (roles swap after a rejoin-as-standby).
@@ -341,13 +345,12 @@
         (info "Setting up ZeroFS HA cluster")
         (cluster-down! c)
         (Thread/sleep 1000)
-        (sh! :bash :-c (str "rm -rf " (:minio-data c) " " (get-in c [:nodes :a :cache])
+        (sh! :bash :-c (str "rm -rf " (:store-data c) " " (get-in c [:nodes :a :cache])
                             " " (get-in c [:nodes :b :cache]) " " (:work c) "/*.log "
                             (:work c) "/*.sock"))
-        (sh! :mkdir :-p (:minio-data c) (get-in c [:nodes :a :cache])
+        (sh! :mkdir :-p (:store-data c) (get-in c [:nodes :a :cache])
              (get-in c [:nodes :b :cache]) (:mount c))
-        (start-minio! c)
-        (make-bucket! c)
+        (start-store! c)
         (let [rs (:relays c)]
           (reset! relays
                   {:to-b (start-relay! (get-in rs [:to-b :listen]) (get-in rs [:to-b :target]))
@@ -792,7 +795,7 @@
   "Restart both nodes and discover the elected leader/standby roles. Works from
   any state (incl. kill-both); the multi-target client re-routes."
   [c]
-  (when-not (minio-up? c) (start-minio! c))
+  (when-not (store-up? c) (start-store! c))
   (kill-pid! (node-pid c :a))
   (kill-pid! (node-pid c :b))
   (Thread/sleep 1000)
@@ -859,12 +862,12 @@
                                  (kill-pid! (node-pid c :b))
                                  (reset! cluster-roles {:a :dead :b :dead})
                                  :killed-both)
-               :pause-minio  (do (pause-pid! (:minio-pid c)) :paused-minio)
-               :resume-minio (do (resume-pid! (:minio-pid c))
+               :pause-store  (do (pause-pid! (:store-pid c)) :paused-store)
+               :resume-store (do (resume-pid! (:store-pid c))
                                  ;; Restart ZeroFS after store recovery.
                                  (Thread/sleep 500)
                                  (heal-restart! c)
-                                 :resumed-minio)
+                                 :resumed-store)
                :await-serving (let [{:keys [from to epoch] :as target} @takeover]
                                 (when-not target
                                   (throw+ {:type ::no-pending-takeover}))
@@ -961,7 +964,7 @@
 (defn ha-nemesis []
   (->HaNemesis (atom nil)))
 
-;; Each fault has a paired recovery. MinIO is paused because restarting the
+;; Each fault has a paired recovery. SeaweedFS is paused because restarting the
 ;; single-drive test instance can lose acknowledged, un-fsynced PUTs.
 (def scenarios
   [{:fault :kill-leader  :heal :heal-rejoin}
@@ -969,7 +972,7 @@
    {:fault :kill-leader  :heal :heal-restart}
    {:fault :kill-standby :heal :heal-restart}
    {:fault :kill-both    :heal :heal-restart}
-   {:fault :pause-minio  :heal :resume-minio}
+   {:fault :pause-store  :heal :resume-store}
    ;; Hold through failure detection and the pre-open claim grace.
    {:fault :pause-leader :heal :resume-leader :hold 32}
    ;; Hello makes a restarted leader defer to an active standby.
@@ -1642,7 +1645,7 @@
 (def cli-opts
   "Extra CLI options. Path defaults read an env var first (set by run.sh locally
   or by CI), then fall back to portable values: a /tmp work dir, the repo's `ci`
-  build, and minio/mc resolved on PATH."
+  build, and weed resolved on PATH."
   [[nil "--work-dir DIR" "Working directory for the cluster + mount"
     :default (or (System/getenv "ZEROFS_JEPSEN_WORK") "/tmp/zerofs-jepsen-ha")]
    [nil "--mount-client CLIENT" "Mount client to exercise: fuse or native"
@@ -1650,10 +1653,8 @@
     :validate [#{"fuse" "native"} "Must be either fuse or native"]]
    [nil "--zerofs-bin PATH" "Path to the zerofs binary"
     :default (or (System/getenv "ZEROFS_BIN") "../../zerofs/target/ci/zerofs")]
-   [nil "--minio-bin PATH" "Path to the minio binary"
-    :default (or (System/getenv "MINIO_BIN") "minio")]
-   [nil "--mc-bin PATH" "Path to the mc (minio client) binary"
-    :default (or (System/getenv "MC_BIN") "mc")]
+   [nil "--weed-bin PATH" "Path to the SeaweedFS weed binary"
+    :default (or (System/getenv "WEED_BIN") "weed")]
    [nil "--[no-]fsync" "fsync every add (default true). --no-fsync acks writes without flushing, so a single Connected kill-leader failover tests semi-sync replication of un-fsynced writes."
     :default true]
    [nil "--fsync-honesty" "Run the fsync-durability-honesty scenario: a burst of un-fsync'd writes, then kill-both + cold restart, then a fsync. Asserts a successful fsync never reports success for the lost writes."
