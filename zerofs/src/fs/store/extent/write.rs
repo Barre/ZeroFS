@@ -134,16 +134,19 @@ impl ExtentStore {
             .scan(start_key..end_key)
             .await
             .map_err(|_| FsError::IoError)?;
+        // Only extents that exist get a tombstone.
+        let mut existing: Vec<u64> = Vec::new();
         while let Some(result) = stream.next().await {
             let (key, value) = result.map_err(|_| FsError::IoError)?;
-            if self.key_codec.parse_extent_key(&key).is_some()
-                && let Some(loc) = FrameLoc::decode(&value)
-            {
-                // Delete debit: live only, total untouched (monotonic).
-                self.seg_delta(txn, loc.segid, -(loc.byte_len as i64), 0);
+            if let Some(extent_idx) = self.key_codec.parse_extent_key(&key) {
+                existing.push(extent_idx);
+                if let Some(loc) = FrameLoc::decode(&value) {
+                    // Delete debit: live only, total untouched (monotonic).
+                    self.seg_delta(txn, loc.segid, -(loc.byte_len as i64), 0);
+                }
             }
         }
-        for extent_idx in start..end {
+        for extent_idx in existing {
             self.delete(txn, id, extent_idx);
         }
         Ok(())
@@ -159,6 +162,8 @@ impl ExtentStore {
         edits: &[(u64, Option<Bytes>)],
     ) -> Result<(), FsError> {
         let mut old_debits: Vec<(Segid, u32)> = Vec::with_capacity(edits.len());
+        // Edited extents that currently have a key.
+        let mut existing: HashSet<u64> = HashSet::new();
         if let (Some(min), Some(max)) = (
             edits.iter().map(|(e, _)| *e).min(),
             edits.iter().map(|(e, _)| *e).max(),
@@ -175,9 +180,11 @@ impl ExtentStore {
                 let (key, value) = result.map_err(|_| FsError::IoError)?;
                 if let Some(extent_idx) = self.key_codec.parse_extent_key(&key)
                     && edited.contains(&extent_idx)
-                    && let Some(loc) = FrameLoc::decode(&value)
                 {
-                    old_debits.push((loc.segid, loc.byte_len));
+                    existing.insert(extent_idx);
+                    if let Some(loc) = FrameLoc::decode(&value) {
+                        old_debits.push((loc.segid, loc.byte_len));
+                    }
                 }
             }
         }
@@ -254,7 +261,11 @@ impl ExtentStore {
                         // Credit the frame just appended: both live and total.
                         self.seg_delta(txn, segid, loc.byte_len as i64, loc.byte_len as i64);
                     }
-                    None => self.delete(txn, id, *extent),
+                    None => {
+                        if existing.contains(extent) {
+                            self.delete(txn, id, *extent);
+                        }
+                    }
                 }
             }
         }
@@ -908,6 +919,55 @@ mod tests {
         let end = (100 + EXTENT_SIZE).min(model.len());
         model[100..end].fill(0);
         assert_read_matches(&store, &model).await;
+    }
+
+    #[tokio::test]
+    async fn zero_range_tombstones_only_existing_extents() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &vec![8u8; 2 * EXTENT_SIZE]).await;
+        let file_size = 1u64 << 40; // a sparse 1 TiB volume
+
+        // Far past the written data, no extent key exists in the range.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut txn, 1, 1 << 30, 1 << 30, file_size)
+            .await
+            .unwrap();
+        assert!(
+            txn.is_empty(),
+            "a trim over unwritten extents must stage no tombstones"
+        );
+
+        // Covering the two written extents plus a large unwritten tail: one
+        // delete per existing extent, nothing for the rest.
+        let mut txn = db.new_transaction().unwrap();
+        store
+            .zero_range(&mut txn, 1, 0, 1 << 30, file_size)
+            .await
+            .unwrap();
+        assert_eq!(txn.op_count(), 2, "one tombstone per existing extent");
+        commit(&store, txn).await;
+        model.fill(0);
+        assert_read_matches(&store, &model).await;
+    }
+
+    #[tokio::test]
+    async fn delete_range_tombstones_only_existing_extents() {
+        let (store, db) = make().await;
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &vec![9u8; 2 * EXTENT_SIZE]).await;
+
+        let mut txn = db.new_transaction().unwrap();
+        store.delete_range(&mut txn, 1, 0, 1_000_000).await.unwrap();
+        assert_eq!(txn.op_count(), 2, "one tombstone per existing extent");
+        commit(&store, txn).await;
+        assert!(store.get(1, 0).await.unwrap().is_none());
+        assert!(store.get(1, 1).await.unwrap().is_none());
+
+        let mut txn = db.new_transaction().unwrap();
+        store.delete_range(&mut txn, 1, 0, 1_000_000).await.unwrap();
+        assert!(txn.is_empty(), "nothing left to delete");
     }
 
     #[tokio::test]
