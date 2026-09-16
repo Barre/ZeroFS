@@ -81,14 +81,8 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
-      - name: Download MinIO + mc
-        run: |
-          mkdir -p "$RUNNER_TEMP/minio-bin"
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
-            -o "$RUNNER_TEMP/minio-bin/minio"
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
-            -o "$RUNNER_TEMP/minio-bin/mc"
-          chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
+      - name: Install SeaweedFS
+        run: bash .github/scripts/seaweedfs.sh install
 
       - run: chmod +x zerofs/target/ci/zerofs
 
@@ -96,7 +90,7 @@ jobs:
         if: matrix.mount-client == 'native'
         run: ./kernel/ci/native-kmod.sh load
 
-      # The test self-manages MinIO (starts the server, creates the bucket) and the
+      # The test self-manages SeaweedFS (starts the server, creates the bucket) and the
       # selected mount, so only the binaries are needed here. lein exits non-zero
       # on a failed analysis; the grep backs up a 0-exit on an invalid result.
       - name: HA test (fsync, kill/heal nemesis)
@@ -112,8 +106,7 @@ jobs:
             --concurrency 10 \
             --mount-client "${{ matrix.mount-client }}" \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
-            --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
-            --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
+            --weed-bin "$RUNNER_TEMP/seaweedfs-bin/weed" \
             --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-fsync" 2>&1 | tee fsync.log
           grep -q "Everything looks good" fsync.log
 
@@ -131,8 +124,7 @@ jobs:
             --no-fsync \
             --mount-client "${{ matrix.mount-client }}" \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
-            --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
-            --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
+            --weed-bin "$RUNNER_TEMP/seaweedfs-bin/weed" \
             --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-nofsync" 2>&1 | tee nofsync.log
           grep -q "Everything looks good" nofsync.log
 
@@ -148,7 +140,7 @@ jobs:
           done
           ./kernel/ci/native-kmod.sh unload
 
-      # Node logs (a.log/b.log/minio.log/mount.log) live in the work-dir, not the
+      # Node logs (a.log/b.log/seaweedfs.log/mount.log) live in the work-dir, not the
       # jepsen store; copy them in so the uploaded artifact captures them.
       - name: Collect node logs on failure
         if: failure()
@@ -292,14 +284,8 @@ jobs:
           sudo chmod +x /usr/local/bin/lein
           lein version
 
-      - name: Download MinIO + mc
-        run: |
-          mkdir -p "$RUNNER_TEMP/minio-bin"
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio \
-            -o "$RUNNER_TEMP/minio-bin/minio"
-          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc \
-            -o "$RUNNER_TEMP/minio-bin/mc"
-          chmod +x "$RUNNER_TEMP/minio-bin/minio" "$RUNNER_TEMP/minio-bin/mc"
+      - name: Install SeaweedFS
+        run: bash .github/scripts/seaweedfs.sh install
 
       - run: chmod +x zerofs/target/ci/zerofs
 
@@ -320,8 +306,7 @@ jobs:
             --time-limit 120 \
             --mount-client "${{ matrix.mount-client }}" \
             --zerofs-bin "$GITHUB_WORKSPACE/zerofs/target/ci/zerofs" \
-            --minio-bin "$RUNNER_TEMP/minio-bin/minio" \
-            --mc-bin "$RUNNER_TEMP/minio-bin/mc" \
+            --weed-bin "$RUNNER_TEMP/seaweedfs-bin/weed" \
             --work-dir "$RUNNER_TEMP/zerofs-ha-${{ matrix.mount-client }}-${{ matrix.scenario }}" 2>&1 | tee scenario.log
           grep -q "Everything looks good" scenario.log
 

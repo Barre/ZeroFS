@@ -61,24 +61,8 @@ jobs:
         if: matrix.client == 'native'
         run: ./kernel/ci/native-kmod.sh load
 
-      - name: Start MinIO
-        run: |
-          sudo docker run -d \
-            --name minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-
-          # Wait for MinIO to be ready
-          for _ in {1..30}; do
-            if curl -f http://localhost:9000/minio/health/live; then
-              echo "MinIO is ready"
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://localhost:9000/minio/health/live >/dev/null
+      - name: Start SeaweedFS
+        run: bash .github/scripts/seaweedfs.sh start zerofs-test
 
       - name: Install dependencies
         run: |
@@ -104,14 +88,6 @@ jobs:
           # List loaded 9p modules
           lsmod | grep 9p || echo "No 9p modules loaded yet"
 
-      - name: Setup MinIO bucket
-        run: |
-          # Install mc (MinIO client)
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x mc
-          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/zerofs-test || true
-
       - name: Start ZeroFS with 9P support
         run: |
           cd zerofs
@@ -134,8 +110,8 @@ jobs:
           addresses = ["127.0.0.1:5564"]
 
           [aws]
-          access_key_id = "minioadmin"
-          secret_access_key = "minioadmin"
+          access_key_id = "zerofsadmin"
+          secret_access_key = "zerofsadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
 

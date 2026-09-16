@@ -30,7 +30,7 @@ members = [
 # same release, so the version the driver reports (GetPluginInfo) must not
 # drift from zerofs's.
 [workspace.package]
-version = "2.3.3"
+version = "2.3.4"
 
 [profile.release]
 lto = true
@@ -100,6 +100,7 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 redis = { version = "1.0", default-features = false, features = ["tokio-comp", "script"] }
 bytes = "1.10"
+bytes-utils = "0.1.4"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
 rand = "0.8"

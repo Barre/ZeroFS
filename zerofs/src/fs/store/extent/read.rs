@@ -7,8 +7,9 @@ use super::{ExtentStore, ZERO_EXTENT};
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
-use crate::segment::{FrameLoc, Segid};
-use bytes::{Bytes, BytesMut};
+use crate::segment::{DirEntry, FrameLoc, LEN_PREFIX, Segid};
+use bytes::{Buf, Bytes};
+use bytes_utils::SegmentedBuf;
 use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -186,8 +187,7 @@ impl ExtentStore {
 
     /// Read a contiguous run of frames from the open or an in-flight sealing
     /// buffer (read-your-writes), or `None` if `segid` is already on the object
-    /// store. Frame offsets are identical in the buffer and the finalized
-    /// segment, so the same slice works for both.
+    /// store. Release the buffer lock before decrypting and decompressing.
     fn read_frames_in_ram(
         &self,
         segid: Segid,
@@ -196,55 +196,73 @@ impl ExtentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Option<Vec<Bytes>>, FsError> {
+        let Some(chunks) =
+            self.frame_chunks_in_ram(segid, byte_offset, byte_len, first_frame, slots.len())?
+        else {
+            return Ok(None);
+        };
+        let frames =
+            crate::segment::read_frames_from_chunks(&self.codec, chunks, segid, first_frame, slots)
+                .map_err(|_| FsError::IoError)?;
+        Ok(Some(frames.into_iter().map(Bytes::from).collect()))
+    }
+
+    pub(super) fn frame_chunks_in_ram(
+        &self,
+        segid: Segid,
+        byte_offset: u64,
+        byte_len: u32,
+        first_frame: u32,
+        count: usize,
+    ) -> Result<Option<SegmentedBuf<Bytes>>, FsError> {
         // The range comes from a db-stored FrameLoc: bounds-checked, never
         // trusted, so a corrupt value surfaces as EIO instead of an
         // out-of-range panic that would poison the open-segment lock for
         // every later writer.
-        fn region(
-            buf: &[u8],
-            segid: Segid,
+        fn region<'a>(
+            chunks: &'a [Bytes],
+            dir: &[DirEntry],
             byte_offset: u64,
             byte_len: u32,
-        ) -> Result<&[u8], FsError> {
-            let start = byte_offset as usize;
-            start
-                .checked_add(byte_len as usize)
-                .and_then(|end| buf.get(start..end))
+            first_frame: u32,
+            count: usize,
+        ) -> Option<&'a [Bytes]> {
+            let start = first_frame as usize;
+            let end = start.checked_add(count)?;
+            let entries = dir.get(start..end)?;
+            let first = entries.first()?;
+            let last = entries.last()?;
+            let range_end = last
+                .byte_offset
+                .checked_add(LEN_PREFIX as u64 + last.len as u64)?;
+            if first.byte_offset != byte_offset
+                || range_end != byte_offset.checked_add(byte_len as u64)?
+            {
+                return None;
+            }
+            chunks.get(start.checked_mul(2)?..end.checked_mul(2)?)
+        }
+        let select = |chunks: &[Bytes], dir: &[DirEntry]| {
+            region(chunks, dir, byte_offset, byte_len, first_frame, count)
+                .map(|chunks| Some(chunks.iter().cloned().collect()))
                 .ok_or_else(|| {
                     error!(
-                        "Corrupt FrameLoc for in-RAM {segid:?}: {byte_len} bytes at {byte_offset} \
-                         exceed the {}-byte buffer",
-                        buf.len()
+                        "Corrupt FrameLoc for in-RAM {segid:?}: {count} frames at \
+                         {first_frame}, {byte_len} bytes at {byte_offset}"
                     );
                     FsError::IoError
                 })
-        }
+        };
         {
             let open = self.open.lock().unwrap();
             if segid == open.segid {
-                let frames = crate::segment::read_frames_from_region(
-                    &self.codec,
-                    region(&open.buf, segid, byte_offset, byte_len)?,
-                    segid,
-                    first_frame,
-                    slots,
-                )
-                .map_err(|_| FsError::IoError)?;
-                return Ok(Some(frames.into_iter().map(Bytes::from).collect()));
+                return select(&open.chunks, &open.dir);
             }
         }
         {
             let sealing = self.sealing.lock().unwrap();
-            if let Some(bytes) = sealing.get(&segid) {
-                let frames = crate::segment::read_frames_from_region(
-                    &self.codec,
-                    region(bytes.as_ref(), segid, byte_offset, byte_len)?,
-                    segid,
-                    first_frame,
-                    slots,
-                )
-                .map_err(|_| FsError::IoError)?;
-                return Ok(Some(frames.into_iter().map(Bytes::from).collect()));
+            if let Some(segment) = sealing.get(&segid) {
+                return select(segment.payload.as_ref(), &segment.dir);
             }
         }
         Ok(None)
@@ -254,7 +272,17 @@ impl ExtentStore {
     /// sequential-only logical read-ahead so the next read lands warm in the
     /// parts cache.
     pub async fn read(&self, id: InodeId, offset: u64, length: u64) -> Result<Bytes, FsError> {
-        let data = self.read_range(id, offset, length).await?;
+        let mut data = self.read_chunks(id, offset, length).await?;
+        Ok(data.copy_to_bytes(data.remaining()))
+    }
+
+    pub(crate) async fn read_chunks(
+        &self,
+        id: InodeId,
+        offset: u64,
+        length: u64,
+    ) -> Result<SegmentedBuf<Bytes>, FsError> {
+        let data = self.read_range_chunks(id, offset, length, false).await?;
         self.trigger_read_ahead(id, offset, length);
         Ok(data)
     }
@@ -301,7 +329,7 @@ impl ExtentStore {
             if cur_seg.is_some() && cur_seg == this.segment_at(id, tgt_ext).await {
                 return;
             }
-            let _ = this.read_range(id, start, end - start).await;
+            let _ = this.read_range_chunks(id, start, end - start, true).await;
         }))
     }
 
@@ -317,23 +345,29 @@ impl ExtentStore {
             .map(|loc| loc.segid)
     }
 
-    /// A byte-range read with no read-ahead side effect (the raw path; also what
-    /// the read-ahead task calls, so it never recurses).
-    async fn read_range(&self, id: InodeId, offset: u64, length: u64) -> Result<Bytes, FsError> {
+    /// Read or prefetch a range without triggering further read-ahead.
+    async fn read_range_chunks(
+        &self,
+        id: InodeId,
+        offset: u64,
+        length: u64,
+        prefetch: bool,
+    ) -> Result<SegmentedBuf<Bytes>, FsError> {
         if length == 0 {
-            return Ok(Bytes::new());
+            return Ok(SegmentedBuf::new());
         }
         let end = offset + length;
         let start_extent = offset / EXTENT_SIZE as u64;
         let end_extent = (end - 1) / EXTENT_SIZE as u64;
         let start_offset = (offset % EXTENT_SIZE as u64) as usize;
 
-        if start_extent == end_extent {
+        if !prefetch && start_extent == end_extent {
             let extent_end = start_offset + length as usize;
-            return Ok(match self.get(id, start_extent).await? {
+            let data = match self.get(id, start_extent).await? {
                 Some(data) => data.slice(start_offset..extent_end),
-                None => Bytes::copy_from_slice(&ZERO_EXTENT[start_offset..extent_end]),
-            });
+                None => Bytes::from_static(&ZERO_EXTENT[start_offset..extent_end]),
+            };
+            return Ok(vec![data].into());
         }
 
         let start_key = self.key_codec.extent_key(id, start_extent);
@@ -362,9 +396,9 @@ impl ExtentStore {
 
         // Assemble, coalescing each maximal run of extents that are contiguous in
         // one segment (consecutive frame index + adjacent byte range) into a
-        // single ranged GET. This is the read-amplification win: a region written
+        // single ranged GET. A region written
         // together reads back in one GET instead of one-per-extent.
-        let mut result = BytesMut::with_capacity(length as usize);
+        let mut result = SegmentedBuf::new();
         let slice = |c: u64| -> (usize, usize) {
             let cs = if c == start_extent { start_offset } else { 0 };
             let ce = if c == end_extent {
@@ -377,10 +411,22 @@ impl ExtentStore {
         let mut extent = start_extent;
         while extent <= end_extent {
             let Some(first) = loc_map.get(&extent).copied() else {
-                // Hole: this extent contributes zeros.
-                let (cs, ce) = slice(extent);
-                result.extend_from_slice(&ZERO_EXTENT[cs..ce]);
+                // Coalesce holes into shared zero buffers, without materializing them.
+                let hole_start = (extent * EXTENT_SIZE as u64).max(offset);
                 extent += 1;
+                while extent <= end_extent && !loc_map.contains_key(&extent) {
+                    extent += 1;
+                }
+                if !prefetch {
+                    let hole_end = extent.saturating_mul(EXTENT_SIZE as u64).min(end);
+                    static ZEROES: [u8; 1024 * 1024] = [0; 1024 * 1024];
+                    let mut left = (hole_end - hole_start) as usize;
+                    while left != 0 {
+                        let n = left.min(ZEROES.len());
+                        result.push(Bytes::from_static(&ZEROES[..n]));
+                        left -= n;
+                    }
+                }
                 continue;
             };
             let mut n = 1u64;
@@ -401,6 +447,18 @@ impl ExtentStore {
                     }
                     _ => break,
                 }
+            }
+            if prefetch {
+                let in_ram = self.open.lock().unwrap().segid == first.segid
+                    || self.sealing.lock().unwrap().contains_key(&first.segid);
+                if !in_ram {
+                    let _ = self
+                        .segments
+                        .prefetch_run(first.segid, first.byte_offset, total_len as u32)
+                        .await;
+                }
+                extent += n;
+                continue;
             }
             // Serve the run from RAM (open or in-flight sealing buffer); else GET.
             let frames = match self.read_frames_in_ram(
@@ -438,7 +496,7 @@ impl ExtentStore {
                         let idx = extent + i as u64;
                         Self::validate_extent_frame(id, idx, frame)?;
                         let (cs, ce) = slice(idx);
-                        result.extend_from_slice(&frame[cs..ce]);
+                        result.push(frame.slice(cs..ce));
                     }
                 }
                 None => {
@@ -449,13 +507,13 @@ impl ExtentStore {
                             None => Bytes::from_static(ZERO_EXTENT),
                         };
                         let (cs, ce) = slice(idx);
-                        result.extend_from_slice(&data[cs..ce]);
+                        result.push(data.slice(cs..ce));
                     }
                 }
             }
             extent += n;
         }
-        Ok(result.freeze())
+        Ok(result)
     }
 }
 
@@ -463,6 +521,59 @@ impl ExtentStore {
 mod tests {
     use super::super::test_util::*;
     use super::*;
+
+    #[tokio::test]
+    async fn sparse_chunks_share_zeroes_and_preserve_unaligned_extent_boundaries() {
+        let (store, db) = make().await;
+        let a = store
+            .read_range_chunks(1, 0, 1024 * 1024, false)
+            .await
+            .unwrap();
+        let b = store
+            .read_range_chunks(1, 0, 1024 * 1024, false)
+            .await
+            .unwrap();
+        assert_eq!(a.segments(), 1);
+        assert_eq!(a.chunk().as_ptr(), b.chunk().as_ptr());
+        assert_eq!(a.remaining(), 1024 * 1024);
+        let tail = store
+            .read_range_chunks(1, u64::MAX - 65535, 65535, false)
+            .await
+            .unwrap();
+        assert_eq!(tail.remaining(), 65535);
+        let mut model = Vec::new();
+        write_and_check(&store, &db, &mut model, 0, &vec![0xab; EXTENT_SIZE]).await;
+        write_and_check(
+            &store,
+            &db,
+            &mut model,
+            2 * EXTENT_SIZE,
+            &vec![0xcd; EXTENT_SIZE],
+        )
+        .await;
+        store.seal_open().await.unwrap();
+        model.resize(3 * EXTENT_SIZE + 7, 0);
+        let offset = EXTENT_SIZE - 3;
+        let len = model.len() - offset;
+        let mut chunks = store
+            .read_range_chunks(1, offset as u64, len as u64, false)
+            .await
+            .unwrap();
+        assert_eq!(chunks.segments(), 4);
+        assert_eq!(
+            chunks.copy_to_bytes(chunks.remaining()).as_ref(),
+            &model[offset..]
+        );
+        let warmed = store
+            .read_range_chunks(1, 0, model.len() as u64, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            warmed.remaining(),
+            0,
+            "prefetch must not materialize read data"
+        );
+    }
 
     #[tokio::test]
     async fn contiguous_multiextent_read_is_one_ranged_get() {
@@ -524,7 +635,9 @@ mod tests {
         txn.put_bytes(&key, Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]));
         commit(&store, txn).await;
 
-        let r = store.read_range(1, 0, 3 * EXTENT_SIZE as u64).await;
+        let r = store
+            .read_range_chunks(1, 0, 3 * EXTENT_SIZE as u64, false)
+            .await;
         assert!(matches!(r, Err(FsError::IoError)));
     }
 

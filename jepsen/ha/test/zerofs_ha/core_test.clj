@@ -251,8 +251,7 @@
                   core/relays (atom nil)
                   core/cluster-down! (fn [_])
                   core/sh! (fn [& _] {:exit 0})
-                  core/start-minio! (fn [_])
-                  core/make-bucket! (fn [_])
+                  core/start-store! (fn [_])
                   core/start-relay! (fn [& _] {})
                   core/standby-ready-count (fn [_ _] @standby-ready)
                   core/start-node!
@@ -287,27 +286,29 @@
       (is @mounted)
       (is (= {:a :leader :b :standby} @core/cluster-roles)))))
 
-(deftest make-bucket-waits-for-a-readable-bucket
+(deftest await-bucket-retries-until-readable
   (let [commands (atom [])
-        stats    (atom 0)
-        c        {:mc "/mc" :minio-addr "127.0.0.1:9000"
+        c        {:s3-addr "127.0.0.1:9000"
                   :access-key "key" :secret-key "secret" :bucket "bucket"}]
     (with-redefs [core/sh-ok!
                   (fn [& args]
                     (swap! commands conj args)
-                    (when (and (= "stat" (second args))
-                               (= 1 (swap! stats inc)))
+                    (when (= 1 (count @commands))
                       (throw (ex-info "bucket not ready" {})))
                     {:exit 0})
                   util/await-fn
-                  (fn [ready? _]
+                  (fn [ready? opts]
+                    (is (= 120000 (:timeout opts)))
                     (try
                       (ready?)
                       (catch clojure.lang.ExceptionInfo _
                         (ready?))))]
-      (core/make-bucket! c)
-      (is (= ["alias" "mb" "stat" "alias" "mb" "stat"]
-             (mapv second @commands))))))
+      (core/await-bucket! c)
+      (is (= 2 (count @commands)))
+      (doseq [command @commands]
+        (is (= [:curl :-fsSI :--connect-timeout 1 :--max-time 2
+                :--aws-sigv4 "aws:amz:us-east-1:s3" :--user "key:secret"
+                "http://127.0.0.1:9000/bucket"] command))))))
 
 (deftest heal-restart-discovers-either-leader-and-waits-for-its-standby
   (doseq [[leader standby] [[:a :b] [:b :a]]]
@@ -320,7 +321,7 @@
           awaits (atom 0)]
       (with-redefs [core/cfg (constantly {})
                     core/cluster-roles (atom roles)
-                    core/minio-up? (constantly true)
+                    core/store-up? (constantly true)
                     core/node-pid (fn [_ node] node)
                     core/kill-pid! #(swap! killed conj %)
                     core/standby-ready-count

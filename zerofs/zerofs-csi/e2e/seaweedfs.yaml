@@ -1,0 +1,80 @@
+# Deployed before the gateway, so this file creates the shared namespace
+# (gateway.yaml also declares it; kubectl apply is idempotent).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerofs
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: zerofs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs
+  template:
+    metadata:
+      labels:
+        app: seaweedfs
+    spec:
+      containers:
+        - name: seaweedfs
+          image: chrislusf/seaweedfs:4.47
+          args:
+            - mini
+            - -dir=/data
+            - -ip=127.0.0.1
+            - -ip.bind=0.0.0.0
+            - -s3.port=9000
+            - -admin.ui=false
+            - -webdav=false
+            - -s3.port.iceberg=0
+            - -s3.port.lance=0
+            - -master.volumeSizeLimitMB=128
+            - -bucket=zerofs-csi
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: zerofsadmin
+            - name: AWS_SECRET_ACCESS_KEY
+              value: zerofsadmin
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            # mini creates the bucket after S3 starts. Gate the gateway rollout
+            # on authenticated bucket access, using curl included in this image.
+            exec:
+              command:
+                - curl
+                - -fsSI
+                - --connect-timeout
+                - "1"
+                - --max-time
+                - "2"
+                - --aws-sigv4
+                - aws:amz:us-east-1:s3
+                - --user
+                - zerofsadmin:zerofsadmin
+                - http://127.0.0.1:9000/zerofs-csi
+            timeoutSeconds: 3
+            periodSeconds: 2
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  namespace: zerofs
+spec:
+  selector:
+    app: seaweedfs
+  ports:
+    - port: 9000
+      targetPort: 9000

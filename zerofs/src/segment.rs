@@ -25,6 +25,8 @@
 //! key-domain [`segment_extractor`](crate::segment_extractor).
 
 use crate::frame_codec::{CodecError, Compressed, FrameCodec};
+use bytes::Bytes;
+use slatedb::object_store::{PutPayload, PutPayloadMut};
 
 /// HKDF info label for the data-plane segment subkey. Domain-separated from the
 /// block-transformer subkey so a block frame and a segment frame never share a key.
@@ -357,11 +359,45 @@ pub(crate) fn assemble_segment(
     sealed_dir: &[u8],
     sealed_seqno: u64,
 ) -> Vec<u8> {
-    let dir_offset = buf.len() as u64;
-    let dir_len = sealed_dir.len() as u32;
+    let footer = segment_footer(segid, buf.len() as u64, k, sealed_dir, sealed_seqno);
     buf.extend_from_slice(sealed_dir);
+    buf.extend_from_slice(&footer);
+    buf
+}
 
-    let total_len = (buf.len() + FOOTER_LEN) as u64;
+/// Finalize owned frame chunks without concatenating their payloads.
+pub(crate) fn assemble_segment_payload(
+    segid: Segid,
+    chunks: Vec<Bytes>,
+    k: u32,
+    sealed_dir: Vec<u8>,
+    sealed_seqno: u64,
+) -> PutPayload {
+    let mut payload = PutPayloadMut::new();
+    for chunk in chunks {
+        payload.push(chunk);
+    }
+    let footer = segment_footer(
+        segid,
+        payload.content_length() as u64,
+        k,
+        &sealed_dir,
+        sealed_seqno,
+    );
+    payload.push(sealed_dir.into());
+    payload.push(Bytes::copy_from_slice(&footer));
+    payload.freeze()
+}
+
+fn segment_footer(
+    segid: Segid,
+    dir_offset: u64,
+    k: u32,
+    sealed_dir: &[u8],
+    sealed_seqno: u64,
+) -> [u8; FOOTER_LEN] {
+    let dir_len = sealed_dir.len() as u32;
+    let total_len = dir_offset + sealed_dir.len() as u64 + FOOTER_LEN as u64;
     let mut footer = [0u8; FOOTER_LEN];
     footer[F_MAGIC..F_MAGIC + 4].copy_from_slice(MAGIC);
     footer[F_VERSION..F_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
@@ -376,17 +412,14 @@ pub(crate) fn assemble_segment(
     // (bytes[dir_offset .. total_len - 8]): frames carry per-frame AEAD, so a
     // reader can verify the tail from a ranged read instead of the whole
     // object.
-    buf.extend_from_slice(&footer);
-    let crc_end = buf.len() - (FOOTER_LEN - F_CRC);
-    let crc = crc32c::crc32c(&buf[dir_offset as usize..crc_end]);
-    let crc_pos = buf.len() - FOOTER_LEN + F_CRC;
-    buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
-    buf
+    let crc = crc32c::crc32c_append(crc32c::crc32c(sealed_dir), &footer[..F_CRC]);
+    footer[F_CRC..F_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+    footer
 }
 
 /// Seal the directory and assemble the final segment bytes in one step, for
 /// callers that own `buf` outright and have nothing to preserve on error. The
-/// open-segment buffer instead uses [`seal_directory`] + [`assemble_segment`]
+/// open-segment buffer instead uses [`seal_directory`] + [`assemble_segment_payload`]
 /// so a seal error can't drop it.
 pub(crate) fn finalize_segment(
     codec: &FrameCodec,
@@ -647,6 +680,7 @@ fn open_spans<T: Send>(
 
 /// Walk the length-prefixed frames packed in `region`, opening each under the
 /// AAD derived from its absolute index and logical block.
+#[cfg(test)]
 pub(crate) fn read_frames_from_region(
     codec: &FrameCodec,
     region: &[u8],
@@ -664,8 +698,57 @@ pub(crate) fn read_frames_from_region(
     })
 }
 
-/// As [`read_frames_from_region`] but AEAD-verify only, returning each frame's
-/// still-compressed payload. The relocation (repack) read: the payloads
+/// Decode a frame run, gathering only frames that cross chunk boundaries.
+pub(crate) fn read_frames_from_chunks(
+    codec: &FrameCodec,
+    mut region: bytes_utils::SegmentedBuf<bytes::Bytes>,
+    segid: Segid,
+    first_frame: u32,
+    slots: &[(u64, u64)],
+) -> Result<Vec<Vec<u8>>, SegmentError> {
+    use bytes::Buf;
+    let parallel = region.remaining() >= PARALLEL_CRYPTO_MIN_BYTES;
+    let mut frames = Vec::with_capacity(slots.len());
+    for (i, &(inode, extent)) in slots.iter().enumerate() {
+        if region.remaining() < LEN_PREFIX {
+            return Err(SegmentError::Malformed("frame length prefix out of bounds"));
+        }
+        let len = region.get_u32_le() as usize;
+        if len > region.remaining() {
+            return Err(SegmentError::Malformed("frame body out of bounds"));
+        }
+        let fi = first_frame
+            .checked_add(i as u32)
+            .ok_or(SegmentError::Malformed("frame index overflow"))?;
+        frames.push((
+            region.copy_to_bytes(len),
+            frame_aad(segid, fi, inode, extent),
+        ));
+    }
+    let open = |(frame, aad): (bytes::Bytes, Vec<u8>)| {
+        codec.open_owned(frame, &aad).map_err(SegmentError::from)
+    };
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    if !parallel
+        || runtime
+            .as_ref()
+            .is_some_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return frames.into_iter().map(open).collect();
+    }
+    let run = || {
+        use rayon::prelude::*;
+        frames.into_par_iter().map(open).collect()
+    };
+    if runtime.is_some() {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    }
+}
+
+/// Verify length-prefixed frames, returning each still-compressed payload.
+/// The relocation (repack) read: the payloads
 /// re-seal under their new slots' AADs without a decompress/recompress round
 /// trip, so gather memory tracks stored size, not the compression ratio.
 pub(crate) fn read_compressed_frames_from_region(
@@ -734,6 +817,64 @@ mod tests {
             .expect("test key should be lockable")
     }
 
+    #[test]
+    fn chunked_segment_preserves_frames_and_wire_format() {
+        let c = codec();
+        let segid = Segid::new(3, 19);
+        let plains = vec![(7, 0, vec![0xab; 32768]), (7, 1, vec![0xcd; 32768])];
+        let raw = Bytes::from(build(&c, segid, &plains));
+        let segment = Segment::parse(raw.clone()).unwrap();
+        let dir = segment.directory(&c).unwrap();
+        let mut chunks = Vec::new();
+        for entry in &dir {
+            let start = entry.byte_offset as usize;
+            chunks.push(raw.slice(start..start + LEN_PREFIX));
+            chunks.push(raw.slice(start + LEN_PREFIX..start + LEN_PREFIX + entry.len as usize));
+        }
+        let payload = assemble_segment_payload(
+            segid,
+            chunks.clone(),
+            dir.len() as u32,
+            raw[segment.dir_offset as usize..raw.len() - FOOTER_LEN].to_vec(),
+            segment.sealed_seqno,
+        );
+        for (original, retained) in chunks.iter().zip(payload.iter()) {
+            assert_eq!(original.as_ptr(), retained.as_ptr());
+            assert_eq!(original.len(), retained.len());
+        }
+        assert_eq!(Bytes::from(payload), raw);
+    }
+
+    #[test]
+    fn segmented_frames_decode_across_every_boundary_and_reject_truncation() {
+        let c = codec();
+        let segid = Segid::new(3, 19);
+        let plains = vec![(7, 0, vec![0xab; 32768]), (7, 1, vec![0xcd; 32768])];
+        let raw = Bytes::from(build(&c, segid, &plains));
+        let end = Segment::parse(raw.clone()).unwrap().dir_offset as usize;
+        let slots = [(7, 0), (7, 1)];
+        for split in 0..=end {
+            let chunks = vec![raw.slice(..split), raw.slice(split..end)].into();
+            let got = read_frames_from_chunks(&c, chunks, segid, 0, &slots).unwrap();
+            assert_eq!(got[0], plains[0].2);
+            assert_eq!(got[1], plains[1].2);
+        }
+        assert!(
+            read_frames_from_chunks(&c, vec![raw.slice(..end - 1)].into(), segid, 0, &slots)
+                .is_err()
+        );
+        assert!(
+            read_frames_from_chunks(
+                &c,
+                vec![raw.slice(..end)].into(),
+                segid,
+                0,
+                &[(8, 0), (7, 1)]
+            )
+            .is_err()
+        );
+    }
+
     // A run past PARALLEL_CRYPTO_MIN_BYTES decodes on rayon and must roundtrip with
     // the per-frame AADs intact and in order. Content is incompressible so the
     // stored run clears the byte gate (compressible frames would shrink below it
@@ -754,6 +895,17 @@ mod tests {
         let got = seg
             .read_range(&c, 0, seg.dir_offset as u32, 0, &slots)
             .unwrap();
+        for ((_, _, want), got) in frames.iter().zip(&got) {
+            assert_eq!(want, got);
+        }
+        let chunks = (0..seg.dir_offset as usize)
+            .step_by(128 * 1024)
+            .map(|start| {
+                seg.bytes
+                    .slice(start..(start + 128 * 1024).min(seg.dir_offset as usize))
+            })
+            .collect();
+        let got = read_frames_from_chunks(&c, chunks, segid, 0, &slots).unwrap();
         for ((_, _, want), got) in frames.iter().zip(&got) {
             assert_eq!(want, got);
         }

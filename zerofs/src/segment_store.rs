@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use bytes_utils::SegmentedBuf;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
-    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path,
+    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
@@ -93,12 +94,12 @@ impl SegmentStore {
 
     /// PUT pre-built segment bytes (durable on return). Used by the open-segment
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
-    /// `assemble_segment`.
-    pub async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
-        validate_segment_size(bytes.len())?;
+    /// `assemble_segment_payload`.
+    pub async fn put_segment(&self, segid: Segid, payload: PutPayload) -> Result<()> {
+        validate_segment_size(payload.content_length())?;
         let path = Path::from(segid.object_key());
         self.object_store
-            .put(&path, bytes.into())
+            .put(&path, payload)
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         Ok(())
@@ -150,7 +151,7 @@ impl SegmentStore {
             ));
         }
         let bytes = builder.finish(segid.counter)?;
-        self.put_segment(segid, Bytes::from(bytes)).await?;
+        self.put_segment(segid, bytes.into()).await?;
         Ok(locs)
     }
 
@@ -179,15 +180,46 @@ impl SegmentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Vec<Bytes>> {
-        let region = self.read_run_region(segid, byte_offset, byte_len).await?;
-        let frames = crate::segment::read_frames_from_region(
+        let region = self.read_run_chunks(segid, byte_offset, byte_len).await?;
+        let frames = crate::segment::read_frames_from_chunks(
             &self.codec,
-            &region,
+            region,
             segid,
             first_frame,
             slots,
         )?;
         Ok(frames.into_iter().map(Bytes::from).collect())
+    }
+
+    pub(crate) async fn prefetch_run(&self, segid: Segid, offset: u64, len: u32) -> Result<()> {
+        self.read_run_chunks(segid, offset, len).await?;
+        Ok(())
+    }
+
+    async fn read_run_chunks(
+        &self,
+        segid: Segid,
+        offset: u64,
+        len: u32,
+    ) -> Result<SegmentedBuf<Bytes>> {
+        let result = self
+            .object_store
+            .get_opts(
+                &Path::from(segid.object_key()),
+                GetOptions {
+                    range: Some(GetRange::Bounded(offset..offset + len as u64)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        let chunks = result
+            .into_stream()
+            .try_collect()
+            .await
+            .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(chunks)
     }
 
     /// As [`Self::read_run`] but AEAD-verify only, returning still-compressed

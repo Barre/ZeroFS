@@ -497,6 +497,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytes-utils"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dafe3a8757b027e2be6e4e5601ed563c55989fcf1546e933c66c8eb3a058d35"
+dependencies = [
+ "bytes",
+ "either",
+]
+
+[[package]]
 name = "bytestream"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6158,7 +6168,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "2.3.3"
+version = "2.3.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6168,6 +6178,7 @@ dependencies = [
  "backon",
  "bincode",
  "bytes",
+ "bytes-utils",
  "chacha20poly1305",
  "chrono",
  "clap",
@@ -6268,7 +6279,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs-csi"
-version = "2.3.3"
+version = "2.3.4"
 dependencies = [
  "anyhow",
  "clap",

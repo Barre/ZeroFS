@@ -46,29 +46,8 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
-      - name: Start MinIO
-        run: |
-          docker run -d \
-            --name minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-
-          # Wait for MinIO to be ready
-          for i in {1..30}; do
-            if curl -f http://localhost:9000/minio/health/live; then
-              echo "MinIO is ready"
-              break
-            fi
-            sleep 1
-          done
-
-          # The glue points every run at s3://zerofs-jepsen/run-<uuid>.
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x mc
-          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/zerofs-jepsen || true
+      - name: Start SeaweedFS
+        run: bash .github/scripts/seaweedfs.sh start zerofs-jepsen
 
       - name: Assemble local-fs (upstream @ pin + ZeroFS glue)
         run: |
@@ -87,7 +66,7 @@ jobs:
         working-directory: /tmp/local-fs
         timeout-minutes: 10
         run: |
-          # The ZeroFS backend self-manages the server (against the MinIO started
+          # The ZeroFS backend self-manages the server (against the SeaweedFS started
           # above) and the 9P FUSE mount, so no separate mount step is needed
           # here. Each trial is a full setup/teardown; --quickcheck-tests bounds
           # CI time.

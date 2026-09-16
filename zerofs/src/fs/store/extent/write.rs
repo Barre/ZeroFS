@@ -14,9 +14,10 @@ use crate::fs::inode::InodeId;
 use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::replication::ReplOp;
-use crate::segment::{DirEntry, FrameLoc, Segid};
-use bytes::{Bytes, BytesMut};
+use crate::segment::{DirEntry, FrameLoc, LEN_PREFIX, Segid};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::stream::{self, StreamExt, TryStreamExt};
+use slatedb::object_store::PutPayload;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::error;
@@ -39,7 +40,21 @@ pub(super) const MAX_INFLIGHT_SEALS: usize = 4;
 /// the segment object is PUT only on flush or when it crosses [`SEAL_THRESHOLD`].
 pub(super) struct OpenSegment {
     pub(super) segid: Segid,
-    pub(super) buf: Vec<u8>,
+    // Two chunks per frame: its length prefix followed by the sealed body.
+    pub(super) chunks: Vec<Bytes>,
+    pub(super) dir: Vec<DirEntry>,
+}
+
+impl OpenSegment {
+    pub(super) fn byte_len(&self) -> usize {
+        self.dir.last().map_or(0, |entry| {
+            entry.byte_offset as usize + LEN_PREFIX + entry.len as usize
+        })
+    }
+}
+
+pub(super) struct SealingSegment {
+    pub(super) payload: PutPayload,
     pub(super) dir: Vec<DirEntry>,
 }
 
@@ -47,18 +62,11 @@ impl ExtentStore {
     /// Raw `[len][sealed]` bytes of a frame still resident in RAM (the open buffer
     /// or an in-flight seal), or `None` once its segment is PUT (the standby reads
     /// the shared store directly). Used to ship un-PUT segments' bytes for HA.
-    fn read_frame_for_ship(&self, segid: Segid, byte_offset: u64, byte_len: u32) -> Option<Bytes> {
-        let start = byte_offset as usize;
-        let end = start.checked_add(byte_len as usize)?;
-        {
-            let open = self.open.lock().unwrap();
-            if open.segid == segid {
-                return open.buf.get(start..end).map(Bytes::copy_from_slice);
-            }
-        }
-        let sealing = self.sealing.lock().unwrap();
-        let bytes = sealing.get(&segid)?;
-        (end <= bytes.len()).then(|| bytes.slice(start..end))
+    fn read_frame_for_ship(&self, loc: FrameLoc) -> Option<Bytes> {
+        let mut chunks = self
+            .frame_chunks_in_ram(loc.segid, loc.byte_offset, loc.byte_len, loc.frame_index, 1)
+            .ok()??;
+        Some(chunks.copy_to_bytes(chunks.remaining()))
     }
 
     /// Enrich a batch's replication ops: an extent-write `Put` whose segment is
@@ -71,8 +79,7 @@ impl ExtentStore {
                 ReplOp::Put(k, v) => {
                     if self.key_codec.parse_extent_key(&k).is_some()
                         && let Some(loc) = FrameLoc::decode(&v)
-                        && let Some(frame) =
-                            self.read_frame_for_ship(loc.segid, loc.byte_offset, loc.byte_len)
+                        && let Some(frame) = self.read_frame_for_ship(loc)
                     {
                         ReplOp::PutFrame(k, v, frame)
                     } else {
@@ -238,10 +245,11 @@ impl ExtentStore {
                             compressed.next().expect("one compressed payload per edit"),
                         )
                         .map_err(|_| FsError::IoError)?;
-                        let byte_offset = open.buf.len() as u64;
+                        let byte_offset = open.byte_len() as u64;
                         let sealed_len = sealed.len() as u32;
-                        open.buf.extend_from_slice(&sealed_len.to_le_bytes());
-                        open.buf.extend_from_slice(&sealed);
+                        open.chunks
+                            .push(Bytes::copy_from_slice(&sealed_len.to_le_bytes()));
+                        open.chunks.push(Bytes::from(sealed));
                         open.dir.push(DirEntry {
                             byte_offset,
                             len: sealed_len,
@@ -273,7 +281,7 @@ impl ExtentStore {
             // Overwrite debit of the superseded frame: live only, total untouched.
             self.seg_delta(txn, segid, -(byte_len as i64), 0);
         }
-        let over_threshold = self.open.lock().unwrap().buf.len() >= self.seal_threshold();
+        let over_threshold = self.open.lock().unwrap().byte_len() >= self.seal_threshold();
         if over_threshold {
             self.spawn_seal().await;
         }
@@ -294,23 +302,21 @@ impl ExtentStore {
             .map_err(|_| FsError::IoError)?;
 
         // Re-PUT any seal whose background attempt failed (still in `sealing`).
-        let pending: Vec<(Segid, Bytes)> = {
-            let s = self.sealing.lock().unwrap();
-            s.iter().map(|(seg, b)| (*seg, b.clone())).collect()
+        let pending: Vec<(Segid, PutPayload)> = {
+            let sealing = self.sealing.lock().unwrap();
+            sealing
+                .iter()
+                .map(|(segid, segment)| (*segid, segment.payload.clone()))
+                .collect()
         };
-        for (segid, bytes) in pending {
+        for (segid, payload) in pending {
             self.segments
-                .put_segment(segid, bytes)
+                .put_segment(segid, payload)
                 .await
                 .map_err(|_| FsError::IoError)?;
             self.sealing.lock().unwrap().remove(&segid);
         }
 
-        // Synchronously seal the current open buffer. Register it in `sealing`
-        // under the open lock and remove it only on success, so the rotated
-        // segment is never absent from both maps: a concurrent read would 404
-        // the not-yet-PUT object, and a failed PUT would strand it. Mirrors
-        // spawn_seal.
         let current = {
             let mut open = self.open.lock().unwrap();
             if open.dir.is_empty() {
@@ -319,37 +325,18 @@ impl ExtentStore {
                 let segid = open.segid;
                 #[cfg(feature = "failpoints")]
                 fail_point!(fp::SEAL_OPEN_FAIL, |_| Err(FsError::IoError));
-                // Seal the directory first: on error the open buffer and its
-                // committed FrameLocs stay intact for retry, instead of being
-                // dropped into a dangling pointer.
+                // Seal the directory before rotating so errors leave the buffer intact.
                 let sealed_dir = crate::segment::seal_directory(&self.codec, segid, &open.dir)
                     .map_err(|_| FsError::IoError)?;
-                let k = open.dir.len() as u32;
-                let buf = std::mem::take(&mut open.buf);
-                let small = (buf.len() as u64) < SMALL_SEGMENT_BYTES;
-                open.dir.clear();
-                open.segid = self.segments.next_segid();
-                debug_assert_ne!(
-                    open.segid, segid,
-                    "rotated open segid must differ from the sealed one"
-                );
-                let bytes = Bytes::from(crate::segment::assemble_segment(
-                    segid,
-                    buf,
-                    k,
-                    &sealed_dir,
-                    segid.counter,
-                ));
-                self.sealing.lock().unwrap().insert(segid, bytes.clone());
-                Some((segid, bytes, small))
+                Some(self.rotate_open_segment(&mut open, sealed_dir))
             }
         };
-        if let Some((segid, bytes, small)) = current {
+        if let Some((segid, payload, small)) = current {
             if small {
                 self.record_reclaim_activity();
             }
             self.segments
-                .put_segment(segid, bytes)
+                .put_segment(segid, payload)
                 .await
                 .map_err(|_| FsError::IoError)?;
             self.sealing.lock().unwrap().remove(&segid);
@@ -366,14 +353,12 @@ impl ExtentStore {
             Ok(p) => p,
             Err(_) => return,
         };
-        let (segid, bytes, small) = {
+        let (segid, payload, small) = {
             let mut open = self.open.lock().unwrap();
             if open.dir.is_empty() {
                 return;
             }
             let segid = open.segid;
-            // Directory first, as in seal_open: an error must leave the open
-            // buffer intact for the next seal/flush to retry.
             let sealed_dir = match crate::segment::seal_directory(&self.codec, segid, &open.dir) {
                 Ok(s) => s,
                 Err(e) => {
@@ -381,26 +366,7 @@ impl ExtentStore {
                     return;
                 }
             };
-            let k = open.dir.len() as u32;
-            let buf = std::mem::take(&mut open.buf);
-            let small = (buf.len() as u64) < SMALL_SEGMENT_BYTES;
-            open.dir.clear();
-            open.segid = self.segments.next_segid();
-            debug_assert_ne!(
-                open.segid, segid,
-                "rotated open segid must differ from the sealed one"
-            );
-            let bytes = Bytes::from(crate::segment::assemble_segment(
-                segid,
-                buf,
-                k,
-                &sealed_dir,
-                segid.counter,
-            ));
-            // Insert into `sealing` while still holding `open`, so the segid is
-            // never absent from both maps (a concurrent read would miss it).
-            self.sealing.lock().unwrap().insert(segid, bytes.clone());
-            (segid, bytes, small)
+            self.rotate_open_segment(&mut open, sealed_dir)
         };
         if small {
             self.record_reclaim_activity();
@@ -408,7 +374,7 @@ impl ExtentStore {
         let segments = self.segments.clone();
         let sealing = self.sealing.clone();
         crate::task::spawn_named("segment-seal", async move {
-            match segments.put_segment(segid, bytes).await {
+            match segments.put_segment(segid, payload).await {
                 Ok(()) => {
                     sealing.lock().unwrap().remove(&segid);
                 }
@@ -421,6 +387,39 @@ impl ExtentStore {
             }
             drop(permit);
         });
+    }
+
+    fn rotate_open_segment(
+        &self,
+        open: &mut OpenSegment,
+        sealed_dir: Vec<u8>,
+    ) -> (Segid, PutPayload, bool) {
+        let segid = open.segid;
+        let small = (open.byte_len() as u64) < SMALL_SEGMENT_BYTES;
+        let chunks = std::mem::take(&mut open.chunks);
+        let dir = std::mem::take(&mut open.dir);
+        open.segid = self.segments.next_segid();
+        debug_assert_ne!(
+            open.segid, segid,
+            "rotated open segid must differ from the sealed one"
+        );
+        let payload = crate::segment::assemble_segment_payload(
+            segid,
+            chunks,
+            dir.len() as u32,
+            sealed_dir,
+            segid.counter,
+        );
+        // The caller holds `open` until registration, keeping concurrent reads valid.
+        // Retain the segment until its PUT succeeds so a failed PUT can be retried.
+        self.sealing.lock().unwrap().insert(
+            segid,
+            SealingSegment {
+                payload: payload.clone(),
+                dir,
+            },
+        );
+        (segid, payload, small)
     }
 
     /// Stage a write at `offset` as read-modify-write over full extents;
@@ -1003,6 +1002,78 @@ mod tests {
             1,
             "a read of a sealed segment is one ranged GET"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_seals_preserve_reads_and_replication_until_retry() {
+        for background in [false, true] {
+            let (_original, db, objects) = make_with_compression(CompressionConfig::Lz4).await;
+            let objects = InFlightObjectStore::new(objects, std::time::Duration::ZERO);
+            objects.set_fail_puts(true);
+            let store = make_store(objects.clone(), db.clone(), CompressionConfig::Lz4, 2).await;
+            let store = store.with_seal_threshold(if background { 1 } else { SEAL_THRESHOLD });
+            let mut model = Vec::new();
+            let data = incompressible(7, 3 * EXTENT_SIZE);
+            write_and_check(&store, &db, &mut model, 0, &data).await;
+            let key = store.key_codec.extent_key(1, 1);
+            let encoded = db.get_bytes(&key).await.unwrap().unwrap();
+            let loc = FrameLoc::decode(&encoded).unwrap();
+            let shipped = store.read_frame_for_ship(loc).unwrap();
+            assert_eq!(shipped.len(), loc.byte_len as usize);
+            assert_eq!(
+                crate::segment::read_frames_from_region(
+                    &store.codec,
+                    &shipped,
+                    loc.segid,
+                    loc.frame_index,
+                    &[(1, 1)],
+                )
+                .unwrap()[0],
+                data[EXTENT_SIZE..2 * EXTENT_SIZE],
+            );
+
+            assert!(store.seal_open().await.is_err());
+            assert!(store.open.lock().unwrap().dir.is_empty());
+            assert_eq!(store.sealing.lock().unwrap().len(), 1);
+            assert_read_matches(&store, &model).await;
+            assert_eq!(
+                store.get(1, 1).await.unwrap().unwrap(),
+                &data[EXTENT_SIZE..2 * EXTENT_SIZE]
+            );
+            assert!(store.unflushed_bytes() > 0);
+            let ops = store.enrich_repl_ops(vec![ReplOp::Put(key.clone(), encoded.clone())]);
+            assert!(matches!(&ops[..], [ReplOp::PutFrame(k, v, frame)]
+                if k == &key && v == &encoded && frame == &shipped));
+            assert!(
+                store
+                    .frame_chunks_in_ram(
+                        loc.segid,
+                        loc.byte_offset + 1,
+                        loc.byte_len,
+                        loc.frame_index,
+                        1,
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .frame_chunks_in_ram(loc.segid, loc.byte_offset, loc.byte_len, u32::MAX, 1)
+                    .is_err()
+            );
+
+            objects.set_fail_puts(false);
+            store.seal_open().await.unwrap();
+            assert!(store.seals_quiet());
+            assert_eq!(store.unflushed_bytes(), 0);
+            assert_read_matches(&store, &model).await;
+            let directory = store.segments.read_directory(loc.segid).await.unwrap();
+            assert_eq!(directory.len(), 3);
+            assert_eq!(directory[1].byte_offset, loc.byte_offset);
+            assert!(matches!(
+                &store.enrich_repl_ops(vec![ReplOp::Put(key, encoded)])[..],
+                [ReplOp::Put(_, _)]
+            ));
+        }
     }
 
     // Not a correctness test: measures single-stream engine-side write

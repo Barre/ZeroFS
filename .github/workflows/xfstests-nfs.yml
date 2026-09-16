@@ -49,32 +49,8 @@ jobs:
           path: zerofs/target/ci
       - run: chmod +x zerofs/target/ci/zerofs
 
-      - name: Start MinIO
-        run: |
-          docker run -d \
-            --name minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-
-          # Wait for MinIO to be ready
-          for i in {1..30}; do
-            if curl -f http://localhost:9000/minio/health/live; then
-              echo "MinIO is ready"
-              break
-            fi
-            sleep 1
-          done
-
-          # The TEST and SCRATCH instances share one bucket under distinct prefixes.
-          wget https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x mc
-          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc mb myminio/zerofs-test || true
-
-          mkdir -p /tmp/zerofs-cache-test
-          mkdir -p /tmp/zerofs-cache-scratch
+      - name: Start SeaweedFS
+        run: bash .github/scripts/seaweedfs.sh start zerofs-test
 
       - name: Start ZeroFS (TEST instance)
         working-directory: zerofs
@@ -91,8 +67,8 @@ jobs:
           encryption_password = "test-password-123"
 
           [aws]
-          access_key_id = "minioadmin"
-          secret_access_key = "minioadmin"
+          access_key_id = "zerofsadmin"
+          secret_access_key = "zerofsadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
 
@@ -137,8 +113,8 @@ jobs:
           encryption_password = "test-password-123"
 
           [aws]
-          access_key_id = "minioadmin"
-          secret_access_key = "minioadmin"
+          access_key_id = "zerofsadmin"
+          secret_access_key = "zerofsadmin"
           endpoint = "http://localhost:9000"
           allow_http = "true"
 

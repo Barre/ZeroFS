@@ -1,7 +1,7 @@
 # e2e variant of deploy/gateway-example.yaml: same names, labels and ports, so
 # deploy/storageclass-example.yaml applies verbatim. Differences from the deploy
 # manifest:
-#   - S3 storage on an in-cluster MinIO (minio.yaml), shared by both nodes. The
+#   - S3 storage on an in-cluster SeaweedFS (seaweedfs.yaml), shared by both nodes. The
 #     two nodes replicate over one store (one bucket prefix), and the data
 #     survives a leader pod deletion (which the failover test depends on).
 #   - the locally imported image.
@@ -27,9 +27,9 @@ data:
     encryption_password = "zerofs-e2e-password"
 
     [aws]
-    endpoint = "http://minio.zerofs.svc.cluster.local:9000"
-    access_key_id = "minioadmin"
-    secret_access_key = "minioadmin"
+    endpoint = "http://seaweedfs.zerofs.svc.cluster.local:9000"
+    access_key_id = "zerofsadmin"
+    secret_access_key = "zerofsadmin"
     allow_http = "true"
 
     [servers]
@@ -133,9 +133,9 @@ data:
     encryption_password = "zerofs-e2e-password"
 
     [aws]
-    endpoint = "http://minio.zerofs.svc.cluster.local:9000"
-    access_key_id = "minioadmin"
-    secret_access_key = "minioadmin"
+    endpoint = "http://seaweedfs.zerofs.svc.cluster.local:9000"
+    access_key_id = "zerofsadmin"
+    secret_access_key = "zerofsadmin"
     allow_http = "true"
 
     [servers]
