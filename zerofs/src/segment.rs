@@ -664,6 +664,55 @@ pub(crate) fn read_frames_from_region(
     })
 }
 
+/// Decode a frame run, gathering only frames that cross chunk boundaries.
+pub(crate) fn read_frames_from_chunks(
+    codec: &FrameCodec,
+    mut region: bytes_utils::SegmentedBuf<bytes::Bytes>,
+    segid: Segid,
+    first_frame: u32,
+    slots: &[(u64, u64)],
+) -> Result<Vec<Vec<u8>>, SegmentError> {
+    use bytes::Buf;
+    let parallel = region.remaining() >= PARALLEL_CRYPTO_MIN_BYTES;
+    let mut frames = Vec::with_capacity(slots.len());
+    for (i, &(inode, extent)) in slots.iter().enumerate() {
+        if region.remaining() < LEN_PREFIX {
+            return Err(SegmentError::Malformed("frame length prefix out of bounds"));
+        }
+        let len = region.get_u32_le() as usize;
+        if len > region.remaining() {
+            return Err(SegmentError::Malformed("frame body out of bounds"));
+        }
+        let fi = first_frame
+            .checked_add(i as u32)
+            .ok_or(SegmentError::Malformed("frame index overflow"))?;
+        frames.push((
+            region.copy_to_bytes(len),
+            frame_aad(segid, fi, inode, extent),
+        ));
+    }
+    let open = |(frame, aad): (bytes::Bytes, Vec<u8>)| {
+        codec.open_owned(frame, &aad).map_err(SegmentError::from)
+    };
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    if !parallel
+        || runtime
+            .as_ref()
+            .is_some_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return frames.into_iter().map(open).collect();
+    }
+    let run = || {
+        use rayon::prelude::*;
+        frames.into_par_iter().map(open).collect()
+    };
+    if runtime.is_some() {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    }
+}
+
 /// As [`read_frames_from_region`] but AEAD-verify only, returning each frame's
 /// still-compressed payload. The relocation (repack) read: the payloads
 /// re-seal under their new slots' AADs without a decompress/recompress round
@@ -734,6 +783,36 @@ mod tests {
             .expect("test key should be lockable")
     }
 
+    #[test]
+    fn segmented_frames_decode_across_every_boundary_and_reject_truncation() {
+        let c = codec();
+        let segid = Segid::new(3, 19);
+        let plains = vec![(7, 0, vec![0xab; 32768]), (7, 1, vec![0xcd; 32768])];
+        let raw = Bytes::from(build(&c, segid, &plains));
+        let end = Segment::parse(raw.clone()).unwrap().dir_offset as usize;
+        let slots = [(7, 0), (7, 1)];
+        for split in 0..=end {
+            let chunks = vec![raw.slice(..split), raw.slice(split..end)].into();
+            let got = read_frames_from_chunks(&c, chunks, segid, 0, &slots).unwrap();
+            assert_eq!(got[0], plains[0].2);
+            assert_eq!(got[1], plains[1].2);
+        }
+        assert!(
+            read_frames_from_chunks(&c, vec![raw.slice(..end - 1)].into(), segid, 0, &slots)
+                .is_err()
+        );
+        assert!(
+            read_frames_from_chunks(
+                &c,
+                vec![raw.slice(..end)].into(),
+                segid,
+                0,
+                &[(8, 0), (7, 1)]
+            )
+            .is_err()
+        );
+    }
+
     // A run past PARALLEL_CRYPTO_MIN_BYTES decodes on rayon and must roundtrip with
     // the per-frame AADs intact and in order. Content is incompressible so the
     // stored run clears the byte gate (compressible frames would shrink below it
@@ -754,6 +833,17 @@ mod tests {
         let got = seg
             .read_range(&c, 0, seg.dir_offset as u32, 0, &slots)
             .unwrap();
+        for ((_, _, want), got) in frames.iter().zip(&got) {
+            assert_eq!(want, got);
+        }
+        let chunks = (0..seg.dir_offset as usize)
+            .step_by(128 * 1024)
+            .map(|start| {
+                seg.bytes
+                    .slice(start..(start + 128 * 1024).min(seg.dir_offset as usize))
+            })
+            .collect();
+        let got = read_frames_from_chunks(&c, chunks, segid, 0, &slots).unwrap();
         for ((_, _, want), got) in frames.iter().zip(&got) {
             assert_eq!(want, got);
         }

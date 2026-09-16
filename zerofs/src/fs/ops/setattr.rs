@@ -762,7 +762,7 @@ mod tests {
             .unwrap();
         assert_eq!(attrs.size, 500);
         let (data, _) = fs.read_file_opened(file_id, 0, 1000).await.unwrap();
-        assert_eq!(data.len(), 500);
+        assert_eq!(bytes::Buf::remaining(&data), 500);
     }
 
     #[tokio::test]
