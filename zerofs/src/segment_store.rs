@@ -14,7 +14,7 @@ use bytes::Bytes;
 use bytes_utils::SegmentedBuf;
 use futures::{StreamExt, TryStreamExt};
 use slatedb::object_store::{
-    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path,
+    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path,
 };
 
 use crate::frame_codec::{Compressed, FrameCodec};
@@ -94,12 +94,12 @@ impl SegmentStore {
 
     /// PUT pre-built segment bytes (durable on return). Used by the open-segment
     /// buffer's seal, which builds the bytes itself via `seal_directory` +
-    /// `assemble_segment`.
-    pub async fn put_segment(&self, segid: Segid, bytes: Bytes) -> Result<()> {
-        validate_segment_size(bytes.len())?;
+    /// `assemble_segment_payload`.
+    pub async fn put_segment(&self, segid: Segid, payload: PutPayload) -> Result<()> {
+        validate_segment_size(payload.content_length())?;
         let path = Path::from(segid.object_key());
         self.object_store
-            .put(&path, bytes.into())
+            .put(&path, payload)
             .await
             .map_err(|e| SegmentStoreError::ObjectStore(e.to_string()))?;
         Ok(())
@@ -151,7 +151,7 @@ impl SegmentStore {
             ));
         }
         let bytes = builder.finish(segid.counter)?;
-        self.put_segment(segid, Bytes::from(bytes)).await?;
+        self.put_segment(segid, bytes.into()).await?;
         Ok(locs)
     }
 

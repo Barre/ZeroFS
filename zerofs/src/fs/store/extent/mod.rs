@@ -28,7 +28,6 @@ use crate::fs::write_coordinator::{LockedMutation, WeakWriteCoordinator};
 use crate::fs::{EXTENT_SIZE, FsError};
 use crate::segment::Segid;
 use crate::segment_store::SegmentStore;
-use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use foyer::{Cache, CacheBuilder};
 use futures::stream::StreamExt;
@@ -39,7 +38,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tracing::error;
 pub(crate) use write::SEAL_THRESHOLD;
-use write::{MAX_INFLIGHT_SEALS, OpenSegment};
+use write::{MAX_INFLIGHT_SEALS, OpenSegment, SealingSegment};
 
 pub(super) const PARALLEL_EXTENT_OPS: usize = 20;
 
@@ -77,10 +76,10 @@ pub struct ExtentStore {
     /// crosses the threshold keeps this gate while waiting for a seal permit,
     /// so later writers cannot keep extending an overdue open segment.
     append_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Finalized bytes of segments whose PUT is in flight (or failed and pending a
+    /// Finalized segments whose PUT is in flight (or failed and pending a
     /// re-PUT). Reads consult these before the object store. Ordered so the
     /// barrier's re-PUT sequence is deterministic (seal order).
-    sealing: Arc<Mutex<BTreeMap<Segid, Bytes>>>,
+    sealing: Arc<Mutex<BTreeMap<Segid, SealingSegment>>>,
     /// Permits = max in-flight seals; acquiring all is the fsync drain barrier.
     seal_sem: Arc<Semaphore>,
     /// Deadline after which each currently-dead segment may be deleted:
@@ -131,7 +130,7 @@ impl ExtentStore {
         let codec = segments.codec();
         let open = Arc::new(Mutex::new(OpenSegment {
             segid: segments.next_segid(),
-            buf: Vec::new(),
+            chunks: Vec::new(),
             dir: Vec::new(),
         }));
         Self {
@@ -243,13 +242,13 @@ impl ExtentStore {
     /// include frames superseded by newer buffered writes, so it is not a live-
     /// byte subset. Read fresh (it is volatile); cheap in-memory lengths.
     pub fn unflushed_bytes(&self) -> u64 {
-        let open = self.open.lock().unwrap().buf.len() as u64;
+        let open = self.open.lock().unwrap().byte_len() as u64;
         let sealing: u64 = self
             .sealing
             .lock()
             .unwrap()
             .values()
-            .map(|b| b.len() as u64)
+            .map(|s| s.payload.content_length() as u64)
             .sum();
         open + sealing
     }
@@ -291,6 +290,7 @@ impl ExtentStore {
 mod tests {
     use super::test_util::*;
     use super::*;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn concurrent_commits_preserve_counter_deltas() {

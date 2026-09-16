@@ -781,16 +781,29 @@ impl PrefetchingObjectStore {
         parts: &HybridCache<PartKey, Bytes>,
         part_size_bytes: usize,
         location: &Path,
-        stream: S,
+        mut stream: S,
         start_part_number: PartId,
-        skip: usize,
+        mut skip: usize,
     ) -> object_store::Result<()>
     where
         S: stream::Stream<Item = Result<Bytes, object_store::Error>> + Unpin,
     {
-        let chunks = Self::collect_parts(stream, part_size_bytes, skip).await?;
-        for (i, bytes) in chunks.into_iter().enumerate() {
-            parts.insert(PartKey::new(location, start_part_number + i), bytes);
+        let mut part_number = start_part_number;
+        let mut cache_part = |bytes| {
+            parts.insert(PartKey::new(location, part_number), bytes);
+            part_number += 1;
+        };
+        // Insert completed parts immediately so unbounded GETs only stage one
+        // unfinished part outside the cache, in addition to the incoming chunk.
+        let mut pending = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let n = skip.min(chunk.len());
+            skip -= n;
+            Self::append_parts(&mut cache_part, &mut pending, part_size_bytes, &chunk[n..]);
+        }
+        if !pending.is_empty() {
+            cache_part(Bytes::from(pending.into_boxed_slice()));
         }
         Ok(())
     }
@@ -811,7 +824,12 @@ impl PrefetchingObjectStore {
             let chunk = chunk?;
             let n = skip.min(chunk.len());
             skip -= n;
-            Self::append_parts(&mut parts, &mut pending, part_size, &chunk[n..]);
+            Self::append_parts(
+                |bytes| parts.push(bytes),
+                &mut pending,
+                part_size,
+                &chunk[n..],
+            );
         }
         if !pending.is_empty() {
             // A short final part must not retain a full-part allocation.
@@ -821,7 +839,7 @@ impl PrefetchingObjectStore {
     }
 
     fn append_parts(
-        parts: &mut Vec<Bytes>,
+        mut emit: impl FnMut(Bytes),
         pending: &mut Vec<u8>,
         part_size: usize,
         mut chunk: &[u8],
@@ -834,7 +852,7 @@ impl PrefetchingObjectStore {
             pending.extend_from_slice(&chunk[..n]);
             chunk = &chunk[n..];
             if pending.len() == part_size {
-                parts.push(Bytes::from(std::mem::take(pending)));
+                emit(Bytes::from(std::mem::take(pending)));
             }
         }
     }
@@ -846,7 +864,12 @@ impl PrefetchingObjectStore {
         let mut parts = Vec::new();
         let mut pending = Vec::new();
         for chunk in payload {
-            Self::append_parts(&mut parts, &mut pending, self.part_size_bytes, &chunk);
+            Self::append_parts(
+                |bytes| parts.push(bytes),
+                &mut pending,
+                self.part_size_bytes,
+                &chunk,
+            );
         }
         if !pending.is_empty() {
             parts.push(Bytes::from(pending.into_boxed_slice()));
@@ -1525,6 +1548,48 @@ mod tests {
             gets.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "unaligned contiguous read should be a single GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_parts_are_cached_before_eof() {
+        let (store, _inner, _dir) = make_store(1024, MEM, DISK).await;
+        let path = Path::from("streamed-parts");
+        let skip = 300;
+        let body = Bytes::from(
+            (0..skip + 2560)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let (tx, stream) = futures::channel::mpsc::unbounded();
+        let mut save = Box::pin(store.save_parts_stream(&path, stream, 7, skip));
+
+        // Skip across chunks, then cross two part boundaries while the stream
+        // stays open. Completed parts must already be available to readers.
+        for range in [0..100, 100..900, 900..2400] {
+            tx.unbounded_send(Ok(body.slice(range))).unwrap();
+        }
+        assert!(futures::poll!(&mut save).is_pending());
+        for (i, range) in [(0, skip..skip + 1024), (1, skip + 1024..skip + 2048)] {
+            let part = store
+                .cached_part(&path, 7 + i)
+                .await
+                .expect("completed part must be cached before EOF");
+            assert_eq!(part.as_ref(), &body[range]);
+        }
+        assert!(store.cached_part(&path, 9).await.is_none());
+
+        tx.unbounded_send(Ok(body.slice(2400..))).unwrap();
+        assert!(futures::poll!(&mut save).is_pending());
+        assert!(
+            store.cached_part(&path, 9).await.is_none(),
+            "the unfinished part must stay buffered until EOF"
+        );
+        drop(tx);
+        save.await.unwrap();
+        assert_eq!(
+            store.cached_part(&path, 9).await.unwrap().as_ref(),
+            &body[skip + 2048..]
         );
     }
 

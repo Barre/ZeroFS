@@ -31,7 +31,7 @@ use slatedb::{BlockTransformer, DbBuilder};
 use std::fmt::{self, Display, Formatter};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -99,6 +99,7 @@ pub(super) struct InFlightObjectStore {
     deletes: Arc<InFlightCounter>,
     listed: Arc<AtomicUsize>,
     listed_at_first_delete: Arc<AtomicUsize>,
+    fail_puts: AtomicBool,
 }
 
 impl InFlightObjectStore {
@@ -111,6 +112,7 @@ impl InFlightObjectStore {
             deletes: Arc::default(),
             listed: Arc::default(),
             listed_at_first_delete: Arc::new(AtomicUsize::new(usize::MAX)),
+            fail_puts: AtomicBool::new(false),
         })
     }
 
@@ -118,6 +120,10 @@ impl InFlightObjectStore {
         self.gets.reset_peak();
         self.puts.reset_peak();
         self.deletes.reset_peak();
+    }
+
+    pub(super) fn set_fail_puts(&self, fail: bool) {
+        self.fail_puts.store(fail, Ordering::Relaxed);
     }
 
     pub(super) fn peak_gets(&self) -> usize {
@@ -154,6 +160,12 @@ impl ObjectStore for InFlightObjectStore {
     ) -> slatedb::object_store::Result<PutResult> {
         let _guard = self.puts.begin();
         tokio::time::sleep(self.delay).await;
+        if self.fail_puts.load(Ordering::Relaxed) {
+            return Err(slatedb::object_store::Error::Generic {
+                store: "test",
+                source: "injected PUT failure".into(),
+            });
+        }
         self.inner.put_opts(location, payload, options).await
     }
 

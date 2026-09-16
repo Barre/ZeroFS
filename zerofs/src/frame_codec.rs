@@ -17,7 +17,7 @@
 use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{
     Key, Tag, XChaCha20Poly1305, XNonce,
-    aead::{Aead, AeadInPlace, KeyInit, Payload},
+    aead::{AeadInPlace, KeyInit},
 };
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
@@ -46,19 +46,15 @@ pub enum CodecError {
     LockedMemory(String),
 }
 
-/// A frame's compressed (but not encrypted) payload: what sits between
-/// [`FrameCodec::compress`] and [`FrameCodec::seal_compressed`], or comes out of
-/// [`FrameCodec::open_compressed`]. A distinct type so plaintext can't be sealed
-/// as if pre-compressed (double compression on read) nor a compressed payload
-/// served as plaintext; the only ways out are `seal_compressed` (re-encrypt
-/// as-is, the segment-repack passthrough) and `decompress`.
+/// Compressed payload for [`FrameCodec::seal_compressed`], kept distinct from
+/// plaintext. Includes nonce space and spare tag capacity for sealing in place.
 pub struct Compressed(Vec<u8>);
 
 impl Compressed {
     /// Compressed payload size.
     #[allow(clippy::len_without_is_empty)] // a compressed payload is never empty
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.0.len() - NONCE_SIZE
     }
 }
 
@@ -123,20 +119,16 @@ impl FrameCodec {
     /// output without a decompress/recompress round trip.
     pub fn seal_compressed(
         &self,
-        Compressed(compressed): Compressed,
+        Compressed(mut out): Compressed,
         aad: &[u8],
     ) -> Result<Vec<u8>, CodecError> {
-        let mut out = Vec::with_capacity(NONCE_SIZE + compressed.len() + TAG_SIZE);
-        let mut nonce_bytes = [0u8; NONCE_SIZE];
-        thread_rng().fill_bytes(&mut nonce_bytes);
-        out.extend_from_slice(&nonce_bytes);
-        out.extend_from_slice(&compressed);
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let (nonce, compressed) = out.split_at_mut(NONCE_SIZE);
+        thread_rng().fill_bytes(nonce);
         // The long-lived subkey stays in locked memory. The RustCrypto cipher
         // is an operation-local copy whose destructor zeroizes its key.
         let cipher = XChaCha20Poly1305::new(Key::from_slice(self.subkey.expose_secret()));
         let tag = cipher
-            .encrypt_in_place_detached(nonce, aad, &mut out[NONCE_SIZE..])
+            .encrypt_in_place_detached(XNonce::from_slice(nonce), aad, compressed)
             .map_err(|_| CodecError::Encrypt)?;
         out.extend_from_slice(tag.as_slice());
         Ok(out)
@@ -145,17 +137,36 @@ impl FrameCodec {
     /// Decrypt (verifying `aad`) then decompress a frame produced by [`Self::seal`].
     pub fn open(&self, frame: &[u8], aad: &[u8]) -> Result<Vec<u8>, CodecError> {
         let Compressed(compressed) = self.open_compressed(frame, aad)?;
-        self.decompress(&compressed)
+        self.decompress(&compressed[NONCE_SIZE..])
     }
 
     /// Decode a frame, reusing its allocation when possible.
     pub(crate) fn open_owned(&self, frame: Bytes, aad: &[u8]) -> Result<Vec<u8>, CodecError> {
+        let mut frame = BytesMut::from(frame);
+        self.decompress(self.decrypt_in_place(&mut frame, aad)?)
+    }
+
+    /// Decrypt (verifying `aad`) a frame, returning its still-compressed payload.
+    /// Relocation can rebind it to new AAD without decompressing or recompressing.
+    pub fn open_compressed(&self, frame: &[u8], aad: &[u8]) -> Result<Compressed, CodecError> {
+        let mut out = frame.to_vec();
+        self.decrypt_in_place(&mut out, aad)?;
+        out.truncate(out.len() - TAG_SIZE);
+        Ok(Compressed(out))
+    }
+
+    fn decrypt_in_place<'a>(
+        &self,
+        frame: &'a mut [u8],
+        aad: &[u8],
+    ) -> Result<&'a mut [u8], CodecError> {
         if frame.len() < NONCE_SIZE + TAG_SIZE {
             return Err(CodecError::TooShort(frame.len()));
         }
-        let mut frame = BytesMut::from(frame);
         let (nonce, body) = frame.split_at_mut(NONCE_SIZE);
         let (ciphertext, tag) = body.split_at_mut(body.len() - TAG_SIZE);
+        // See `seal_compressed`: only the persistent key is required to remain
+        // in locked memory; this operation-local cipher zeroizes on drop.
         let cipher = XChaCha20Poly1305::new(Key::from_slice(self.subkey.expose_secret()));
         cipher
             .decrypt_in_place_detached(
@@ -165,49 +176,33 @@ impl FrameCodec {
                 Tag::from_slice(tag),
             )
             .map_err(|_| CodecError::Decrypt)?;
-        self.decompress(ciphertext)
-    }
-
-    /// Decrypt (verifying `aad`) a frame, returning its still-compressed payload.
-    /// `open(frame, aad)` is exactly `decompress(open_compressed(frame, aad))`;
-    /// the split lets a relocation verify and rebind a frame without ever
-    /// materializing (or recompressing) the plaintext.
-    pub fn open_compressed(&self, frame: &[u8], aad: &[u8]) -> Result<Compressed, CodecError> {
-        if frame.len() < NONCE_SIZE + TAG_SIZE {
-            return Err(CodecError::TooShort(frame.len()));
-        }
-        let (nonce_bytes, ciphertext) = frame.split_at(NONCE_SIZE);
-        let nonce = XNonce::from_slice(nonce_bytes);
-        // See `seal_compressed`: only the persistent key is required to remain
-        // in locked memory; this operation-local cipher zeroizes on drop.
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(self.subkey.expose_secret()));
-        cipher
-            .decrypt(
-                nonce,
-                Payload {
-                    msg: ciphertext,
-                    aad,
-                },
-            )
-            .map(Compressed)
-            .map_err(|_| CodecError::Decrypt)
+        Ok(ciphertext)
     }
 
     /// Compress `data` with the configured codec. Pure: the output depends only
     /// on the bytes and the configured level, never on shared state, so it can
     /// run on any thread, outside any lock, and feed [`Self::seal_compressed`].
     pub fn compress(&self, data: &[u8]) -> Result<Compressed, CodecError> {
+        let bound = self.max_sealed_size(data.len()) as usize;
+        let mut out = Vec::with_capacity(bound);
+        out.resize(NONCE_SIZE, 0);
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         match self.compression {
-            CompressionConfig::Lz4 => Ok(Compressed(lz4_flex::compress_prepend_size(data))),
+            CompressionConfig::Lz4 => {
+                out.resize(bound - TAG_SIZE, 0);
+                let len = lz4_flex::block::compress_into(data, &mut out[NONCE_SIZE + 4..])
+                    .map_err(|e| CodecError::Compress(e.to_string()))?;
+                out.truncate(NONCE_SIZE + 4 + len);
+            }
             CompressionConfig::Zstd(level) => {
-                let compressed = zstd_compress(data, level)?;
-                // Prepend original size (LE u32) for decompression.
-                let mut result = Vec::with_capacity(4 + compressed.len());
-                result.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                result.extend_from_slice(&compressed);
-                Ok(Compressed(result))
+                let mut dest = std::io::Cursor::new(&mut out);
+                dest.set_position((NONCE_SIZE + 4) as u64);
+                zstd_compress(data, level, &mut dest)?;
             }
         }
+        // Release excess capacity, keeping room for the authentication tag.
+        out.shrink_to(out.len() + TAG_SIZE);
+        Ok(Compressed(out))
     }
 
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, CodecError> {
@@ -228,7 +223,11 @@ impl FrameCodec {
 /// 32 KiB frame costs more than low-level compression itself. Keyed by level so
 /// codecs at different levels (or a config change) rebuild it; the output is
 /// byte-identical to one-shot `zstd::bulk::compress` at the same level.
-fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>, CodecError> {
+fn zstd_compress(
+    data: &[u8],
+    level: i32,
+    dest: &mut impl zstd::zstd_safe::WriteBuf,
+) -> Result<usize, CodecError> {
     use std::cell::RefCell;
     thread_local! {
         static ZSTD: RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> =
@@ -244,7 +243,7 @@ fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>, CodecError> {
         slot.as_mut()
             .expect("compressor installed above")
             .1
-            .compress(data)
+            .compress_to_buffer(data, dest)
             .map_err(|e| CodecError::Compress(e.to_string()))
     })
 }
@@ -252,6 +251,7 @@ fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     fn codec() -> FrameCodec {
         FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Lz4)
@@ -295,16 +295,40 @@ mod tests {
             FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Zstd(3))
                 .expect("test key should be lockable"),
         ] {
-            let plain = vec![9u8; 40_000];
-            let sealed = c
-                .seal_compressed(c.compress(&plain).unwrap(), b"aad")
-                .unwrap();
-            assert!(sealed.len() as u64 <= c.max_sealed_size(plain.len()));
-            assert_eq!(c.open(&sealed, b"aad").unwrap(), plain);
-            assert!(matches!(
-                c.open(&sealed, b"other"),
-                Err(CodecError::Decrypt)
-            ));
+            let mut random = vec![0; 40_000];
+            rand::rngs::StdRng::seed_from_u64(7).fill_bytes(&mut random);
+            for plain in [vec![], vec![9u8; 40_000], random] {
+                let expected = match c.compression {
+                    CompressionConfig::Lz4 => lz4_flex::compress_prepend_size(&plain),
+                    CompressionConfig::Zstd(level) => {
+                        let mut bytes = (plain.len() as u32).to_le_bytes().to_vec();
+                        bytes.extend(zstd::bulk::compress(&plain, level).unwrap());
+                        bytes
+                    }
+                };
+                let compressed = c.compress(&plain).unwrap();
+                assert_eq!(&compressed.0[NONCE_SIZE..], expected);
+                assert_eq!(compressed.len(), expected.len());
+                assert_eq!(
+                    compressed.0.capacity(),
+                    NONCE_SIZE + expected.len() + TAG_SIZE
+                );
+                let allocation = compressed.0.as_ptr();
+                let sealed = c.seal_compressed(compressed, b"aad").unwrap();
+                assert_eq!(sealed.as_ptr(), allocation);
+                assert!(sealed.len() as u64 <= c.max_sealed_size(plain.len()));
+                assert_eq!(c.open(&sealed, b"aad").unwrap(), plain);
+                assert!(matches!(
+                    c.open(&sealed, b"other"),
+                    Err(CodecError::Decrypt)
+                ));
+                let compressed = c.open_compressed(&sealed, b"aad").unwrap();
+                assert_eq!(&compressed.0[NONCE_SIZE..], expected);
+                let allocation = compressed.0.as_ptr();
+                let resealed = c.seal_compressed(compressed, b"relocated").unwrap();
+                assert_eq!(resealed.as_ptr(), allocation);
+                assert_eq!(c.open(&resealed, b"relocated").unwrap(), plain);
+            }
         }
     }
 
