@@ -7,7 +7,7 @@ use super::{ExtentStore, ZERO_EXTENT};
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::inode::InodeId;
 use crate::fs::{EXTENT_SIZE, FsError};
-use crate::segment::{FrameLoc, Segid};
+use crate::segment::{DirEntry, FrameLoc, LEN_PREFIX, Segid};
 use bytes::{Buf, Bytes};
 use bytes_utils::SegmentedBuf;
 use futures::stream::StreamExt;
@@ -187,8 +187,7 @@ impl ExtentStore {
 
     /// Read a contiguous run of frames from the open or an in-flight sealing
     /// buffer (read-your-writes), or `None` if `segid` is already on the object
-    /// store. Frame offsets are identical in the buffer and the finalized
-    /// segment, so the same slice works for both.
+    /// store. Release the buffer lock before decrypting and decompressing.
     fn read_frames_in_ram(
         &self,
         segid: Segid,
@@ -197,55 +196,73 @@ impl ExtentStore {
         first_frame: u32,
         slots: &[(InodeId, u64)],
     ) -> Result<Option<Vec<Bytes>>, FsError> {
+        let Some(chunks) =
+            self.frame_chunks_in_ram(segid, byte_offset, byte_len, first_frame, slots.len())?
+        else {
+            return Ok(None);
+        };
+        let frames =
+            crate::segment::read_frames_from_chunks(&self.codec, chunks, segid, first_frame, slots)
+                .map_err(|_| FsError::IoError)?;
+        Ok(Some(frames.into_iter().map(Bytes::from).collect()))
+    }
+
+    pub(super) fn frame_chunks_in_ram(
+        &self,
+        segid: Segid,
+        byte_offset: u64,
+        byte_len: u32,
+        first_frame: u32,
+        count: usize,
+    ) -> Result<Option<SegmentedBuf<Bytes>>, FsError> {
         // The range comes from a db-stored FrameLoc: bounds-checked, never
         // trusted, so a corrupt value surfaces as EIO instead of an
         // out-of-range panic that would poison the open-segment lock for
         // every later writer.
-        fn region(
-            buf: &[u8],
-            segid: Segid,
+        fn region<'a>(
+            chunks: &'a [Bytes],
+            dir: &[DirEntry],
             byte_offset: u64,
             byte_len: u32,
-        ) -> Result<&[u8], FsError> {
-            let start = byte_offset as usize;
-            start
-                .checked_add(byte_len as usize)
-                .and_then(|end| buf.get(start..end))
+            first_frame: u32,
+            count: usize,
+        ) -> Option<&'a [Bytes]> {
+            let start = first_frame as usize;
+            let end = start.checked_add(count)?;
+            let entries = dir.get(start..end)?;
+            let first = entries.first()?;
+            let last = entries.last()?;
+            let range_end = last
+                .byte_offset
+                .checked_add(LEN_PREFIX as u64 + last.len as u64)?;
+            if first.byte_offset != byte_offset
+                || range_end != byte_offset.checked_add(byte_len as u64)?
+            {
+                return None;
+            }
+            chunks.get(start.checked_mul(2)?..end.checked_mul(2)?)
+        }
+        let select = |chunks: &[Bytes], dir: &[DirEntry]| {
+            region(chunks, dir, byte_offset, byte_len, first_frame, count)
+                .map(|chunks| Some(chunks.iter().cloned().collect()))
                 .ok_or_else(|| {
                     error!(
-                        "Corrupt FrameLoc for in-RAM {segid:?}: {byte_len} bytes at {byte_offset} \
-                         exceed the {}-byte buffer",
-                        buf.len()
+                        "Corrupt FrameLoc for in-RAM {segid:?}: {count} frames at \
+                         {first_frame}, {byte_len} bytes at {byte_offset}"
                     );
                     FsError::IoError
                 })
-        }
+        };
         {
             let open = self.open.lock().unwrap();
             if segid == open.segid {
-                let frames = crate::segment::read_frames_from_region(
-                    &self.codec,
-                    region(&open.buf, segid, byte_offset, byte_len)?,
-                    segid,
-                    first_frame,
-                    slots,
-                )
-                .map_err(|_| FsError::IoError)?;
-                return Ok(Some(frames.into_iter().map(Bytes::from).collect()));
+                return select(&open.chunks, &open.dir);
             }
         }
         {
             let sealing = self.sealing.lock().unwrap();
-            if let Some(bytes) = sealing.get(&segid) {
-                let frames = crate::segment::read_frames_from_region(
-                    &self.codec,
-                    region(bytes.as_ref(), segid, byte_offset, byte_len)?,
-                    segid,
-                    first_frame,
-                    slots,
-                )
-                .map_err(|_| FsError::IoError)?;
-                return Ok(Some(frames.into_iter().map(Bytes::from).collect()));
+            if let Some(segment) = sealing.get(&segid) {
+                return select(segment.payload.as_ref(), &segment.dir);
             }
         }
         Ok(None)
