@@ -14,8 +14,9 @@
 //! Compression is auto-detected on `open` from the (decrypted) payload, so a
 //! codec configured for one algorithm decodes frames written by the other.
 
+use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{
-    Key, XChaCha20Poly1305, XNonce,
+    Key, Tag, XChaCha20Poly1305, XNonce,
     aead::{Aead, AeadInPlace, KeyInit, Payload},
 };
 use hkdf::Hkdf;
@@ -147,6 +148,26 @@ impl FrameCodec {
         self.decompress(&compressed)
     }
 
+    /// Decode a frame, reusing its allocation when possible.
+    pub(crate) fn open_owned(&self, frame: Bytes, aad: &[u8]) -> Result<Vec<u8>, CodecError> {
+        if frame.len() < NONCE_SIZE + TAG_SIZE {
+            return Err(CodecError::TooShort(frame.len()));
+        }
+        let mut frame = BytesMut::from(frame);
+        let (nonce, body) = frame.split_at_mut(NONCE_SIZE);
+        let (ciphertext, tag) = body.split_at_mut(body.len() - TAG_SIZE);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(self.subkey.expose_secret()));
+        cipher
+            .decrypt_in_place_detached(
+                XNonce::from_slice(nonce),
+                aad,
+                ciphertext,
+                Tag::from_slice(tag),
+            )
+            .map_err(|_| CodecError::Decrypt)?;
+        self.decompress(ciphertext)
+    }
+
     /// Decrypt (verifying `aad`) a frame, returning its still-compressed payload.
     /// `open(frame, aad)` is exactly `decompress(open_compressed(frame, aad))`;
     /// the split lets a relocation verify and rebind a frame without ever
@@ -235,6 +256,34 @@ mod tests {
     fn codec() -> FrameCodec {
         FrameCodec::try_new(&[7u8; 32], b"frame-codec-test", CompressionConfig::Lz4)
             .expect("test key should be lockable")
+    }
+
+    #[test]
+    fn owned_and_shared_frames_preserve_authentication_and_cached_ciphertext() {
+        for compression in [CompressionConfig::Lz4, CompressionConfig::Zstd(3)] {
+            let c = FrameCodec::try_new(&[7; 32], b"decode-ownership", compression).unwrap();
+            let plain = vec![0x5a; 32768];
+            let sealed = c.seal(&plain, b"correct aad").unwrap();
+            assert_eq!(
+                c.open_owned(Bytes::from(sealed.clone()), b"correct aad")
+                    .unwrap(),
+                plain
+            );
+            let shared = Bytes::from(sealed.clone());
+            assert_eq!(c.open_owned(shared.clone(), b"correct aad").unwrap(), plain);
+            assert_eq!(shared.as_ref(), sealed);
+            assert!(matches!(
+                c.open_owned(shared.clone(), b"wrong aad"),
+                Err(CodecError::Decrypt)
+            ));
+            assert_eq!(shared.as_ref(), sealed);
+            let mut corrupt = sealed;
+            *corrupt.last_mut().unwrap() ^= 1;
+            assert!(matches!(
+                c.open_owned(Bytes::from(corrupt), b"correct aad"),
+                Err(CodecError::Decrypt)
+            ));
+        }
     }
 
     // seal() must remain exactly seal_compressed(compress(..)): the write path

@@ -15,7 +15,8 @@ use crate::fs::types::{AuthContext, FallocateMode, FileAttributes, InodeWithId};
 use crate::fs::write_coordinator::LockedMutation;
 use crate::fs::{ZeroFS, get_current_time};
 use ::tracing::{debug, error};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use bytes_utils::SegmentedBuf;
 use std::sync::atomic::Ordering;
 
 impl ZeroFS {
@@ -231,7 +232,8 @@ impl ZeroFS {
         offset: u64,
         count: u32,
     ) -> Result<(Bytes, bool), FsError> {
-        self.read_file_inner(Some(auth), id, offset, count).await
+        let (mut data, eof) = self.read_file_inner(Some(auth), id, offset, count).await?;
+        Ok((data.copy_to_bytes(data.remaining()), eof))
     }
 
     /// Read through a fid whose read access was already authorized at open.
@@ -240,7 +242,7 @@ impl ZeroFS {
         id: InodeId,
         offset: u64,
         count: u32,
-    ) -> Result<(Bytes, bool), FsError> {
+    ) -> Result<(SegmentedBuf<Bytes>, bool), FsError> {
         self.read_file_inner(None, id, offset, count).await
     }
 
@@ -250,7 +252,7 @@ impl ZeroFS {
         id: InodeId,
         offset: u64,
         count: u32,
-    ) -> Result<(Bytes, bool), FsError> {
+    ) -> Result<(SegmentedBuf<Bytes>, bool), FsError> {
         debug!("read_file: id={}, offset={}, count={}", id, offset, count);
 
         let inode = self.inode_store.get(id).await?;
@@ -268,16 +270,16 @@ impl ZeroFS {
                         id,
                         FileOperation::Read { offset, length: 0 },
                     );
-                    return Ok((Bytes::new(), true));
+                    return Ok((SegmentedBuf::new(), true));
                 }
 
                 let read_len = std::cmp::min(count as u64, file.size - offset);
-                let result_bytes = self.extent_store.read(id, offset, read_len).await?;
+                let result_bytes = self.extent_store.read_chunks(id, offset, read_len).await?;
                 let eof = offset + read_len >= file.size;
 
                 self.stats
                     .bytes_read
-                    .fetch_add(result_bytes.len() as u64, Ordering::Relaxed);
+                    .fetch_add(result_bytes.remaining() as u64, Ordering::Relaxed);
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
                 self.stats.total_operations.fetch_add(1, Ordering::Relaxed);
 
