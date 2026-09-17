@@ -9,6 +9,3 @@ homepage = "https://www.zerofs.net"
 documentation = "https://docs.rs/nbd-proto"
 keywords = ["nbd", "network-block-device", "protocol", "filesystem", "zerofs"]
 categories = ["network-programming", "filesystem", "encoding"]
-
-[dependencies]
-deku = "0.20"
