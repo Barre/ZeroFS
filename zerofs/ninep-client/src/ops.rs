@@ -142,20 +142,31 @@ impl NinePClient {
     }
 }
 
-/// An entry type with a 9P readdir cookie.
+/// An entry type that can be buffered with a 9P readdir cookie.
 pub trait DirEntryCookie {
     fn cookie(&self) -> u64;
+
+    /// Detach frame-backed names before caching.
+    fn detach_name(&mut self);
 }
 
 impl DirEntryCookie for DirEntry {
     fn cookie(&self) -> u64 {
         self.offset
     }
+
+    fn detach_name(&mut self) {
+        self.name.data = Bytes::copy_from_slice(self.name.as_ref());
+    }
 }
 
 impl DirEntryCookie for DirEntryPlus {
     fn cookie(&self) -> u64 {
         self.offset
+    }
+
+    fn detach_name(&mut self) {
+        self.name.data = Bytes::copy_from_slice(self.name.as_ref());
     }
 }
 
@@ -198,6 +209,83 @@ impl<E: DirEntryCookie> ReaddirState<E> {
             Some(last) => self.fetch_cookie = last.cookie(),
             None => self.eof = true,
         }
-        self.buf.extend(entries);
+        self.buf.extend(entries.into_iter().map(|mut entry| {
+            entry.detach_name();
+            entry
+        }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ninep_proto::{P9String, Stat};
+    use std::sync::Arc;
+
+    fn cache_entry<E: DirEntryCookie>(make_entry: impl FnOnce(Bytes) -> E) -> E {
+        struct ReceiveBuffer {
+            data: Vec<u8>,
+            _lifetime: Arc<()>,
+        }
+
+        impl AsRef<[u8]> for ReceiveBuffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+
+        let lifetime = Arc::new(());
+        let released = Arc::downgrade(&lifetime);
+        let mut data = vec![0; 256 * 1024];
+        data[..2].copy_from_slice(b"x\xff");
+        let name = Bytes::from_owner(ReceiveBuffer {
+            data,
+            _lifetime: lifetime,
+        })
+        .slice(..2);
+        let entry = make_entry(name);
+        let cookie = entry.cookie();
+        assert!(released.upgrade().is_some());
+
+        let mut state = ReaddirState::starting_at(0);
+        state.absorb(vec![entry]);
+        assert!(
+            released.upgrade().is_none(),
+            "cache retained receive buffer"
+        );
+        assert_eq!(state.buf.len(), 1);
+        assert_eq!(state.fetch_cookie, cookie);
+        assert!(!state.eof);
+        state.buf.pop_front().unwrap()
+    }
+
+    #[test]
+    fn readdir_cache_releases_receive_buffer() {
+        let entry = cache_entry(|name| DirEntry {
+            qid: Qid::default(),
+            offset: 42,
+            type_: 0,
+            name: P9String::new(name),
+        });
+        assert_eq!(entry.name.as_ref(), b"x\xff");
+        assert_eq!(entry.offset, 42);
+    }
+
+    #[test]
+    fn readdirplus_cache_releases_receive_buffer() {
+        let stat = Stat {
+            size: 123,
+            ..Stat::default()
+        };
+        let entry = cache_entry(|name| DirEntryPlus {
+            qid: stat.qid,
+            offset: 42,
+            type_: 0,
+            name: P9String::new(name),
+            stat,
+        });
+        assert_eq!(entry.name.as_ref(), b"x\xff");
+        assert_eq!(entry.offset, 42);
+        assert_eq!(entry.stat, stat);
     }
 }
