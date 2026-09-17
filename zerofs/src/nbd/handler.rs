@@ -6,10 +6,9 @@ use crate::fs::inode::Inode;
 use crate::fs::tracing::FileOperation;
 use crate::fs::types::AuthContext;
 use bytes::Bytes;
-use deku::DekuContainerWrite;
 use nbd_proto::{
     NBD_INFO_EXPORT, NBD_REP_ACK, NBD_REP_ERR_INVALID, NBD_REP_ERR_UNKNOWN, NBD_REP_INFO,
-    NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS,
+    NBD_REP_SERVER, NBDInfoExport, TRANSMISSION_FLAGS, WireCodec,
 };
 use std::sync::Arc;
 use tracing::debug;

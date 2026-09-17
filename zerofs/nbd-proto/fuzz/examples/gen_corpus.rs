@@ -1,6 +1,5 @@
 //! Generate seed inputs for the `decode` fuzz target.
 
-use deku::prelude::*;
 use nbd_proto::*;
 use std::fs;
 use std::path::Path;

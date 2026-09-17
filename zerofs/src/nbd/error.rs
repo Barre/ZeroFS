@@ -16,8 +16,8 @@ pub enum NBDError {
     #[error("Client does not support required features")]
     IncompatibleClient,
 
-    #[error("Deku parsing error: {0}")]
-    Deku(#[from] deku::DekuError),
+    #[error("NBD codec error: {0}")]
+    Codec(#[from] nbd_proto::CodecError),
 
     #[error("Filesystem error: {0}")]
     Filesystem(#[from] FsError),

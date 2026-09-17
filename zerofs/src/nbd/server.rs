@@ -3,7 +3,6 @@ use super::handler::{NBDDevice, NBDHandler, OptionReply, OptionResult};
 use super::out_of_bounds;
 use crate::fs::ZeroFS;
 use bytes::BytesMut;
-use deku::prelude::*;
 use nbd_proto::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -170,7 +169,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let mut buf = [0u8; 4];
         self.reader.read_exact(&mut buf).await?;
-        let client_flags = NBDClientFlags::from_bytes((&buf, 0))?.1;
+        let client_flags = NBDClientFlags::decode(&buf)?;
 
         debug!("Client flags: 0x{:x}", client_flags.flags);
 
@@ -195,12 +194,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 Err(e) => return Err(NBDError::Io(e)),
             }
-            let header = NBDOptionHeader::from_bytes((&header_buf, 0))
-                .map_err(|e| {
-                    debug!("Raw header bytes: {:02x?}", header_buf);
-                    NBDError::Protocol(format!("Invalid option header: {e}"))
-                })?
-                .1;
+            let header = NBDOptionHeader::decode(&header_buf).map_err(|e| {
+                debug!("Raw header bytes: {:02x?}", header_buf);
+                NBDError::Protocol(format!("Invalid option header: {e}"))
+            })?;
 
             debug!(
                 "Received option: {} (length: {})",
@@ -398,9 +395,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
             }
 
-            let request = NBDRequest::from_bytes((&request_buf, 0))
-                .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?
-                .1;
+            let request = NBDRequest::decode(&request_buf)
+                .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?;
 
             debug!(
                 "NBD command: {:?}, offset={}, length={}",
