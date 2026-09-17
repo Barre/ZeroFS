@@ -1240,7 +1240,7 @@ impl Filesystem for Fuse9P {
                     // except "." and ".."; account for it like `resolve_child` so a
                     // later forget balances. The fid stays unbound (bound lazily by
                     // `user_fid` via Trebind on the first real op).
-                    if !matches!(e.name.data.as_slice(), b"." | b"..") {
+                    if !matches!(e.name.as_ref(), b"." | b"..") {
                         inodes.entry(child_ino).or_default().lookup += 1;
                     }
                 }
@@ -3397,7 +3397,7 @@ mod client_tests {
         let entries = c2.readdir(df, 0, 8192).await.unwrap();
         let dotdot = entries
             .iter()
-            .find(|e| e.name.data.as_slice() == b"..")
+            .find(|e| e.name.as_ref() == b"..")
             .expect("readdir returned no .. entry");
         assert_eq!(
             dotdot.qid.path, vol_qid.path,

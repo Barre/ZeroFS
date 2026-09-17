@@ -12,7 +12,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use ninep_proto::{
     P9_CHANNEL_SIZE, P9_DEBUG_BUFFER_SIZE, P9_HEADER_SIZE, P9_MAX_MSIZE, P9_MIN_MESSAGE_SIZE,
-    P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message, T_WRITE,
+    P9_OP_ENVELOPE_LEN, P9_OP_ID_LEN, P9_SIZE_FIELD_LEN, P9Message,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
 /// 9P message type byte for Tflush. Kept here so the reader can recognise a
-/// flush from the raw frame header without deku-parsing the whole body.
+/// flush from the raw frame header without decoding the whole body.
 const TFLUSH_TYPE: u8 = 108;
 /// `Rlerror` is permitted after serving-authority loss.
 const RLERROR_TYPE: u8 = 7;
@@ -787,13 +787,8 @@ pub(crate) fn dispatch_9p_frame(
     let tx = tx.clone();
 
     spawn_named("9p-request", async move {
-        // Only Twrite has an inbound bulk payload worth retaining. Other
-        // requests keep the regular decoder and the original error diagnostics.
-        let parsed = if type_byte == T_WRITE {
-            P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol)
-        } else {
-            P9Message::from_bytes_ctx(&frame, zerofs_protocol)
-        };
+        // Strings and bulk payloads share the received frame's allocation.
+        let parsed = P9Message::from_owned_bytes_ctx(frame.clone(), zerofs_protocol);
 
         // Barrier waiters were captured synchronously in receive order.
         for waiter in prior_waiters {
@@ -915,7 +910,7 @@ mod tests {
     use crate::fs::permissions::Credentials;
     use crate::ninep::lock_manager::FileLock;
     use ninep_proto::{
-        DekuBytes, GETATTR_ALL, LockType, Message, P9String, Rclunk, Rflush, Rlerror, Rlopenat,
+        GETATTR_ALL, LockType, Message, P9Bytes, P9String, Rclunk, Rflush, Rlerror, Rlopenat,
         Rread, Tattach, Tclunk, Tflush, Tgetattr, Tlopenat, Tmkdir, Tversion, Twrite,
         VERSION_9P2000L_ZEROFS,
     };
@@ -1332,7 +1327,7 @@ mod tests {
                 21,
                 Message::Rread(Rread {
                     count: data.len() as u32,
-                    data: DekuBytes::default(),
+                    data: P9Bytes::default(),
                 }),
             );
             let (tx, rx) = mpsc::channel(2);
@@ -1446,7 +1441,7 @@ mod tests {
             52,
             Message::Rread(Rread {
                 count: 0,
-                data: DekuBytes::from(vec![0; RESPONSE_BUFFER_CAPACITY - 17]),
+                data: P9Bytes::from(vec![0; RESPONSE_BUFFER_CAPACITY - 17]),
             }),
         )
         .to_vec();

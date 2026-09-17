@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes};
 use bytes_utils::SegmentedBuf;
-use ninep_proto::{DekuBytes, Message, P9Message, Rlerror};
+use ninep_proto::{Message, P9Bytes, P9Message, Rlerror};
 
 pub(crate) type EncodedResponse = bytes::buf::Chain<Bytes, SegmentedBuf<Bytes>>;
 
@@ -10,7 +10,7 @@ pub(crate) struct Response {
     payload: Option<SegmentedBuf<Bytes>>,
 }
 
-fn counted_data(body: &mut Message) -> Option<(&mut u32, &mut DekuBytes)> {
+fn counted_data(body: &mut Message) -> Option<(&mut u32, &mut P9Bytes)> {
     match body {
         Message::Rread(r) => Some((&mut r.count, &mut r.data)),
         Message::Rlopenatread(r) => Some((&mut r.count, &mut r.data)),
@@ -38,7 +38,7 @@ impl Response {
         Self { message, payload }
     }
 
-    pub(crate) fn encode(mut self) -> Result<EncodedResponse, deku::DekuError> {
+    pub(crate) fn encode(mut self) -> Result<EncodedResponse, ninep_proto::CodecError> {
         let payload = match counted_data(&mut self.message.body) {
             Some((count, data)) => {
                 let inline = std::mem::take(&mut data.0);
@@ -93,7 +93,7 @@ mod tests {
             17,
             Message::Rread(Rread {
                 count: 0,
-                data: DekuBytes::default(),
+                data: P9Bytes::default(),
             }),
         );
         assert_eq!(
