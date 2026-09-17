@@ -117,7 +117,6 @@ argon2 = { version = "0.5", features = ["zeroize"] }
 region = "3.0"
 zeroize = "1.8"
 url = "2.5"
-deku = "0.20"
 thiserror = "2.0"
 crc32c = "0.6"
 comfy-table = "7.1"

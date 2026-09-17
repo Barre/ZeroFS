@@ -1,10 +1,6 @@
 //! Fixed 9P wire values shared with the native kernel client.
 //!
-//! The kernel includes this source without Deku. Userspace adds Deku derives
-//! while retaining exactly the same Rust representation and field order.
-
-#[cfg(all(not(MODULE), feature = "owned"))]
-use deku::{DekuRead, DekuWrite, ctx::Endian};
+//! The same declarations are used by the kernel, server, and userspace clients.
 
 pub const VERSION_9P2000L: &[u8] = b"9P2000.L";
 pub const VERSION_9P2000L_ZEROFS: &[u8] = b"9P2000.L.Z";
@@ -270,15 +266,6 @@ pub mod message_type {
 }
 
 /// A ZeroFS inode identity.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
-#[cfg_attr(
-    all(not(MODULE), feature = "owned"),
-    deku(
-        endian = "endian",
-        ctx = "endian: Endian",
-        ctx_default = "Endian::Little"
-    )
-)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Qid {
     pub type_: u8,
@@ -292,8 +279,6 @@ impl Qid {
 }
 
 /// Attributes returned by ZeroFS.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
-#[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stat {
     pub qid: Qid,
@@ -324,12 +309,9 @@ impl Stat {
 }
 
 // Replies whose every field is fixed width need no storage parameter, so one
-// declaration serves the owned and the borrowed codec alike. Only the Deku
-// derives are conditional, exactly as for `Qid` and `Stat` above.
+// declaration serves the owned and borrowed codec alike.
 
 /// Durability lineage and the active HA writer epoch.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
-#[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgetlineage {
     pub token: u64,
@@ -338,50 +320,39 @@ pub struct Rgetlineage {
 }
 
 /// Identity of a fid rebound by inode id.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rrebind {
     pub qid: Qid,
 }
 
 /// Attributes for a fid, with the mask of fields the server answered.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgetattr {
-    #[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
     pub valid: u64,
     pub stat: Stat,
 }
 
 /// Standard open reply layout, also used on the wire by private `Rlopenat`.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rlopen {
     pub qid: Qid,
-    #[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
     pub iounit: u32,
 }
 
 /// Post-operation stat of a created and opened regular file.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rlcreateattr {
-    #[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
     pub iounit: u32,
     pub stat: Stat,
 }
 
 /// Bytes accepted by a write.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
-#[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rwrite {
     pub count: u32,
 }
 
 /// Remote filesystem capacity and limits.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
-#[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rstatfs {
     /// Filesystem type.
@@ -441,15 +412,12 @@ impl LockStatus {
 
 /// Outcome of a lock request, as the raw wire byte. Map it with
 /// [`LockStatus::from_wire`].
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rlock {
     pub status: u8,
 }
 
 /// A failed request's Linux errno.
-#[cfg_attr(all(not(MODULE), feature = "owned"), derive(DekuRead, DekuWrite))]
-#[cfg_attr(all(not(MODULE), feature = "owned"), deku(endian = "little"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rlerror {
     pub ecode: u32,

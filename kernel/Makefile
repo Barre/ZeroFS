@@ -187,7 +187,7 @@ module-path:
 test: test-protocol test-tags
 
 test-protocol:
-	$(RUSTC) --edition=2024 --test -D warnings --cfg MODULE \
+	$(RUSTC) --edition=2021 --test -D warnings --cfg MODULE \
 		$(CURDIR)/protocol.rs -o /tmp/zerofs-protocol-tests
 	/tmp/zerofs-protocol-tests
 
