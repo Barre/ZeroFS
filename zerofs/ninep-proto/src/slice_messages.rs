@@ -188,6 +188,8 @@ pub enum QidList<'a> {
     Values(&'a [Qid]),
 }
 
+// Shared with kernels built using Rust 1.85.
+#[clippy::msrv = "1.85"]
 impl<'a> QidList<'a> {
     pub fn len(self) -> usize {
         match self {
@@ -211,7 +213,7 @@ impl<'a> QidList<'a> {
 
     fn size(self) -> Result<usize, CodecError> {
         match self {
-            Self::Encoded(bytes) if !bytes.len().is_multiple_of(Qid::WIRE_SIZE) => {
+            Self::Encoded(bytes) if bytes.len() % Qid::WIRE_SIZE != 0 => {
                 return Err(CodecError::Truncated);
             }
             _ => {}
