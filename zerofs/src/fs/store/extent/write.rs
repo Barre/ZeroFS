@@ -443,7 +443,7 @@ impl ExtentStore {
 
         // Read the existing content of any partially-overwritten extent (full
         // overwrites and extents past EOF need no read).
-        let existing_extents: HashMap<u64, Bytes> = stream::iter(start_extent..=end_extent)
+        let mut existing_extents: HashMap<u64, Bytes> = stream::iter(start_extent..=end_extent)
             .map(|extent_idx| {
                 let extent_start = extent_idx * EXTENT_SIZE as u64;
                 let extent_end = extent_start + EXTENT_SIZE as u64;
@@ -486,7 +486,10 @@ impl ExtentStore {
             let extent: Bytes = if write_start == 0 && write_end == EXTENT_SIZE {
                 data.slice(data_offset..data_offset + write_len)
             } else {
-                let mut buf = BytesMut::from(existing_extents[&extent_idx].as_ref());
+                // Consume the decoded extent so uniquely owned storage can be reused.
+                // Static zero extents and shared buffers are copied by BytesMut.
+                let existing = existing_extents.remove(&extent_idx).expect("extent loaded");
+                let mut buf = BytesMut::from(existing);
                 buf[write_start..write_end]
                     .copy_from_slice(&data[data_offset..data_offset + write_len]);
                 buf.freeze()
