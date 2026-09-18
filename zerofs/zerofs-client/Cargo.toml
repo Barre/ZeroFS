@@ -1,6 +1,6 @@
 [package]
 name = "zerofs-client"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Async, path-based client library for ZeroFS over 9P"
@@ -29,8 +29,8 @@ serde = ["dep:serde"]
 # crates (a bare `path` dep is stripped on publish, leaving no version req).
 # The transport crates are independently versioned on their own pre-1.0 line;
 # zerofs-client itself is on the client-family version.
-ninep-client = { path = "../ninep-client", version = "0.3.0" }
-ninep-proto = { path = "../ninep-proto", version = "0.3.0" }
+ninep-client = { path = "../ninep-client", version = "0.4.0" }
+ninep-proto = { path = "../ninep-proto", version = "0.4.0" }
 tokio = { version = "1.52", features = ["sync"] }
 bytes = "1"
 futures-core = { version = "0.3", optional = true }
