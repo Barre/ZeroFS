@@ -791,12 +791,12 @@ async fn verify_segment_reclaimable(
             let key = store.key_codec.extent_key(inode, extent);
             let current = store
                 .db
-                .get_bytes(&key)
+                .get_bytes(key.as_ref())
                 .await
                 .map_err(|_| FsError::IoError)?;
             let durable = store
                 .db
-                .get_bytes_durable(&key)
+                .get_bytes_durable(key.as_ref())
                 .await
                 .map_err(|_| FsError::IoError)?;
             let points_here = |encoded: Option<Bytes>, view: &str| match encoded {
@@ -1073,7 +1073,7 @@ mod tests {
             KeyCodec::encode_segcount(0, total),
         );
         txn.put_bytes(
-            &store.key_codec.extent_key(1, 0),
+            &store.key_codec.extent_key(1, 0).into(),
             Bytes::from_static(b"malformed FrameLoc"),
         );
         commit(&store, txn).await;

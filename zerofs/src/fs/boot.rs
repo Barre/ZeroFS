@@ -108,7 +108,7 @@ impl ZeroFS {
         };
 
         let root_inode_key = key_codec.inode_key(0);
-        if db.get_bytes(&root_inode_key).await?.is_none() {
+        if db.get_bytes(root_inode_key.as_ref()).await?.is_none() {
             if db.is_read_only() {
                 return Err(anyhow::anyhow!(
                     "Cannot initialize filesystem in read-only mode. Root inode does not exist."
@@ -134,7 +134,7 @@ impl ZeroFS {
             };
             let serialized = bincode::serialize(&Inode::Directory(root_dir))?;
             db.put_with_options(
-                &root_inode_key,
+                &root_inode_key.into(),
                 &serialized,
                 &PutOptions::default(),
                 &WriteOptions::default(),

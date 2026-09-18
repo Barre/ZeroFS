@@ -540,7 +540,7 @@ impl Db {
         self.inner.is_read_only()
     }
 
-    pub async fn get_bytes(&self, key: &Bytes) -> Result<Option<Bytes>> {
+    pub async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.get_bytes_at(key, DurabilityLevel::Memory).await
     }
 
@@ -549,7 +549,7 @@ impl Db {
     /// Unlike a serving read, this waits through a recoverable lease
     /// suspension. Commit preparation uses it before write admission so a
     /// temporary authority gap does not turn a safe retry into an I/O error.
-    pub(crate) async fn get_bytes_internal(&self, key: &Bytes) -> Result<Option<Bytes>> {
+    pub(crate) async fn get_bytes_internal(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.check_internal_lease().await?;
         self.check_closing()?;
         let result = self
@@ -561,13 +561,13 @@ impl Db {
     }
 
     /// Point read seeing only object-storage-durable data.
-    pub async fn get_bytes_durable(&self, key: &Bytes) -> Result<Option<Bytes>> {
+    pub async fn get_bytes_durable(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.get_bytes_at(key, DurabilityLevel::Remote).await
     }
 
     async fn get_bytes_at(
         &self,
-        key: &Bytes,
+        key: &[u8],
         durability_filter: DurabilityLevel,
     ) -> Result<Option<Bytes>> {
         self.check_lease()?;
@@ -581,7 +581,7 @@ impl Db {
 
     async fn get_bytes_at_unchecked(
         &self,
-        key: &Bytes,
+        key: &[u8],
         durability_filter: DurabilityLevel,
     ) -> Result<Option<Bytes>> {
         let read_options = ReadOptions {

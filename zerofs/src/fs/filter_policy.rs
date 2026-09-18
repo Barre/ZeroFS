@@ -99,12 +99,12 @@ mod tests {
         let p = ZerofsPrefixExtractor;
         let codec = KeyCodec::new();
         for k in [
-            codec.inode_key(1),
+            codec.inode_key(1).into(),
             codec.dir_cookie_counter_key(1),
             codec.stats_shard_key(0),
             codec.system_counter_key(),
             codec.tombstone_key(123, 1),
-            codec.extent_key(42, 7),
+            codec.extent_key(42, 7).into(),
         ] {
             assert_eq!(extract(&p, k), None);
         }

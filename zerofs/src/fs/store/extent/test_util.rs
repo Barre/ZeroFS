@@ -380,7 +380,7 @@ pub(super) async fn frameloc_of(
     extent: u64,
 ) -> Option<FrameLoc> {
     let key = store.key_codec.extent_key(inode, extent);
-    db.get_bytes(&key)
+    db.get_bytes(key.as_ref())
         .await
         .unwrap()
         .and_then(|b| FrameLoc::decode(&b))

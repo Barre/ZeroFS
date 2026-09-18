@@ -59,7 +59,7 @@ async fn create_file(fs: &ZeroFS, name: &[u8], data: &[u8]) -> InodeId {
 async fn location(fs: &ZeroFS, id: InodeId, extent: u64) -> FrameLoc {
     FrameLoc::decode(
         &fs.db
-            .get_bytes(&KeyCodec::new().extent_key(id, extent))
+            .get_bytes(KeyCodec::new().extent_key(id, extent).as_ref())
             .await
             .unwrap()
             .unwrap(),
@@ -169,14 +169,14 @@ impl RepackFixture {
         );
         assert!(
             fs.db
-                .get_bytes(&KeyCodec::new().extent_key(self.victim, 0))
+                .get_bytes(KeyCodec::new().extent_key(self.victim, 0).as_ref())
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             fs.db
-                .get_bytes(&KeyCodec::new().extent_key(self.victim, 10_010))
+                .get_bytes(KeyCodec::new().extent_key(self.victim, 10_010).as_ref())
                 .await
                 .unwrap()
                 .is_none()

@@ -248,7 +248,7 @@ async fn plan_source(store: &ExtentStore, segid: Segid) -> Result<SourcePlan, Fs
             let key = store.key_codec.extent_key(e.inode, e.extent);
             let enc = store
                 .db
-                .get_bytes(&key)
+                .get_bytes(key.as_ref())
                 .await
                 .map_err(|_| FsError::IoError)?;
             Ok::<_, FsError>(
@@ -447,7 +447,7 @@ async fn repoint_inode(
         let key = store.key_codec.extent_key(inode, extent);
         if let Some(enc) = store
             .db
-            .get_bytes(&key)
+            .get_bytes(key.as_ref())
             .await
             .map_err(|_| FsError::IoError)?
             && let Some(loc) = FrameLoc::decode(&enc)
@@ -456,7 +456,7 @@ async fn repoint_inode(
             // frame between gather and swap.
             && loc == old_loc
         {
-            txn.put_bytes(&key, Bytes::copy_from_slice(&new_loc.encode()));
+            txn.put_bytes(&key.into(), Bytes::copy_from_slice(&new_loc.encode()));
             store.seg_delta(&mut txn, old_loc.segid, -(loc.byte_len as i64), 0);
             store.seg_delta(&mut txn, new_loc.segid, new_loc.byte_len as i64, 0);
             swapped += 1;

@@ -1394,7 +1394,7 @@ mod tests {
             let mut id = 0;
             while id < INODES {
                 let v = db
-                    .get_bytes(&codec.inode_key(id))
+                    .get_bytes(codec.inode_key(id).as_ref())
                     .await
                     .expect("get")
                     .expect("inode present");
@@ -1430,7 +1430,8 @@ mod tests {
                     let mut batch = WriteBatch::new();
                     for i in 0..(INODES / 4) {
                         let id = extent * (INODES / 4) + i;
-                        batch.put_bytes(codec.inode_key(id), Bytes::from(vec![id as u8; 64]));
+                        batch
+                            .put_bytes(codec.inode_key(id).into(), Bytes::from(vec![id as u8; 64]));
                     }
                     raw.write_with_options(batch, &WriteOptions::default())
                         .await
