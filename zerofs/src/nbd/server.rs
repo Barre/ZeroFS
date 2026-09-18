@@ -163,7 +163,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn perform_handshake(&mut self) -> Result<()> {
         let handshake = NBDServerHandshake::new(NBD_FLAG_FIXED_NEWSTYLE | NBD_FLAG_NO_ZEROES);
-        let handshake_bytes = handshake.to_bytes()?;
+        let mut handshake_bytes = [0; NBDServerHandshake::WIRE_SIZE];
+        handshake.encode(&mut handshake_bytes)?;
         self.writer.write_all(&handshake_bytes).await?;
         self.writer.flush().await?;
 
@@ -373,7 +374,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn send_option_reply(&mut self, option: u32, reply_type: u32, data: &[u8]) -> Result<()> {
         let reply = NBDOptionReply::new(option, reply_type, data.len() as u32);
-        let reply_bytes = reply.to_bytes()?;
+        let mut reply_bytes = [0; NBDOptionReply::WIRE_SIZE];
+        reply.encode(&mut reply_bytes)?;
         self.writer.write_all(&reply_bytes).await?;
         if !data.is_empty() {
             self.writer.write_all(data).await?;
@@ -562,7 +564,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn send_simple_reply(&mut self, cookie: u64, error: u32, data: &[u8]) -> Result<()> {
         let reply = NBDSimpleReply::new(cookie, error);
-        let reply_bytes = reply.to_bytes()?;
+        let mut reply_bytes = [0; NBDSimpleReply::WIRE_SIZE];
+        reply.encode(&mut reply_bytes)?;
         self.writer.write_all(&reply_bytes).await?;
         if !data.is_empty() {
             self.writer.write_all(data).await?;
