@@ -43,25 +43,25 @@ const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_EXTENT: u8 = 0xFE;
 
-const SYSTEM_COUNTER_SUBTYPE: u8 = 0x01;
+const SYSTEM_COUNTER_KEY: &[u8; 6] = b"meta\x06\x01";
 // HA: the highest shipped replication batch seqno (with its writer epoch) that
 // has been flushed into this data db. Written atomically with each shipped
 // batch so a promoted standby can prune its tail to exactly what the db already
 // holds (see write_coordinator + takeover replay).
-const SYSTEM_HA_SEQNO_SUBTYPE: u8 = 0x02;
+const SYSTEM_HA_SEQNO_KEY: &[u8; 6] = b"meta\x06\x02";
 // Durability lineage token (see fsync-honesty / ZeroFS::lineage_token). A single
 // u64 identifying the current unbroken durable lineage. Regenerated at a cold
 // bootstrap or a Solo-tainted takeover; carried forward unchanged at an untainted
 // takeover (so a clean failover keeps a client's fsync transparent).
-const SYSTEM_LINEAGE_SUBTYPE: u8 = 0x03;
+const SYSTEM_LINEAGE_KEY: &[u8; 6] = b"meta\x06\x03";
 // Solo taint: set to the lineage token that was live when the leader first
 // downgraded to Solo replication. A takeover reads it to decide keep-vs-regenerate
 // the lineage token (taint == stored lineage => the lineage may be missing acked
 // Solo writes => regenerate, so those writes' fsync fails instead of reporting success).
-const SYSTEM_TAINT_SUBTYPE: u8 = 0x04;
+const SYSTEM_TAINT_KEY: &[u8; 6] = b"meta\x06\x04";
 // Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
 // orphan sweep.
-const SYSTEM_ORPHAN_SWEEP_SUBTYPE: u8 = 0x05;
+const SYSTEM_ORPHAN_SWEEP_KEY: &[u8; 6] = b"meta\x06\x05";
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -354,10 +354,7 @@ impl KeyCodec {
     }
 
     pub fn system_counter_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_COUNTER_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_COUNTER_KEY)
     }
 
     /// Key for HA provenance flushed atomically with each replicated leader
@@ -365,10 +362,7 @@ impl KeyCodec {
     /// history, and highest locally applied ship attempt; takeover validates the
     /// volatile tail and exact-result ledger against it.
     pub fn ha_seqno_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_HA_SEQNO_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_HA_SEQNO_KEY)
     }
 
     pub(crate) fn encode_ha_stamp(stamp: &HaStamp) -> Bytes {
@@ -388,27 +382,18 @@ impl KeyCodec {
 
     /// Key for the durability lineage token (a single u64).
     pub fn lineage_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_LINEAGE_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_LINEAGE_KEY)
     }
 
     /// Key for the Solo taint (the lineage token that went Solo).
     pub fn taint_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_TAINT_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_TAINT_KEY)
     }
 
     /// Key for the last-orphan-sweep wall-clock timestamp (epoch seconds, a u64 via
     /// [`Self::encode_u64`]).
     pub fn last_orphan_sweep_key(&self) -> Bytes {
-        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::System) + 1);
-        self.push_prefix(&mut key, KeyPrefix::System);
-        key.push(SYSTEM_ORPHAN_SWEEP_SUBTYPE);
-        Bytes::from(key)
+        Bytes::from_static(SYSTEM_ORPHAN_SWEEP_KEY)
     }
 
     pub fn encode_u64(value: u64) -> Bytes {
