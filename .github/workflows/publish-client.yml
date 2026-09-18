@@ -50,12 +50,9 @@ jobs:
           fi
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
 
-  # Publish zerofs-client to crates.io. The transport crates (ninep-proto,
-  # ninep-client) are independently versioned and already on crates.io; this job
-  # does not republish them, since crates.io rejects re-uploading an existing
-  # version (there is no skip-existing flag). Bump and publish a transport by hand
-  # when it changes, before the dependent client release. zerofs-ffi is
-  # `publish = false`; zerofs-client rides the client-family version.
+  # Publish transports before zerofs-client, skipping versions already on
+  # crates.io. The transport versions are independent of the client family;
+  # bump their manifests when they change. zerofs-ffi is `publish = false`.
   publish-crates:
     name: Publish crates.io
     needs: verify-version
@@ -83,19 +80,22 @@ jobs:
             exit 1
           fi
 
-      - name: Publish zerofs-client
+      - name: Publish transport and client crates
         working-directory: zerofs
         run: |
           set -euo pipefail
-          # Idempotent: skip if this version is already on crates.io (e.g. a
-          # re-run after another job failed). crates.io has no skip-existing flag
-          # and rejects a duplicate upload, so check first. Mirrors the npm job's
-          # `npm view` guard.
-          if curl -sf -A "zerofs-release" "https://crates.io/api/v1/crates/zerofs-client/$CLIENT_VERSION" >/dev/null; then
-            echo "zerofs-client@$CLIENT_VERSION already on crates.io; skipping"
-          else
-            cargo publish -p zerofs-client
-          fi
+          # Dependency order matters: cargo publish verifies against crates.io,
+          # not the in-tree path dependencies, and waits for index availability.
+          for crate in ninep-proto ninep-client zerofs-client; do
+            version="$(grep -m1 '^version = ' "$crate/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/')"
+            status="$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+              -A "zerofs-release" "https://crates.io/api/v1/crates/$crate/$version")"
+            case "$status" in
+              200) echo "$crate@$version already on crates.io; skipping" ;;
+              404) cargo publish -p "$crate" ;;
+              *) echo "::error::Failed to check $crate@$version: HTTP $status" >&2; exit 1 ;;
+            esac
+          done
 
   # PyPI: build a per-target wheel on each native runner (each wheel bundles its
   # cdylib) plus one sdist, upload them as artifacts, then publish them all from a
