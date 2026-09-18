@@ -184,21 +184,21 @@ pub enum SegmentError {
     Codec(#[from] CodecError),
 }
 
-fn frame_aad(segid: Segid, frame_index: u32, inode: u64, extent: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + 16 + 4 + 8 + 8);
-    v.push(b'F');
-    v.extend_from_slice(&segid.to_le_bytes());
-    v.extend_from_slice(&frame_index.to_le_bytes());
-    v.extend_from_slice(&inode.to_le_bytes());
-    v.extend_from_slice(&extent.to_le_bytes());
+fn frame_aad(segid: Segid, frame_index: u32, inode: u64, extent: u64) -> [u8; 37] {
+    let mut v = [0; 37];
+    v[0] = b'F';
+    v[1..17].copy_from_slice(&segid.to_le_bytes());
+    v[17..21].copy_from_slice(&frame_index.to_le_bytes());
+    v[21..29].copy_from_slice(&inode.to_le_bytes());
+    v[29..37].copy_from_slice(&extent.to_le_bytes());
     v
 }
 
-fn dir_aad(segid: Segid, k: u32) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + 16 + 4);
-    v.push(b'D');
-    v.extend_from_slice(&segid.to_le_bytes());
-    v.extend_from_slice(&k.to_le_bytes());
+fn dir_aad(segid: Segid, k: u32) -> [u8; 21] {
+    let mut v = [0; 21];
+    v[0] = b'D';
+    v[1..17].copy_from_slice(&segid.to_le_bytes());
+    v[17..21].copy_from_slice(&k.to_le_bytes());
     v
 }
 
@@ -725,7 +725,7 @@ pub(crate) fn read_frames_from_chunks(
             frame_aad(segid, fi, inode, extent),
         ));
     }
-    let open = |(frame, aad): (bytes::Bytes, Vec<u8>)| {
+    let open = |(frame, aad): (bytes::Bytes, [u8; 37])| {
         codec.open_owned(frame, &aad).map_err(SegmentError::from)
     };
     let runtime = tokio::runtime::Handle::try_current().ok();
