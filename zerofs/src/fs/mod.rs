@@ -223,6 +223,7 @@ mod tests {
         let io = codec.id_offset(KeyPrefix::Inode);
         for id in [0u64, 42, 999] {
             let key = codec.inode_key(id);
+            let key = key.as_ref();
             assert_eq!(key[ko], u8::from(KeyPrefix::Inode));
             assert_eq!(&key[io..io + 8], &id.to_be_bytes());
         }
@@ -237,6 +238,7 @@ mod tests {
         let io = codec.id_offset(KeyPrefix::Extent);
         for (ino, idx) in [(1u64, 0u64), (42, 10), (999, 999)] {
             let key = codec.extent_key(ino, idx);
+            let key = key.as_ref();
             assert_eq!(key[ko], u8::from(KeyPrefix::Extent));
             assert_eq!(&key[io..io + 8], &ino.to_be_bytes());
             assert_eq!(&key[io + 8..io + 16], &idx.to_be_bytes());

@@ -60,7 +60,7 @@ impl ExtentStore {
     /// hole. Resolves the extent key's `FrameLoc` then fetches the frame.
     pub async fn get(&self, id: InodeId, extent_idx: u64) -> Result<Option<Bytes>, FsError> {
         let key = self.key_codec.extent_key(id, extent_idx);
-        let encoded = match self.db.get_bytes(&key).await {
+        let encoded = match self.db.get_bytes(key.as_ref()).await {
             Ok(v) => v,
             Err(e) => {
                 error!(
@@ -102,7 +102,7 @@ impl ExtentStore {
                 // a hole; otherwise the error is real.
                 let reresolved = self
                     .db
-                    .get_bytes(&key)
+                    .get_bytes(key.as_ref())
                     .await
                     .map_err(|_| FsError::IoError)?;
                 match Self::decode_reresolved_extent(id, extent_idx, reresolved.as_ref())? {
@@ -337,7 +337,7 @@ impl ExtentStore {
     async fn segment_at(&self, id: InodeId, extent: u64) -> Option<Segid> {
         let key = self.key_codec.extent_key(id, extent);
         self.db
-            .get_bytes(&key)
+            .get_bytes(key.as_ref())
             .await
             .ok()
             .flatten()
@@ -613,7 +613,7 @@ mod tests {
         };
         let key = store.key_codec.extent_key(1, 5);
         let mut txn = db.new_transaction().unwrap();
-        txn.put_bytes(&key, Bytes::copy_from_slice(&bogus.encode()));
+        txn.put_bytes(&key.into(), Bytes::copy_from_slice(&bogus.encode()));
         commit(&store, txn).await;
 
         assert!(matches!(store.get(1, 5).await, Err(FsError::IoError)));
@@ -632,7 +632,10 @@ mod tests {
         // extents 0..=2 so the ranged-scan path (not `get`) resolves it.
         let key = store.key_codec.extent_key(1, 1);
         let mut txn = db.new_transaction().unwrap();
-        txn.put_bytes(&key, Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]));
+        txn.put_bytes(
+            &key.into(),
+            Bytes::from_static(&[0u8; FrameLoc::ENCODED_LEN - 1]),
+        );
         commit(&store, txn).await;
 
         let r = store

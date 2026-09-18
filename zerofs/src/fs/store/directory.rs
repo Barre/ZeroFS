@@ -587,7 +587,7 @@ mod tests {
         let inode = test_file_inode(10);
 
         db.put_with_options(
-            &codec.inode_key(inode_id),
+            &codec.inode_key(inode_id).into(),
             &bincode::serialize(&inode).unwrap(),
             &PutOptions::default(),
             &WriteOptions::default(),
@@ -653,7 +653,7 @@ mod tests {
         let inode = test_file_inode(10);
 
         db.put_with_options(
-            &codec.inode_key(inode_id),
+            &codec.inode_key(inode_id).into(),
             &bincode::serialize(&inode).unwrap(),
             &PutOptions::default(),
             &WriteOptions::default(),

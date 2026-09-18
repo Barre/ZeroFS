@@ -679,7 +679,7 @@ mod tests {
         let key = codec().extent_key(41, 0);
         let locks = fs.lock_manager.acquire_multi(vec![41, 42]).await;
         let mut txn = Transaction::new();
-        txn.put_bytes(&key, Bytes::from_static(b"applied"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"applied"));
         let mutation = LockedMutation::new(txn, locks);
         let write_barrier = fs.db.flush_barrier().write_owned().await;
         let coordinator = fs.write_coordinator.clone();
@@ -715,7 +715,7 @@ mod tests {
             .await
             .expect("multi-inode locks were not returned after apply");
         assert_eq!(
-            fs.db.get_bytes(&key).await.unwrap(),
+            fs.db.get_bytes(key.as_ref()).await.unwrap(),
             Some(Bytes::from_static(b"applied"))
         );
     }
@@ -830,9 +830,9 @@ mod tests {
         let mut txn = Transaction::new();
         // Use a real codec-built key so the segment extractor accepts it.
         let key = codec().extent_key(1, 0);
-        txn.put_bytes(&key, Bytes::from_static(b"value"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"value"));
         fs.write_coordinator.commit(txn).await.unwrap();
-        let v = fs.db.get_bytes(&key).await.unwrap();
+        let v = fs.db.get_bytes(key.as_ref()).await.unwrap();
         assert_eq!(v.as_deref(), Some(&b"value"[..]));
     }
 
@@ -847,7 +847,7 @@ mod tests {
             let k = codec.extent_key(1, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&k, Bytes::from(vec![1u8; 8]));
+                txn.put_bytes(&k.into(), Bytes::from(vec![1u8; 8]));
                 c.commit(txn).await
             }));
         }
@@ -855,7 +855,11 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..32 {
-            let v = fs.db.get_bytes(&codec.extent_key(1, i)).await.unwrap();
+            let v = fs
+                .db
+                .get_bytes(codec.extent_key(1, i).as_ref())
+                .await
+                .unwrap();
             assert!(v.is_some());
         }
     }
@@ -871,7 +875,7 @@ mod tests {
             let k = codec.extent_key(2, i);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&k, Bytes::from(vec![2u8; 8]));
+                txn.put_bytes(&k.into(), Bytes::from(vec![2u8; 8]));
                 c.commit(txn).await
             }));
         }
@@ -879,7 +883,11 @@ mod tests {
             h.await.unwrap().unwrap();
         }
         for i in 0u64..16 {
-            let v = fs.db.get_bytes(&codec.extent_key(2, i)).await.unwrap();
+            let v = fs
+                .db
+                .get_bytes(codec.extent_key(2, i).as_ref())
+                .await
+                .unwrap();
             assert!(
                 v.is_some(),
                 "extent {i} not durable after sync_writes commit"
@@ -960,7 +968,7 @@ mod tests {
 
         // A commit that doesn't allocate any inode.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().extent_key(3, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().extent_key(3, 0).into(), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after = fs.db.get_bytes(&counter_key).await.unwrap();
@@ -972,7 +980,7 @@ mod tests {
         // Now allocate and commit; counter must advance on disk.
         let _id = fs.inode_store.allocate();
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().extent_key(3, 1), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec().extent_key(3, 1).into(), Bytes::from_static(b"v"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let after_allocate = fs.db.get_bytes(&counter_key).await.unwrap();
@@ -999,7 +1007,7 @@ mod tests {
             .unwrap();
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(7, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec.extent_key(7, 0).into(), Bytes::from_static(b"v"));
         txn.add_seg_delta(&seg_key, 5, 5);
         txn.delete_segcount(&codec.segcount_key(1, 2), 7, 13);
         fs.write_coordinator
@@ -1030,7 +1038,7 @@ mod tests {
         // that batch (and the staged counter put) to the segcount abort.
         let id = fs.inode_store.allocate();
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(id, 0), Bytes::from_static(b"v"));
+        txn.put_bytes(&codec.extent_key(id, 0).into(), Bytes::from_static(b"v"));
         txn.add_seg_delta(&seg_key, 5, 5);
         fs.write_coordinator.commit(txn).await.unwrap_err();
 
@@ -1038,7 +1046,7 @@ mod tests {
         // covering `id` (via the id burned on abort); otherwise a restart
         // would hand out `id` again over this batch's durable records.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(id, 1), Bytes::from_static(b"w"));
+        txn.put_bytes(&codec.extent_key(id, 1).into(), Bytes::from_static(b"w"));
         fs.write_coordinator.commit(txn).await.unwrap();
 
         let persisted = fs
@@ -1074,7 +1082,7 @@ mod tests {
             let key = codec.extent_key(inode_id, 0);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&key, Bytes::from_static(b"x"));
+                txn.put_bytes(&key.into(), Bytes::from_static(b"x"));
                 txn.add_stats_delta(inode_id, ((k + 1) * 10) as i64, 1);
                 c.commit(txn).await
             }));
@@ -1122,7 +1130,7 @@ mod tests {
             let key = codec.extent_key(inode_id, 1);
             handles.push(tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&key, Bytes::from_static(b"y"));
+                txn.put_bytes(&key.into(), Bytes::from_static(b"y"));
                 txn.add_stats_delta(inode_id, -(((k + 1) * 10) as i64), 0);
                 c.commit(txn).await
             }));
@@ -1339,7 +1347,7 @@ mod tests {
         let key = codec().extent_key(7, 0);
         let flushes_before = fs.flush_coordinator.completed_flush_count();
         let mut txn = Transaction::new();
-        txn.put_bytes(&key, Bytes::from_static(b"never-applied"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"never-applied"));
         assert_eq!(
             fs.write_coordinator
                 .commit(txn)
@@ -1393,7 +1401,7 @@ mod tests {
         let key = codec.extent_key(1, 0);
         let flushes_before = fs.flush_coordinator.completed_flush_count();
         let mut txn = Transaction::new();
-        txn.put_bytes(&key, Bytes::from_static(b"v"));
+        txn.put_bytes(&key.into(), Bytes::from_static(b"v"));
         let error = coord
             .commit(txn)
             .await
@@ -1405,13 +1413,13 @@ mod tests {
             "a writer proven stale must not flush before returning the clean failure"
         );
         assert!(
-            fs.db.get_bytes(&key).await.unwrap().is_none(),
+            fs.db.get_bytes(key.as_ref()).await.unwrap().is_none(),
             "a deposed leader must not apply the rejected batch"
         );
 
         // Deposal is terminal: later batches fail too.
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 1), Bytes::from_static(b"w"));
+        txn.put_bytes(&codec.extent_key(1, 1).into(), Bytes::from_static(b"w"));
         assert_eq!(
             coord.commit(txn).await.expect_err("deposal must be sticky"),
             FsError::LeaderRejectedBeforeApply
@@ -1443,10 +1451,9 @@ mod tests {
 
         let first_commit = {
             let coordinator = fs.write_coordinator.clone();
-            let first_key = first_key.clone();
             tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&first_key, Bytes::from_static(b"first"));
+                txn.put_bytes(&first_key.into(), Bytes::from_static(b"first"));
                 coordinator.commit(txn).await
             })
         };
@@ -1535,7 +1542,7 @@ mod tests {
         // The Solo mutation follows the lineage-taint flush.
         let solo_key = codec().extent_key(91, 0);
         let mut solo = Transaction::new();
-        solo.put_bytes(&solo_key, Bytes::from_static(b"solo"));
+        solo.put_bytes(&solo_key.into(), Bytes::from_static(b"solo"));
         fs.write_coordinator.commit(solo).await.unwrap();
         let ha_stamp_key = codec().ha_seqno_key();
         let solo_stamp = fs
@@ -1554,10 +1561,9 @@ mod tests {
         let op_id = [0x91; 16];
         let reconnect_commit = {
             let coordinator = fs.write_coordinator.clone();
-            let reconnect_key = reconnect_key.clone();
             tokio::spawn(async move {
                 let mut txn = Transaction::new();
-                txn.put_bytes(&reconnect_key, Bytes::from_static(b"reconnected"));
+                txn.put_bytes(&reconnect_key.into(), Bytes::from_static(b"reconnected"));
                 txn.set_dedup_result(op_id, crate::dedup::DedupResult::Applied);
                 coordinator.commit(txn).await
             })
@@ -1579,7 +1585,11 @@ mod tests {
             "the reconnect batch must wait behind the Solo-base barrier"
         );
         assert!(
-            fs.db.get_bytes(&reconnect_key).await.unwrap().is_none(),
+            fs.db
+                .get_bytes(reconnect_key.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
             "the reconnect mutation must not apply before the base flush"
         );
         assert!(
@@ -1627,7 +1637,10 @@ mod tests {
 
         lease.renew(std::time::Duration::from_secs(30));
         let mut later = Transaction::new();
-        later.put_bytes(&codec().extent_key(91, 2), Bytes::from_static(b"later"));
+        later.put_bytes(
+            &codec().extent_key(91, 2).into(),
+            Bytes::from_static(b"later"),
+        );
         fs.write_coordinator
             .commit(later)
             .await
@@ -1647,14 +1660,14 @@ mod tests {
         let codec = codec();
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 0), Bytes::from_static(b"a"));
+        txn.put_bytes(&codec.extent_key(1, 0).into(), Bytes::from_static(b"a"));
         coord.commit(txn).await.unwrap();
         let baseline = fs.flush_coordinator.completed_flush_count();
 
         control.set_sender_for_tests(None).await;
         for i in 1..=2u64 {
             let mut txn = Transaction::new();
-            txn.put_bytes(&codec.extent_key(1, i), Bytes::from_static(b"s"));
+            txn.put_bytes(&codec.extent_key(1, i).into(), Bytes::from_static(b"s"));
             coord.commit(txn).await.unwrap();
         }
         assert_eq!(
@@ -1668,7 +1681,7 @@ mod tests {
             .await;
         let reconnect_op_id = [0xa7; 16];
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 3), Bytes::from_static(b"c"));
+        txn.put_bytes(&codec.extent_key(1, 3).into(), Bytes::from_static(b"c"));
         txn.set_dedup_result(reconnect_op_id, crate::dedup::DedupResult::Applied);
         coord.commit(txn).await.unwrap();
         assert_eq!(
@@ -1682,7 +1695,7 @@ mod tests {
         ));
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec.extent_key(1, 4), Bytes::from_static(b"d"));
+        txn.put_bytes(&codec.extent_key(1, 4).into(), Bytes::from_static(b"d"));
         coord.commit(txn).await.unwrap();
         assert_eq!(
             fs.flush_coordinator.completed_flush_count(),
@@ -1702,7 +1715,10 @@ mod tests {
         let coord = replicating_coordinator(&fs, repl);
 
         let mut txn = Transaction::new();
-        txn.put_bytes(&codec().extent_key(1, 0), Bytes::from_static(b"acked"));
+        txn.put_bytes(
+            &codec().extent_key(1, 0).into(),
+            Bytes::from_static(b"acked"),
+        );
         coord.commit(txn).await.unwrap();
         let baseline = fs.flush_coordinator.completed_flush_count();
         assert_eq!(

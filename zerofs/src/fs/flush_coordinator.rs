@@ -510,8 +510,8 @@ mod tests {
     fn dirty_batch() -> WriteBatch {
         let codec = crate::fs::key_codec::KeyCodec::new();
         let mut batch = WriteBatch::new();
-        batch.put_bytes(codec.inode_key(1), Bytes::from_static(b"inode"));
-        batch.put_bytes(codec.extent_key(1, 0), Bytes::from_static(b"extent"));
+        batch.put_bytes(codec.inode_key(1).into(), Bytes::from_static(b"inode"));
+        batch.put_bytes(codec.extent_key(1, 0).into(), Bytes::from_static(b"extent"));
         batch
     }
 

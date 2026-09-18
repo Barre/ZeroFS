@@ -70,6 +70,39 @@ pub const META_DOMAIN: &[u8] = b"meta";
 /// Domain prefix for bulk extent data.
 pub const EXTENT_DOMAIN: &[u8] = b"extent";
 
+const INODE_KEY_SIZE: usize = META_DOMAIN.len() + 1 + U64_SIZE;
+const EXTENT_KEY_SIZE: usize = EXTENT_DOMAIN.len() + 1 + U64_SIZE * 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InodeKey([u8; INODE_KEY_SIZE]);
+
+impl AsRef<[u8]> for InodeKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<InodeKey> for Bytes {
+    fn from(key: InodeKey) -> Self {
+        Self::copy_from_slice(key.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtentKey([u8; EXTENT_KEY_SIZE]);
+
+impl AsRef<[u8]> for ExtentKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<ExtentKey> for Bytes {
+    fn from(key: ExtentKey) -> Self {
+        Self::copy_from_slice(key.as_ref())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyPrefix {
     Inode,
@@ -189,12 +222,12 @@ impl KeyCodec {
 
     /// Total bytes in a complete inode key.
     pub fn inode_key_size(&self) -> usize {
-        self.id_offset(KeyPrefix::Inode) + U64_SIZE
+        INODE_KEY_SIZE
     }
 
     /// Total bytes in a complete extent key.
     pub fn extent_key_size(&self) -> usize {
-        self.id_offset(KeyPrefix::Extent) + U64_SIZE * 2
+        EXTENT_KEY_SIZE
     }
 
     /// Total bytes in a complete tombstone key.
@@ -207,19 +240,22 @@ impl KeyCodec {
         self.id_offset(KeyPrefix::Orphan) + U64_SIZE
     }
 
-    pub fn inode_key(&self, inode_id: InodeId) -> Bytes {
-        let mut key = Vec::with_capacity(self.inode_key_size());
-        self.push_prefix(&mut key, KeyPrefix::Inode);
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        Bytes::from(key)
+    pub fn inode_key(&self, inode_id: InodeId) -> InodeKey {
+        let mut key = [0; INODE_KEY_SIZE];
+        key[..META_DOMAIN.len()].copy_from_slice(META_DOMAIN);
+        key[self.kind_offset(KeyPrefix::Inode)] = PREFIX_INODE;
+        key[self.id_offset(KeyPrefix::Inode)..].copy_from_slice(&inode_id.to_be_bytes());
+        InodeKey(key)
     }
 
-    pub fn extent_key(&self, inode_id: InodeId, extent_index: u64) -> Bytes {
-        let mut key = Vec::with_capacity(self.extent_key_size());
-        self.push_prefix(&mut key, KeyPrefix::Extent);
-        key.extend_from_slice(&inode_id.to_be_bytes());
-        key.extend_from_slice(&extent_index.to_be_bytes());
-        Bytes::from(key)
+    pub fn extent_key(&self, inode_id: InodeId, extent_index: u64) -> ExtentKey {
+        let mut key = [0; EXTENT_KEY_SIZE];
+        key[..EXTENT_DOMAIN.len()].copy_from_slice(EXTENT_DOMAIN);
+        key[self.kind_offset(KeyPrefix::Extent)] = PREFIX_EXTENT;
+        let id_offset = self.id_offset(KeyPrefix::Extent);
+        key[id_offset..id_offset + U64_SIZE].copy_from_slice(&inode_id.to_be_bytes());
+        key[id_offset + U64_SIZE..].copy_from_slice(&extent_index.to_be_bytes());
+        ExtentKey(key)
     }
 
     pub fn parse_extent_key(&self, key: &[u8]) -> Option<u64> {
@@ -653,25 +689,25 @@ mod tests {
         let inode_id = 7u64;
         let extent_index = 99u64;
         let key = codec.extent_key(inode_id, extent_index);
-        assert_eq!(codec.parse_extent_key(&key), Some(extent_index));
+        assert_eq!(codec.parse_extent_key(key.as_ref()), Some(extent_index));
     }
 
     #[test]
     fn test_layout_routing() {
         let codec = KeyCodec::new();
         let inode_key = codec.inode_key(0);
-        assert!(inode_key.starts_with(META_DOMAIN));
-        assert_eq!(inode_key[META_DOMAIN.len()], PREFIX_INODE);
+        assert!(inode_key.as_ref().starts_with(META_DOMAIN));
+        assert_eq!(inode_key.as_ref()[META_DOMAIN.len()], PREFIX_INODE);
 
         let extent_key = codec.extent_key(0, 0);
-        assert!(extent_key.starts_with(EXTENT_DOMAIN));
-        assert_eq!(extent_key[EXTENT_DOMAIN.len()], PREFIX_EXTENT);
+        assert!(extent_key.as_ref().starts_with(EXTENT_DOMAIN));
+        assert_eq!(extent_key.as_ref()[EXTENT_DOMAIN.len()], PREFIX_EXTENT);
 
         let tombstone = codec.tombstone_key(0, 0);
         assert!(tombstone.starts_with(META_DOMAIN));
 
         // No metadata key should be misrouted into the extent domain.
-        assert!(!inode_key.starts_with(EXTENT_DOMAIN));
+        assert!(!inode_key.as_ref().starts_with(EXTENT_DOMAIN));
         assert!(!tombstone.starts_with(EXTENT_DOMAIN));
     }
 
@@ -694,7 +730,7 @@ mod tests {
         assert!(sc.as_ref() >= start.as_ref() && sc.as_ref() < end.as_ref());
         let ino = codec.inode_key(9);
         assert!(!(ino.as_ref() >= start.as_ref() && ino.as_ref() < end.as_ref()));
-        assert_eq!(codec.parse_segcount_key(&ino), None);
+        assert_eq!(codec.parse_segcount_key(ino.as_ref()), None);
     }
 
     #[test]
@@ -847,7 +883,10 @@ mod tests {
             ParsedKey::Unknown
         ));
         let inode_key = codec.inode_key(1);
-        assert!(matches!(codec.parse_key(&inode_key), ParsedKey::Unknown));
+        assert!(matches!(
+            codec.parse_key(inode_key.as_ref()),
+            ParsedKey::Unknown
+        ));
     }
 }
 
@@ -870,8 +909,8 @@ mod prop_tests {
             let codec = KeyCodec::new();
             let ka = codec.extent_key(a.0, a.1);
             let kb = codec.extent_key(b.0, b.1);
-            prop_assert_eq!(codec.parse_extent_key(&ka), Some(a.1));
-            prop_assert_eq!(codec.parse_extent_key(&kb), Some(b.1));
+            prop_assert_eq!(codec.parse_extent_key(ka.as_ref()), Some(a.1));
+            prop_assert_eq!(codec.parse_extent_key(kb.as_ref()), Some(b.1));
             prop_assert_eq!(ka.as_ref().cmp(kb.as_ref()), a.cmp(&b));
         }
 
@@ -935,7 +974,7 @@ mod prop_tests {
             name in prop::collection::vec(any::<u8>(), 0..40),
         ) {
             let codec = KeyCodec::new();
-            prop_assert_eq!(codec.parse_extent_key(&codec.inode_key(ino)), None);
+            prop_assert_eq!(codec.parse_extent_key(codec.inode_key(ino).as_ref()), None);
             prop_assert_eq!(codec.parse_extent_key(&codec.tombstone_key(x, ino)), None);
             prop_assert_eq!(codec.parse_extent_key(&codec.orphan_key(ino)), None);
             prop_assert_eq!(codec.parse_extent_key(&codec.dir_scan_key(ino, x)), None);

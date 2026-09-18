@@ -227,9 +227,9 @@ mod tests {
     fn test_describe_key_decodes_every_kind() {
         let codec = KeyCodec::new();
         let cases: Vec<(bytes::Bytes, KeyPrefix, &str)> = vec![
-            (codec.inode_key(42), KeyPrefix::Inode, "inode_id=42"),
+            (codec.inode_key(42).into(), KeyPrefix::Inode, "inode_id=42"),
             (
-                codec.extent_key(7, 99),
+                codec.extent_key(7, 99).into(),
                 KeyPrefix::Extent,
                 "inode_id=7, extent_index=99",
             ),
@@ -289,7 +289,7 @@ mod tests {
         // A recognized kind with a truncated payload still classifies (and
         // counts) but falls back to the raw rendering instead of misdecoding.
         let inode_key = codec.inode_key(1);
-        let truncated = &inode_key[..inode_key.len() - 1];
+        let truncated = &inode_key.as_ref()[..inode_key.as_ref().len() - 1];
         let (prefix, detail) = describe_key(&codec, truncated).unwrap();
         assert_eq!(prefix, KeyPrefix::Inode);
         assert!(detail.starts_with("raw="));
