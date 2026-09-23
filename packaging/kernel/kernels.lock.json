@@ -10,30 +10,30 @@
       "architectures": {
         "x86_64": [
           {
-            "kernel": "7.0.0-30-generic",
-            "version": "7.0.0-30.30",
-            "source_version": "7.0.0-30.30",
-            "snapshot": "20260818T113016Z"
-          },
-          {
             "kernel": "7.0.0-31-generic",
             "version": "7.0.0-31.31",
             "source_version": "7.0.0-31.31",
             "snapshot": "20260910T090621Z"
+          },
+          {
+            "kernel": "7.0.0-34-generic",
+            "version": "7.0.0-34.34",
+            "source_version": "7.0.0-34.34",
+            "snapshot": "20260923T130136Z"
           }
         ],
         "aarch64": [
           {
-            "kernel": "7.0.0-30-generic",
-            "version": "7.0.0-30.30",
-            "source_version": "7.0.0-30.30",
-            "snapshot": "20260818T113016Z"
-          },
-          {
             "kernel": "7.0.0-31-generic",
             "version": "7.0.0-31.31",
             "source_version": "7.0.0-31.31",
             "snapshot": "20260910T090621Z"
+          },
+          {
+            "kernel": "7.0.0-34-generic",
+            "version": "7.0.0-34.34",
+            "source_version": "7.0.0-34.34",
+            "snapshot": "20260923T130136Z"
           }
         ]
       }
@@ -47,33 +47,33 @@
       "architectures": {
         "x86_64": [
           {
-            "kernel": "7.0.0-30-generic",
-            "version": "7.0.0-30.30~24.04.1",
-            "source_version": "7.0.0-30.30~24.04.1",
-            "snapshot": "20260821T072458Z",
-            "source_name": "linux-hwe-7.0"
-          },
-          {
             "kernel": "7.0.0-31-generic",
             "version": "7.0.0-31.31~24.04.1",
             "source_version": "7.0.0-31.31~24.04.1",
             "snapshot": "20260910T090621Z",
+            "source_name": "linux-hwe-7.0"
+          },
+          {
+            "kernel": "7.0.0-34-generic",
+            "version": "7.0.0-34.34~24.04.1",
+            "source_version": "7.0.0-34.34~24.04.1",
+            "snapshot": "20260923T130136Z",
             "source_name": "linux-hwe-7.0"
           }
         ],
         "aarch64": [
           {
-            "kernel": "7.0.0-30-generic",
-            "version": "7.0.0-30.30~24.04.1",
-            "source_version": "7.0.0-30.30~24.04.1",
-            "snapshot": "20260821T072458Z",
-            "source_name": "linux-hwe-7.0"
-          },
-          {
             "kernel": "7.0.0-31-generic",
             "version": "7.0.0-31.31~24.04.1",
             "source_version": "7.0.0-31.31~24.04.1",
             "snapshot": "20260910T090621Z",
+            "source_name": "linux-hwe-7.0"
+          },
+          {
+            "kernel": "7.0.0-34-generic",
+            "version": "7.0.0-34.34~24.04.1",
+            "source_version": "7.0.0-34.34~24.04.1",
+            "snapshot": "20260923T130136Z",
             "source_name": "linux-hwe-7.0"
           }
         ]
@@ -195,21 +195,6 @@
       "architectures": {
         "x86_64": [
           {
-            "nvr": "kernel-7.2.5-200.fc44",
-            "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6",
-            "artifacts": {
-              "cargo-1.98.1-1.fc44.x86_64.rpm": "b32e8b630c55c5ae0df6a3efdf58173974d4dc462a2e2be7a10cd18ea365d30f",
-              "kernel-7.2.5-200.fc44.src.rpm": "5837b7f983afed8d2da96b06a1fdb95b3cc8d9ac91b58257ec47725fc452064a",
-              "kernel-core-7.2.5-200.fc44.x86_64.rpm": "e0f975e67f4bbc43b323c432031cb016eaa4d0844d4e551cbaf7b58366a83525",
-              "kernel-devel-7.2.5-200.fc44.x86_64.rpm": "ae1e721889284c078c5cf7c4a51524bbb4d665f69fe0c34ef39b20385e3af2fe",
-              "kernel-modules-core-7.2.5-200.fc44.x86_64.rpm": "799e3ca6648e782e462c8d4f6cbc9664abeda247405961f42f64b92b46264196",
-              "rust-1.98.1-1.fc44.x86_64.rpm": "4f4a346f18eddff7ee512850a65e9a0a6b0f1ccfe96b1e665a99b6d02dacfa76",
-              "rust-src-1.98.1-1.fc44.noarch.rpm": "2f0b0eb989b366ff5a18b7e712cf21b1d5c1800d74f3410d217777e4d1d2b1b0",
-              "rust-std-static-1.98.1-1.fc44.x86_64.rpm": "612185594cb772f5320d5c9a97dd226390fb32972389a47a99b3cb07786c39c4",
-              "rustfmt-1.98.1-1.fc44.x86_64.rpm": "9d9803ebd806cec9be934baa3b8d77778bb24476ee1c54d968212f0c1519d94b"
-            }
-          },
-          {
             "nvr": "kernel-7.2.6-200.fc44",
             "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6",
             "artifacts": {
@@ -223,24 +208,24 @@
               "rust-std-static-1.98.1-1.fc44.x86_64.rpm": "612185594cb772f5320d5c9a97dd226390fb32972389a47a99b3cb07786c39c4",
               "rustfmt-1.98.1-1.fc44.x86_64.rpm": "9d9803ebd806cec9be934baa3b8d77778bb24476ee1c54d968212f0c1519d94b"
             }
+          },
+          {
+            "nvr": "kernel-7.2.7-200.fc44",
+            "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6",
+            "artifacts": {
+              "cargo-1.98.1-1.fc44.x86_64.rpm": "b32e8b630c55c5ae0df6a3efdf58173974d4dc462a2e2be7a10cd18ea365d30f",
+              "kernel-7.2.7-200.fc44.src.rpm": "7dfc6f39d52fbae59e0024fc1bc1d666900b6848d7e1fff53813d8b6b03aa5e8",
+              "kernel-core-7.2.7-200.fc44.x86_64.rpm": "9b9dc55d348b252406070254941265deef117f9d9cafc50940ffcbcce217090a",
+              "kernel-devel-7.2.7-200.fc44.x86_64.rpm": "d0e60ffd35c6ce8448c6be7a4109ef6279f28d14e3402560c5bb53ecca4a4e56",
+              "kernel-modules-core-7.2.7-200.fc44.x86_64.rpm": "5c880a5c00700ca938758f05848f8879076c90571040b28131f4b7ff76570718",
+              "rust-1.98.1-1.fc44.x86_64.rpm": "4f4a346f18eddff7ee512850a65e9a0a6b0f1ccfe96b1e665a99b6d02dacfa76",
+              "rust-src-1.98.1-1.fc44.noarch.rpm": "2f0b0eb989b366ff5a18b7e712cf21b1d5c1800d74f3410d217777e4d1d2b1b0",
+              "rust-std-static-1.98.1-1.fc44.x86_64.rpm": "612185594cb772f5320d5c9a97dd226390fb32972389a47a99b3cb07786c39c4",
+              "rustfmt-1.98.1-1.fc44.x86_64.rpm": "9d9803ebd806cec9be934baa3b8d77778bb24476ee1c54d968212f0c1519d94b"
+            }
           }
         ],
         "aarch64": [
-          {
-            "nvr": "kernel-7.2.5-200.fc44",
-            "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6",
-            "artifacts": {
-              "cargo-1.98.1-1.fc44.aarch64.rpm": "dc182e51e7224c769e847e5abe68b2685d5bebde024beef724729a34e4da437f",
-              "kernel-7.2.5-200.fc44.src.rpm": "5837b7f983afed8d2da96b06a1fdb95b3cc8d9ac91b58257ec47725fc452064a",
-              "kernel-core-7.2.5-200.fc44.aarch64.rpm": "f5b17536baf8270cc96261f5c99890cb533297031f97d88c9c4b16d63f57a3bb",
-              "kernel-devel-7.2.5-200.fc44.aarch64.rpm": "2bb0001a1e64f6570bffaeae69606bd701ec87680aa73ba4241d45a84f8c6e53",
-              "kernel-modules-core-7.2.5-200.fc44.aarch64.rpm": "189afebdf95763ea12e3d7f97f471e9847d68eac9faa4b7a872163cbfa2c7d0f",
-              "rust-1.98.1-1.fc44.aarch64.rpm": "a7bac3f9c15bc2980cf04b8043d807d18ee3c30d50cb43455fe3dccd69355955",
-              "rust-src-1.98.1-1.fc44.noarch.rpm": "2f0b0eb989b366ff5a18b7e712cf21b1d5c1800d74f3410d217777e4d1d2b1b0",
-              "rust-std-static-1.98.1-1.fc44.aarch64.rpm": "a242bf67ab7a37c616ecb569e9c125d0250369411dcc8a6ff8f33f518b2f0148",
-              "rustfmt-1.98.1-1.fc44.aarch64.rpm": "e3d70b1953670f65d85bdcde3ddb285b84626094d063758b0d5628bdcefdd8ec"
-            }
-          },
           {
             "nvr": "kernel-7.2.6-200.fc44",
             "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6",
@@ -250,6 +235,21 @@
               "kernel-core-7.2.6-200.fc44.aarch64.rpm": "8cc9ebeccb600f7e601f5a868735ec3e3dfb36f09f98ecce993d11b35b1823c9",
               "kernel-devel-7.2.6-200.fc44.aarch64.rpm": "4e8e91768ce66d5efcddd48cbc2953ad70001f23161d2c640268fa29d4d2b83b",
               "kernel-modules-core-7.2.6-200.fc44.aarch64.rpm": "f805997ae2c12dde9f3e5d70f5e83afae02db59919db87bb4f88aec49c234547",
+              "rust-1.98.1-1.fc44.aarch64.rpm": "a7bac3f9c15bc2980cf04b8043d807d18ee3c30d50cb43455fe3dccd69355955",
+              "rust-src-1.98.1-1.fc44.noarch.rpm": "2f0b0eb989b366ff5a18b7e712cf21b1d5c1800d74f3410d217777e4d1d2b1b0",
+              "rust-std-static-1.98.1-1.fc44.aarch64.rpm": "a242bf67ab7a37c616ecb569e9c125d0250369411dcc8a6ff8f33f518b2f0148",
+              "rustfmt-1.98.1-1.fc44.aarch64.rpm": "e3d70b1953670f65d85bdcde3ddb285b84626094d063758b0d5628bdcefdd8ec"
+            }
+          },
+          {
+            "nvr": "kernel-7.2.7-200.fc44",
+            "signing_fingerprint": "36f612dcf27f7d1a48a835e4dbfcf71c6d9f90a6",
+            "artifacts": {
+              "cargo-1.98.1-1.fc44.aarch64.rpm": "dc182e51e7224c769e847e5abe68b2685d5bebde024beef724729a34e4da437f",
+              "kernel-7.2.7-200.fc44.src.rpm": "7dfc6f39d52fbae59e0024fc1bc1d666900b6848d7e1fff53813d8b6b03aa5e8",
+              "kernel-core-7.2.7-200.fc44.aarch64.rpm": "a591f2309d2837073710838e729912d8c7b60e5dd7e6b6433361abb3f28e827d",
+              "kernel-devel-7.2.7-200.fc44.aarch64.rpm": "2d50d1e15b5b5b230fa9cf4932a2b0c7a63d04aa1120c3e9c851c96885106200",
+              "kernel-modules-core-7.2.7-200.fc44.aarch64.rpm": "43342f56e63f6c431d73358f5746607580195ff12dcb6a15ee5ce545acecb0c1",
               "rust-1.98.1-1.fc44.aarch64.rpm": "a7bac3f9c15bc2980cf04b8043d807d18ee3c30d50cb43455fe3dccd69355955",
               "rust-src-1.98.1-1.fc44.noarch.rpm": "2f0b0eb989b366ff5a18b7e712cf21b1d5c1800d74f3410d217777e4d1d2b1b0",
               "rust-std-static-1.98.1-1.fc44.aarch64.rpm": "a242bf67ab7a37c616ecb569e9c125d0250369411dcc8a6ff8f33f518b2f0148",
