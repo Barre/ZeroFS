@@ -291,8 +291,10 @@ deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$snapshot 
 EOF
     install_apt_snapshot_ca
 
+    # The pinned kernels need backported dependencies such as linux-base.
+    # Resolve the development packages from the same suite as their libraries.
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        --no-install-recommends \
+        --no-install-recommends -t "$apt_suite" \
         bc \
         binutils \
         bison \
@@ -310,8 +312,6 @@ EOF
         "linux-image-$kernel_release=$kernel_package_version" \
         "linux-source-$source_series=$source_version" \
         python3 \
-        bindgen \
-        rustc \
         xz-utils \
         zstd
 
@@ -796,6 +796,70 @@ select_rust_tools() {
     fi
 }
 
+install_opensuse_target_tools() {
+    local auto_conf=$1
+    local target_cc_text=$2
+    local gcc_version
+    local gcc_release
+    local as_version
+    local selected_assembler
+    local selected_as_version
+    local binutils_release
+    local package_paths
+    local script_dir
+    local -a options=()
+    local -a packages=()
+
+    if grep -qx 'CONFIG_AS_IS_GNU=y' "$auto_conf"; then
+        as_version=$(config_value "$auto_conf" CONFIG_AS_VERSION)
+        [[ "$as_version" =~ ^[1-9][0-9]{4,5}$ ]] ||
+            die "cannot determine the target assembler version: $as_version"
+        read -r selected_assembler selected_as_version < <(
+            "$kernel_source/scripts/as-version.sh" "$target_cc"
+        )
+        if [[ "$selected_assembler" != GNU ||
+              "$selected_as_version" != "$as_version" ]]; then
+            printf -v binutils_release '%d.%d.%d' \
+                "$((as_version / 10000))" \
+                "$((as_version / 100 % 100))" \
+                "$((as_version % 100))"
+            options+=(--binutils-version "${binutils_release%.0}")
+        fi
+    fi
+    if [[ $(LC_ALL=C "$target_cc" --version | sed -n '1p') == "$target_cc_text" &&
+          ${#options[@]} -eq 0 ]]; then
+        return
+    fi
+
+    gcc_version=$(config_value "$auto_conf" CONFIG_GCC_VERSION)
+    [[ "$gcc_version" =~ ^[1-9][0-9]{4,5}$ ]] ||
+        die "cannot determine the target GCC version: $gcc_version"
+    printf -v gcc_release '%d.%d.%d' \
+        "$((gcc_version / 10000))" \
+        "$((gcc_version / 100 % 100))" \
+        "$((gcc_version % 100))"
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+    # Tumbleweed can retain the kernel's toolchain RPMs in the locked snapshot
+    # after its repository metadata starts advertising newer build tools.
+    package_paths=$(python3 "$script_dir/opensuse-toolchain.py" \
+        --snapshot "$snapshot" --version "$gcc_release" \
+        --arch "$target_arch" --output "$work_root/opensuse-toolchain" \
+        "${options[@]}") ||
+        die "cannot acquire the target kernel's build tools"
+    readarray -t packages <<<"$package_paths"
+    zypper --non-interactive install --oldpackage --no-recommends \
+        "${packages[@]}"
+    if [[ ${#options[@]} -gt 0 ]]; then
+        read -r selected_assembler selected_as_version < <(
+            "$kernel_source/scripts/as-version.sh" "$target_cc"
+        )
+        [[ "$selected_assembler" == GNU &&
+           "$selected_as_version" == "$as_version" ]] ||
+            die "installed assembler does not match target: $selected_as_version (expected $as_version)"
+    fi
+}
+
 select_target_cc() {
     local auto_conf=$1
     local configured_cc
@@ -820,6 +884,13 @@ select_target_cc() {
         die "cannot find the target kernel C compiler"
 
     target_cc_version=$(LC_ALL=C "$target_cc" --version | sed -n '1p')
+    if [[ "$distro" == opensuse ]] &&
+       grep -qx 'CONFIG_CC_IS_GCC=y' "$auto_conf"; then
+        install_opensuse_target_tools "$auto_conf" "$target_cc_text"
+        target_cc_version=$(LC_ALL=C "$target_cc" --version | sed -n '1p')
+        [[ "$target_cc_version" == "$target_cc_text" ]] ||
+            die "installed GCC does not match target: $target_cc_version (expected $target_cc_text)"
+    fi
     if [[ -z "$target_cc_text" ||
           "$target_cc_version" != "$target_cc_text" ]]; then
         echo "warning: selected C compiler does not exactly match target" >&2
@@ -886,6 +957,7 @@ build_source_package_module() {
     local package_install_status=0
     local resolved_installed_module
     local package_version
+    local -a apt_options=()
 
     # Release modules receive one stable vendor signature before the final
     # exact-byte boot test. Prevent distro DKMS from appending an ephemeral
@@ -943,8 +1015,11 @@ build_source_package_module() {
         die "kernel-client package has an unsafe version: $package_version"
     case $distro in
         ubuntu | debian)
+            if [[ "$distro" == debian ]]; then
+                apt_options=(-t "$apt_suite")
+            fi
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                --no-install-recommends "$source_package" ||
+                --no-install-recommends "${apt_options[@]}" "$source_package" ||
                 package_install_status=$?
             ;;
         fedora)
