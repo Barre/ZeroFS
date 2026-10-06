@@ -972,6 +972,15 @@ impl Db {
 
     pub async fn close(&self) -> Result<()> {
         self.mark_closing();
+        // The server's coordinator seals and flushes writes before closing a writer.
+        // Save its hot cache entries while SlateDB still accepts cache operations.
+        let cache_result = match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db.flush_cache_to_disk().await,
+            SlateDbHandle::ReadOnly(reader) => reader.load_full().flush_cache_to_disk().await,
+        };
+        if let Err(error) = cache_result {
+            tracing::warn!(%error, "Failed to persist the SlateDB cache before close");
+        }
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
                 if let Err(e) = db.close().await {
@@ -1060,6 +1069,65 @@ mod warm_tracker_tests {
         // An id that was retired and reappears is treated as new (its blocks are
         // no longer guaranteed cached), so it warms again.
         assert_eq!(sorted(t.plan(5, [10, 20, 11].into_iter())), vec![11]);
+    }
+}
+
+#[cfg(test)]
+mod cache_close_tests {
+    use super::*;
+    use slatedb::db_cache::{CachedEntry, CachedKey, DbCache};
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct FailingFlushCache {
+        flushes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DbCache for FailingFlushCache {
+        async fn get_block(&self, _: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+            Ok(None)
+        }
+        async fn get_index(&self, _: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+            Ok(None)
+        }
+        async fn get_filter(&self, _: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+            Ok(None)
+        }
+        async fn get_stats(&self, _: &CachedKey) -> Result<Option<CachedEntry>, slatedb::Error> {
+            Ok(None)
+        }
+        async fn insert(&self, _: CachedKey, _: CachedEntry) {}
+        async fn remove(&self, _: &CachedKey) {}
+        fn entry_count(&self) -> u64 {
+            0
+        }
+        async fn flush_scope(&self, _: u64) -> Result<(), slatedb::Error> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Err(slatedb::Error::unavailable("cache disk unavailable".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_flush_failure_still_closes_database() {
+        let cache = Arc::new(FailingFlushCache::default());
+        let raw = Arc::new(
+            slatedb::DbBuilder::new(
+                "cache-close",
+                Arc::new(object_store::memory::InMemory::new()),
+            )
+            .with_db_cache(cache.clone(), 0)
+            .build()
+            .await
+            .unwrap(),
+        );
+        let db = Db::new(raw.clone(), None);
+        db.close().await.unwrap();
+        assert_eq!(cache.flushes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            raw.get(b"key").await.unwrap_err().kind(),
+            slatedb::ErrorKind::Closed(slatedb::CloseReason::Clean)
+        );
     }
 }
 

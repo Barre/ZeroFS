@@ -676,7 +676,7 @@ pub async fn build_slatedb(
                 .with_settings(settings)
                 .with_gc_runtime(maintenance_runtime.clone())
                 .with_sst_block_size(slatedb::SstBlockSize::Block32Kib)
-                .with_db_cache(cache)
+                .with_db_cache(cache, 0)
                 .with_block_cache_policy(
                     slatedb::BlockCachePolicy::default().with_compaction_output_targets(&[
                         slatedb::CacheTarget::data::<&[u8], _>(..),
@@ -1375,7 +1375,7 @@ mod tests {
             };
             slatedb::DbBuilder::new(slatedb::object_store::path::Path::from("db"), store)
                 .with_settings(settings)
-                .with_db_cache(cache)
+                .with_db_cache(cache, 0)
                 .with_sst_block_size(SstBlockSize::Block32Kib)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
